@@ -1,90 +1,137 @@
-# Obsidian Sample Plugin
+# Yandex Disk Sync for Obsidian
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+## Features
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open modal (simple)" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and output 'click' to the console.
-- Registers a global interval which logs 'setInterval' to the console.
+- **Real-time synchronization** — automatic upload of modified files when saving
+- **Periodic full synchronization** — check and synchronize all files by timer
+- **Two-way synchronization** — changes from any device are synchronized to all others
+- **Conflict resolution** — automatic conflict resolution (newer file wins)
+- **Deletion synchronization** — deleted files are deleted on all devices
+- **Flexible filters** — configurable include/exclude file patterns
+- **Multi-device support** — work under one token on different devices
 
-## First time developing plugins?
+## Installation
 
-Quick starting guide for new plugin devs:
+### Manual
 
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `main.ts` to `main.js`.
-- Make changes to `main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
+1. Download `main.js`, `manifest.json`, and `styles.css` from [latest release](../../releases)
+2. Create `yandex-disk-sync` folder in `<Vault>/.obsidian/plugins/`
+3. Copy downloaded files to created folder
+4. Restart Obsidian
+5. Enable plugin in **Settings → Community plugins**
 
-## Releasing new releases
+### Via BRAT (for beta testing)
 
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
+1. Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin
+2. Add repository through BRAT
 
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
+## Setup
 
-## Adding your plugin to the community plugin list
+### Getting OAuth Token
 
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
+1. Go to [Yandex OAuth](https://oauth.yandex.ru/)
+2. Create application with `cloud_api:disk.app_folder` or `cloud_api:disk.read` + `cloud_api:disk.write` permissions
+3. Get OAuth token
+4. Paste token in plugin settings
 
-## How to use
+### Plugin Settings
 
-- Clone this repo.
-- Make sure your NodeJS is at least v16 (`node --version`).
-- `npm i` or `yarn` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
+| Parameter                     | Description                                                          |
+| ----------------------------- | -------------------------------------------------------------------- |
+| **OAuth token**               | Token for Yandex Disk API access                                     |
+| **Remote path**               | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`)       |
+| **Real-time sync**            | Automatic synchronization when files are changed                    |
+| **Full sync interval**        | Full synchronization interval in minutes (0 = manual only)           |
+| **Sync delay**                | Delay before uploading file after change (debounce)                  |
+| **Sync config folder**        | Synchronize Obsidian settings folder                                 |
+| **Include/Exclude patterns**  | Glob patterns for file filtering                                     |
 
-## Manually installing the plugin
+## Commands
 
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
+| Command              | Description                                             |
+| -------------------- | ------------------------------------------------------- |
+| `Sync now`           | Run full synchronization manually                       |
+| `Pause/Resume sync`  | Pause or resume synchronization                         |
+| `Show sync status`   | Show status and statistics of last synchronization      |
+| `Force upload all`   | Force upload all local files                            |
+| `Force download all` | Force download all files from disk                      |
 
-## Improve code quality with eslint
-- [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code. 
-- This project already has eslint preconfigured, you can invoke a check by running`npm run lint`
-- Together with a custom eslint [plugin](https://github.com/obsidianmd/eslint-plugin) for Obsidan specific code guidelines.
-- A GitHub action is preconfigured to automatically lint every commit on all branches.
+## Usage
 
-## Funding URL
+### First Launch
 
-You can include funding URLs where people who use your plugin can financially support it.
+On first launch, the plugin will check for files locally and on Yandex Disk:
 
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
+- **If local vault is empty and disk has files** — files will be downloaded
+- **If disk is empty and local has files** — files will be uploaded
+- **If files exist in both places** — you will be prompted to choose synchronization strategy
 
-```json
-{
-    "fundingUrl": "https://buymeacoffee.com"
-}
+### Working on Multiple Devices
+
+1. Set up plugin on first device and perform initial synchronization
+2. On second device, install plugin with same token and path
+3. Plugin will automatically download files from Yandex Disk
+
+### Conflict Resolution
+
+When conflict occurs (file changed on multiple devices), plugin automatically selects newer version by modification time.
+
+## Development
+
+### Requirements
+
+- Node.js 18+
+- npm
+
+### Install Dependencies
+
+```bash
+npm install
 ```
 
-If you have multiple URLs, you can also do:
+### Development Mode
 
-```json
-{
-    "fundingUrl": {
-        "Buy Me a Coffee": "https://buymeacoffee.com",
-        "GitHub Sponsor": "https://github.com/sponsors",
-        "Patreon": "https://www.patreon.com/"
-    }
-}
+```bash
+npm run dev
 ```
 
-## API Documentation
+### Build
 
-See https://docs.obsidian.md
+```bash
+npm run build
+```
+
+Built files will be in `build/` folder and automatically copied to test vault.
+
+### Linting
+
+```bash
+npm run lint
+```
+
+## Architecture
+
+Detailed description of architecture and approaches see in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Security
+
+- OAuth token is stored locally in plugin settings
+- Token is not logged and not transmitted to third parties
+- Recommended to use token with minimal necessary permissions
+
+## Limitations
+
+- Maximum file size for upload: 50 MB (Yandex Disk API limitation)
+- Binary file synchronization may be slower
+- Symlinks synchronization is not supported
+
+## License
+
+MIT
+
+## Acknowledgments
+
+- [Obsidian](https://obsidian.md) for excellent product and API
+- [Yandex Disk](https://disk.yandex.ru) for cloud storage

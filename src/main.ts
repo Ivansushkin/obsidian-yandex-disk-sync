@@ -1,99 +1,589 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+/**
+ * Yandex Disk Sync Plugin for Obsidian
+ * File synchronization with Yandex Disk
+ */
 
-// Remember to rename these classes and interfaces!
+import { Notice, Plugin } from "obsidian";
+import {
+	YandexDiskSyncSettings,
+	DEFAULT_SETTINGS,
+	SyncIndex,
+	InitMode,
+} from "./types";
+import { YandexDiskSyncSettingTab } from "./settings";
+import { YandexDiskClient } from "./api/yandex-client";
+import { VaultAdapter } from "./api/vault-adapter";
+import { IndexManager } from "./sync/index-manager";
+import { SyncEngine } from "./sync/sync-engine";
+import { FileWatcher } from "./sync/file-watcher";
+import { SyncScheduler } from "./sync/sync-scheduler";
+import { SyncStatusBar } from "./ui/status-bar";
+import { InitSyncModal, SyncStatusModal, ConfirmModal } from "./ui/init-modal";
+import { generateDeviceId } from "./utils/path-utils";
+import { logger } from "./utils/logger";
+import { initI18n, t } from "./i18n";
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
-
-	async onload() {
-		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
-	}
-
-	onunload() {
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+interface PluginData {
+	settings: YandexDiskSyncSettings;
+	localIndex: Partial<SyncIndex> | null;
+	lastSyncStats: {
+		uploaded: number;
+		downloaded: number;
+		deleted: number;
+		errors: number;
+	};
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+export default class YandexDiskSyncPlugin extends Plugin {
+	settings: YandexDiskSyncSettings = DEFAULT_SETTINGS;
+
+	private yandexClient!: YandexDiskClient;
+	private vaultAdapter!: VaultAdapter;
+	private indexManager!: IndexManager;
+	private syncEngine!: SyncEngine;
+	private fileWatcher!: FileWatcher;
+	private syncScheduler!: SyncScheduler;
+	private statusBar: SyncStatusBar | null = null;
+	private sidebarButton: HTMLElement | null = null;
+
+	private lastSyncStats = {
+		uploaded: 0,
+		downloaded: 0,
+		deleted: 0,
+		errors: 0,
+	};
+
+	private isInitialized = false;
+
+	async onload(): Promise<void> {
+		// Initialize i18n service
+		initI18n();
+
+		logger.info("Loading Yandex Disk Sync plugin...");
+
+		// Load settings
+		await this.loadSettings();
+
+		// Generate device ID if missing
+		if (!this.settings.deviceId) {
+			this.settings.deviceId = generateDeviceId();
+			await this.saveSettings();
+		}
+
+		// Initialize components
+		this.initializeComponents();
+
+		// Register settings tab
+		this.addSettingTab(new YandexDiskSyncSettingTab(this.app, this));
+
+		// Register commands
+		this.registerCommands();
+
+		// Create status bar and sidebar button
+		this.createStatusBar();
+		this.createSyncSidebarButton();
+
+		// Wait for layout ready to start synchronization
+		this.app.workspace.onLayoutReady(() => {
+			void this.onLayoutReady();
+		});
+
+		logger.info("Yandex Disk Sync plugin loaded");
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	onunload(): void {
+		logger.info("Unloading Yandex Disk Sync plugin...");
+
+		// Stop components
+		if (this.fileWatcher) {
+			this.fileWatcher.stop();
+		}
+		if (this.syncScheduler) {
+			this.syncScheduler.stop();
+		}
+		if (this.statusBar) {
+			this.statusBar.destroy();
+		}
+		if (this.sidebarButton) {
+			this.sidebarButton.remove();
+			this.sidebarButton = null;
+		}
+
+		// Save index (sync version - onunload is not async)
+		void this.saveData({
+			settings: this.settings,
+			localIndex: this.indexManager?.getLocalIndex() ?? null,
+			lastSyncStats: this.lastSyncStats,
+		} as PluginData);
+
+		logger.info("Yandex Disk Sync plugin unloaded");
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	/**
+	 * Initialize components
+	 */
+	private initializeComponents(): void {
+		// Create API client
+		this.yandexClient = new YandexDiskClient({
+			token: this.settings.yandexTokenSecret,
+		});
+
+		// Create vault adapter
+		this.vaultAdapter = new VaultAdapter(this.app, this.settings);
+
+		// Create index manager
+		this.indexManager = new IndexManager(
+			this.yandexClient,
+			this.vaultAdapter,
+			this.settings
+		);
+
+		// Create sync engine
+		this.syncEngine = new SyncEngine(
+			this.yandexClient,
+			this.vaultAdapter,
+			this.indexManager,
+			this.settings
+		);
+
+		// Set callback for saving local index after auto-sync operations
+		this.syncEngine.setIndexSaveCallback(async () => {
+			await this.saveLocalIndex();
+		});
+
+		// Create file watcher
+		this.fileWatcher = new FileWatcher(
+			this.app,
+			this.syncEngine,
+			this.settings
+		);
+
+		// Create sync scheduler
+		this.syncScheduler = new SyncScheduler(this.syncEngine, this.settings);
+	}
+
+	/**
+	 * Create status bar
+	 */
+	private createStatusBar(): void {
+		const statusBarEl = this.addStatusBarItem();
+		this.statusBar = new SyncStatusBar(statusBarEl, this.syncEngine);
+	}
+
+	/**
+	 * Add manual sync trigger button to sidebar
+	 */
+	private createSyncSidebarButton(): void {
+		const button = this.addRibbonIcon(
+			"refresh-cw",
+			t("command.sync_now"),
+			() => {
+				void this.runFullSync();
+			}
+		);
+		button.addClass("yandex-sync-sidebar-button");
+		this.sidebarButton = button;
+	}
+
+	/**
+	 * Register commands
+	 */
+	private registerCommands(): void {
+		// Sync now
+		this.addCommand({
+			id: "sync-now",
+			name: t("command.sync_now"),
+			callback: async () => {
+				await this.runFullSync();
+			},
+		});
+
+		// Toggle sync
+		this.addCommand({
+			id: "toggle-sync",
+			name: t("command.toggle_sync"),
+			callback: () => {
+				if (this.syncEngine.isSyncPaused()) {
+					this.syncEngine.resume();
+					this.fileWatcher.start();
+					this.syncScheduler.start();
+					new Notice(t("notice.sync_resumed"));
+				} else {
+					this.syncEngine.pause();
+					this.fileWatcher.stop();
+					this.syncScheduler.stop();
+					new Notice(t("notice.sync_paused"));
+				}
+			},
+		});
+
+		// Show status
+		this.addCommand({
+			id: "show-status",
+			name: t("command.show_status"),
+			callback: () => {
+				const state = this.syncEngine.getState();
+				new SyncStatusModal(this.app, {
+					lastSyncTime: state.lastSyncTime,
+					...this.lastSyncStats,
+				}).open();
+			},
+		});
+
+		// Force download all
+		this.addCommand({
+			id: "force-download",
+			name: t("command.force_download"),
+			callback: async () => {
+				const confirmed = await this.confirmAction(
+					t("notice.force_action_confirm", { type: t("generic.local") + " " + t("generic.files") })
+				);
+				if (confirmed) {
+					await this.runInitialSync("download");
+				}
+			},
+		});
+
+		// Force upload all
+		this.addCommand({
+			id: "force-upload",
+			name: t("command.force_upload"),
+			callback: async () => {
+				const confirmed = await this.confirmAction(
+					t("notice.force_action_confirm", { type: t("generic.remote") + " " + t("generic.files") })
+				);
+				if (confirmed) {
+					await this.runInitialSync("upload");
+				}
+			},
+		});
+	}
+
+	/**
+	 * Callback when layout is ready
+	 */
+	private async onLayoutReady(): Promise<void> {
+		// Check if token is configured
+		if (!this.settings.yandexTokenSecret) {
+			logger.info("Token not configured, waiting for settings");
+			return;
+		}
+
+		// Load saved index
+		const data = (await this.loadData()) as PluginData | null;
+		if (data?.localIndex) {
+			this.indexManager.loadLocalIndexFromData(data.localIndex);
+		}
+		if (data?.lastSyncStats) {
+			this.lastSyncStats = data.lastSyncStats;
+		}
+
+		// Check if initial setup is needed
+		const needsInitialSync = await this.needsInitialSync();
+		if (needsInitialSync) {
+			await this.checkAndRunInitialSync();
+		} else {
+			// Start regular synchronization
+			this.startSync();
+		}
+
+		this.isInitialized = true;
+	}
+
+	/**
+	 * Проверка необходимости первичной синхронизации
+	 */
+	private async needsInitialSync(): Promise<boolean> {
+		try {
+			// Проверяем наличие удаленного индекса
+			const remoteIndexExists = await this.indexManager.remoteIndexExists();
+			if (remoteIndexExists) {
+				// Если индекс есть на диске - это не первичная синхронизация
+				logger.info("Remote index exists, skipping initial sync");
+				return false;
+			}
+
+			// Проверяем локальный индекс
+			const localIndex = this.indexManager.getLocalIndex();
+			if (localIndex.lastSyncTime > 0) {
+				// Если была синхронизация - не первичная
+				logger.info("Local index has sync time, skipping initial sync");
+				return false;
+			}
+
+			// Иначе - нужна первичная синхронизация
+			logger.info("Initial sync needed");
+			return true;
+		} catch (e) {
+			logger.warn("Error checking initial sync status:", e);
+			// В случае ошибки считаем что нужна первичная синхронизация
+			return true;
+		}
+	}
+
+	/**
+	 * Check and run initial synchronization
+	 */
+	private async checkAndRunInitialSync(): Promise<void> {
+		try {
+			new Notice(t("notice.connection_check"));
+
+			// Check token
+			const tokenValid = await this.yandexClient.checkToken();
+			if (!tokenValid) {
+				new Notice(t("notice.token_invalid"));
+				return;
+			}
+
+			// Check if files exist on disk
+			const remoteExists = await this.indexManager.remotePathExists();
+			let remoteHasFiles = false;
+
+			if (remoteExists) {
+				const remoteFiles = await this.indexManager.getRemoteFiles();
+				remoteHasFiles = remoteFiles.size > 0;
+			}
+
+			// Check if local files exist
+			const localFiles = await this.vaultAdapter.getAllSyncableFiles();
+			const localHasFiles = localFiles.length > 0;
+
+			if (remoteHasFiles && localHasFiles) {
+				// Show choice dialog
+				new InitSyncModal(
+					this.app,
+					remoteHasFiles,
+					localHasFiles,
+					(mode) => {
+						if (mode) {
+							void this.runInitialSync(mode).then(() => {
+								this.startSync();
+							});
+						} else {
+							this.startSync();
+						}
+					}
+				).open();
+			} else if (remoteHasFiles) {
+				// Only remote files - download
+				new Notice(t("notice.download_started"));
+				await this.runInitialSync("download");
+				this.startSync();
+			} else {
+				// Only local files or empty - upload
+				if (localHasFiles) {
+					new Notice(t("notice.upload_started"));
+				}
+				await this.runInitialSync("upload");
+				this.startSync();
+			}
+		} catch (e) {
+			logger.error("Error during initial setup:", e);
+			new Notice(`Initialization error: ${(e as Error).message}`);
+		}
+	}
+
+	/**
+	 * Run initial synchronization with specific mode
+	 */
+	private async runInitialSync(mode: InitMode): Promise<void> {
+		try {
+			// Create remote folder if not exists
+			const exists = await this.indexManager.remotePathExists();
+			if (!exists) {
+				await this.indexManager.createRemotePath();
+			}
+
+			if (mode === "download" || mode === "merge") {
+				// Load remote index
+				await this.indexManager.loadRemoteIndex();
+			}
+
+			// Run full synchronization
+			const result = await this.syncEngine.fullSync();
+
+			this.lastSyncStats = {
+				uploaded: result.uploaded,
+				downloaded: result.downloaded,
+				deleted: result.deleted,
+				errors: result.errors.length,
+			};
+
+			// Save updated index after sync
+			await this.saveData({
+				settings: this.settings,
+				localIndex: this.indexManager.getLocalIndex(),
+				lastSyncStats: this.lastSyncStats,
+			} as PluginData);
+
+			if (result.success) {
+				new Notice(
+					t("notice.sync_completed", { successful: result.uploaded + result.downloaded + result.deleted })
+				);
+			} else {
+				new Notice(t("notice.sync_error", { errors: result.errors.length }));
+			}
+		} catch (e) {
+			logger.error("Error during initial synchronization:", e);
+			new Notice(`Sync error: ${(e as Error).message}`);
+		}
+	}
+
+	/**
+	 * Run full synchronization
+	 */
+	private async runFullSync(): Promise<void> {
+		if (!this.settings.yandexTokenSecret) {
+			new Notice(t("notice.token_missing"));
+			return;
+		}
+
+		new Notice(t("notice.sync_started"));
+
+		try {
+			const result = await this.syncEngine.fullSync();
+
+			this.lastSyncStats = {
+				uploaded: result.uploaded,
+				downloaded: result.downloaded,
+				deleted: result.deleted,
+				errors: result.errors.length,
+			};
+
+			// Save updated index after sync
+			await this.saveData({
+				settings: this.settings,
+				localIndex: this.indexManager.getLocalIndex(),
+				lastSyncStats: this.lastSyncStats,
+			} as PluginData);
+
+			if (result.success) {
+				new Notice(
+					t("notice.sync_completed", { successful: result.uploaded + result.downloaded + result.deleted })
+				);
+			} else {
+				new Notice(t("notice.sync_error", { errors: result.errors.length }));
+			}
+		} catch (e) {
+			logger.error("Sync error:", e);
+			new Notice(`Sync error: ${(e as Error).message}`);
+		}
+	}
+
+	/**
+	 * Start regular synchronization
+	 */
+	private startSync(): void {
+		logger.info("[Main] Starting regular synchronization");
+
+		// Start file watcher
+		logger.info("[Main] Starting file watcher");
+		this.fileWatcher.start();
+
+		// Start scheduler
+		logger.info("[Main] Starting sync scheduler");
+		this.syncScheduler.start();
+
+		logger.info("[Main] Synchronization started");
+
+		// Run initial sync immediately to check for changes
+		logger.info("[Main] Running initial sync check");
+		void this.runFullSync();
+	}
+
+	/**
+	 * Confirm action via Modal
+	 */
+	private confirmAction(message: string): Promise<boolean> {
+		return new Promise((resolve) => {
+			new ConfirmModal(this.app, message, (confirmed) => {
+				resolve(confirmed);
+			}).open();
+		});
+	}
+
+	/**
+	 * Load settings
+	 */
+	async loadSettings(): Promise<void> {
+		const data = (await this.loadData()) as PluginData | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
+
+		// Automatically determine path with vault name
+		const vaultName = this.app.vault.getName();
+		const saved = data?.settings;
+		
+		// Apply automatic path determination if:
+		// - settings were not saved before, or
+		// - path is not set, or
+		// - path equals the default value
+		if (!saved || !this.settings.remotePath || 
+		    this.settings.remotePath === DEFAULT_SETTINGS.remotePath) {
+			this.settings.remotePath = `${DEFAULT_SETTINGS.remotePath}/${vaultName}`;
+			// Save updated settings
+			await this.saveSettings();
+		}
+	}
+
+	/**
+	 * Save settings
+	 */
+	async saveSettings(): Promise<void> {
+		// Update components
+		if (this.yandexClient) {
+			this.yandexClient.setToken(this.settings.yandexTokenSecret);
+		}
+		if (this.vaultAdapter) {
+			this.vaultAdapter.updateSettings(this.settings);
+		}
+		if (this.indexManager) {
+			this.indexManager.updateSettings(this.settings);
+		}
+		if (this.syncEngine) {
+			this.syncEngine.updateSettings(this.settings);
+		}
+		if (this.fileWatcher) {
+			this.fileWatcher.updateSettings(this.settings);
+		}
+		if (this.syncScheduler) {
+			this.syncScheduler.updateSettings(this.settings);
+		}
+
+		await this.saveData({
+			settings: this.settings,
+			localIndex: this.indexManager?.getLocalIndex() ?? null,
+			lastSyncStats: this.lastSyncStats,
+		} as PluginData);
+	}
+
+	/**
+	 * Test connection to Yandex Disk
+	 */
+	async testConnection(): Promise<{ success: boolean; message: string }> {
+		if (!this.settings.yandexTokenSecret) {
+			return { success: false, message: t("notice.token_missing") };
+		}
+
+		try {
+			const valid = await this.yandexClient.checkToken();
+			if (valid) {
+				return { success: true, message: t("notice.connection_test_success") };
+			} else {
+				return { success: false, message: t("notice.token_invalid") };
+			}
+		} catch (e) {
+			return { success: false, message: (e as Error).message };
+		}
+	}
+
+	/**
+	 * Save local index to plugin data
+	 */
+	private async saveLocalIndex(): Promise<void> {
+		await this.saveData({
+			settings: this.settings,
+			localIndex: this.indexManager.getLocalIndex(),
+			lastSyncStats: this.lastSyncStats,
+		} as PluginData);
 	}
 }

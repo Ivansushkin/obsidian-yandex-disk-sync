@@ -1,0 +1,162 @@
+/**
+ * Path utilities
+ */
+
+/**
+ * Path normalization (remove leading/trailing slashes, replace backslashes)
+ */
+export function normalizePath(path: string): string {
+	return path
+		.replace(/\\/g, "/")
+		.replace(/^\/+/, "")
+		.replace(/\/+$/, "")
+		.replace(/\/+/g, "/");
+}
+
+/**
+ * Path parts joining
+ */
+export function joinPath(...parts: string[]): string {
+	return normalizePath(parts.filter(Boolean).join("/"));
+}
+
+/**
+ * Get file name from path
+ */
+export function getFileName(path: string): string {
+	const normalized = normalizePath(path);
+	const lastSlash = normalized.lastIndexOf("/");
+	return lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
+}
+
+/**
+ * Get directory from path
+ */
+export function getDirectory(path: string): string {
+	const normalized = normalizePath(path);
+	const lastSlash = normalized.lastIndexOf("/");
+	return lastSlash >= 0 ? normalized.slice(0, lastSlash) : "";
+}
+
+/**
+ * Get file extension
+ */
+export function getExtension(path: string): string {
+	const fileName = getFileName(path);
+	const lastDot = fileName.lastIndexOf(".");
+	return lastDot >= 0 ? fileName.slice(lastDot + 1).toLowerCase() : "";
+}
+
+/**
+ * Convert local path to remote path
+ */
+export function toRemotePath(localPath: string, remotePath: string): string {
+	return joinPath(remotePath, localPath);
+}
+
+/**
+ * Convert remote path to local path
+ */
+export function toLocalPath(
+	fullRemotePath: string,
+	remoteBasePath: string
+): string {
+	const normalized = normalizePath(fullRemotePath);
+	const base = normalizePath(remoteBasePath);
+
+	// Remove "disk:/" prefix if present
+	const cleanPath = normalized.replace(/^disk:\//, "");
+	const cleanBase = base.replace(/^disk:\//, "");
+
+	if (cleanPath.startsWith(cleanBase + "/")) {
+		return cleanPath.slice(cleanBase.length + 1);
+	}
+	if (cleanPath === cleanBase) {
+		return "";
+	}
+	return cleanPath;
+}
+
+/**
+ * Check if path is hidden file/folder
+ */
+export function isHiddenPath(path: string, configDir?: string): boolean {
+	const parts = normalizePath(path).split("/");
+	return parts.some((part) => part.startsWith(".") && (!configDir || part !== configDir));
+}
+
+/**
+ * Simple pattern matching (supports * and **)
+ */
+export function matchPattern(path: string, pattern: string): boolean {
+	const normalizedPath = normalizePath(path);
+	const normalizedPattern = normalizePath(pattern);
+
+	// Convert glob pattern to regular expression
+	const regexPattern = normalizedPattern
+		.replace(/[.+^${}()|[\]\\]/g, "\\$&") // Escape regex special chars
+		.replace(/\*\*/g, "<<<GLOBSTAR>>>") // Temporary replacement for **
+		.replace(/\*/g, "[^/]*") // * = any chars except /
+		.replace(/<<<GLOBSTAR>>>/g, ".*"); // ** = any chars including /
+
+	const regex = new RegExp(`^${regexPattern}$`);
+	return regex.test(normalizedPath);
+}
+
+/**
+ * Check if path matches any pattern in list
+ */
+export function matchesPatterns(path: string, patterns: string[]): boolean {
+	return patterns.some((pattern) => matchPattern(path, pattern));
+}
+
+/**
+ * Check if file should be synchronized
+ */
+export function shouldSyncFile(
+	path: string,
+	includePatterns: string[],
+	excludePatterns: string[],
+	syncDotObsidian: boolean,
+	configDir?: string
+): boolean {
+	const normalized = normalizePath(path);
+
+	// Check config directory
+	if (configDir && normalized.startsWith(configDir)) {
+		if (!syncDotObsidian) {
+			return false;
+		}
+	}
+
+	// Check exclusions
+	if (matchesPatterns(normalized, excludePatterns)) {
+		return false;
+	}
+
+	// Check inclusions
+	if (includePatterns.length === 0) {
+		return true;
+	}
+
+	return matchesPatterns(normalized, includePatterns);
+}
+
+/**
+ * Encode path for URL
+ */
+export function encodePathForUrl(path: string): string {
+	return normalizePath(path)
+		.split("/")
+		.map((part) => encodeURIComponent(part))
+		.join("/");
+}
+
+/**
+ * Generate unique device ID
+ */
+export function generateDeviceId(): string {
+	const timestamp = Date.now().toString(36);
+	const random = Math.random().toString(36).substring(2, 10);
+	return `device_${timestamp}_${random}`;
+}
