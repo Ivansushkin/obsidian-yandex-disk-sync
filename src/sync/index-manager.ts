@@ -60,10 +60,11 @@ export class IndexManager {
 	 * Load local index from saved plugin data
 	 */
 	loadLocalIndexFromData(data: Partial<SyncIndex> | null): void {
-		if (data && data.version === CURRENT_INDEX_VERSION) {
+		if (data && (data.version === CURRENT_INDEX_VERSION || data.version === 1)) {
 			this.localIndex = {
-				version: data.version,
+				version: CURRENT_INDEX_VERSION,
 				lastSyncTime: data.lastSyncTime || 0,
+				lastBackupTime: typeof data.lastBackupTime === 'number' ? data.lastBackupTime : undefined,
 				deviceId: data.deviceId || this.settings.deviceId,
 				files: data.files || {},
 			};
@@ -111,10 +112,11 @@ export class IndexManager {
 			const jsonStr = decoder.decode(content);
 			const data = JSON.parse(jsonStr) as Partial<SyncIndex>;
 
-			if (data.version === CURRENT_INDEX_VERSION) {
+			if (data.version === CURRENT_INDEX_VERSION || data.version === 1) {
 				this.remoteIndex = {
 					version: data.version,
 					lastSyncTime: data.lastSyncTime || 0,
+					lastBackupTime: typeof data.lastBackupTime === 'number' ? data.lastBackupTime : undefined,
 					deviceId: data.deviceId || "",
 					files: data.files || {},
 				};
@@ -126,8 +128,7 @@ export class IndexManager {
 			}
 
 			logger.info(
-				`Loaded remote index: ${
-					Object.keys(this.remoteIndex.files).length
+				`Loaded remote index: ${Object.keys(this.remoteIndex.files).length
 				} files`
 			);
 			return this.remoteIndex;
@@ -147,6 +148,7 @@ export class IndexManager {
 			REMOTE_INDEX_FILENAME
 		);
 
+		this.remoteIndex.version = CURRENT_INDEX_VERSION;
 		this.remoteIndex.lastSyncTime = Date.now();
 		this.remoteIndex.deviceId = this.settings.deviceId;
 
@@ -241,6 +243,11 @@ export class IndexManager {
 				this.settings.remotePath
 			);
 
+			// Skip protected paths (like .backup folder)
+			if (localPath.startsWith('.backup/') || localPath === '.backup') {
+				continue;
+			}
+
 			// Check if file should be synchronized
 			if (!this.vaultAdapter.shouldSync(localPath)) {
 				continue;
@@ -317,6 +324,21 @@ export class IndexManager {
 		);
 		const resource = await this.yandexClient.getResource(indexPath);
 		return resource !== null;
+	}
+
+	/**
+	 * Get last backup time from remote index
+	 */
+	getLastBackupTime(): number | null {
+		return this.remoteIndex.lastBackupTime ?? null;
+	}
+
+	/**
+	 * Set last backup time in remote index
+	 */
+	setLastBackupTime(timestamp: number): void {
+		this.remoteIndex.lastBackupTime = timestamp;
+		this.localIndex.lastBackupTime = timestamp;
 	}
 
 	/**

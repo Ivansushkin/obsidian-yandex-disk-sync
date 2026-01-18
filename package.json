@@ -13,6 +13,7 @@
 	"keywords": [],
 	"license": "0-BSD",
 	"devDependencies": {
+		"@types/jszip": "^3.4.1",
 		"@types/node": "^16.11.6",
 		"esbuild": "0.25.5",
 		"eslint-plugin-obsidianmd": "0.1.9",
@@ -24,6 +25,7 @@
 		"jiti": "2.6.1"
 	},
 	"dependencies": {
-		"obsidian": "latest"
+		"obsidian": "latest",
+		"jszip": "^3.10.1"
 	}
 }

@@ -11,6 +11,7 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 - **Deletion synchronization** — deleted files are deleted on all devices
 - **Flexible filters** — configurable include/exclude file patterns
 - **Multi-device support** — work under one token on different devices
+- **Backup system** — create ZIP backups of vault stored on Yandex Disk
 
 ## Installation
 
@@ -47,6 +48,7 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 | **Sync delay**                | Delay before uploading file after change (debounce)                  |
 | **Sync config folder**        | Synchronize Obsidian settings folder                                 |
 | **Include/Exclude patterns**  | Glob patterns for file filtering                                     |
+| **Backup**                    | Create ZIP backups of synchronized files                             |
 
 ## Commands
 
@@ -77,6 +79,18 @@ On first launch, the plugin will check for files locally and on Yandex Disk:
 ### Conflict Resolution
 
 When conflict occurs (file changed on multiple devices), plugin automatically selects newer version by modification time.
+
+### Backup System
+
+Plugin includes built-in backup system for creating ZIP archives of your vault:
+
+- **Create backups**: Go to plugin settings → Backup section → "Create backup" button
+- **Backup location**: Backups are stored in `.backup` folder on Yandex Disk
+- **Backup format**: `backup_YYYY-MM-DD_HH-MM-SS.zip`
+- **Content**: All synchronized files according to your include/exclude filters
+- **Sync**: Last backup time is synchronized between all devices
+
+**Note**: `.backup` folder is protected and excluded from synchronization operations.
 
 ## Development
 

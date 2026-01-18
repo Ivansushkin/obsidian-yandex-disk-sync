@@ -1,7 +1,7 @@
-# Common rules
+# Common agents rules
 
 - Always communicate in RU (Russian)
-- To understand the project, read the project context, it is located in the docs folder
+- To understand the project, read the project context from docs/* folder
 - Don't use emojis
 - Always write high-quality but not redundant jsdoc over functions/ classes, write them in EN
 - Do not write redundant comments in the code

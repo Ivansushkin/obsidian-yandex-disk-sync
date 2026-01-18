@@ -19,6 +19,7 @@ import { FileWatcher } from "./sync/file-watcher";
 import { SyncScheduler } from "./sync/sync-scheduler";
 import { SyncStatusBar } from "./ui/status-bar";
 import { InitSyncModal, SyncStatusModal, ConfirmModal } from "./ui/init-modal";
+import { BackupManager } from "./backup/backup-manager";
 import { generateDeviceId } from "./utils/path-utils";
 import { logger } from "./utils/logger";
 import { initI18n, t } from "./i18n";
@@ -43,6 +44,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private syncEngine!: SyncEngine;
 	private fileWatcher!: FileWatcher;
 	private syncScheduler!: SyncScheduler;
+	private backupManager!: BackupManager;
 	private statusBar: SyncStatusBar | null = null;
 	private sidebarButton: HTMLElement | null = null;
 
@@ -160,6 +162,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Create sync scheduler
 		this.syncScheduler = new SyncScheduler(this.syncEngine, this.settings);
+
+		// Create backup manager
+		this.backupManager = new BackupManager(
+			this.yandexClient,
+			this.vaultAdapter,
+			this.indexManager,
+			this.settings
+		);
 	}
 
 	/**
@@ -276,6 +286,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 		if (data?.lastSyncStats) {
 			this.lastSyncStats = data.lastSyncStats;
+		}
+
+		// Load remote index to get synchronized backup time
+		try {
+			await this.indexManager.loadRemoteIndex();
+		} catch (e) {
+			logger.warn("Could not load remote index for backup time:", e);
 		}
 
 		// Check if initial setup is needed
@@ -548,6 +565,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.syncScheduler) {
 			this.syncScheduler.updateSettings(this.settings);
 		}
+		if (this.backupManager) {
+			this.backupManager.updateSettings(this.settings);
+		}
 
 		await this.saveData({
 			settings: this.settings,
@@ -574,6 +594,39 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		} catch (e) {
 			return { success: false, message: (e as Error).message };
 		}
+	}
+
+	/**
+	 * Create backup of synchronized files
+	 */
+	async createBackup(): Promise<{ success: boolean; backupName?: string; error?: string }> {
+		if (!this.settings.yandexTokenSecret) {
+			return { success: false, error: t("notice.token_missing") };
+		}
+
+		new Notice(t("notice.backup_started"));
+
+		try {
+			const result = await this.backupManager.createBackup();
+
+			if (result.success && result.backupName) {
+				new Notice(t("notice.backup_completed", { name: result.backupName }));
+				return { success: true, backupName: result.backupName };
+			} else {
+				return { success: false, error: result.error };
+			}
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			logger.error("Backup creation failed:", error);
+			return { success: false, error: errorMessage };
+		}
+	}
+
+	/**
+	 * Get last backup time from synchronized index
+	 */
+	getLastBackupTime(): number | null {
+		return this.indexManager ? this.indexManager.getLastBackupTime() : null;
 	}
 
 	/**

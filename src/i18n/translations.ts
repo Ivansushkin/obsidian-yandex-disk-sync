@@ -50,6 +50,8 @@ export const translations: Record<Language, Record<string, string>> = {
         'notice.upload_started': 'Uploading files to Yandex Disk...',
         'notice.conflict_resolved': 'Conflict resolved, copy created: {path}',
         'notice.force_action_confirm': 'This will overwrite {type}. Continue?',
+        'notice.backup_started': 'Creating backup...',
+        'notice.backup_completed': 'Backup created: {name}',
 
         // Modal titles
         'modal.confirm_title': 'Confirm action',
@@ -78,11 +80,13 @@ export const translations: Record<Language, Record<string, string>> = {
 
         // Settings
         'settings.connection_section': 'Connection',
-        'settings.oauth_apps': 'OAuth Applications',
-        'settings.oauth_instruction_1': '1. Click \'Manage clients\' to create/open your Yandex OAuth app',
-        'settings.oauth_instruction_2': '2. Copy Client ID from the app settings',
-        'settings.oauth_instruction_3': '3. Paste Client ID below',
-        'settings.oauth_instruction_4': '4. Click \'Get token\' to authorize access',
+        'settings.oauth_apps': 'Getting and setting up disk OAuth token',
+        'settings.oauth_instruction_1': '1. Click \'Manage clients\'',
+        'settings.oauth_instruction_2': '2. Create and open a new Yandex OAuth app',
+        'settings.oauth_instruction_3': '3. Copy Client ID from the app settings',
+        'settings.oauth_instruction_4': '4. Paste Client ID in the input below',
+        'settings.oauth_instruction_5': '5. Click \'Get token\'',
+        'settings.oauth_instruction_6': '6. Copy the received token and paste it in the input below',
         'settings.manage_clients': 'Manage clients',
         'settings.get_token': 'Get token',
         'settings.client_id': 'Client ID',
@@ -121,6 +125,14 @@ export const translations: Record<Language, Record<string, string>> = {
         'settings.testing_button': 'Testing...',
         'settings.success_button': 'Success!',
         'settings.error_button': 'Error',
+        'settings.backup_section': 'Backup',
+        'settings.backup_desc': 'Backup will be saved as a ZIP archive in the .backup folder on disk',
+        'settings.backup_last': 'Last backup',
+        'settings.backup_never': 'Never',
+        'settings.backup_button': 'Create backup',
+        'settings.backup_in_progress': 'Creating...',
+        'settings.backup_success': 'Backup created!',
+        'settings.backup_error': 'Backup failed',
 
         // Generic strings
         'generic.yes': 'Yes',
@@ -189,6 +201,8 @@ export const translations: Record<Language, Record<string, string>> = {
         'notice.upload_started': 'Загрузка файлов на Яндекс Диск...',
         'notice.conflict_resolved': 'Конфликт разрешён, создана копия: {path}',
         'notice.force_action_confirm': 'Это перезапишет {type}. Продолжить?',
+        'notice.backup_started': 'Создание бекапа...',
+        'notice.backup_completed': 'Бекап создан: {name}',
 
         // Modal titles
         'modal.confirm_title': 'Подтверждение действия',
@@ -217,11 +231,13 @@ export const translations: Record<Language, Record<string, string>> = {
 
         // Settings
         'settings.connection_section': 'Подключение',
-        'settings.oauth_apps': 'Приложения OAuth',
-        'settings.oauth_instruction_1': '1. Нажмите \'Управление клиентами\' для создания/открытия приложения Yandex OAuth',
-        'settings.oauth_instruction_2': '2. Скопируйте Client ID из настроек приложения',
-        'settings.oauth_instruction_3': '3. Вставьте Client ID ниже',
-        'settings.oauth_instruction_4': '4. Нажмите \'Получить токен\' для авторизации доступа',
+        'settings.oauth_apps': 'Получение и установка OAuth токена диска',
+        'settings.oauth_instruction_1': '1. Нажмите \'Управление клиентами\'',
+        'settings.oauth_instruction_2': '2. Создайте и откройте новое приложение Yandex OAuth',
+        'settings.oauth_instruction_3': '3. Скопируйте Client ID из настроек приложения',
+        'settings.oauth_instruction_4': '4. Вставьте Client ID в инпут ниже',
+        'settings.oauth_instruction_5': '5. Нажмите \'Получить токен\'',
+        'settings.oauth_instruction_6': '6. Скопируйте полученный токен и вставьте его в инпут ниже',
         'settings.manage_clients': 'Управление клиентами',
         'settings.get_token': 'Получить токен',
         'settings.client_id': 'Client ID',
@@ -260,6 +276,14 @@ export const translations: Record<Language, Record<string, string>> = {
         'settings.testing_button': 'Тестирование...',
         'settings.success_button': 'Успешно!',
         'settings.error_button': 'Ошибка',
+        'settings.backup_section': 'Резервное копирование',
+        'settings.backup_desc': 'Бекап будет сохранен как zip архив в папку .backup на диске',
+        'settings.backup_last': 'Последний бекап',
+        'settings.backup_never': 'Не создавался',
+        'settings.backup_button': 'Сделать бекап',
+        'settings.backup_in_progress': 'Создание...',
+        'settings.backup_success': 'Бекап создан!',
+        'settings.backup_error': 'Ошибка бекапа',
 
         // Generic strings
         'generic.yes': 'Да',

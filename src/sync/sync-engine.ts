@@ -451,7 +451,6 @@ export class SyncEngine {
 			folders.forEach((folder: string) => {
 				folderPaths.push(folder);
 			});
-			// eslint-disable-next-line @typescript-eslint/no-unsafe-call
 			await this.yandexClient.ensureFoldersExist(folderPaths);
 		}
 	}
@@ -486,7 +485,6 @@ export class SyncEngine {
 			}
 		});
 
-		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 		const concurrency: number =
 			typeof this.settings.maxConcurrency === "number"
 				? this.settings.maxConcurrency

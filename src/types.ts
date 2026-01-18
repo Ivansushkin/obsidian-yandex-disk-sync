@@ -29,6 +29,8 @@ export interface YandexDiskSyncSettings {
 	debounceDelay: number;
 	/** Maximum number of concurrent operations during sync */
 	maxConcurrency: number;
+	/** Last backup creation time (timestamp) */
+	lastBackupTime: number | null;
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
@@ -43,6 +45,7 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	deviceId: "",
 	debounceDelay: 2000,
 	maxConcurrency: 5,
+	lastBackupTime: null,
 };
 
 // ============================================================================
@@ -54,6 +57,8 @@ export interface SyncIndex {
 	version: number;
 	/** Last synchronization time (timestamp) */
 	lastSyncTime: number;
+	/** Last backup creation time (timestamp) */
+	lastBackupTime?: number;
 	/** Device ID that created the index */
 	deviceId: string;
 	/** File map: path -> metadata */
@@ -79,7 +84,7 @@ export interface FileMetadata {
 	lastModifiedBy?: string;
 }
 
-export const CURRENT_INDEX_VERSION = 1;
+export const CURRENT_INDEX_VERSION = 2;
 
 export function createEmptyIndex(deviceId: string): SyncIndex {
 	return {

@@ -2,6 +2,9 @@
  * Path utilities
  */
 
+/** System-protected paths that should never be synchronized */
+const PROTECTED_PATHS = ['.backup'];
+
 /**
  * Path normalization (remove leading/trailing slashes, replace backslashes)
  */
@@ -86,6 +89,17 @@ export function isHiddenPath(path: string, configDir?: string): boolean {
 }
 
 /**
+ * Check if path is protected from synchronization
+ */
+export function isProtectedPath(path: string): boolean {
+	const normalized = normalizePath(path);
+	const parts = normalized.split("/");
+
+	// Check if any part of the path matches protected paths
+	return parts.some((part) => PROTECTED_PATHS.includes(part));
+}
+
+/**
  * Simple pattern matching (supports * and **)
  */
 export function matchPattern(path: string, pattern: string): boolean {
@@ -121,6 +135,11 @@ export function shouldSyncFile(
 	configDir?: string
 ): boolean {
 	const normalized = normalizePath(path);
+
+	// Check if path is protected (never sync)
+	if (isProtectedPath(normalized)) {
+		return false;
+	}
 
 	// Check config directory
 	if (configDir && normalized.startsWith(configDir)) {

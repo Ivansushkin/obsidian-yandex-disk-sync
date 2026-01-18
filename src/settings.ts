@@ -45,6 +45,26 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 							window.open(authUrl, "_blank");
 						}
 					})
+			)
+			.addButton((button) =>
+				button.setButtonText(t("settings.test_button")).onClick(async () => {
+					button.setDisabled(true);
+					button.setButtonText(t("settings.testing_button"));
+					try {
+						const result = await this.plugin.testConnection();
+						if (result.success) {
+							button.setButtonText(t("settings.success_button"));
+						} else {
+							button.setButtonText(t("settings.error_button"));
+						}
+					} catch {
+						button.setButtonText(t("settings.error_button"));
+					}
+					setTimeout(() => {
+						button.setDisabled(false);
+						button.setButtonText(t("settings.test_button"));
+					}, 2000);
+				})
 			);
 
 		// Create custom description with multiline text
@@ -57,6 +77,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_2") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_3") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_4") });
+		instructionDiv.createDiv({ text: t("settings.oauth_instruction_5") });
+		instructionDiv.createDiv({ text: t("settings.oauth_instruction_6") });
 
 		// Client ID
 		new Setting(containerEl)
@@ -228,28 +250,45 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				text.setValue(this.plugin.settings.deviceId).setDisabled(true)
 			);
 
-		// Test connection button
+		// Backup section
 		new Setting(containerEl)
-			.setName(t("settings.test_connection"))
-			.setDesc(t("settings.test_connection_desc"))
+			.setName(t("settings.backup_section"))
+			.setDesc(t("settings.backup_desc"))
+			.setHeading();
+
+		// Combined backup status and button
+		const lastBackupTime = this.plugin.getLastBackupTime();
+		const lastBackupText = lastBackupTime
+			? new Date(lastBackupTime).toLocaleString()
+			: t("settings.backup_never");
+
+		new Setting(containerEl)
+			.setName(lastBackupText)
 			.addButton((button) =>
-				button.setButtonText(t("settings.test_button")).onClick(async () => {
+				button.setButtonText(t("settings.backup_button")).onClick(async () => {
 					button.setDisabled(true);
-					button.setButtonText(t("settings.testing_button"));
+					button.setButtonText(t("settings.backup_in_progress"));
+
 					try {
-						const result = await this.plugin.testConnection();
+						const result = await this.plugin.createBackup();
+
 						if (result.success) {
-							button.setButtonText(t("settings.success_button"));
+							button.setButtonText(t("settings.backup_success"));
+							// Update last backup time display
+							this.display();
 						} else {
-							button.setButtonText(t("settings.error_button"));
+							button.setButtonText(t("settings.backup_error"));
 						}
-					} catch {
-						button.setButtonText(t("settings.error_button"));
+					} catch (error) {
+						button.setButtonText(t("settings.backup_error"));
+						console.error("Backup failed:", error);
 					}
+
+					// Re-enable button after delay
 					setTimeout(() => {
 						button.setDisabled(false);
-						button.setButtonText(t("settings.test_button"));
-					}, 2000);
+						button.setButtonText(t("settings.backup_button"));
+					}, 3000);
 				})
 			);
 	}
