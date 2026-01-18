@@ -15,9 +15,10 @@ import { YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import { IndexManager } from "./index-manager";
 import { ConflictResolver } from "./conflict-resolver";
-import { joinPath } from "../utils/path-utils";
+import { joinPath, getDirectory } from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
 import { logger } from "../utils/logger";
+import { runWithConcurrencySettled } from "../utils/semaphore";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -213,50 +214,139 @@ export class SyncEngine {
 				`Determined ${operations.length} synchronization operations`
 			);
 
-			// 6. Execute operations
+			// 6. Preflight: Create all necessary folders
+			this.updateState({ currentOperation: "Creating folders..." });
+			await this.ensureFoldersExist(operations);
+
+			// 7. Execute operations in parallel by type
 			const totalOps = operations.length;
 			let processedOps = 0;
-			for (const op of operations) {
-				if (this.isPaused) {
-					result.success = false;
-					result.errors.push({
-						path: "",
-						operation: "none",
-						message: "Synchronization interrupted",
-					});
-					break;
-				}
 
-				processedOps++;
-				const progress = Math.round((processedOps / totalOps) * 100);
+			// Group operations by type
+			const uploads = operations.filter((op) => op.action === "upload");
+			const downloads = operations.filter(
+				(op) => op.action === "download"
+			);
+			const deletes = operations.filter(
+				(op) =>
+					op.action === "delete_remote" || op.action === "delete_local"
+			);
+			const conflicts = operations.filter(
+				(op) => op.action === "conflict"
+			);
+
+			// Execute uploads in parallel
+			if (uploads.length > 0) {
+				this.updateState({ currentOperation: "Uploading files..." });
+				const uploadResults = await this.executeOperationsParallel(
+					uploads,
+					result,
+					(completed) => {
+						processedOps = completed;
+						const progress = Math.round(
+							(processedOps / totalOps) * 100
+						);
+						this.updateState({
+							progress,
+							pendingCount: totalOps - processedOps,
+						});
+					}
+				);
+				result.uploaded = uploadResults.succeeded;
+				result.errors.push(...uploadResults.errors);
+			}
+
+			// Execute downloads in parallel
+			if (downloads.length > 0) {
+				this.updateState({ currentOperation: "Downloading files..." });
+				const downloadResults = await this.executeOperationsParallel(
+					downloads,
+					result,
+					(completed) => {
+						processedOps = uploads.length + completed;
+						const progress = Math.round(
+							(processedOps / totalOps) * 100
+						);
+						this.updateState({
+							progress,
+							pendingCount: totalOps - processedOps,
+						});
+					}
+				);
+				result.downloaded = downloadResults.succeeded;
+				result.errors.push(...downloadResults.errors);
+			}
+
+			// Execute deletes in parallel
+			if (deletes.length > 0) {
+				this.updateState({ currentOperation: "Deleting files..." });
+				const deleteResults = await this.executeOperationsParallel(
+					deletes,
+					result,
+					(completed) => {
+						processedOps =
+							uploads.length + downloads.length + completed;
+						const progress = Math.round(
+							(processedOps / totalOps) * 100
+						);
+						this.updateState({
+							progress,
+							pendingCount: totalOps - processedOps,
+						});
+					}
+				);
+				result.deleted = deleteResults.succeeded;
+				result.errors.push(...deleteResults.errors);
+			}
+
+			// Execute conflicts sequentially (require special handling)
+			if (conflicts.length > 0) {
 				this.updateState({
-					currentOperation: `${op.action}: ${op.path}`,
-					progress,
-					pendingCount: totalOps - processedOps,
+					currentOperation: "Resolving conflicts...",
 				});
+				for (const op of conflicts) {
+					if (this.isPaused) {
+						result.success = false;
+						result.errors.push({
+							path: "",
+							operation: "none",
+							message: "Synchronization interrupted",
+						});
+						break;
+					}
 
-				try {
-					await this.executeOperation(op, result);
-				} catch (e) {
-					const error: SyncError = {
-						path: op.path,
-						operation: op.action,
-						message: (e as Error).message,
-					};
-					result.errors.push(error);
-					logger.error(
-						`Error executing ${op.action} operation for ${op.path}:`,
-						e
-					);
+					processedOps++;
+					const progress = Math.round((processedOps / totalOps) * 100);
+					this.updateState({
+						currentOperation: `Conflict: ${op.path}`,
+						progress,
+						pendingCount: totalOps - processedOps,
+					});
+
+					try {
+						await this.handleConflict(op);
+						result.conflicts++;
+					} catch (e) {
+						const error: SyncError = {
+							path: op.path,
+							operation: op.action,
+							message: (e as Error).message,
+						};
+						result.errors.push(error);
+						logger.error(
+							`Error resolving conflict for ${op.path}:`,
+							e
+						);
+					}
 				}
 			}
 
-			// 7. Save indexes
+			// 8. Save indexes
 			this.updateState({ currentOperation: "Saving indexes..." });
 			this.indexManager.updateSyncTime();
 			await this.indexManager.saveRemoteIndex();
 
-			// 8. Cleanup old deleted records
+			// 9. Cleanup old deleted records
 			this.indexManager.cleanupDeletedFiles();
 
 			result.success = result.errors.length === 0;
@@ -338,15 +428,118 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Ensure all necessary folders exist before operations
+	 */
+	private async ensureFoldersExist(
+		operations: SyncOperation[]
+	): Promise<void> {
+		const folders = new Set<string>();
+
+		for (const op of operations) {
+			if (op.action === "upload" || op.action === "download") {
+				const remotePath = joinPath(this.settings.remotePath, op.path);
+				const dir = getDirectory(remotePath);
+				if (dir) {
+					folders.add(dir);
+				}
+			}
+		}
+
+		if (folders.size > 0) {
+			logger.info(`Ensuring ${folders.size} folders exist...`);
+			const folderPaths: string[] = [];
+			folders.forEach((folder: string) => {
+				folderPaths.push(folder);
+			});
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+			await this.yandexClient.ensureFoldersExist(folderPaths);
+		}
+	}
+
+	/**
+	 * Execute operations in parallel with concurrency control
+	 */
+	private async executeOperationsParallel(
+		operations: SyncOperation[],
+		result: SyncResult,
+		onProgress?: (completed: number) => void
+	): Promise<{ succeeded: number; errors: SyncError[] }> {
+		const tasks = operations.map((op) => async () => {
+			if (this.isPaused) {
+				throw new Error("Synchronization interrupted");
+			}
+
+			switch (op.action) {
+				case "upload":
+					// Skip folder check since we pre-created all folders
+					await this.uploadFile(op.path, true);
+					break;
+				case "download":
+					await this.downloadFile(op.path);
+					break;
+				case "delete_remote":
+					await this.deleteRemoteFile(op.path);
+					break;
+				case "delete_local":
+					await this.deleteLocalFile(op.path);
+					break;
+			}
+		});
+
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+		const concurrency: number =
+			typeof this.settings.maxConcurrency === "number"
+				? this.settings.maxConcurrency
+				: 5;
+		const results = await runWithConcurrencySettled(
+			tasks,
+			concurrency,
+			onProgress
+		);
+
+		const errors: SyncError[] = [];
+		let succeeded = 0;
+
+		for (let i = 0; i < results.length; i++) {
+			const res = results[i];
+			const op = operations[i];
+			
+			if (!res || !op) {
+				continue;
+			}
+
+			if (res.status === "rejected") {
+				const errorMessage =
+					res.reason instanceof Error
+						? res.reason.message
+						: String(res.reason);
+				errors.push({
+					path: op.path,
+					operation: op.action,
+					message: errorMessage,
+				});
+				logger.error(
+					`Error executing ${op.action} operation for ${op.path}:`,
+					res.reason
+				);
+			} else {
+				succeeded++;
+			}
+		}
+
+		return { succeeded, errors };
+	}
+
+	/**
 	 * Upload file to Yandex Disk
 	 */
-	async uploadFile(path: string): Promise<void> {
+	async uploadFile(path: string, skipFolderCheck = false): Promise<void> {
 		logger.debug(`Uploading file: ${path}`);
 
 		const content = await this.vaultAdapter.readFile(path);
 		const remotePath = joinPath(this.settings.remotePath, path);
 
-		await this.yandexClient.uploadFile(remotePath, content);
+		await this.yandexClient.uploadFile(remotePath, content, skipFolderCheck);
 
 		// Update indexes
 		const sha256 = await computeSha256(content);

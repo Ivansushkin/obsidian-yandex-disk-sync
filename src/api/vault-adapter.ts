@@ -11,6 +11,7 @@ import {
 	getDirectory,
 } from "../utils/path-utils";
 import { logger } from "../utils/logger";
+import { runWithConcurrency } from "../utils/semaphore";
 
 export class VaultAdapter {
 	private app: App;
@@ -282,23 +283,38 @@ export class VaultAdapter {
 		const files = await this.getAllSyncableFiles();
 		const metadata = new Map<string, FileMetadata>();
 
-		for (const file of files) {
+		// Process files in parallel with concurrency limit
+		const tasks = files.map((file) => async () => {
 			try {
 				const content = await this.vault.readBinary(file);
 				const sha256 = await computeSha256(content);
 
-				metadata.set(file.path, {
+				return {
 					path: file.path,
-					sha256,
-					size: file.stat.size,
-					mtime: file.stat.mtime,
-					syncedAt: 0,
-				});
+					metadata: {
+						path: file.path,
+						sha256,
+						size: file.stat.size,
+						mtime: file.stat.mtime,
+						syncedAt: 0,
+					},
+				};
 			} catch (e) {
 				logger.warn(
 					`Failed to get file metadata: ${file.path}`,
 					e
 				);
+				return null;
+			}
+		});
+
+		// Use higher concurrency for CPU-bound operations
+		const results = await runWithConcurrency(tasks, 10);
+
+		// Collect results into map
+		for (const result of results) {
+			if (result) {
+				metadata.set(result.path, result.metadata);
 			}
 		}
 

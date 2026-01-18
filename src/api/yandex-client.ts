@@ -24,6 +24,7 @@ export class YandexDiskClient {
 	private token: string;
 	private maxRetries: number;
 	private retryDelay: number;
+	private folderCache: Set<string> = new Set();
 
 	constructor(config: YandexClientConfig) {
 		this.token = config.token;
@@ -36,6 +37,13 @@ export class YandexDiskClient {
 	 */
 	setToken(token: string): void {
 		this.token = token;
+	}
+
+	/**
+	 * Clear folder cache
+	 */
+	clearFolderCache(): void {
+		this.folderCache.clear();
 	}
 
 	/**
@@ -128,13 +136,21 @@ export class YandexDiskClient {
 	 * Create folder
 	 */
 	async createFolder(path: string): Promise<void> {
+		// Check cache first
+		if (this.folderCache.has(path)) {
+			return;
+		}
+
 		const encodedPath = encodePathForUrl(path);
 		try {
 			await this.request("PUT", `/resources?path=${encodedPath}`);
+			this.folderCache.add(path);
 			logger.debug(`Created folder: ${path}`);
 		} catch (e: unknown) {
 			// Ignore error if folder already exists
-			if (!this.isConflictError(e)) {
+			if (this.isConflictError(e)) {
+				this.folderCache.add(path);
+			} else {
 				throw e;
 			}
 		}
@@ -150,6 +166,38 @@ export class YandexDiskClient {
 		for (const part of parts) {
 			currentPath = currentPath ? `${currentPath}/${part}` : part;
 			await this.createFolder(currentPath);
+		}
+	}
+
+	/**
+	 * Ensure multiple folders exist (optimized batch creation)
+	 */
+	async ensureFoldersExist(paths: string[]): Promise<void> {
+		// Collect all unique folder paths including parent folders
+		const allFolders = new Set<string>();
+		
+		for (const path of paths) {
+			const parts = path.split("/").filter(Boolean);
+			let currentPath = "";
+			
+			for (const part of parts) {
+				currentPath = currentPath ? `${currentPath}/${part}` : part;
+				if (!this.folderCache.has(currentPath)) {
+					allFolders.add(currentPath);
+				}
+			}
+		}
+
+		// Sort by depth to create parent folders first
+		const sortedFolders = Array.from(allFolders).sort((a, b) => {
+			const depthA = a.split("/").length;
+			const depthB = b.split("/").length;
+			return depthA - depthB;
+		});
+
+		// Create folders sequentially by level
+		for (const folder of sortedFolders) {
+			await this.createFolder(folder);
 		}
 	}
 
@@ -173,12 +221,18 @@ export class YandexDiskClient {
 	 */
 	async uploadFile(
 		remotePath: string,
-		content: ArrayBuffer | string
+		content: ArrayBuffer | string,
+		skipFolderCheck = false
 	): Promise<void> {
-		// Ensure parent folder exists
-		const parentPath = remotePath.substring(0, remotePath.lastIndexOf("/"));
-		if (parentPath) {
-			await this.createFolderRecursive(parentPath);
+		// Ensure parent folder exists (if not skipped)
+		if (!skipFolderCheck) {
+			const parentPath = remotePath.substring(
+				0,
+				remotePath.lastIndexOf("/")
+			);
+			if (parentPath) {
+				await this.createFolderRecursive(parentPath);
+			}
 		}
 
 		// Get upload link

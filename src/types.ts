@@ -27,6 +27,8 @@ export interface YandexDiskSyncSettings {
 	deviceId: string;
 	/** Debounce delay for real-time sync in ms */
 	debounceDelay: number;
+	/** Maximum number of concurrent operations during sync */
+	maxConcurrency: number;
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
@@ -40,6 +42,7 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	syncDotObsidian: false,
 	deviceId: "",
 	debounceDelay: 2000,
+	maxConcurrency: 5,
 };
 
 // ============================================================================

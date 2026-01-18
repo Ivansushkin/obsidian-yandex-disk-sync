@@ -148,6 +148,21 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
+		// Max concurrency
+		new Setting(containerEl)
+			.setName(t("settings.max_concurrency"))
+			.setDesc(t("settings.max_concurrency_desc"))
+			.addSlider((slider) =>
+				slider
+					.setLimits(1, 20, 1)
+					.setValue(this.plugin.settings.maxConcurrency)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.maxConcurrency = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
 		// File filters section
 		new Setting(containerEl).setName(t("settings.file_filters_section")).setHeading();
 
