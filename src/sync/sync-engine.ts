@@ -36,6 +36,9 @@ export class SyncEngine {
 	private isSyncing = false;
 	private isPaused = false;
 
+	private syncPauseCallbacks: Array<() => void> = [];
+	private syncResumeCallbacks: Array<() => void> = [];
+
 	constructor(
 		yandexClient: YandexDiskClient,
 		vaultAdapter: VaultAdapter,
@@ -54,6 +57,32 @@ export class SyncEngine {
 	 */
 	setIndexSaveCallback(callback: IndexSaveCallback): void {
 		this.indexSaveCallback = callback;
+	}
+
+	/**
+	 * Register callback to be called when full sync starts
+	 */
+	onSyncPause(callback: () => void): () => void {
+		this.syncPauseCallbacks.push(callback);
+		return () => {
+			const index = this.syncPauseCallbacks.indexOf(callback);
+			if (index >= 0) {
+				this.syncPauseCallbacks.splice(index, 1);
+			}
+		};
+	}
+
+	/**
+	 * Register callback to be called when full sync ends
+	 */
+	onSyncResume(callback: () => void): () => void {
+		this.syncResumeCallbacks.push(callback);
+		return () => {
+			const index = this.syncResumeCallbacks.indexOf(callback);
+			if (index >= 0) {
+				this.syncResumeCallbacks.splice(index, 1);
+			}
+		};
 	}
 
 	/**
@@ -151,6 +180,16 @@ export class SyncEngine {
 		}
 
 		this.isSyncing = true;
+
+		// Notify listeners that sync has started
+		for (const callback of this.syncPauseCallbacks) {
+			try {
+				callback();
+			} catch (e) {
+				logger.error("Error in sync pause callback:", e);
+			}
+		}
+
 		const startTime = Date.now();
 
 		const result: SyncResult = {
@@ -207,7 +246,8 @@ export class SyncEngine {
 				localFiles,
 				remoteFiles,
 				localIndex.files,
-				remoteIndex.files
+				remoteIndex.files,
+				startTime
 			);
 
 			logger.info(
@@ -388,6 +428,15 @@ export class SyncEngine {
 			logger.error("Critical synchronization error:", e);
 			return result;
 		} finally {
+			// Notify listeners that sync has ended
+			for (const callback of this.syncResumeCallbacks) {
+				try {
+					callback();
+				} catch (e) {
+					logger.error("Error in sync resume callback:", e);
+				}
+			}
+
 			this.isSyncing = false;
 		}
 	}

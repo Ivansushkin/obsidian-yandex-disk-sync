@@ -16,6 +16,7 @@ export class FileWatcher {
 	private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 	private isEnabled = false;
 	private isLayoutReady = false;
+	private isPausedForSync = false;
 
 	constructor(
 		app: App,
@@ -39,6 +40,38 @@ export class FileWatcher {
 		} else if (!this.isEnabled && settings.enableRealtimeSync) {
 			this.start();
 		}
+	}
+
+	/**
+	 * Pause file watching during full synchronization
+	 */
+	pauseForSync(): void {
+		if (!this.isEnabled) {
+			return;
+		}
+
+		this.isPausedForSync = true;
+		logger.info("[FileWatcher] Paused for full sync");
+
+		// Cancel all pending sync operations
+		// Since fullSync will handle these files anyway
+		for (const [path, timer] of this.debounceTimers.entries()) {
+			clearTimeout(timer);
+			logger.debug(`[FileWatcher] Cancelled pending sync for ${path} due to sync pause`);
+		}
+		this.debounceTimers.clear();
+	}
+
+	/**
+	 * Resume file watching after full synchronization
+	 */
+	resumeAfterSync(): void {
+		if (!this.isEnabled) {
+			return;
+		}
+
+		this.isPausedForSync = false;
+		logger.info("[FileWatcher] Resumed after full sync");
 	}
 
 	/**
@@ -143,6 +176,11 @@ export class FileWatcher {
 	 * Handle file creation
 	 */
 	private handleFileCreate(file: TFile): void {
+		if (this.isPausedForSync) {
+			logger.debug(`[FileWatcher] Ignoring file creation during sync pause: ${file.path}`);
+			return;
+		}
+
 		logger.debug(`File created: ${file.path}`);
 		this.scheduleSync(file.path, "upload");
 	}
@@ -151,6 +189,11 @@ export class FileWatcher {
 	 * Handle file modification
 	 */
 	private handleFileModify(file: TFile): void {
+		if (this.isPausedForSync) {
+			logger.debug(`[FileWatcher] Ignoring file modification during sync pause: ${file.path}`);
+			return;
+		}
+
 		logger.debug(`File modified: ${file.path}`);
 		this.scheduleSync(file.path, "upload");
 	}
@@ -159,6 +202,11 @@ export class FileWatcher {
 	 * Handle file deletion
 	 */
 	private handleFileDelete(file: TFile): void {
+		if (this.isPausedForSync) {
+			logger.debug(`[FileWatcher] Ignoring file deletion during sync pause: ${file.path}`);
+			return;
+		}
+
 		logger.info(`[FileWatcher] File deleted: ${file.path}`);
 		// Cancel pending upload if exists
 		this.cancelPendingSync(file.path);
@@ -173,6 +221,11 @@ export class FileWatcher {
 	 * Handle file rename
 	 */
 	private handleFileRename(file: TFile, oldPath: string): void {
+		if (this.isPausedForSync) {
+			logger.debug(`[FileWatcher] Ignoring file rename during sync pause: ${oldPath} -> ${file.path}`);
+			return;
+		}
+
 		logger.debug(`File renamed: ${oldPath} -> ${file.path}`);
 		// Cancel pending sync for old path
 		this.cancelPendingSync(oldPath);

@@ -295,6 +295,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			logger.warn("Could not load remote index for backup time:", e);
 		}
 
+		// Subscribe to sync engine events to pause/resume file watcher
+		this.syncEngine.onSyncPause(() => {
+			this.fileWatcher.pauseForSync();
+		});
+		this.syncEngine.onSyncResume(() => {
+			this.fileWatcher.resumeAfterSync();
+		});
+
 		// Check if initial setup is needed
 		const needsInitialSync = await this.needsInitialSync();
 		if (needsInitialSync) {
@@ -505,6 +513,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Run initial sync immediately to check for changes
 		logger.info("[Main] Running initial sync check");
+		// FileWatcher will be automatically paused by sync engine callbacks
 		void this.runFullSync();
 	}
 

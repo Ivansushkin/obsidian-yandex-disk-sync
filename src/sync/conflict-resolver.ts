@@ -22,7 +22,8 @@ export class ConflictResolver {
 		localMeta: FileMetadata | null,
 		remoteMeta: FileMetadata | null,
 		localIndexMeta: FileMetadata | null,
-		remoteIndexMeta: FileMetadata | null
+		remoteIndexMeta: FileMetadata | null,
+		syncStartTime?: number
 	): SyncOperation {
 		// Case 1: File only local (not on disk and not in remote index)
 		if (localMeta && !remoteMeta && !remoteIndexMeta) {
@@ -75,7 +76,7 @@ export class ConflictResolver {
 
 		// Case 6: Both files exist - compare them
 		if (localMeta && remoteMeta) {
-			return this.compareFiles(path, localMeta, remoteMeta);
+			return this.compareFiles(path, localMeta, remoteMeta, syncStartTime);
 		}
 
 		// Case 7: File exists only locally, but was in remote index (deleted on disk)
@@ -129,7 +130,8 @@ export class ConflictResolver {
 	private compareFiles(
 		path: string,
 		localMeta: FileMetadata,
-		remoteMeta: FileMetadata
+		remoteMeta: FileMetadata,
+		syncStartTime?: number
 	): SyncOperation {
 		// Hashes match - files are identical
 		if (localMeta.sha256 === remoteMeta.sha256) {
@@ -144,35 +146,91 @@ export class ConflictResolver {
 
 		// Hashes differ - determine direction by modification time
 		const timeDiff = localMeta.mtime - remoteMeta.mtime;
+		const currentTime = Date.now();
 
-		// 1 second tolerance for time inaccuracy
-		const TIME_TOLERANCE = 1000;
+		// Time tolerances
+		const TIME_TOLERANCE = 1000;           // Original tolerance for exact matches
+		const EXTENDED_TIME_TOLERANCE = 5000;  // Extended tolerance before creating conflicts
+		const FRESH_FILE_THRESHOLD = 5000;     // Files modified within this time are considered fresh
 
-		if (timeDiff > TIME_TOLERANCE) {
-			// Local file is newer
-			return {
-				action: "upload",
-				path,
-				reason: "Local file is newer",
-				localMeta,
-				remoteMeta,
-			};
-		} else if (timeDiff < -TIME_TOLERANCE) {
-			// Remote file is newer
-			return {
-				action: "download",
-				path,
-				reason: "Remote file is newer",
-				localMeta,
-				remoteMeta,
-			};
-		} else {
-			// Times are approximately equal, but hashes differ - conflict
+		// Check if time difference is significant enough to determine winner
+		if (Math.abs(timeDiff) > EXTENDED_TIME_TOLERANCE) {
+			// Large time difference - use standard logic
+			if (timeDiff > 0) {
+				// Local file is significantly newer
+				return {
+					action: "upload",
+					path,
+					reason: "Local file is significantly newer",
+					localMeta,
+					remoteMeta,
+				};
+			} else {
+				// Remote file is significantly newer
+				return {
+					action: "download",
+					path,
+					reason: "Remote file is significantly newer",
+					localMeta,
+					remoteMeta,
+				};
+			}
+		}
+
+		// Small time difference - check if file is "fresh" (actively being edited)
+		const localFileAge = currentTime - localMeta.mtime;
+		const remoteFileAge = currentTime - remoteMeta.mtime;
+		const isLocalFresh = localFileAge < FRESH_FILE_THRESHOLD;
+		const isRemoteFresh = remoteFileAge < FRESH_FILE_THRESHOLD;
+
+		if (isLocalFresh || isRemoteFresh) {
+			// At least one file is fresh - give priority to the newer one
+			if (timeDiff > 0) {
+				return {
+					action: "upload",
+					path,
+					reason: "Fresh local file is newer",
+					localMeta,
+					remoteMeta,
+				};
+			} else {
+				return {
+					action: "download",
+					path,
+					reason: "Fresh remote file is newer",
+					localMeta,
+					remoteMeta,
+				};
+			}
+		}
+
+		// Files are not fresh and time difference is small - check for very close times
+		if (Math.abs(timeDiff) <= TIME_TOLERANCE) {
+			// Times are very close but content differs - create conflict
 			logger.warn(`Conflict for file: ${path}`);
 			return {
 				action: "conflict",
 				path,
-				reason: "Same modification time but different content",
+				reason: "Very similar modification times but different content",
+				localMeta,
+				remoteMeta,
+			};
+		}
+
+		// Small difference but not fresh - still determine winner based on time
+		if (timeDiff > 0) {
+			return {
+				action: "upload",
+				path,
+				reason: "Local file is slightly newer",
+				localMeta,
+				remoteMeta,
+			};
+		} else {
+			return {
+				action: "download",
+				path,
+				reason: "Remote file is slightly newer",
 				localMeta,
 				remoteMeta,
 			};
@@ -234,7 +292,8 @@ export class ConflictResolver {
 		localFiles: Map<string, FileMetadata>,
 		remoteFiles: Map<string, FileMetadata>,
 		localIndex: Record<string, FileMetadata>,
-		remoteIndex: Record<string, FileMetadata>
+		remoteIndex: Record<string, FileMetadata>,
+		syncStartTime?: number
 	): SyncOperation[] {
 		const allPaths = this.collectAllPaths(
 			localFiles,
@@ -256,7 +315,8 @@ export class ConflictResolver {
 				localMeta,
 				remoteMeta,
 				localIndexMeta,
-				remoteIndexMeta
+				remoteIndexMeta,
+				syncStartTime
 			);
 
 			if (operation.action !== "none") {
