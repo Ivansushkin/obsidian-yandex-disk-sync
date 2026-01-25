@@ -3,7 +3,7 @@
 	"name": "Yandex Disk Sync",
 	"version": "1.0.0",
 	"minAppVersion": "0.15.0",
-	"description": "Syncing Obsidian files with Yandex.Disk",
+	"description": "Syncing files with Yandex Disk.",
 	"author": "Ivansushkin",
 	"isDesktopOnly": false
 }
