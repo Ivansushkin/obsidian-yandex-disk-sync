@@ -14,8 +14,7 @@ const prod = process.argv[2] === "production";
 
 // Пути для сборки
 const BUILD_DIR = "./build";
-const TEST_VAULT_PLUGIN_DIR =
-	"/Users/swnet/Desktop/obsidian-work/.obsidian/plugins/obsidian-yandex-disk-sync";
+const TEST_VAULT_PLUGIN_DIR = process.env.YANDEX_PLUGIN_PATH; // Для локальной отладки
 
 // Файлы для копирования
 const FILES_TO_COPY = ["manifest.json", "styles.css"];
@@ -28,15 +27,17 @@ function copyFiles(sourceDir, destDir) {
 	if (!fs.existsSync(BUILD_DIR)) {
 		fs.mkdirSync(BUILD_DIR, { recursive: true });
 	}
-	if (!fs.existsSync(destDir)) {
+	if (destDir && !fs.existsSync(destDir)) {
 		fs.mkdirSync(destDir, { recursive: true });
 	}
 
 	// Копируем main.js
 	const mainJsSource = path.join(BUILD_DIR, "main.js");
 	if (fs.existsSync(mainJsSource)) {
-		fs.copyFileSync(mainJsSource, path.join(destDir, "main.js"));
-		console.log(`Copied main.js to ${destDir}`);
+		if (destDir) {
+			fs.copyFileSync(mainJsSource, path.join(destDir, "main.js"));
+			console.log(`Copied main.js to ${destDir}`);
+		}
 	}
 
 	// Копируем остальные файлы
@@ -45,9 +46,12 @@ function copyFiles(sourceDir, destDir) {
 		if (fs.existsSync(sourcePath)) {
 			// Копируем в build директорию
 			fs.copyFileSync(sourcePath, path.join(BUILD_DIR, file));
-			// Копируем в тестовый vault
-			fs.copyFileSync(sourcePath, path.join(destDir, file));
-			console.log(`Copied ${file} to ${BUILD_DIR} and ${destDir}`);
+			console.log(`Copied ${file} to ${BUILD_DIR}`);
+			// Копируем в тестовый vault если указан
+			if (destDir) {
+				fs.copyFileSync(sourcePath, path.join(destDir, file));
+				console.log(`Copied ${file} to ${destDir}`);
+			}
 		}
 	}
 }

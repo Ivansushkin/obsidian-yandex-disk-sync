@@ -8,7 +8,6 @@ import {
 	YandexDiskSyncSettings,
 	DEFAULT_SETTINGS,
 	SyncIndex,
-	InitMode,
 } from "./types";
 import { YandexDiskSyncSettingTab } from "./settings";
 import { YandexDiskClient } from "./api/yandex-client";
@@ -18,7 +17,7 @@ import { SyncEngine } from "./sync/sync-engine";
 import { FileWatcher } from "./sync/file-watcher";
 import { SyncScheduler } from "./sync/sync-scheduler";
 import { SyncStatusBar } from "./ui/status-bar";
-import { InitSyncModal, SyncStatusModal, ConfirmModal } from "./ui/init-modal";
+import { SyncStatusModal, ConfirmModal } from "./ui/init-modal";
 import { BackupManager } from "./backup/backup-manager";
 import { generateDeviceId } from "./utils/path-utils";
 import { logger } from "./utils/logger";
@@ -239,34 +238,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				}).open();
 			},
 		});
-
-		// Force download all
-		this.addCommand({
-			id: "force-download",
-			name: t("command.force_download"),
-			callback: async () => {
-				const confirmed = await this.confirmAction(
-					t("notice.force_action_confirm", { type: t("generic.local") + " " + t("generic.files") })
-				);
-				if (confirmed) {
-					await this.runInitialSync("download");
-				}
-			},
-		});
-
-		// Force upload all
-		this.addCommand({
-			id: "force-upload",
-			name: t("command.force_upload"),
-			callback: async () => {
-				const confirmed = await this.confirmAction(
-					t("notice.force_action_confirm", { type: t("generic.remote") + " " + t("generic.files") })
-				);
-				if (confirmed) {
-					await this.runInitialSync("upload");
-				}
-			},
-		});
 	}
 
 	/**
@@ -282,20 +253,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Load saved index
 		const data = (await this.loadData()) as PluginData | null;
 		if (data?.localIndex) {
-			this.indexManager.loadLocalIndexFromData(data.localIndex);
-		}
-		if (data?.lastSyncStats) {
-			this.lastSyncStats = data.lastSyncStats;
-		}
+		this.indexManager.loadLocalIndexFromData(data.localIndex);
+	}
+	if (data?.lastSyncStats) {
+		this.lastSyncStats = data.lastSyncStats;
+	}
 
-		// Load remote index to get synchronized backup time
-		try {
-			await this.indexManager.loadRemoteIndex();
-		} catch (e) {
-			logger.warn("Could not load remote index for backup time:", e);
-		}
-
-		// Subscribe to sync engine events to pause/resume file watcher
+	// Subscribe to sync engine events to pause/resume file watcher
 		this.syncEngine.onSyncPause(() => {
 			this.fileWatcher.pauseForSync();
 		});
@@ -360,48 +324,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				return;
 			}
 
-			// Check if files exist on disk
-			const remoteExists = await this.indexManager.remotePathExists();
-			let remoteHasFiles = false;
-
-			if (remoteExists) {
-				const remoteFiles = await this.indexManager.getRemoteFiles();
-				remoteHasFiles = remoteFiles.size > 0;
-			}
-
-			// Check if local files exist
-			const localFiles = await this.vaultAdapter.getAllSyncableFiles();
-			const localHasFiles = localFiles.length > 0;
-
-			if (remoteHasFiles && localHasFiles) {
-				// Show choice dialog
-				new InitSyncModal(
-					this.app,
-					remoteHasFiles,
-					localHasFiles,
-					(mode) => {
-						if (mode) {
-							void this.runInitialSync(mode).then(() => {
-								this.startSync();
-							});
-						} else {
-							this.startSync();
-						}
-					}
-				).open();
-			} else if (remoteHasFiles) {
-				// Only remote files - download
-				new Notice(t("notice.download_started"));
-				await this.runInitialSync("download");
-				this.startSync();
-			} else {
-				// Only local files or empty - upload
-				if (localHasFiles) {
-					new Notice(t("notice.upload_started"));
-				}
-				await this.runInitialSync("upload");
-				this.startSync();
-			}
+			new Notice(t("notice.sync_started"));
+			await this.runInitialSync();
+			this.startSync();
 		} catch (e) {
 			logger.error("Error during initial setup:", e);
 			new Notice(`Initialization error: ${(e as Error).message}`);
@@ -409,9 +334,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Run initial synchronization with specific mode
+	 * Run initial synchronization with merge strategy
 	 */
-	private async runInitialSync(mode: InitMode): Promise<void> {
+	private async runInitialSync(): Promise<void> {
 		try {
 			// Create remote folder if not exists
 			const exists = await this.indexManager.remotePathExists();
@@ -419,10 +344,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				await this.indexManager.createRemotePath();
 			}
 
-			if (mode === "download" || mode === "merge") {
-				// Load remote index
-				await this.indexManager.loadRemoteIndex();
-			}
+			// Always load remote index for merge strategy
+			await this.indexManager.loadRemoteIndex();
 
 			// Run full synchronization
 			const result = await this.syncEngine.fullSync();
@@ -457,7 +380,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Run full synchronization
 	 */
-	private async runFullSync(): Promise<void> {
+	async runFullSync(): Promise<void> {
 		if (!this.settings.yandexTokenSecret) {
 			new Notice(t("notice.token_missing"));
 			return;
@@ -632,10 +555,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Get last backup time from synchronized index
+	 * Get backup manager instance
 	 */
-	getLastBackupTime(): number | null {
-		return this.indexManager ? this.indexManager.getLastBackupTime() : null;
+	getBackupManager(): BackupManager {
+		return this.backupManager;
 	}
 
 	/**

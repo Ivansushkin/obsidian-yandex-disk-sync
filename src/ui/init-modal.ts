@@ -1,103 +1,10 @@
 /**
- * Initial synchronization modal
+ * Synchronization status modal
  */
 
 import { App, Modal, Setting } from "obsidian";
-import type { InitMode } from "../types";
 import { t } from "../i18n";
 
-export class InitSyncModal extends Modal {
-	private result: InitMode | null = null;
-	private onSubmit: (mode: InitMode | null) => void;
-	private remoteHasFiles: boolean;
-	private localHasFiles: boolean;
-
-	constructor(
-		app: App,
-		remoteHasFiles: boolean,
-		localHasFiles: boolean,
-		onSubmit: (mode: InitMode | null) => void
-	) {
-		super(app);
-		this.remoteHasFiles = remoteHasFiles;
-		this.localHasFiles = localHasFiles;
-		this.onSubmit = onSubmit;
-	}
-
-	onOpen(): void {
-		const { contentEl } = this;
-
-		contentEl.createEl("h2", { text: t("modal.init_title") });
-
-		contentEl.createEl("p", {
-			text: t("modal.init_description"),
-		});
-
-		// State information
-		const infoEl = contentEl.createDiv("init-sync-info");
-		infoEl.createEl("p", {
-			text: t("modal.init_local_files", { status: t(this.localHasFiles ? "generic.exists" : "generic.none") }),
-		});
-		infoEl.createEl("p", {
-			text: t("modal.init_remote_files", { status: t(this.remoteHasFiles ? "generic.exists" : "generic.none") }),
-		});
-
-		// Options
-		new Setting(contentEl)
-			.setName(t("modal.init_download_desc"))
-			.setDesc(t("modal.init_download_desc"))
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.init_download_button"))
-					.setCta()
-					.onClick(() => {
-						this.result = "download";
-						this.close();
-					})
-			);
-
-		new Setting(contentEl)
-			.setName(t("modal.init_upload_desc"))
-			.setDesc(t("modal.init_upload_desc"))
-			.addButton((btn) =>
-				btn.setButtonText(t("modal.init_upload_button")).onClick(() => {
-					this.result = "upload";
-					this.close();
-				})
-			);
-
-		new Setting(contentEl)
-			.setName(t("modal.init_merge_desc"))
-			.setDesc(t("modal.init_merge_desc"))
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.init_merge_button"))
-					.setCta()
-					.onClick(() => {
-						this.result = "merge";
-						this.close();
-					})
-			);
-
-		// Cancel button
-		new Setting(contentEl).addButton((btn) =>
-			btn.setButtonText(t("modal.init_cancel_button")).onClick(() => {
-				this.result = null;
-				this.close();
-			})
-		);
-	}
-
-	onClose(): void {
-		const { contentEl } = this;
-		contentEl.empty();
-		this.onSubmit(this.result);
-	}
-}
-
-/**
- * Synchronization status modal
- */
 export class SyncStatusModal extends Modal {
 	private lastSyncTime: number | undefined;
 	private uploaded: number;

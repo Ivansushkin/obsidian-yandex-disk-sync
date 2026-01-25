@@ -1,9 +1,0 @@
-{
-	"id": "yandex-disk-sync",
-	"name": "Yandex Disk Sync",
-	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
-	"description": "Синхронизация файлов Obsidian с Яндекс Диском",
-	"author": "swnet",
-	"isDesktopOnly": false
-}

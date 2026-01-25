@@ -64,7 +64,6 @@ export class IndexManager {
 			this.localIndex = {
 				version: CURRENT_INDEX_VERSION,
 				lastSyncTime: data.lastSyncTime || 0,
-				lastBackupTime: typeof data.lastBackupTime === 'number' ? data.lastBackupTime : undefined,
 				deviceId: data.deviceId || this.settings.deviceId,
 				files: data.files || {},
 			};
@@ -112,15 +111,14 @@ export class IndexManager {
 			const jsonStr = decoder.decode(content);
 			const data = JSON.parse(jsonStr) as Partial<SyncIndex>;
 
-			if (data.version === CURRENT_INDEX_VERSION || data.version === 1) {
-				this.remoteIndex = {
-					version: data.version,
-					lastSyncTime: data.lastSyncTime || 0,
-					lastBackupTime: typeof data.lastBackupTime === 'number' ? data.lastBackupTime : undefined,
-					deviceId: data.deviceId || "",
-					files: data.files || {},
-				};
-			} else {
+		if (data.version === CURRENT_INDEX_VERSION || data.version === 1) {
+			this.remoteIndex = {
+				version: data.version,
+				lastSyncTime: data.lastSyncTime || 0,
+				deviceId: data.deviceId || "",
+				files: data.files || {},
+			};
+		} else {
 				logger.warn(
 					"Remote index version mismatch, resetting"
 				);
@@ -324,21 +322,6 @@ export class IndexManager {
 		);
 		const resource = await this.yandexClient.getResource(indexPath);
 		return resource !== null;
-	}
-
-	/**
-	 * Get last backup time from remote index
-	 */
-	getLastBackupTime(): number | null {
-		return this.remoteIndex.lastBackupTime ?? null;
-	}
-
-	/**
-	 * Set last backup time in remote index
-	 */
-	setLastBackupTime(timestamp: number): void {
-		this.remoteIndex.lastBackupTime = timestamp;
-		this.localIndex.lastBackupTime = timestamp;
 	}
 
 	/**

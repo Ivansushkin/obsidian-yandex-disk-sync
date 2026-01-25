@@ -29,8 +29,6 @@ export interface YandexDiskSyncSettings {
 	debounceDelay: number;
 	/** Maximum number of concurrent operations during sync */
 	maxConcurrency: number;
-	/** Last backup creation time (timestamp) */
-	lastBackupTime: number | null;
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
@@ -43,9 +41,8 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	excludePatterns: ["workspace.json", "cache"],
 	syncDotObsidian: false,
 	deviceId: "",
-	debounceDelay: 2000,
-	maxConcurrency: 5,
-	lastBackupTime: null,
+	debounceDelay: 1000,
+	maxConcurrency: 10,
 };
 
 // ============================================================================
@@ -57,8 +54,6 @@ export interface SyncIndex {
 	version: number;
 	/** Last synchronization time (timestamp) */
 	lastSyncTime: number;
-	/** Last backup creation time (timestamp) */
-	lastBackupTime?: number;
 	/** Device ID that created the index */
 	deviceId: string;
 	/** File map: path -> metadata */
@@ -246,12 +241,17 @@ export interface FileChangeEvent {
 }
 
 // ============================================================================
-// Initialization configuration
+// Backup management
 // ============================================================================
 
-export type InitMode = "download" | "upload" | "merge";
-
-export interface InitConfig {
-	mode: InitMode;
+export interface BackupInfo {
+	/** Backup filename (e.g., backup_2026-01-25_14-30-00.zip) */
+	name: string;
+	/** Date created, parsed from filename */
+	created: Date;
+	/** File size in bytes */
+	size: number;
+	/** Full path on Yandex Disk */
 	remotePath: string;
 }
+

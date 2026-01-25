@@ -83,3 +83,63 @@
 .oauth-instruction > div:last-child {
 	margin-bottom: 0;
 }
+
+/* Backup list modal */
+.backup-list-loading {
+	text-align: center;
+	color: var(--text-muted);
+	padding: 16px;
+	font-style: italic;
+}
+
+.backup-list-error {
+	color: var(--text-error);
+	padding: 12px;
+	background: var(--background-secondary);
+	border-radius: 4px;
+	margin-bottom: 12px;
+}
+
+.backup-list-empty {
+	text-align: center;
+	color: var(--text-muted);
+	padding: 16px;
+	font-style: italic;
+}
+
+.backup-list-table {
+	width: 100%;
+	border-collapse: collapse;
+	margin-top: 12px;
+}
+
+.backup-list-table thead {
+	background: var(--background-secondary);
+}
+
+.backup-list-table th {
+	padding: 8px;
+	text-align: left;
+	font-weight: 600;
+	font-size: 12px;
+	color: var(--text-normal);
+	border-bottom: 1px solid var(--divider-color);
+}
+
+.backup-list-table td {
+	padding: 8px;
+	border-bottom: 1px solid var(--divider-color);
+	font-size: 13px;
+}
+
+.backup-list-table tbody tr:hover {
+	background: var(--background-secondary);
+}
+
+.backup-download-btn {
+	padding: 4px 8px;
+	font-size: 12px;
+	height: auto;
+	min-width: 70px;
+}
+

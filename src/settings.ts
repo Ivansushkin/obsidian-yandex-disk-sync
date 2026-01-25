@@ -5,6 +5,7 @@
 import { App, PluginSettingTab, Setting, TextAreaComponent } from "obsidian";
 import type YandexDiskSyncPlugin from "./main";
 import { t } from "./i18n";
+import { BackupListModal } from "./ui/backup-list-modal";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
@@ -14,10 +15,34 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	private async getLastBackupText(): Promise<string> {
+		try {
+			const backupManager = this.plugin.getBackupManager();
+			if (!backupManager) {
+				return t("settings.backup_never");
+			}
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+			const backups = await backupManager.listBackups() as unknown;
+			if (Array.isArray(backups) && backups.length > 0) {
+				// Show the most recent backup date
+				const backup = backups[0] as {created: Date};
+				return backup.created.toLocaleString();
+			}
+		} catch {
+			// If error loading backups, just show "Never"
+		}
+		return t("settings.backup_never");
+	}
 
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+
+		void this.renderDisplay();
+	}
+
+	private async renderDisplay(): Promise<void> {
+		const { containerEl } = this;
 
 		// Connection section
 		new Setting(containerEl).setName(t("settings.connection_section")).setHeading();
@@ -47,22 +72,31 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					})
 			)
 			.addButton((button) =>
-				button.setButtonText(t("settings.test_button")).onClick(async () => {
+				button.setButtonText(t("settings.sync_button")).onClick(async () => {
 					button.setDisabled(true);
-					button.setButtonText(t("settings.testing_button"));
+					button.setButtonText(t("settings.syncing_button"));
 					try {
+						// First test connection
 						const result = await this.plugin.testConnection();
-						if (result.success) {
-							button.setButtonText(t("settings.success_button"));
-						} else {
-							button.setButtonText(t("settings.error_button"));
+						if (!result.success) {
+							// If test failed, show error and stop
+							button.setButtonText(t("settings.sync_error_button"));
+							setTimeout(() => {
+								button.setDisabled(false);
+								button.setButtonText(t("settings.sync_button"));
+							}, 2000);
+							return;
 						}
+						
+						// If test succeeded, run full sync
+						await this.plugin.runFullSync();
+						button.setButtonText(t("settings.sync_success_button"));
 					} catch {
-						button.setButtonText(t("settings.error_button"));
+						button.setButtonText(t("settings.sync_error_button"));
 					}
 					setTimeout(() => {
 						button.setDisabled(false);
-						button.setButtonText(t("settings.test_button"));
+						button.setButtonText(t("settings.sync_button"));
 					}, 2000);
 				})
 			);
@@ -73,12 +107,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		const instructionDiv = descEl.createDiv({ cls: "oauth-instruction" });
 
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_1") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_2") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_3") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_4") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_5") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_6") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_1") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_2") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_3") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_4") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_5") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_6") });
+	instructionDiv.createDiv({ text: t("settings.oauth_instruction_7") });
 
 		// Client ID
 		new Setting(containerEl)
@@ -256,40 +291,42 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.setDesc(t("settings.backup_desc"))
 			.setHeading();
 
-		// Combined backup status and button
-		const lastBackupTime = this.plugin.getLastBackupTime();
-		const lastBackupText = lastBackupTime
-			? new Date(lastBackupTime).toLocaleString()
-			: t("settings.backup_never");
+	// Combined backup status and button
+	const lastBackupText = await this.getLastBackupText();
 
-		new Setting(containerEl)
-			.setName(lastBackupText)
-			.addButton((button) =>
-				button.setButtonText(t("settings.backup_button")).onClick(async () => {
-					button.setDisabled(true);
-					button.setButtonText(t("settings.backup_in_progress"));
+	new Setting(containerEl)
+		.setName(lastBackupText)
+		.addButton((button) =>
+			button.setButtonText(t("settings.backup_button")).onClick(async () => {
+				button.setDisabled(true);
+				button.setButtonText(t("settings.backup_in_progress"));
 
-					try {
-						const result = await this.plugin.createBackup();
+				try {
+					const result = await this.plugin.createBackup();
 
-						if (result.success) {
-							button.setButtonText(t("settings.backup_success"));
-							// Update last backup time display
-							this.display();
-						} else {
-							button.setButtonText(t("settings.backup_error"));
-						}
-					} catch (error) {
+					if (result.success) {
+						button.setButtonText(t("settings.backup_success"));
+						// Update display to show new backup
+						this.display();
+					} else {
 						button.setButtonText(t("settings.backup_error"));
-						console.error("Backup failed:", error);
 					}
+				} catch (error) {
+					button.setButtonText(t("settings.backup_error"));
+					console.error("Backup failed:", error);
+				}
 
-					// Re-enable button after delay
-					setTimeout(() => {
-						button.setDisabled(false);
-						button.setButtonText(t("settings.backup_button"));
-					}, 3000);
-				})
-			);
+				// Re-enable button after delay
+				setTimeout(() => {
+					button.setDisabled(false);
+					button.setButtonText(t("settings.backup_button"));
+				}, 3000);
+			})
+		)
+		.addButton((button) =>
+			button.setButtonText(t("settings.backup_show_all")).onClick(() => {
+				new BackupListModal(this.app, this.plugin.getBackupManager()).open();
+			})
+		);
 	}
 }

@@ -10,8 +10,6 @@ export const translations: Record<Language, Record<string, string>> = {
         'command.sync_now': 'Sync with Yandex Disk now',
         'command.toggle_sync': 'Pause/Resume synchronization',
         'command.show_status': 'Show synchronization status',
-        'command.force_download': 'Download all files from Yandex Disk',
-        'command.force_upload': 'Upload all files to Yandex Disk',
 
         // Status bar
         'status.ready': 'Ready',
@@ -55,21 +53,9 @@ export const translations: Record<Language, Record<string, string>> = {
 
         // Modal titles
         'modal.confirm_title': 'Confirm action',
-        'modal.init_title': 'Initial synchronization',
         'modal.status_title': 'Synchronization status',
 
         // Modal descriptions
-        'modal.init_description': 'Files detected in both locations. Choose synchronization strategy:',
-        'modal.init_local_files': 'Local files: {status}',
-        'modal.init_remote_files': 'Yandex Disk files: {status}',
-        'modal.init_download_desc': 'Download all files from Yandex Disk. Local files with same names will be overwritten.',
-        'modal.init_upload_desc': 'Upload all local files to Yandex Disk. Remote files with same names will be overwritten.',
-        'modal.init_merge_desc': 'Perform two-way synchronization. Newer files will overwrite older ones.',
-        'modal.init_download_button': 'Download',
-        'modal.init_upload_button': 'Upload',
-        'modal.init_merge_button': 'Merge',
-        'modal.init_cancel_button': 'Cancel',
-        'modal.confirm_button': 'Confirm',
         'modal.cancel_button': 'Cancel',
         'modal.close_button': 'Close',
         'modal.status_no_sync': 'Synchronization has not been performed yet',
@@ -87,6 +73,7 @@ export const translations: Record<Language, Record<string, string>> = {
         'settings.oauth_instruction_4': '4. Paste Client ID in the input below',
         'settings.oauth_instruction_5': '5. Click \'Get token\'',
         'settings.oauth_instruction_6': '6. Copy the received token and paste it in the input below',
+        'settings.oauth_instruction_7': '7. Click \'Synchronize\'',
         'settings.manage_clients': 'Manage clients',
         'settings.get_token': 'Get token',
         'settings.client_id': 'Client ID',
@@ -121,18 +108,34 @@ export const translations: Record<Language, Record<string, string>> = {
         'settings.device_id_desc': 'Unique identifier for this device',
         'settings.test_connection': 'Test connection',
         'settings.test_connection_desc': 'Check connection to Yandex Disk',
-        'settings.test_button': 'Test',
-        'settings.testing_button': 'Testing...',
-        'settings.success_button': 'Success!',
-        'settings.error_button': 'Error',
+        'settings.sync_button': 'Synchronize',
+        'settings.syncing_button': 'Syncing...',
+        'settings.sync_success_button': 'Synced!',
+        'settings.sync_error_button': 'Error',
         'settings.backup_section': 'Backup',
         'settings.backup_desc': 'Backup will be saved as a ZIP archive in the .backup folder on disk',
         'settings.backup_last': 'Last backup',
         'settings.backup_never': 'Never',
         'settings.backup_button': 'Create backup',
+        'settings.backup_show_all': 'Show all backups',
         'settings.backup_in_progress': 'Creating...',
         'settings.backup_success': 'Backup created!',
         'settings.backup_error': 'Backup failed',
+
+        // Backup list modal
+        'backup_list.title': 'Available backups',
+        'backup_list.loading': 'Loading backups...',
+        'backup_list.no_backups': 'No backups found',
+        'backup_list.date': 'Date',
+        'backup_list.size': 'Size',
+        'backup_list.actions': 'Actions',
+        'backup_list.download': 'Download',
+
+        // Backup download notices
+        'notice.backup_download_started': 'Downloading backup...',
+        'notice.backup_download_completed': 'Backup downloaded: {name}',
+        'notice.backup_download_failed': 'Failed to download backup',
+        'notice.backup_list_load_failed': 'Failed to load backup list',
 
         // Generic strings
         'generic.yes': 'Yes',
@@ -161,8 +164,6 @@ export const translations: Record<Language, Record<string, string>> = {
         'command.sync_now': 'Синхронизировать с Яндекс Диском сейчас',
         'command.toggle_sync': 'Приостановить/возобновить синхронизацию',
         'command.show_status': 'Показать статус синхронизации',
-        'command.force_download': 'Скачать все файлы с Яндекс Диска',
-        'command.force_upload': 'Загрузить все файлы на Яндекс Диск',
 
         // Status bar
         'status.ready': 'Готов',
@@ -206,21 +207,9 @@ export const translations: Record<Language, Record<string, string>> = {
 
         // Modal titles
         'modal.confirm_title': 'Подтверждение действия',
-        'modal.init_title': 'Первичная синхронизация',
         'modal.status_title': 'Статус синхронизации',
 
         // Modal descriptions
-        'modal.init_description': 'Обнаружены файлы в обоих местах. Выберите стратегию синхронизации:',
-        'modal.init_local_files': 'Локальные файлы: {status}',
-        'modal.init_remote_files': 'Файлы на Яндекс Диске: {status}',
-        'modal.init_download_desc': 'Скачать все файлы с Яндекс Диска. Локальные файлы с такими же именами будут перезаписаны.',
-        'modal.init_upload_desc': 'Загрузить все локальные файлы на Яндекс Диск. Удалённые файлы с такими же именами будут перезаписаны.',
-        'modal.init_merge_desc': 'Выполнить двустороннюю синхронизацию. Более новые файлы перезапишут более старые.',
-        'modal.init_download_button': 'Скачать',
-        'modal.init_upload_button': 'Загрузить',
-        'modal.init_merge_button': 'Объединить',
-        'modal.init_cancel_button': 'Отмена',
-        'modal.confirm_button': 'Подтвердить',
         'modal.cancel_button': 'Отмена',
         'modal.close_button': 'Закрыть',
         'modal.status_no_sync': 'Синхронизация ещё не выполнялась',
@@ -238,6 +227,7 @@ export const translations: Record<Language, Record<string, string>> = {
         'settings.oauth_instruction_4': '4. Вставьте Client ID в инпут ниже',
         'settings.oauth_instruction_5': '5. Нажмите \'Получить токен\'',
         'settings.oauth_instruction_6': '6. Скопируйте полученный токен и вставьте его в инпут ниже',
+        'settings.oauth_instruction_7': '7. Нажмите на Синхронизировать',
         'settings.manage_clients': 'Управление клиентами',
         'settings.get_token': 'Получить токен',
         'settings.client_id': 'Client ID',
@@ -272,18 +262,34 @@ export const translations: Record<Language, Record<string, string>> = {
         'settings.device_id_desc': 'Уникальный идентификатор этого устройства',
         'settings.test_connection': 'Тестирование подключения',
         'settings.test_connection_desc': 'Проверка подключения к Yandex Disk',
-        'settings.test_button': 'Тест',
-        'settings.testing_button': 'Тестирование...',
-        'settings.success_button': 'Успешно!',
-        'settings.error_button': 'Ошибка',
+        'settings.sync_button': 'Синхронизировать',
+        'settings.syncing_button': 'Синхронизация...',
+        'settings.sync_success_button': 'Синхронизация завершена!',
+        'settings.sync_error_button': 'Ошибка',
         'settings.backup_section': 'Резервное копирование',
         'settings.backup_desc': 'Бекап будет сохранен как zip архив в папку .backup на диске',
         'settings.backup_last': 'Последний бекап',
         'settings.backup_never': 'Не создавался',
         'settings.backup_button': 'Сделать бекап',
+        'settings.backup_show_all': 'Показать все бекапы',
         'settings.backup_in_progress': 'Создание...',
         'settings.backup_success': 'Бекап создан!',
         'settings.backup_error': 'Ошибка бекапа',
+
+        // Backup list modal
+        'backup_list.title': 'Доступные бекапы',
+        'backup_list.loading': 'Загрузка бекапов...',
+        'backup_list.no_backups': 'Бекапы не найдены',
+        'backup_list.date': 'Дата',
+        'backup_list.size': 'Размер',
+        'backup_list.actions': 'Действия',
+        'backup_list.download': 'Скачать',
+
+        // Backup download notices
+        'notice.backup_download_started': 'Скачивание бекапа...',
+        'notice.backup_download_completed': 'Бекап скачан: {name}',
+        'notice.backup_download_failed': 'Ошибка скачивания бекапа',
+        'notice.backup_list_load_failed': 'Ошибка загрузки списка бекапов',
 
         // Generic strings
         'generic.yes': 'Да',

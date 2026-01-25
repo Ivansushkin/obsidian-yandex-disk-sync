@@ -5,6 +5,7 @@
 import JSZip from 'jszip';
 import type {
 	YandexDiskSyncSettings,
+	BackupInfo,
 } from '../types';
 import { YandexDiskClient } from '../api/yandex-client';
 import { VaultAdapter } from '../api/vault-adapter';
@@ -90,19 +91,14 @@ export class BackupManager {
 			const backupPath = joinPath(this.settings.remotePath, '.backup', backupName);
 			await this.yandexClient.uploadFile(backupPath, zipContent);
 
-			logger.info(`Backup created successfully: ${backupName} (${files.length} files, ${totalSize} bytes)`);
+		logger.info(`Backup created successfully: ${backupName} (${files.length} files, ${totalSize} bytes)`);
 
-			// Update backup time in index and save it
-			const backupTime = Date.now();
-			this.indexManager.setLastBackupTime(backupTime);
-			await this.indexManager.saveRemoteIndex();
-
-			return {
-				success: true,
-				backupName,
-				fileCount: files.length,
-				totalSize,
-			};
+		return {
+			success: true,
+			backupName,
+			fileCount: files.length,
+			totalSize,
+		};
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			logger.error('Backup creation failed:', error);
@@ -136,5 +132,91 @@ export class BackupManager {
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
 		this.settings = settings;
+	}
+
+	/**
+	 * Parse backup filename to extract creation date
+	 */
+	private parseBackupName(name: string): Date | null {
+		// Format: backup_YYYY-MM-DD_HH-MM-SS.zip
+		const match = name.match(/^backup_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.zip$/);
+		if (!match || match.length < 7) {
+			return null;
+		}
+
+		const year = match[1]!;
+		const month = match[2]!;
+		const day = match[3]!;
+		const hours = match[4]!;
+		const minutes = match[5]!;
+		const seconds = match[6]!;
+
+		const date = new Date(
+			parseInt(year, 10),
+			parseInt(month, 10) - 1,
+			parseInt(day, 10),
+			parseInt(hours, 10),
+			parseInt(minutes, 10),
+			parseInt(seconds, 10)
+		);
+
+		return isNaN(date.getTime()) ? null : date;
+	}
+
+	/**
+	 * List all available backups from the .backup folder
+	 */
+	async listBackups(): Promise<BackupInfo[]> {
+		try {
+			const backupFolder = joinPath(this.settings.remotePath, '.backup');
+			logger.info('Fetching backup list from:', backupFolder);
+
+			const resources = await this.yandexClient.getResourcesRecursive(backupFolder);
+			const backups: BackupInfo[] = [];
+
+			for (const resource of resources) {
+				// Only process files with .zip extension
+				if (resource.type !== 'file' || !resource.name.endsWith('.zip')) {
+					continue;
+				}
+
+				const created = this.parseBackupName(resource.name);
+				if (!created) {
+					logger.warn(`Invalid backup filename format: ${resource.name}`);
+					continue;
+				}
+
+				backups.push({
+					name: resource.name,
+					created,
+					size: resource.size || 0,
+					remotePath: resource.path,
+				});
+			}
+
+			// Sort by creation date (newest first)
+			backups.sort((a, b) => b.created.getTime() - a.created.getTime());
+
+			logger.info(`Found ${backups.length} backups`);
+			return backups;
+		} catch (error) {
+			logger.error('Error listing backups:', error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Download backup file to local device
+	 */
+	async downloadBackup(backupPath: string): Promise<ArrayBuffer> {
+		try {
+			logger.info('Starting backup download:', backupPath);
+			const content = await this.yandexClient.downloadFile(backupPath);
+			logger.info('Backup downloaded successfully');
+			return content;
+		} catch (error) {
+			logger.error('Error downloading backup:', error);
+			throw error;
+		}
 	}
 }
