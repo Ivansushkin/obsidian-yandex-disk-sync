@@ -50,7 +50,7 @@ export class BackupManager {
 			logger.info('Starting backup creation...');
 
 			// Get list of files to backup
-			const files = await this.vaultAdapter.getAllSyncableFiles();
+			const files = this.vaultAdapter.getAllSyncableFiles();
 			logger.info(`Found ${files.length} files to backup`);
 
 			if (files.length === 0) {

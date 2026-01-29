@@ -39,7 +39,7 @@ export class VaultAdapter {
 	/**
 	 * Get list of all files for synchronization
 	 */
-	async getAllSyncableFiles(): Promise<TFile[]> {
+	getAllSyncableFiles(): TFile[] {
 		const allFiles = this.vault.getFiles();
 		const configDir = this.app.vault.configDir;
 
@@ -181,15 +181,10 @@ export class VaultAdapter {
 	/**
 	 * Delete file
 	 */
-	async deleteFile(path: string, trash = true): Promise<void> {
+	async deleteFile(path: string): Promise<void> {
 		const file = this.getFile(path);
 		if (file) {
-			if (trash) {
-				await this.app.fileManager.trashFile(file);
-			} else {
-				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
-				await this.vault.delete(file);
-			}
+			await this.app.fileManager.trashFile(file);
 			logger.debug(`Deleted file: ${path}`);
 		}
 	}
@@ -242,15 +237,10 @@ export class VaultAdapter {
 	/**
 	 * Delete folder
 	 */
-	async deleteFolder(path: string, trash = true): Promise<void> {
+	async deleteFolder(path: string): Promise<void> {
 		const folder = this.getFolder(path);
 		if (folder) {
-			if (trash) {
-				await this.app.fileManager.trashFile(folder);
-			} else {
-				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
-				await this.vault.delete(folder, true);
-			}
+			await this.app.fileManager.trashFile(folder);
 			logger.debug(`Deleted folder: ${path}`);
 		}
 	}
@@ -280,7 +270,7 @@ export class VaultAdapter {
 	 * Get metadata of all synchronizable files
 	 */
 	async getAllFileMetadata(): Promise<Map<string, FileMetadata>> {
-		const files = await this.getAllSyncableFiles();
+		const files = this.getAllSyncableFiles();
 		const metadata = new Map<string, FileMetadata>();
 
 		// Process files in parallel with concurrency limit

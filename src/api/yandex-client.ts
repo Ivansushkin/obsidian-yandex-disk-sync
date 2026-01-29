@@ -175,11 +175,11 @@ export class YandexDiskClient {
 	async ensureFoldersExist(paths: string[]): Promise<void> {
 		// Collect all unique folder paths including parent folders
 		const allFolders = new Set<string>();
-		
+
 		for (const path of paths) {
 			const parts = path.split("/").filter(Boolean);
 			let currentPath = "";
-			
+
 			for (const part of parts) {
 				currentPath = currentPath ? `${currentPath}/${part}` : part;
 				if (!this.folderCache.has(currentPath)) {
@@ -247,7 +247,7 @@ export class YandexDiskClient {
 		await requestUrl({
 			url: uploadLink.href,
 			method: "PUT",
-			body: bytes.buffer as ArrayBuffer,
+			body: bytes.buffer,
 			throw: true,
 		});
 
@@ -385,7 +385,7 @@ export class YandexDiskClient {
 				if (response.status === 429 || response.status === 503) {
 					lastError = new YandexApiError(
 						errorData?.description ||
-							"Rate limit or service unavailable",
+						"Rate limit or service unavailable",
 						response.status,
 						errorData?.error
 					);
