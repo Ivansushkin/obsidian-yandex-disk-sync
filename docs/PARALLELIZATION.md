@@ -52,11 +52,11 @@
 
 ```typescript
 class Semaphore {
-  private permits: number;
-  private waiting: Array<() => void> = [];
+	private permits: number;
+	private waiting: Array<() => void> = [];
 
-  async acquire(): Promise<void>  // Захватить разрешение
-  release(): void                  // Освободить разрешение
+	async acquire(): Promise<void>; // Захватить разрешение
+	release(): void; // Освободить разрешение
 }
 ```
 
@@ -68,16 +68,17 @@ class Semaphore {
 
 ```typescript
 async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-  onProgress?: (completed: number, total: number) => void
-): Promise<T[]>
+	tasks: Array<() => Promise<T>>,
+	concurrency: number,
+	onProgress?: (completed: number, total: number) => void,
+): Promise<T[]>;
 ```
 
 **Пример:**
+
 ```typescript
-const tasks = files.map(file => async () => {
-  return await processFile(file);
+const tasks = files.map((file) => async () => {
+	return await processFile(file);
 });
 
 const results = await runWithConcurrency(tasks, 5);
@@ -89,25 +90,28 @@ const results = await runWithConcurrency(tasks, 5);
 
 ```typescript
 async function runWithConcurrencySettled<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-  onProgress?: (completed: number, total: number) => void
-): Promise<Array<
-  | { status: "fulfilled"; value: T }
-  | { status: "rejected"; reason: unknown }
->>
+	tasks: Array<() => Promise<T>>,
+	concurrency: number,
+	onProgress?: (completed: number, total: number) => void,
+): Promise<
+	Array<
+		| { status: "fulfilled"; value: T }
+		| { status: "rejected"; reason: unknown }
+	>
+>;
 ```
 
 **Пример:**
+
 ```typescript
 const results = await runWithConcurrencySettled(tasks, 5);
 
 results.forEach((result, i) => {
-  if (result.status === "rejected") {
-    console.error(`Task ${i} failed:`, result.reason);
-  } else {
-    console.log(`Task ${i} succeeded:`, result.value);
-  }
+	if (result.status === "rejected") {
+		console.error(`Task ${i} failed:`, result.reason);
+	} else {
+		console.log(`Task ${i} succeeded:`, result.value);
+	}
 });
 ```
 
@@ -116,15 +120,17 @@ results.forEach((result, i) => {
 ### 1. Параллельное вычисление хешей
 
 **До:**
+
 ```typescript
 for (const file of files) {
-  const content = await vault.readBinary(file);
-  const sha256 = await computeSha256(content);
-  // ...
+	const content = await vault.readBinary(file);
+	const sha256 = await computeSha256(content);
+	// ...
 }
 ```
 
 **После:**
+
 ```typescript
 const tasks = files.map(file => async () => {
   const content = await vault.readBinary(file);
@@ -145,8 +151,8 @@ const results = await runWithConcurrency(tasks, 10);
 // Собрать все уникальные папки
 const folders = new Set<string>();
 for (const op of operations) {
-  const dir = getDirectory(op.path);
-  if (dir) folders.add(dir);
+	const dir = getDirectory(op.path);
+	if (dir) folders.add(dir);
 }
 
 // Создать папки последовательно по уровням
@@ -161,17 +167,17 @@ await yandexClient.ensureFoldersExist(Array.from(folders));
 
 ```typescript
 class YandexDiskClient {
-  private folderCache: Set<string> = new Set();
+	private folderCache: Set<string> = new Set();
 
-  async createFolder(path: string): Promise<void> {
-    if (this.folderCache.has(path)) {
-      return; // Папка уже создана
-    }
-    
-    // Создать папку и добавить в кэш
-    await this.request("PUT", `/resources?path=${path}`);
-    this.folderCache.add(path);
-  }
+	async createFolder(path: string): Promise<void> {
+		if (this.folderCache.has(path)) {
+			return; // Папка уже создана
+		}
+
+		// Создать папку и добавить в кэш
+		await this.request("PUT", `/resources?path=${path}`);
+		this.folderCache.add(path);
+	}
 }
 ```
 
@@ -180,10 +186,10 @@ class YandexDiskClient {
 Операции группируются и выполняются параллельно внутри групп:
 
 ```typescript
-const uploads = operations.filter(op => op.action === "upload");
-const downloads = operations.filter(op => op.action === "download");
-const deletes = operations.filter(op => op.action.includes("delete"));
-const conflicts = operations.filter(op => op.action === "conflict");
+const uploads = operations.filter((op) => op.action === "upload");
+const downloads = operations.filter((op) => op.action === "download");
+const deletes = operations.filter((op) => op.action.includes("delete"));
+const conflicts = operations.filter((op) => op.action === "conflict");
 
 // Uploads параллельно
 await executeOperationsParallel(uploads, maxConcurrency);
@@ -196,7 +202,7 @@ await executeOperationsParallel(deletes, maxConcurrency);
 
 // Conflicts последовательно (требуют особой обработки)
 for (const op of conflicts) {
-  await handleConflict(op);
+	await handleConflict(op);
 }
 ```
 
@@ -215,6 +221,7 @@ for (const op of conflicts) {
 `Settings → Automatic sync → Max concurrent operations`
 
 **Программная настройка:**
+
 ```typescript
 this.plugin.settings.maxConcurrency = 10;
 await this.plugin.saveSettings();
@@ -241,9 +248,11 @@ await this.plugin.saveSettings();
 ### Оптимальные значения concurrency
 
 **Для вычисления хешей (CPU-bound):**
+
 - Фиксировано: 10
 
 **Для сетевых операций (I/O-bound):**
+
 - Автоматически: `settings.maxConcurrency`
 - По умолчанию: 5
 - Максимум: 20
@@ -259,12 +268,12 @@ const results = await runWithConcurrencySettled(tasks, concurrency);
 
 // Собрать ошибки
 const errors = results
-  .filter(r => r.status === "rejected")
-  .map(r => r.reason);
+	.filter((r) => r.status === "rejected")
+	.map((r) => r.reason);
 
 // Сообщить пользователю
 if (errors.length > 0) {
-  logger.error(`${errors.length} operations failed`);
+	logger.error(`${errors.length} operations failed`);
 }
 ```
 
@@ -295,7 +304,8 @@ if (errors.length > 0) {
 
 **Проблема:** Yandex Disk вернул 429 (Too Many Requests).
 
-**Решение:** 
+**Решение:**
+
 - Встроенный retry с exponential backoff в `YandexDiskClient.request()`
 - При повторном 429 операция помечается как failed
 - Рекомендация в логах: уменьшить `maxConcurrency`
@@ -331,8 +341,8 @@ Progress обновляется в реальном времени:
 
 ```typescript
 const onProgress = (completed: number, total: number) => {
-  const progress = Math.round((completed / total) * 100);
-  this.updateState({ progress, pendingCount: total - completed });
+	const progress = Math.round((completed / total) * 100);
+	this.updateState({ progress, pendingCount: total - completed });
 };
 
 await runWithConcurrency(tasks, concurrency, onProgress);
@@ -341,6 +351,7 @@ await runWithConcurrency(tasks, concurrency, onProgress);
 ### Status Bar
 
 Status bar показывает:
+
 - Текущую операцию: "Uploading files..."
 - Progress: 45%
 - Осталось файлов: 55
@@ -351,11 +362,11 @@ Status bar показывает:
 
 ```typescript
 class Semaphore {
-  constructor(permits: number);
-  
-  async acquire(): Promise<void>;
-  release(): void;
-  availablePermits(): number;
+	constructor(permits: number);
+
+	async acquire(): Promise<void>;
+	release(): void;
+	availablePermits(): number;
 }
 ```
 
@@ -363,13 +374,14 @@ class Semaphore {
 
 ```typescript
 async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-  onProgress?: (completed: number, total: number) => void
-): Promise<T[]>
+	tasks: Array<() => Promise<T>>,
+	concurrency: number,
+	onProgress?: (completed: number, total: number) => void,
+): Promise<T[]>;
 ```
 
 **Параметры:**
+
 - `tasks`: Массив функций, возвращающих Promise
 - `concurrency`: Максимальное количество одновременных выполнений
 - `onProgress`: Опциональный callback для отслеживания прогресса
@@ -382,13 +394,15 @@ async function runWithConcurrency<T>(
 
 ```typescript
 async function runWithConcurrencySettled<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-  onProgress?: (completed: number, total: number) => void
-): Promise<Array<
-  | { status: "fulfilled"; value: T }
-  | { status: "rejected"; reason: unknown }
->>
+	tasks: Array<() => Promise<T>>,
+	concurrency: number,
+	onProgress?: (completed: number, total: number) => void,
+): Promise<
+	Array<
+		| { status: "fulfilled"; value: T }
+		| { status: "rejected"; reason: unknown }
+	>
+>;
 ```
 
 **Параметры:** Те же, что у `runWithConcurrency`
@@ -404,6 +418,7 @@ async ensureFoldersExist(paths: string[]): Promise<void>
 ```
 
 **Параметры:**
+
 - `paths`: Массив путей к папкам
 
 **Описание:** Создаёт все указанные папки вместе с родительскими. Использует кэш для избежания дублирующих запросов. Создание происходит последовательно по уровням вложенности.
@@ -413,11 +428,13 @@ async ensureFoldersExist(paths: string[]): Promise<void>
 ### Версия 1.0.x → 1.1.x
 
 **Изменения:**
+
 1. Добавлена настройка `maxConcurrency` со значением по умолчанию 5
 2. Все операции теперь выполняются параллельно
 3. API методов не изменился - совместимость полная
 
 **Действия:**
+
 - Обновить плагин
 - При желании настроить `maxConcurrency` в Settings
 - Никаких изменений в данных или индексах не требуется
@@ -444,12 +461,14 @@ async ensureFoldersExist(paths: string[]): Promise<void>
 ### 3. Производительность первой синхронизации
 
 При первой синхронизации большого хранилища:
+
 - Временно увеличьте `maxConcurrency` до 15-20
 - После завершения верните к нормальному значению
 
 ### 4. Отладка проблем
 
 При проблемах с синхронизацией:
+
 1. Уменьшите `maxConcurrency` до 1
 2. Проверьте логи на конкретные ошибки
 3. После исправления постепенно увеличивайте concurrency

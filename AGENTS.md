@@ -44,10 +44,10 @@ npm run build
 
 ## Linting
 
-- To use eslint install eslint from terminal: `npm install -g eslint`
-- To use eslint to analyze this project use this command: `eslint main.ts`
-- eslint will then create a report with suggestions for code improvement by file and line number.
-- If your source code is in a folder, such as `src`, you can use eslint with this command to analyze all files in that folder: `eslint ./src/`
+- eslint is a devDependency — no global install needed.
+- To lint the entire project: `npm run lint` (runs `eslint .`)
+- The command will produce a report with suggestions and line numbers.
+- If your source code is in a folder, such as `src`, you can use `npx eslint ./src/`.
 
 ## File & folder conventions
 
@@ -58,17 +58,25 @@ npm run build
   ```
   src/
     main.ts           # Plugin entry point, lifecycle management
-    settings.ts       # Settings interface and defaults
-    commands/         # Command implementations
-      command1.ts
-      command2.ts
-    ui/              # UI components, modals, views
-      modal.ts
-      view.ts
-    utils/           # Utility functions, helpers
-      helpers.ts
+    settings.ts       # Settings UI rendering (SettingsTab), modals
+    types.ts          # TypeScript interfaces and types
+    api/              # Yandex Disk API client
+      yandex-client.ts
+    sync/             # Sync engine, index manager, conflict resolver
+      sync-engine.ts
+      index-manager.ts
+      conflict-resolver.ts
+    crypto/           # E2E encryption (Web Crypto API)
+      encryption.ts
+    ui/               # UI components, modals, views
+      force-sync-modal.ts
+    i18n/             # Internationalization (EN + RU)
+      translations.ts
+    backup/           # Backup utility
+      backup-manager.ts
+    utils/            # Utility functions, helpers
       constants.ts
-    types.ts         # TypeScript interfaces and types
+      helpers.ts
   ```
 
 - **Do not commit build artifacts**: Never commit `node_modules/`, `main.js`, or other generated files to version control.

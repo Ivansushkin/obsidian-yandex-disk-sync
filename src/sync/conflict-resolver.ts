@@ -76,6 +76,19 @@ export class ConflictResolver {
 
 		// Case 6: Both files exist - compare them
 		if (localMeta && remoteMeta) {
+			// When encryption is active, Yandex Disk API returns sha256 of encrypted content,
+			// which never matches the local file's sha256 of plaintext content.
+			// The remote index stores the correct plaintext sha256 from the last sync.
+			// If local sha256 matches the remote index, the file hasn't changed.
+			if (remoteIndexMeta && localMeta.sha256 === remoteIndexMeta.sha256) {
+				return {
+					action: "none",
+					path,
+					reason: "Files match index (encryption)",
+					localMeta,
+					remoteMeta,
+				};
+			}
 			return this.compareFiles(path, localMeta, remoteMeta, syncStartTime);
 		}
 

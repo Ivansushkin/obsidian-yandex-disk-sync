@@ -14,6 +14,7 @@ import { joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
+const ENCRYPTION_SALT_FILENAME = ".obsidian-encrypt.json";
 
 export class IndexManager {
 	private yandexClient: YandexDiskClient;
@@ -111,14 +112,14 @@ export class IndexManager {
 			const jsonStr = decoder.decode(content);
 			const data = JSON.parse(jsonStr) as Partial<SyncIndex>;
 
-		if (data.version === CURRENT_INDEX_VERSION || data.version === 1) {
-			this.remoteIndex = {
-				version: data.version,
-				lastSyncTime: data.lastSyncTime || 0,
-				deviceId: data.deviceId || "",
-				files: data.files || {},
-			};
-		} else {
+			if (data.version === CURRENT_INDEX_VERSION || data.version === 1) {
+				this.remoteIndex = {
+					version: data.version,
+					lastSyncTime: data.lastSyncTime || 0,
+					deviceId: data.deviceId || "",
+					files: data.files || {},
+				};
+			} else {
 				logger.warn(
 					"Remote index version mismatch, resetting"
 				);
@@ -329,5 +330,65 @@ export class IndexManager {
 	 */
 	async createRemotePath(): Promise<void> {
 		await this.yandexClient.createFolderRecursive(this.settings.remotePath);
+	}
+
+	// ============================================================================
+	// Encryption salt management
+	// ============================================================================
+
+	private getEncryptionSaltPath(): string {
+		return joinPath(this.settings.remotePath, ENCRYPTION_SALT_FILENAME);
+	}
+
+	/**
+	 * Upload encryption salt to Yandex Disk (raw — no encryption).
+	 * Salt is not secret, it's stored alongside user data for multi-device sync.
+	 */
+	async uploadEncryptionSalt(saltBase64: string): Promise<void> {
+		const content = JSON.stringify({ version: 1, salt: saltBase64 });
+		await this.yandexClient.uploadFile(
+			this.getEncryptionSaltPath(),
+			content,
+			false,
+			true
+		);
+		logger.info("Encryption salt uploaded to remote");
+	}
+
+	/**
+	 * Download encryption salt from Yandex Disk (raw — no decryption).
+	 * Returns null if salt file doesn't exist (encryption not active on remote).
+	 */
+	async downloadEncryptionSalt(): Promise<string | null> {
+		try {
+			const resource = await this.yandexClient.getResource(
+				this.getEncryptionSaltPath()
+			);
+			if (!resource) return null;
+
+			const content = await this.yandexClient.downloadFile(
+				this.getEncryptionSaltPath(),
+				true
+			);
+			const data = JSON.parse(new TextDecoder().decode(content)) as {
+				salt: string;
+			};
+			if (!data.salt) return null;
+			return data.salt;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Delete encryption salt from Yandex Disk.
+	 */
+	async deleteEncryptionSalt(): Promise<void> {
+		await this.yandexClient.deleteResource(
+			this.getEncryptionSaltPath(),
+			false,
+			true
+		);
+		logger.info("Encryption salt deleted from remote");
 	}
 }

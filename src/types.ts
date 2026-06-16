@@ -29,6 +29,12 @@ export interface YandexDiskSyncSettings {
 	debounceDelay: number;
 	/** Maximum number of concurrent operations during sync */
 	maxConcurrency: number;
+	/** Enable end-to-end encryption */
+	enableEncryption: boolean;
+	/** Base64-encoded salt for key derivation (null = not initialized) */
+	encryptionSalt: string | null;
+	/** Base64-encoded user password (stored alongside settings) */
+	encryptedPassword: string | null;
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
@@ -43,6 +49,9 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	deviceId: "",
 	debounceDelay: 1000,
 	maxConcurrency: 10,
+	enableEncryption: false,
+	encryptionSalt: null,
+	encryptedPassword: null,
 };
 
 // ============================================================================

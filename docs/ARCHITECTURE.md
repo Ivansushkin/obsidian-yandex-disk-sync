@@ -43,6 +43,7 @@ src/
 ### Main (main.ts)
 
 Точка входа плагина. Отвечает за:
+
 - Инициализацию всех компонентов
 - Регистрацию команд
 - Обработку жизненного цикла (onload/onunload)
@@ -62,6 +63,7 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 - `moveResource(from, to)` — переместить/переименовать
 
 **Особенности реализации:**
+
 - Двухшаговая загрузка файлов (получение upload URL → PUT контента)
 - Автоматический retry с exponential backoff для 429/503 ошибок
 - Пагинация для больших директорий
@@ -72,6 +74,7 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 Адаптер для работы с файловой системой Obsidian Vault.
 
 **Основные методы:**
+
 - `getAllSyncableFiles()` — получить все файлы для синхронизации
 - `getAllFileMetadata()` — получить метаданные всех файлов с хешами
 - `readFile(path)` — читать содержимое файла
@@ -80,6 +83,7 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 - `renameFile(from, to)` — переименовать файл
 
 **Особенности:**
+
 - Фильтрация по include/exclude паттернам
 - Поддержка конфигурируемой папки настроек Obsidian
 - Использование FileManager.trashFile() для удаления
@@ -90,26 +94,28 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 Управление индексами синхронизации.
 
 **Структура индекса:**
+
 ```typescript
 interface SyncIndex {
-  version: number;           // Версия формата индекса
-  lastSyncTime: number;      // Время последней синхронизации
-  deviceId: string;          // ID устройства
-  files: Record<string, FileMetadata>;
+	version: number; // Версия формата индекса
+	lastSyncTime: number; // Время последней синхронизации
+	deviceId: string; // ID устройства
+	files: Record<string, FileMetadata>;
 }
 
 interface FileMetadata {
-  path: string;              // Путь к файлу
-  sha256: string;            // SHA256 хеш содержимого
-  size: number;              // Размер в байтах
-  mtime: number;             // Время модификации
-  syncedAt: number;          // Время последней синхронизации
-  deleted?: boolean;         // Флаг удаления
-  deletedAt?: number;        // Время удаления
+	path: string; // Путь к файлу
+	sha256: string; // SHA256 хеш содержимого
+	size: number; // Размер в байтах
+	mtime: number; // Время модификации
+	syncedAt: number; // Время последней синхронизации
+	deleted?: boolean; // Флаг удаления
+	deletedAt?: number; // Время удаления
 }
 ```
 
 **Два индекса:**
+
 1. **Локальный индекс** — хранится в data.json плагина
 2. **Удалённый индекс** — файл `.sync-index.json` на Яндекс Диске
 
@@ -144,6 +150,7 @@ interface FileMetadata {
 Разрешение конфликтов синхронизации.
 
 **Стратегии:**
+
 - `newerWins` — более новый файл по mtime побеждает
 - `localWins` — локальная версия имеет приоритет
 - `remoteWins` — удалённая версия имеет приоритет
@@ -154,12 +161,14 @@ interface FileMetadata {
 Отслеживание изменений файлов в реальном времени.
 
 **События:**
+
 - `vault.on('create')` — создание файла → upload
 - `vault.on('modify')` — изменение файла → upload (с debounce)
 - `vault.on('delete')` — удаление файла → delete remote
 - `vault.on('rename')` — переименование → move remote
 
 **Debouncing:**
+
 - Задержка 2-3 секунды после последнего изменения
 - Предотвращает множественные загрузки при быстром наборе текста
 
@@ -218,17 +227,17 @@ interface FileMetadata {
 const delays = [1000, 2000, 4000, 8000, 16000]; // мс
 
 async function requestWithRetry(fn, maxRetries = 5) {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await fn();
-    } catch (error) {
-      if (isRetryable(error) && i < maxRetries - 1) {
-        await sleep(delays[i]);
-        continue;
-      }
-      throw error;
-    }
-  }
+	for (let i = 0; i < maxRetries; i++) {
+		try {
+			return await fn();
+		} catch (error) {
+			if (isRetryable(error) && i < maxRetries - 1) {
+				await sleep(delays[i]);
+				continue;
+			}
+			throw error;
+		}
+	}
 }
 ```
 
@@ -245,6 +254,7 @@ async function requestWithRetry(fn, maxRetries = 5) {
 ### Хранение токена
 
 OAuth токен хранится в `data.json` плагина. Рекомендации:
+
 - Не коммитить data.json в git
 - Использовать токен с минимальными правами
 - В будущем: интеграция с SecretStorage Obsidian
@@ -280,17 +290,20 @@ OAuth токен хранится в `data.json` плагина. Рекомен�
 ```typescript
 // В conflict-resolver.ts
 class ConflictResolver {
-  resolve(local: FileMetadata, remote: FileMetadata): SyncAction {
-    switch (this.strategy) {
-      case 'myNewStrategy':
-        return this.myNewStrategyLogic(local, remote);
-      // ...
-    }
-  }
-  
-  private myNewStrategyLogic(local: FileMetadata, remote: FileMetadata): SyncAction {
-    // Ваша логика
-  }
+	resolve(local: FileMetadata, remote: FileMetadata): SyncAction {
+		switch (this.strategy) {
+			case "myNewStrategy":
+				return this.myNewStrategyLogic(local, remote);
+			// ...
+		}
+	}
+
+	private myNewStrategyLogic(
+		local: FileMetadata,
+		remote: FileMetadata,
+	): SyncAction {
+		// Ваша логика
+	}
 }
 ```
 
@@ -300,12 +313,12 @@ class ConflictResolver {
 
 ```typescript
 interface StorageClient {
-  getResource(path: string): Promise<ResourceMetadata | null>;
-  listFolder(path: string): Promise<ResourceMetadata[]>;
-  uploadFile(path: string, content: ArrayBuffer): Promise<void>;
-  downloadFile(path: string): Promise<ArrayBuffer>;
-  deleteResource(path: string): Promise<void>;
-  moveResource(from: string, to: string): Promise<void>;
+	getResource(path: string): Promise<ResourceMetadata | null>;
+	listFolder(path: string): Promise<ResourceMetadata[]>;
+	uploadFile(path: string, content: ArrayBuffer): Promise<void>;
+	downloadFile(path: string): Promise<ArrayBuffer>;
+	deleteResource(path: string): Promise<void>;
+	moveResource(from: string, to: string): Promise<void>;
 }
 ```
 
@@ -316,10 +329,10 @@ interface StorageClient {
 1. Создайте тестовый vault
 2. Настройте плагин с тестовым токеном
 3. Проверьте сценарии:
-   - Создание/редактирование/удаление файлов
-   - Конфликты (изменение на двух устройствах)
-   - Офлайн → онлайн переход
-   - Большие файлы
+    - Создание/редактирование/удаление файлов
+    - Конфликты (изменение на двух устройствах)
+    - Офлайн → онлайн переход
+    - Большие файлы
 
 ### Отладка
 
@@ -327,7 +340,7 @@ interface StorageClient {
 
 ```javascript
 // В logger.ts уровень debug
-logger.setLevel('debug');
+logger.setLevel("debug");
 ```
 
 ## Параллелизация операций
@@ -387,9 +400,9 @@ Sync Flow:
 
 ```typescript
 class Semaphore {
-  private permits: number;
-  async acquire(): Promise<void>;
-  release(): void;
+	private permits: number;
+	async acquire(): Promise<void>;
+	release(): void;
 }
 ```
 
@@ -408,34 +421,35 @@ await runWithConcurrencySettled(tasks, maxConcurrency, onProgress);
 ### Оптимизации
 
 1. **Параллельное вычисление хешей**
-   - Вычисление SHA256 для всех файлов происходит параллельно (concurrency=10)
-   - Ускорение в ~10x для больших хранилищ
+    - Вычисление SHA256 для всех файлов происходит параллельно (concurrency=10)
+    - Ускорение в ~10x для больших хранилищ
 
 2. **Preflight создание папок**
-   - Все папки создаются заранее перед началом загрузки
-   - Позволяет параллельно загружать файлы без проверки папок
-   - Кэширование созданных папок предотвращает повторные запросы
+    - Все папки создаются заранее перед началом загрузки
+    - Позволяет параллельно загружать файлы без проверки папок
+    - Кэширование созданных папок предотвращает повторные запросы
 
 3. **Folder caching в YandexDiskClient**
-   - Кэш созданных папок (`folderCache: Set<string>`)
-   - Проверка кэша перед каждым API запросом
-   - Автоматическое добавление в кэш при 409 (Already Exists)
+    - Кэш созданных папок (`folderCache: Set<string>`)
+    - Проверка кэша перед каждым API запросом
+    - Автоматическое добавление в кэш при 409 (Already Exists)
 
 4. **Группировка операций**
-   - Операции группируются по типам (upload/download/delete/conflict)
-   - Каждая группа выполняется параллельно
-   - Conflicts обрабатываются последовательно (требуют особой логики)
+    - Операции группируются по типам (upload/download/delete/conflict)
+    - Каждая группа выполняется параллельно
+    - Conflicts обрабатываются последовательно (требуют особой логики)
 
 ### Настройки производительности
 
 **maxConcurrency** (1-20, по умолчанию 5):
+
 - Контролирует количество одновременных операций
 - Можно настроить через Settings → Automatic sync
 - Рекомендуемые значения:
-  - 1-3: медленное соединение
-  - 5-7: стандартное соединение
-  - 8-15: быстрое соединение
-  - 16-20: очень быстрое соединение
+    - 1-3: медленное соединение
+    - 5-7: стандартное соединение
+    - 8-15: быстрое соединение
+    - 16-20: очень быстрое соединение
 
 ### Производительность
 
@@ -463,6 +477,7 @@ backup/
 ### BackupManager (backup/backup-manager.ts)
 
 Отвечает за:
+
 - Создание ZIP-архивов всех синхронизируемых файлов
 - Загрузку бекапов на Яндекс.Диск в защищенную папку `.backup`
 - Управление метаданными бекапов в индексе синхронизации
@@ -497,6 +512,7 @@ Force Sync — функция принудительной синхрониза�
 Модальное окно подтверждения перед выполнением Force Sync.
 
 **Возможности:**
+
 - Пояснение операции в зависимости от направления
 - Предупреждение о деструктивности операции
 - Кнопка создания бекапа перед выполнением
@@ -508,6 +524,7 @@ Force Sync — функция принудительной синхрониза�
 Перезаписывает ВСЕ файлы на Яндекс.Диске локальными версиями. Файлы, отсутствующие локально, удаляются с диска.
 
 **Алгоритм:**
+
 ```
 1. Построить локальный индекс (сканирование vault)
 2. Получить список файлов с Яндекс.Диска
@@ -521,6 +538,7 @@ Force Sync — функция принудительной синхрониза�
 Перезаписывает ВСЕ локальные файлы версиями с Яндекс.Диска. Локальные файлы, отсутствующие на диске, удаляются.
 
 **Алгоритм:**
+
 ```
 1. Построить локальный индекс (для определения удаляемых файлов)
 2. Загрузить удалённый индекс

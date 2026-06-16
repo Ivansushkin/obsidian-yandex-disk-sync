@@ -19,10 +19,12 @@ import { SyncScheduler } from "./sync/sync-scheduler";
 import { SyncStatusBar } from "./ui/status-bar";
 import { SyncStatusModal, ConfirmModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
+import { PasswordPromptModal } from "./ui/encryption-modals";
 import { BackupManager } from "./backup/backup-manager";
-import { generateDeviceId } from "./utils/path-utils";
+import { generateDeviceId, joinPath } from "./utils/path-utils";
 import { logger } from "./utils/logger";
 import { initI18n, t } from "./i18n";
+import { EncryptionService } from "./crypto/encryption";
 
 interface PluginData {
 	settings: YandexDiskSyncSettings;
@@ -56,6 +58,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	};
 
 	private isInitialized = false;
+	private encryptionService: EncryptionService | null = null;
 
 	async onload(): Promise<void> {
 		// Initialize i18n service
@@ -170,6 +173,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.indexManager,
 			this.settings
 		);
+
+		// Initialize encryption if enabled
+		void this.initEncryption();
 	}
 
 	/**
@@ -251,14 +257,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return;
 		}
 
+		// Check remote for encryption salt before loading index
+		await this.syncEncryptionStateWithRemote();
+
 		// Load saved index
 		const data = (await this.loadData()) as PluginData | null;
 		if (data?.localIndex) {
-		this.indexManager.loadLocalIndexFromData(data.localIndex);
-	}
-	if (data?.lastSyncStats) {
-		this.lastSyncStats = data.lastSyncStats;
-	}
+			this.indexManager.loadLocalIndexFromData(data.localIndex);
+		}
+		if (data?.lastSyncStats) {
+			this.lastSyncStats = data.lastSyncStats;
+		}
 
 	// Subscribe to sync engine events to pause/resume file watcher
 		this.syncEngine.onSyncPause(() => {
@@ -635,6 +644,237 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			localIndex: this.indexManager?.getLocalIndex() ?? null,
 			lastSyncStats: this.lastSyncStats,
 		} as PluginData);
+	}
+
+	// ============================================================================
+	// Encryption
+	// ============================================================================
+
+	/**
+	 * Initialize encryption service from stored settings.
+	 * Called during plugin load; silently returns if encryption is disabled or
+	 * if password/salt is missing.
+	 */
+	private async initEncryption(): Promise<void> {
+		if (
+			!this.settings.enableEncryption
+			|| !this.settings.encryptionSalt
+			|| !this.settings.encryptedPassword
+		) {
+			this.yandexClient.setEncryptionService(null);
+			return;
+		}
+
+		try {
+			const salt = EncryptionService.base64ToBytes(
+				this.settings.encryptionSalt
+			);
+			const service = new EncryptionService(salt);
+			await service.initializeKey(this.settings.encryptedPassword);
+			this.encryptionService = service;
+			this.yandexClient.setEncryptionService(service);
+			logger.info("Encryption initialized successfully");
+		} catch (e) {
+			logger.warn("Failed to initialize encryption:", e);
+			this.encryptionService = null;
+			this.yandexClient.setEncryptionService(null);
+
+			new Notice(t("notice.encryption_wrong_password"));
+		}
+	}
+
+	/**
+	 * Enable encryption with the given password.
+	 *
+	 * If remote already has an encryption salt (another device enabled encryption),
+	 * uses that salt — so the same password produces the same key across devices.
+	 * If no remote salt exists, generates a new one and uploads it.
+	 *
+	 * When using an existing remote salt, verifies the password by trying to
+	 * load the encrypted index. Throws if the password is wrong.
+	 */
+	async enableEncryption(password: string): Promise<void> {
+		const remoteSalt = await this.indexManager.downloadEncryptionSalt();
+
+		let saltBytes: Uint8Array;
+		let isNewEncryption: boolean;
+
+		if (remoteSalt) {
+			// Remote already has encryption — reuse the same salt
+			saltBytes = EncryptionService.base64ToBytes(remoteSalt);
+			isNewEncryption = false;
+		} else {
+			// First-time setup — generate new salt
+			saltBytes = EncryptionService.generateSalt();
+			isNewEncryption = true;
+		}
+
+		// Before setting encryption, save list of existing remote files for cleanup
+		let oldRemoteFiles: Map<string, never> | null = null;
+		if (isNewEncryption) {
+			try {
+				const remoteFiles = await this.indexManager.getRemoteFiles();
+				if (remoteFiles && remoteFiles.size > 0) {
+					oldRemoteFiles = remoteFiles as Map<string, never>;
+				}
+			} catch (e) {
+				logger.warn("Failed to get remote file list before encryption:", e);
+			}
+		}
+
+		const service = new EncryptionService(saltBytes);
+		await service.initializeKey(password);
+
+		this.yandexClient.setEncryptionService(service);
+
+		// If using existing remote salt, verify password by loading the encrypted index
+		if (!isNewEncryption) {
+			try {
+				await this.indexManager.loadRemoteIndex();
+			} catch {
+				this.yandexClient.setEncryptionService(null);
+				throw new Error(t("notice.encryption_wrong_password"));
+			}
+		}
+
+		this.encryptionService = service;
+		this.settings.enableEncryption = true;
+		this.settings.encryptionSalt = EncryptionService.bytesToBase64(saltBytes);
+		this.settings.encryptedPassword = password;
+		await this.saveSettings();
+
+		// For first-time setup: upload salt, re-upload all files with encryption, clean up old files
+		if (isNewEncryption) {
+			try {
+				await this.indexManager.uploadEncryptionSalt(
+					EncryptionService.bytesToBase64(saltBytes)
+				);
+
+				// Re-upload all local files with encryption
+				logger.info("Re-uploading all files with encryption...");
+				await this.syncEngine.forceSyncFromLocal();
+
+				// Clean up old plaintext files from remote
+				if (oldRemoteFiles && oldRemoteFiles.size > 0) {
+					logger.info(`Cleaning up ${oldRemoteFiles.size} old plaintext files...`);
+					for (const [path] of oldRemoteFiles) {
+						try {
+							const remotePath = joinPath(this.settings.remotePath, path);
+							await this.yandexClient.deleteResource(remotePath, false, true);
+						} catch (e) {
+							logger.warn(`Failed to delete old plaintext file ${path}:`, e);
+						}
+					}
+				}
+			} catch (e) {
+				logger.warn("Failed to re-encrypt existing files:", e);
+			}
+		}
+
+		logger.info("Encryption enabled");
+	}
+
+	/**
+	 * Disable encryption.
+	 *
+	 * When `reuploadPlaintext` is true, re-uploads all local files as plaintext
+	 * and deletes old encrypted files from remote. This is used when the user
+	 * explicitly turns off encryption (toggle OFF).
+	 *
+	 * When `reuploadPlaintext` is false (change-password flow), only clears
+	 * settings and salt without touching the files on disk.
+	 */
+	async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<void> {
+		this.encryptionService = null;
+		this.yandexClient.setEncryptionService(null);
+
+		if (options?.reuploadPlaintext) {
+			logger.info("Re-uploading all files as plaintext...");
+			await this.syncEngine.forceSyncFromLocal();
+		}
+
+		this.settings.enableEncryption = false;
+		this.settings.encryptionSalt = null;
+		this.settings.encryptedPassword = null;
+		await this.saveSettings();
+
+		// Remove salt from remote
+		try {
+			await this.indexManager.deleteEncryptionSalt();
+		} catch (e) {
+			logger.warn("Failed to delete encryption salt from remote:", e);
+		}
+
+		logger.info("Encryption disabled");
+	}
+
+	/**
+	 * Check remote for encryption salt.
+	 * If salt exists but no local password is configured, prompt the user
+	 * to enter the encryption password for multi-device setup.
+	 */
+	private async syncEncryptionStateWithRemote(): Promise<void> {
+		// Already configured locally — skip
+		if (this.settings.enableEncryption && this.settings.encryptedPassword) {
+			return;
+		}
+
+		try {
+			const remoteSalt = await this.indexManager.downloadEncryptionSalt();
+			if (!remoteSalt) {
+				// No encryption on remote — nothing to do
+				return;
+			}
+
+			// Local encryption is NOT configured but remote has salt
+			// Need to prompt user for password
+			new Notice(t("notice.encryption_detected"), 8000);
+
+			const password = await new Promise<string | null>((resolve) => {
+				new PasswordPromptModal(
+					this.app,
+					resolve,
+					() => this.createBackup(),
+					t("modal.encryption_enter_password")
+				).open();
+			});
+			if (!password) {
+				logger.warn("User cancelled encryption password prompt");
+				return;
+			}
+
+			const saltBytes = EncryptionService.base64ToBytes(remoteSalt);
+			const service = new EncryptionService(saltBytes);
+			await service.initializeKey(password);
+
+			// Verify by trying to load the encrypted index
+			this.yandexClient.setEncryptionService(service);
+			try {
+				await this.indexManager.loadRemoteIndex();
+
+				// Success — password is correct
+				this.encryptionService = service;
+				this.settings.enableEncryption = true;
+				this.settings.encryptionSalt = remoteSalt;
+				this.settings.encryptedPassword = password;
+				await this.saveSettings();
+				logger.info("Encryption configured from remote salt");
+			} catch {
+				// Wrong password
+				this.yandexClient.setEncryptionService(null);
+				this.encryptionService = null;
+				new Notice(t("notice.encryption_wrong_password"));
+			}
+		} catch (e) {
+			logger.warn("Error syncing encryption state with remote:", e);
+		}
+	}
+
+	/**
+	 * Get encryption service instance (may be null if disabled).
+	 */
+	getEncryptionService(): EncryptionService | null {
+		return this.encryptionService;
 	}
 
 	/**

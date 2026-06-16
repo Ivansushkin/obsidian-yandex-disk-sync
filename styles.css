@@ -153,17 +153,52 @@
 }
 
 .force-sync-modal-buttons:has(button) .setting-item-control {
-	flex-direction: row;
+	flex-direction: column;
 	justify-content: center;
-	align-items: center;
-	gap: 12px;
-}
-
-.force-sync-modal-buttons:has(button) .setting-item-control button {
-	width: auto;
+	align-items: stretch;
+	gap: 8px;
 }
 
 .force-sync-modal-buttons .setting-item-info {
 	display: none;
+}
+
+/* Encryption password modal */
+.encryption-password-input {
+	width: 100%;
+	margin-bottom: 8px;
+}
+
+.encryption-password-error {
+	color: var(--text-error);
+	margin-bottom: 8px;
+}
+
+.encryption-password-input.is-error {
+	border-color: var(--text-error);
+	box-shadow: 0 0 0 1px var(--text-error);
+}
+
+.encryption-info-warning {
+	color: var(--text-warning);
+	font-weight: 600;
+}
+
+.encryption-toggle-hidden {
+	display: none;
+}
+
+.encryption-toggle-spinner {
+	display: inline-block;
+	width: 1em;
+	height: 1em;
+	border: 2px solid var(--interactive-accent);
+	border-top-color: transparent;
+	border-radius: 50%;
+	animation: encryption-spin 0.6s linear infinite;
+}
+
+@keyframes encryption-spin {
+	to { transform: rotate(360deg); }
 }
 

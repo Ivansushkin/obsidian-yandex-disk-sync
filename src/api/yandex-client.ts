@@ -9,10 +9,12 @@ import type {
 	YandexDownloadLink,
 	YandexError,
 } from "../types";
+import type { EncryptionService } from "../crypto/encryption";
 import { logger } from "../utils/logger";
-import { encodePathForUrl } from "../utils/path-utils";
+import { encodePathForUrl, getFileName, getDirectory } from "../utils/path-utils";
 
 const API_BASE_URL = "https://cloud-api.yandex.net/v1/disk";
+const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
 
 export interface YandexClientConfig {
 	token: string;
@@ -25,6 +27,7 @@ export class YandexDiskClient {
 	private maxRetries: number;
 	private retryDelay: number;
 	private folderCache: Set<string> = new Set();
+	private encryptionService: EncryptionService | null = null;
 
 	constructor(config: YandexClientConfig) {
 		this.token = config.token;
@@ -37,6 +40,14 @@ export class YandexDiskClient {
 	 */
 	setToken(token: string): void {
 		this.token = token;
+	}
+
+	/**
+	 * Set encryption service for transparent encryption/decryption.
+	 * Pass null to disable encryption.
+	 */
+	setEncryptionService(service: EncryptionService | null): void {
+		this.encryptionService = service;
 	}
 
 	/**
@@ -58,6 +69,65 @@ export class YandexDiskClient {
 		}
 	}
 
+	// ============================================================================
+	// Encryption helpers
+	// ============================================================================
+
+	private async encryptContent(data: ArrayBuffer): Promise<ArrayBuffer> {
+		if (!this.encryptionService) return data;
+		return this.encryptionService.encrypt(data);
+	}
+
+	private async decryptContent(data: ArrayBuffer): Promise<ArrayBuffer> {
+		if (!this.encryptionService) return data;
+		return this.encryptionService.decrypt(data);
+	}
+
+	private async encryptFilePath(path: string): Promise<string> {
+		if (!this.encryptionService) return path;
+		const fileName = getFileName(path);
+		if (!fileName) return path;
+		if (fileName === REMOTE_INDEX_FILENAME) return path;
+		const encrypted = await this.encryptionService.encryptFilename(fileName);
+		const dir = getDirectory(path);
+		return dir ? `${dir}/${encrypted}` : encrypted;
+	}
+
+	private async decryptFileName(name: string): Promise<string> {
+		if (!this.encryptionService) return name;
+		try {
+			return await this.encryptionService.decryptFilename(name);
+		} catch {
+			return name;
+		}
+	}
+
+	private async decryptFilePath(path: string): Promise<string> {
+		if (!this.encryptionService) return path;
+		const fileName = getFileName(path);
+		if (!fileName) return path;
+		const decrypted = await this.decryptFileName(fileName);
+		const dir = getDirectory(path);
+		return dir ? `${dir}/${decrypted}` : decrypted;
+	}
+
+	private async decryptResource(resource: YandexResource): Promise<YandexResource> {
+		if (!this.encryptionService) return resource;
+		return {
+			...resource,
+			name: await this.decryptFileName(resource.name),
+			path: await this.decryptFilePath(resource.path),
+			_embedded: resource._embedded
+				? {
+						...resource._embedded,
+						items: await Promise.all(
+							resource._embedded.items.map((item) => this.decryptResource(item))
+						),
+					}
+				: undefined,
+		};
+	}
+
 	/**
 	 * Get resource information (file or folder)
 	 */
@@ -72,7 +142,8 @@ export class YandexDiskClient {
 				"GET",
 				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`
 			);
-			return response.json as YandexResource;
+			const resource = response.json as YandexResource;
+			return await this.decryptResource(resource);
 		} catch (e: unknown) {
 			if (this.isNotFoundError(e)) {
 				return null;
@@ -100,7 +171,6 @@ export class YandexDiskClient {
 					offset
 				);
 				if (!resource) break;
-
 				if (resource.type === "file") {
 					results.push(resource);
 					break;
@@ -206,9 +276,11 @@ export class YandexDiskClient {
 	 */
 	async getUploadLink(
 		path: string,
-		overwrite = true
+		overwrite = true,
+		raw = false
 	): Promise<YandexUploadLink> {
-		const encodedPath = encodePathForUrl(path);
+		const targetPath = raw ? path : await this.encryptFilePath(path);
+		const encodedPath = encodePathForUrl(targetPath);
 		const response = await this.request(
 			"GET",
 			`/resources/upload?path=${encodedPath}&overwrite=${overwrite}`
@@ -217,14 +289,16 @@ export class YandexDiskClient {
 	}
 
 	/**
-	 * Upload file to Yandex Disk
+	 * Upload file to Yandex Disk.
+	 * When `raw` is true, skips content and path encryption (for metadata files).
 	 */
 	async uploadFile(
 		remotePath: string,
 		content: ArrayBuffer | string,
-		skipFolderCheck = false
+		skipFolderCheck = false,
+		raw = false
 	): Promise<void> {
-		// Ensure parent folder exists (if not skipped)
+		// Ensure parent folder exists (if not skipped) — use plaintext parent path
 		if (!skipFolderCheck) {
 			const parentPath = remotePath.substring(
 				0,
@@ -235,19 +309,23 @@ export class YandexDiskClient {
 			}
 		}
 
-		// Get upload link
-		const uploadLink = await this.getUploadLink(remotePath);
-
-		// Upload file
 		const bytes =
 			typeof content === "string"
 				? new TextEncoder().encode(content)
 				: new Uint8Array(content);
 
+		const bodyContent = raw
+			? bytes.buffer
+			: await this.encryptContent(bytes.buffer);
+
+		// Get upload link with optionally encrypted path
+		const uploadLink = await this.getUploadLink(remotePath, true, raw);
+
+		// Upload file
 		await requestUrl({
 			url: uploadLink.href,
 			method: "PUT",
-			body: bytes.buffer,
+			body: bodyContent,
 			throw: true,
 		});
 
@@ -257,8 +335,9 @@ export class YandexDiskClient {
 	/**
 	 * Get download link for file
 	 */
-	async getDownloadLink(path: string): Promise<YandexDownloadLink> {
-		const encodedPath = encodePathForUrl(path);
+	async getDownloadLink(path: string, raw = false): Promise<YandexDownloadLink> {
+		const targetPath = raw ? path : await this.encryptFilePath(path);
+		const encodedPath = encodePathForUrl(targetPath);
 		const response = await this.request(
 			"GET",
 			`/resources/download?path=${encodedPath}`
@@ -267,10 +346,11 @@ export class YandexDiskClient {
 	}
 
 	/**
-	 * Download file from Yandex Disk
+	 * Download file from Yandex Disk.
+	 * When `raw` is true, skips path and content decryption (for metadata files).
 	 */
-	async downloadFile(remotePath: string): Promise<ArrayBuffer> {
-		const downloadLink = await this.getDownloadLink(remotePath);
+	async downloadFile(remotePath: string, raw = false): Promise<ArrayBuffer> {
+		const downloadLink = await this.getDownloadLink(remotePath, raw);
 
 		const response = await requestUrl({
 			url: downloadLink.href,
@@ -278,15 +358,25 @@ export class YandexDiskClient {
 			throw: true,
 		});
 
+		const result = raw
+			? response.arrayBuffer
+			: await this.decryptContent(response.arrayBuffer);
+
 		logger.debug(`Downloaded file: ${remotePath}`);
-		return response.arrayBuffer;
+		return result;
 	}
 
 	/**
-	 * Delete file or folder
+	 * Delete file or folder.
+	 * When `raw` is true, skips path encryption.
 	 */
-	async deleteResource(path: string, permanently = false): Promise<void> {
-		const encodedPath = encodePathForUrl(path);
+	async deleteResource(
+		path: string,
+		permanently = false,
+		raw = false
+	): Promise<void> {
+		const targetPath = raw ? path : await this.encryptFilePath(path);
+		const encodedPath = encodePathForUrl(targetPath);
 		try {
 			await this.request(
 				"DELETE",
@@ -309,10 +399,12 @@ export class YandexDiskClient {
 		toPath: string,
 		overwrite = false
 	): Promise<void> {
-		const encodedFrom = encodePathForUrl(fromPath);
-		const encodedTo = encodePathForUrl(toPath);
+		const encryptedFrom = await this.encryptFilePath(fromPath);
+		const encryptedTo = await this.encryptFilePath(toPath);
+		const encodedFrom = encodePathForUrl(encryptedFrom);
+		const encodedTo = encodePathForUrl(encryptedTo);
 
-		// Ensure target folder exists
+		// Ensure target folder exists — use plaintext parent path
 		const parentPath = toPath.substring(0, toPath.lastIndexOf("/"));
 		if (parentPath) {
 			await this.createFolderRecursive(parentPath);
@@ -333,8 +425,10 @@ export class YandexDiskClient {
 		toPath: string,
 		overwrite = false
 	): Promise<void> {
-		const encodedFrom = encodePathForUrl(fromPath);
-		const encodedTo = encodePathForUrl(toPath);
+		const encryptedFrom = await this.encryptFilePath(fromPath);
+		const encryptedTo = await this.encryptFilePath(toPath);
+		const encodedFrom = encodePathForUrl(encryptedFrom);
+		const encodedTo = encodePathForUrl(encryptedTo);
 
 		await this.request(
 			"POST",

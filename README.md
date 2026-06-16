@@ -2,28 +2,30 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-> **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**  
-> 
+> **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**
+>
 > **Legal Liability**  
 > The author is not responsible for the safety and security of your data. Install and use the plugin at your own risk. All plugin code is open source, and you can independently verify its security.
-> 
+>
 > **Data Security**  
 > The OAuth token is stored locally in Obsidian settings and is not transmitted to third parties. Never share your token with the developer or other persons. It is recommended to use a token with minimal necessary permissions (`cloud_api:disk.app_folder`).
-> 
-> **Yandex Disk API Limitations (as of this document's writing)**  
+>
+> **Yandex Disk API Limitations (as of this document's writing)**
+>
 > - **Maximum file size**: 50 GB (requires active Yandex 360 plan), for free version — 2 GB
 > - **Daily limit**: 750 GB of uploads per day per account
 > - **Free storage**: 5 GB (can be increased to 200 GB, 1 TB, or 3 TB with Yandex 360 plan)
-> 
-> **Synchronization Risks**  
+>
+> **Synchronization Risks**
+>
 > - In case of file conflicts, the newer version replaces the older one without creating copies
 > - Deleted files will be deleted on all devices during synchronization
 > - Automatic synchronization may lead to data loss with unstable internet connection
 > - Intensive API usage may lead to temporary account blocking by Yandex
-> 
+>
 > **Account Requirements**  
 > To upload files larger than 2 GB, an active Yandex 360 plan is required. The free version has limitations on file size and total storage.
-> 
+>
 > **Privacy**  
 > The plugin does not collect or transmit any of your data, file contents, or metadata to the developer. All operations occur locally on your device using the official Yandex Disk API.
 
@@ -38,6 +40,7 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 - **Multi-device support** — work under one token on different devices
 - **Backup system** — create ZIP backups of vault stored on Yandex Disk
 - **Force synchronization** — unconditional one-way overwrite (local→remote or remote→local) for recovery or manual resync
+- **End-to-end encryption** — AES-256-GCM encryption for file content and filenames with PBKDF2 key derivation
 
 ## Installation
 
@@ -80,6 +83,9 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 | **Include/Exclude patterns** | Glob patterns for file filtering                               | `*.md`, `attachments/*` |
 | **Force Sync**               | Unconditional one-way overwrite (local→remote / remote→local)  | —                       |
 | **Backup**                   | Create ZIP backups of synchronized files                       | Disabled (by default)   |
+| **Encryption**               | Enable end-to-end AES-256-GCM encryption                       | Disabled (by default)   |
+| **Encryption info**          | Information about encryption and password storage              | —                       |
+| **Change password**          | Change encryption password (when encryption is enabled)        | —                       |
 
 ## Commands
 
@@ -145,6 +151,29 @@ Force sync ignores timestamps, file hashes, and conflict resolver — it creates
 >
 > **Location**: Settings → Force Sync section.
 
+### Encryption
+
+The plugin supports end-to-end encryption of file content and filenames using **AES-256-GCM** with **PBKDF2** key derivation (100k iterations, HMAC-SHA256):
+
+- **Content encryption**: each file gets a random 12-byte IV, ensuring unique ciphertext even for identical files
+- **Filename encryption**: deterministic IV derived from the file path via SHA-256, so encrypted paths are stable across devices and sessions
+- **Key**: derived from your password + random 16-byte salt — the master key never leaves your device
+- **Multi-device**: salt is stored in a shared file `.obsidian-encrypt.json` on Yandex Disk (raw, unencrypted). When encryption is enabled on a new device, it auto-detects encrypted data, prompts for the password, and verifies it before enabling
+
+**How to enable**:
+1. Go to **Settings → Encryption section**
+2. Click the encryption toggle
+3. Choose whether to create a backup first
+4. Enter and confirm your password
+5. Wait for the initial encryption sync (all files are re-uploaded encrypted)
+
+**Password recovery**: The password is NOT recoverable. If you lose the password while encryption is enabled, your data on Yandex Disk becomes permanently inaccessible. Keep the password in a safe place (e.g., password manager).
+
+**Password storage**: The password is stored in `data.json` (Obsidian plugin config) as a plaintext string. It is never sent to Yandex or any third party.
+
+> **⚠️ Warning**
+> Enabling encryption will re-upload ALL files to Yandex Disk in encrypted form. Old plaintext files are permanently deleted from the remote. This operation cannot be undone without the password.
+
 ## Development
 
 ### Requirements
@@ -190,6 +219,7 @@ Detailed description of architecture and approaches see in [docs/ARCHITECTURE.md
 - When removing the plugin, the token is **not** automatically deleted — delete it manually from Obsidian settings
 - All network requests use HTTPS with certificate verification
 - User data is never collected or analyzed by the plugin developer
+- **End-to-end encryption**: file content and filenames are encrypted with AES-256-GCM before upload; the encryption key never leaves your device
 
 ## Limitations
 
@@ -221,10 +251,10 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ---
 
-**Last Updated**: June 16, 2026  
+**Last Updated**: June 17, 2026  
 **Version**: 1.0.0  
 **Supported Platforms**: Windows, macOS, Linux, iOS, Android  
-**Required Obsidian Version**: 1.0.0+  
+**Required Obsidian Version**: 1.0.0+
 
 > **ℹ️ Developer Note**  
 > This plugin is created by the community for the community. It is not an official product of Obsidian or Yandex. All trademarks and copyrights belong to their respective owners.

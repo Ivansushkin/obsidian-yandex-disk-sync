@@ -2,10 +2,11 @@
  * Yandex Disk Sync plugin settings
  */
 
-import { App, PluginSettingTab, Setting, TextAreaComponent } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, TextAreaComponent, ToggleComponent } from "obsidian";
 import type YandexDiskSyncPlugin from "./main";
 import { t } from "./i18n";
 import { BackupListModal } from "./ui/backup-list-modal";
+import { EnableEncryptionModal, DisableEncryptionModal, VerifyPasswordModal, ChangePasswordModal } from "./ui/encryption-modals";
 import type { BackupInfo } from "./types";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
@@ -241,6 +242,157 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						void this.plugin.runForceSyncFromRemote();
 					})
 			);
+
+		// Encryption section
+		new Setting(containerEl).setName(t("settings.encryption_section")).setHeading();
+
+		const infoSetting = new Setting(containerEl)
+			.setName(t("settings.encryption_info_title"))
+			.setDesc(t("settings.encryption_info_how"));
+
+		infoSetting.descEl.createEl("p", {
+			text: t("settings.encryption_info_warning"),
+			cls: "encryption-info-warning",
+		});
+
+		infoSetting.descEl.createEl("p", {
+			text: t("settings.encryption_info_password"),
+		});
+
+		let encryptionToggle: ToggleComponent | null = null;
+
+		const showToggleSpinner = (tgl: ToggleComponent): HTMLElement => {
+			tgl.setDisabled(true);
+			tgl.toggleEl.addClass("encryption-toggle-hidden");
+			return tgl.toggleEl.parentElement!.createSpan({ cls: "encryption-toggle-spinner" });
+		};
+
+		const hideToggleSpinner = (tgl: ToggleComponent, spinner: HTMLElement): void => {
+			spinner.remove();
+			tgl.toggleEl.removeClass("encryption-toggle-hidden");
+			tgl.setDisabled(false);
+		};
+
+		new Setting(containerEl)
+			.setName(t("settings.encryption_desc"))
+			.addToggle((toggle) => {
+				encryptionToggle = toggle;
+				return toggle
+					.setValue(this.plugin.settings.enableEncryption)
+					.onChange(async (value) => {
+						showToggleSpinner(toggle);
+
+						if (value && !this.plugin.settings.enableEncryption) {
+							const password = await new Promise<string | null>((resolve) => {
+								new EnableEncryptionModal(
+									this.app,
+									resolve,
+									() => this.plugin.createBackup()
+								).open();
+							});
+							if (!password) {
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
+								return;
+							}
+							const notice = new Notice(t("notice.encryption_syncing"), 0);
+							try {
+								await this.plugin.enableEncryption(password);
+								notice.hide();
+								new Notice(t("notice.encryption_enabled"));
+							} catch (e) {
+								notice.hide();
+								new Notice(e instanceof Error ? e.message : String(e));
+							}
+							// eslint-disable-next-line @typescript-eslint/no-deprecated
+							this.display();
+						} else if (!value && this.plugin.settings.enableEncryption) {
+							const currentPassword = await new Promise<string | null>((resolve) => {
+								new VerifyPasswordModal(
+									this.app,
+									resolve,
+									this.plugin.settings.encryptedPassword ?? ""
+								).open();
+							});
+							if (!currentPassword) {
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
+								return;
+							}
+
+							const confirmed = await new Promise<boolean>((resolve) => {
+								new DisableEncryptionModal(this.app, resolve).open();
+							});
+							if (!confirmed) {
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
+								return;
+							}
+							const notice = new Notice(t("notice.encryption_disabling"), 0);
+							try {
+								await this.plugin.disableEncryption({ reuploadPlaintext: true });
+								notice.hide();
+								new Notice(t("notice.encryption_disabled"));
+							} catch (e) {
+								notice.hide();
+								new Notice(e instanceof Error ? e.message : String(e));
+							}
+							// eslint-disable-next-line @typescript-eslint/no-deprecated
+							this.display();
+						}
+					})
+			});
+
+		if (this.plugin.settings.enableEncryption) {
+			new Setting(containerEl)
+				.setDesc(t("settings.encryption_status_active"))
+				.addButton((button) =>
+					button
+						.setButtonText(t("settings.encryption_change_password"))
+						.onClick(async () => {
+							let spinnerEl: HTMLElement | null = null;
+							if (encryptionToggle) {
+								spinnerEl = showToggleSpinner(encryptionToggle);
+							}
+
+							const currentPassword = await new Promise<string | null>((resolve) => {
+								new VerifyPasswordModal(
+									this.app,
+									resolve,
+									this.plugin.settings.encryptedPassword ?? ""
+								).open();
+							});
+							if (!currentPassword) {
+								if (spinnerEl && encryptionToggle) {
+									hideToggleSpinner(encryptionToggle, spinnerEl);
+								}
+								return;
+							}
+
+							const newPassword = await new Promise<string | null>((resolve) => {
+								new ChangePasswordModal(this.app, resolve).open();
+							});
+							if (!newPassword) {
+								if (spinnerEl && encryptionToggle) {
+									hideToggleSpinner(encryptionToggle, spinnerEl);
+								}
+								return;
+							}
+							const notice = new Notice(t("notice.encryption_syncing"), 0);
+							try {
+								await this.plugin.disableEncryption();
+								await this.plugin.enableEncryption(newPassword);
+								notice.hide();
+								new Notice(t("notice.encryption_enabled"));
+							} catch (e) {
+								notice.hide();
+								new Notice(e instanceof Error ? e.message : String(e));
+							}
+							// eslint-disable-next-line @typescript-eslint/no-deprecated
+							this.display();
+						})
+			);
+		}
 
 		// File filters section
 		new Setting(containerEl).setName(t("settings.file_filters_section")).setHeading();

@@ -22,3 +22,8 @@ data.json
 .DS_Store
 
 build
+
+# code agents
+.opencode
+.agents
+.claude
