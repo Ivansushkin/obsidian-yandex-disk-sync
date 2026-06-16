@@ -18,6 +18,7 @@ import { FileWatcher } from "./sync/file-watcher";
 import { SyncScheduler } from "./sync/sync-scheduler";
 import { SyncStatusBar } from "./ui/status-bar";
 import { SyncStatusModal, ConfirmModal } from "./ui/init-modal";
+import { ForceSyncModal } from "./ui/force-sync-modal";
 import { BackupManager } from "./backup/backup-manager";
 import { generateDeviceId } from "./utils/path-utils";
 import { logger } from "./utils/logger";
@@ -415,6 +416,134 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		} catch (e) {
 			logger.error("Sync error:", e);
 			new Notice(`Sync error: ${(e as Error).message}`);
+		}
+	}
+
+	/**
+	 * Show confirm modal for force sync operation
+	 */
+	private confirmForceSync(
+		direction: "from_local" | "from_remote"
+	): Promise<boolean> {
+		return new Promise((resolve) => {
+			new ForceSyncModal(
+				this.app,
+				direction,
+				async () => await this.createBackup(),
+				(action) => {
+					resolve(action === "proceed");
+				}
+			).open();
+		});
+	}
+
+	/**
+	 * Run force synchronization from local to remote
+	 */
+	async runForceSyncFromLocal(): Promise<void> {
+		if (!this.settings.yandexTokenSecret) {
+			new Notice(t("notice.token_missing"));
+			return;
+		}
+
+		const confirmed = await this.confirmForceSync("from_local");
+		if (!confirmed) {
+			return;
+		}
+
+		const notice = new Notice(t("notice.force_sync_from_local_started"), 600000);
+
+		try {
+			const result = await this.syncEngine.forceSyncFromLocal();
+
+			this.lastSyncStats = {
+				uploaded: result.uploaded,
+				downloaded: result.downloaded,
+				deleted: result.deleted,
+				errors: result.errors.length,
+			};
+
+			await this.saveData({
+				settings: this.settings,
+				localIndex: this.indexManager.getLocalIndex(),
+				lastSyncStats: this.lastSyncStats,
+			} as PluginData);
+
+			notice.hide();
+
+			if (result.success) {
+				new Notice(
+					t("notice.force_sync_completed", {
+						successful:
+							result.uploaded +
+							result.downloaded +
+							result.deleted,
+					})
+				);
+			} else {
+				new Notice(
+					t("notice.sync_error", { errors: result.errors.length })
+				);
+			}
+		} catch (e) {
+			notice.hide();
+			logger.error("Force sync error:", e);
+			new Notice(`Force sync error: ${(e as Error).message}`);
+		}
+	}
+
+	/**
+	 * Run force synchronization from remote to local
+	 */
+	async runForceSyncFromRemote(): Promise<void> {
+		if (!this.settings.yandexTokenSecret) {
+			new Notice(t("notice.token_missing"));
+			return;
+		}
+
+		const confirmed = await this.confirmForceSync("from_remote");
+		if (!confirmed) {
+			return;
+		}
+
+		const notice = new Notice(t("notice.force_sync_from_remote_started"), 600000);
+
+		try {
+			const result = await this.syncEngine.forceSyncFromRemote();
+
+			this.lastSyncStats = {
+				uploaded: result.uploaded,
+				downloaded: result.downloaded,
+				deleted: result.deleted,
+				errors: result.errors.length,
+			};
+
+			await this.saveData({
+				settings: this.settings,
+				localIndex: this.indexManager.getLocalIndex(),
+				lastSyncStats: this.lastSyncStats,
+			} as PluginData);
+
+			notice.hide();
+
+			if (result.success) {
+				new Notice(
+					t("notice.force_sync_completed", {
+						successful:
+							result.uploaded +
+							result.downloaded +
+							result.deleted,
+					})
+				);
+			} else {
+				new Notice(
+					t("notice.sync_error", { errors: result.errors.length })
+				);
+			}
+		} catch (e) {
+			notice.hide();
+			logger.error("Force sync error:", e);
+			new Notice(`Force sync error: ${(e as Error).message}`);
 		}
 	}
 

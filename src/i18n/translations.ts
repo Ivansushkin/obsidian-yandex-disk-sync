@@ -147,6 +147,26 @@ export const translations: Record<Language, Record<string, string>> = {
         'generic.none': 'None',
         'generic.unknown': 'Unknown',
 
+        // Force sync
+        'settings.force_sync_section': 'Force Sync',
+        'settings.force_sync_desc': 'Force synchronization ignores all conditions (timestamps, file hashes, indexes). Creates an exact copy in the specified direction.',
+        'settings.force_sync_from_local_name': 'From local to remote',
+        'settings.force_sync_from_local_desc': 'Overwrite ALL files on Yandex Disk with local versions. Files not present locally will be deleted from disk.',
+        'settings.force_sync_from_local_button': 'Sync from local → remote',
+        'settings.force_sync_from_remote_name': 'From remote to local',
+        'settings.force_sync_from_remote_desc': 'Overwrite ALL local files with versions from Yandex Disk. Files not present on disk will be deleted locally.',
+        'settings.force_sync_from_remote_button': 'Sync from remote → local',
+        'modal.force_sync_title': 'Force sync confirmation',
+        'modal.force_sync_from_local_text': 'This operation will overwrite ALL files on Yandex Disk with local versions. Files that exist only on Yandex Disk will be permanently deleted.',
+        'modal.force_sync_from_remote_text': 'This operation will overwrite ALL local files with versions from Yandex Disk. Local files that do not exist on Yandex Disk will be permanently deleted.',
+        'modal.force_sync_warning': 'WARNING: This operation is destructive and cannot be undone. Changes made after the sync on the overwritten side may be lost.',
+        'modal.force_sync_recommend_backup': 'It is strongly recommended to create a backup before proceeding.',
+        'modal.force_sync_backup_button': 'Create backup and proceed',
+        'modal.force_sync_proceed_button': 'Proceed without backup',
+        'notice.force_sync_from_local_started': 'Forcing sync from local to remote...',
+        'notice.force_sync_from_remote_started': 'Forcing sync from remote to local...',
+        'notice.force_sync_completed': 'Force sync completed! ({successful} operations)',
+
         // Diagnostics
         'diag.sync_completed': 'Synchronization completed successfully',
         'diag.sync_failed': 'Synchronization failed',
@@ -300,6 +320,26 @@ export const translations: Record<Language, Record<string, string>> = {
         'generic.exists': 'Есть',
         'generic.none': 'Нет',
         'generic.unknown': 'Неизвестно',
+
+        // Force sync
+        'settings.force_sync_section': 'Принудительная синхронизация',
+        'settings.force_sync_desc': 'Принудительная синхронизация игнорирует все условия (даты, хеши файлов, индексы). Создаёт точную копию в указанном направлении.',
+        'settings.force_sync_from_local_name': 'Из локального в удалённое',
+        'settings.force_sync_from_local_desc': 'Перезаписать ВСЕ файлы на Яндекс.Диске локальными версиями. Файлы, отсутствующие локально, будут удалены с диска.',
+        'settings.force_sync_from_local_button': 'Синхр. локальное → удалённое',
+        'settings.force_sync_from_remote_name': 'Из удалённого в локальное',
+        'settings.force_sync_from_remote_desc': 'Перезаписать ВСЕ локальные файлы версиями с Яндекс.Диска. Файлы, отсутствующие на диске, будут удалены локально.',
+        'settings.force_sync_from_remote_button': 'Синхр. удалённое → локальное',
+        'modal.force_sync_title': 'Подтверждение принудительной синхронизации',
+        'modal.force_sync_from_local_text': 'Эта операция перезапишет ВСЕ файлы на Яндекс.Диске локальными версиями. Файлы, которые существуют только на Яндекс.Диске, будут безвозвратно удалены.',
+        'modal.force_sync_from_remote_text': 'Эта операция перезапишет ВСЕ локальные файлы версиями с Яндекс.Диска. Локальные файлы, которых нет на Яндекс.Диске, будут безвозвратно удалены.',
+        'modal.force_sync_warning': 'ВНИМАНИЕ: Операция является деструктивной и не может быть отменена. Изменения, сделанные после синхронизации на перезаписываемой стороне, могут быть потеряны.',
+        'modal.force_sync_recommend_backup': 'Настоятельно рекомендуется создать бекап перед выполнением.',
+        'modal.force_sync_backup_button': 'Создать бекап и продолжить',
+        'modal.force_sync_proceed_button': 'Продолжить без бекапа',
+        'notice.force_sync_from_local_started': 'Принудительная синхронизация из локального в удалённое...',
+        'notice.force_sync_from_remote_started': 'Принудительная синхронизация из удалённого в локальное...',
+        'notice.force_sync_completed': 'Принудительная синхронизация завершена! ({successful} операций)',
 
         // Diagnostics
         'diag.sync_completed': 'Синхронизация успешно завершена',

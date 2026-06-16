@@ -37,6 +37,7 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 - **Flexible filters** — configurable include/exclude file patterns
 - **Multi-device support** — work under one token on different devices
 - **Backup system** — create ZIP backups of vault stored on Yandex Disk
+- **Force synchronization** — unconditional one-way overwrite (local→remote or remote→local) for recovery or manual resync
 
 ## Installation
 
@@ -77,6 +78,7 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 | **Sync delay**               | Delay before uploading file after change (debounce)            | 5 seconds               |
 | **Sync config folder**       | Synchronize Obsidian settings folder                           | Disabled (by default)   |
 | **Include/Exclude patterns** | Glob patterns for file filtering                               | `*.md`, `attachments/*` |
+| **Force Sync**               | Unconditional one-way overwrite (local→remote / remote→local)  | —                       |
 | **Backup**                   | Create ZIP backups of synchronized files                       | Disabled (by default)   |
 
 ## Commands
@@ -128,6 +130,20 @@ Plugin includes built-in backup system for creating ZIP archives of your vault:
 - **Sync**: Last backup time is synchronized between devices
 
 **Note**: `.backup` folder is protected and excluded from synchronization operations.
+
+### Force Synchronization
+
+The plugin includes a **Force Sync** feature for cases when normal two-way sync is not sufficient:
+
+- **Sync from local → remote**: overwrites ALL files on Yandex Disk with local versions. Files not present locally are deleted from the remote.
+- **Sync from remote → local**: overwrites ALL local files with versions from Yandex Disk. Files not present on the remote are deleted locally.
+
+Force sync ignores timestamps, file hashes, and conflict resolver — it creates an exact copy in the chosen direction.
+
+> **⚠️ Warning**
+> Force sync is destructive. The overwritten side is fully replaced. Create a backup before proceeding.
+>
+> **Location**: Settings → Force Sync section.
 
 ## Development
 
@@ -205,7 +221,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ---
 
-**Last Updated**: January 26, 2026  
+**Last Updated**: June 16, 2026  
 **Version**: 1.0.0  
 **Supported Platforms**: Windows, macOS, Linux, iOS, Android  
 **Required Obsidian Version**: 1.0.0+  

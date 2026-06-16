@@ -143,3 +143,27 @@
 	min-width: 70px;
 }
 
+/* Force sync modal warning */
+.force-sync-warning {
+	background: var(--background-modifier-error);
+	color: var(--text-on-accent);
+	padding: 12px;
+	border-radius: 4px;
+	margin-bottom: 16px;
+}
+
+.force-sync-modal-buttons:has(button) .setting-item-control {
+	flex-direction: row;
+	justify-content: center;
+	align-items: center;
+	gap: 12px;
+}
+
+.force-sync-modal-buttons:has(button) .setting-item-control button {
+	width: auto;
+}
+
+.force-sync-modal-buttons .setting-item-info {
+	display: none;
+}
+

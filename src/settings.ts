@@ -222,6 +222,28 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
+		// Force Sync section
+		new Setting(containerEl).setName(t("settings.force_sync_section")).setHeading();
+
+		new Setting(containerEl)
+			.setDesc(t("settings.force_sync_desc"))
+			.addButton((button) =>
+				button
+					.setButtonText(t("settings.force_sync_from_local_button"))
+					.setCta()
+					.onClick(() => {
+						void this.plugin.runForceSyncFromLocal();
+					})
+			)
+			.addButton((button) =>
+				button
+					.setButtonText(t("settings.force_sync_from_remote_button"))
+					.setCta()
+					.onClick(() => {
+						void this.plugin.runForceSyncFromRemote();
+					})
+			);
+
 		// File filters section
 		new Setting(containerEl).setName(t("settings.file_filters_section")).setHeading();
 
@@ -330,5 +352,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					new BackupListModal(this.app, this.plugin.getBackupManager()).open();
 				})
 			);
+
 	}
 }
