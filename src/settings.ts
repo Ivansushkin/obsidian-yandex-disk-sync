@@ -24,7 +24,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			}
 			const backups: BackupInfo[] = await backupManager.listBackups();
 			if (backups.length > 0) {
-				// Show the most recent backup date
 				const backup = backups[0];
 				if (backup) {
 					return backup.created.toLocaleString();
@@ -65,7 +64,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setButtonText(t("settings.get_token"))
 					.setDisabled(!this.plugin.settings.clientId?.trim())
 					.onClick(() => {
-						// Get current value from settings at click time
 						const clientId = this.plugin.settings.clientId?.trim();
 						if (clientId) {
 							const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
@@ -78,10 +76,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					button.setDisabled(true);
 					button.setButtonText(t("settings.syncing_button"));
 					try {
-						// First test connection
 						const result = await this.plugin.testConnection();
 						if (!result.success) {
-							// If test failed, show error and stop
 							button.setButtonText(t("settings.sync_error_button"));
 							setTimeout(() => {
 								button.setDisabled(false);
@@ -90,7 +86,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 							return;
 						}
 
-						// If test succeeded, run full sync
 						await this.plugin.runFullSync();
 						button.setButtonText(t("settings.sync_success_button"));
 					} catch {
@@ -128,7 +123,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.clientId = value;
 						await this.plugin.saveSettings();
-						// Fully redraw settings to update button state
+						// eslint-disable-next-line @typescript-eslint/no-deprecated
 						this.display();
 					})
 			);
@@ -185,6 +180,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				slider
 					.setLimits(0, 60, 1)
 					.setValue(this.plugin.settings.syncInterval)
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.plugin.settings.syncInterval = value;
@@ -200,6 +196,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				slider
 					.setLimits(500, 10000, 500)
 					.setValue(this.plugin.settings.debounceDelay)
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.plugin.settings.debounceDelay = value;
@@ -215,6 +212,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				slider
 					.setLimits(1, 20, 1)
 					.setValue(this.plugin.settings.maxConcurrency)
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.plugin.settings.maxConcurrency = value;
@@ -330,7 +328,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 						if (result.success) {
 							button.setButtonText(t("settings.backup_success"));
-							// Update display to show new backup
+							// eslint-disable-next-line @typescript-eslint/no-deprecated
 							this.display();
 						} else {
 							button.setButtonText(t("settings.backup_error"));
@@ -340,7 +338,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						console.error("Backup failed:", error);
 					}
 
-					// Re-enable button after delay
 					setTimeout(() => {
 						button.setDisabled(false);
 						button.setButtonText(t("settings.backup_button"));
