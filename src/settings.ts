@@ -42,7 +42,14 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		return t("settings.backup_never");
 	}
 
+	hide(): void {
+		this.plugin.encryptionStateChangeCallback = null;
+		super.hide();
+	}
+
 	display(): void {
+		// eslint-disable-next-line @typescript-eslint/no-deprecated
+		this.plugin.encryptionStateChangeCallback = () => { this.display(); };
 		const { containerEl } = this;
 		containerEl.empty();
 
@@ -372,9 +379,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 							}
 							const notice = new Notice(t("notice.encryption_disabling"), 0);
 							try {
-								await this.plugin.disableEncryption({ reuploadPlaintext: true });
+								const { hadErrors } = await this.plugin.disableEncryption({ reuploadPlaintext: true });
 								notice.hide();
-								new Notice(t("notice.encryption_disabled"));
+								if (!hadErrors) {
+									new Notice(t("notice.encryption_disabled"));
+								}
 							} catch (e) {
 								notice.hide();
 								new Notice(e instanceof Error ? e.message : String(e));

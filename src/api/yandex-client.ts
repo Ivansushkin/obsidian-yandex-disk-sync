@@ -11,11 +11,9 @@ import type {
 } from "../types";
 import type { EncryptionService } from "../crypto/encryption";
 import { logger } from "../utils/logger";
-import { encodePathForUrl, getFileName, getDirectory } from "../utils/path-utils";
+import { encodePathForUrl, isProtectedPath, normalizePath } from "../utils/path-utils";
 
 const API_BASE_URL = "https://cloud-api.yandex.net/v1/disk";
-const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
-const ENCRYPTION_MANIFEST_FILENAME = ".obsidian-encrypt.json";
 
 export interface YandexClientConfig {
 	token: string;
@@ -29,6 +27,7 @@ export class YandexDiskClient {
 	private retryDelay: number;
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionService | null = null;
+	private remotePath = "";
 
 	constructor(config: YandexClientConfig) {
 		this.token = config.token;
@@ -49,6 +48,15 @@ export class YandexDiskClient {
 	 */
 	setEncryptionService(service: EncryptionService | null): void {
 		this.encryptionService = service;
+	}
+
+	/**
+	 * Set the remote base path. Required for segment-wise path encryption:
+	 * the base path itself is never encrypted (it hosts service files and is
+	 * the entry point for traversal), only segments below it are.
+	 */
+	setRemotePath(remotePath: string): void {
+		this.remotePath = normalizePath(remotePath);
 	}
 
 	/**
@@ -84,14 +92,27 @@ export class YandexDiskClient {
 		return this.encryptionService.decrypt(data);
 	}
 
+	/**
+	 * Encrypt a remote path segment by segment. The base path is left intact;
+	 * only the segments below it are encrypted. Protected paths (service files,
+	 * backups) are returned unchanged so traversal entry points stay readable.
+	 */
 	private async encryptFilePath(path: string): Promise<string> {
 		if (!this.encryptionService) return path;
-		const fileName = getFileName(path);
-		if (!fileName) return path;
-		if (fileName === REMOTE_INDEX_FILENAME || fileName === ENCRYPTION_MANIFEST_FILENAME) return path;
-		const encrypted = await this.encryptionService.encryptFilename(fileName);
-		const dir = getDirectory(path);
-		return dir ? `${dir}/${encrypted}` : encrypted;
+		if (isProtectedPath(path)) return path;
+
+		const base = this.remotePath;
+		const full = normalizePath(path);
+		if (!full || full === base) return path;
+
+		const hasBase = base !== "" && full.startsWith(base + "/");
+		const relative = hasBase ? full.slice(base.length + 1) : full;
+
+		const encrypted = await Promise.all(
+			relative.split("/").map((seg) => this.encryptionService!.encryptFilename(seg))
+		);
+		const joined = encrypted.join("/");
+		return hasBase ? `${base}/${joined}` : joined;
 	}
 
 	private async decryptFileName(name: string): Promise<string> {
@@ -103,13 +124,29 @@ export class YandexDiskClient {
 		}
 	}
 
+	/**
+	 * Decrypt a remote path segment by segment, mirroring encryptFilePath().
+	 * Handles the Yandex "disk:/" prefix and leaves the base path and protected
+	 * paths intact. Individual segments fall back to their raw value if they are
+	 * not valid ciphertext (handled inside decryptFileName).
+	 */
 	private async decryptFilePath(path: string): Promise<string> {
 		if (!this.encryptionService) return path;
-		const fileName = getFileName(path);
-		if (!fileName) return path;
-		const decrypted = await this.decryptFileName(fileName);
-		const dir = getDirectory(path);
-		return dir ? `${dir}/${decrypted}` : decrypted;
+		if (isProtectedPath(path)) return path;
+
+		const diskPrefix = path.startsWith("disk:/") ? "disk:/" : "";
+		const clean = normalizePath(path.replace(/^disk:\//, ""));
+		const base = normalizePath(this.remotePath.replace(/^disk:\//, ""));
+		if (!clean || clean === base) return path;
+
+		const hasBase = base !== "" && clean.startsWith(base + "/");
+		const relative = hasBase ? clean.slice(base.length + 1) : clean;
+
+		const decrypted = await Promise.all(
+			relative.split("/").map((seg) => this.decryptFileName(seg))
+		);
+		const joined = decrypted.join("/");
+		return hasBase ? `${diskPrefix}${base}/${joined}` : `${diskPrefix}${joined}`;
 	}
 
 	private async decryptResource(resource: YandexResource): Promise<YandexResource> {
@@ -170,15 +207,18 @@ export class YandexDiskClient {
 			const limit = 1000;
 
 			while (true) {
+				// Always fetch raw: directory paths must stay encrypted so the
+				// next traversal request hits the correct remote path. Only file
+				// results are decrypted before being returned to the caller.
 				const resource = await this.getResource(
 					currentPath,
 					limit,
 					offset,
-					raw
+					true
 				);
 				if (!resource) break;
 				if (resource.type === "file") {
-					results.push(resource);
+					results.push(raw ? resource : await this.decryptResource(resource));
 					break;
 				}
 
@@ -187,7 +227,7 @@ export class YandexDiskClient {
 						if (item.type === "dir") {
 							queue.push(item.path);
 						} else {
-							results.push(item);
+							results.push(raw ? item : await this.decryptResource(item));
 						}
 					}
 
@@ -249,10 +289,16 @@ export class YandexDiskClient {
 	 * Ensure multiple folders exist (optimized batch creation)
 	 */
 	async ensureFoldersExist(paths: string[]): Promise<void> {
+		// Encrypt folder paths so intermediate levels are created with their
+		// encrypted names. Each level is an independently-encrypted segment.
+		const effectivePaths = this.encryptionService
+			? await Promise.all(paths.map((p) => this.encryptFilePath(p)))
+			: paths;
+
 		// Collect all unique folder paths including parent folders
 		const allFolders = new Set<string>();
 
-		for (const path of paths) {
+		for (const path of effectivePaths) {
 			const parts = path.split("/").filter(Boolean);
 			let currentPath = "";
 
@@ -304,11 +350,15 @@ export class YandexDiskClient {
 		skipFolderCheck = false,
 		raw = false
 	): Promise<void> {
-		// Ensure parent folder exists (if not skipped) — use plaintext parent path
+		// Ensure parent folder exists (if not skipped) — derive the parent from
+		// the encrypted target path so encrypted folder segments are created.
 		if (!skipFolderCheck) {
-			const parentPath = remotePath.substring(
+			const encryptedPath = raw
+				? remotePath
+				: await this.encryptFilePath(remotePath);
+			const parentPath = encryptedPath.substring(
 				0,
-				remotePath.lastIndexOf("/")
+				encryptedPath.lastIndexOf("/")
 			);
 			if (parentPath) {
 				await this.createFolderRecursive(parentPath);
@@ -410,8 +460,8 @@ export class YandexDiskClient {
 		const encodedFrom = encodePathForUrl(encryptedFrom);
 		const encodedTo = encodePathForUrl(encryptedTo);
 
-		// Ensure target folder exists — use plaintext parent path
-		const parentPath = toPath.substring(0, toPath.lastIndexOf("/"));
+		// Ensure target folder exists — derive parent from the encrypted path.
+		const parentPath = encryptedTo.substring(0, encryptedTo.lastIndexOf("/"));
 		if (parentPath) {
 			await this.createFolderRecursive(parentPath);
 		}

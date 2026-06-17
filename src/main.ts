@@ -68,6 +68,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private encryptionService: EncryptionService | null = null;
 	private encryptionBlockReason: string | null = null;
 	private encryptionPromptPromise: Promise<boolean> | null = null;
+	/** Called whenever the encryption enabled/disabled state changes so UI can refresh. */
+	encryptionStateChangeCallback: (() => void) | null = null;
 
 	async onload(): Promise<void> {
 		// Initialize i18n service
@@ -142,6 +144,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.yandexClient = new YandexDiskClient({
 			token: this.settings.yandexTokenSecret,
 		});
+		this.yandexClient.setRemotePath(this.settings.remotePath);
 
 		// Create vault adapter
 		this.vaultAdapter = new VaultAdapter(this.app, this.settings);
@@ -658,6 +661,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Update components
 		if (this.yandexClient) {
 			this.yandexClient.setToken(this.settings.yandexTokenSecret);
+			this.yandexClient.setRemotePath(this.settings.remotePath);
 		}
 		if (this.vaultAdapter) {
 			this.vaultAdapter.updateSettings(this.settings);
@@ -756,12 +760,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		);
 
 		logger.info("Re-uploading all files with encryption...");
-		const result = await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+		const result = await this.syncEngine.forceSyncFromLocal({
+			skipEncryptionGuard: true,
+			skipRemoteDeletes: true,
+		});
 		if (!result.success) {
 			throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
 		}
 
 		await this.deleteRemoteRawPaths(oldRawPaths);
+		await this.deleteRemoteRawFolders(oldRawPaths);
 		await this.indexManager.uploadEncryptionManifest(
 			await this.createEncryptionManifest(service, saltBase64, "enabled", revision)
 		);
@@ -778,47 +786,90 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 *
 	 * When `reuploadPlaintext` is false, only clears local encryption settings.
 	 */
-	async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<void> {
+	async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<{ hadErrors: boolean }> {
+		let partialErrors = false;
+
 		if (options?.reuploadPlaintext) {
+			// Capture encrypted paths while service is still active
+			const oldRawPaths = await this.indexManager.getRemoteRawFilePaths();
+
 			if (this.encryptionService && this.settings.encryptionSalt) {
 				const revision = this.settings.encryptionRevision ?? 1;
-				await this.indexManager.uploadEncryptionManifest(
-					await this.createEncryptionManifest(
-						this.encryptionService,
-						this.settings.encryptionSalt,
-						"disabling",
-						revision
-					)
-				);
+				try {
+					await this.indexManager.uploadEncryptionManifest(
+						await this.createEncryptionManifest(
+							this.encryptionService,
+							this.settings.encryptionSalt,
+							"disabling",
+							revision
+						)
+					);
+				} catch (e) {
+					logger.warn("Failed to upload disabling manifest:", e);
+					partialErrors = true;
+				}
 			}
 
 			this.encryptionService = null;
 			this.yandexClient.setEncryptionService(null);
+
 			logger.info("Re-uploading all files as plaintext...");
-			const result = await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+			const result = await this.syncEngine.forceSyncFromLocal({
+				skipEncryptionGuard: true,
+				skipRemoteDeletes: true,
+			});
 			if (!result.success) {
-				throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
+				logger.warn(`Disable re-upload completed with ${result.errors.length} errors`);
+				partialErrors = true;
 			}
+
+			// Bulk cleanup of old encrypted files and folders — sequential, no concurrent
+			// folder-delete race. Both helpers suppress individual errors internally.
+			await this.deleteRemoteRawPaths(oldRawPaths);
+			await this.deleteRemoteRawFolders(oldRawPaths);
 		} else {
 			this.encryptionService = null;
 			this.yandexClient.setEncryptionService(null);
 		}
 
+		// Always clear local encryption state regardless of remote errors
 		this.settings.enableEncryption = false;
 		this.settings.encryptionSalt = null;
 		this.settings.encryptedPassword = null;
 		this.settings.encryptionRevision = null;
 		await this.saveSettings();
 
-		// Remove manifest from remote
 		try {
 			await this.indexManager.deleteEncryptionManifest();
 		} catch (e) {
 			logger.warn("Failed to delete encryption manifest from remote:", e);
+			partialErrors = true;
 		}
 
 		this.setEncryptionBlock(null);
 		logger.info("Encryption disabled");
+
+		if (partialErrors) {
+			new Notice(t("notice.encryption_disable_partial"), 30000);
+		}
+
+		return { hadErrors: partialErrors };
+	}
+
+	/**
+	 * Clear local encryption settings and service without touching remote state.
+	 * Used when remote state already reflects the disabled encryption (e.g. another
+	 * device disabled it) so there is nothing to clean up on the server side.
+	 */
+	private async clearLocalEncryptionState(): Promise<void> {
+		this.encryptionService = null;
+		this.yandexClient.setEncryptionService(null);
+		this.settings.enableEncryption = false;
+		this.settings.encryptionSalt = null;
+		this.settings.encryptedPassword = null;
+		this.settings.encryptionRevision = null;
+		await this.saveSettings();
+		this.setEncryptionBlock(null);
 	}
 
 	/**
@@ -856,12 +907,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.saveSettings();
 
 		logger.info("Re-uploading all files after encryption password rotation...");
-		const result = await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+		const result = await this.syncEngine.forceSyncFromLocal({
+			skipEncryptionGuard: true,
+			skipRemoteDeletes: true,
+		});
 		if (!result.success) {
 			throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
 		}
 
 		await this.deleteRemoteRawPaths(oldRawPaths);
+		await this.deleteRemoteRawFolders(oldRawPaths);
 		await this.indexManager.uploadEncryptionManifest(
 			await this.createEncryptionManifest(service, saltBase64, "enabled", revision)
 		);
@@ -927,10 +982,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const manifest = await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
 				if (this.settings.enableEncryption) {
-					this.setEncryptionBlock(t("notice.encryption_remote_missing"));
-					return false;
+					// Encryption was disabled on another device — auto-sync local state
+					logger.info("Remote encryption manifest gone; auto-disabling local encryption");
+					await this.clearLocalEncryptionState();
+					new Notice(t("notice.encryption_disabled_remotely"), 10000);
+					this.encryptionStateChangeCallback?.();
 				}
-				this.setEncryptionBlock(null);
 				return true;
 			}
 
@@ -1034,6 +1091,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		try {
 			await this.connectToRemoteEncryption(password, manifest);
 			new Notice(t("notice.encryption_connected"));
+			this.encryptionStateChangeCallback?.();
 			return true;
 		} catch (e) {
 			this.encryptionService = null;
@@ -1123,6 +1181,42 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				await this.yandexClient.deleteResource(remotePath, false, true);
 			} catch (e) {
 				logger.warn(`Failed to delete old remote file ${path}:`, e);
+			}
+		}
+	}
+
+	/**
+	 * Delete remote folders that were parents of the given raw file paths.
+	 * Used during encryption enable/rotate where the remote index already
+	 * reflects the new key and cannot be used to verify emptiness. Since
+	 * deleteRemoteRawPaths removed all files beforehand, the folders are
+	 * guaranteed to be empty. Deletes deepest first so children are gone
+	 * before parents are attempted.
+	 */
+	private async deleteRemoteRawFolders(rawFilePaths: string[]): Promise<void> {
+		if (rawFilePaths.length === 0) return;
+
+		const folders = new Set<string>();
+		for (const filePath of rawFilePaths) {
+			const segments = filePath.split("/");
+			for (let i = 1; i < segments.length; i++) {
+				folders.add(segments.slice(0, i).join("/"));
+			}
+		}
+		if (folders.size === 0) return;
+
+		const sorted = Array.from(folders).sort(
+			(a, b) => b.split("/").length - a.split("/").length
+		);
+
+		logger.info(`Cleaning up ${sorted.length} old remote folders...`);
+		for (const folder of sorted) {
+			try {
+				const remotePath = joinPath(this.settings.remotePath, folder);
+				await this.yandexClient.deleteResource(remotePath, false, true);
+				logger.debug(`Deleted old remote folder: ${folder}`);
+			} catch (e) {
+				logger.warn(`Failed to delete old remote folder ${folder}:`, e);
 			}
 		}
 	}

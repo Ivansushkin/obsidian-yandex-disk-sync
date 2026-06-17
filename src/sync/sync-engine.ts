@@ -27,6 +27,12 @@ export type SyncGuardCallback = () => string | null | Promise<string | null>;
 export interface SyncRunOptions {
 	/** Skip encryption state guard for internal encryption maintenance flows. */
 	skipEncryptionGuard?: boolean;
+	/**
+	 * Skip generation of delete_remote operations. Used by encryption transition
+	 * flows where remote cleanup of stale paths is handled separately as a bulk
+	 * operation, avoiding race conditions from concurrent folder deletions.
+	 */
+	skipRemoteDeletes?: boolean;
 }
 
 export class SyncEngine {
@@ -559,14 +565,16 @@ export class SyncEngine {
 				});
 			}
 
-			for (const [path, meta] of remoteFiles) {
-				if (!localFiles.has(path)) {
-					operations.push({
-						action: "delete_remote",
-						path,
-						reason: "Force sync from local: file not present locally",
-						remoteMeta: meta,
-					});
+			if (!options?.skipRemoteDeletes) {
+				for (const [path, meta] of remoteFiles) {
+					if (!localFiles.has(path)) {
+						operations.push({
+							action: "delete_remote",
+							path,
+							reason: "Force sync from local: file not present locally",
+							remoteMeta: meta,
+						});
+					}
 				}
 			}
 
@@ -1105,6 +1113,45 @@ export class SyncEngine {
 		// Update indexes
 		this.indexManager.markRemoteFileDeleted(path);
 		this.indexManager.removeFromLocalIndex(path);
+
+		// Remove parent folders that became empty after this deletion
+		await this.pruneRemoteFolders([path]);
+	}
+
+	/**
+	 * Delete remote folders that became empty after file deletions.
+	 * Uses the in-memory remote index to determine emptiness — no extra API
+	 * calls needed. Must be called after index updates so the index reflects
+	 * the current state. Deletes deepest directories first so children are
+	 * removed before their parents.
+	 */
+	private async pruneRemoteFolders(localPaths: string[]): Promise<void> {
+		const candidates = new Set<string>();
+		for (const filePath of localPaths) {
+			const segments = filePath.split("/");
+			for (let i = 1; i < segments.length; i++) {
+				candidates.add(segments.slice(0, i).join("/"));
+			}
+		}
+		if (candidates.size === 0) return;
+
+		const remoteFiles = this.indexManager.getRemoteIndex().files;
+		const emptyDirs = Array.from(candidates).filter((dir) => {
+			const prefix = dir + "/";
+			return !Object.keys(remoteFiles).some(
+				(fp) => !remoteFiles[fp]?.deleted && fp.startsWith(prefix)
+			);
+		});
+		if (emptyDirs.length === 0) return;
+
+		emptyDirs.sort((a, b) => b.split("/").length - a.split("/").length);
+
+		for (const dir of emptyDirs) {
+			await this.yandexClient.deleteResource(
+				joinPath(this.settings.remotePath, dir)
+			);
+			logger.debug(`[SyncEngine] Pruned empty remote folder: ${dir}`);
+		}
 	}
 
 	/**
@@ -1278,6 +1325,9 @@ export class SyncEngine {
 			// Add new file to indexes
 			this.indexManager.updateLocalFile(newPath, newMetadata);
 			this.indexManager.updateRemoteFile(newPath, newMetadata);
+
+			// Remove source folders that became empty after the move
+			await this.pruneRemoteFolders([oldPath]);
 
 			// Save remote index after rename
 			await this.indexManager.saveRemoteIndex();

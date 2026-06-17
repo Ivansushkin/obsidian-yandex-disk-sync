@@ -22,6 +22,16 @@ export class EncryptionService {
 	private key: CryptoKey | null = null;
 	private readonly salt: Uint8Array;
 
+	/**
+	 * Per-instance caches for deterministic filename encryption/decryption.
+	 * Since each password/salt change creates a new EncryptionService instance,
+	 * these caches are automatically scoped to the current key and never need
+	 * manual invalidation. They eliminate redundant crypto work when the same
+	 * path segment (e.g. a folder name) is processed many times during sync.
+	 */
+	private filenameEncCache = new Map<string, string>();
+	private filenameDecCache = new Map<string, string>();
+
 	constructor(salt: Uint8Array) {
 		if (salt.length !== SALT_LENGTH) {
 			throw new Error(`Salt must be ${SALT_LENGTH} bytes`);
@@ -121,6 +131,9 @@ export class EncryptionService {
 	 * Returns Base64URL-encoded string (no padding, URL-safe).
 	 */
 	async encryptFilename(originalPath: string): Promise<string> {
+		const cached = this.filenameEncCache.get(originalPath);
+		if (cached !== undefined) return cached;
+
 		const encoder = new TextEncoder();
 		const ivInput = encoder.encode(
 			originalPath + ":iv:" + EncryptionService.bytesToBase64(this.salt)
@@ -138,7 +151,9 @@ export class EncryptionService {
 		combined.set(iv, 0);
 		combined.set(new Uint8Array(encrypted), IV_LENGTH);
 
-		return EncryptionService.base64UrlEncode(combined);
+		const result = EncryptionService.base64UrlEncode(combined);
+		this.filenameEncCache.set(originalPath, result);
+		return result;
 	}
 
 	/**
@@ -146,6 +161,9 @@ export class EncryptionService {
 	 * Extracts the IV from the first 12 bytes of the decoded data.
 	 */
 	async decryptFilename(encryptedName: string): Promise<string> {
+		const cached = this.filenameDecCache.get(encryptedName);
+		if (cached !== undefined) return cached;
+
 		const data = EncryptionService.base64UrlDecode(encryptedName);
 		const iv = data.slice(0, IV_LENGTH);
 		const ciphertext = data.slice(IV_LENGTH);
@@ -156,7 +174,9 @@ export class EncryptionService {
 			ciphertext
 		);
 
-		return new TextDecoder().decode(decrypted);
+		const result = new TextDecoder().decode(decrypted);
+		this.filenameDecCache.set(encryptedName, result);
+		return result;
 	}
 
 	/**
