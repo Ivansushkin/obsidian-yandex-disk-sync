@@ -160,25 +160,65 @@ async enableEncryption(password: string): Promise<void> {
 #### disableEncryption(options?)
 
 ```typescript
-async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<void> {
+async disableEncryption(
+    options?: { reuploadPlaintext?: boolean }
+): Promise<{ hadErrors: boolean }> {
+    let partialErrors = false;
+
     if (options?.reuploadPlaintext) {
-        await this.indexManager.uploadEncryptionManifest(disablingManifest);
+        // Capture encrypted paths while service is still active
+        const oldRawPaths = await this.indexManager.getRemoteRawFilePaths();
+
+        // Upload "disabling" manifest (non-fatal if it fails)
+        try { await this.indexManager.uploadEncryptionManifest(disablingManifest); }
+        catch { partialErrors = true; }
+
+        this.encryptionService = null;
         this.yandexClient.setEncryptionService(null);
-        await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+
+        // Upload plaintext files without generating delete_remote ops —
+        // encrypted files are cleaned up separately to avoid parallel
+        // folder-delete race conditions against the Yandex API.
+        const result = await this.syncEngine.forceSyncFromLocal({
+            skipEncryptionGuard: true,
+            skipRemoteDeletes: true,
+        });
+        if (!result.success) partialErrors = true;
+
+        // Sequential bulk cleanup: files first, then deepest-first folders
+        await this.deleteRemoteRawPaths(oldRawPaths);
+        await this.deleteRemoteRawFolders(oldRawPaths);
+    } else {
+        this.encryptionService = null;
+        this.yandexClient.setEncryptionService(null);
     }
 
+    // Always clear local state regardless of remote errors
     this.settings.enableEncryption = false;
-    this.settings.encryptionSalt = null;
-    this.settings.encryptedPassword = null;
-    this.settings.encryptionRevision = null;
+    /* ... clear salt / password / revision ... */
     await this.saveSettings();
-    await this.indexManager.deleteEncryptionManifest();
+
+    try { await this.indexManager.deleteEncryptionManifest(); }
+    catch { partialErrors = true; }
+
+    this.setEncryptionBlock(null);
+
+    if (partialErrors) {
+        new Notice(t("notice.encryption_disable_partial"), 30000);
+    }
+    return { hadErrors: partialErrors };
 }
 ```
 
 При выключении (toggle OFF): `disableEncryption({ reuploadPlaintext: true })`.
-Метод пишет manifest `state="disabling"`, выгружает plaintext-версии файлов,
-затем удаляет `.obsidian-encrypt.json`.
+
+**Ключевые особенности:**
+
+- Функция **не бросает throw** при partial errors — toggle и manifest сбрасываются всегда.
+- `oldRawPaths` захватываются **до** обнуления `encryptionService`, пока пути ещё можно получить.
+- `forceSyncFromLocal` вызывается с `skipRemoteDeletes: true`, поэтому зашифрованные remote-файлы не попадают в список `delete_remote` операций — исключает race condition от параллельных удалений одной папки.
+- Bulk cleanup через `deleteRemoteRawPaths` + `deleteRemoteRawFolders` — последовательный, deepest-first.
+- `caller` (settings.ts) показывает `notice.encryption_disabled` только при `hadErrors: false`; при `true` notice уже показан внутри.
 
 При смене пароля используется отдельный метод `rotateEncryptionPassword(newPassword)`:
 
@@ -189,13 +229,36 @@ async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<void
 5. Удаляет старые raw encrypted-файлы
 6. Загружает manifest `state="enabled"`
 
+#### clearLocalEncryptionState() (private)
+
+Сбрасывает encryption service и все локальные настройки шифрования без обращения
+к remote. Используется в `ensureEncryptionReady` когда удалённый manifest пропал
+(другое устройство отключило шифрование). Вызывает `saveSettings()` и
+`setEncryptionBlock(null)`.
+
+#### encryptionStateChangeCallback
+
+```typescript
+encryptionStateChangeCallback: (() => void) | null = null;
+```
+
+Публичный callback, устанавливаемый `SettingsTab.display()`. Вызывается
+в двух местах:
+
+- `promptForRemoteEncryptionPasswordOnce` после успешного `connectToRemoteEncryption` — обновляет toggle в ON
+- `ensureEncryptionReady` после авто-отключения через `clearLocalEncryptionState` — обновляет toggle в OFF
+
+`SettingsTab.hide()` сбрасывает его в `null`, предотвращая вызов после закрытия tab.
+
 #### ensureEncryptionReady()
 
 Вызывается перед любым sync-входом: startup, manual sync, force sync,
 scheduler и realtime watcher через guard в `SyncEngine`.
 
 1. Проверить remote manifest
-2. Если manifest отсутствует, а локально encryption включён — заблокировать sync
+2. Если manifest отсутствует:
+   - Локально encryption **выключен** → sync разрешён, `setEncryptionBlock(null)`
+   - Локально encryption **включён** → авто-отключение через `clearLocalEncryptionState()` + Notice `encryption_disabled_remotely` (10s) + `encryptionStateChangeCallback?.()` → sync разрешён
 3. Если `state` не `enabled` — заблокировать sync до завершения операции на другом устройстве
 4. Если локально нет ключа — показать `ConnectEncryptedVaultModal` и запросить пароль
 5. Если `salt/revision` отличаются — запросить новый пароль
@@ -235,13 +298,20 @@ scheduler и realtime watcher через guard в `SyncEngine`.
 - Toggle "Enable encryption"
   - ON, remote manifest отсутствует: `EnableEncryptionModal` -> persistent notice -> `enableEncryption(password)` -> `Notice(encryption_enabled)`
   - ON, remote manifest есть: `ConnectEncryptedVaultModal` -> `connectToRemoteEncryption(password)` -> `Notice(encryption_connected)`
-  - OFF: `DisableEncryptionModal` -> persistent notice -> `disableEncryption({ reuploadPlaintext: true })` -> `Notice(encryption_disabled)`
+  - OFF: `DisableEncryptionModal` -> persistent notice -> `disableEncryption({ reuploadPlaintext: true })` -> если `!hadErrors`: `Notice(encryption_disabled)`, иначе notice уже показан внутри функции
 - При активном шифровании: кнопка "Change password"
   - `VerifyPasswordModal(correctPassword)` -> `ChangePasswordModal` -> persistent notice -> `rotateEncryptionPassword(newPassword)` -> `Notice(encryption_password_changed)`
 - Информационный блок после toggle/change-password:
   - Описание принципа работы (AES-256-GCM + PBKDF2)
   - Warning о безвозвратной потере данных при утере пароля
   - Уведомление, что пароль хранится локально и не отправляется на удалённое хранилище
+
+**Toggle auto-refresh:**
+
+`display()` устанавливает `plugin.encryptionStateChangeCallback = () => this.display()`.
+`hide()` сбрасывает его в `null`. Callback вызывается из `main.ts` при изменении
+состояния шифрования из фоновых операций (connect после prompt, авто-отключение при
+пропавшем манифесте), обновляя toggle без перехода в settings вручную.
 
 ### 2.7 IndexManager (`src/sync/index-manager.ts`)
 
@@ -370,6 +440,28 @@ Device B (password changed elsewhere):
     3. Показать Notice "Пароль изменён на другом устройстве"
     4. Запросить новый пароль через ConnectEncryptedVaultModal
     5. Проверить verifier и сохранить новый revision
+
+Device A (disable encryption with reuploadPlaintext):
+  disableEncryption({ reuploadPlaintext: true }):
+    1. Захватить oldRawPaths (зашифрованные пути) пока service активен
+    2. Загрузить manifest state=disabling
+    3. Обнулить encryptionService, yandexClient.setEncryptionService(null)
+    4. forceSyncFromLocal({ skipEncryptionGuard: true, skipRemoteDeletes: true })
+       — загружает plaintext файлы, НЕ генерирует delete_remote для зашифрованных
+    5. deleteRemoteRawPaths(oldRawPaths) — последовательное удаление файлов
+    6. deleteRemoteRawFolders(oldRawPaths) — удаление пустых папок deepest-first
+    7. Сохранить enableEncryption=false, удалить manifest
+    8. Если были ошибки → Notice(encryption_disable_partial, 30s)
+       Иначе → Notice(encryption_disabled)
+
+Device B (encryption was disabled elsewhere, opens Obsidian):
+  ensureEncryptionReady() [before sync]:
+    1. Проверить remote manifest — не найден (удалён device A)
+    2. Локально enableEncryption=true → авто-отключение:
+       clearLocalEncryptionState(): обнулить service + соль + пароль + saveSettings
+    3. Notice(encryption_disabled_remotely, 10s)
+    4. encryptionStateChangeCallback?.() — toggle в settings переключается в OFF
+    5. Sync разрешён в plaintext-режиме
 ```
 
 ## 5. Ключевые решения
@@ -414,17 +506,21 @@ Device B (password changed elsewhere):
 | Remote manifest state `enabling/rotating/disabling` | ensureEncryptionReady           | sync blocked, Notice с инструкцией дождаться завершения |
 | Remote salt/revision изменились                 | ensureEncryptionReady               | sync blocked, запрос нового пароля             |
 | Ошибка чтения/parse manifest                     | downloadEncryptionManifest          | sync blocked, ошибка не трактуется как plaintext remote |
+| Remote manifest отсутствует, локально enc ON    | ensureEncryptionReady               | авто-отключение через `clearLocalEncryptionState`, sync разрешён, Notice `encryption_disabled_remotely` |
+| forceSyncFromLocal частично завершился с ошибками при отключении | disableEncryption | toggle и manifest всё равно сбрасываются; Notice `encryption_disable_partial` (30s) |
 
 ## 8. UI нотификации
 
-| Операция                     | Notice (persistent, 0)                          | Финальный Notice                        |
-| ---------------------------- | ----------------------------------------------- | --------------------------------------- |
-| Включение шифрования         | `notice.encryption_syncing`                     | `notice.encryption_enabled`             |
-| Отключение шифрования        | `notice.encryption_disabling`                   | `notice.encryption_disabled`            |
-| Неверный пароль (verify)     | -- (Notice с ошибкой)                           | модалка не закрывается, `is-error`      |
-| Подключение второго устройства| `notice.encryption_detected`                    | `notice.encryption_connected`           |
-| Смена пароля                 | `notice.encryption_password_rotating`           | `notice.encryption_password_changed`    |
-| Требуется пароль             | `notice.encryption_password_required`           | status bar `YD: Требуется пароль шифрования` |
+| Операция                                      | Notice (persistent, 0)               | Финальный Notice                                          |
+| --------------------------------------------- | ------------------------------------ | --------------------------------------------------------- |
+| Включение шифрования                          | `notice.encryption_syncing`          | `notice.encryption_enabled`                               |
+| Отключение шифрования (успешно)               | `notice.encryption_disabling`        | `notice.encryption_disabled`                              |
+| Отключение шифрования (с ошибками)            | `notice.encryption_disabling`        | `notice.encryption_disable_partial` (30s, из main.ts)     |
+| Авто-отключение при пропавшем remote manifest | --                                   | `notice.encryption_disabled_remotely` (10s)               |
+| Неверный пароль (verify)                      | -- (Notice с ошибкой)                | модалка не закрывается, `is-error`                        |
+| Подключение второго устройства                | `notice.encryption_detected`         | `notice.encryption_connected`                             |
+| Смена пароля                                  | `notice.encryption_password_rotating`| `notice.encryption_password_changed`                      |
+| Требуется пароль                              | `notice.encryption_password_required`| status bar `YD: Требуется пароль шифрования`              |
 
 ## 9. История реализации
 
@@ -442,3 +538,7 @@ Device B (password changed elsewhere):
 | 9    | encryption-modals.ts: class-based модалки (VerifyPassword, ChangePassword)| Done   |
 | 10   | UI: persistent notices, инфоблок в настройках, is-error подсветка         | Done   |
 | 11   | Manifest v2, verifier, fail-closed sync guard, password rotation          | Done   |
+| 12   | Segment-wise folder name encryption, empty folder pruning                 | Done   |
+| 13   | `disableEncryption` fail-forward: `skipRemoteDeletes`, bulk cleanup, `{hadErrors}` return | Done |
+| 14   | `ensureEncryptionReady`: авто-отключение при пропавшем манифесте вместо блокировки sync | Done |
+| 15   | `encryptionStateChangeCallback`: авто-обновление toggle при connect и авто-отключении | Done |
