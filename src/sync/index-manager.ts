@@ -6,15 +6,25 @@ import type {
 	SyncIndex,
 	FileMetadata,
 	YandexDiskSyncSettings,
+	YandexResource,
+	EncryptionManifest,
+	EncryptionManifestState,
+	RemoteEncryptionManifest,
 } from "../types";
 import { CURRENT_INDEX_VERSION, createEmptyIndex } from "../types";
-import { YandexDiskClient } from "../api/yandex-client";
+import { YandexApiError, YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
-import { joinPath, toLocalPath } from "../utils/path-utils";
+import { isProtectedPath, joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
-const ENCRYPTION_SALT_FILENAME = ".obsidian-encrypt.json";
+const ENCRYPTION_MANIFEST_FILENAME = ".obsidian-encrypt.json";
+const ENCRYPTION_MANIFEST_STATES: EncryptionManifestState[] = [
+	"enabled",
+	"enabling",
+	"rotating",
+	"disabling",
+];
 
 export class IndexManager {
 	private yandexClient: YandexDiskClient;
@@ -133,8 +143,7 @@ export class IndexManager {
 			return this.remoteIndex;
 		} catch (e) {
 			logger.warn("Error loading remote index:", e);
-			this.remoteIndex = createEmptyIndex("");
-			return this.remoteIndex;
+			throw e;
 		}
 	}
 
@@ -186,6 +195,29 @@ export class IndexManager {
 	}
 
 	/**
+	 * Seed local index from the currently loaded remote index.
+	 * Called after connecting to an already-encrypted remote vault so the sync
+	 * engine knows which files exist remotely. Without this, subsequent local
+	 * deletions resolve to localIndexMeta=null and are mis-classified as
+	 * "new remote files" (Case 2 in conflict resolver) instead of deletions.
+	 * Only adds entries that are absent from localIndex; existing entries are
+	 * not overwritten.
+	 */
+	seedLocalIndexFromRemote(): void {
+		let added = 0;
+		for (const [path, meta] of Object.entries(this.remoteIndex.files)) {
+			if (meta.deleted) continue;
+			if (this.localIndex.files[path]) continue;
+			this.localIndex.files[path] = {
+				...meta,
+				lastModifiedBy: this.settings.deviceId,
+			};
+			added++;
+		}
+		logger.info(`[IndexManager] Seeded local index with ${added} entries from remote`);
+	}
+
+	/**
 	 * Update file metadata in remote index
 	 */
 	updateRemoteFile(path: string, metadata: FileMetadata): void {
@@ -227,11 +259,6 @@ export class IndexManager {
 		const result = new Map<string, FileMetadata>();
 
 		for (const resource of resources) {
-			// Skip index file
-			if (resource.name === REMOTE_INDEX_FILENAME) {
-				continue;
-			}
-
 			// Skip directories
 			if (resource.type !== "file") {
 				continue;
@@ -242,8 +269,8 @@ export class IndexManager {
 				this.settings.remotePath
 			);
 
-			// Skip protected paths (like .backup folder)
-			if (localPath.startsWith('.backup/') || localPath === '.backup') {
+			// Skip service/protected paths.
+			if (isProtectedPath(localPath)) {
 				continue;
 			}
 
@@ -336,59 +363,187 @@ export class IndexManager {
 	// Encryption salt management
 	// ============================================================================
 
-	private getEncryptionSaltPath(): string {
-		return joinPath(this.settings.remotePath, ENCRYPTION_SALT_FILENAME);
+	private getEncryptionManifestPath(): string {
+		return joinPath(this.settings.remotePath, ENCRYPTION_MANIFEST_FILENAME);
 	}
 
 	/**
-	 * Upload encryption salt to Yandex Disk (raw — no encryption).
-	 * Salt is not secret, it's stored alongside user data for multi-device sync.
+	 * Upload encryption manifest to Yandex Disk (raw — no encryption).
 	 */
-	async uploadEncryptionSalt(saltBase64: string): Promise<void> {
-		const content = JSON.stringify({ version: 1, salt: saltBase64 });
+	async uploadEncryptionManifest(manifest: EncryptionManifest): Promise<void> {
+		const content = JSON.stringify(manifest, null, 2);
 		await this.yandexClient.uploadFile(
-			this.getEncryptionSaltPath(),
+			this.getEncryptionManifestPath(),
 			content,
 			false,
 			true
 		);
-		logger.info("Encryption salt uploaded to remote");
+		logger.info("Encryption manifest uploaded to remote");
 	}
 
 	/**
-	 * Download encryption salt from Yandex Disk (raw — no decryption).
-	 * Returns null if salt file doesn't exist (encryption not active on remote).
+	 * Download encryption manifest from Yandex Disk (raw — no decryption).
+	 * Returns null only if manifest file doesn't exist.
 	 */
-	async downloadEncryptionSalt(): Promise<string | null> {
+	async downloadEncryptionManifest(): Promise<RemoteEncryptionManifest | null> {
 		try {
 			const resource = await this.yandexClient.getResource(
-				this.getEncryptionSaltPath()
+				this.getEncryptionManifestPath(),
+				1000,
+				0,
+				true
 			);
 			if (!resource) return null;
 
 			const content = await this.yandexClient.downloadFile(
-				this.getEncryptionSaltPath(),
+				this.getEncryptionManifestPath(),
 				true
 			);
-			const data = JSON.parse(new TextDecoder().decode(content)) as {
-				salt: string;
-			};
-			if (!data.salt) return null;
-			return data.salt;
-		} catch {
-			return null;
+			const data = JSON.parse(new TextDecoder().decode(content)) as Record<string, unknown>;
+			return this.parseEncryptionManifest(data);
+		} catch (e) {
+			if (this.isNotFoundError(e)) {
+				return null;
+			}
+			throw e;
 		}
 	}
 
 	/**
-	 * Delete encryption salt from Yandex Disk.
+	 * Download legacy salt value from the remote encryption manifest.
 	 */
-	async deleteEncryptionSalt(): Promise<void> {
+	async downloadEncryptionSalt(): Promise<string | null> {
+		const manifest = await this.downloadEncryptionManifest();
+		return manifest?.salt ?? null;
+	}
+
+	/**
+	 * Delete encryption manifest from Yandex Disk.
+	 */
+	async deleteEncryptionManifest(): Promise<void> {
 		await this.yandexClient.deleteResource(
-			this.getEncryptionSaltPath(),
+			this.getEncryptionManifestPath(),
 			false,
 			true
 		);
-		logger.info("Encryption salt deleted from remote");
+		logger.info("Encryption manifest deleted from remote");
+	}
+
+	/**
+	 * Delete legacy encryption salt from Yandex Disk.
+	 */
+	async deleteEncryptionSalt(): Promise<void> {
+		await this.deleteEncryptionManifest();
+	}
+
+	/**
+	 * Get raw remote user file paths without decrypting filenames.
+	 */
+	async getRemoteRawFilePaths(): Promise<string[]> {
+		let resources: YandexResource[];
+		try {
+			resources = await this.yandexClient.getResourcesRecursive(
+				this.settings.remotePath,
+				true
+			);
+		} catch (e) {
+			if (this.isNotFoundError(e)) {
+				return [];
+			}
+			throw e;
+		}
+		const result: string[] = [];
+
+		for (const resource of resources) {
+			if (resource.type !== "file") {
+				continue;
+			}
+
+			const localPath = toLocalPath(
+				resource.path,
+				this.settings.remotePath
+			);
+			if (isProtectedPath(localPath)) {
+				continue;
+			}
+
+			result.push(localPath);
+		}
+
+		return result;
+	}
+
+	private parseEncryptionManifest(data: Record<string, unknown>): RemoteEncryptionManifest {
+		const salt = data.salt;
+		if (typeof salt !== "string" || !salt) {
+			throw new Error("Invalid encryption manifest: missing salt");
+		}
+
+		if (data.version === 1) {
+			return {
+				version: 1,
+				state: "enabled",
+				revision: 1,
+				salt,
+				verifier: null,
+				legacy: true,
+				updatedAt: 0,
+				updatedBy: "",
+			};
+		}
+
+		if (data.version !== 2) {
+			throw new Error("Unsupported encryption manifest version");
+		}
+
+		const state = data.state;
+		const revision = data.revision;
+		const verifier = data.verifier;
+		const updatedAt = data.updatedAt;
+		const updatedBy = data.updatedBy;
+
+		if (typeof state !== "string" || !this.isEncryptionManifestState(state)) {
+			throw new Error("Invalid encryption manifest: unsupported state");
+		}
+		if (typeof revision !== "number" || revision < 1) {
+			throw new Error("Invalid encryption manifest: invalid revision");
+		}
+		if (typeof verifier !== "string" || !verifier) {
+			throw new Error("Invalid encryption manifest: missing verifier");
+		}
+		if (typeof updatedAt !== "number") {
+			throw new Error("Invalid encryption manifest: invalid updatedAt");
+		}
+		if (typeof updatedBy !== "string") {
+			throw new Error("Invalid encryption manifest: invalid updatedBy");
+		}
+
+		return {
+			version: 2,
+			state,
+			revision,
+			salt,
+			verifier,
+			kdf: {
+				name: "PBKDF2",
+				hash: "SHA-256",
+				iterations: 100_000,
+			},
+			cipher: {
+				name: "AES-GCM",
+				keyLength: 256,
+				ivLength: 12,
+			},
+			updatedAt,
+			updatedBy,
+		};
+	}
+
+	private isEncryptionManifestState(value: string): value is EncryptionManifestState {
+		return ENCRYPTION_MANIFEST_STATES.includes(value as EncryptionManifestState);
+	}
+
+	private isNotFoundError(e: unknown): boolean {
+		return e instanceof YandexApiError && e.status === 404;
 	}
 }

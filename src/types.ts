@@ -33,8 +33,10 @@ export interface YandexDiskSyncSettings {
 	enableEncryption: boolean;
 	/** Base64-encoded salt for key derivation (null = not initialized) */
 	encryptionSalt: string | null;
-	/** Base64-encoded user password (stored alongside settings) */
+	/** Plaintext user password stored locally in plugin settings */
 	encryptedPassword: string | null;
+	/** Remote encryption manifest revision applied on this device */
+	encryptionRevision: number | null;
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
@@ -52,7 +54,80 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	enableEncryption: false,
 	encryptionSalt: null,
 	encryptedPassword: null,
+	encryptionRevision: null,
 };
+
+// ============================================================================
+// Encryption manifest
+// ============================================================================
+
+export type EncryptionManifestState =
+	| "enabled"
+	| "enabling"
+	| "rotating"
+	| "disabling";
+
+export interface EncryptionManifestKdfParams {
+	/** Key derivation algorithm */
+	name: "PBKDF2";
+	/** Hash algorithm used by PBKDF2 */
+	hash: "SHA-256";
+	/** Number of PBKDF2 iterations */
+	iterations: number;
+}
+
+export interface EncryptionManifestCipherParams {
+	/** Content and verifier cipher */
+	name: "AES-GCM";
+	/** AES key length in bits */
+	keyLength: number;
+	/** AES-GCM IV length in bytes */
+	ivLength: number;
+}
+
+export interface EncryptionManifest {
+	/** Manifest format version */
+	version: 2;
+	/** Current remote encryption state */
+	state: EncryptionManifestState;
+	/** Monotonic key revision shared by devices */
+	revision: number;
+	/** Base64-encoded PBKDF2 salt */
+	salt: string;
+	/** Base64-encoded encrypted verifier payload */
+	verifier: string;
+	/** Key derivation parameters */
+	kdf: EncryptionManifestKdfParams;
+	/** Cipher parameters */
+	cipher: EncryptionManifestCipherParams;
+	/** Unix timestamp of the latest manifest update */
+	updatedAt: number;
+	/** Device ID that wrote the manifest */
+	updatedBy: string;
+}
+
+export interface LegacyEncryptionManifest {
+	/** Legacy salt-only manifest format */
+	version: 1;
+	/** Legacy salt-only manifests are treated as enabled */
+	state: "enabled";
+	/** Synthetic revision for legacy manifests */
+	revision: 1;
+	/** Base64-encoded PBKDF2 salt */
+	salt: string;
+	/** Legacy manifests do not contain password verifier */
+	verifier: null;
+	/** Marks a manifest converted from the legacy format */
+	legacy: true;
+	/** Legacy manifests do not contain update timestamp */
+	updatedAt: number;
+	/** Legacy manifests do not contain writer device ID */
+	updatedBy: string;
+}
+
+export type RemoteEncryptionManifest =
+	| EncryptionManifest
+	| LegacyEncryptionManifest;
 
 // ============================================================================
 // Synchronization index
@@ -109,7 +184,8 @@ export type SyncStatus =
 	| "error"
 	| "paused"
 	| "offline"
-	| "initializing";
+	| "initializing"
+	| "encryption-required";
 
 export interface SyncState {
 	/** Current synchronization status */
@@ -263,4 +339,3 @@ export interface BackupInfo {
 	/** Full path on Yandex Disk */
 	remotePath: string;
 }
-

@@ -3,7 +3,11 @@
  */
 
 /** System-protected paths that should never be synchronized */
-const PROTECTED_PATHS = ['.backup'];
+const PROTECTED_PATHS = [
+	'.backup',
+	'.obsidian-sync-index.json',
+	'.obsidian-encrypt.json',
+];
 
 /**
  * Path normalization (remove leading/trailing slashes, replace backslashes)

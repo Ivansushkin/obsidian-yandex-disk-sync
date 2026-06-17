@@ -26,6 +26,11 @@
 	color: var(--text-faint);
 }
 
+.yandex-sync-status.sync-encryption-required {
+	color: var(--text-warning);
+	font-weight: 600;
+}
+
 /* Модальное окно инициализации */
 .init-sync-info {
 	background: var(--background-secondary);
@@ -201,4 +206,3 @@
 @keyframes encryption-spin {
 	to { transform: rotate(360deg); }
 }
-

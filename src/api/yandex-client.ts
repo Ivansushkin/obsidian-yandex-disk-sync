@@ -15,6 +15,7 @@ import { encodePathForUrl, getFileName, getDirectory } from "../utils/path-utils
 
 const API_BASE_URL = "https://cloud-api.yandex.net/v1/disk";
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
+const ENCRYPTION_MANIFEST_FILENAME = ".obsidian-encrypt.json";
 
 export interface YandexClientConfig {
 	token: string;
@@ -87,7 +88,7 @@ export class YandexDiskClient {
 		if (!this.encryptionService) return path;
 		const fileName = getFileName(path);
 		if (!fileName) return path;
-		if (fileName === REMOTE_INDEX_FILENAME) return path;
+		if (fileName === REMOTE_INDEX_FILENAME || fileName === ENCRYPTION_MANIFEST_FILENAME) return path;
 		const encrypted = await this.encryptionService.encryptFilename(fileName);
 		const dir = getDirectory(path);
 		return dir ? `${dir}/${encrypted}` : encrypted;
@@ -134,7 +135,8 @@ export class YandexDiskClient {
 	async getResource(
 		path: string,
 		limit = 1000,
-		offset = 0
+		offset = 0,
+		raw = false
 	): Promise<YandexResource | null> {
 		try {
 			const encodedPath = encodePathForUrl(path);
@@ -143,6 +145,9 @@ export class YandexDiskClient {
 				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`
 			);
 			const resource = response.json as YandexResource;
+			if (raw) {
+				return resource;
+			}
 			return await this.decryptResource(resource);
 		} catch (e: unknown) {
 			if (this.isNotFoundError(e)) {
@@ -155,7 +160,7 @@ export class YandexDiskClient {
 	/**
 	 * Recursively get all files in folder
 	 */
-	async getResourcesRecursive(path: string): Promise<YandexResource[]> {
+	async getResourcesRecursive(path: string, raw = false): Promise<YandexResource[]> {
 		const results: YandexResource[] = [];
 		const queue: string[] = [path];
 
@@ -168,7 +173,8 @@ export class YandexDiskClient {
 				const resource = await this.getResource(
 					currentPath,
 					limit,
-					offset
+					offset,
+					raw
 				);
 				if (!resource) break;
 				if (resource.type === "file") {

@@ -16,6 +16,7 @@
 const PBKDF2_ITERATIONS = 100_000;
 const IV_LENGTH = 12;
 const SALT_LENGTH = 16;
+const VERIFIER_PAYLOAD = "obsidian-yandex-disk-sync:encryption-verifier:v1";
 
 export class EncryptionService {
 	private key: CryptoKey | null = null;
@@ -90,6 +91,24 @@ export class EncryptionService {
 			this.getKey(),
 			ciphertext
 		);
+	}
+
+	/**
+	 * Create an encrypted verifier payload for remote password checks.
+	 */
+	async createVerifier(): Promise<string> {
+		const encoded = new TextEncoder().encode(VERIFIER_PAYLOAD);
+		const encrypted = await this.encrypt(encoded.buffer);
+		return EncryptionService.bytesToBase64(new Uint8Array(encrypted));
+	}
+
+	/**
+	 * Verify that the current key can decrypt the remote verifier payload.
+	 */
+	async verifyVerifier(verifierBase64: string): Promise<boolean> {
+		const encrypted = EncryptionService.base64ToBytes(verifierBase64);
+		const decrypted = await this.decrypt(encrypted.buffer);
+		return new TextDecoder().decode(decrypted) === VERIFIER_PAYLOAD;
 	}
 
 	/**

@@ -6,8 +6,14 @@ import { App, Notice, PluginSettingTab, Setting, TextAreaComponent, ToggleCompon
 import type YandexDiskSyncPlugin from "./main";
 import { t } from "./i18n";
 import { BackupListModal } from "./ui/backup-list-modal";
-import { EnableEncryptionModal, DisableEncryptionModal, VerifyPasswordModal, ChangePasswordModal } from "./ui/encryption-modals";
-import type { BackupInfo } from "./types";
+import {
+	ChangePasswordModal,
+	ConnectEncryptedVaultModal,
+	DisableEncryptionModal,
+	EnableEncryptionModal,
+	VerifyPasswordModal,
+} from "./ui/encryption-modals";
+import type { BackupInfo, RemoteEncryptionManifest } from "./types";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
@@ -73,30 +79,22 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					})
 			)
 			.addButton((button) =>
-				button.setButtonText(t("settings.sync_button")).onClick(async () => {
-					button.setDisabled(true);
-					button.setButtonText(t("settings.syncing_button"));
-					try {
-						const result = await this.plugin.testConnection();
-						if (!result.success) {
-							button.setButtonText(t("settings.sync_error_button"));
-							setTimeout(() => {
-								button.setDisabled(false);
-								button.setButtonText(t("settings.sync_button"));
-							}, 2000);
-							return;
-						}
-
-						await this.plugin.runFullSync();
-						button.setButtonText(t("settings.sync_success_button"));
-					} catch {
-						button.setButtonText(t("settings.sync_error_button"));
+			button.setButtonText(t("settings.sync_button")).onClick(async () => {
+				button.setDisabled(true);
+				button.setButtonText(t("settings.syncing_button"));
+				try {
+					const result = await this.plugin.testConnection();
+					if (!result.success) {
+						return;
 					}
-					setTimeout(() => {
-						button.setDisabled(false);
-						button.setButtonText(t("settings.sync_button"));
-					}, 2000);
-				})
+					await this.plugin.runFullSync();
+				} catch {
+					// errors are surfaced via Notice inside runFullSync
+				} finally {
+					button.setDisabled(false);
+					button.setButtonText(t("settings.sync_button"));
+				}
+			})
 			);
 
 		// Create custom description with multiline text
@@ -283,6 +281,50 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						showToggleSpinner(toggle);
 
 						if (value && !this.plugin.settings.enableEncryption) {
+							let remoteManifest: RemoteEncryptionManifest | null = null;
+							try {
+								remoteManifest = await this.plugin.getRemoteEncryptionManifest();
+							} catch (e) {
+								new Notice(e instanceof Error ? e.message : String(e));
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
+								return;
+							}
+
+							if (remoteManifest) {
+								if (remoteManifest.state !== "enabled") {
+									new Notice(t("notice.encryption_remote_busy"));
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									this.display();
+									return;
+								}
+
+								const password = await new Promise<string | null>((resolve) => {
+									new ConnectEncryptedVaultModal(
+										this.app,
+										resolve,
+										t("modal.encryption_connect_title"),
+										t("modal.encryption_connect_desc"),
+										t("modal.encryption_connect_button")
+									).open();
+								});
+								if (!password) {
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									this.display();
+									return;
+								}
+
+								try {
+									await this.plugin.connectToRemoteEncryption(password, remoteManifest);
+									new Notice(t("notice.encryption_connected"));
+								} catch (e) {
+									new Notice(e instanceof Error ? e.message : String(e));
+								}
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
+								return;
+							}
+
 							const password = await new Promise<string | null>((resolve) => {
 								new EnableEncryptionModal(
 									this.app,
@@ -378,12 +420,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 								}
 								return;
 							}
-							const notice = new Notice(t("notice.encryption_syncing"), 0);
+							const notice = new Notice(t("notice.encryption_password_rotating"), 0);
 							try {
-								await this.plugin.disableEncryption();
-								await this.plugin.enableEncryption(newPassword);
+								await this.plugin.rotateEncryptionPassword(newPassword);
 								notice.hide();
-								new Notice(t("notice.encryption_enabled"));
+								new Notice(t("notice.encryption_password_changed"));
 							} catch (e) {
 								notice.hide();
 								new Notice(e instanceof Error ? e.message : String(e));

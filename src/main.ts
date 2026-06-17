@@ -8,6 +8,8 @@ import {
 	YandexDiskSyncSettings,
 	DEFAULT_SETTINGS,
 	SyncIndex,
+	EncryptionManifest,
+	RemoteEncryptionManifest,
 } from "./types";
 import { YandexDiskSyncSettingTab } from "./settings";
 import { YandexDiskClient } from "./api/yandex-client";
@@ -19,7 +21,7 @@ import { SyncScheduler } from "./sync/sync-scheduler";
 import { SyncStatusBar } from "./ui/status-bar";
 import { SyncStatusModal, ConfirmModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
-import { PasswordPromptModal } from "./ui/encryption-modals";
+import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
 import { BackupManager } from "./backup/backup-manager";
 import { generateDeviceId, joinPath } from "./utils/path-utils";
 import { logger } from "./utils/logger";
@@ -35,6 +37,11 @@ interface PluginData {
 		deleted: number;
 		errors: number;
 	};
+}
+
+interface EncryptionReadyOptions {
+	/** Whether the user can be prompted for a missing or rotated password. */
+	prompt: boolean;
 }
 
 export default class YandexDiskSyncPlugin extends Plugin {
@@ -59,6 +66,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private isInitialized = false;
 	private encryptionService: EncryptionService | null = null;
+	private encryptionBlockReason: string | null = null;
+	private encryptionPromptPromise: Promise<boolean> | null = null;
 
 	async onload(): Promise<void> {
 		// Initialize i18n service
@@ -77,6 +86,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Initialize components
 		this.initializeComponents();
+		await this.initEncryption();
 
 		// Register settings tab
 		this.addSettingTab(new YandexDiskSyncSettingTab(this.app, this));
@@ -155,6 +165,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.syncEngine.setIndexSaveCallback(async () => {
 			await this.saveLocalIndex();
 		});
+		this.syncEngine.setSyncGuardCallback(async () => {
+			if (!this.settings.yandexTokenSecret) {
+				return null;
+			}
+			const ready = await this.ensureEncryptionReady({ prompt: true });
+			return ready
+				? null
+				: this.encryptionBlockReason ?? t("notice.encryption_password_required");
+		});
 
 		// Create file watcher
 		this.fileWatcher = new FileWatcher(
@@ -174,8 +193,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.settings
 		);
 
-		// Initialize encryption if enabled
-		void this.initEncryption();
 	}
 
 	/**
@@ -218,8 +235,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.addCommand({
 			id: "toggle-sync",
 			name: t("command.toggle_sync"),
-			callback: () => {
+			callback: async () => {
 				if (this.syncEngine.isSyncPaused()) {
+					if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+						return;
+					}
 					this.syncEngine.resume();
 					this.fileWatcher.start();
 					this.syncScheduler.start();
@@ -257,8 +277,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return;
 		}
 
-		// Check remote for encryption salt before loading index
-		await this.syncEncryptionStateWithRemote();
+		// Check remote encryption state before loading index or starting sync.
+		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+			return;
+		}
 
 		// Load saved index
 		const data = (await this.loadData()) as PluginData | null;
@@ -283,7 +305,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.checkAndRunInitialSync();
 		} else {
 			// Start regular synchronization
-			this.startSync();
+			await this.startSync();
 		}
 
 		this.isInitialized = true;
@@ -336,7 +358,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 			new Notice(t("notice.sync_started"));
 			await this.runInitialSync();
-			this.startSync();
+			await this.startSync();
 		} catch (e) {
 			logger.error("Error during initial setup:", e);
 			new Notice(`Initialization error: ${(e as Error).message}`);
@@ -348,6 +370,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private async runInitialSync(): Promise<void> {
 		try {
+			if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+				return;
+			}
+
 			// Create remote folder if not exists
 			const exists = await this.indexManager.remotePathExists();
 			if (!exists) {
@@ -393,6 +419,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	async runFullSync(): Promise<void> {
 		if (!this.settings.yandexTokenSecret) {
 			new Notice(t("notice.token_missing"));
+			return;
+		}
+		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
 			return;
 		}
 
@@ -454,6 +483,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			new Notice(t("notice.token_missing"));
 			return;
 		}
+		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+			return;
+		}
 
 		const confirmed = await this.confirmForceSync("from_local");
 		if (!confirmed) {
@@ -509,6 +541,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			new Notice(t("notice.token_missing"));
 			return;
 		}
+		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+			return;
+		}
 
 		const confirmed = await this.confirmForceSync("from_remote");
 		if (!confirmed) {
@@ -559,8 +594,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Start regular synchronization
 	 */
-	private startSync(): void {
+	private async startSync(): Promise<void> {
 		logger.info("[Main] Starting regular synchronization");
+		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+			logger.warn("[Main] Synchronization blocked by encryption state");
+			return;
+		}
 
 		// Start file watcher
 		logger.info("[Main] Starting file watcher");
@@ -638,6 +677,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.backupManager) {
 			this.backupManager.updateSettings(this.settings);
 		}
+		if (this.encryptionBlockReason) {
+			this.fileWatcher?.stop();
+			this.syncScheduler?.stop();
+		}
 
 		await this.saveData({
 			settings: this.settings,
@@ -684,93 +727,45 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Enable encryption with the given password.
-	 *
-	 * If remote already has an encryption salt (another device enabled encryption),
-	 * uses that salt — so the same password produces the same key across devices.
-	 * If no remote salt exists, generates a new one and uploads it.
-	 *
-	 * When using an existing remote salt, verifies the password by trying to
-	 * load the encrypted index. Throws if the password is wrong.
+	 * Enable encryption or connect to an already encrypted remote vault.
 	 */
 	async enableEncryption(password: string): Promise<void> {
-		const remoteSalt = await this.indexManager.downloadEncryptionSalt();
-
-		let saltBytes: Uint8Array;
-		let isNewEncryption: boolean;
-
-		if (remoteSalt) {
-			// Remote already has encryption — reuse the same salt
-			saltBytes = EncryptionService.base64ToBytes(remoteSalt);
-			isNewEncryption = false;
-		} else {
-			// First-time setup — generate new salt
-			saltBytes = EncryptionService.generateSalt();
-			isNewEncryption = true;
+		const remoteManifest = await this.indexManager.downloadEncryptionManifest();
+		if (remoteManifest) {
+			await this.connectToRemoteEncryption(password, remoteManifest);
+			return;
 		}
 
-		// Before setting encryption, save list of existing remote files for cleanup
-		let oldRemoteFiles: Map<string, never> | null = null;
-		if (isNewEncryption) {
-			try {
-				const remoteFiles = await this.indexManager.getRemoteFiles();
-				if (remoteFiles && remoteFiles.size > 0) {
-					oldRemoteFiles = remoteFiles as Map<string, never>;
-				}
-			} catch (e) {
-				logger.warn("Failed to get remote file list before encryption:", e);
-			}
-		}
-
+		const oldRawPaths = await this.indexManager.getRemoteRawFilePaths();
+		const saltBytes = EncryptionService.generateSalt();
+		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
+		const revision = 1;
 		const service = new EncryptionService(saltBytes);
 		await service.initializeKey(password);
 
-		this.yandexClient.setEncryptionService(service);
-
-		// If using existing remote salt, verify password by loading the encrypted index
-		if (!isNewEncryption) {
-			try {
-				await this.indexManager.loadRemoteIndex();
-			} catch {
-				this.yandexClient.setEncryptionService(null);
-				throw new Error(t("notice.encryption_wrong_password"));
-			}
-		}
-
 		this.encryptionService = service;
+		this.yandexClient.setEncryptionService(service);
 		this.settings.enableEncryption = true;
-		this.settings.encryptionSalt = EncryptionService.bytesToBase64(saltBytes);
+		this.settings.encryptionSalt = saltBase64;
 		this.settings.encryptedPassword = password;
+		this.settings.encryptionRevision = revision;
 		await this.saveSettings();
 
-		// For first-time setup: upload salt, re-upload all files with encryption, clean up old files
-		if (isNewEncryption) {
-			try {
-				await this.indexManager.uploadEncryptionSalt(
-					EncryptionService.bytesToBase64(saltBytes)
-				);
+		await this.indexManager.uploadEncryptionManifest(
+			await this.createEncryptionManifest(service, saltBase64, "enabling", revision)
+		);
 
-				// Re-upload all local files with encryption
-				logger.info("Re-uploading all files with encryption...");
-				await this.syncEngine.forceSyncFromLocal();
-
-				// Clean up old plaintext files from remote
-				if (oldRemoteFiles && oldRemoteFiles.size > 0) {
-					logger.info(`Cleaning up ${oldRemoteFiles.size} old plaintext files...`);
-					for (const [path] of oldRemoteFiles) {
-						try {
-							const remotePath = joinPath(this.settings.remotePath, path);
-							await this.yandexClient.deleteResource(remotePath, false, true);
-						} catch (e) {
-							logger.warn(`Failed to delete old plaintext file ${path}:`, e);
-						}
-					}
-				}
-			} catch (e) {
-				logger.warn("Failed to re-encrypt existing files:", e);
-			}
+		logger.info("Re-uploading all files with encryption...");
+		const result = await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+		if (!result.success) {
+			throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
 		}
 
+		await this.deleteRemoteRawPaths(oldRawPaths);
+		await this.indexManager.uploadEncryptionManifest(
+			await this.createEncryptionManifest(service, saltBase64, "enabled", revision)
+		);
+		this.setEncryptionBlock(null);
 		logger.info("Encryption enabled");
 	}
 
@@ -781,92 +776,354 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * and deletes old encrypted files from remote. This is used when the user
 	 * explicitly turns off encryption (toggle OFF).
 	 *
-	 * When `reuploadPlaintext` is false (change-password flow), only clears
-	 * settings and salt without touching the files on disk.
+	 * When `reuploadPlaintext` is false, only clears local encryption settings.
 	 */
 	async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<void> {
-		this.encryptionService = null;
-		this.yandexClient.setEncryptionService(null);
-
 		if (options?.reuploadPlaintext) {
+			if (this.encryptionService && this.settings.encryptionSalt) {
+				const revision = this.settings.encryptionRevision ?? 1;
+				await this.indexManager.uploadEncryptionManifest(
+					await this.createEncryptionManifest(
+						this.encryptionService,
+						this.settings.encryptionSalt,
+						"disabling",
+						revision
+					)
+				);
+			}
+
+			this.encryptionService = null;
+			this.yandexClient.setEncryptionService(null);
 			logger.info("Re-uploading all files as plaintext...");
-			await this.syncEngine.forceSyncFromLocal();
+			const result = await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+			if (!result.success) {
+				throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
+			}
+		} else {
+			this.encryptionService = null;
+			this.yandexClient.setEncryptionService(null);
 		}
 
 		this.settings.enableEncryption = false;
 		this.settings.encryptionSalt = null;
 		this.settings.encryptedPassword = null;
+		this.settings.encryptionRevision = null;
 		await this.saveSettings();
 
-		// Remove salt from remote
+		// Remove manifest from remote
 		try {
-			await this.indexManager.deleteEncryptionSalt();
+			await this.indexManager.deleteEncryptionManifest();
 		} catch (e) {
-			logger.warn("Failed to delete encryption salt from remote:", e);
+			logger.warn("Failed to delete encryption manifest from remote:", e);
 		}
 
+		this.setEncryptionBlock(null);
 		logger.info("Encryption disabled");
 	}
 
 	/**
-	 * Check remote for encryption salt.
-	 * If salt exists but no local password is configured, prompt the user
-	 * to enter the encryption password for multi-device setup.
+	 * Rotate the encryption password and re-upload all files with a new key.
 	 */
-	private async syncEncryptionStateWithRemote(): Promise<void> {
-		// Already configured locally — skip
-		if (this.settings.enableEncryption && this.settings.encryptedPassword) {
-			return;
+	async rotateEncryptionPassword(newPassword: string): Promise<void> {
+		const currentManifest = await this.indexManager.downloadEncryptionManifest();
+		if (currentManifest && currentManifest.state !== "enabled") {
+			throw new Error(t("notice.encryption_remote_busy"));
+		}
+		if (!this.settings.enableEncryption || !this.settings.encryptionSalt) {
+			throw new Error(t("notice.encryption_password_required"));
+		}
+
+		const oldRawPaths = await this.indexManager.getRemoteRawFilePaths();
+		const saltBytes = EncryptionService.generateSalt();
+		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
+		const revision = Math.max(
+			currentManifest?.revision ?? 1,
+			this.settings.encryptionRevision ?? 1
+		) + 1;
+		const service = new EncryptionService(saltBytes);
+		await service.initializeKey(newPassword);
+
+		await this.indexManager.uploadEncryptionManifest(
+			await this.createEncryptionManifest(service, saltBase64, "rotating", revision)
+		);
+
+		this.encryptionService = service;
+		this.yandexClient.setEncryptionService(service);
+		this.settings.enableEncryption = true;
+		this.settings.encryptionSalt = saltBase64;
+		this.settings.encryptedPassword = newPassword;
+		this.settings.encryptionRevision = revision;
+		await this.saveSettings();
+
+		logger.info("Re-uploading all files after encryption password rotation...");
+		const result = await this.syncEngine.forceSyncFromLocal({ skipEncryptionGuard: true });
+		if (!result.success) {
+			throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
+		}
+
+		await this.deleteRemoteRawPaths(oldRawPaths);
+		await this.indexManager.uploadEncryptionManifest(
+			await this.createEncryptionManifest(service, saltBase64, "enabled", revision)
+		);
+		this.setEncryptionBlock(null);
+		logger.info("Encryption password rotated");
+	}
+
+	/**
+	 * Download remote encryption manifest for UI decisions.
+	 */
+	async getRemoteEncryptionManifest(): Promise<RemoteEncryptionManifest | null> {
+		return await this.indexManager.downloadEncryptionManifest();
+	}
+
+	/**
+	 * Connect this device to an encrypted remote vault using the provided password.
+	 */
+	async connectToRemoteEncryption(
+		password: string,
+		manifest?: RemoteEncryptionManifest
+	): Promise<void> {
+		const remoteManifest = manifest ?? await this.indexManager.downloadEncryptionManifest();
+		if (!remoteManifest) {
+			throw new Error(t("notice.encryption_remote_missing"));
+		}
+		if (remoteManifest.state !== "enabled") {
+			throw new Error(t("notice.encryption_remote_busy"));
+		}
+
+		const saltBytes = EncryptionService.base64ToBytes(remoteManifest.salt);
+		const service = new EncryptionService(saltBytes);
+		await service.initializeKey(password);
+		await this.verifyRemoteEncryptionPassword(service, remoteManifest);
+
+		this.encryptionService = service;
+		this.yandexClient.setEncryptionService(service);
+		this.settings.enableEncryption = true;
+		this.settings.encryptionSalt = remoteManifest.salt;
+		this.settings.encryptedPassword = password;
+		this.settings.encryptionRevision = remoteManifest.revision;
+
+		// Populate localIndex from remote so the conflict resolver has a baseline.
+		// Without this, any local deletions before the first fullSync are
+		// misidentified as "new remote files" and re-downloaded.
+		try {
+			await this.indexManager.loadRemoteIndex();
+			this.indexManager.seedLocalIndexFromRemote();
+		} catch (e) {
+			logger.warn("Could not seed local index from remote after connecting:", e);
+		}
+
+		await this.saveSettings();
+		this.setEncryptionBlock(null);
+		logger.info("Encryption configured from remote manifest");
+	}
+
+	/**
+	 * Ensure local encryption settings match the remote manifest before sync.
+	 */
+	private async ensureEncryptionReady(options: EncryptionReadyOptions): Promise<boolean> {
+
+		try {
+			const manifest = await this.indexManager.downloadEncryptionManifest();
+			if (!manifest) {
+				if (this.settings.enableEncryption) {
+					this.setEncryptionBlock(t("notice.encryption_remote_missing"));
+					return false;
+				}
+				this.setEncryptionBlock(null);
+				return true;
+			}
+
+			if (manifest.state !== "enabled") {
+				this.setEncryptionBlock(t("notice.encryption_remote_busy"));
+				return false;
+			}
+
+			const hasLocalEncryption = Boolean(
+				this.settings.enableEncryption
+				&& this.settings.encryptionSalt
+				&& this.settings.encryptedPassword
+				&& this.encryptionService
+			);
+			const localRevision = this.settings.encryptionRevision ?? 1;
+			const matchesRemote = hasLocalEncryption
+				&& this.settings.encryptionSalt === manifest.salt
+				&& (manifest.version === 1 || localRevision === manifest.revision);
+
+			if (!matchesRemote) {
+				const reason = hasLocalEncryption
+					? t("notice.encryption_password_changed_remote")
+					: t("notice.encryption_password_required");
+				this.setEncryptionBlock(reason);
+				if (!options.prompt) {
+					return false;
+				}
+				return await this.promptForRemoteEncryptionPassword(
+					manifest,
+					hasLocalEncryption ? "rotated" : "connect"
+				);
+			}
+
+			if (manifest.version === 2 && this.encryptionService) {
+				try {
+					if (!(await this.encryptionService.verifyVerifier(manifest.verifier))) {
+						throw new Error(t("notice.encryption_wrong_password"));
+					}
+				} catch {
+					this.setEncryptionBlock(t("notice.encryption_password_changed_remote"));
+					if (!options.prompt) {
+						return false;
+					}
+					return await this.promptForRemoteEncryptionPassword(manifest, "rotated");
+				}
+			}
+
+			this.setEncryptionBlock(null);
+			return true;
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			logger.warn("Error checking remote encryption state:", e);
+			this.setEncryptionBlock(t("notice.encryption_state_check_failed", { error: message }));
+			return false;
+		}
+	}
+
+	private async promptForRemoteEncryptionPassword(
+		manifest: RemoteEncryptionManifest,
+		mode: "connect" | "rotated"
+	): Promise<boolean> {
+		if (this.encryptionPromptPromise) {
+			return await this.encryptionPromptPromise;
+		}
+
+		this.encryptionPromptPromise = this.promptForRemoteEncryptionPasswordOnce(
+			manifest,
+			mode
+		).finally(() => {
+			this.encryptionPromptPromise = null;
+		});
+
+		return await this.encryptionPromptPromise;
+	}
+
+	private async promptForRemoteEncryptionPasswordOnce(
+		manifest: RemoteEncryptionManifest,
+		mode: "connect" | "rotated"
+	): Promise<boolean> {
+		const title = mode === "connect"
+			? t("modal.encryption_connect_title")
+			: t("modal.encryption_rotated_title");
+		const body = mode === "connect"
+			? t("modal.encryption_connect_desc")
+			: t("modal.encryption_rotated_desc");
+
+		const password = await new Promise<string | null>((resolve) => {
+			new ConnectEncryptedVaultModal(
+				this.app,
+				resolve,
+				title,
+				body,
+				t("modal.encryption_connect_button")
+			).open();
+		});
+		if (!password) {
+			logger.warn("User cancelled encryption password prompt");
+			return false;
 		}
 
 		try {
-			const remoteSalt = await this.indexManager.downloadEncryptionSalt();
-			if (!remoteSalt) {
-				// No encryption on remote — nothing to do
-				return;
-			}
-
-			// Local encryption is NOT configured but remote has salt
-			// Need to prompt user for password
-			new Notice(t("notice.encryption_detected"), 8000);
-
-			const password = await new Promise<string | null>((resolve) => {
-				new PasswordPromptModal(
-					this.app,
-					resolve,
-					() => this.createBackup(),
-					t("modal.encryption_enter_password")
-				).open();
-			});
-			if (!password) {
-				logger.warn("User cancelled encryption password prompt");
-				return;
-			}
-
-			const saltBytes = EncryptionService.base64ToBytes(remoteSalt);
-			const service = new EncryptionService(saltBytes);
-			await service.initializeKey(password);
-
-			// Verify by trying to load the encrypted index
-			this.yandexClient.setEncryptionService(service);
-			try {
-				await this.indexManager.loadRemoteIndex();
-
-				// Success — password is correct
-				this.encryptionService = service;
-				this.settings.enableEncryption = true;
-				this.settings.encryptionSalt = remoteSalt;
-				this.settings.encryptedPassword = password;
-				await this.saveSettings();
-				logger.info("Encryption configured from remote salt");
-			} catch {
-				// Wrong password
-				this.yandexClient.setEncryptionService(null);
-				this.encryptionService = null;
-				new Notice(t("notice.encryption_wrong_password"));
-			}
+			await this.connectToRemoteEncryption(password, manifest);
+			new Notice(t("notice.encryption_connected"));
+			return true;
 		} catch (e) {
-			logger.warn("Error syncing encryption state with remote:", e);
+			this.encryptionService = null;
+			this.yandexClient.setEncryptionService(null);
+			const message = e instanceof Error ? e.message : String(e);
+			this.setEncryptionBlock(t("notice.encryption_password_required"));
+			new Notice(message);
+			return false;
+		}
+	}
+
+	private async verifyRemoteEncryptionPassword(
+		service: EncryptionService,
+		manifest: RemoteEncryptionManifest
+	): Promise<void> {
+		if (manifest.version === 2) {
+			try {
+				if (await service.verifyVerifier(manifest.verifier)) {
+					return;
+				}
+			} catch {
+				throw new Error(t("notice.encryption_wrong_password"));
+			}
+			throw new Error(t("notice.encryption_wrong_password"));
+		}
+
+		const previousService = this.encryptionService;
+		this.yandexClient.setEncryptionService(service);
+		try {
+			await this.indexManager.loadRemoteIndex();
+		} catch {
+			this.yandexClient.setEncryptionService(previousService);
+			throw new Error(t("notice.encryption_wrong_password"));
+		}
+		this.yandexClient.setEncryptionService(previousService);
+	}
+
+	private async createEncryptionManifest(
+		service: EncryptionService,
+		salt: string,
+		state: EncryptionManifest["state"],
+		revision: number
+	): Promise<EncryptionManifest> {
+		return {
+			version: 2,
+			state,
+			revision,
+			salt,
+			verifier: await service.createVerifier(),
+			kdf: {
+				name: "PBKDF2",
+				hash: "SHA-256",
+				iterations: 100_000,
+			},
+			cipher: {
+				name: "AES-GCM",
+				keyLength: 256,
+				ivLength: 12,
+			},
+			updatedAt: Date.now(),
+			updatedBy: this.settings.deviceId,
+		};
+	}
+
+	private setEncryptionBlock(reason: string | null): void {
+		const changed = this.encryptionBlockReason !== reason;
+		this.encryptionBlockReason = reason;
+		this.syncEngine?.setExternalBlockReason(reason);
+		if (reason) {
+			this.fileWatcher?.stop();
+			this.syncScheduler?.stop();
+			if (changed) {
+				new Notice(reason, 10000);
+			}
+		}
+	}
+
+	private async deleteRemoteRawPaths(paths: string[]): Promise<void> {
+		if (paths.length === 0) {
+			return;
+		}
+
+		logger.info(`Cleaning up ${paths.length} old remote files...`);
+		for (const path of paths) {
+			try {
+				const remotePath = joinPath(this.settings.remotePath, path);
+				await this.yandexClient.deleteResource(remotePath, false, true);
+			} catch (e) {
+				logger.warn(`Failed to delete old remote file ${path}:`, e);
+			}
 		}
 	}
 

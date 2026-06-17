@@ -22,6 +22,12 @@ import { runWithConcurrencySettled } from "../utils/semaphore";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
+export type SyncGuardCallback = () => string | null | Promise<string | null>;
+
+export interface SyncRunOptions {
+	/** Skip encryption state guard for internal encryption maintenance flows. */
+	skipEncryptionGuard?: boolean;
+}
 
 export class SyncEngine {
 	private yandexClient: YandexDiskClient;
@@ -33,6 +39,8 @@ export class SyncEngine {
 	private state: SyncState = { ...INITIAL_SYNC_STATE };
 	private eventListeners: SyncEventCallback[] = [];
 	private indexSaveCallback: IndexSaveCallback | null = null;
+	private syncGuardCallback: SyncGuardCallback | null = null;
+	private externalBlockReason: string | null = null;
 	private isSyncing = false;
 	private isPaused = false;
 
@@ -57,6 +65,31 @@ export class SyncEngine {
 	 */
 	setIndexSaveCallback(callback: IndexSaveCallback): void {
 		this.indexSaveCallback = callback;
+	}
+
+	/**
+	 * Set callback that can block sync before any operation starts.
+	 */
+	setSyncGuardCallback(callback: SyncGuardCallback): void {
+		this.syncGuardCallback = callback;
+	}
+
+	/**
+	 * Set externally managed sync block reason.
+	 */
+	setExternalBlockReason(reason: string | null): void {
+		this.externalBlockReason = reason;
+		if (reason) {
+			this.setBlockedState(reason);
+		} else if (this.state.status === "encryption-required") {
+			this.updateState({
+				status: "idle",
+				errorMessage: undefined,
+				currentOperation: undefined,
+				progress: undefined,
+				pendingCount: 0,
+			});
+		}
 	}
 
 	/**
@@ -168,7 +201,7 @@ export class SyncEngine {
 	/**
 	 * Perform full synchronization
 	 */
-	async fullSync(): Promise<SyncResult> {
+	async fullSync(options?: SyncRunOptions): Promise<SyncResult> {
 		if (this.isSyncing) {
 			logger.warn("Synchronization already in progress");
 			return this.createErrorResult("Synchronization already in progress");
@@ -177,6 +210,11 @@ export class SyncEngine {
 		if (this.isPaused) {
 			logger.warn("Synchronization is paused");
 			return this.createErrorResult("Synchronization is paused");
+		}
+
+		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
+		if (blockReason) {
+			return this.createBlockedResult(blockReason);
 		}
 
 		this.isSyncing = true;
@@ -446,7 +484,7 @@ export class SyncEngine {
 	 * Overwrites ALL remote files with local versions.
 	 * Files not present locally are deleted from remote.
 	 */
-	async forceSyncFromLocal(): Promise<SyncResult> {
+	async forceSyncFromLocal(options?: SyncRunOptions): Promise<SyncResult> {
 		if (this.isSyncing) {
 			logger.warn("Synchronization already in progress");
 			return this.createErrorResult("Synchronization already in progress");
@@ -455,6 +493,11 @@ export class SyncEngine {
 		if (this.isPaused) {
 			logger.warn("Synchronization is paused");
 			return this.createErrorResult("Synchronization is paused");
+		}
+
+		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
+		if (blockReason) {
+			return this.createBlockedResult(blockReason);
 		}
 
 		this.isSyncing = true;
@@ -651,7 +694,7 @@ export class SyncEngine {
 	 * Overwrites ALL local files with remote versions.
 	 * Files not present on remote are deleted locally.
 	 */
-	async forceSyncFromRemote(): Promise<SyncResult> {
+	async forceSyncFromRemote(options?: SyncRunOptions): Promise<SyncResult> {
 		if (this.isSyncing) {
 			logger.warn("Synchronization already in progress");
 			return this.createErrorResult("Synchronization already in progress");
@@ -660,6 +703,11 @@ export class SyncEngine {
 		if (this.isPaused) {
 			logger.warn("Synchronization is paused");
 			return this.createErrorResult("Synchronization is paused");
+		}
+
+		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
+		if (blockReason) {
+			return this.createBlockedResult(blockReason);
 		}
 
 		this.isSyncing = true;
@@ -1116,10 +1164,22 @@ export class SyncEngine {
 	): Promise<void> {
 		logger.info(`[SyncEngine] syncSingleFile called for ${path}, action: ${action}`);
 
+		const blockReason = await this.getSyncBlockReason(false);
+		if (blockReason) {
+			logger.warn(`[SyncEngine] Skipping file sync ${path}: ${blockReason}`);
+			this.setBlockedState(blockReason);
+			return;
+		}
+
 		if (this.isPaused || this.isSyncing) {
 			logger.info(
 				`[SyncEngine] Skipping file sync ${path}: sync busy (${this.isSyncing}) or paused (${this.isPaused})`
 			);
+			// Persist the deletion intent so the next fullSync resolves it as
+			// delete_remote (Case 3) rather than downloading the file (Case 2/8).
+			if (action === "delete") {
+				this.indexManager.markLocalFileDeleted(path);
+			}
 			return;
 		}
 
@@ -1155,6 +1215,13 @@ export class SyncEngine {
 	 * Rename file on Yandex Disk
 	 */
 	async renameFile(oldPath: string, newPath: string): Promise<void> {
+		const blockReason = await this.getSyncBlockReason(false);
+		if (blockReason) {
+			logger.warn(`[SyncEngine] Skipping rename ${oldPath}: ${blockReason}`);
+			this.setBlockedState(blockReason);
+			return;
+		}
+
 		if (this.isPaused || this.isSyncing) {
 			return;
 		}
@@ -1247,5 +1314,33 @@ export class SyncEngine {
 			startTime: Date.now(),
 			endTime: Date.now(),
 		};
+	}
+
+	private async getSyncBlockReason(skipGuard?: boolean): Promise<string | null> {
+		if (skipGuard) {
+			return null;
+		}
+		if (this.externalBlockReason) {
+			return this.externalBlockReason;
+		}
+		if (!this.syncGuardCallback) {
+			return null;
+		}
+		return await this.syncGuardCallback();
+	}
+
+	private createBlockedResult(reason: string): SyncResult {
+		this.setBlockedState(reason);
+		return this.createErrorResult(reason);
+	}
+
+	private setBlockedState(reason: string): void {
+		this.updateState({
+			status: "encryption-required",
+			errorMessage: reason,
+			currentOperation: undefined,
+			progress: undefined,
+			pendingCount: 0,
+		});
 	}
 }

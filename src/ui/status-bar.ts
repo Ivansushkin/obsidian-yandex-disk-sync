@@ -51,7 +51,10 @@ export class SyncStatusBar {
 			"sync-idle",
 			"sync-syncing",
 			"sync-error",
-			"sync-paused"
+			"sync-paused",
+			"sync-offline",
+			"sync-initializing",
+			"sync-encryption-required"
 		);
 		this.statusBarEl.addClass(`sync-${state.status}`);
 
@@ -76,6 +79,8 @@ export class SyncStatusBar {
 				return "[X]";
 			case "initializing":
 				return "[...]";
+			case "encryption-required":
+				return "[!]";
 			default:
 				return "[-]";
 		}
@@ -109,6 +114,9 @@ export class SyncStatusBar {
 
 			case "initializing":
 				return t("status.initializing");
+
+			case "encryption-required":
+				return t("status.encryption_required");
 
 			default:
 				return "YD";
@@ -148,6 +156,12 @@ export class SyncStatusBar {
 				break;
 			case "initializing":
 				lines.push(t("status.tooltip.initializing"));
+				break;
+			case "encryption-required":
+				lines.push(t("status.tooltip.encryption_required"));
+				if (state.errorMessage) {
+					lines.push(state.errorMessage);
+				}
 				break;
 		}
 

@@ -5,9 +5,9 @@ export class EnableEncryptionModal extends Modal {
 	private resolve: (value: string | null) => void;
 	private resolved = false;
 	private createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>;
-	private passwordInput: HTMLInputElement;
-	private confirmInput: HTMLInputElement;
-	private errorEl: HTMLElement;
+	private passwordInput!: HTMLInputElement;
+	private confirmInput!: HTMLInputElement;
+	private errorEl!: HTMLElement;
 
 	constructor(
 		app: App,
@@ -165,7 +165,7 @@ export class VerifyPasswordModal extends Modal {
 	private resolve: (value: string | null) => void;
 	private resolved = false;
 	private correctPassword: string;
-	private input: HTMLInputElement;
+	private input!: HTMLInputElement;
 
 	constructor(app: App, resolve: (value: string | null) => void, correctPassword: string) {
 		super(app);
@@ -243,9 +243,9 @@ export class VerifyPasswordModal extends Modal {
 export class ChangePasswordModal extends Modal {
 	private resolve: (value: string | null) => void;
 	private resolved = false;
-	private passwordInput: HTMLInputElement;
-	private confirmInput: HTMLInputElement;
-	private errorEl: HTMLElement;
+	private passwordInput!: HTMLInputElement;
+	private confirmInput!: HTMLInputElement;
+	private errorEl!: HTMLElement;
 
 	constructor(app: App, resolve: (value: string | null) => void) {
 		super(app);
@@ -331,7 +331,7 @@ export class PasswordPromptModal extends Modal {
 	private resolve: (value: string | null) => void;
 	private resolved = false;
 	private createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>;
-	private input: HTMLInputElement;
+	private input!: HTMLInputElement;
 	private promptText: string;
 
 	constructor(
@@ -387,6 +387,86 @@ export class PasswordPromptModal extends Modal {
 			.addButton((btn) =>
 				btn
 					.setButtonText(t("modal.encryption_enable_without_backup"))
+					.onClick(() => {
+						const pw = this.getPassword();
+						if (!pw) return;
+						this.finish(pw);
+						this.close();
+					})
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText(t("modal.cancel_button"))
+					.onClick(() => {
+						this.finish(null);
+						this.close();
+					})
+			);
+		setting.settingEl.addClass("force-sync-modal-buttons");
+	}
+
+	onClose(): void {
+		this.finish(null);
+		const { contentEl } = this;
+		contentEl.empty();
+	}
+}
+
+export class ConnectEncryptedVaultModal extends Modal {
+	private resolve: (value: string | null) => void;
+	private resolved = false;
+	private input!: HTMLInputElement;
+	private title: string;
+	private description: string;
+	private buttonText: string;
+
+	constructor(
+		app: App,
+		resolve: (value: string | null) => void,
+		title: string,
+		description: string,
+		buttonText: string
+	) {
+		super(app);
+		this.resolve = resolve;
+		this.title = title;
+		this.description = description;
+		this.buttonText = buttonText;
+	}
+
+	private finish(value: string | null): void {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.resolve(value);
+	}
+
+	private getPassword(): string | null {
+		const pw = this.input.value;
+		if (!pw) return null;
+		return pw;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+
+		this.titleEl.setText(this.title);
+
+		contentEl.createEl("p", { text: this.description });
+		contentEl.createEl("p", {
+			text: t("modal.encryption_connect_privacy"),
+		});
+
+		this.input = contentEl.createEl("input", {
+			type: "password",
+			placeholder: t("modal.encryption_password_label"),
+		});
+		this.input.addClass("encryption-password-input");
+
+		const setting = new Setting(contentEl)
+			.addButton((btn) =>
+				btn
+					.setButtonText(this.buttonText)
+					.setCta()
 					.onClick(() => {
 						const pw = this.getPassword();
 						if (!pw) return;
