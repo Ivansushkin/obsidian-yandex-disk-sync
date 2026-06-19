@@ -72,7 +72,7 @@ export class BackupManager {
 					zip.file(file.path, content);
 					totalSize += content.byteLength;
 				} catch (error) {
-					logger.warn(`Failed to read file for backup: ${file.path}`, error);
+					logger.warn(`Failed to read file for backup: ${file.path}`, { error });
 					// Continue with other files
 				}
 			}
@@ -101,7 +101,7 @@ export class BackupManager {
 		};
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			logger.error('Backup creation failed:', error);
+			logger.error('Backup creation failed:', { error });
 
 			return {
 				success: false,
@@ -169,7 +169,7 @@ export class BackupManager {
 	async listBackups(): Promise<BackupInfo[]> {
 		try {
 			const backupFolder = joinPath(this.settings.remotePath, '.backup');
-			logger.info('Fetching backup list from:', backupFolder);
+			logger.info(`Fetching backup list from: ${backupFolder}`);
 
 			const resources = await this.yandexClient.getResourcesRecursive(backupFolder);
 			const backups: BackupInfo[] = [];
@@ -200,7 +200,7 @@ export class BackupManager {
 			logger.info(`Found ${backups.length} backups`);
 			return backups;
 		} catch (error) {
-			logger.error('Error listing backups:', error);
+			logger.error('Error listing backups:', { error });
 			throw error;
 		}
 	}
@@ -210,12 +210,12 @@ export class BackupManager {
 	 */
 	async downloadBackup(backupPath: string): Promise<ArrayBuffer> {
 		try {
-			logger.info('Starting backup download:', backupPath);
+			logger.info(`Starting backup download: ${backupPath}`);
 			const content = await this.yandexClient.downloadFile(backupPath);
 			logger.info('Backup downloaded successfully');
 			return content;
 		} catch (error) {
-			logger.error('Error downloading backup:', error);
+			logger.error('Error downloading backup:', { error });
 			throw error;
 		}
 	}

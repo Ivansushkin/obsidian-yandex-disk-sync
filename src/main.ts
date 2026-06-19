@@ -26,7 +26,12 @@ import { BackupManager } from "./backup/backup-manager";
 import { generateDeviceId, joinPath } from "./utils/path-utils";
 import { logger } from "./utils/logger";
 import { initI18n, t } from "./i18n";
-import { EncryptionService } from "./crypto/encryption";
+import {
+	EncryptionService,
+	PBKDF2_ITERATIONS,
+	AES_KEY_LENGTH,
+	IV_LENGTH,
+} from "./crypto/encryption";
 
 interface PluginData {
 	settings: YandexDiskSyncSettings;
@@ -79,6 +84,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Load settings
 		await this.loadSettings();
+
+		// Configure logger from settings
+		logger.configure({
+			app: this.app,
+			minLevel: this.settings.enableDebugLogging ? "debug" : "info",
+			consoleEnabled: true,
+			fileEnabled: this.settings.logToFile,
+		});
+		logger.info("Loading Yandex Disk Sync plugin...");
 
 		// Generate device ID if missing
 		if (!this.settings.deviceId) {
@@ -315,32 +329,32 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Проверка необходимости первичной синхронизации
+	 * Check whether an initial sync is required.
 	 */
 	private async needsInitialSync(): Promise<boolean> {
 		try {
-			// Проверяем наличие удаленного индекса
+			// Check whether a remote index exists
 			const remoteIndexExists = await this.indexManager.remoteIndexExists();
 			if (remoteIndexExists) {
-				// Если индекс есть на диске - это не первичная синхронизация
+				// Existing remote index means this is not the first sync
 				logger.info("Remote index exists, skipping initial sync");
 				return false;
 			}
 
-			// Проверяем локальный индекс
+			// Check the local index
 			const localIndex = this.indexManager.getLocalIndex();
 			if (localIndex.lastSyncTime > 0) {
-				// Если была синхронизация - не первичная
+				// A previous sync was recorded, so this is not the first sync
 				logger.info("Local index has sync time, skipping initial sync");
 				return false;
 			}
 
-			// Иначе - нужна первичная синхронизация
+			// Otherwise an initial sync is needed
 			logger.info("Initial sync needed");
 			return true;
 		} catch (e) {
-			logger.warn("Error checking initial sync status:", e);
-			// В случае ошибки считаем что нужна первичная синхронизация
+			logger.warn("Error checking initial sync status:", { error: e });
+			// If the check fails, assume an initial sync is required
 			return true;
 		}
 	}
@@ -363,7 +377,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.runInitialSync();
 			await this.startSync();
 		} catch (e) {
-			logger.error("Error during initial setup:", e);
+			logger.error("Error during initial setup:", { error: e });
 			new Notice(`Initialization error: ${(e as Error).message}`);
 		}
 	}
@@ -411,7 +425,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				new Notice(t("notice.sync_error", { errors: result.errors.length }));
 			}
 		} catch (e) {
-			logger.error("Error during initial synchronization:", e);
+			logger.error("Error during initial synchronization:", { error: e });
 			new Notice(`Sync error: ${(e as Error).message}`);
 		}
 	}
@@ -455,7 +469,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				new Notice(t("notice.sync_error", { errors: result.errors.length }));
 			}
 		} catch (e) {
-			logger.error("Sync error:", e);
+			logger.error("Sync error:", { error: e });
 			new Notice(`Sync error: ${(e as Error).message}`);
 		}
 	}
@@ -531,7 +545,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 		} catch (e) {
 			notice.hide();
-			logger.error("Force sync error:", e);
+			logger.error("Force sync error:", { error: e });
 			new Notice(`Force sync error: ${(e as Error).message}`);
 		}
 	}
@@ -589,7 +603,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 		} catch (e) {
 			notice.hide();
-			logger.error("Force sync error:", e);
+			logger.error("Force sync error:", { error: e });
 			new Notice(`Force sync error: ${(e as Error).message}`);
 		}
 	}
@@ -638,6 +652,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const data = (await this.loadData()) as PluginData | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
 
+		// Migrate legacy field name `encryptedPassword` -> `encryptionPassword`.
+		const legacySettings = data?.settings as
+			| (Partial<YandexDiskSyncSettings> & { encryptedPassword?: string | null })
+			| undefined;
+		if (legacySettings?.encryptedPassword && !this.settings.encryptionPassword) {
+			this.settings.encryptionPassword = legacySettings.encryptedPassword;
+		}
+
 		// Automatically determine path with vault name
 		const vaultName = this.app.vault.getName();
 		const saved = data?.settings;
@@ -658,6 +680,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Save settings
 	 */
 	async saveSettings(): Promise<void> {
+		// Update logger configuration
+		logger.configure({
+			app: this.app,
+			minLevel: this.settings.enableDebugLogging ? "debug" : "info",
+			consoleEnabled: true,
+			fileEnabled: this.settings.logToFile,
+		});
+
 		// Update components
 		if (this.yandexClient) {
 			this.yandexClient.setToken(this.settings.yandexTokenSecret);
@@ -706,7 +736,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (
 			!this.settings.enableEncryption
 			|| !this.settings.encryptionSalt
-			|| !this.settings.encryptedPassword
+			|| !this.settings.encryptionPassword
 		) {
 			this.yandexClient.setEncryptionService(null);
 			return;
@@ -717,12 +747,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.settings.encryptionSalt
 			);
 			const service = new EncryptionService(salt);
-			await service.initializeKey(this.settings.encryptedPassword);
+			await service.initializeKey(this.settings.encryptionPassword);
 			this.encryptionService = service;
 			this.yandexClient.setEncryptionService(service);
 			logger.info("Encryption initialized successfully");
 		} catch (e) {
-			logger.warn("Failed to initialize encryption:", e);
+			logger.warn("Failed to initialize encryption:", { error: e });
 			this.encryptionService = null;
 			this.yandexClient.setEncryptionService(null);
 
@@ -751,7 +781,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.yandexClient.setEncryptionService(service);
 		this.settings.enableEncryption = true;
 		this.settings.encryptionSalt = saltBase64;
-		this.settings.encryptedPassword = password;
+		this.settings.encryptionPassword = password;
 		this.settings.encryptionRevision = revision;
 		await this.saveSettings();
 
@@ -805,7 +835,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						)
 					);
 				} catch (e) {
-					logger.warn("Failed to upload disabling manifest:", e);
+					logger.warn("Failed to upload disabling manifest:", { error: e });
 					partialErrors = true;
 				}
 			}
@@ -835,14 +865,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Always clear local encryption state regardless of remote errors
 		this.settings.enableEncryption = false;
 		this.settings.encryptionSalt = null;
-		this.settings.encryptedPassword = null;
+		this.settings.encryptionPassword = null;
 		this.settings.encryptionRevision = null;
 		await this.saveSettings();
 
 		try {
 			await this.indexManager.deleteEncryptionManifest();
 		} catch (e) {
-			logger.warn("Failed to delete encryption manifest from remote:", e);
+			logger.warn("Failed to delete encryption manifest from remote:", { error: e });
 			partialErrors = true;
 		}
 
@@ -866,7 +896,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.yandexClient.setEncryptionService(null);
 		this.settings.enableEncryption = false;
 		this.settings.encryptionSalt = null;
-		this.settings.encryptedPassword = null;
+		this.settings.encryptionPassword = null;
 		this.settings.encryptionRevision = null;
 		await this.saveSettings();
 		this.setEncryptionBlock(null);
@@ -902,7 +932,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.yandexClient.setEncryptionService(service);
 		this.settings.enableEncryption = true;
 		this.settings.encryptionSalt = saltBase64;
-		this.settings.encryptedPassword = newPassword;
+		this.settings.encryptionPassword = newPassword;
 		this.settings.encryptionRevision = revision;
 		await this.saveSettings();
 
@@ -955,7 +985,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.yandexClient.setEncryptionService(service);
 		this.settings.enableEncryption = true;
 		this.settings.encryptionSalt = remoteManifest.salt;
-		this.settings.encryptedPassword = password;
+		this.settings.encryptionPassword = password;
 		this.settings.encryptionRevision = remoteManifest.revision;
 
 		// Populate localIndex from remote so the conflict resolver has a baseline.
@@ -965,7 +995,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.indexManager.loadRemoteIndex();
 			this.indexManager.seedLocalIndexFromRemote();
 		} catch (e) {
-			logger.warn("Could not seed local index from remote after connecting:", e);
+			logger.warn("Could not seed local index from remote after connecting:", { error: e });
 		}
 
 		await this.saveSettings();
@@ -999,7 +1029,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const hasLocalEncryption = Boolean(
 				this.settings.enableEncryption
 				&& this.settings.encryptionSalt
-				&& this.settings.encryptedPassword
+				&& this.settings.encryptionPassword
 				&& this.encryptionService
 			);
 			const localRevision = this.settings.encryptionRevision ?? 1;
@@ -1039,7 +1069,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return true;
 		} catch (e) {
 			const message = e instanceof Error ? e.message : String(e);
-			logger.warn("Error checking remote encryption state:", e);
+			logger.warn("Error checking remote encryption state:", { error: e });
 			this.setEncryptionBlock(t("notice.encryption_state_check_failed", { error: message }));
 			return false;
 		}
@@ -1123,10 +1153,31 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		try {
 			await this.indexManager.loadRemoteIndex();
 		} catch {
-			this.yandexClient.setEncryptionService(previousService);
 			throw new Error(t("notice.encryption_wrong_password"));
+		} finally {
+			this.yandexClient.setEncryptionService(previousService);
 		}
-		this.yandexClient.setEncryptionService(previousService);
+	}
+
+	/**
+	 * Verify a candidate encryption password against the currently initialized
+	 * encryption service. Returns false if encryption is not active or the
+	 * password does not derive the same key.
+	 */
+	async verifyEncryptionPassword(password: string): Promise<boolean> {
+		if (!this.encryptionService || !this.settings.encryptionSalt) {
+			return false;
+		}
+
+		try {
+			const salt = EncryptionService.base64ToBytes(this.settings.encryptionSalt);
+			const candidate = new EncryptionService(salt);
+			await candidate.initializeKey(password);
+			const verifier = await this.encryptionService.createVerifier();
+			return await candidate.verifyVerifier(verifier);
+		} catch {
+			return false;
+		}
 	}
 
 	private async createEncryptionManifest(
@@ -1144,12 +1195,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			kdf: {
 				name: "PBKDF2",
 				hash: "SHA-256",
-				iterations: 100_000,
+				iterations: PBKDF2_ITERATIONS,
 			},
 			cipher: {
 				name: "AES-GCM",
-				keyLength: 256,
-				ivLength: 12,
+				keyLength: AES_KEY_LENGTH,
+				ivLength: IV_LENGTH,
 			},
 			updatedAt: Date.now(),
 			updatedBy: this.settings.deviceId,
@@ -1180,7 +1231,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				const remotePath = joinPath(this.settings.remotePath, path);
 				await this.yandexClient.deleteResource(remotePath, false, true);
 			} catch (e) {
-				logger.warn(`Failed to delete old remote file ${path}:`, e);
+				logger.warn(`Failed to delete old remote file ${path}:`, { error: e });
 			}
 		}
 	}
@@ -1216,16 +1267,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				await this.yandexClient.deleteResource(remotePath, false, true);
 				logger.debug(`Deleted old remote folder: ${folder}`);
 			} catch (e) {
-				logger.warn(`Failed to delete old remote folder ${folder}:`, e);
+				logger.warn(`Failed to delete old remote folder ${folder}:`, { error: e });
 			}
 		}
-	}
-
-	/**
-	 * Get encryption service instance (may be null if disabled).
-	 */
-	getEncryptionService(): EncryptionService | null {
-		return this.encryptionService;
 	}
 
 	/**
@@ -1269,7 +1313,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			logger.error("Backup creation failed:", error);
+			logger.error("Backup creation failed:", { error });
 			return { success: false, error: errorMessage };
 		}
 	}

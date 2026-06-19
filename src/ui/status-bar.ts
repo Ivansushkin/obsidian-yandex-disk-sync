@@ -46,7 +46,7 @@ export class SyncStatusBar {
 		this.statusBarEl.empty();
 		this.statusBarEl.createSpan({ text: `${icon} ${text}` });
 
-		// Обновляем класс для стилизации
+		// Update the CSS class for styling
 		this.statusBarEl.removeClass(
 			"sync-idle",
 			"sync-syncing",
@@ -58,7 +58,7 @@ export class SyncStatusBar {
 		);
 		this.statusBarEl.addClass(`sync-${state.status}`);
 
-		// Добавляем tooltip
+		// Add tooltip
 		this.statusBarEl.setAttribute("aria-label", this.getTooltip(state));
 	}
 

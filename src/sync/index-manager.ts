@@ -16,6 +16,11 @@ import { YandexApiError, YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import { isProtectedPath, joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
+import {
+	PBKDF2_ITERATIONS,
+	AES_KEY_LENGTH,
+	IV_LENGTH,
+} from "../crypto/encryption";
 
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
 const ENCRYPTION_MANIFEST_FILENAME = ".obsidian-encrypt.json";
@@ -142,7 +147,7 @@ export class IndexManager {
 			);
 			return this.remoteIndex;
 		} catch (e) {
-			logger.warn("Error loading remote index:", e);
+			logger.warn("Error loading remote index:", { error: e });
 			throw e;
 		}
 	}
@@ -410,14 +415,6 @@ export class IndexManager {
 	}
 
 	/**
-	 * Download legacy salt value from the remote encryption manifest.
-	 */
-	async downloadEncryptionSalt(): Promise<string | null> {
-		const manifest = await this.downloadEncryptionManifest();
-		return manifest?.salt ?? null;
-	}
-
-	/**
 	 * Delete encryption manifest from Yandex Disk.
 	 */
 	async deleteEncryptionManifest(): Promise<void> {
@@ -427,13 +424,6 @@ export class IndexManager {
 			true
 		);
 		logger.info("Encryption manifest deleted from remote");
-	}
-
-	/**
-	 * Delete legacy encryption salt from Yandex Disk.
-	 */
-	async deleteEncryptionSalt(): Promise<void> {
-		await this.deleteEncryptionManifest();
 	}
 
 	/**
@@ -527,12 +517,12 @@ export class IndexManager {
 			kdf: {
 				name: "PBKDF2",
 				hash: "SHA-256",
-				iterations: 100_000,
+				iterations: PBKDF2_ITERATIONS,
 			},
 			cipher: {
 				name: "AES-GCM",
-				keyLength: 256,
-				ivLength: 12,
+				keyLength: AES_KEY_LENGTH,
+				ivLength: IV_LENGTH,
 			},
 			updatedAt,
 			updatedBy,

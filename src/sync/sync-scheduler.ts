@@ -109,7 +109,7 @@ export class SyncScheduler {
 				);
 			}
 		} catch (e) {
-			logger.error("Scheduled synchronization error:", e);
+			logger.error("Scheduled synchronization error:", { error: e });
 		}
 	}
 

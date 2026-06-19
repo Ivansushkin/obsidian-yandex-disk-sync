@@ -1,6 +1,6 @@
 /* Yandex Disk Sync Plugin Styles */
 
-/* Статус-бар */
+/* Status bar */
 .yandex-sync-status {
 	cursor: pointer;
 	padding: 0 8px;
@@ -31,7 +31,7 @@
 	font-weight: 600;
 }
 
-/* Модальное окно инициализации */
+/* Initialization modal */
 .init-sync-info {
 	background: var(--background-secondary);
 	padding: 12px;
@@ -43,7 +43,7 @@
 	margin: 4px 0;
 }
 
-/* Модальное окно статуса */
+/* Status modal */
 .sync-status-stats {
 	background: var(--background-secondary);
 	padding: 12px;
@@ -55,7 +55,7 @@
 	margin: 8px 0;
 }
 
-/* Настройки */
+/* Settings */
 .yandex-sync-settings textarea {
 	width: 100%;
 	min-height: 80px;
@@ -63,7 +63,7 @@
 	font-size: 12px;
 }
 
-/* Кнопки OAuth в настройках - вертикальное расположение для лучшей адаптивности */
+/* OAuth buttons in settings - vertical layout for better responsiveness */
 .setting-item:has(button) .setting-item-control {
 	display: flex;
 	flex-direction: column;
@@ -76,7 +76,34 @@
 	flex-shrink: 0;
 }
 
-/* Инструкция OAuth */
+/* Connection setup block */
+.connection-block {
+	margin-bottom: 24px;
+}
+
+.connection-block .setting-item {
+	border-top: none;
+}
+
+.connection-block .setting-item-control input {
+	width: 100%;
+}
+
+.connection-block .setting-item-control label {
+	display: block;
+	text-align: left;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text-muted);
+}
+
+/* Log viewer modal */
+.log-viewer-textarea {
+	font-family: var(--font-monospace);
+	font-size: 11px;
+}
+
+/* OAuth instruction */
 .oauth-instruction {
 	line-height: 1.6;
 }
@@ -175,8 +202,13 @@
 }
 
 .encryption-password-error {
+	display: none;
 	color: var(--text-error);
 	margin-bottom: 8px;
+}
+
+.encryption-password-error.is-visible {
+	display: block;
 }
 
 .encryption-password-input.is-error {

@@ -13,9 +13,10 @@
  *   IV is stored prepended so decryption works without knowing the original path.
  */
 
-const PBKDF2_ITERATIONS = 100_000;
-const IV_LENGTH = 12;
-const SALT_LENGTH = 16;
+export const PBKDF2_ITERATIONS = 100_000;
+export const AES_KEY_LENGTH = 256;
+export const IV_LENGTH = 12;
+export const SALT_LENGTH = 16;
 const VERIFIER_PAYLOAD = "obsidian-yandex-disk-sync:encryption-verifier:v1";
 
 export class EncryptionService {

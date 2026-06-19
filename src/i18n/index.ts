@@ -4,6 +4,7 @@
  */
 
 import { translations, Language } from './translations';
+import { logger } from '../utils/logger';
 
 let currentLanguage: Language = 'en';
 let isInitialized = false;
@@ -25,7 +26,7 @@ function detectLanguage(): Language {
         }
     } catch (e) {
         // Log error but don't crash
-        console.warn('[YandexSync i18n] Error detecting language:', e);
+        logger.warn('[YandexSync i18n] Error detecting language:', { error: e });
     }
 
     // Default to English

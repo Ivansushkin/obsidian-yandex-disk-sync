@@ -29,12 +29,20 @@ export interface YandexDiskSyncSettings {
 	debounceDelay: number;
 	/** Maximum number of concurrent operations during sync */
 	maxConcurrency: number;
+	/** Enable debug logging (verbose output) */
+	enableDebugLogging: boolean;
+	/** Write logs to a file in the vault for debugging */
+	logToFile: boolean;
 	/** Enable end-to-end encryption */
 	enableEncryption: boolean;
 	/** Base64-encoded salt for key derivation (null = not initialized) */
 	encryptionSalt: string | null;
-	/** Plaintext user password stored locally in plugin settings */
-	encryptedPassword: string | null;
+	/**
+	 * User-provided encryption password stored locally as a plaintext string.
+	 * This field is intentionally not encrypted because Obsidian mobile plugins
+	 * do not have access to the OS keychain. Keep it inside plugin sandbox data.
+	 */
+	encryptionPassword: string | null;
 	/** Remote encryption manifest revision applied on this device */
 	encryptionRevision: number | null;
 }
@@ -51,9 +59,11 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	deviceId: "",
 	debounceDelay: 1000,
 	maxConcurrency: 10,
+	enableDebugLogging: false,
+	logToFile: true,
 	enableEncryption: false,
 	encryptionSalt: null,
-	encryptedPassword: null,
+	encryptionPassword: null,
 	encryptionRevision: null,
 };
 

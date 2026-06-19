@@ -73,7 +73,10 @@ export class YandexDiskClient {
 		try {
 			await this.request("GET", "/");
 			return true;
-		} catch {
+		} catch (e) {
+			logger.error("Token validation failed", {
+				error: e instanceof Error ? e.message : String(e),
+			});
 			return false;
 		}
 	}
@@ -378,6 +381,7 @@ export class YandexDiskClient {
 		const uploadLink = await this.getUploadLink(remotePath, true, raw);
 
 		// Upload file
+		logger.debug(`Uploading file directly: ${remotePath}`);
 		await requestUrl({
 			url: uploadLink.href,
 			method: "PUT",
@@ -408,6 +412,7 @@ export class YandexDiskClient {
 	async downloadFile(remotePath: string, raw = false): Promise<ArrayBuffer> {
 		const downloadLink = await this.getDownloadLink(remotePath, raw);
 
+		logger.debug(`Downloading file directly: ${remotePath}`);
 		const response = await requestUrl({
 			url: downloadLink.href,
 			method: "GET",
@@ -521,10 +526,16 @@ export class YandexDiskClient {
 
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			try {
+				logger.debug(`API request: ${method} ${endpoint}`, {
+					attempt: attempt + 1,
+					maxRetries: this.maxRetries,
+				});
+
 				const response = await requestUrl(params);
 
 				// Successful statuses
 				if (response.status >= 200 && response.status < 300) {
+					logger.debug(`API response: ${method} ${endpoint} -> ${response.status}`);
 					return response;
 				}
 
@@ -540,17 +551,29 @@ export class YandexDiskClient {
 						errorData?.error
 					);
 
+					logger.warn(`API rate/service error: ${method} ${endpoint} -> ${response.status}`, {
+						code: errorData?.error,
+						description: errorData?.description,
+						attempt: attempt + 1,
+					});
+
 					if (attempt < this.maxRetries) {
 						const delay = this.retryDelay * Math.pow(2, attempt);
 						logger.warn(
-							`Error ${response.status}, retry in ${delay}ms`
+							`Retrying API request in ${delay}ms`
 						);
 						await this.sleep(delay);
 						continue;
 					}
 				}
 
-				// Other errors - don't retry
+			// Other errors - don't retry
+			logger.debug(`API error: ${method} ${endpoint} -> ${response.status}`, {
+				code: errorData?.error,
+				description: errorData?.description,
+				message: errorData?.message,
+				reason: errorData?.reason,
+			});
 				throw new YandexApiError(
 					errorData?.description || `HTTP ${response.status}`,
 					response.status,
@@ -562,11 +585,15 @@ export class YandexDiskClient {
 				}
 				lastError = e as Error;
 
+				logger.error(`API request failed: ${method} ${endpoint}`, {
+					attempt: attempt + 1,
+					error: (e as Error).message,
+				});
+
 				if (attempt < this.maxRetries) {
 					const delay = this.retryDelay * Math.pow(2, attempt);
 					logger.warn(
-						`Network error, retry in ${delay}ms:`,
-						(e as Error).message
+						`Network error, retry in ${delay}ms:`
 					);
 					await this.sleep(delay);
 				}

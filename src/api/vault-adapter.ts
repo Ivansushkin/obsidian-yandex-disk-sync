@@ -292,7 +292,7 @@ export class VaultAdapter {
 			} catch (e) {
 				logger.warn(
 					`Failed to get file metadata: ${file.path}`,
-					e
+					{ error: e }
 				);
 				return null;
 			}

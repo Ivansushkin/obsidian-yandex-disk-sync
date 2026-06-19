@@ -101,16 +101,11 @@ setEncryptionService(service: EncryptionService | null): void {
 
 ### 2.3 SyncEngine (`src/sync/sync-engine.ts`)
 
-Добавляется поддержка прогресса для обратной связи при длительном шифровании:
-
-```typescript
-private encryptionProgressCallback: ((filename: string, progress: number) => void) | null = null;
-
-setEncryptionProgressCallback(cb): void;
-```
-
-Прогресс-колбэк вызывается в циклах `uploadFile()` внутри `fullSync()`
-и `forceSyncFromLocal()`: `(processedCount / totalCount * 100)`.
+Шифрование прозрачно для движка синхронизации: оно выполняется внутри
+`YandexDiskClient` при upload/download. Прогресс длительных операций
+включения/отключения шифрования и смены пароля отображается через общий
+`onProgress` колбэк `SyncEngine` (`updateState` → status bar), который
+получает `(processedCount / totalCount * 100)`.
 
 ### 2.4 main.ts
 
@@ -122,18 +117,18 @@ setEncryptionProgressCallback(cb): void;
 private async initEncryption(): Promise<void> {
     if (!this.settings.enableEncryption
         || !this.settings.encryptionSalt
-        || !this.settings.encryptedPassword
+        || !this.settings.encryptionPassword
     ) return;
 
     const salt = EncryptionService.base64ToBytes(this.settings.encryptionSalt);
     const service = new EncryptionService(salt);
-    await service.initializeKey(this.settings.encryptedPassword);
+    await service.initializeKey(this.settings.encryptionPassword);
     this.encryptionService = service;
     this.yandexClient.setEncryptionService(service);
 }
 ```
 
-Пароль хранится в `encryptedPassword` как plaintext string (не base64).
+Пароль хранится в `encryptionPassword` как plaintext string (не base64).
 
 #### enableEncryption(password)
 
@@ -278,7 +273,6 @@ scheduler и realtime watcher через guard в `SyncEngine`.
 | `DisableEncryptionModal`| Подтверждение отключения                            | 0            | Yes (Cta) / Cancel                                       |
 | `VerifyPasswordModal`   | Верификация текущего пароля (смена пароля)          | 1            | Confirm (Cta) / Cancel                                   |
 | `ConnectEncryptedVaultModal` | Запрос пароля для подключения encrypted remote vault | 1      | Connect / Cancel                                          |
-| `PasswordPromptModal`   | Legacy prompt для запроса пароля                    | 1            | Create backup + continue / Continue without backup / Cancel |
 | `ChangePasswordModal`   | Ввод нового пароля при смене                        | 2 (pw + confirm) | Change password (Cta) / Cancel                         |
 
 Общий паттерн для всех модалок:
@@ -300,7 +294,7 @@ scheduler и realtime watcher через guard в `SyncEngine`.
   - ON, remote manifest есть: `ConnectEncryptedVaultModal` -> `connectToRemoteEncryption(password)` -> `Notice(encryption_connected)`
   - OFF: `DisableEncryptionModal` -> persistent notice -> `disableEncryption({ reuploadPlaintext: true })` -> если `!hadErrors`: `Notice(encryption_disabled)`, иначе notice уже показан внутри функции
 - При активном шифровании: кнопка "Change password"
-  - `VerifyPasswordModal(correctPassword)` -> `ChangePasswordModal` -> persistent notice -> `rotateEncryptionPassword(newPassword)` -> `Notice(encryption_password_changed)`
+  - `VerifyPasswordModal(verifyPassword)` -> `ChangePasswordModal` -> persistent notice -> `rotateEncryptionPassword(newPassword)` -> `Notice(encryption_password_changed)`
 - Информационный блок после toggle/change-password:
   - Описание принципа работы (AES-256-GCM + PBKDF2)
   - Warning о безвозвратной потере данных при утере пароля
@@ -387,7 +381,7 @@ Manifest хранится на Яндекс.Диске как `/Приложен
 // В YandexDiskSyncSettings:
 enableEncryption: boolean; // false
 encryptionSalt: string | null; // Base64, null = не инициализирован
-encryptedPassword: string | null; // plaintext string, пароль пользователя
+encryptionPassword: string | null; // plaintext string, пароль пользователя
 encryptionRevision: number | null; // remote manifest revision, применённый локально
 ```
 
@@ -518,7 +512,7 @@ Device B (encryption was disabled elsewhere, opens Obsidian):
 | Отключение шифрования (с ошибками)            | `notice.encryption_disabling`        | `notice.encryption_disable_partial` (30s, из main.ts)     |
 | Авто-отключение при пропавшем remote manifest | --                                   | `notice.encryption_disabled_remotely` (10s)               |
 | Неверный пароль (verify)                      | -- (Notice с ошибкой)                | модалка не закрывается, `is-error`                        |
-| Подключение второго устройства                | `notice.encryption_detected`         | `notice.encryption_connected`                             |
+| Подключение второго устройства                | `notice.encryption_password_required`| `notice.encryption_connected`                             |
 | Смена пароля                                  | `notice.encryption_password_rotating`| `notice.encryption_password_changed`                      |
 | Требуется пароль                              | `notice.encryption_password_required`| status bar `YD: Требуется пароль шифрования`              |
 

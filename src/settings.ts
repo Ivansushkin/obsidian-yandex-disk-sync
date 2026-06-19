@@ -2,10 +2,12 @@
  * Yandex Disk Sync plugin settings
  */
 
-import { App, Notice, PluginSettingTab, Setting, TextAreaComponent, ToggleComponent } from "obsidian";
+import { App, ButtonComponent, Notice, PluginSettingTab, Setting, TextAreaComponent, TextComponent, ToggleComponent } from "obsidian";
 import type YandexDiskSyncPlugin from "./main";
 import { t } from "./i18n";
+import { logger } from "./utils/logger";
 import { BackupListModal } from "./ui/backup-list-modal";
+import { LogViewerModal } from "./ui/log-viewer-modal";
 import {
 	ChangePasswordModal,
 	ConnectEncryptedVaultModal,
@@ -47,6 +49,113 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		super.hide();
 	}
 
+	private showToggleSpinner(tgl: ToggleComponent): HTMLElement {
+		tgl.setDisabled(true);
+		tgl.toggleEl.addClass("encryption-toggle-hidden");
+		return tgl.toggleEl.parentElement!.createSpan({ cls: "encryption-toggle-spinner" });
+	}
+
+	private hideToggleSpinner(tgl: ToggleComponent, spinner: HTMLElement): void {
+		spinner.remove();
+		tgl.toggleEl.removeClass("encryption-toggle-hidden");
+		tgl.setDisabled(false);
+	}
+
+	private async enableEncryptionFlow(): Promise<void> {
+		let remoteManifest: RemoteEncryptionManifest | null = null;
+		try {
+			remoteManifest = await this.plugin.getRemoteEncryptionManifest();
+		} catch (e) {
+			new Notice(e instanceof Error ? e.message : String(e));
+			return;
+		}
+
+		if (remoteManifest) {
+			if (remoteManifest.state !== "enabled") {
+				new Notice(t("notice.encryption_remote_busy"));
+				return;
+			}
+
+			const password = await this.promptConnectEncryptionPassword();
+			if (!password) return;
+
+			try {
+				await this.plugin.connectToRemoteEncryption(password, remoteManifest);
+				new Notice(t("notice.encryption_connected"));
+			} catch (e) {
+				new Notice(e instanceof Error ? e.message : String(e));
+			}
+			return;
+		}
+
+		const password = await this.promptNewEncryptionPassword();
+		if (!password) return;
+
+		const notice = new Notice(t("notice.encryption_syncing"), 0);
+		try {
+			await this.plugin.enableEncryption(password);
+			notice.hide();
+			new Notice(t("notice.encryption_enabled"));
+		} catch (e) {
+			notice.hide();
+			new Notice(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	private async disableEncryptionFlow(): Promise<void> {
+		const currentPassword = await this.promptCurrentEncryptionPassword();
+		if (!currentPassword) return;
+
+		const confirmed = await new Promise<boolean>((resolve) => {
+			new DisableEncryptionModal(this.app, resolve).open();
+		});
+		if (!confirmed) return;
+
+		const notice = new Notice(t("notice.encryption_disabling"), 0);
+		try {
+			const { hadErrors } = await this.plugin.disableEncryption({ reuploadPlaintext: true });
+			notice.hide();
+			if (!hadErrors) {
+				new Notice(t("notice.encryption_disabled"));
+			}
+		} catch (e) {
+			notice.hide();
+			new Notice(e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	private async promptNewEncryptionPassword(): Promise<string | null> {
+		return await new Promise<string | null>((resolve) => {
+			new EnableEncryptionModal(
+				this.app,
+				resolve,
+				() => this.plugin.createBackup()
+			).open();
+		});
+	}
+
+	private async promptConnectEncryptionPassword(): Promise<string | null> {
+		return await new Promise<string | null>((resolve) => {
+			new ConnectEncryptedVaultModal(
+				this.app,
+				resolve,
+				t("modal.encryption_connect_title"),
+				t("modal.encryption_connect_desc"),
+				t("modal.encryption_connect_button")
+			).open();
+		});
+	}
+
+	private async promptCurrentEncryptionPassword(): Promise<string | null> {
+		return await new Promise<string | null>((resolve) => {
+			new VerifyPasswordModal(
+				this.app,
+				resolve,
+				async (pw) => this.plugin.verifyEncryptionPassword(pw)
+			).open();
+		});
+	}
+
 	display(): void {
 		// eslint-disable-next-line @typescript-eslint/no-deprecated
 		this.plugin.encryptionStateChangeCallback = () => { this.display(); };
@@ -62,54 +171,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		// Connection section
 		new Setting(containerEl).setName(t("settings.connection_section")).setHeading();
 
-		// OAuth application management
-		const oauthSetting = new Setting(containerEl)
-			.setName(t("settings.oauth_apps"))
-			.addButton((button) =>
-				button
-					.setButtonText(t("settings.manage_clients"))
-					.setCta()
-					.onClick(() => {
-						window.open("https://oauth.yandex.ru/", "_blank");
-					})
-			)
-			.addButton((button) =>
-				button
-					.setButtonText(t("settings.get_token"))
-					.setDisabled(!this.plugin.settings.clientId?.trim())
-					.onClick(() => {
-						const clientId = this.plugin.settings.clientId?.trim();
-						if (clientId) {
-							const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
-							window.open(authUrl, "_blank");
-						}
-					})
-			)
-			.addButton((button) =>
-			button.setButtonText(t("settings.sync_button")).onClick(async () => {
-				button.setDisabled(true);
-				button.setButtonText(t("settings.syncing_button"));
-				try {
-					const result = await this.plugin.testConnection();
-					if (!result.success) {
-						return;
-					}
-					await this.plugin.runFullSync();
-				} catch {
-					// errors are surfaced via Notice inside runFullSync
-				} finally {
-					button.setDisabled(false);
-					button.setButtonText(t("settings.sync_button"));
-				}
-			})
-			);
+		const connectionBlock = containerEl.createDiv({ cls: "connection-block" });
 
-		// Create custom description with multiline text
+		const oauthSetting = new Setting(connectionBlock);
+
 		const descEl = oauthSetting.descEl;
 		descEl.empty();
-
 		const instructionDiv = descEl.createDiv({ cls: "oauth-instruction" });
-
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_1") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_2") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_3") });
@@ -118,35 +186,65 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_6") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_7") });
 
-		// Client ID
-		new Setting(containerEl)
-			.setName(t("settings.client_id"))
-			.setDesc(t("settings.client_id_desc"))
-			.addText((text) =>
-				text
-					.setPlaceholder(t("settings.client_id_placeholder"))
-					.setValue(this.plugin.settings.clientId)
-					.onChange(async (value) => {
-						this.plugin.settings.clientId = value;
-						await this.plugin.saveSettings();
-						// eslint-disable-next-line @typescript-eslint/no-deprecated
-						this.display();
-					})
-			);
+		const controlEl = oauthSetting.controlEl;
 
-		// OAuth token
-		new Setting(containerEl)
-			.setName(t("settings.oauth_token"))
-			.setDesc(t("settings.oauth_token_desc"))
-			.addText((text) =>
-				text
-					.setPlaceholder(t("settings.oauth_token_placeholder"))
-					.setValue(this.plugin.settings.yandexTokenSecret)
-					.onChange(async (value) => {
-						this.plugin.settings.yandexTokenSecret = value;
-						await this.plugin.saveSettings();
-					})
-			);
+		new ButtonComponent(controlEl)
+			.setButtonText(t("settings.manage_clients"))
+			.setCta()
+			.onClick(() => {
+				window.open("https://oauth.yandex.ru/", "_blank");
+			});
+
+		controlEl.createEl("label", { text: t("settings.client_id") });
+		new TextComponent(controlEl)
+			.setPlaceholder(t("settings.client_id_placeholder"))
+			.setValue(this.plugin.settings.clientId)
+			.onChange(async (value) => {
+				this.plugin.settings.clientId = value;
+				await this.plugin.saveSettings();
+				// eslint-disable-next-line @typescript-eslint/no-deprecated
+				this.display();
+			});
+
+		new ButtonComponent(controlEl)
+			.setButtonText(t("settings.get_token"))
+			.setDisabled(!this.plugin.settings.clientId?.trim())
+			.onClick(() => {
+				const clientId = this.plugin.settings.clientId?.trim();
+				if (clientId) {
+					const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
+					window.open(authUrl, "_blank");
+				}
+			});
+
+		controlEl.createEl("label", { text: t("settings.oauth_token") });
+		new TextComponent(controlEl)
+			.setPlaceholder(t("settings.oauth_token_placeholder"))
+			.setValue(this.plugin.settings.yandexTokenSecret)
+			.onChange(async (value) => {
+				this.plugin.settings.yandexTokenSecret = value;
+				await this.plugin.saveSettings();
+			});
+
+		const syncButton = new ButtonComponent(controlEl)
+			.setButtonText(t("settings.sync_button"))
+			.setCta();
+		syncButton.onClick(async () => {
+			syncButton.setDisabled(true);
+			syncButton.setButtonText(t("settings.syncing_button"));
+			try {
+				const result = await this.plugin.testConnection();
+				if (!result.success) {
+					return;
+				}
+				await this.plugin.runFullSync();
+			} catch {
+				// errors are surfaced via Notice inside runFullSync
+			} finally {
+				syncButton.setDisabled(false);
+				syncButton.setButtonText(t("settings.sync_button"));
+			}
+		});
 
 		// Remote path
 		new Setting(containerEl)
@@ -266,18 +364,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		let encryptionToggle: ToggleComponent | null = null;
 
-		const showToggleSpinner = (tgl: ToggleComponent): HTMLElement => {
-			tgl.setDisabled(true);
-			tgl.toggleEl.addClass("encryption-toggle-hidden");
-			return tgl.toggleEl.parentElement!.createSpan({ cls: "encryption-toggle-spinner" });
-		};
-
-		const hideToggleSpinner = (tgl: ToggleComponent, spinner: HTMLElement): void => {
-			spinner.remove();
-			tgl.toggleEl.removeClass("encryption-toggle-hidden");
-			tgl.setDisabled(false);
-		};
-
 		new Setting(containerEl)
 			.setName(t("settings.encryption_desc"))
 			.addToggle((toggle) => {
@@ -285,109 +371,15 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				return toggle
 					.setValue(this.plugin.settings.enableEncryption)
 					.onChange(async (value) => {
-						showToggleSpinner(toggle);
-
-						if (value && !this.plugin.settings.enableEncryption) {
-							let remoteManifest: RemoteEncryptionManifest | null = null;
-							try {
-								remoteManifest = await this.plugin.getRemoteEncryptionManifest();
-							} catch (e) {
-								new Notice(e instanceof Error ? e.message : String(e));
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-								return;
+						const spinner = this.showToggleSpinner(toggle);
+						try {
+							if (value && !this.plugin.settings.enableEncryption) {
+								await this.enableEncryptionFlow();
+							} else if (!value && this.plugin.settings.enableEncryption) {
+								await this.disableEncryptionFlow();
 							}
-
-							if (remoteManifest) {
-								if (remoteManifest.state !== "enabled") {
-									new Notice(t("notice.encryption_remote_busy"));
-									// eslint-disable-next-line @typescript-eslint/no-deprecated
-									this.display();
-									return;
-								}
-
-								const password = await new Promise<string | null>((resolve) => {
-									new ConnectEncryptedVaultModal(
-										this.app,
-										resolve,
-										t("modal.encryption_connect_title"),
-										t("modal.encryption_connect_desc"),
-										t("modal.encryption_connect_button")
-									).open();
-								});
-								if (!password) {
-									// eslint-disable-next-line @typescript-eslint/no-deprecated
-									this.display();
-									return;
-								}
-
-								try {
-									await this.plugin.connectToRemoteEncryption(password, remoteManifest);
-									new Notice(t("notice.encryption_connected"));
-								} catch (e) {
-									new Notice(e instanceof Error ? e.message : String(e));
-								}
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-								return;
-							}
-
-							const password = await new Promise<string | null>((resolve) => {
-								new EnableEncryptionModal(
-									this.app,
-									resolve,
-									() => this.plugin.createBackup()
-								).open();
-							});
-							if (!password) {
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-								return;
-							}
-							const notice = new Notice(t("notice.encryption_syncing"), 0);
-							try {
-								await this.plugin.enableEncryption(password);
-								notice.hide();
-								new Notice(t("notice.encryption_enabled"));
-							} catch (e) {
-								notice.hide();
-								new Notice(e instanceof Error ? e.message : String(e));
-							}
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							this.display();
-						} else if (!value && this.plugin.settings.enableEncryption) {
-							const currentPassword = await new Promise<string | null>((resolve) => {
-								new VerifyPasswordModal(
-									this.app,
-									resolve,
-									this.plugin.settings.encryptedPassword ?? ""
-								).open();
-							});
-							if (!currentPassword) {
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-								return;
-							}
-
-							const confirmed = await new Promise<boolean>((resolve) => {
-								new DisableEncryptionModal(this.app, resolve).open();
-							});
-							if (!confirmed) {
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-								return;
-							}
-							const notice = new Notice(t("notice.encryption_disabling"), 0);
-							try {
-								const { hadErrors } = await this.plugin.disableEncryption({ reuploadPlaintext: true });
-								notice.hide();
-								if (!hadErrors) {
-									new Notice(t("notice.encryption_disabled"));
-								}
-							} catch (e) {
-								notice.hide();
-								new Notice(e instanceof Error ? e.message : String(e));
-							}
+						} finally {
+							this.hideToggleSpinner(toggle, spinner);
 							// eslint-disable-next-line @typescript-eslint/no-deprecated
 							this.display();
 						}
@@ -401,45 +393,34 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					button
 						.setButtonText(t("settings.encryption_change_password"))
 						.onClick(async () => {
-							let spinnerEl: HTMLElement | null = null;
-							if (encryptionToggle) {
-								spinnerEl = showToggleSpinner(encryptionToggle);
-							}
-
-							const currentPassword = await new Promise<string | null>((resolve) => {
-								new VerifyPasswordModal(
-									this.app,
-									resolve,
-									this.plugin.settings.encryptedPassword ?? ""
-								).open();
-							});
-							if (!currentPassword) {
-								if (spinnerEl && encryptionToggle) {
-									hideToggleSpinner(encryptionToggle, spinnerEl);
-								}
-								return;
-							}
-
-							const newPassword = await new Promise<string | null>((resolve) => {
-								new ChangePasswordModal(this.app, resolve).open();
-							});
-							if (!newPassword) {
-								if (spinnerEl && encryptionToggle) {
-									hideToggleSpinner(encryptionToggle, spinnerEl);
-								}
-								return;
-							}
-							const notice = new Notice(t("notice.encryption_password_rotating"), 0);
+							const spinner = encryptionToggle
+								? this.showToggleSpinner(encryptionToggle)
+								: null;
 							try {
-								await this.plugin.rotateEncryptionPassword(newPassword);
-								notice.hide();
-								new Notice(t("notice.encryption_password_changed"));
-							} catch (e) {
-								notice.hide();
-								new Notice(e instanceof Error ? e.message : String(e));
+								const currentPassword = await this.promptCurrentEncryptionPassword();
+								if (!currentPassword) return;
+
+								const newPassword = await new Promise<string | null>((resolve) => {
+									new ChangePasswordModal(this.app, resolve).open();
+								});
+								if (!newPassword) return;
+
+								const notice = new Notice(t("notice.encryption_password_rotating"), 0);
+								try {
+									await this.plugin.rotateEncryptionPassword(newPassword);
+									notice.hide();
+									new Notice(t("notice.encryption_password_changed"));
+								} catch (e) {
+									notice.hide();
+									new Notice(e instanceof Error ? e.message : String(e));
+								}
+							} finally {
+								if (spinner && encryptionToggle) {
+									this.hideToggleSpinner(encryptionToggle, spinner);
+								}
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
 							}
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							this.display();
 						})
 			);
 		}
@@ -498,6 +479,56 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				textArea.inputEl.cols = 30;
 			});
 
+		// Logging section
+		new Setting(containerEl).setName(t("settings.logging_section")).setHeading();
+
+		// Enable debug logging
+		new Setting(containerEl)
+			.setName(t("settings.enable_debug_logging"))
+			.setDesc(t("settings.enable_debug_logging_desc"))
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.enableDebugLogging)
+					.onChange(async (value) => {
+						this.plugin.settings.enableDebugLogging = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		// Write logs to file
+		new Setting(containerEl)
+			.setName(t("settings.log_to_file"))
+			.setDesc(t("settings.log_to_file_desc"))
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.logToFile)
+					.onChange(async (value) => {
+						this.plugin.settings.logToFile = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		// View logs button
+		new Setting(containerEl)
+			.addButton((button) =>
+				button
+					.setButtonText(t("settings.view_logs_button"))
+					.setCta()
+					.onClick(() => {
+						new LogViewerModal(this.app).open();
+					})
+			)
+			.addButton((button) =>
+				button
+					.setButtonText(t("settings.clear_logs_button"))
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
+					.setWarning()
+					.onClick(async () => {
+						await logger.clearLogs();
+						new Notice(t("notice.logs_cleared"));
+					})
+			);
+
 		// Information section
 		new Setting(containerEl).setName(t("settings.information_section")).setHeading();
 
@@ -537,7 +568,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						}
 					} catch (error) {
 						button.setButtonText(t("settings.backup_error"));
-						console.error("Backup failed:", error);
+						logger.error("Backup failed:", { error });
 					}
 
 					setTimeout(() => {

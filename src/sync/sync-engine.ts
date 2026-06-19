@@ -19,6 +19,7 @@ import { joinPath, getDirectory } from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
 import { logger } from "../utils/logger";
 import { runWithConcurrencySettled } from "../utils/semaphore";
+import { t } from "../i18n";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -173,7 +174,7 @@ export class SyncEngine {
 			try {
 				listener(this.state);
 			} catch (e) {
-				logger.error("Error in state handler:", e);
+				logger.error("Error in state handler:", { error: e });
 			}
 		}
 	}
@@ -208,281 +209,167 @@ export class SyncEngine {
 	 * Perform full synchronization
 	 */
 	async fullSync(options?: SyncRunOptions): Promise<SyncResult> {
-		if (this.isSyncing) {
-			logger.warn("Synchronization already in progress");
-			return this.createErrorResult("Synchronization already in progress");
-		}
-
-		if (this.isPaused) {
-			logger.warn("Synchronization is paused");
-			return this.createErrorResult("Synchronization is paused");
-		}
-
-		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
-		if (blockReason) {
-			return this.createBlockedResult(blockReason);
-		}
-
-		this.isSyncing = true;
-
-		// Notify listeners that sync has started
-		for (const callback of this.syncPauseCallbacks) {
-			try {
-				callback();
-			} catch (e) {
-				logger.error("Error in sync pause callback:", e);
-			}
-		}
-
-		const startTime = Date.now();
-
-		const result: SyncResult = {
-			success: true,
-			uploaded: 0,
-			downloaded: 0,
-			deleted: 0,
-			conflicts: 0,
-			errors: [],
-			startTime,
-			endTime: 0,
-		};
-
-		try {
-			this.updateState({
-				status: "syncing",
-				currentOperation: "Preparing...",
-				progress: 0,
-			});
-
-			// 1. Ensure remote folder exists
-			this.updateState({
-				currentOperation: "Checking remote folder...",
-			});
-			const remoteExists = await this.indexManager.remotePathExists();
-			if (!remoteExists) {
-				await this.indexManager.createRemotePath();
-			}
-
-			// 2. Load remote index
-			this.updateState({
-				currentOperation: "Loading remote index...",
-			});
-			await this.indexManager.loadRemoteIndex();
-
-			// 3. Build local index
-			this.updateState({
-				currentOperation: "Scanning local files...",
-			});
-			const localFiles = await this.indexManager.buildLocalIndex();
-
-			// 4. Get remote files list
-			this.updateState({
-				currentOperation: "Getting remote files list...",
-			});
-			const remoteFiles = await this.indexManager.getRemoteFiles();
-
-			// 5. Determine operations
-			this.updateState({ currentOperation: "Analyzing changes..." });
-			const localIndex = this.indexManager.getLocalIndex();
-			const remoteIndex = this.indexManager.getRemoteIndex();
-
-			const operations = this.conflictResolver.determineOperations(
-				localFiles,
-				remoteFiles,
-				localIndex.files,
-				remoteIndex.files,
-				startTime
-			);
-
-			logger.info(
-				`Determined ${operations.length} synchronization operations`
-			);
-
-			// 6. Preflight: Create all necessary folders
-			this.updateState({ currentOperation: "Creating folders..." });
-			await this.ensureFoldersExist(operations);
-
-			// 7. Execute operations in parallel by type
-			const totalOps = operations.length;
-			let processedOps = 0;
-
-			// Group operations by type
-			const uploads = operations.filter((op) => op.action === "upload");
-			const downloads = operations.filter(
-				(op) => op.action === "download"
-			);
-			const deletes = operations.filter(
-				(op) =>
-					op.action === "delete_remote" || op.action === "delete_local"
-			);
-			const conflicts = operations.filter(
-				(op) => op.action === "conflict"
-			);
-
-			// Execute uploads in parallel
-			if (uploads.length > 0) {
-				this.updateState({ currentOperation: "Uploading files..." });
-				const uploadResults = await this.executeOperationsParallel(
-					uploads,
-					result,
-					(completed) => {
-						processedOps = completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
-						});
-					}
-				);
-				result.uploaded = uploadResults.succeeded;
-				result.errors.push(...uploadResults.errors);
-			}
-
-			// Execute downloads in parallel
-			if (downloads.length > 0) {
-				this.updateState({ currentOperation: "Downloading files..." });
-				const downloadResults = await this.executeOperationsParallel(
-					downloads,
-					result,
-					(completed) => {
-						processedOps = uploads.length + completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
-						});
-					}
-				);
-				result.downloaded = downloadResults.succeeded;
-				result.errors.push(...downloadResults.errors);
-			}
-
-			// Execute deletes in parallel
-			if (deletes.length > 0) {
-				this.updateState({ currentOperation: "Deleting files..." });
-				const deleteResults = await this.executeOperationsParallel(
-					deletes,
-					result,
-					(completed) => {
-						processedOps =
-							uploads.length + downloads.length + completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
-						});
-					}
-				);
-				result.deleted = deleteResults.succeeded;
-				result.errors.push(...deleteResults.errors);
-			}
-
-			// Execute conflicts sequentially (require special handling)
-			if (conflicts.length > 0) {
+		return await this.runSyncSession(
+			options,
+			async (result, startTime) => {
+				// 1. Ensure remote folder exists
 				this.updateState({
-					currentOperation: "Resolving conflicts...",
+					currentOperation: t("status.op.checking_remote_folder"),
 				});
-				for (const op of conflicts) {
-					if (this.isPaused) {
-						result.success = false;
-						result.errors.push({
-							path: "",
-							operation: "none",
-							message: "Synchronization interrupted",
-						});
-						break;
-					}
+				const remoteExists = await this.indexManager.remotePathExists();
+				if (!remoteExists) {
+					await this.indexManager.createRemotePath();
+				}
 
-					processedOps++;
-					const progress = Math.round((processedOps / totalOps) * 100);
+				// 2. Load remote index
+				this.updateState({
+					currentOperation: t("status.op.loading_remote_index"),
+				});
+				await this.indexManager.loadRemoteIndex();
+
+				// 3. Build local index
+				this.updateState({
+					currentOperation: t("status.op.scanning_local_files"),
+				});
+				const localFiles = await this.indexManager.buildLocalIndex();
+
+				// 4. Get remote files list
+				this.updateState({
+					currentOperation: t("status.op.getting_remote_files"),
+				});
+				const remoteFiles = await this.indexManager.getRemoteFiles();
+
+				// 5. Determine operations
+				this.updateState({ currentOperation: t("status.op.analyzing_changes") });
+				const localIndex = this.indexManager.getLocalIndex();
+				const remoteIndex = this.indexManager.getRemoteIndex();
+
+				const operations = this.conflictResolver.determineOperations(
+					localFiles,
+					remoteFiles,
+					localIndex.files,
+					remoteIndex.files,
+					startTime
+				);
+
+				logger.info(
+					`Determined ${operations.length} synchronization operations`
+				);
+
+				// 6. Preflight: Create all necessary folders
+				this.updateState({ currentOperation: t("status.op.creating_folders") });
+				await this.ensureFoldersExist(operations);
+
+				// 7. Execute operations in parallel by type
+				const totalOps = operations.length;
+				let processedOps = 0;
+
+				const uploads = operations.filter((op) => op.action === "upload");
+				const downloads = operations.filter(
+					(op) => op.action === "download"
+				);
+				const deletes = operations.filter(
+					(op) =>
+						op.action === "delete_remote" || op.action === "delete_local"
+				);
+				const conflicts = operations.filter(
+					(op) => op.action === "conflict"
+				);
+
+				if (uploads.length > 0) {
+					this.updateState({ currentOperation: t("status.op.uploading_files") });
+					const uploadResults = await this.executeOperationsParallel(
+						uploads,
+						result,
+						(completed) => {
+							processedOps = completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.uploaded = uploadResults.succeeded;
+					result.errors.push(...uploadResults.errors);
+				}
+
+				if (downloads.length > 0) {
+					this.updateState({ currentOperation: t("status.op.downloading_files") });
+					const downloadResults = await this.executeOperationsParallel(
+						downloads,
+						result,
+						(completed) => {
+							processedOps = uploads.length + completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.downloaded = downloadResults.succeeded;
+					result.errors.push(...downloadResults.errors);
+				}
+
+				if (deletes.length > 0) {
+					this.updateState({ currentOperation: t("status.op.deleting_files") });
+					const deleteResults = await this.executeOperationsParallel(
+						deletes,
+						result,
+						(completed) => {
+							processedOps =
+								uploads.length + downloads.length + completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.deleted = deleteResults.succeeded;
+					result.errors.push(...deleteResults.errors);
+				}
+
+				if (conflicts.length > 0) {
 					this.updateState({
-						currentOperation: `Conflict: ${op.path}`,
-						progress,
-						pendingCount: totalOps - processedOps,
+						currentOperation: t("status.op.resolving_conflicts"),
 					});
+					for (const op of conflicts) {
+						if (this.isPaused) {
+							result.success = false;
+							result.errors.push({
+								path: "",
+								operation: "none",
+								message: "Synchronization interrupted",
+							});
+							break;
+						}
 
-					try {
-						await this.handleConflict(op);
-						result.conflicts++;
-					} catch (e) {
-						const error: SyncError = {
-							path: op.path,
-							operation: op.action,
-							message: (e as Error).message,
-						};
-						result.errors.push(error);
-						logger.error(
+						processedOps++;
+						this.updateState({
+							currentOperation: t("status.op.conflict", { path: op.path }),
+							progress: Math.round((processedOps / totalOps) * 100),
+							pendingCount: totalOps - processedOps,
+						});
+
+						try {
+							await this.handleConflict(op);
+							result.conflicts++;
+						} catch (e) {
+							const error: SyncError = {
+								path: op.path,
+								operation: op.action,
+								message: (e as Error).message,
+							};
+							result.errors.push(error);
+logger.error(
 							`Error resolving conflict for ${op.path}:`,
-							e
+							{ error: e }
 						);
+						}
 					}
 				}
-			}
 
-			// 8. Save indexes
-			this.updateState({ currentOperation: "Saving indexes..." });
-			this.indexManager.updateSyncTime();
-			await this.indexManager.saveRemoteIndex();
+				// 8. Save indexes
+				this.updateState({ currentOperation: t("status.op.saving_indexes") });
+				this.indexManager.updateSyncTime();
+				await this.indexManager.saveRemoteIndex();
 
-			// 9. Cleanup old deleted records
-			this.indexManager.cleanupDeletedFiles();
-
-			result.success = result.errors.length === 0;
-			result.endTime = Date.now();
-
-			this.updateState({
-				status: result.success ? "idle" : "error",
-				lastSyncTime: result.endTime,
-				errorMessage: result.success
-					? undefined
-					: `Errors: ${result.errors.length}`,
-				currentOperation: undefined,
-				progress: undefined,
-				pendingCount: 0,
-			});
-
-			logger.info(
+				// 9. Cleanup old deleted records
+				this.indexManager.cleanupDeletedFiles();
+			},
+			(result) =>
 				`Synchronization completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`
-			);
-
-			return result;
-		} catch (e) {
-			const error = e as Error;
-			result.success = false;
-			result.errors.push({
-				path: "",
-				operation: "none",
-				message: error.message,
-			});
-			result.endTime = Date.now();
-
-			this.updateState({
-				status: "error",
-				errorMessage: error.message,
-				currentOperation: undefined,
-				progress: undefined,
-			});
-
-			logger.error("Critical synchronization error:", e);
-			return result;
-		} finally {
-			// Notify listeners that sync has ended
-			for (const callback of this.syncResumeCallbacks) {
-				try {
-					callback();
-				} catch (e) {
-					logger.error("Error in sync resume callback:", e);
-				}
-			}
-
-			this.isSyncing = false;
-		}
+		);
 	}
 
 	/**
@@ -491,210 +378,109 @@ export class SyncEngine {
 	 * Files not present locally are deleted from remote.
 	 */
 	async forceSyncFromLocal(options?: SyncRunOptions): Promise<SyncResult> {
-		if (this.isSyncing) {
-			logger.warn("Synchronization already in progress");
-			return this.createErrorResult("Synchronization already in progress");
-		}
+		return await this.runSyncSession(
+			options,
+			async (result) => {
+				// 1. Ensure remote folder exists
+				this.updateState({ currentOperation: t("status.op.checking_remote_folder") });
+				const remoteExists = await this.indexManager.remotePathExists();
+				if (!remoteExists) {
+					await this.indexManager.createRemotePath();
+				}
 
-		if (this.isPaused) {
-			logger.warn("Synchronization is paused");
-			return this.createErrorResult("Synchronization is paused");
-		}
+				// 2. Build local index
+				this.updateState({ currentOperation: t("status.op.scanning_local_files") });
+				const localFiles = await this.indexManager.buildLocalIndex();
 
-		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
-		if (blockReason) {
-			return this.createBlockedResult(blockReason);
-		}
+				// 3. Get remote files list
+				this.updateState({ currentOperation: t("status.op.getting_remote_files") });
+				const remoteFiles = await this.indexManager.getRemoteFiles();
 
-		this.isSyncing = true;
+				// 4. Generate operations manually: all local → upload, remote-only → delete_remote
+				this.updateState({ currentOperation: t("status.op.analyzing_changes") });
+				const operations: SyncOperation[] = [];
 
-		for (const callback of this.syncPauseCallbacks) {
-			try {
-				callback();
-			} catch (e) {
-				logger.error("Error in sync pause callback:", e);
-			}
-		}
+				for (const [path, meta] of localFiles) {
+					operations.push({
+						action: "upload",
+						path,
+						reason: "Force sync from local",
+						localMeta: meta,
+					});
+				}
 
-		const startTime = Date.now();
-
-		const result: SyncResult = {
-			success: true,
-			uploaded: 0,
-			downloaded: 0,
-			deleted: 0,
-			conflicts: 0,
-			errors: [],
-			startTime,
-			endTime: 0,
-		};
-
-		try {
-			this.updateState({
-				status: "syncing",
-				currentOperation: "Preparing...",
-				progress: 0,
-			});
-
-			// 1. Ensure remote folder exists
-			this.updateState({ currentOperation: "Checking remote folder..." });
-			const remoteExists = await this.indexManager.remotePathExists();
-			if (!remoteExists) {
-				await this.indexManager.createRemotePath();
-			}
-
-			// 2. Build local index
-			this.updateState({ currentOperation: "Scanning local files..." });
-			const localFiles = await this.indexManager.buildLocalIndex();
-
-			// 3. Get remote files list
-			this.updateState({ currentOperation: "Getting remote files list..." });
-			const remoteFiles = await this.indexManager.getRemoteFiles();
-
-			// 4. Generate operations manually: all local → upload, remote-only → delete_remote
-			// No ConflictResolver used — force overwrite regardless of timestamps/hashes
-			this.updateState({ currentOperation: "Analyzing changes..." });
-			const operations: SyncOperation[] = [];
-
-			for (const [path, meta] of localFiles) {
-				operations.push({
-					action: "upload",
-					path,
-					reason: "Force sync from local",
-					localMeta: meta,
-				});
-			}
-
-			if (!options?.skipRemoteDeletes) {
-				for (const [path, meta] of remoteFiles) {
-					if (!localFiles.has(path)) {
-						operations.push({
-							action: "delete_remote",
-							path,
-							reason: "Force sync from local: file not present locally",
-							remoteMeta: meta,
-						});
+				if (!options?.skipRemoteDeletes) {
+					for (const [path, meta] of remoteFiles) {
+						if (!localFiles.has(path)) {
+							operations.push({
+								action: "delete_remote",
+								path,
+								reason: "Force sync from local: file not present locally",
+								remoteMeta: meta,
+							});
+						}
 					}
 				}
-			}
 
-			logger.info(
-				`Force sync from local: ${operations.length} synchronization operations`
-			);
-
-			// 5. Preflight: Create all necessary folders
-			this.updateState({ currentOperation: "Creating folders..." });
-			await this.ensureFoldersExist(operations);
-
-			// 6. Execute operations in parallel by type
-			const totalOps = operations.length;
-			let processedOps = 0;
-
-			const uploads = operations.filter(
-				(op) => op.action === "upload"
-			);
-			const deletes = operations.filter(
-				(op) => op.action === "delete_remote"
-			);
-
-			if (uploads.length > 0) {
-				this.updateState({ currentOperation: "Uploading files..." });
-				const uploadResults = await this.executeOperationsParallel(
-					uploads,
-					result,
-					(completed) => {
-						processedOps = completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
-						});
-					}
+				logger.info(
+					`Force sync from local: ${operations.length} synchronization operations`
 				);
-				result.uploaded = uploadResults.succeeded;
-				result.errors.push(...uploadResults.errors);
-			}
 
-			if (deletes.length > 0) {
-				this.updateState({ currentOperation: "Deleting remote files..." });
-				const deleteResults = await this.executeOperationsParallel(
-					deletes,
-					result,
-					(completed) => {
-						processedOps = uploads.length + completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
-						});
-					}
+				// 5. Preflight: Create all necessary folders
+				this.updateState({ currentOperation: t("status.op.creating_folders") });
+				await this.ensureFoldersExist(operations);
+
+				// 6. Execute operations in parallel by type
+				const totalOps = operations.length;
+				let processedOps = 0;
+
+				const uploads = operations.filter(
+					(op) => op.action === "upload"
 				);
-				result.deleted = deleteResults.succeeded;
-				result.errors.push(...deleteResults.errors);
-			}
+				const deletes = operations.filter(
+					(op) => op.action === "delete_remote"
+				);
 
-			// 7. Sync indexes: remote becomes a copy of local
-			this.updateState({ currentOperation: "Saving indexes..." });
-			this.indexManager.cleanupDeletedFiles();
-			const localIndex = this.indexManager.getLocalIndex();
-			const remoteIndex = this.indexManager.getRemoteIndex();
-			remoteIndex.files = { ...localIndex.files };
-			this.indexManager.updateSyncTime();
-			await this.indexManager.saveRemoteIndex();
+				if (uploads.length > 0) {
+					this.updateState({ currentOperation: t("status.op.uploading_files") });
+					const uploadResults = await this.executeOperationsParallel(
+						uploads,
+						result,
+						(completed) => {
+							processedOps = completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.uploaded = uploadResults.succeeded;
+					result.errors.push(...uploadResults.errors);
+				}
 
-			result.success = result.errors.length === 0;
-			result.endTime = Date.now();
+				if (deletes.length > 0) {
+					this.updateState({ currentOperation: t("status.op.deleting_remote_files") });
+					const deleteResults = await this.executeOperationsParallel(
+						deletes,
+						result,
+						(completed) => {
+							processedOps = uploads.length + completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.deleted = deleteResults.succeeded;
+					result.errors.push(...deleteResults.errors);
+				}
 
-			this.updateState({
-				status: result.success ? "idle" : "error",
-				lastSyncTime: result.endTime,
-				errorMessage: result.success
-					? undefined
-					: `Errors: ${result.errors.length}`,
-				currentOperation: undefined,
-				progress: undefined,
-				pendingCount: 0,
-			});
-
-			logger.info(
+				// 7. Sync indexes: remote becomes a copy of local
+				this.updateState({ currentOperation: t("status.op.saving_indexes") });
+				this.indexManager.cleanupDeletedFiles();
+				const localIndex = this.indexManager.getLocalIndex();
+				const remoteIndex = this.indexManager.getRemoteIndex();
+				remoteIndex.files = { ...localIndex.files };
+				this.indexManager.updateSyncTime();
+				await this.indexManager.saveRemoteIndex();
+			},
+			(result) =>
 				`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`
-			);
-
-			return result;
-		} catch (e) {
-			const error = e as Error;
-			result.success = false;
-			result.errors.push({
-				path: "",
-				operation: "none",
-				message: error.message,
-			});
-			result.endTime = Date.now();
-
-			this.updateState({
-				status: "error",
-				errorMessage: error.message,
-				currentOperation: undefined,
-				progress: undefined,
-			});
-
-			logger.error("Critical force sync error:", e);
-			return result;
-		} finally {
-			for (const callback of this.syncResumeCallbacks) {
-				try {
-					callback();
-				} catch (e) {
-					logger.error("Error in sync resume callback:", e);
-				}
-			}
-
-			this.isSyncing = false;
-		}
+		);
 	}
 
 	/**
@@ -703,211 +489,111 @@ export class SyncEngine {
 	 * Files not present on remote are deleted locally.
 	 */
 	async forceSyncFromRemote(options?: SyncRunOptions): Promise<SyncResult> {
-		if (this.isSyncing) {
-			logger.warn("Synchronization already in progress");
-			return this.createErrorResult("Synchronization already in progress");
-		}
+		return await this.runSyncSession(
+			options,
+			async (result) => {
+				// 1. Ensure remote folder exists
+				this.updateState({ currentOperation: t("status.op.checking_remote_folder") });
+				const remoteExists = await this.indexManager.remotePathExists();
+				if (!remoteExists) {
+					await this.indexManager.createRemotePath();
+				}
 
-		if (this.isPaused) {
-			logger.warn("Synchronization is paused");
-			return this.createErrorResult("Synchronization is paused");
-		}
+				// 2. Build local index (to know what to delete)
+				this.updateState({ currentOperation: t("status.op.scanning_local_files") });
+				const localFiles = await this.indexManager.buildLocalIndex();
 
-		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
-		if (blockReason) {
-			return this.createBlockedResult(blockReason);
-		}
+				// 3. Load remote index
+				this.updateState({ currentOperation: t("status.op.loading_remote_index") });
+				await this.indexManager.loadRemoteIndex();
 
-		this.isSyncing = true;
+				// 4. Get remote files list
+				this.updateState({ currentOperation: t("status.op.getting_remote_files") });
+				const remoteFiles = await this.indexManager.getRemoteFiles();
 
-		for (const callback of this.syncPauseCallbacks) {
-			try {
-				callback();
-			} catch (e) {
-				logger.error("Error in sync pause callback:", e);
-			}
-		}
+				// 5. Generate operations manually: all remote → download, local-only → delete_local
+				this.updateState({ currentOperation: t("status.op.analyzing_changes") });
+				const operations: SyncOperation[] = [];
 
-		const startTime = Date.now();
-
-		const result: SyncResult = {
-			success: true,
-			uploaded: 0,
-			downloaded: 0,
-			deleted: 0,
-			conflicts: 0,
-			errors: [],
-			startTime,
-			endTime: 0,
-		};
-
-		try {
-			this.updateState({
-				status: "syncing",
-				currentOperation: "Preparing...",
-				progress: 0,
-			});
-
-			// 1. Ensure remote folder exists
-			this.updateState({ currentOperation: "Checking remote folder..." });
-			const remoteExists = await this.indexManager.remotePathExists();
-			if (!remoteExists) {
-				await this.indexManager.createRemotePath();
-			}
-
-			// 2. Build local index (to know what to delete)
-			this.updateState({ currentOperation: "Scanning local files..." });
-			const localFiles = await this.indexManager.buildLocalIndex();
-
-			// 3. Load remote index
-			this.updateState({ currentOperation: "Loading remote index..." });
-			await this.indexManager.loadRemoteIndex();
-
-			// 4. Get remote files list
-			this.updateState({ currentOperation: "Getting remote files list..." });
-			const remoteFiles = await this.indexManager.getRemoteFiles();
-
-			// 5. Generate operations manually: all remote → download, local-only → delete_local
-			this.updateState({ currentOperation: "Analyzing changes..." });
-			const operations: SyncOperation[] = [];
-
-			for (const [path, meta] of remoteFiles) {
-				operations.push({
-					action: "download",
-					path,
-					reason: "Force sync from remote",
-					remoteMeta: meta,
-				});
-			}
-
-			for (const [path, meta] of localFiles) {
-				if (!remoteFiles.has(path)) {
+				for (const [path, meta] of remoteFiles) {
 					operations.push({
-						action: "delete_local",
+						action: "download",
 						path,
-						reason: "Force sync from remote: file not present on disk",
-						localMeta: meta,
+						reason: "Force sync from remote",
+						remoteMeta: meta,
 					});
 				}
-			}
 
-			logger.info(
-				`Force sync from remote: ${operations.length} synchronization operations`
-			);
-
-			// 6. Preflight: Create all necessary folders
-			this.updateState({ currentOperation: "Creating folders..." });
-			await this.ensureFoldersExist(operations);
-
-			// 7. Execute operations in parallel by type
-			const totalOps = operations.length;
-			let processedOps = 0;
-
-			const downloads = operations.filter(
-				(op) => op.action === "download"
-			);
-			const deletes = operations.filter(
-				(op) => op.action === "delete_local"
-			);
-
-			if (downloads.length > 0) {
-				this.updateState({ currentOperation: "Downloading files..." });
-				const downloadResults = await this.executeOperationsParallel(
-					downloads,
-					result,
-					(completed) => {
-						processedOps = completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
+				for (const [path, meta] of localFiles) {
+					if (!remoteFiles.has(path)) {
+						operations.push({
+							action: "delete_local",
+							path,
+							reason: "Force sync from remote: file not present on disk",
+							localMeta: meta,
 						});
 					}
-				);
-				result.downloaded = downloadResults.succeeded;
-				result.errors.push(...downloadResults.errors);
-			}
-
-			if (deletes.length > 0) {
-				this.updateState({ currentOperation: "Deleting local files..." });
-				const deleteResults = await this.executeOperationsParallel(
-					deletes,
-					result,
-					(completed) => {
-						processedOps = downloads.length + completed;
-						const progress = Math.round(
-							(processedOps / totalOps) * 100
-						);
-						this.updateState({
-							progress,
-							pendingCount: totalOps - processedOps,
-						});
-					}
-				);
-				result.deleted = deleteResults.succeeded;
-				result.errors.push(...deleteResults.errors);
-			}
-
-			// 8. Sync indexes: local becomes a copy of remote
-			this.updateState({ currentOperation: "Saving indexes..." });
-			this.indexManager.cleanupDeletedFiles();
-			const localIndex = this.indexManager.getLocalIndex();
-			const remoteIndex = this.indexManager.getRemoteIndex();
-			localIndex.files = { ...remoteIndex.files };
-			this.indexManager.updateSyncTime();
-			await this.indexManager.saveRemoteIndex();
-
-			result.success = result.errors.length === 0;
-			result.endTime = Date.now();
-
-			this.updateState({
-				status: result.success ? "idle" : "error",
-				lastSyncTime: result.endTime,
-				errorMessage: result.success
-					? undefined
-					: `Errors: ${result.errors.length}`,
-				currentOperation: undefined,
-				progress: undefined,
-				pendingCount: 0,
-			});
-
-			logger.info(
-				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`
-			);
-
-			return result;
-		} catch (e) {
-			const error = e as Error;
-			result.success = false;
-			result.errors.push({
-				path: "",
-				operation: "none",
-				message: error.message,
-			});
-			result.endTime = Date.now();
-
-			this.updateState({
-				status: "error",
-				errorMessage: error.message,
-				currentOperation: undefined,
-				progress: undefined,
-			});
-
-			logger.error("Critical force sync error:", e);
-			return result;
-		} finally {
-			for (const callback of this.syncResumeCallbacks) {
-				try {
-					callback();
-				} catch (e) {
-					logger.error("Error in sync resume callback:", e);
 				}
-			}
 
-			this.isSyncing = false;
-		}
+				logger.info(
+					`Force sync from remote: ${operations.length} synchronization operations`
+				);
+
+				// 6. Preflight: Create all necessary folders
+				this.updateState({ currentOperation: t("status.op.creating_folders") });
+				await this.ensureFoldersExist(operations);
+
+				// 7. Execute operations in parallel by type
+				const totalOps = operations.length;
+				let processedOps = 0;
+
+				const downloads = operations.filter(
+					(op) => op.action === "download"
+				);
+				const deletes = operations.filter(
+					(op) => op.action === "delete_local"
+				);
+
+				if (downloads.length > 0) {
+					this.updateState({ currentOperation: t("status.op.downloading_files") });
+					const downloadResults = await this.executeOperationsParallel(
+						downloads,
+						result,
+						(completed) => {
+							processedOps = completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.downloaded = downloadResults.succeeded;
+					result.errors.push(...downloadResults.errors);
+				}
+
+				if (deletes.length > 0) {
+					this.updateState({ currentOperation: t("status.op.deleting_local_files") });
+					const deleteResults = await this.executeOperationsParallel(
+						deletes,
+						result,
+						(completed) => {
+							processedOps = downloads.length + completed;
+							this.reportProgress(processedOps, totalOps);
+						}
+					);
+					result.deleted = deleteResults.succeeded;
+					result.errors.push(...deleteResults.errors);
+				}
+
+				// 8. Sync indexes: local becomes a copy of remote
+				this.updateState({ currentOperation: t("status.op.saving_indexes") });
+				this.indexManager.cleanupDeletedFiles();
+				const localIndex = this.indexManager.getLocalIndex();
+				const remoteIndex = this.indexManager.getRemoteIndex();
+				localIndex.files = { ...remoteIndex.files };
+				this.indexManager.updateSyncTime();
+				await this.indexManager.saveRemoteIndex();
+			},
+			(result) =>
+				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`
+		);
 	}
 
 	/**
@@ -1036,7 +722,7 @@ export class SyncEngine {
 				});
 				logger.error(
 					`Error executing ${op.action} operation for ${op.path}:`,
-					res.reason
+					{ error: res.reason }
 				);
 			} else {
 				succeeded++;
@@ -1254,7 +940,7 @@ export class SyncEngine {
 				logger.debug(`Local index saved after ${action} for ${path}`);
 			}
 		} catch (e) {
-			logger.error(`Error synchronizing file ${path}:`, e);
+			logger.error(`Error synchronizing file ${path}:`, { error: e });
 		}
 	}
 
@@ -1338,7 +1024,7 @@ export class SyncEngine {
 				await this.indexSaveCallback();
 			}
 		} catch (e) {
-			logger.error(`Error renaming file ${oldPath}:`, e);
+			logger.error(`Error renaming file ${oldPath}:`, { error: e });
 			// If rename failed, upload file again
 			await this.uploadFile(newPath);
 			// Save remote index after upload
@@ -1351,7 +1037,140 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Create error result
+	 * Create an empty result for a new sync session.
+	 */
+	private createEmptyResult(startTime: number): SyncResult {
+		return {
+			success: true,
+			uploaded: 0,
+			downloaded: 0,
+			deleted: 0,
+			conflicts: 0,
+			errors: [],
+			startTime,
+			endTime: 0,
+		};
+	}
+
+	/**
+	 * Notify listeners that sync has started.
+	 */
+	private notifySyncPauseCallbacks(): void {
+		for (const callback of this.syncPauseCallbacks) {
+			try {
+				callback();
+			} catch (e) {
+				logger.error("Error in sync pause callback:", { error: e });
+			}
+		}
+	}
+
+	/**
+	 * Notify listeners that sync has ended.
+	 */
+	private notifySyncResumeCallbacks(): void {
+		for (const callback of this.syncResumeCallbacks) {
+			try {
+				callback();
+			} catch (e) {
+				logger.error("Error in sync resume callback:", { error: e });
+			}
+		}
+	}
+
+	/**
+	 * Update progress state during operation execution.
+	 */
+	private reportProgress(processedOps: number, totalOps: number): void {
+		const progress = Math.round((processedOps / totalOps) * 100);
+		this.updateState({
+			progress,
+			pendingCount: totalOps - processedOps,
+		});
+	}
+
+	/**
+	 * Run a sync session with common guard, lifecycle, and error handling.
+	 */
+	private async runSyncSession(
+		options: SyncRunOptions | undefined,
+		body: (result: SyncResult, startTime: number) => Promise<void>,
+		logMessage: (result: SyncResult) => string
+	): Promise<SyncResult> {
+		if (this.isSyncing) {
+			logger.warn("Synchronization already in progress");
+			return this.createErrorResult("Synchronization already in progress");
+		}
+
+		if (this.isPaused) {
+			logger.warn("Synchronization is paused");
+			return this.createErrorResult("Synchronization is paused");
+		}
+
+		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
+		if (blockReason) {
+			return this.createBlockedResult(blockReason);
+		}
+
+		this.isSyncing = true;
+		this.notifySyncPauseCallbacks();
+
+		const startTime = Date.now();
+		const result = this.createEmptyResult(startTime);
+
+		try {
+			this.updateState({
+				status: "syncing",
+				currentOperation: t("status.op.preparing"),
+				progress: 0,
+			});
+
+			await body(result, startTime);
+
+			result.success = result.errors.length === 0;
+			result.endTime = Date.now();
+
+			this.updateState({
+				status: result.success ? "idle" : "error",
+				lastSyncTime: result.endTime,
+				errorMessage: result.success
+					? undefined
+					: `Errors: ${result.errors.length}`,
+				currentOperation: undefined,
+				progress: undefined,
+				pendingCount: 0,
+			});
+
+			logger.info(logMessage(result));
+
+			return result;
+		} catch (e) {
+			const error = e as Error;
+			result.success = false;
+			result.errors.push({
+				path: "",
+				operation: "none",
+				message: error.message,
+			});
+			result.endTime = Date.now();
+
+			this.updateState({
+				status: "error",
+				errorMessage: error.message,
+				currentOperation: undefined,
+				progress: undefined,
+			});
+
+			logger.error("Critical synchronization error:", { error: e });
+			return result;
+		} finally {
+			this.notifySyncResumeCallbacks();
+			this.isSyncing = false;
+		}
+	}
+
+	/**
+	 * Create an error result.
 	 */
 	private createErrorResult(message: string): SyncResult {
 		return {

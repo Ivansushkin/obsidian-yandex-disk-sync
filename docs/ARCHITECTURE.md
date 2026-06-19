@@ -26,10 +26,14 @@ src/
 ├── backup/
 │   └── backup-manager.ts   # Управление резервным копированием
 │
+├── crypto/
+│   └── encryption.ts       # E2E encryption service (Web Crypto API)
+│
 ├── ui/
 │   ├── status-bar.ts       # Индикатор статуса в статус-баре
 │   ├── init-modal.ts       # Модальные окна
-│   └── force-sync-modal.ts # Модал подтверждения Force Sync
+│   ├── force-sync-modal.ts # Модал подтверждения Force Sync
+│   └── encryption-modals.ts # Модальные окна шифрования
 │
 └── utils/
     ├── path-utils.ts       # Утилиты для работы с путями

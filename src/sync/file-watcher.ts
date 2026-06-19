@@ -213,7 +213,7 @@ export class FileWatcher {
 		// Delete immediately (no debounce)
 		logger.info(`[FileWatcher] Starting deletion from Yandex Disk: ${file.path}`);
 		this.syncEngine.syncSingleFile(file.path, "delete").catch((e) => {
-			logger.error(`Error deleting file ${file.path}:`, e);
+			logger.error(`Error deleting file ${file.path}:`, { error: e });
 		});
 	}
 
@@ -231,7 +231,7 @@ export class FileWatcher {
 		this.cancelPendingSync(oldPath);
 		// Perform rename
 		this.syncEngine.renameFile(oldPath, file.path).catch((e) => {
-			logger.error(`Error renaming ${oldPath} -> ${file.path}:`, e);
+			logger.error(`Error renaming ${oldPath} -> ${file.path}:`, { error: e });
 		});
 	}
 
@@ -246,7 +246,7 @@ export class FileWatcher {
 		const timer = setTimeout(() => {
 			this.debounceTimers.delete(path);
 			this.syncEngine.syncSingleFile(path, action).catch((e) => {
-				logger.error(`Error synchronizing ${path}:`, e);
+				logger.error(`Error synchronizing ${path}:`, { error: e });
 			});
 		}, this.settings.debounceDelay);
 

@@ -29,8 +29,7 @@ export class EnableEncryptionModal extends Modal {
 		const pw = this.passwordInput.value;
 		const confirmPw = this.confirmInput.value;
 		if (!pw || pw !== confirmPw) {
-			// eslint-disable-next-line obsidianmd/no-static-styles-assignment
-			this.errorEl.style.display = "block";
+			this.errorEl.addClass("is-visible");
 			return null;
 		}
 		return pw;
@@ -65,8 +64,6 @@ export class EnableEncryptionModal extends Modal {
 			text: t("modal.encryption_password_mismatch"),
 		});
 		this.errorEl.addClass("encryption-password-error");
-		// eslint-disable-next-line obsidianmd/no-static-styles-assignment
-		this.errorEl.style.display = "none";
 
 		const setting = new Setting(contentEl)
 			.addButton((btn) =>
@@ -164,13 +161,17 @@ export class DisableEncryptionModal extends Modal {
 export class VerifyPasswordModal extends Modal {
 	private resolve: (value: string | null) => void;
 	private resolved = false;
-	private correctPassword: string;
+	private verifyPassword: (password: string) => Promise<boolean>;
 	private input!: HTMLInputElement;
 
-	constructor(app: App, resolve: (value: string | null) => void, correctPassword: string) {
+	constructor(
+		app: App,
+		resolve: (value: string | null) => void,
+		verifyPassword: (password: string) => Promise<boolean>
+	) {
 		super(app);
 		this.resolve = resolve;
-		this.correctPassword = correctPassword;
+		this.verifyPassword = verifyPassword;
 	}
 
 	private finish(value: string | null): void {
@@ -211,10 +212,10 @@ export class VerifyPasswordModal extends Modal {
 				btn
 					.setButtonText(t("generic.confirm"))
 					.setCta()
-					.onClick(() => {
+					.onClick(async () => {
 						const pw = this.input.value;
 						if (!pw) return;
-						if (pw !== this.correctPassword) {
+						if (!(await this.verifyPassword(pw))) {
 							this.setError();
 							return;
 						}
@@ -262,8 +263,7 @@ export class ChangePasswordModal extends Modal {
 		const pw = this.passwordInput.value;
 		const confirmPw = this.confirmInput.value;
 		if (!pw || pw !== confirmPw) {
-			// eslint-disable-next-line obsidianmd/no-static-styles-assignment
-			this.errorEl.style.display = "block";
+			this.errorEl.addClass("is-visible");
 			return null;
 		}
 		return pw;
@@ -294,99 +294,12 @@ export class ChangePasswordModal extends Modal {
 			text: t("modal.encryption_password_mismatch"),
 		});
 		this.errorEl.addClass("encryption-password-error");
-		// eslint-disable-next-line obsidianmd/no-static-styles-assignment
-		this.errorEl.style.display = "none";
 
 		const setting = new Setting(contentEl)
 			.addButton((btn) =>
 				btn
 					.setButtonText(t("modal.encryption_change_password_button"))
 					.setCta()
-					.onClick(() => {
-						const pw = this.getPassword();
-						if (!pw) return;
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(null);
-						this.close();
-					})
-			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
-	}
-
-	onClose(): void {
-		this.finish(null);
-		const { contentEl } = this;
-		contentEl.empty();
-	}
-}
-
-export class PasswordPromptModal extends Modal {
-	private resolve: (value: string | null) => void;
-	private resolved = false;
-	private createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>;
-	private input!: HTMLInputElement;
-	private promptText: string;
-
-	constructor(
-		app: App,
-		resolve: (value: string | null) => void,
-		createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>,
-		promptText: string
-	) {
-		super(app);
-		this.resolve = resolve;
-		this.createBackup = createBackup;
-		this.promptText = promptText;
-	}
-
-	private finish(value: string | null): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.resolve(value);
-	}
-
-	private getPassword(): string | null {
-		const pw = this.input.value;
-		if (!pw) return null;
-		return pw;
-	}
-
-	onOpen(): void {
-		const { contentEl } = this;
-
-		this.titleEl.setText(t("modal.encryption_enable_title"));
-
-		contentEl.createEl("p", { text: this.promptText });
-
-		this.input = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_password_label"),
-		});
-		this.input.addClass("encryption-password-input");
-
-		const setting = new Setting(contentEl)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.encryption_enable_with_backup"))
-					.setCta()
-					.onClick(async () => {
-						const pw = this.getPassword();
-						if (!pw) return;
-						await this.createBackup();
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.encryption_enable_without_backup"))
 					.onClick(() => {
 						const pw = this.getPassword();
 						if (!pw) return;

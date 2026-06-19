@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "yandex-disk-sync",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Sync Obsidian vault with Yandex Disk",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {

@@ -38,7 +38,7 @@ export class BackupListModal extends Modal {
 			this.backups = await this.backupManager.listBackups();
 		} catch (error) {
 			this.isLoading = false;
-			logger.error('Error loading backups:', error);
+			logger.error('Error loading backups:', { error });
 			contentEl.empty();
 
 			const errorEl = contentEl.createDiv({ cls: 'backup-list-error' });
@@ -123,7 +123,7 @@ export class BackupListModal extends Modal {
 
 			new Notice(t('notice.backup_download_completed', { name: backup.name }));
 		} catch (error) {
-			logger.error('Error downloading backup:', error);
+			logger.error('Error downloading backup:', { error });
 			new Notice(t('notice.backup_download_failed'));
 		} finally {
 			button.disabled = false;
