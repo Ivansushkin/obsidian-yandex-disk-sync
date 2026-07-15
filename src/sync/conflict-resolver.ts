@@ -6,6 +6,14 @@ import type { FileMetadata, SyncOperation } from "../types";
 import { getFileName, getDirectory, getExtension } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 
+/**
+ * Tolerance applied when comparing the server-side mtime of a remote resource
+ * against the server-side mtime stored in the remote index. Both values come
+ * from the Yandex Disk API clock, so this only needs to absorb minor jitter
+ * (re-reads, caching, sub-second rounding) — not inter-device clock skew.
+ */
+const CONFLICT_REMOTE_MTIME_TOLERANCE = 5000;
+
 export interface ConflictInfo {
 	path: string;
 	localMeta: FileMetadata;
@@ -23,7 +31,7 @@ export class ConflictResolver {
 		remoteMeta: FileMetadata | null,
 		localIndexMeta: FileMetadata | null,
 		remoteIndexMeta: FileMetadata | null,
-		syncStartTime?: number
+		syncStartTime?: number,
 	): SyncOperation {
 		// Case 1: File only local (not on disk and not in remote index)
 		if (localMeta && !remoteMeta && !remoteIndexMeta) {
@@ -76,20 +84,52 @@ export class ConflictResolver {
 
 		// Case 6: Both files exist - compare them
 		if (localMeta && remoteMeta) {
-			// When encryption is active, Yandex Disk API returns sha256 of encrypted content,
-			// which never matches the local file's sha256 of plaintext content.
-			// The remote index stores the correct plaintext sha256 from the last sync.
-			// If local sha256 matches the remote index, the file hasn't changed.
-			if (remoteIndexMeta && localMeta.sha256 === remoteIndexMeta.sha256) {
-				return {
-					action: "none",
-					path,
-					reason: "Files match index (encryption)",
-					localMeta,
-					remoteMeta,
-				};
+			// When encryption is active, Yandex Disk returns the sha256 of the
+			// *encrypted* content, which never matches the local plaintext
+			// sha256. The remote index, however, stores the plaintext sha256
+			// from the last sync. If the local sha256 still matches the remote
+			// index, the local file has not changed since the last sync.
+			if (
+				remoteIndexMeta &&
+				localMeta.sha256 === remoteIndexMeta.sha256
+			) {
+				// Local unchanged. But the remote may have been modified
+				// externally (Yandex web UI, another client that did not update
+				// the index, etc.). Detect that by comparing the *server* mtime
+				// we stored in the remote index against the server mtime we now
+				// observe. If we don't have a stored remote mtime (older plugin
+				// wrote this entry, or it was never (re)synced by this version),
+				// there is no reliable way to tell — keep the legacy behavior of
+				// treating the file as unchanged.
+				const indexRemoteMtime = remoteIndexMeta.remoteMtime;
+				const currentRemoteMtime = remoteMeta.remoteMtime;
+				const remotelyChanged =
+					typeof indexRemoteMtime === "number" &&
+					Number.isFinite(indexRemoteMtime) &&
+					typeof currentRemoteMtime === "number" &&
+					Number.isFinite(currentRemoteMtime) &&
+					currentRemoteMtime - indexRemoteMtime >
+						CONFLICT_REMOTE_MTIME_TOLERANCE;
+				if (!remotelyChanged) {
+					return {
+						action: "none",
+						path,
+						reason: "Files match index (encryption)",
+						localMeta,
+						remoteMeta,
+					};
+				}
+				// Fall through: remote changed externally, let compareFiles
+				// decide the direction.
 			}
-			return this.compareFiles(path, localMeta, remoteMeta, syncStartTime);
+			return this.compareFiles(
+				path,
+				localMeta,
+				remoteMeta,
+				localIndexMeta,
+				remoteIndexMeta,
+				syncStartTime,
+			);
 		}
 
 		// Case 7: File exists only locally, but was in remote index (deleted on disk)
@@ -138,15 +178,28 @@ export class ConflictResolver {
 	}
 
 	/**
-	 * Compare two existing files
+	 * Compare two existing files.
+	 *
+	 * When the remote index entry carries a server-side mtime
+	 * ({@link FileMetadata.remoteMtime}), a two-sided comparison is used that
+	 * detects local changes via content hash (both plaintext, works under
+	 * encryption) and remote changes via server mtime (both from the Yandex
+	 * clock, immune to device clock skew). When the stored remote mtime is
+	 * unavailable (entries written by an older plugin version or never
+	 * re-synced by this version), the legacy mixed-clock comparison is used
+	 * to avoid regressing existing behavior.
 	 */
 	private compareFiles(
 		path: string,
 		localMeta: FileMetadata,
 		remoteMeta: FileMetadata,
-		syncStartTime?: number
+		localIndexMeta: FileMetadata | null,
+		remoteIndexMeta: FileMetadata | null,
+		_syncStartTime?: number,
 	): SyncOperation {
-		// Hashes match - files are identical
+		// Hashes match - files are identical (covers the unencrypted case where
+		// Yandex's sha256 is the plaintext sha256, and any case where content
+		// hashes are directly comparable).
 		if (localMeta.sha256 === remoteMeta.sha256) {
 			return {
 				action: "none",
@@ -157,20 +210,94 @@ export class ConflictResolver {
 			};
 		}
 
-		// Hashes differ - determine direction by modification time
+		const indexRemoteMtime = remoteIndexMeta?.remoteMtime;
+		const currentRemoteMtime = remoteMeta.remoteMtime;
+		const remoteMtimeKnown =
+			!!remoteIndexMeta &&
+			typeof indexRemoteMtime === "number" &&
+			Number.isFinite(indexRemoteMtime) &&
+			typeof currentRemoteMtime === "number" &&
+			Number.isFinite(currentRemoteMtime);
+
+		if (remoteMtimeKnown) {
+			// Local change detection — content based. Both hashes are of the
+			// plaintext (local filesystem + index), so this is reliable under
+			// encryption too. When there is no local index entry, treat the
+			// local file as changed (conservative: we don't know its last
+			// synced state, so we must not silently drop it).
+			const localChanged =
+				!localIndexMeta || localMeta.sha256 !== localIndexMeta.sha256;
+
+			// Remote change detection — server mtime based. Both timestamps
+			// come from Yandex Disk, so this is immune to client clock skew and
+			// to the local/server mtime semantic mismatch that plagued the
+			// legacy comparison.
+			const remotelyChanged =
+				currentRemoteMtime - indexRemoteMtime >
+				CONFLICT_REMOTE_MTIME_TOLERANCE;
+
+			if (localChanged && remotelyChanged) {
+				logger.warn(`Conflict for file: ${path}`);
+				return {
+					action: "conflict",
+					path,
+					reason: "Both local and remote changed since last sync (server mtime)",
+					localMeta,
+					remoteMeta,
+				};
+			}
+			if (localChanged) {
+				return {
+					action: "upload",
+					path,
+					reason: "Local file changed since last sync",
+					localMeta,
+					remoteMeta,
+				};
+			}
+			if (remotelyChanged) {
+				return {
+					action: "download",
+					path,
+					reason: "Remote file changed since last sync",
+					localMeta,
+					remoteMeta,
+				};
+			}
+			return {
+				action: "none",
+				path,
+				reason: "Neither side changed since last sync",
+				localMeta,
+				remoteMeta,
+			};
+		}
+
+		// Legacy fallback: no reliable server-side mtime baseline. Preserve the
+		// previous mixed-clock behavior so we don't regress on indexes written
+		// by older plugin versions.
+		return this.compareFilesLegacy(path, localMeta, remoteMeta);
+	}
+
+	/**
+	 * Legacy mixed-clock comparison used when the remote index entry does not
+	 * carry a server-side mtime. Retained verbatim for behavioral parity with
+	 * plugin versions that did not populate {@link FileMetadata.remoteMtime}.
+	 */
+	private compareFilesLegacy(
+		path: string,
+		localMeta: FileMetadata,
+		remoteMeta: FileMetadata,
+	): SyncOperation {
 		const timeDiff = localMeta.mtime - remoteMeta.mtime;
 		const currentTime = Date.now();
 
-		// Time tolerances
-		const TIME_TOLERANCE = 1000;           // Original tolerance for exact matches
-		const EXTENDED_TIME_TOLERANCE = 5000;  // Extended tolerance before creating conflicts
-		const FRESH_FILE_THRESHOLD = 5000;     // Files modified within this time are considered fresh
+		const TIME_TOLERANCE = 1000;
+		const EXTENDED_TIME_TOLERANCE = 5000;
+		const FRESH_FILE_THRESHOLD = 5000;
 
-		// Check if time difference is significant enough to determine winner
 		if (Math.abs(timeDiff) > EXTENDED_TIME_TOLERANCE) {
-			// Large time difference - use standard logic
 			if (timeDiff > 0) {
-				// Local file is significantly newer
 				return {
 					action: "upload",
 					path,
@@ -178,26 +305,22 @@ export class ConflictResolver {
 					localMeta,
 					remoteMeta,
 				};
-			} else {
-				// Remote file is significantly newer
-				return {
-					action: "download",
-					path,
-					reason: "Remote file is significantly newer",
-					localMeta,
-					remoteMeta,
-				};
 			}
+			return {
+				action: "download",
+				path,
+				reason: "Remote file is significantly newer",
+				localMeta,
+				remoteMeta,
+			};
 		}
 
-		// Small time difference - check if file is "fresh" (actively being edited)
 		const localFileAge = currentTime - localMeta.mtime;
 		const remoteFileAge = currentTime - remoteMeta.mtime;
 		const isLocalFresh = localFileAge < FRESH_FILE_THRESHOLD;
 		const isRemoteFresh = remoteFileAge < FRESH_FILE_THRESHOLD;
 
 		if (isLocalFresh || isRemoteFresh) {
-			// At least one file is fresh - give priority to the newer one
 			if (timeDiff > 0) {
 				return {
 					action: "upload",
@@ -206,20 +329,17 @@ export class ConflictResolver {
 					localMeta,
 					remoteMeta,
 				};
-			} else {
-				return {
-					action: "download",
-					path,
-					reason: "Fresh remote file is newer",
-					localMeta,
-					remoteMeta,
-				};
 			}
+			return {
+				action: "download",
+				path,
+				reason: "Fresh remote file is newer",
+				localMeta,
+				remoteMeta,
+			};
 		}
 
-		// Files are not fresh and time difference is small - check for very close times
 		if (Math.abs(timeDiff) <= TIME_TOLERANCE) {
-			// Times are very close but content differs - create conflict
 			logger.warn(`Conflict for file: ${path}`);
 			return {
 				action: "conflict",
@@ -230,7 +350,6 @@ export class ConflictResolver {
 			};
 		}
 
-		// Small difference but not fresh - still determine winner based on time
 		if (timeDiff > 0) {
 			return {
 				action: "upload",
@@ -239,15 +358,14 @@ export class ConflictResolver {
 				localMeta,
 				remoteMeta,
 			};
-		} else {
-			return {
-				action: "download",
-				path,
-				reason: "Remote file is slightly newer",
-				localMeta,
-				remoteMeta,
-			};
 		}
+		return {
+			action: "download",
+			path,
+			reason: "Remote file is slightly newer",
+			localMeta,
+			remoteMeta,
+		};
 	}
 
 	/**
@@ -265,8 +383,9 @@ export class ConflictResolver {
 			.slice(0, 19);
 
 		const shortDeviceId = deviceId.slice(-6);
-		const conflictName = `${baseName}_conflict_${timestamp}_${shortDeviceId}${ext ? "." + ext : ""
-			}`;
+		const conflictName = `${baseName}_conflict_${timestamp}_${shortDeviceId}${
+			ext ? "." + ext : ""
+		}`;
 
 		return dir ? `${dir}/${conflictName}` : conflictName;
 	}
@@ -278,7 +397,7 @@ export class ConflictResolver {
 		localFiles: Map<string, FileMetadata>,
 		remoteFiles: Map<string, FileMetadata>,
 		localIndex: Record<string, FileMetadata>,
-		remoteIndex: Record<string, FileMetadata>
+		remoteIndex: Record<string, FileMetadata>,
 	): Set<string> {
 		const allPaths = new Set<string>();
 
@@ -306,13 +425,13 @@ export class ConflictResolver {
 		remoteFiles: Map<string, FileMetadata>,
 		localIndex: Record<string, FileMetadata>,
 		remoteIndex: Record<string, FileMetadata>,
-		syncStartTime?: number
+		syncStartTime?: number,
 	): SyncOperation[] {
 		const allPaths = this.collectAllPaths(
 			localFiles,
 			remoteFiles,
 			localIndex,
-			remoteIndex
+			remoteIndex,
 		);
 
 		const operations: SyncOperation[] = [];
@@ -329,7 +448,7 @@ export class ConflictResolver {
 				remoteMeta,
 				localIndexMeta,
 				remoteIndexMeta,
-				syncStartTime
+				syncStartTime,
 			);
 
 			if (operation.action !== "none") {

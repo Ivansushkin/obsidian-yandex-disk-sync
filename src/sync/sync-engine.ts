@@ -13,7 +13,10 @@ import type {
 import { INITIAL_SYNC_STATE } from "../types";
 import { YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
-import { IndexManager } from "./index-manager";
+import {
+	IndexManager,
+	RemoteIndexConcurrentModificationError,
+} from "./index-manager";
 import { ConflictResolver } from "./conflict-resolver";
 import { joinPath, getDirectory } from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
@@ -58,7 +61,7 @@ export class SyncEngine {
 		yandexClient: YandexDiskClient,
 		vaultAdapter: VaultAdapter,
 		indexManager: IndexManager,
-		settings: YandexDiskSyncSettings
+		settings: YandexDiskSyncSettings,
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
@@ -240,7 +243,9 @@ export class SyncEngine {
 				const remoteFiles = await this.indexManager.getRemoteFiles();
 
 				// 5. Determine operations
-				this.updateState({ currentOperation: t("status.op.analyzing_changes") });
+				this.updateState({
+					currentOperation: t("status.op.analyzing_changes"),
+				});
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
 
@@ -249,63 +254,96 @@ export class SyncEngine {
 					remoteFiles,
 					localIndex.files,
 					remoteIndex.files,
-					startTime
+					startTime,
 				);
 
 				logger.info(
-					`Determined ${operations.length} synchronization operations`
+					`Determined ${operations.length} synchronization operations`,
 				);
 
 				// 6. Preflight: Create all necessary folders
-				this.updateState({ currentOperation: t("status.op.creating_folders") });
+				this.updateState({
+					currentOperation: t("status.op.creating_folders"),
+				});
 				await this.ensureFoldersExist(operations);
 
 				// 7. Execute operations in parallel by type
 				const totalOps = operations.length;
 				let processedOps = 0;
 
-				const uploads = operations.filter((op) => op.action === "upload");
+				const uploads = operations.filter(
+					(op) => op.action === "upload",
+				);
 				const downloads = operations.filter(
-					(op) => op.action === "download"
+					(op) => op.action === "download",
 				);
 				const deletes = operations.filter(
 					(op) =>
-						op.action === "delete_remote" || op.action === "delete_local"
+						op.action === "delete_remote" ||
+						op.action === "delete_local",
 				);
 				const conflicts = operations.filter(
-					(op) => op.action === "conflict"
+					(op) => op.action === "conflict",
 				);
 
+				let mtimeStamped = false;
 				if (uploads.length > 0) {
-					this.updateState({ currentOperation: t("status.op.uploading_files") });
+					this.updateState({
+						currentOperation: t("status.op.uploading_files"),
+					});
 					const uploadResults = await this.executeOperationsParallel(
 						uploads,
 						result,
 						(completed) => {
 							processedOps = completed;
 							this.reportProgress(processedOps, totalOps);
-						}
+						},
 					);
 					result.uploaded = uploadResults.succeeded;
 					result.errors.push(...uploadResults.errors);
+
+					// Batch-fill `remoteMtime` on the remote index entries just
+					// created by the upload group. uploads ran with
+					// `stampRemoteMtime=false`, so a single re-read of the remote
+					// file list replaces N per-file `getResource` calls. Best-effort:
+					// on failure the entries stay without `remoteMtime` and the
+					// conflict resolver falls back to legacy comparison.
+					if (uploadResults.succeeded > 0) {
+						try {
+							const liveRemote =
+								await this.indexManager.getRemoteFiles();
+							mtimeStamped =
+								this.indexManager.applyServerMtimes(liveRemote);
+						} catch (e) {
+							logger.warn(
+								"Batch server mtime re-read after uploads failed; entries will use legacy comparison:",
+								{ error: e },
+							);
+						}
+					}
 				}
 
 				if (downloads.length > 0) {
-					this.updateState({ currentOperation: t("status.op.downloading_files") });
-					const downloadResults = await this.executeOperationsParallel(
-						downloads,
-						result,
-						(completed) => {
-							processedOps = uploads.length + completed;
-							this.reportProgress(processedOps, totalOps);
-						}
-					);
+					this.updateState({
+						currentOperation: t("status.op.downloading_files"),
+					});
+					const downloadResults =
+						await this.executeOperationsParallel(
+							downloads,
+							result,
+							(completed) => {
+								processedOps = uploads.length + completed;
+								this.reportProgress(processedOps, totalOps);
+							},
+						);
 					result.downloaded = downloadResults.succeeded;
 					result.errors.push(...downloadResults.errors);
 				}
 
 				if (deletes.length > 0) {
-					this.updateState({ currentOperation: t("status.op.deleting_files") });
+					this.updateState({
+						currentOperation: t("status.op.deleting_files"),
+					});
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
 						result,
@@ -313,10 +351,29 @@ export class SyncEngine {
 							processedOps =
 								uploads.length + downloads.length + completed;
 							this.reportProgress(processedOps, totalOps);
-						}
+						},
 					);
 					result.deleted = deleteResults.succeeded;
 					result.errors.push(...deleteResults.errors);
+				}
+
+				// Prune remote folders that became empty after the delete group.
+				// Done centrally (once) rather than per-file to avoid the parallel
+				// race where each delete sees the others' targets as still-present
+				// and skips pruning. Only delete_remote operations affect remote
+				// folders; delete_local is irrelevant here.
+				const deletedRemotePaths = deletes
+					.filter((op) => op.action === "delete_remote")
+					.map((op) => op.path);
+				if (deletedRemotePaths.length > 0) {
+					try {
+						await this.pruneRemoteFolders(deletedRemotePaths);
+					} catch (e) {
+						logger.warn(
+							"Failed to prune remote folders after deletes:",
+							{ error: e },
+						);
+					}
 				}
 
 				if (conflicts.length > 0) {
@@ -336,8 +393,12 @@ export class SyncEngine {
 
 						processedOps++;
 						this.updateState({
-							currentOperation: t("status.op.conflict", { path: op.path }),
-							progress: Math.round((processedOps / totalOps) * 100),
+							currentOperation: t("status.op.conflict", {
+								path: op.path,
+							}),
+							progress: Math.round(
+								(processedOps / totalOps) * 100,
+							),
 							pendingCount: totalOps - processedOps,
 						});
 
@@ -351,24 +412,67 @@ export class SyncEngine {
 								message: (e as Error).message,
 							};
 							result.errors.push(error);
-logger.error(
-							`Error resolving conflict for ${op.path}:`,
-							{ error: e }
-						);
+							logger.error(
+								`Error resolving conflict for ${op.path}:`,
+								{ error: e },
+							);
 						}
 					}
 				}
 
 				// 8. Save indexes
-				this.updateState({ currentOperation: t("status.op.saving_indexes") });
-				this.indexManager.updateSyncTime();
-				await this.indexManager.saveRemoteIndex();
+				this.updateState({
+					currentOperation: t("status.op.saving_indexes"),
+				});
 
-				// 9. Cleanup old deleted records
-				this.indexManager.cleanupDeletedFiles();
+				// A long sync may have taken minutes, during which another device could
+				// have flipped the remote encryption state (enable/rotate/disable). If
+				// so, abort before committing the index so we don't record a sync
+				// against a now-stale encryption context. File transfers that already
+				// landed are harmless and will be reconciled on the next sync.
+				const staleReason = await this.getSyncBlockReason(false);
+				if (staleReason) {
+					result.errors.push({
+						path: "",
+						operation: "none",
+						message: `Sync aborted before saving: ${staleReason}`,
+					});
+					return;
+				}
+
+				// Cleanup expired tombstones BEFORE deciding whether to save.
+				// This ensures removed tombstones are persisted in the same
+				// write, not deferred to the next sync.
+				const hadOperations =
+					result.uploaded > 0 ||
+					result.downloaded > 0 ||
+					result.deleted > 0 ||
+					result.conflicts > 0;
+				const tombstonesRemoved =
+					this.indexManager.cleanupDeletedFiles();
+
+				// Skip the remote index write when nothing changed during this
+				// sync: no file operations, no batch mtime stamping, and no
+				// expired tombstones. This avoids unnecessary API calls, 409
+				// "folder exists" noise, and reduces the window for concurrent-
+				// index conflicts between devices. The local index is still
+				// persisted by the caller via indexSaveCallback.
+				const indexDirty =
+					hadOperations || mtimeStamped || tombstonesRemoved;
+				if (!indexDirty) {
+					logger.debug(
+						"[SyncEngine] No changes detected, skipping remote index save",
+					);
+					return;
+				}
+
+				this.indexManager.updateSyncTime();
+				if (!(await this.saveRemoteIndexOrAbort(result))) {
+					return;
+				}
 			},
 			(result) =>
-				`Synchronization completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`
+				`Synchronization completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
 		);
 	}
 
@@ -382,22 +486,30 @@ logger.error(
 			options,
 			async (result) => {
 				// 1. Ensure remote folder exists
-				this.updateState({ currentOperation: t("status.op.checking_remote_folder") });
+				this.updateState({
+					currentOperation: t("status.op.checking_remote_folder"),
+				});
 				const remoteExists = await this.indexManager.remotePathExists();
 				if (!remoteExists) {
 					await this.indexManager.createRemotePath();
 				}
 
 				// 2. Build local index
-				this.updateState({ currentOperation: t("status.op.scanning_local_files") });
+				this.updateState({
+					currentOperation: t("status.op.scanning_local_files"),
+				});
 				const localFiles = await this.indexManager.buildLocalIndex();
 
 				// 3. Get remote files list
-				this.updateState({ currentOperation: t("status.op.getting_remote_files") });
+				this.updateState({
+					currentOperation: t("status.op.getting_remote_files"),
+				});
 				const remoteFiles = await this.indexManager.getRemoteFiles();
 
 				// 4. Generate operations manually: all local → upload, remote-only → delete_remote
-				this.updateState({ currentOperation: t("status.op.analyzing_changes") });
+				this.updateState({
+					currentOperation: t("status.op.analyzing_changes"),
+				});
 				const operations: SyncOperation[] = [];
 
 				for (const [path, meta] of localFiles) {
@@ -423,11 +535,13 @@ logger.error(
 				}
 
 				logger.info(
-					`Force sync from local: ${operations.length} synchronization operations`
+					`Force sync from local: ${operations.length} synchronization operations`,
 				);
 
 				// 5. Preflight: Create all necessary folders
-				this.updateState({ currentOperation: t("status.op.creating_folders") });
+				this.updateState({
+					currentOperation: t("status.op.creating_folders"),
+				});
 				await this.ensureFoldersExist(operations);
 
 				// 6. Execute operations in parallel by type
@@ -435,51 +549,99 @@ logger.error(
 				let processedOps = 0;
 
 				const uploads = operations.filter(
-					(op) => op.action === "upload"
+					(op) => op.action === "upload",
 				);
 				const deletes = operations.filter(
-					(op) => op.action === "delete_remote"
+					(op) => op.action === "delete_remote",
 				);
 
 				if (uploads.length > 0) {
-					this.updateState({ currentOperation: t("status.op.uploading_files") });
+					this.updateState({
+						currentOperation: t("status.op.uploading_files"),
+					});
 					const uploadResults = await this.executeOperationsParallel(
 						uploads,
 						result,
 						(completed) => {
 							processedOps = completed;
 							this.reportProgress(processedOps, totalOps);
-						}
+						},
 					);
 					result.uploaded = uploadResults.succeeded;
 					result.errors.push(...uploadResults.errors);
+
+					// Batch-fill `remoteMtime` on the remote index entries just
+					// created by the upload group (see fullSync for rationale).
+					if (uploadResults.succeeded > 0) {
+						try {
+							const liveRemote =
+								await this.indexManager.getRemoteFiles();
+							this.indexManager.applyServerMtimes(liveRemote);
+						} catch (e) {
+							logger.warn(
+								"Batch server mtime re-read after force uploads failed; entries will use legacy comparison:",
+								{ error: e },
+							);
+						}
+					}
 				}
 
 				if (deletes.length > 0) {
-					this.updateState({ currentOperation: t("status.op.deleting_remote_files") });
+					this.updateState({
+						currentOperation: t("status.op.deleting_remote_files"),
+					});
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
 						result,
 						(completed) => {
 							processedOps = uploads.length + completed;
 							this.reportProgress(processedOps, totalOps);
-						}
+						},
 					);
 					result.deleted = deleteResults.succeeded;
 					result.errors.push(...deleteResults.errors);
+
+					// Prune remote folders emptied by the delete group (centralized,
+					// once, after all parallel deletes have settled).
+					try {
+						await this.pruneRemoteFolders(
+							deletes.map((op) => op.path),
+						);
+					} catch (e) {
+						logger.warn(
+							"Failed to prune remote folders after force deletes:",
+							{ error: e },
+						);
+					}
 				}
 
-				// 7. Sync indexes: remote becomes a copy of local
-				this.updateState({ currentOperation: t("status.op.saving_indexes") });
+				// 7. Sync indexes: remote becomes a copy of local (only for
+				// operations that actually succeeded). Entries whose upload/delete
+				// failed are left out of the remote index so that (a) the next
+				// sync retries them, and (b) other devices don't try to download
+				// files that never made it to remote and fail with 404.
+				this.updateState({
+					currentOperation: t("status.op.saving_indexes"),
+				});
 				this.indexManager.cleanupDeletedFiles();
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
-				remoteIndex.files = { ...localIndex.files };
+				const failedPaths = new Set(
+					result.errors.map((e) => e.path).filter(Boolean),
+				);
+				const newRemoteFiles: Record<string, FileMetadata> = {};
+				for (const [p, meta] of Object.entries(localIndex.files)) {
+					if (failedPaths.has(p)) continue;
+					newRemoteFiles[p] = meta;
+				}
+				remoteIndex.files = newRemoteFiles;
 				this.indexManager.updateSyncTime();
-				await this.indexManager.saveRemoteIndex();
+				if (!(await this.saveRemoteIndexOrAbort(result))) {
+					return;
+				}
 			},
 			(result) =>
-				`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`
+				`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
 	}
 
@@ -493,26 +655,36 @@ logger.error(
 			options,
 			async (result) => {
 				// 1. Ensure remote folder exists
-				this.updateState({ currentOperation: t("status.op.checking_remote_folder") });
+				this.updateState({
+					currentOperation: t("status.op.checking_remote_folder"),
+				});
 				const remoteExists = await this.indexManager.remotePathExists();
 				if (!remoteExists) {
 					await this.indexManager.createRemotePath();
 				}
 
 				// 2. Build local index (to know what to delete)
-				this.updateState({ currentOperation: t("status.op.scanning_local_files") });
+				this.updateState({
+					currentOperation: t("status.op.scanning_local_files"),
+				});
 				const localFiles = await this.indexManager.buildLocalIndex();
 
 				// 3. Load remote index
-				this.updateState({ currentOperation: t("status.op.loading_remote_index") });
+				this.updateState({
+					currentOperation: t("status.op.loading_remote_index"),
+				});
 				await this.indexManager.loadRemoteIndex();
 
 				// 4. Get remote files list
-				this.updateState({ currentOperation: t("status.op.getting_remote_files") });
+				this.updateState({
+					currentOperation: t("status.op.getting_remote_files"),
+				});
 				const remoteFiles = await this.indexManager.getRemoteFiles();
 
 				// 5. Generate operations manually: all remote → download, local-only → delete_local
-				this.updateState({ currentOperation: t("status.op.analyzing_changes") });
+				this.updateState({
+					currentOperation: t("status.op.analyzing_changes"),
+				});
 				const operations: SyncOperation[] = [];
 
 				for (const [path, meta] of remoteFiles) {
@@ -536,11 +708,13 @@ logger.error(
 				}
 
 				logger.info(
-					`Force sync from remote: ${operations.length} synchronization operations`
+					`Force sync from remote: ${operations.length} synchronization operations`,
 				);
 
 				// 6. Preflight: Create all necessary folders
-				this.updateState({ currentOperation: t("status.op.creating_folders") });
+				this.updateState({
+					currentOperation: t("status.op.creating_folders"),
+				});
 				await this.ensureFoldersExist(operations);
 
 				// 7. Execute operations in parallel by type
@@ -548,51 +722,71 @@ logger.error(
 				let processedOps = 0;
 
 				const downloads = operations.filter(
-					(op) => op.action === "download"
+					(op) => op.action === "download",
 				);
 				const deletes = operations.filter(
-					(op) => op.action === "delete_local"
+					(op) => op.action === "delete_local",
 				);
 
 				if (downloads.length > 0) {
-					this.updateState({ currentOperation: t("status.op.downloading_files") });
-					const downloadResults = await this.executeOperationsParallel(
-						downloads,
-						result,
-						(completed) => {
-							processedOps = completed;
-							this.reportProgress(processedOps, totalOps);
-						}
-					);
+					this.updateState({
+						currentOperation: t("status.op.downloading_files"),
+					});
+					const downloadResults =
+						await this.executeOperationsParallel(
+							downloads,
+							result,
+							(completed) => {
+								processedOps = completed;
+								this.reportProgress(processedOps, totalOps);
+							},
+						);
 					result.downloaded = downloadResults.succeeded;
 					result.errors.push(...downloadResults.errors);
 				}
 
 				if (deletes.length > 0) {
-					this.updateState({ currentOperation: t("status.op.deleting_local_files") });
+					this.updateState({
+						currentOperation: t("status.op.deleting_local_files"),
+					});
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
 						result,
 						(completed) => {
 							processedOps = downloads.length + completed;
 							this.reportProgress(processedOps, totalOps);
-						}
+						},
 					);
 					result.deleted = deleteResults.succeeded;
 					result.errors.push(...deleteResults.errors);
 				}
 
-				// 8. Sync indexes: local becomes a copy of remote
-				this.updateState({ currentOperation: t("status.op.saving_indexes") });
+				// 8. Sync indexes: local becomes a copy of remote (only for
+				// downloads that actually succeeded). Entries whose download failed
+				// are left out of the local index so the next sync retries them and
+				// the local state does not falsely claim a file is present.
+				this.updateState({
+					currentOperation: t("status.op.saving_indexes"),
+				});
 				this.indexManager.cleanupDeletedFiles();
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
-				localIndex.files = { ...remoteIndex.files };
+				const failedPaths = new Set(
+					result.errors.map((e) => e.path).filter(Boolean),
+				);
+				const newLocalFiles: Record<string, FileMetadata> = {};
+				for (const [p, meta] of Object.entries(remoteIndex.files)) {
+					if (failedPaths.has(p)) continue;
+					newLocalFiles[p] = meta;
+				}
+				localIndex.files = newLocalFiles;
 				this.indexManager.updateSyncTime();
-				await this.indexManager.saveRemoteIndex();
+				if (!(await this.saveRemoteIndexOrAbort(result))) {
+					return;
+				}
 			},
 			(result) =>
-				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`
+				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
 	}
 
@@ -601,7 +795,7 @@ logger.error(
 	 */
 	private async executeOperation(
 		op: SyncOperation,
-		result: SyncResult
+		result: SyncResult,
 	): Promise<void> {
 		switch (op.action) {
 			case "upload":
@@ -610,7 +804,10 @@ logger.error(
 				break;
 
 			case "download":
-				await this.downloadFile(op.path);
+				await this.downloadFile(
+					op.path,
+					op.remoteMeta?.remoteMtime ?? op.remoteMeta?.mtime,
+				);
 				result.downloaded++;
 				break;
 
@@ -635,12 +832,17 @@ logger.error(
 	 * Ensure all necessary folders exist before operations
 	 */
 	private async ensureFoldersExist(
-		operations: SyncOperation[]
+		operations: SyncOperation[],
 	): Promise<void> {
 		const folders = new Set<string>();
 
 		for (const op of operations) {
-			if (op.action === "upload" || op.action === "download") {
+			// Only uploads need their destination folders ensured on remote — the
+			// source folder for a download already exists by definition, and
+			// creating it here wastes API calls and, under encryption, creates
+			// no-op encrypted folder entries. Conflict copies create their own
+			// folder at upload time (uploadFile with default skipFolderCheck).
+			if (op.action === "upload") {
 				const remotePath = joinPath(this.settings.remotePath, op.path);
 				const dir = getDirectory(remotePath);
 				if (dir) {
@@ -665,7 +867,7 @@ logger.error(
 	private async executeOperationsParallel(
 		operations: SyncOperation[],
 		result: SyncResult,
-		onProgress?: (completed: number) => void
+		onProgress?: (completed: number) => void,
 	): Promise<{ succeeded: number; errors: SyncError[] }> {
 		const tasks = operations.map((op) => async () => {
 			if (this.isPaused) {
@@ -674,11 +876,17 @@ logger.error(
 
 			switch (op.action) {
 				case "upload":
-					// Skip folder check since we pre-created all folders
-					await this.uploadFile(op.path, true);
+					// Skip folder check since we pre-created all folders, and
+					// skip per-file server mtime fetch — the caller performs a
+					// single batch re-read of the remote file list after the
+					// upload group via `applyServerMtimes`.
+					await this.uploadFile(op.path, true, false);
 					break;
 				case "download":
-					await this.downloadFile(op.path);
+					await this.downloadFile(
+						op.path,
+						op.remoteMeta?.remoteMtime ?? op.remoteMeta?.mtime,
+					);
 					break;
 				case "delete_remote":
 					await this.deleteRemoteFile(op.path);
@@ -696,7 +904,7 @@ logger.error(
 		const results = await runWithConcurrencySettled(
 			tasks,
 			concurrency,
-			onProgress
+			onProgress,
 		);
 
 		const errors: SyncError[] = [];
@@ -705,7 +913,7 @@ logger.error(
 		for (let i = 0; i < results.length; i++) {
 			const res = results[i];
 			const op = operations[i];
-			
+
 			if (!res || !op) {
 				continue;
 			}
@@ -722,7 +930,7 @@ logger.error(
 				});
 				logger.error(
 					`Error executing ${op.action} operation for ${op.path}:`,
-					{ error: res.reason }
+					{ error: res.reason },
 				);
 			} else {
 				succeeded++;
@@ -733,20 +941,41 @@ logger.error(
 	}
 
 	/**
-	 * Upload file to Yandex Disk
+	 * Upload file to Yandex Disk.
+	 *
+	 * When `stampRemoteMtime` is true (default) the server-side mtime of the
+	 * just-uploaded resource is fetched and stored on the remote index entry so
+	 * the next sync can detect external remote changes via server-mtime
+	 * comparison. Set it to false for bulk upload flows that perform a single
+	 * batch re-read of the remote file list afterwards (see
+	 * `IndexManager.applyServerMtimes`); this saves one `getResource` API call
+	 * per uploaded file.
 	 */
-	async uploadFile(path: string, skipFolderCheck = false): Promise<void> {
+	async uploadFile(
+		path: string,
+		skipFolderCheck = false,
+		stampRemoteMtime = true,
+	): Promise<void> {
 		logger.debug(`Uploading file: ${path}`);
 
 		const content = await this.vaultAdapter.readFile(path);
 		const remotePath = joinPath(this.settings.remotePath, path);
 
-		await this.yandexClient.uploadFile(remotePath, content, skipFolderCheck);
+		await this.yandexClient.uploadFile(
+			remotePath,
+			content,
+			skipFolderCheck,
+		);
 
 		// Update indexes
 		const sha256 = await computeSha256(content);
 		const mtime = this.vaultAdapter.getFileMtime(path) || Date.now();
 		const size = content.byteLength;
+		// Best-effort: if the fetch fails, leave remoteMtime undefined and the
+		// resolver falls back to the legacy mixed-clock comparison.
+		const remoteMtime = stampRemoteMtime
+			? await this.fetchServerMtime(path)
+			: undefined;
 
 		const metadata: FileMetadata = {
 			path,
@@ -757,23 +986,56 @@ logger.error(
 		};
 
 		this.indexManager.updateLocalFile(path, metadata);
-		this.indexManager.updateRemoteFile(path, metadata);
+		// The remote index entry additionally carries the server mtime so the
+		// next sync can detect external remote modifications without involving
+		// the local clock.
+		this.indexManager.updateRemoteFile(path, { ...metadata, remoteMtime });
 	}
 
 	/**
-	 * Download file from Yandex Disk
+	 * Download file from Yandex Disk.
+	 * `serverMtime` is the server-side modification time of the remote resource
+	 * (typically `remoteMeta.mtime` from the conflict resolver), used to stamp
+	 * {@link FileMetadata.remoteMtime} on the remote index entry without an
+	 * extra API call. When omitted, the server mtime is fetched best-effort.
 	 */
-	async downloadFile(path: string): Promise<void> {
+	async downloadFile(path: string, serverMtime?: number): Promise<void> {
 		logger.debug(`Downloading file: ${path}`);
 
 		const remotePath = joinPath(this.settings.remotePath, path);
 		const content = await this.yandexClient.downloadFile(remotePath);
+
+		// If a local file already exists and its content has diverged from the
+		// last synced state (per the local index), it means the local copy
+		// carried unsynced changes that this download is about to overwrite.
+		// Back it up first so the edit is recoverable. This is especially
+		// important for the legacy mixed-clock conflict path and for
+		// force-sync-from-remote, which can overwrite non-trivial local edits.
+		const localIndexMeta = this.indexManager.getLocalIndex().files[path];
+		if (localIndexMeta && this.vaultAdapter.fileExists(path)) {
+			try {
+				const existing = await this.vaultAdapter.readFile(path);
+				const existingSha = await computeSha256(existing);
+				if (existingSha !== localIndexMeta.sha256) {
+					await this.vaultAdapter.backupOverwrittenFile(
+						path,
+						existing,
+					);
+				}
+			} catch (e) {
+				logger.warn(
+					`Could not back up local ${path} before overwrite:`,
+					{ error: e },
+				);
+			}
+		}
 
 		await this.vaultAdapter.writeFile(path, content);
 
 		// Update indexes
 		const sha256 = await computeSha256(content);
 		const mtime = this.vaultAdapter.getFileMtime(path) || Date.now();
+		const remoteMtime = serverMtime ?? (await this.fetchServerMtime(path));
 
 		const metadata: FileMetadata = {
 			path,
@@ -784,7 +1046,28 @@ logger.error(
 		};
 
 		this.indexManager.updateLocalFile(path, metadata);
-		this.indexManager.updateRemoteFile(path, metadata);
+		this.indexManager.updateRemoteFile(path, { ...metadata, remoteMtime });
+	}
+
+	/**
+	 * Fetch the server-side modification time for a remote file. Returns
+	 * undefined when the resource cannot be read (e.g. it was concurrently
+	 * deleted) or the modified timestamp is not parseable. Callers treat
+	 * undefined as "no remoteMtime known" and fall back to legacy logic.
+	 */
+	private async fetchServerMtime(path: string): Promise<number | undefined> {
+		try {
+			const remotePath = joinPath(this.settings.remotePath, path);
+			const resource = await this.yandexClient.getResource(remotePath);
+			if (!resource) return undefined;
+			const ts = new Date(resource.modified).getTime();
+			return Number.isFinite(ts) ? ts : undefined;
+		} catch (e) {
+			logger.debug(`Failed to fetch server mtime for ${path}:`, {
+				error: e,
+			});
+			return undefined;
+		}
 	}
 
 	/**
@@ -799,17 +1082,26 @@ logger.error(
 		// Update indexes
 		this.indexManager.markRemoteFileDeleted(path);
 		this.indexManager.removeFromLocalIndex(path);
-
-		// Remove parent folders that became empty after this deletion
-		await this.pruneRemoteFolders([path]);
+		// Note: pruning of now-empty remote folders is performed centrally
+		// after the whole delete group (see fullSync/forceSyncFromLocal) to
+		// avoid the race where parallel deletes each observe the others'
+		// targets as still-present and skip pruning, leaving empty folders
+		// behind forever.
 	}
 
 	/**
 	 * Delete remote folders that became empty after file deletions.
-	 * Uses the in-memory remote index to determine emptiness — no extra API
-	 * calls needed. Must be called after index updates so the index reflects
-	 * the current state. Deletes deepest directories first so children are
-	 * removed before their parents.
+	 *
+	 * Candidates are derived from the in-memory remote index (which tracks
+	 * only files, not folders): a folder is a candidate when no non-deleted
+	 * index entry lives under it. Because the index may be stale (written by
+	 * an older plugin version, or lagging behind another device's sync), every
+	 * candidate is re-verified against Yandex Disk via {@link
+	 * YandexDiskClient.isFolderEmpty} before deletion — never delete a folder
+	 * the server reports as non-empty, since that would wipe its contents.
+	 * Deepest directories are processed first so children are pruned before
+	 * their parents; a folder that still contains a (candidate) subfolder is
+	 * left untouched this round and retried on the next sync.
 	 */
 	private async pruneRemoteFolders(localPaths: string[]): Promise<void> {
 		const candidates = new Set<string>();
@@ -825,7 +1117,7 @@ logger.error(
 		const emptyDirs = Array.from(candidates).filter((dir) => {
 			const prefix = dir + "/";
 			return !Object.keys(remoteFiles).some(
-				(fp) => !remoteFiles[fp]?.deleted && fp.startsWith(prefix)
+				(fp) => !remoteFiles[fp]?.deleted && fp.startsWith(prefix),
 			);
 		});
 		if (emptyDirs.length === 0) return;
@@ -833,10 +1125,30 @@ logger.error(
 		emptyDirs.sort((a, b) => b.split("/").length - a.split("/").length);
 
 		for (const dir of emptyDirs) {
-			await this.yandexClient.deleteResource(
-				joinPath(this.settings.remotePath, dir)
-			);
-			logger.debug(`[SyncEngine] Pruned empty remote folder: ${dir}`);
+			const remoteDir = joinPath(this.settings.remotePath, dir);
+			// Re-check against the live remote state. Under a stale index this
+			// prevents deleting a folder that actually still contains files.
+			let isEmpty: boolean;
+			try {
+				isEmpty = await this.yandexClient.isFolderEmpty(remoteDir);
+			} catch (e) {
+				logger.warn(
+					`[SyncEngine] Could not verify emptiness of ${dir}, skipping prune:`,
+					{ error: e },
+				);
+				continue;
+			}
+			if (!isEmpty) continue;
+
+			try {
+				await this.yandexClient.deleteResource(remoteDir);
+				logger.debug(`[SyncEngine] Pruned empty remote folder: ${dir}`);
+			} catch (e) {
+				logger.warn(
+					`[SyncEngine] Failed to prune empty folder ${dir}:`,
+					{ error: e },
+				);
+			}
 		}
 	}
 
@@ -851,6 +1163,17 @@ logger.error(
 		// Update indexes
 		this.indexManager.markLocalFileDeleted(path);
 		this.indexManager.removeFromRemoteIndex(path);
+
+		// Prune local ancestor folders that became empty after this deletion,
+		// so the local tree mirrors the remote tree after a delete sync. Only
+		// truly empty folders are trashed (recoverable).
+		try {
+			await this.vaultAdapter.pruneEmptyLocalAncestors(path);
+		} catch (e) {
+			logger.warn(`Failed to prune empty local ancestors for ${path}:`, {
+				error: e,
+			});
+		}
 	}
 
 	/**
@@ -865,7 +1188,7 @@ logger.error(
 			// Save local version as conflict copy
 			const conflictPath = this.conflictResolver.generateConflictName(
 				op.path,
-				this.settings.deviceId
+				this.settings.deviceId,
 			);
 
 			const localContent = await this.vaultAdapter.readFile(op.path);
@@ -874,15 +1197,18 @@ logger.error(
 			// Upload conflict copy to disk
 			const remoteConflictPath = joinPath(
 				this.settings.remotePath,
-				conflictPath
+				conflictPath,
 			);
 			await this.yandexClient.uploadFile(
 				remoteConflictPath,
-				localContent
+				localContent,
 			);
 
 			// Download remote version
-			await this.downloadFile(op.path);
+			await this.downloadFile(
+				op.path,
+				op.remoteMeta?.remoteMtime ?? op.remoteMeta?.mtime,
+			);
 
 			logger.info(`Conflict resolved, copy created: ${conflictPath}`);
 		}
@@ -893,25 +1219,42 @@ logger.error(
 	 */
 	async syncSingleFile(
 		path: string,
-		action: "upload" | "delete"
+		action: "upload" | "delete",
 	): Promise<void> {
-		logger.info(`[SyncEngine] syncSingleFile called for ${path}, action: ${action}`);
+		logger.info(
+			`[SyncEngine] syncSingleFile called for ${path}, action: ${action}`,
+		);
 
 		const blockReason = await this.getSyncBlockReason(false);
 		if (blockReason) {
-			logger.warn(`[SyncEngine] Skipping file sync ${path}: ${blockReason}`);
+			logger.warn(
+				`[SyncEngine] Skipping file sync ${path}: ${blockReason}`,
+			);
 			this.setBlockedState(blockReason);
 			return;
 		}
 
 		if (this.isPaused || this.isSyncing) {
 			logger.info(
-				`[SyncEngine] Skipping file sync ${path}: sync busy (${this.isSyncing}) or paused (${this.isPaused})`
+				`[SyncEngine] Skipping file sync ${path}: sync busy (${this.isSyncing}) or paused (${this.isPaused})`,
 			);
 			// Persist the deletion intent so the next fullSync resolves it as
 			// delete_remote (Case 3) rather than downloading the file (Case 2/8).
 			if (action === "delete") {
 				this.indexManager.markLocalFileDeleted(path);
+				// Persist the local index to disk; otherwise an Obsidian restart
+				// before the next full sync would lose the deletion intent and
+				// the file would be re-downloaded (Case 8: remote mtime > 0).
+				if (this.indexSaveCallback) {
+					try {
+						await this.indexSaveCallback();
+					} catch (e) {
+						logger.error(
+							`Error persisting deletion intent for ${path}:`,
+							{ error: e },
+						);
+					}
+				}
 			}
 			return;
 		}
@@ -931,7 +1274,7 @@ logger.error(
 			}
 
 			// Save remote index after operation to keep it in sync
-			await this.indexManager.saveRemoteIndex();
+			await this.saveRemoteIndexBestEffort();
 			logger.debug(`Remote index saved after ${action} for ${path}`);
 
 			// Save local index via callback
@@ -950,7 +1293,9 @@ logger.error(
 	async renameFile(oldPath: string, newPath: string): Promise<void> {
 		const blockReason = await this.getSyncBlockReason(false);
 		if (blockReason) {
-			logger.warn(`[SyncEngine] Skipping rename ${oldPath}: ${blockReason}`);
+			logger.warn(
+				`[SyncEngine] Skipping rename ${oldPath}: ${blockReason}`,
+			);
 			this.setBlockedState(blockReason);
 			return;
 		}
@@ -964,7 +1309,7 @@ logger.error(
 			if (this.vaultAdapter.shouldSync(oldPath)) {
 				await this.deleteRemoteFile(oldPath);
 				// Save remote index after deletion
-				await this.indexManager.saveRemoteIndex();
+				await this.saveRemoteIndexBestEffort();
 				// Save local index via callback
 				if (this.indexSaveCallback) {
 					await this.indexSaveCallback();
@@ -1016,7 +1361,7 @@ logger.error(
 			await this.pruneRemoteFolders([oldPath]);
 
 			// Save remote index after rename
-			await this.indexManager.saveRemoteIndex();
+			await this.saveRemoteIndexBestEffort();
 			logger.debug(`File renamed: ${oldPath} -> ${newPath}`);
 
 			// Save local index via callback
@@ -1025,10 +1370,27 @@ logger.error(
 			}
 		} catch (e) {
 			logger.error(`Error renaming file ${oldPath}:`, { error: e });
-			// If rename failed, upload file again
+			// If rename failed, the source remote file may still exist. Remove
+			// it before re-uploading to the destination so we don't leave a
+			// duplicate that would otherwise only be cleaned up on the next
+			// full sync (ConflictResolver Case 3). Best-effort: ignore if it's
+			// already gone (404) or if the move partially succeeded.
+			try {
+				const staleRemotePath = joinPath(
+					this.settings.remotePath,
+					oldPath,
+				);
+				await this.yandexClient.deleteResource(staleRemotePath);
+			} catch (cleanupErr) {
+				logger.warn(
+					`Failed to clean up old remote file after rename failure (${oldPath}):`,
+					{ error: cleanupErr },
+				);
+			}
+			// Re-upload the file to the destination path
 			await this.uploadFile(newPath);
 			// Save remote index after upload
-			await this.indexManager.saveRemoteIndex();
+			await this.saveRemoteIndexBestEffort();
 			// Save local index via callback
 			if (this.indexSaveCallback) {
 				await this.indexSaveCallback();
@@ -1095,11 +1457,13 @@ logger.error(
 	private async runSyncSession(
 		options: SyncRunOptions | undefined,
 		body: (result: SyncResult, startTime: number) => Promise<void>,
-		logMessage: (result: SyncResult) => string
+		logMessage: (result: SyncResult) => string,
 	): Promise<SyncResult> {
 		if (this.isSyncing) {
 			logger.warn("Synchronization already in progress");
-			return this.createErrorResult("Synchronization already in progress");
+			return this.createErrorResult(
+				"Synchronization already in progress",
+			);
 		}
 
 		if (this.isPaused) {
@@ -1107,7 +1471,9 @@ logger.error(
 			return this.createErrorResult("Synchronization is paused");
 		}
 
-		const blockReason = await this.getSyncBlockReason(options?.skipEncryptionGuard);
+		const blockReason = await this.getSyncBlockReason(
+			options?.skipEncryptionGuard,
+		);
 		if (blockReason) {
 			return this.createBlockedResult(blockReason);
 		}
@@ -1170,6 +1536,56 @@ logger.error(
 	}
 
 	/**
+	 * Save the remote index with optimistic concurrency control. If another
+	 * device wrote a newer index during this sync, do NOT overwrite it: our
+	 * physical file transfers already landed and will be reconciled on the next
+	 * sync once we reload the newer index. Returns false (and records an error
+	 * on `result`) when the save was skipped due to a concurrent modification.
+	 */
+	private async saveRemoteIndexOrAbort(result: SyncResult): Promise<boolean> {
+		try {
+			await this.indexManager.saveRemoteIndex();
+			return true;
+		} catch (e) {
+			if (!(e instanceof RemoteIndexConcurrentModificationError)) {
+				throw e;
+			}
+			logger.warn(
+				"Remote index was modified by another device during sync; skipping index overwrite.",
+			);
+			result.errors.push({
+				path: "",
+				operation: "none",
+				message:
+					"Concurrent sync detected from another device. Index not overwritten; please run sync again to reconcile.",
+			});
+			result.success = false;
+			return false;
+		}
+	}
+
+	/**
+	 * Save the remote index from a single-file (real-time) flow. Unlike the
+	 * bulk sync path, a concurrent modification here is not surfaced as an
+	 * error: the file transfer already succeeded, and the next full sync will
+	 * reload the newer remote index and reconcile. We only log a warning so
+	 * real-time editing stays non-disruptive.
+	 */
+	private async saveRemoteIndexBestEffort(): Promise<void> {
+		try {
+			await this.indexManager.saveRemoteIndex();
+		} catch (e) {
+			if (e instanceof RemoteIndexConcurrentModificationError) {
+				logger.warn(
+					"Remote index modified concurrently during single-file sync; skipping remote index save. It will be reconciled on the next full sync.",
+				);
+				return;
+			}
+			throw e;
+		}
+	}
+
+	/**
 	 * Create an error result.
 	 */
 	private createErrorResult(message: string): SyncResult {
@@ -1185,7 +1601,9 @@ logger.error(
 		};
 	}
 
-	private async getSyncBlockReason(skipGuard?: boolean): Promise<string | null> {
+	private async getSyncBlockReason(
+		skipGuard?: boolean,
+	): Promise<string | null> {
 		if (skipGuard) {
 			return null;
 		}

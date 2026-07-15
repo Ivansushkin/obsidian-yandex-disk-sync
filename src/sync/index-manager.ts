@@ -39,10 +39,20 @@ export class IndexManager {
 	private localIndex: SyncIndex;
 	private remoteIndex: SyncIndex;
 
+	/**
+	 * Content fingerprint (Yandex-provided md5/sha256) of the remote index
+	 * resource as observed at the last {@link loadRemoteIndex} call. Used by
+	 * {@link saveRemoteIndex} to detect a concurrent write by another device
+	 * between load and save (optimistic locking, since the Yandex REST API
+	 * does not expose conditional PUT). undefined when no remote index existed
+	 * at load time, or after the index has been (re)created locally.
+	 */
+	private remoteIndexFingerprint: string | null = null;
+
 	constructor(
 		yandexClient: YandexDiskClient,
 		vaultAdapter: VaultAdapter,
-		settings: YandexDiskSyncSettings
+		settings: YandexDiskSyncSettings,
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
@@ -76,7 +86,10 @@ export class IndexManager {
 	 * Load local index from saved plugin data
 	 */
 	loadLocalIndexFromData(data: Partial<SyncIndex> | null): void {
-		if (data && (data.version === CURRENT_INDEX_VERSION || data.version === 1)) {
+		if (
+			data &&
+			(data.version === CURRENT_INDEX_VERSION || data.version === 1)
+		) {
 			this.localIndex = {
 				version: CURRENT_INDEX_VERSION,
 				lastSyncTime: data.lastSyncTime || 0,
@@ -111,7 +124,7 @@ export class IndexManager {
 	async loadRemoteIndex(): Promise<SyncIndex> {
 		const indexPath = joinPath(
 			this.settings.remotePath,
-			REMOTE_INDEX_FILENAME
+			REMOTE_INDEX_FILENAME,
 		);
 
 		try {
@@ -119,10 +132,21 @@ export class IndexManager {
 			if (!resource) {
 				logger.info("Remote index not found, creating new one");
 				this.remoteIndex = createEmptyIndex("");
+				this.remoteIndexFingerprint = null;
 				return this.remoteIndex;
 			}
 
-			const content = await this.yandexClient.downloadFile(indexPath);
+			// Record the server-side content fingerprint so saveRemoteIndex can
+			// detect a concurrent modification by another device between load
+			// and save. Prefer md5 (always present for files), fall back to
+			// sha256, then resource_id.
+			this.remoteIndexFingerprint =
+				resource.md5 || resource.sha256 || resource.resource_id || null;
+
+			const content = await this.yandexClient.downloadFile(
+				indexPath,
+				true,
+			);
 			const decoder = new TextDecoder();
 			const jsonStr = decoder.decode(content);
 			const data = JSON.parse(jsonStr) as Partial<SyncIndex>;
@@ -135,15 +159,15 @@ export class IndexManager {
 					files: data.files || {},
 				};
 			} else {
-				logger.warn(
-					"Remote index version mismatch, resetting"
-				);
+				logger.warn("Remote index version mismatch, resetting");
 				this.remoteIndex = createEmptyIndex("");
+				this.remoteIndexFingerprint = null;
 			}
 
 			logger.info(
-				`Loaded remote index: ${Object.keys(this.remoteIndex.files).length
-				} files`
+				`Loaded remote index: ${
+					Object.keys(this.remoteIndex.files).length
+				} files`,
 			);
 			return this.remoteIndex;
 		} catch (e) {
@@ -158,7 +182,7 @@ export class IndexManager {
 	async saveRemoteIndex(): Promise<void> {
 		const indexPath = joinPath(
 			this.settings.remotePath,
-			REMOTE_INDEX_FILENAME
+			REMOTE_INDEX_FILENAME,
 		);
 
 		this.remoteIndex.version = CURRENT_INDEX_VERSION;
@@ -166,7 +190,55 @@ export class IndexManager {
 		this.remoteIndex.deviceId = this.settings.deviceId;
 
 		const jsonStr = JSON.stringify(this.remoteIndex, null, 2);
-		await this.yandexClient.uploadFile(indexPath, jsonStr);
+
+		// Optimistic concurrency control: re-fetch the remote index resource
+		// just before writing and verify its fingerprint matches the one we
+		// observed at load time. If another device wrote a newer index in
+		// between, abort with RemoteIndexConcurrentModificationError so the
+		// caller can reload and re-resolve instead of silently overwriting
+		// (which would lose the other device's updates). This works regardless
+		// of the remote plugin version since it relies on Yandex-provided
+		// content hashes, not any field the plugin itself writes.
+		if (this.remoteIndexFingerprint !== null) {
+			const current = await this.yandexClient.getResource(indexPath);
+			if (current) {
+				const currentFingerprint =
+					current.md5 ||
+					current.sha256 ||
+					current.resource_id ||
+					null;
+				if (
+					currentFingerprint !== null &&
+					currentFingerprint !== this.remoteIndexFingerprint
+				) {
+					throw new RemoteIndexConcurrentModificationError(
+						"Remote index was modified by another device during synchronization",
+					);
+				}
+			}
+			// If current is null, the index disappeared (another device deleted
+			// it or we are in a transition). Proceed to recreate it.
+		}
+
+		await this.yandexClient.uploadFile(indexPath, jsonStr, true, true);
+
+		// Re-fetch the resource so we have the authoritative server fingerprint
+		// for the content we just wrote. This lets a subsequent save in the same
+		// session still detect concurrent writes by other devices. Best-effort:
+		// if the fetch fails we clear the fingerprint and lose within-session
+		// detection, but never block the save.
+		try {
+			const written = await this.yandexClient.getResource(indexPath);
+			this.remoteIndexFingerprint = written
+				? written.md5 || written.sha256 || written.resource_id || null
+				: null;
+		} catch (e) {
+			logger.warn(
+				"Failed to re-read remote index fingerprint after save:",
+				{ error: e },
+			);
+			this.remoteIndexFingerprint = null;
+		}
 
 		logger.info("Remote index saved");
 	}
@@ -185,11 +257,13 @@ export class IndexManager {
 	 * Mark file as deleted in local index
 	 */
 	markLocalFileDeleted(path: string): void {
-		if (this.localIndex.files[path]) {
-			this.localIndex.files[path].deleted = true;
-			this.localIndex.files[path].deletedAt = Date.now();
-			this.localIndex.files[path].lastModifiedBy = this.settings.deviceId;
+		const meta = this.localIndex.files[path];
+		if (!meta) return;
+		if (!meta.deleted) {
+			meta.deleted = true;
+			meta.deletedAt = Date.now();
 		}
+		meta.lastModifiedBy = this.settings.deviceId;
 	}
 
 	/**
@@ -219,7 +293,9 @@ export class IndexManager {
 			};
 			added++;
 		}
-		logger.info(`[IndexManager] Seeded local index with ${added} entries from remote`);
+		logger.info(
+			`[IndexManager] Seeded local index with ${added} entries from remote`,
+		);
 	}
 
 	/**
@@ -233,15 +309,54 @@ export class IndexManager {
 	}
 
 	/**
+	 * Stamp `remoteMtime` on remote index entries that are missing it, using
+	 * the server-side mtime carried by a freshly-read remote file listing.
+	 *
+	 * Used as a batch replacement for per-upload `fetchServerMtime`: the bulk
+	 * upload path writes remote index entries without `remoteMtime`, then the
+	 * sync engine performs a single `getRemoteFiles` call and passes the
+	 * result here. Entries that already carry a `remoteMtime` (e.g. written by
+	 * a single-file upload path) are left untouched. Entries whose path is
+	 * absent from `remoteFiles` (e.g. the file was deleted between upload and
+	 * re-read) keep `remoteMtime` undefined and fall back to the legacy
+	 * mixed-clock comparison, which is safe.
+	 */
+	applyServerMtimes(remoteFiles: Map<string, FileMetadata>): boolean {
+		let stamped = 0;
+		for (const [path, meta] of Object.entries(this.remoteIndex.files)) {
+			if (typeof meta.remoteMtime === "number") continue;
+			if (meta.deleted) continue;
+			const live = remoteFiles.get(path);
+			if (!live) continue;
+			if (typeof live.remoteMtime !== "number") continue;
+			this.remoteIndex.files[path] = {
+				...meta,
+				remoteMtime: live.remoteMtime,
+			};
+			stamped++;
+		}
+		if (stamped > 0) {
+			logger.debug(
+				`[IndexManager] Stamped remoteMtime on ${stamped} remote index entries from batch re-read`,
+			);
+		}
+		return stamped > 0;
+	}
+
+	/**
 	 * Mark file as deleted in remote index
 	 */
 	markRemoteFileDeleted(path: string): void {
-		if (this.remoteIndex.files[path]) {
-			this.remoteIndex.files[path].deleted = true;
-			this.remoteIndex.files[path].deletedAt = Date.now();
-			this.remoteIndex.files[path].lastModifiedBy =
-				this.settings.deviceId;
+		const meta = this.remoteIndex.files[path];
+		if (!meta) return;
+		// Only stamp the deletion time on the first transition to deleted.
+		// Re-stamping would reset the 7-day cleanup TTL and lose the original
+		// deletion timestamp recorded by whichever device deleted first.
+		if (!meta.deleted) {
+			meta.deleted = true;
+			meta.deletedAt = Date.now();
 		}
+		meta.lastModifiedBy = this.settings.deviceId;
 	}
 
 	/**
@@ -258,7 +373,7 @@ export class IndexManager {
 		logger.info("Getting remote files list...");
 
 		const resources = await this.yandexClient.getResourcesRecursive(
-			this.settings.remotePath
+			this.settings.remotePath,
 		);
 
 		const result = new Map<string, FileMetadata>();
@@ -271,7 +386,7 @@ export class IndexManager {
 
 			const localPath = toLocalPath(
 				resource.path,
-				this.settings.remotePath
+				this.settings.remotePath,
 			);
 
 			// Skip service/protected paths.
@@ -291,6 +406,10 @@ export class IndexManager {
 				sha256: resource.sha256 || "",
 				size: resource.size || 0,
 				mtime,
+				// Server-side modification time, stored separately so remote-side
+				// change detection can compare server timestamps against server
+				// timestamps, avoiding clock skew with the local filesystem.
+				remoteMtime: Number.isFinite(mtime) ? mtime : undefined,
 				syncedAt: 0,
 			});
 		}
@@ -309,10 +428,13 @@ export class IndexManager {
 	}
 
 	/**
-	 * Clean up deleted files older than specified age
+	 * Clean up deleted files older than specified age.
+	 * Returns true when at least one tombstone was removed (i.e. the indexes
+	 * changed and callers should persist them).
 	 */
-	cleanupDeletedFiles(maxAge: number = 7 * 24 * 60 * 60 * 1000): void {
+	cleanupDeletedFiles(maxAge: number = 7 * 24 * 60 * 60 * 1000): boolean {
 		const now = Date.now();
+		let changed = false;
 
 		for (const [path, meta] of Object.entries(this.localIndex.files)) {
 			if (
@@ -321,6 +443,7 @@ export class IndexManager {
 				now - meta.deletedAt > maxAge
 			) {
 				delete this.localIndex.files[path];
+				changed = true;
 			}
 		}
 
@@ -331,8 +454,11 @@ export class IndexManager {
 				now - meta.deletedAt > maxAge
 			) {
 				delete this.remoteIndex.files[path];
+				changed = true;
 			}
 		}
+
+		return changed;
 	}
 
 	/**
@@ -340,7 +466,7 @@ export class IndexManager {
 	 */
 	async remotePathExists(): Promise<boolean> {
 		const resource = await this.yandexClient.getResource(
-			this.settings.remotePath
+			this.settings.remotePath,
 		);
 		return resource !== null;
 	}
@@ -351,7 +477,7 @@ export class IndexManager {
 	async remoteIndexExists(): Promise<boolean> {
 		const indexPath = joinPath(
 			this.settings.remotePath,
-			REMOTE_INDEX_FILENAME
+			REMOTE_INDEX_FILENAME,
 		);
 		const resource = await this.yandexClient.getResource(indexPath);
 		return resource !== null;
@@ -375,13 +501,15 @@ export class IndexManager {
 	/**
 	 * Upload encryption manifest to Yandex Disk (raw — no encryption).
 	 */
-	async uploadEncryptionManifest(manifest: EncryptionManifest): Promise<void> {
+	async uploadEncryptionManifest(
+		manifest: EncryptionManifest,
+	): Promise<void> {
 		const content = JSON.stringify(manifest, null, 2);
 		await this.yandexClient.uploadFile(
 			this.getEncryptionManifestPath(),
 			content,
 			false,
-			true
+			true,
 		);
 		logger.info("Encryption manifest uploaded to remote");
 	}
@@ -396,15 +524,17 @@ export class IndexManager {
 				this.getEncryptionManifestPath(),
 				1000,
 				0,
-				true
+				true,
 			);
 			if (!resource) return null;
 
 			const content = await this.yandexClient.downloadFile(
 				this.getEncryptionManifestPath(),
-				true
+				true,
 			);
-			const data = JSON.parse(new TextDecoder().decode(content)) as Record<string, unknown>;
+			const data = JSON.parse(
+				new TextDecoder().decode(content),
+			) as Record<string, unknown>;
 			return this.parseEncryptionManifest(data);
 		} catch (e) {
 			if (this.isNotFoundError(e)) {
@@ -421,7 +551,7 @@ export class IndexManager {
 		await this.yandexClient.deleteResource(
 			this.getEncryptionManifestPath(),
 			false,
-			true
+			true,
 		);
 		logger.info("Encryption manifest deleted from remote");
 	}
@@ -434,7 +564,7 @@ export class IndexManager {
 		try {
 			resources = await this.yandexClient.getResourcesRecursive(
 				this.settings.remotePath,
-				true
+				true,
 			);
 		} catch (e) {
 			if (this.isNotFoundError(e)) {
@@ -451,7 +581,7 @@ export class IndexManager {
 
 			const localPath = toLocalPath(
 				resource.path,
-				this.settings.remotePath
+				this.settings.remotePath,
 			);
 			if (isProtectedPath(localPath)) {
 				continue;
@@ -463,7 +593,9 @@ export class IndexManager {
 		return result;
 	}
 
-	private parseEncryptionManifest(data: Record<string, unknown>): RemoteEncryptionManifest {
+	private parseEncryptionManifest(
+		data: Record<string, unknown>,
+	): RemoteEncryptionManifest {
 		const salt = data.salt;
 		if (typeof salt !== "string" || !salt) {
 			throw new Error("Invalid encryption manifest: missing salt");
@@ -492,7 +624,10 @@ export class IndexManager {
 		const updatedAt = data.updatedAt;
 		const updatedBy = data.updatedBy;
 
-		if (typeof state !== "string" || !this.isEncryptionManifestState(state)) {
+		if (
+			typeof state !== "string" ||
+			!this.isEncryptionManifestState(state)
+		) {
 			throw new Error("Invalid encryption manifest: unsupported state");
 		}
 		if (typeof revision !== "number" || revision < 1) {
@@ -529,11 +664,28 @@ export class IndexManager {
 		};
 	}
 
-	private isEncryptionManifestState(value: string): value is EncryptionManifestState {
-		return ENCRYPTION_MANIFEST_STATES.includes(value as EncryptionManifestState);
+	private isEncryptionManifestState(
+		value: string,
+	): value is EncryptionManifestState {
+		return ENCRYPTION_MANIFEST_STATES.includes(
+			value as EncryptionManifestState,
+		);
 	}
 
 	private isNotFoundError(e: unknown): boolean {
 		return e instanceof YandexApiError && e.status === 404;
+	}
+}
+
+/**
+ * Thrown by {@link IndexManager.saveRemoteIndex} when the remote index resource
+ * changed on Yandex Disk between the load and the save of the current sync
+ * run. Callers should abort, reload the remote index, and re-resolve
+ * operations instead of overwriting the newer remote index.
+ */
+export class RemoteIndexConcurrentModificationError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RemoteIndexConcurrentModificationError";
 	}
 }

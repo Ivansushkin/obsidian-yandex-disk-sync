@@ -2,7 +2,13 @@
  * Adapter for working with Obsidian Vault files
  */
 
-import { App, TFile, TFolder, Vault } from "obsidian";
+import {
+	App,
+	TFile,
+	TFolder,
+	Vault,
+	normalizePath as obsidianNormalize,
+} from "obsidian";
 import type { FileMetadata, YandexDiskSyncSettings } from "../types";
 import { computeSha256 } from "../utils/hash-utils";
 import {
@@ -45,22 +51,22 @@ export class VaultAdapter {
 
 		logger.debug(`Total files in vault: ${allFiles.length}`);
 		logger.debug(`Config dir: ${configDir}`);
-		logger.debug(`Sync patterns: ${JSON.stringify(this.settings.syncPatterns)}`);
-		logger.debug(`Exclude patterns: ${JSON.stringify(this.settings.excludePatterns)}`);
+		logger.debug(
+			`Sync patterns: ${JSON.stringify(this.settings.syncPatterns)}`,
+		);
+		logger.debug(
+			`Exclude patterns: ${JSON.stringify(this.settings.excludePatterns)}`,
+		);
 		logger.debug(`Sync .obsidian: ${this.settings.syncDotObsidian}`);
 
 		const syncableFiles = allFiles.filter((file) => {
-			const shouldSync = shouldSyncFile(
+			return shouldSyncFile(
 				file.path,
 				this.settings.syncPatterns,
 				this.settings.excludePatterns,
 				this.settings.syncDotObsidian,
-				configDir
+				configDir,
 			);
-			if (!shouldSync) {
-				logger.debug(`Excluded file: ${file.path}`);
-			}
-			return shouldSync;
 		});
 
 		logger.debug(`Files for synchronization: ${syncableFiles.length}`);
@@ -76,9 +82,8 @@ export class VaultAdapter {
 			this.settings.syncPatterns,
 			this.settings.excludePatterns,
 			this.settings.syncDotObsidian,
-			this.app.vault.configDir
+			this.app.vault.configDir,
 		);
-		logger.debug(`[VaultAdapter] File ${path} is eligible for sync: ${result}`);
 		return result;
 	}
 
@@ -87,7 +92,7 @@ export class VaultAdapter {
 	 */
 	getFile(path: string): TFile | null {
 		const abstractFile = this.vault.getAbstractFileByPath(
-			normalizePath(path)
+			normalizePath(path),
 		);
 		if (abstractFile instanceof TFile) {
 			return abstractFile;
@@ -107,7 +112,7 @@ export class VaultAdapter {
 	 */
 	getFolder(path: string): TFolder | null {
 		const abstractFile = this.vault.getAbstractFileByPath(
-			normalizePath(path)
+			normalizePath(path),
 		);
 		if (abstractFile instanceof TFolder) {
 			return abstractFile;
@@ -149,7 +154,7 @@ export class VaultAdapter {
 	 */
 	async writeFile(
 		path: string,
-		content: ArrayBuffer | string
+		content: ArrayBuffer | string,
 	): Promise<void> {
 		const normalizedPath = normalizePath(path);
 
@@ -246,6 +251,115 @@ export class VaultAdapter {
 	}
 
 	/**
+	 * Walk up from a deleted file's directory and trash each ancestor folder
+	 * that has become completely empty (no files and no subfolders). Stops at
+	 * the first non-empty ancestor, at the vault root, or at the Obsidian
+	 * config directory. Only folders that contain nothing are removed, so a
+	 * folder holding local-only or excluded files is never touched. Trashed
+	 * folders are recoverable from the system trash. Mirrors the remote
+	 * {@link SyncEngine.pruneRemoteFolders} behavior so the local and remote
+	 * folder trees stay consistent after deletions.
+	 */
+	async pruneEmptyLocalAncestors(filePath: string): Promise<void> {
+		const configDir = this.app.vault.configDir;
+		let dir = getDirectory(normalizePath(filePath));
+		while (dir) {
+			if (dir === configDir) break;
+			const folder = this.getFolder(dir);
+			if (!folder) break;
+			if (folder.children.length > 0) break;
+			try {
+				await this.app.fileManager.trashFile(folder);
+				logger.debug(`Pruned empty local folder: ${dir}`);
+			} catch (e) {
+				logger.warn(`Failed to prune empty local folder ${dir}:`, {
+					error: e,
+				});
+				break;
+			}
+			dir = getDirectory(dir);
+		}
+	}
+
+	/**
+	 * Save a recoverable backup copy of the given content under the plugin's
+	 * data folder inside the Obsidian config directory (`.obsidian/plugins`),
+	 * which is excluded from synchronization by default. Used before a download
+	 * overwrites a local file whose content diverged from the last synced state
+	 * (e.g. legacy mixed-clock conflict resolution, or a force-sync from
+	 * remote), so unsaved local edits are never silently lost. The backup is
+	 * flattened into a single file with a timestamp to avoid nested folder
+	 * creation and to keep it out of the sync scope.
+	 */
+	async backupOverwrittenFile(
+		originalPath: string,
+		content: ArrayBuffer,
+	): Promise<string | null> {
+		try {
+			const configDir = this.app.vault.configDir;
+			const ts = new Date()
+				.toISOString()
+				.replace(/[:.]/g, "-")
+				.slice(0, 19);
+			const safeName = originalPath.replace(/[\\/]+/g, "__");
+			const backupName = `${safeName}_${ts}`;
+			const backupPath = obsidianNormalize(
+				`${configDir}/plugins/yandex-disk-sync/overwritten/${backupName}`,
+			);
+			const backupDir = getDirectory(backupPath);
+			if (backupDir && !this.folderExists(backupDir)) {
+				await this.createFolderRecursive(backupDir);
+			}
+			await this.vault.createBinary(backupPath, content);
+			logger.info(`Backed up overwritten local file to: ${backupPath}`);
+			return backupPath;
+		} catch (e) {
+			logger.warn(`Failed to back up overwritten file ${originalPath}:`, {
+				error: e,
+			});
+			return null;
+		}
+	}
+
+	/**
+	 * Remove backup files under `overwritten/` older than `maxAgeDays`. Called
+	 * once at plugin load to keep the backup directory from growing without
+	 * bound. Each backup is trashed (recoverable) and counted. Errors per-file
+	 * are logged and skipped so one bad file doesn't abort the whole sweep.
+	 */
+	async cleanupOldBackups(maxAgeDays = 30): Promise<number> {
+		const configDir = this.app.vault.configDir;
+		const backupDir = obsidianNormalize(
+			`${configDir}/plugins/yandex-disk-sync/overwritten`,
+		);
+		const folder = this.getFolder(backupDir);
+		if (!folder) return 0;
+
+		const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+		let removed = 0;
+		for (const child of folder.children) {
+			if (!(child instanceof TFile)) continue;
+			if (child.stat.mtime < cutoff) {
+				try {
+					await this.app.fileManager.trashFile(child);
+					removed++;
+				} catch (e) {
+					logger.warn(
+						`Failed to remove stale backup ${child.path}:`,
+						{ error: e },
+					);
+				}
+			}
+		}
+		if (removed > 0) {
+			logger.info(
+				`Cleaned up ${removed} stale overwritten-file backup(s) older than ${maxAgeDays}d`,
+			);
+		}
+		return removed;
+	}
+
+	/**
 	 * Get file metadata
 	 */
 	async getFileMetadata(path: string): Promise<FileMetadata | null> {
@@ -290,10 +404,9 @@ export class VaultAdapter {
 					},
 				};
 			} catch (e) {
-				logger.warn(
-					`Failed to get file metadata: ${file.path}`,
-					{ error: e }
-				);
+				logger.warn(`Failed to get file metadata: ${file.path}`, {
+					error: e,
+				});
 				return null;
 			}
 		});

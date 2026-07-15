@@ -327,6 +327,23 @@ export class YandexDiskClient {
 	}
 
 	/**
+	 * Check whether a remote folder is empty (no child resources of any kind).
+	 * The path is encrypted segment-wise under encryption so the real remote
+	 * folder is inspected. Returns true when the folder does not exist or has
+	 * no children. Used by the sync engine before pruning a folder that the
+	 * in-memory index believes to be empty, to guard against a stale index
+	 * (e.g. written by an older plugin version) wrongly claiming emptiness
+	 * and causing the folder's actually-present files to be deleted.
+	 */
+	async isFolderEmpty(remotePath: string): Promise<boolean> {
+		const target = await this.encryptFilePath(remotePath);
+		const resource = await this.getResource(target, 1000, 0, true);
+		if (!resource) return true;
+		const items = resource._embedded?.items ?? [];
+		return items.length === 0;
+	}
+
+	/**
 	 * Get upload link for file
 	 */
 	async getUploadLink(
@@ -346,6 +363,14 @@ export class YandexDiskClient {
 	/**
 	 * Upload file to Yandex Disk.
 	 * When `raw` is true, skips content and path encryption (for metadata files).
+	 *
+	 * When `skipFolderCheck` is true the caller asserts that the parent folder
+	 * already exists (preflight ensured it). If the upload then fails anyway —
+	 * most commonly because another concurrent sync pruned that folder in the
+	 * meantime — we recreate the parent folder and retry the upload once,
+	 * instead of failing the operation until the next full sync. Only 404/409
+	 * errors trigger the retry; other failures (auth, quota, network, 5xx) are
+	 * re-thrown immediately so the real cause isn't masked as a missing folder.
 	 */
 	async uploadFile(
 		remotePath: string,
@@ -356,18 +381,66 @@ export class YandexDiskClient {
 		// Ensure parent folder exists (if not skipped) — derive the parent from
 		// the encrypted target path so encrypted folder segments are created.
 		if (!skipFolderCheck) {
-			const encryptedPath = raw
-				? remotePath
-				: await this.encryptFilePath(remotePath);
-			const parentPath = encryptedPath.substring(
-				0,
-				encryptedPath.lastIndexOf("/")
-			);
-			if (parentPath) {
-				await this.createFolderRecursive(parentPath);
-			}
+			await this.ensureUploadParent(remotePath, raw);
 		}
 
+		try {
+			await this.putFile(remotePath, content, raw);
+			logger.debug(`Uploaded file: ${remotePath}`);
+			return;
+		} catch (e) {
+			if (!skipFolderCheck) throw e;
+			// Only retry when the failure is consistent with a missing/vanished
+			// parent folder (404 not found or 409 conflict). Other errors
+			// (auth, quota, network, 5xx) are not caused by a missing folder
+			// and would just waste an extra upload attempt while masking the
+			// real cause.
+			if (
+				!(e instanceof YandexApiError) ||
+				(e.status !== 404 && e.status !== 409)
+			) {
+				throw e;
+			}
+			// The preflight-created parent may have been pruned between preflight
+			// and this upload (e.g. another device's fullSync removed the last
+			// file in that folder and pruned the empty folder). Recreate the
+			// parent and retry once.
+			logger.warn(
+				`Upload failed for ${remotePath} (skipFolderCheck); recreating parent and retrying once:`,
+				{ error: e }
+			);
+			await this.ensureUploadParent(remotePath, raw);
+			await this.putFile(remotePath, content, raw);
+			logger.debug(`Uploaded file after folder retry: ${remotePath}`);
+		}
+	}
+
+	/**
+	 * Ensure the parent folder of the given target path exists, deriving the
+	 * parent from the (optionally encrypted) target path.
+	 */
+	private async ensureUploadParent(remotePath: string, raw: boolean): Promise<void> {
+		const encryptedPath = raw
+			? remotePath
+			: await this.encryptFilePath(remotePath);
+		const parentPath = encryptedPath.substring(
+			0,
+			encryptedPath.lastIndexOf("/")
+		);
+		if (parentPath) {
+			await this.createFolderRecursive(parentPath);
+		}
+	}
+
+	/**
+	 * Encrypt (unless raw) and PUT the file content to Yandex Disk via the
+	 * upload link. Does not perform any folder checks.
+	 */
+	private async putFile(
+		remotePath: string,
+		content: ArrayBuffer | string,
+		raw: boolean
+	): Promise<void> {
 		const bytes =
 			typeof content === "string"
 				? new TextEncoder().encode(content)
@@ -380,16 +453,12 @@ export class YandexDiskClient {
 		// Get upload link with optionally encrypted path
 		const uploadLink = await this.getUploadLink(remotePath, true, raw);
 
-		// Upload file
-		logger.debug(`Uploading file directly: ${remotePath}`);
 		await requestUrl({
 			url: uploadLink.href,
 			method: "PUT",
 			body: bodyContent,
 			throw: true,
 		});
-
-		logger.debug(`Uploaded file: ${remotePath}`);
 	}
 
 	/**

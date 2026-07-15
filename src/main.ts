@@ -80,8 +80,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Initialize i18n service
 		initI18n();
 
-		logger.info("Loading Yandex Disk Sync plugin...");
-
 		// Load settings
 		await this.loadSettings();
 
@@ -167,7 +165,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.indexManager = new IndexManager(
 			this.yandexClient,
 			this.vaultAdapter,
-			this.settings
+			this.settings,
 		);
 
 		// Create sync engine
@@ -175,7 +173,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.yandexClient,
 			this.vaultAdapter,
 			this.indexManager,
-			this.settings
+			this.settings,
 		);
 
 		// Set callback for saving local index after auto-sync operations
@@ -189,14 +187,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const ready = await this.ensureEncryptionReady({ prompt: true });
 			return ready
 				? null
-				: this.encryptionBlockReason ?? t("notice.encryption_password_required");
+				: (this.encryptionBlockReason ??
+						t("notice.encryption_password_required"));
 		});
 
 		// Create file watcher
 		this.fileWatcher = new FileWatcher(
 			this.app,
 			this.syncEngine,
-			this.settings
+			this.settings,
 		);
 
 		// Create sync scheduler
@@ -207,9 +206,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.yandexClient,
 			this.vaultAdapter,
 			this.indexManager,
-			this.settings
+			this.settings,
 		);
-
 	}
 
 	/**
@@ -229,7 +227,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			t("command.sync_now"),
 			() => {
 				void this.runFullSync();
-			}
+			},
 		);
 		button.addClass("yandex-sync-sidebar-button");
 		this.sidebarButton = button;
@@ -308,7 +306,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.lastSyncStats = data.lastSyncStats;
 		}
 
-	// Subscribe to sync engine events to pause/resume file watcher
+		// Sweep stale overwritten-file backups so the data folder doesn't grow
+		// without bound. Non-critical: log and ignore failures so a backup
+		// cleanup problem never blocks sync startup.
+		try {
+			await this.vaultAdapter.cleanupOldBackups();
+		} catch (e) {
+			logger.warn("Overwritten-file backup cleanup failed:", {
+				error: e,
+			});
+		}
+
+		// Subscribe to sync engine events to pause/resume file watcher
 		this.syncEngine.onSyncPause(() => {
 			this.fileWatcher.pauseForSync();
 		});
@@ -334,7 +343,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private async needsInitialSync(): Promise<boolean> {
 		try {
 			// Check whether a remote index exists
-			const remoteIndexExists = await this.indexManager.remoteIndexExists();
+			const remoteIndexExists =
+				await this.indexManager.remoteIndexExists();
 			if (remoteIndexExists) {
 				// Existing remote index means this is not the first sync
 				logger.info("Remote index exists, skipping initial sync");
@@ -419,10 +429,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 			if (result.success) {
 				new Notice(
-					t("notice.sync_completed", { successful: result.uploaded + result.downloaded + result.deleted })
+					t("notice.sync_completed", {
+						successful:
+							result.uploaded +
+							result.downloaded +
+							result.deleted,
+					}),
 				);
 			} else {
-				new Notice(t("notice.sync_error", { errors: result.errors.length }));
+				new Notice(
+					t("notice.sync_error", { errors: result.errors.length }),
+				);
 			}
 		} catch (e) {
 			logger.error("Error during initial synchronization:", { error: e });
@@ -463,10 +480,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 			if (result.success) {
 				new Notice(
-					t("notice.sync_completed", { successful: result.uploaded + result.downloaded + result.deleted })
+					t("notice.sync_completed", {
+						successful:
+							result.uploaded +
+							result.downloaded +
+							result.deleted,
+					}),
 				);
 			} else {
-				new Notice(t("notice.sync_error", { errors: result.errors.length }));
+				new Notice(
+					t("notice.sync_error", { errors: result.errors.length }),
+				);
 			}
 		} catch (e) {
 			logger.error("Sync error:", { error: e });
@@ -478,7 +502,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Show confirm modal for force sync operation
 	 */
 	private confirmForceSync(
-		direction: "from_local" | "from_remote"
+		direction: "from_local" | "from_remote",
 	): Promise<boolean> {
 		return new Promise((resolve) => {
 			new ForceSyncModal(
@@ -487,7 +511,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				async () => await this.createBackup(),
 				(action) => {
 					resolve(action === "proceed");
-				}
+				},
 			).open();
 		});
 	}
@@ -509,7 +533,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return;
 		}
 
-		const notice = new Notice(t("notice.force_sync_from_local_started"), 600000);
+		const notice = new Notice(
+			t("notice.force_sync_from_local_started"),
+			600000,
+		);
 
 		try {
 			const result = await this.syncEngine.forceSyncFromLocal();
@@ -536,11 +563,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							result.uploaded +
 							result.downloaded +
 							result.deleted,
-					})
+					}),
 				);
 			} else {
 				new Notice(
-					t("notice.sync_error", { errors: result.errors.length })
+					t("notice.sync_error", { errors: result.errors.length }),
 				);
 			}
 		} catch (e) {
@@ -567,7 +594,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return;
 		}
 
-		const notice = new Notice(t("notice.force_sync_from_remote_started"), 600000);
+		const notice = new Notice(
+			t("notice.force_sync_from_remote_started"),
+			600000,
+		);
 
 		try {
 			const result = await this.syncEngine.forceSyncFromRemote();
@@ -594,11 +624,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							result.uploaded +
 							result.downloaded +
 							result.deleted,
-					})
+					}),
 				);
 			} else {
 				new Notice(
-					t("notice.sync_error", { errors: result.errors.length })
+					t("notice.sync_error", { errors: result.errors.length }),
 				);
 			}
 		} catch (e) {
@@ -613,10 +643,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private async startSync(): Promise<void> {
 		logger.info("[Main] Starting regular synchronization");
-		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
-			logger.warn("[Main] Synchronization blocked by encryption state");
-			return;
-		}
 
 		// Start file watcher
 		logger.info("[Main] Starting file watcher");
@@ -654,22 +680,30 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Migrate legacy field name `encryptedPassword` -> `encryptionPassword`.
 		const legacySettings = data?.settings as
-			| (Partial<YandexDiskSyncSettings> & { encryptedPassword?: string | null })
+			| (Partial<YandexDiskSyncSettings> & {
+					encryptedPassword?: string | null;
+			  })
 			| undefined;
-		if (legacySettings?.encryptedPassword && !this.settings.encryptionPassword) {
+		if (
+			legacySettings?.encryptedPassword &&
+			!this.settings.encryptionPassword
+		) {
 			this.settings.encryptionPassword = legacySettings.encryptedPassword;
 		}
 
 		// Automatically determine path with vault name
 		const vaultName = this.app.vault.getName();
 		const saved = data?.settings;
-		
+
 		// Apply automatic path determination if:
 		// - settings were not saved before, or
 		// - path is not set, or
 		// - path equals the default value
-		if (!saved || !this.settings.remotePath || 
-		    this.settings.remotePath === DEFAULT_SETTINGS.remotePath) {
+		if (
+			!saved ||
+			!this.settings.remotePath ||
+			this.settings.remotePath === DEFAULT_SETTINGS.remotePath
+		) {
 			this.settings.remotePath = `${DEFAULT_SETTINGS.remotePath}/${vaultName}`;
 			// Save updated settings
 			await this.saveSettings();
@@ -734,9 +768,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private async initEncryption(): Promise<void> {
 		if (
-			!this.settings.enableEncryption
-			|| !this.settings.encryptionSalt
-			|| !this.settings.encryptionPassword
+			!this.settings.enableEncryption ||
+			!this.settings.encryptionSalt ||
+			!this.settings.encryptionPassword
 		) {
 			this.yandexClient.setEncryptionService(null);
 			return;
@@ -744,7 +778,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		try {
 			const salt = EncryptionService.base64ToBytes(
-				this.settings.encryptionSalt
+				this.settings.encryptionSalt,
 			);
 			const service = new EncryptionService(salt);
 			await service.initializeKey(this.settings.encryptionPassword);
@@ -764,7 +798,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Enable encryption or connect to an already encrypted remote vault.
 	 */
 	async enableEncryption(password: string): Promise<void> {
-		const remoteManifest = await this.indexManager.downloadEncryptionManifest();
+		const remoteManifest =
+			await this.indexManager.downloadEncryptionManifest();
 		if (remoteManifest) {
 			await this.connectToRemoteEncryption(password, remoteManifest);
 			return;
@@ -786,7 +821,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.saveSettings();
 
 		await this.indexManager.uploadEncryptionManifest(
-			await this.createEncryptionManifest(service, saltBase64, "enabling", revision)
+			await this.createEncryptionManifest(
+				service,
+				saltBase64,
+				"enabling",
+				revision,
+			),
 		);
 
 		logger.info("Re-uploading all files with encryption...");
@@ -795,13 +835,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			skipRemoteDeletes: true,
 		});
 		if (!result.success) {
-			throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
+			throw new Error(
+				t("notice.encryption_sync_failed", {
+					errors: result.errors.length,
+				}),
+			);
 		}
 
 		await this.deleteRemoteRawPaths(oldRawPaths);
 		await this.deleteRemoteRawFolders(oldRawPaths);
 		await this.indexManager.uploadEncryptionManifest(
-			await this.createEncryptionManifest(service, saltBase64, "enabled", revision)
+			await this.createEncryptionManifest(
+				service,
+				saltBase64,
+				"enabled",
+				revision,
+			),
 		);
 		this.setEncryptionBlock(null);
 		logger.info("Encryption enabled");
@@ -816,7 +865,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 *
 	 * When `reuploadPlaintext` is false, only clears local encryption settings.
 	 */
-	async disableEncryption(options?: { reuploadPlaintext?: boolean }): Promise<{ hadErrors: boolean }> {
+	async disableEncryption(options?: {
+		reuploadPlaintext?: boolean;
+	}): Promise<{ hadErrors: boolean }> {
 		let partialErrors = false;
 
 		if (options?.reuploadPlaintext) {
@@ -831,11 +882,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							this.encryptionService,
 							this.settings.encryptionSalt,
 							"disabling",
-							revision
-						)
+							revision,
+						),
 					);
 				} catch (e) {
-					logger.warn("Failed to upload disabling manifest:", { error: e });
+					logger.warn("Failed to upload disabling manifest:", {
+						error: e,
+					});
 					partialErrors = true;
 				}
 			}
@@ -849,7 +902,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				skipRemoteDeletes: true,
 			});
 			if (!result.success) {
-				logger.warn(`Disable re-upload completed with ${result.errors.length} errors`);
+				logger.warn(
+					`Disable re-upload completed with ${result.errors.length} errors`,
+				);
 				partialErrors = true;
 			}
 
@@ -872,7 +927,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		try {
 			await this.indexManager.deleteEncryptionManifest();
 		} catch (e) {
-			logger.warn("Failed to delete encryption manifest from remote:", { error: e });
+			logger.warn("Failed to delete encryption manifest from remote:", {
+				error: e,
+			});
 			partialErrors = true;
 		}
 
@@ -906,7 +963,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Rotate the encryption password and re-upload all files with a new key.
 	 */
 	async rotateEncryptionPassword(newPassword: string): Promise<void> {
-		const currentManifest = await this.indexManager.downloadEncryptionManifest();
+		const currentManifest =
+			await this.indexManager.downloadEncryptionManifest();
 		if (currentManifest && currentManifest.state !== "enabled") {
 			throw new Error(t("notice.encryption_remote_busy"));
 		}
@@ -917,15 +975,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const oldRawPaths = await this.indexManager.getRemoteRawFilePaths();
 		const saltBytes = EncryptionService.generateSalt();
 		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
-		const revision = Math.max(
-			currentManifest?.revision ?? 1,
-			this.settings.encryptionRevision ?? 1
-		) + 1;
+		const revision =
+			Math.max(
+				currentManifest?.revision ?? 1,
+				this.settings.encryptionRevision ?? 1,
+			) + 1;
 		const service = new EncryptionService(saltBytes);
 		await service.initializeKey(newPassword);
 
 		await this.indexManager.uploadEncryptionManifest(
-			await this.createEncryptionManifest(service, saltBase64, "rotating", revision)
+			await this.createEncryptionManifest(
+				service,
+				saltBase64,
+				"rotating",
+				revision,
+			),
 		);
 
 		this.encryptionService = service;
@@ -936,19 +1000,30 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.settings.encryptionRevision = revision;
 		await this.saveSettings();
 
-		logger.info("Re-uploading all files after encryption password rotation...");
+		logger.info(
+			"Re-uploading all files after encryption password rotation...",
+		);
 		const result = await this.syncEngine.forceSyncFromLocal({
 			skipEncryptionGuard: true,
 			skipRemoteDeletes: true,
 		});
 		if (!result.success) {
-			throw new Error(t("notice.encryption_sync_failed", { errors: result.errors.length }));
+			throw new Error(
+				t("notice.encryption_sync_failed", {
+					errors: result.errors.length,
+				}),
+			);
 		}
 
 		await this.deleteRemoteRawPaths(oldRawPaths);
 		await this.deleteRemoteRawFolders(oldRawPaths);
 		await this.indexManager.uploadEncryptionManifest(
-			await this.createEncryptionManifest(service, saltBase64, "enabled", revision)
+			await this.createEncryptionManifest(
+				service,
+				saltBase64,
+				"enabled",
+				revision,
+			),
 		);
 		this.setEncryptionBlock(null);
 		logger.info("Encryption password rotated");
@@ -966,9 +1041,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	async connectToRemoteEncryption(
 		password: string,
-		manifest?: RemoteEncryptionManifest
+		manifest?: RemoteEncryptionManifest,
 	): Promise<void> {
-		const remoteManifest = manifest ?? await this.indexManager.downloadEncryptionManifest();
+		const remoteManifest =
+			manifest ?? (await this.indexManager.downloadEncryptionManifest());
 		if (!remoteManifest) {
 			throw new Error(t("notice.encryption_remote_missing"));
 		}
@@ -995,7 +1071,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.indexManager.loadRemoteIndex();
 			this.indexManager.seedLocalIndexFromRemote();
 		} catch (e) {
-			logger.warn("Could not seed local index from remote after connecting:", { error: e });
+			logger.warn(
+				"Could not seed local index from remote after connecting:",
+				{ error: e },
+			);
 		}
 
 		await this.saveSettings();
@@ -1006,14 +1085,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Ensure local encryption settings match the remote manifest before sync.
 	 */
-	private async ensureEncryptionReady(options: EncryptionReadyOptions): Promise<boolean> {
-
+	private async ensureEncryptionReady(
+		options: EncryptionReadyOptions,
+	): Promise<boolean> {
 		try {
-			const manifest = await this.indexManager.downloadEncryptionManifest();
+			const manifest =
+				await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
 				if (this.settings.enableEncryption) {
 					// Encryption was disabled on another device — auto-sync local state
-					logger.info("Remote encryption manifest gone; auto-disabling local encryption");
+					logger.info(
+						"Remote encryption manifest gone; auto-disabling local encryption",
+					);
 					await this.clearLocalEncryptionState();
 					new Notice(t("notice.encryption_disabled_remotely"), 10000);
 					this.encryptionStateChangeCallback?.();
@@ -1027,15 +1110,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 
 			const hasLocalEncryption = Boolean(
-				this.settings.enableEncryption
-				&& this.settings.encryptionSalt
-				&& this.settings.encryptionPassword
-				&& this.encryptionService
+				this.settings.enableEncryption &&
+				this.settings.encryptionSalt &&
+				this.settings.encryptionPassword &&
+				this.encryptionService,
 			);
 			const localRevision = this.settings.encryptionRevision ?? 1;
-			const matchesRemote = hasLocalEncryption
-				&& this.settings.encryptionSalt === manifest.salt
-				&& (manifest.version === 1 || localRevision === manifest.revision);
+			const matchesRemote =
+				hasLocalEncryption &&
+				this.settings.encryptionSalt === manifest.salt &&
+				(manifest.version === 1 || localRevision === manifest.revision);
 
 			if (!matchesRemote) {
 				const reason = hasLocalEncryption
@@ -1047,21 +1131,30 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				}
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
-					hasLocalEncryption ? "rotated" : "connect"
+					hasLocalEncryption ? "rotated" : "connect",
 				);
 			}
 
 			if (manifest.version === 2 && this.encryptionService) {
 				try {
-					if (!(await this.encryptionService.verifyVerifier(manifest.verifier))) {
+					if (
+						!(await this.encryptionService.verifyVerifier(
+							manifest.verifier,
+						))
+					) {
 						throw new Error(t("notice.encryption_wrong_password"));
 					}
 				} catch {
-					this.setEncryptionBlock(t("notice.encryption_password_changed_remote"));
+					this.setEncryptionBlock(
+						t("notice.encryption_password_changed_remote"),
+					);
 					if (!options.prompt) {
 						return false;
 					}
-					return await this.promptForRemoteEncryptionPassword(manifest, "rotated");
+					return await this.promptForRemoteEncryptionPassword(
+						manifest,
+						"rotated",
+					);
 				}
 			}
 
@@ -1069,40 +1162,46 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return true;
 		} catch (e) {
 			const message = e instanceof Error ? e.message : String(e);
-			logger.warn("Error checking remote encryption state:", { error: e });
-			this.setEncryptionBlock(t("notice.encryption_state_check_failed", { error: message }));
+			logger.warn("Error checking remote encryption state:", {
+				error: e,
+			});
+			this.setEncryptionBlock(
+				t("notice.encryption_state_check_failed", { error: message }),
+			);
 			return false;
 		}
 	}
 
 	private async promptForRemoteEncryptionPassword(
 		manifest: RemoteEncryptionManifest,
-		mode: "connect" | "rotated"
+		mode: "connect" | "rotated",
 	): Promise<boolean> {
 		if (this.encryptionPromptPromise) {
 			return await this.encryptionPromptPromise;
 		}
 
-		this.encryptionPromptPromise = this.promptForRemoteEncryptionPasswordOnce(
-			manifest,
-			mode
-		).finally(() => {
-			this.encryptionPromptPromise = null;
-		});
+		this.encryptionPromptPromise =
+			this.promptForRemoteEncryptionPasswordOnce(manifest, mode).finally(
+				() => {
+					this.encryptionPromptPromise = null;
+				},
+			);
 
 		return await this.encryptionPromptPromise;
 	}
 
 	private async promptForRemoteEncryptionPasswordOnce(
 		manifest: RemoteEncryptionManifest,
-		mode: "connect" | "rotated"
+		mode: "connect" | "rotated",
 	): Promise<boolean> {
-		const title = mode === "connect"
-			? t("modal.encryption_connect_title")
-			: t("modal.encryption_rotated_title");
-		const body = mode === "connect"
-			? t("modal.encryption_connect_desc")
-			: t("modal.encryption_rotated_desc");
+		const title =
+			mode === "connect"
+				? t("modal.encryption_connect_title")
+				: t("modal.encryption_rotated_title");
+		const body =
+			mode === "connect"
+				? t("modal.encryption_connect_desc")
+				: t("modal.encryption_rotated_desc");
 
 		const password = await new Promise<string | null>((resolve) => {
 			new ConnectEncryptedVaultModal(
@@ -1110,7 +1209,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				resolve,
 				title,
 				body,
-				t("modal.encryption_connect_button")
+				t("modal.encryption_connect_button"),
 			).open();
 		});
 		if (!password) {
@@ -1135,7 +1234,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private async verifyRemoteEncryptionPassword(
 		service: EncryptionService,
-		manifest: RemoteEncryptionManifest
+		manifest: RemoteEncryptionManifest,
 	): Promise<void> {
 		if (manifest.version === 2) {
 			try {
@@ -1170,7 +1269,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		try {
-			const salt = EncryptionService.base64ToBytes(this.settings.encryptionSalt);
+			const salt = EncryptionService.base64ToBytes(
+				this.settings.encryptionSalt,
+			);
 			const candidate = new EncryptionService(salt);
 			await candidate.initializeKey(password);
 			const verifier = await this.encryptionService.createVerifier();
@@ -1184,7 +1285,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		service: EncryptionService,
 		salt: string,
 		state: EncryptionManifest["state"],
-		revision: number
+		revision: number,
 	): Promise<EncryptionManifest> {
 		return {
 			version: 2,
@@ -1231,7 +1332,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				const remotePath = joinPath(this.settings.remotePath, path);
 				await this.yandexClient.deleteResource(remotePath, false, true);
 			} catch (e) {
-				logger.warn(`Failed to delete old remote file ${path}:`, { error: e });
+				logger.warn(`Failed to delete old remote file ${path}:`, {
+					error: e,
+				});
 			}
 		}
 	}
@@ -1244,7 +1347,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * guaranteed to be empty. Deletes deepest first so children are gone
 	 * before parents are attempted.
 	 */
-	private async deleteRemoteRawFolders(rawFilePaths: string[]): Promise<void> {
+	private async deleteRemoteRawFolders(
+		rawFilePaths: string[],
+	): Promise<void> {
 		if (rawFilePaths.length === 0) return;
 
 		const folders = new Set<string>();
@@ -1257,7 +1362,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (folders.size === 0) return;
 
 		const sorted = Array.from(folders).sort(
-			(a, b) => b.split("/").length - a.split("/").length
+			(a, b) => b.split("/").length - a.split("/").length,
 		);
 
 		logger.info(`Cleaning up ${sorted.length} old remote folders...`);
@@ -1267,7 +1372,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				await this.yandexClient.deleteResource(remotePath, false, true);
 				logger.debug(`Deleted old remote folder: ${folder}`);
 			} catch (e) {
-				logger.warn(`Failed to delete old remote folder ${folder}:`, { error: e });
+				logger.warn(`Failed to delete old remote folder ${folder}:`, {
+					error: e,
+				});
 			}
 		}
 	}
@@ -1283,7 +1390,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		try {
 			const valid = await this.yandexClient.checkToken();
 			if (valid) {
-				return { success: true, message: t("notice.connection_test_success") };
+				return {
+					success: true,
+					message: t("notice.connection_test_success"),
+				};
 			} else {
 				return { success: false, message: t("notice.token_invalid") };
 			}
@@ -1295,7 +1405,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Create backup of synchronized files
 	 */
-	async createBackup(): Promise<{ success: boolean; backupName?: string; error?: string }> {
+	async createBackup(): Promise<{
+		success: boolean;
+		backupName?: string;
+		error?: string;
+	}> {
 		if (!this.settings.yandexTokenSecret) {
 			return { success: false, error: t("notice.token_missing") };
 		}
@@ -1306,13 +1420,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const result = await this.backupManager.createBackup();
 
 			if (result.success && result.backupName) {
-				new Notice(t("notice.backup_completed", { name: result.backupName }));
+				new Notice(
+					t("notice.backup_completed", { name: result.backupName }),
+				);
 				return { success: true, backupName: result.backupName };
 			} else {
 				return { success: false, error: result.error };
 			}
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
+			const errorMessage =
+				error instanceof Error ? error.message : String(error);
 			logger.error("Backup creation failed:", { error });
 			return { success: false, error: errorMessage };
 		}

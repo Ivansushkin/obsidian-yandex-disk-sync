@@ -165,6 +165,17 @@ export interface FileMetadata {
 	mtime: number;
 	/** Last sync time for this file */
 	syncedAt: number;
+	/**
+	 * Server-side modification time of the remote resource (Yandex Disk
+	 * `resource.modified`). Stored separately from `mtime` (which is the local
+	 * filesystem mtime) so remote-side change detection can compare server
+	 * timestamps against server timestamps, avoiding clock skew between devices
+	 * and the different semantics of local vs server mtime.
+	 * undefined for entries written by older plugin versions or rebuilt from
+	 * a fresh local index; consumers must fall back to the legacy mixed-clock
+	 * comparison logic in that case.
+	 */
+	remoteMtime?: number;
 	/** Soft delete flag */
 	deleted?: boolean;
 	/** Deletion time (timestamp) */
@@ -284,6 +295,8 @@ export interface YandexResource {
 	modified: string;
 	size?: number;
 	mime_type?: string;
+	/** MD5 hash of the resource content (Yandex Disk, present for files) */
+	md5?: string;
 	sha256?: string;
 	resource_id?: string;
 	revision?: number;
