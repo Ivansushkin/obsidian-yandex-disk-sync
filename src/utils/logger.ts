@@ -89,11 +89,33 @@ function sanitizeContext(context: unknown): unknown {
 	}
 
 	if (typeof context === "object") {
+		// Error and DOMException have non-enumerable properties that
+		// Object.entries() misses, producing "{}" in logs. Extract the
+		// useful fields explicitly so diagnostics show the actual error.
+		if (context instanceof Error) {
+			const result: Record<string, unknown> = {
+				name: context.name,
+				message: context.message,
+			};
+			if (context.stack) {
+				result.stack = context.stack;
+			}
+			const code = (context as { code?: unknown }).code;
+			if (code !== undefined) {
+				result.code = code;
+			}
+			return result;
+		}
 		const result: Record<string, unknown> = {};
-		for (const [key, value] of Object.entries(context as Record<string, unknown>)) {
+		for (const [key, value] of Object.entries(
+			context as Record<string, unknown>,
+		)) {
 			const lowerKey = key.toLowerCase();
-			if (SENSITIVE_KEYS.some((sensitive) => lowerKey.includes(sensitive))) {
-				result[key] = typeof value === "string" ? maskString(value) : "***";
+			if (
+				SENSITIVE_KEYS.some((sensitive) => lowerKey.includes(sensitive))
+			) {
+				result[key] =
+					typeof value === "string" ? maskString(value) : "***";
 			} else {
 				result[key] = sanitizeContext(value);
 			}
@@ -178,7 +200,7 @@ class Logger {
 	private formatEntry(
 		level: LogLevel,
 		message: string,
-		context?: Record<string, unknown>
+		context?: Record<string, unknown>,
 	): string {
 		const timestamp = formatTimestamp(new Date());
 		let entry = `${timestamp} [${level.toUpperCase()}] ${LOG_PREFIX} ${message}`;
@@ -196,7 +218,7 @@ class Logger {
 	private log(
 		level: LogLevel,
 		message: string,
-		context?: Record<string, unknown>
+		context?: Record<string, unknown>,
 	): void {
 		if (!this.shouldLog(level)) {
 			return;

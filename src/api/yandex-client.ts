@@ -51,6 +51,15 @@ export class YandexDiskClient {
 	}
 
 	/**
+	 * Check whether an encryption service is currently active. Used by callers
+	 * (e.g. `IndexManager.loadRemoteIndex`) to choose the optimal download mode
+	 * without a wasteful fallback round-trip.
+	 */
+	hasEncryptionService(): boolean {
+		return this.encryptionService !== null;
+	}
+
+	/**
 	 * Set the remote base path. Required for segment-wise path encryption:
 	 * the base path itself is never encrypted (it hosts service files and is
 	 * the entry point for traversal), only segments below it are.

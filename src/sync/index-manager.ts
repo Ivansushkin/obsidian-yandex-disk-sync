@@ -128,7 +128,15 @@ export class IndexManager {
 		);
 
 		try {
-			const resource = await this.yandexClient.getResource(indexPath);
+			logger.debug(
+				"[loadRemoteIndex] Fetching resource metadata (raw)...",
+			);
+			const resource = await this.yandexClient.getResource(
+				indexPath,
+				1000,
+				0,
+				true,
+			);
 			if (!resource) {
 				logger.info("Remote index not found, creating new one");
 				this.remoteIndex = createEmptyIndex("");
@@ -143,13 +151,41 @@ export class IndexManager {
 			this.remoteIndexFingerprint =
 				resource.md5 || resource.sha256 || resource.resource_id || null;
 
-			const content = await this.yandexClient.downloadFile(
-				indexPath,
-				true,
+			logger.debug(
+				"[loadRemoteIndex] Downloading index content...",
 			);
-			const decoder = new TextDecoder();
-			const jsonStr = decoder.decode(content);
-			const data = JSON.parse(jsonStr) as Partial<SyncIndex>;
+			// Choose the download mode that matches the expected index format:
+			// when encryption is active the index is stored encrypted (raw=false
+			// decrypts the content); when encryption is inactive the index is
+			// stored as plaintext (raw=true skips decryption). This avoids a
+			// wasteful fallback round-trip in the common case. The fallback
+			// below handles transition/migration scenarios where the index
+			// format does not yet match the expected one.
+			const encActive = this.yandexClient.hasEncryptionService();
+			let content = await this.yandexClient.downloadFile(
+				indexPath,
+				!encActive,
+			);
+			let jsonStr = new TextDecoder().decode(content);
+			logger.debug("[loadRemoteIndex] Parsing JSON...");
+			let data: Partial<SyncIndex>;
+			try {
+				data = JSON.parse(jsonStr) as Partial<SyncIndex>;
+			} catch {
+				// The index format does not match the expectation: either the
+				// index is encrypted but we tried plaintext, or vice-versa
+				// (e.g. encryption was just enabled/disabled and the index
+				// hasn't been rewritten yet). Try the opposite mode.
+				logger.debug(
+					"[loadRemoteIndex] Parse failed, retrying with opposite mode...",
+				);
+				content = await this.yandexClient.downloadFile(
+					indexPath,
+					encActive,
+				);
+				jsonStr = new TextDecoder().decode(content);
+				data = JSON.parse(jsonStr) as Partial<SyncIndex>;
+			}
 
 			if (data.version === CURRENT_INDEX_VERSION || data.version === 1) {
 				this.remoteIndex = {
@@ -200,7 +236,12 @@ export class IndexManager {
 		// of the remote plugin version since it relies on Yandex-provided
 		// content hashes, not any field the plugin itself writes.
 		if (this.remoteIndexFingerprint !== null) {
-			const current = await this.yandexClient.getResource(indexPath);
+			const current = await this.yandexClient.getResource(
+				indexPath,
+				1000,
+				0,
+				true,
+			);
 			if (current) {
 				const currentFingerprint =
 					current.md5 ||
@@ -220,7 +261,14 @@ export class IndexManager {
 			// it or we are in a transition). Proceed to recreate it.
 		}
 
-		await this.yandexClient.uploadFile(indexPath, jsonStr, true, true);
+		// raw=false so that when encryption is active the index content is
+		// encrypted (the index stores plaintext file paths which would leak
+		// the vault structure if uploaded as plaintext). When encryption is
+		// inactive, `encryptContent` returns the bytes unchanged, so
+		// unencrypted vaults still get a plaintext index. The index path
+		// itself stays plaintext because `isProtectedPath` short-circuits
+		// `encryptFilePath`, keeping the file findable by all devices.
+		await this.yandexClient.uploadFile(indexPath, jsonStr, true, false);
 
 		// Re-fetch the resource so we have the authoritative server fingerprint
 		// for the content we just wrote. This lets a subsequent save in the same
@@ -228,7 +276,12 @@ export class IndexManager {
 		// if the fetch fails we clear the fingerprint and lose within-session
 		// detection, but never block the save.
 		try {
-			const written = await this.yandexClient.getResource(indexPath);
+			const written = await this.yandexClient.getResource(
+				indexPath,
+				1000,
+				0,
+				true,
+			);
 			this.remoteIndexFingerprint = written
 				? written.md5 || written.sha256 || written.resource_id || null
 				: null;
@@ -467,6 +520,9 @@ export class IndexManager {
 	async remotePathExists(): Promise<boolean> {
 		const resource = await this.yandexClient.getResource(
 			this.settings.remotePath,
+			1000,
+			0,
+			true,
 		);
 		return resource !== null;
 	}
@@ -479,7 +535,12 @@ export class IndexManager {
 			this.settings.remotePath,
 			REMOTE_INDEX_FILENAME,
 		);
-		const resource = await this.yandexClient.getResource(indexPath);
+		const resource = await this.yandexClient.getResource(
+			indexPath,
+			1000,
+			0,
+			true,
+		);
 		return resource !== null;
 	}
 
