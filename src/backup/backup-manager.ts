@@ -2,16 +2,14 @@
  * Backup manager for creating and managing vault backups
  */
 
-import JSZip from 'jszip';
-import type {
-	YandexDiskSyncSettings,
-	BackupInfo,
-} from '../types';
-import { YandexDiskClient } from '../api/yandex-client';
-import { VaultAdapter } from '../api/vault-adapter';
-import type { IndexManager } from '../sync/index-manager';
-import { joinPath } from '../utils/path-utils';
-import { logger } from '../utils/logger';
+import JSZip from "jszip";
+import type { YandexDiskSyncSettings, BackupInfo } from "../types";
+import { YandexDiskClient, YandexApiError } from "../api/yandex-client";
+import { VaultAdapter } from "../api/vault-adapter";
+import type { IndexManager } from "../sync/index-manager";
+import { joinPath } from "../utils/path-utils";
+import { logger } from "../utils/logger";
+import { t } from "../i18n";
 
 export interface BackupResult {
 	success: boolean;
@@ -34,7 +32,7 @@ export class BackupManager {
 		yandexClient: YandexDiskClient,
 		vaultAdapter: VaultAdapter,
 		indexManager: IndexManager,
-		settings: YandexDiskSyncSettings
+		settings: YandexDiskSyncSettings,
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
@@ -47,7 +45,7 @@ export class BackupManager {
 	 */
 	async createBackup(): Promise<BackupResult> {
 		try {
-			logger.info('Starting backup creation...');
+			logger.info("Starting backup creation...");
 
 			// Get list of files to backup
 			const files = this.vaultAdapter.getAllSyncableFiles();
@@ -58,7 +56,7 @@ export class BackupManager {
 					success: false,
 					fileCount: 0,
 					totalSize: 0,
-					error: 'No files to backup',
+					error: "No files to backup",
 				};
 			}
 
@@ -72,36 +70,51 @@ export class BackupManager {
 					zip.file(file.path, content);
 					totalSize += content.byteLength;
 				} catch (error) {
-					logger.warn(`Failed to read file for backup: ${file.path}`, { error });
+					logger.warn(
+						`Failed to read file for backup: ${file.path}`,
+						{ error },
+					);
 					// Continue with other files
 				}
 			}
 
 			// Generate ZIP content
 			const zipContent = await zip.generateAsync({
-				type: 'arraybuffer',
-				compression: 'DEFLATE',
+				type: "arraybuffer",
+				compression: "DEFLATE",
 				compressionOptions: { level: 6 },
 			});
 
-			// Generate backup filename
-			const backupName = this.formatBackupName();
+			// Generate backup filename. Include `.enc` in the name when
+			// encryption is active so downloadBackup can choose the correct
+			// raw mode without decrypting plaintext or skipping encrypted
+			// content.
+			const backupName = this.formatBackupName(
+				this.yandexClient.hasEncryptionService(),
+			);
 
 			// Upload to Yandex Disk
-			const backupPath = joinPath(this.settings.remotePath, '.backup', backupName);
+			const backupPath = joinPath(
+				this.settings.remotePath,
+				".backup",
+				backupName,
+			);
 			await this.yandexClient.uploadFile(backupPath, zipContent);
 
-		logger.info(`Backup created successfully: ${backupName} (${files.length} files, ${totalSize} bytes)`);
+			logger.info(
+				`Backup created successfully: ${backupName} (${files.length} files, ${totalSize} bytes)`,
+			);
 
-		return {
-			success: true,
-			backupName,
-			fileCount: files.length,
-			totalSize,
-		};
+			return {
+				success: true,
+				backupName,
+				fileCount: files.length,
+				totalSize,
+			};
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
-			logger.error('Backup creation failed:', { error });
+			const errorMessage =
+				error instanceof Error ? error.message : String(error);
+			logger.error("Backup creation failed:", { error });
 
 			return {
 				success: false,
@@ -115,16 +128,17 @@ export class BackupManager {
 	/**
 	 * Format backup filename with current timestamp
 	 */
-	private formatBackupName(): string {
+	private formatBackupName(encrypted: boolean): string {
 		const now = new Date();
 		const year = now.getFullYear();
-		const month = String(now.getMonth() + 1).padStart(2, '0');
-		const day = String(now.getDate()).padStart(2, '0');
-		const hours = String(now.getHours()).padStart(2, '0');
-		const minutes = String(now.getMinutes()).padStart(2, '0');
-		const seconds = String(now.getSeconds()).padStart(2, '0');
+		const month = String(now.getMonth() + 1).padStart(2, "0");
+		const day = String(now.getDate()).padStart(2, "0");
+		const hours = String(now.getHours()).padStart(2, "0");
+		const minutes = String(now.getMinutes()).padStart(2, "0");
+		const seconds = String(now.getSeconds()).padStart(2, "0");
+		const suffix = encrypted ? ".enc" : "";
 
-		return `backup_${year}-${month}-${day}_${hours}-${minutes}-${seconds}.zip`;
+		return `backup_${year}-${month}-${day}_${hours}-${minutes}-${seconds}${suffix}.zip`;
 	}
 
 	/**
@@ -138,8 +152,11 @@ export class BackupManager {
 	 * Parse backup filename to extract creation date
 	 */
 	private parseBackupName(name: string): Date | null {
-		// Format: backup_YYYY-MM-DD_HH-MM-SS.zip
-		const match = name.match(/^backup_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.zip$/);
+		// Matches both `backup_YYYY-MM-DD_HH-MM-SS.zip` (plaintext)
+		// and `backup_YYYY-MM-DD_HH-MM-SS.enc.zip` (encrypted).
+		const match = name.match(
+			/^backup_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:\.enc)?\.zip$/,
+		);
 		if (!match || match.length < 7) {
 			return null;
 		}
@@ -157,7 +174,7 @@ export class BackupManager {
 			parseInt(day, 10),
 			parseInt(hours, 10),
 			parseInt(minutes, 10),
-			parseInt(seconds, 10)
+			parseInt(seconds, 10),
 		);
 
 		return isNaN(date.getTime()) ? null : date;
@@ -168,21 +185,32 @@ export class BackupManager {
 	 */
 	async listBackups(): Promise<BackupInfo[]> {
 		try {
-			const backupFolder = joinPath(this.settings.remotePath, '.backup');
+			const backupFolder = joinPath(this.settings.remotePath, ".backup");
 			logger.info(`Fetching backup list from: ${backupFolder}`);
 
-			const resources = await this.yandexClient.getResourcesRecursive(backupFolder);
+			// raw=true: .backup is a protected path — filenames are always
+			// plaintext timestamps and never need decryption. Skipping
+			// decryptResource avoids unnecessary crypto attempts per file.
+			const resources = await this.yandexClient.getResourcesRecursive(
+				backupFolder,
+				true,
+			);
 			const backups: BackupInfo[] = [];
 
 			for (const resource of resources) {
 				// Only process files with .zip extension
-				if (resource.type !== 'file' || !resource.name.endsWith('.zip')) {
+				if (
+					resource.type !== "file" ||
+					!resource.name.endsWith(".zip")
+				) {
 					continue;
 				}
 
 				const created = this.parseBackupName(resource.name);
 				if (!created) {
-					logger.warn(`Invalid backup filename format: ${resource.name}`);
+					logger.warn(
+						`Invalid backup filename format: ${resource.name}`,
+					);
 					continue;
 				}
 
@@ -200,7 +228,11 @@ export class BackupManager {
 			logger.info(`Found ${backups.length} backups`);
 			return backups;
 		} catch (error) {
-			logger.error('Error listing backups:', { error });
+			if (error instanceof YandexApiError && error.status === 404) {
+				logger.info("Backup folder does not exist yet");
+				return [];
+			}
+			logger.error("Error listing backups:", { error });
 			throw error;
 		}
 	}
@@ -209,13 +241,43 @@ export class BackupManager {
 	 * Download backup file to local device
 	 */
 	async downloadBackup(backupPath: string): Promise<ArrayBuffer> {
+		// Determine the download mode from the filename: `.enc.zip` was
+		// encrypted at creation time and needs decryption (raw=false);
+		// plain `.zip` was stored as plaintext and must be downloaded
+		// raw to avoid a futile decrypt attempt on non-encrypted bytes.
+		const isEncrypted = backupPath.includes(".enc.zip");
 		try {
 			logger.info(`Starting backup download: ${backupPath}`);
-			const content = await this.yandexClient.downloadFile(backupPath);
-			logger.info('Backup downloaded successfully');
+			if (isEncrypted && !this.yandexClient.hasEncryptionService()) {
+				throw new Error(t("notice.backup_encrypted_no_key"));
+			}
+			const content = await this.yandexClient.downloadFile(
+				backupPath,
+				!isEncrypted,
+			);
+			logger.info("Backup downloaded successfully");
 			return content;
 		} catch (error) {
-			logger.error('Error downloading backup:', { error });
+			// If the backup is encrypted and the download attempt was made
+			// (encryption service was active), a decrypt failure likely means
+			// the backup was created with a different key — e.g. before a
+			// password rotation. Surface a clear message.
+			if (
+				isEncrypted &&
+				!(
+					error instanceof Error &&
+					error.message === t("notice.backup_encrypted_no_key")
+				)
+			) {
+				const isCryptoError =
+					error instanceof DOMException ||
+					(error instanceof Error &&
+						/decrypt|crypto|aes|gcm|auth/i.test(error.message));
+				if (isCryptoError) {
+					throw new Error(t("notice.backup_old_key"));
+				}
+			}
+			logger.error("Error downloading backup:", { error });
 			throw error;
 		}
 	}

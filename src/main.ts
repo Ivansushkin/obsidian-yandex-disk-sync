@@ -23,7 +23,11 @@ import { SyncStatusModal, ConfirmModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
 import { BackupManager } from "./backup/backup-manager";
-import { generateDeviceId, joinPath } from "./utils/path-utils";
+import {
+	generateDeviceId,
+	isProtectedPath,
+	joinPath,
+} from "./utils/path-utils";
 import { logger } from "./utils/logger";
 import { initI18n, t } from "./i18n";
 import {
@@ -1251,6 +1255,20 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.yandexClient.setEncryptionService(service);
 		try {
 			await this.indexManager.loadRemoteIndex();
+			// `loadRemoteIndex` may succeed via plaintext fallback even with
+			// a wrong password when the index is not yet encrypted (e.g. the
+			// vault was just created or encryption was freshly disabled).
+			// Try to decrypt an actual remote file to confirm the password
+			// is correct. Skip when the vault is empty (nothing to verify).
+			const remoteIndex = this.indexManager.getRemoteIndex();
+			const testEntry = Object.entries(remoteIndex.files).find(
+				([p, m]) => !m.deleted && !isProtectedPath(p),
+			);
+			if (testEntry) {
+				const [testPath] = testEntry;
+				const remotePath = joinPath(this.settings.remotePath, testPath);
+				await this.yandexClient.downloadFile(remotePath, false);
+			}
 		} catch {
 			throw new Error(t("notice.encryption_wrong_password"));
 		} finally {
@@ -1367,6 +1385,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		logger.info(`Cleaning up ${sorted.length} old remote folders...`);
 		for (const folder of sorted) {
+			if (isProtectedPath(folder)) {
+				logger.debug(
+					`Skipping protected folder during cleanup: ${folder}`,
+				);
+				continue;
+			}
 			try {
 				const remotePath = joinPath(this.settings.remotePath, folder);
 				await this.yandexClient.deleteResource(remotePath, false, true);
