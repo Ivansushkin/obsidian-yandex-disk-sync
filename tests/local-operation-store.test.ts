@@ -50,6 +50,55 @@ test("put mutation retains the pre-upload baseline hash", () => {
 	assert.equal(store.findLatestPutBaselineSha("note.md"), "old");
 });
 
+test("retargeted put preserves FIFO sequence and causal baseline", () => {
+	const store = new LocalOperationStore("device-a");
+	store.loadMutations(undefined, 1);
+	const original = store.enqueueMutation(
+		"put",
+		"A.md",
+		"epoch-a",
+		7,
+		{
+			sha256: "old-content",
+			baselineSha256: "baseline",
+		},
+	);
+
+	const retargeted = store.retargetLatestPut(
+		"A.md",
+		"folder/B.md",
+		"new-content",
+	);
+
+	assert.equal(retargeted?.id, original.id);
+	assert.equal(retargeted?.seq, original.seq);
+	assert.equal(retargeted?.baseRevision, original.baseRevision);
+	assert.equal(retargeted?.baselineSha256, "baseline");
+	assert.equal(retargeted?.path, "folder/B.md");
+	assert.equal(retargeted?.sha256, "new-content");
+	assert.equal(store.getNextMutationSeq(), 2);
+});
+
+test("delete supersedes an uncommitted put without a FIFO gap", () => {
+	const store = new LocalOperationStore("device-a");
+	store.loadMutations(undefined, 1);
+	const put = store.enqueueMutation("put", "A.md", "epoch-a", 7, {
+		sha256: "content",
+	});
+
+	const deletion = store.replacePutWithDelete(put.id);
+
+	assert.ok(deletion);
+	assert.equal(deletion.id, put.id);
+	assert.equal(deletion.seq, put.seq);
+	assert.equal(deletion.type, "delete-file");
+	assert.equal(deletion.sha256, undefined);
+	assert.equal(store.getNextMutationSeq(), 2);
+	const applied: Record<string, number> = {};
+	assert.equal(store.stageMutation(applied, deletion), true);
+	assert.equal(applied["device-a"], 1);
+});
+
 test("physical actions are idempotent and survive local reload", () => {
 	const firstStore = new LocalOperationStore("device-a");
 	const first = firstStore.enqueuePhysicalAction(

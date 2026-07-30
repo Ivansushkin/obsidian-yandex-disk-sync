@@ -383,6 +383,32 @@ export class IndexManager {
 		return this.operationStore.findLatestPutBaseRevision(path);
 	}
 
+	/**
+	 * Move the newest unconfirmed put to a new logical path.
+	 */
+	retargetPendingPut(
+		oldPath: string,
+		newPath: string,
+		sha256: string,
+		baselineSha256?: string,
+	): PendingMutation | undefined {
+		return this.operationStore.retargetLatestPut(
+			oldPath,
+			newPath,
+			sha256,
+			baselineSha256,
+		);
+	}
+
+	/**
+	 * Reuse a put sequence for a delete that superseded it before commit.
+	 */
+	replacePendingPutWithDelete(
+		id: string,
+	): PendingMutation | undefined {
+		return this.operationStore.replacePutWithDelete(id);
+	}
+
 	consumeRejectedPuts(): Array<{
 		path: string;
 		reason: "delete" | "conflict";
@@ -440,17 +466,23 @@ export class IndexManager {
 			resourceKind?: "file" | "folder";
 			sha256?: string;
 			baselineSha256?: string;
+			epoch?: string | null;
+			baseRevision?: number | null;
 		},
 	): PendingMutation {
-			return this.operationStore.enqueueMutation(
-				type,
-				path,
-				this.localState.observedEpoch,
-				this.localState.observedEpoch === null
+		return this.operationStore.enqueueMutation(
+			type,
+			path,
+			options?.epoch === undefined
+				? this.localState.observedEpoch
+				: options.epoch,
+			options?.baseRevision === undefined
+				? this.localState.observedEpoch === null
 					? null
-					: this.localState.observedRevision,
-				options,
-			);
+					: this.localState.observedRevision
+				: options.baseRevision,
+			options,
+		);
 	}
 
 	stageMutation(mutation: PendingMutation): void {
@@ -471,6 +503,17 @@ export class IndexManager {
 			id,
 			this.remoteIndex.appliedMutationSeq,
 		);
+	}
+
+	/**
+	 * Confirm local work against a canonical snapshot read outside the
+	 * manager's current desired-index view.
+	 */
+	confirmMutationAgainst(
+		id: string,
+		appliedMutationSeq: Record<string, number>,
+	): void {
+		this.operationStore.confirmMutation(id, appliedMutationSeq);
 	}
 
 	discardMutation(id: string): void {
@@ -2724,7 +2767,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.4. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.5. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

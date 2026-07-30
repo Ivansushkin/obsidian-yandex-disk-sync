@@ -141,7 +141,7 @@
 | -------- | --- | ------------------------------------------------------ | ------------------------------------------------------------------ | ----------------- |
 | MOVE-001 | P1  | Rename файла                                           | Old tombstone и new live фиксируются одной revision                | auto: integration |
 | MOVE-002 | P1  | Rename глубокой папки                                  | Все logical paths изменяются атомарно                              | auto: integration |
-| MOVE-003 | P0  | Target уже существует                                  | Target не перезаписывается; создаётся conflict/blocked result      | auto: integration |
+| MOVE-003 | P0  | Target уже существует                                  | Target не перезаписывается; создаётся conflict/blocked result      | auto: `different physical target is not overwritten by rename` |
 | MOVE-004 | P0  | Concurrent edit old path                               | Правило конфликта применяется до physical move                     | auto: two-device  |
 | MOVE-005 | P0  | Concurrent edit new path                               | Target не теряется                                                 | auto: two-device  |
 | MOVE-006 | P1  | Crash после logical commit до move                     | Любое устройство завершает move идемпотентно                       | auto: fault       |
@@ -150,6 +150,11 @@
 | MOVE-009 | P1  | Rename из syncable в excluded                          | Old path удаляется remote, target не загружается                   | auto: integration |
 | MOVE-010 | P1  | Rename из excluded в syncable                          | Target загружается как новый                                       | auto: integration |
 | MOVE-011 | P1  | Async move failed/timeout                              | Move остаётся pending, оба пути проверяются повторно               | auto: fake-yandex |
+| MOVE-012 | P0  | Create → rename до начала upload                       | Загружается только target; source не получает tombstone, move или physical action | auto: `plaintext/encrypted unsynced rename retargets the pending put` |
+| MOVE-013 | P0  | Modify существующего файла → rename до upload          | Target содержит новый SHA; старый physical удаляется только после fingerprint guard | auto: `plaintext/encrypted modified source rename materializes target before cleanup` |
+| MOVE-014 | P0  | Beta.4: canonical target live, source/target physical отсутствуют | Target materialize из совпадающего local snapshot, move/action завершаются за один full | auto: `beta.4 missing move target is materialized and completed` |
+| MOVE-015 | P1  | Create A → rename A→B → создать новый A                | Rename и новый put имеют разные ID; canonical сохраняет оба файла | auto: `new file at the old path survives a queued rename`; manual-required |
+| MOVE-016 | P1  | Быстрые move A→B→C                                     | Не начатая цепочка coalesce до A→C; начатые шаги завершаются последовательно и идемпотентно | auto: `quick file rename chain coalesces to the final target`; manual-required |
 
 ## Несколько устройств
 
@@ -288,6 +293,7 @@
 | DIAG-006 | P1 | Force вернул `success=false`                  | Журнал содержит `completed with errors` и transaction outcome, но не сообщение об успешном завершении | auto: integration |
 | DIAG-007 | P1 | Ни один index codec не читается               | Лог содержит стадии codec, размер, fingerprint и короткий SHA без index/ciphertext   | auto: index-manager |
 | DIAG-008 | P2 | Удаление папки поглощает дочерние watcher events | Лог содержит число live targets, пропущенных historical tombstones и оставшихся physical actions | auto: folder-delete |
+| DIAG-009 | P1 | После post-pass остаётся pending move          | Full sync пишет `completed with errors`, сохраняет action и не продвигает observed revision | auto: `unresolved final move recovery records a full-sync error`; manual-required |
 
 ## Матрица вариантов
 

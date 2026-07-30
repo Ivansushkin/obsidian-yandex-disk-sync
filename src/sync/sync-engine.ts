@@ -8,6 +8,8 @@ import type {
 	SyncOperation,
 	SyncError,
 	FileMetadata,
+	PendingPhysicalAction,
+	YandexResource,
 	YandexDiskSyncSettings,
 } from "../types";
 import { INITIAL_SYNC_STATE } from "../types";
@@ -36,6 +38,17 @@ import {
 	shouldBackupLocalDelete,
 } from "./physical-action-rules";
 import { collectFolderDeleteTargets } from "./index-rules";
+import {
+	createRealtimeBatchResult,
+	isMissingUploadSuperseded,
+	selectFileRenamePlan,
+	wasMutationApplied,
+	wasPendingPutAccepted,
+	wasRenameSourceCausallyLive,
+	type RealtimeBatchResult,
+	type RealtimeFileEvent,
+	type WatcherCausalContext,
+} from "./realtime-rules";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -291,6 +304,18 @@ export class SyncEngine {
 		this.isPaused = false;
 		this.updateState({ status: "idle" });
 		logger.info("Synchronization resumed");
+	}
+
+	/**
+	 * Capture the causal baseline when a watcher event is observed.
+	 */
+	getWatcherCausalContext(): WatcherCausalContext {
+		const local = this.indexManager.getLocalIndex();
+		return {
+			epoch: local.observedEpoch,
+			baseRevision:
+				local.observedEpoch === null ? null : local.observedRevision,
+		};
 	}
 
 	/**
@@ -592,12 +617,16 @@ export class SyncEngine {
 					if (this.indexSaveCallback) {
 						await this.indexSaveCallback();
 					}
+					await this.resumePendingPhysicalActions(result);
+					await this.resumePendingMoves(result, true);
 					return;
 				}
 				if (
 					indexCommittedBeforeDeletes &&
 					conflicts.length === 0
 				) {
+					await this.resumePendingPhysicalActions(result);
+					await this.resumePendingMoves(result, true);
 					return;
 				}
 
@@ -608,9 +637,11 @@ export class SyncEngine {
 				await this.repairMissingAcceptedUploads(
 					uploads.map((operation) => operation.path),
 				);
+				await this.resumePendingPhysicalActions(result);
+				await this.resumePendingMoves(result, true);
 			},
 			(result) =>
-				`Synchronization completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
+				`Full reconciliation completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
 			);
 		if (
 			options?.skipMaintenanceGuard &&
@@ -1463,6 +1494,22 @@ export class SyncEngine {
 		logger.info("Remote physical deletion started", actionContext);
 		const canonical = await this.indexManager.readCanonicalIndex();
 		if (!isPhysicalDeleteAuthorized(physicalAction, canonical)) {
+			const waitsForRetargetedPut =
+				physicalAction.origin === "rejected-upload" &&
+				physicalAction.epoch === canonical.epoch &&
+				canonical.files[path] === undefined &&
+				physicalAction.targetPath !== undefined &&
+				canonical.files[physicalAction.targetPath] === undefined;
+			if (waitsForRetargetedPut) {
+				logger.info(
+					"Deferred rejected upload cleanup until target put commits",
+					{
+						...actionContext,
+						targetPath: physicalAction.targetPath,
+					},
+				);
+				return;
+			}
 			this.indexManager.completePhysicalAction(physicalAction.id);
 			logger.warn("Cancelled obsolete remote deletion", {
 				...actionContext,
@@ -1505,7 +1552,10 @@ export class SyncEngine {
 		logger.info("Remote physical deletion confirmed", actionContext);
 
 		// Update indexes
-		if (physicalAction.origin !== "force-reset") {
+		if (
+			physicalAction.origin === "exact-delete" ||
+			physicalAction.origin === "folder-delete"
+		) {
 			this.indexManager.markRemoteFileDeleted(path);
 			this.indexManager.markLocalFileDeleted(path);
 		}
@@ -1726,71 +1776,142 @@ export class SyncEngine {
 	/**
 	 * Apply a debounced realtime file batch with one canonical index commit.
 	 *
-	 * @returns `true` only when every event is durably reconciled. A `false`
-	 * result tells the watcher to retain the batch for a later retry.
+	 * @returns Per-event durable outcomes used to acknowledge only completed or
+	 * causally superseded watcher work.
 	 */
 	async syncFileBatch(
-		events: Array<{ path: string; action: "upload" | "delete" }>,
-	): Promise<boolean> {
+		events: RealtimeFileEvent[],
+	): Promise<RealtimeBatchResult> {
 		return await this.coordinator.run("realtime", async () => {
+			const batchResult = createRealtimeBatchResult();
 			const blockReason = await this.getSyncBlockReason(false);
 			if (blockReason || this.isPaused) {
 				if (blockReason) this.setBlockedState(blockReason);
-				return false;
+				batchResult.retry.push(...events.map((event) => event.id));
+				return batchResult;
 			}
 
 			const prepared: Array<{
+				id: string;
 				path: string;
 				action: "upload" | "delete";
 				mutation: ReturnType<IndexManager["enqueueMutation"]>;
 				snapshot?: { content: ArrayBuffer; sha256: string };
 			}> = [];
-			let preparationFailed = false;
 			for (const event of events) {
-				if (!this.vaultAdapter.shouldSync(event.path)) continue;
+				if (!this.vaultAdapter.shouldSync(event.path)) {
+					batchResult.completed.push(event.id);
+					continue;
+				}
 				if (event.action === "upload") {
+					if (event.superseded) {
+						batchResult.superseded.push(event.id);
+						logger.debug("Realtime upload event superseded", {
+							eventId: event.id,
+							path: event.path,
+							reason: "replaced-by-newer-event",
+							epoch: shortenDiagnosticValue(event.epoch),
+							baseRevision: event.baseRevision,
+						});
+						continue;
+					}
+					if (!this.vaultAdapter.fileExists(event.path)) {
+						const remoteIndex =
+							this.indexManager.getRemoteIndex();
+						if (
+							isMissingUploadSuperseded(
+								event,
+								remoteIndex.files[event.path],
+								remoteIndex.moves,
+							)
+						) {
+							batchResult.superseded.push(event.id);
+							logger.debug("Realtime upload event superseded", {
+								eventId: event.id,
+								path: event.path,
+								reason: "canonical-replacement",
+								epoch: shortenDiagnosticValue(event.epoch),
+								baseRevision: event.baseRevision,
+							});
+						} else {
+							batchResult.retry.push(event.id);
+							logger.warn(
+								"Realtime upload path is missing without a causal replacement",
+								{
+									eventId: event.id,
+									path: event.path,
+									epoch: shortenDiagnosticValue(event.epoch),
+									baseRevision: event.baseRevision,
+								},
+							);
+						}
+						continue;
+					}
 					try {
 						const content = await this.vaultAdapter.readFile(event.path);
 						const sha256 = await computeSha256(content);
 						prepared.push({
 							...event,
-							mutation: this.indexManager.enqueueMutation(
-								"put",
-								event.path,
-								{
+							mutation:
+								this.reusePendingFileMutation(
+									event,
+									"put",
 									sha256,
-									baselineSha256:
-										this.indexManager.getLocalIndex().files[
-											event.path
-										]?.sha256,
-								},
-							),
+								) ??
+								this.indexManager.enqueueMutation(
+									"put",
+									event.path,
+									{
+										sha256,
+										baselineSha256:
+											this.indexManager.getLocalIndex()
+												.files[event.path]?.sha256,
+										epoch: event.epoch,
+										baseRevision: event.baseRevision,
+									},
+								),
 							snapshot: { content, sha256 },
 						});
 					} catch (e) {
 						logger.warn(
 							`Could not prepare realtime upload ${event.path}:`,
-							{ error: e },
+							{ eventId: event.id, error: e },
 						);
-						preparationFailed = true;
+						batchResult.retry.push(event.id);
 					}
 					continue;
 				}
 				this.indexManager.markLocalFileDeleted(event.path);
+				const pendingPut = this.reusePendingFileMutation(
+					event,
+					"put",
+				);
 				prepared.push({
 					...event,
-					mutation: this.indexManager.enqueueMutation(
-						"delete-file",
-						event.path,
-					),
+					mutation:
+						(pendingPut
+							? this.indexManager.replacePendingPutWithDelete(
+									pendingPut.id,
+								)
+							: undefined) ??
+						this.reusePendingFileMutation(event, "delete-file") ??
+						this.indexManager.enqueueMutation(
+							"delete-file",
+							event.path,
+							{
+								epoch: event.epoch,
+								baseRevision: event.baseRevision,
+							},
+						),
 				});
 			}
-			if (prepared.length === 0) return !preparationFailed;
+			if (prepared.length === 0) return batchResult;
 			if (this.indexSaveCallback) await this.indexSaveCallback();
 
 			const accepted: typeof prepared = [];
-			let processingFailed = false;
-			for (const item of prepared) {
+			let failedIndex = -1;
+			for (let index = 0; index < prepared.length; index++) {
+				const item = prepared[index]!;
 				try {
 					if (item.action === "upload") {
 						await this.uploadFile(
@@ -1820,15 +1941,25 @@ export class SyncEngine {
 				} catch (e) {
 					logger.error(
 						`Realtime batch stopped at ${item.path}:`,
-						{ error: e },
+						{ eventId: item.id, error: e },
 					);
-					processingFailed = true;
+					failedIndex = index;
+					batchResult.retry.push(
+						...prepared.slice(index).map((event) => event.id),
+					);
 					break;
 				}
 			}
-			if (accepted.length === 0) return false;
+			if (accepted.length === 0) return batchResult;
 			if (this.indexSaveCallback) await this.indexSaveCallback();
-			if (!(await this.saveRemoteIndexBestEffort())) return false;
+			if (!(await this.saveRemoteIndexBestEffort())) {
+				batchResult.retry.push(
+					...accepted
+						.map((event) => event.id)
+						.filter((id) => !batchResult.retry.includes(id)),
+				);
+				return batchResult;
+			}
 			await this.repairMissingAcceptedUploads(
 				accepted
 					.filter((item) => item.action === "upload")
@@ -1847,6 +1978,14 @@ export class SyncEngine {
 				}),
 				Math.max(1, this.settings.maxConcurrency || 5),
 			);
+			for (const item of accepted.filter(
+				(event) => event.action === "upload",
+			)) {
+				batchResult.completed.push(item.id);
+			}
+			for (const item of deletes) {
+				batchResult.completed.push(item.id);
+			}
 			if (deletes.length > 0) {
 				await this.pruneRemoteFolders(
 					deletes.map((item) => item.path),
@@ -1860,15 +1999,49 @@ export class SyncEngine {
 				this.indexManager.markRemoteObserved();
 			}
 			if (this.indexSaveCallback) await this.indexSaveCallback();
-			return (
-				!preparationFailed &&
-				!processingFailed &&
-				accepted.length === prepared.length &&
-				deleteResults.every(
-					(outcome) => outcome.status === "fulfilled",
-				)
-			);
+			if (failedIndex >= 0) {
+				logger.warn("Realtime file batch completed with retry events", {
+					completed: batchResult.completed.length,
+					superseded: batchResult.superseded.length,
+					retry: batchResult.retry.length,
+				});
+			}
+			return batchResult;
 		});
+	}
+
+	/**
+	 * Reuse durable file work without allocating a second FIFO sequence.
+	 */
+	private reusePendingFileMutation(
+		event: RealtimeFileEvent,
+		type: "put" | "delete-file",
+		sha256?: string,
+	): ReturnType<IndexManager["enqueueMutation"]> | undefined {
+		const appliedMutationSeq =
+			this.indexManager.getRemoteIndex().appliedMutationSeq;
+		const existing = [
+			...this.indexManager.getPendingMutations(),
+		]
+			.reverse()
+			.find(
+				(mutation) =>
+					mutation.type === type &&
+					mutation.path === event.path &&
+					mutation.epoch === event.epoch &&
+					!wasMutationApplied(mutation, appliedMutationSeq),
+			);
+		if (!existing) return undefined;
+		if (type === "put" && sha256) {
+			return (
+				this.indexManager.retargetPendingPut(
+					event.path,
+					event.path,
+					sha256,
+				) ?? existing
+			);
+		}
+		return existing;
 	}
 
 	private async syncSingleFileNow(
@@ -1996,15 +2169,20 @@ export class SyncEngine {
 	/**
 	 * Rename file on Yandex Disk
 	 */
-	async renameFile(oldPath: string, newPath: string): Promise<void> {
+	async renameFile(
+		oldPath: string,
+		newPath: string,
+		context?: WatcherCausalContext,
+	): Promise<void> {
 		return await this.enqueueRealtime(() =>
-			this.renameFileNow(oldPath, newPath),
+			this.renameFileNow(oldPath, newPath, context),
 		);
 	}
 
 	private async renameFileNow(
 		oldPath: string,
 		newPath: string,
+		context = this.getWatcherCausalContext(),
 	): Promise<void> {
 		const blockReason = await this.getSyncBlockReason(false);
 		if (blockReason) {
@@ -2015,39 +2193,13 @@ export class SyncEngine {
 			throw new Error(blockReason);
 		}
 
-		const mutation = this.indexManager.enqueueMutation("move", oldPath, {
-			targetPath: newPath,
-			resourceKind: "file",
-		});
-		this.indexManager.recordMove(
-			mutation.id,
-			oldPath,
-			newPath,
-			"file",
-			mutation.baseRevision ?? this.indexManager.getRemoteIndex().revision,
-		);
-		const physicalMove = this.indexManager.enqueuePhysicalAction(
-			"move-remote",
-			oldPath,
-			{
-				targetPath: newPath,
-				canonicalRevision:
-					this.indexManager.getRemoteIndex().revision + 1,
-				expectedFingerprint:
-					this.indexManager.getRemoteIndex().files[oldPath]
-						?.remoteFingerprint,
-				origin: "move",
-			},
-		);
-		if (this.indexSaveCallback) await this.indexSaveCallback();
-
-		if (this.isPaused || this.isSyncing) {
-			return;
-		}
-
 		if (!this.vaultAdapter.shouldSync(newPath)) {
-			// If new path is not synchronized, delete old one
 			if (this.vaultAdapter.shouldSync(oldPath)) {
+				const mutation = this.indexManager.enqueueMutation(
+					"delete-file",
+					oldPath,
+					context,
+				);
 				this.indexManager.markRemoteFileDeleted(oldPath);
 				this.indexManager.enqueuePhysicalAction(
 					"delete-remote",
@@ -2059,8 +2211,6 @@ export class SyncEngine {
 						origin: "exact-delete",
 					},
 				);
-				this.indexManager.completePhysicalAction(physicalMove.id);
-				this.indexManager.completeMove(mutation.id);
 				this.indexManager.stageMutation(mutation);
 				if (!(await this.saveRemoteIndexBestEffort())) return;
 				await this.deleteRemoteFile(oldPath);
@@ -2068,32 +2218,146 @@ export class SyncEngine {
 				if (this.indexSaveCallback) {
 					await this.indexSaveCallback();
 				}
-			} else {
-				this.indexManager.completePhysicalAction(physicalMove.id);
-				this.indexManager.completeMove(mutation.id);
-				this.indexManager.discardMutation(mutation.id);
 			}
 			return;
 		}
 
 		try {
-			const oldLocalMeta =
-				this.indexManager.getLocalIndex().files[oldPath];
-			const oldRemoteMeta =
-				this.indexManager.getRemoteIndex().files[oldPath];
-
-			if (oldLocalMeta) {
-				this.indexManager.markLocalFileDeleted(oldPath);
-			}
-
-			if (oldRemoteMeta) {
-				this.indexManager.markRemoteFileDeleted(oldPath);
-			}
-
-			// Read new file metadata for the renamed file
 			const content = await this.vaultAdapter.readFile(newPath);
 			const sha256 = await computeSha256(content);
 			const mtime = this.vaultAdapter.getFileMtime(newPath) || Date.now();
+			const oldLocalMeta =
+				this.indexManager.getLocalIndex().files[oldPath];
+			const canonical = await this.indexManager.readCanonicalIndex();
+			const canonicalSource = canonical.files[oldPath];
+			const existingMove = Object.values(canonical.moves).find(
+				(move) =>
+					move.pending &&
+					move.kind === "file" &&
+					move.fromPath === oldPath &&
+					move.toPath === newPath,
+			);
+			if (existingMove) {
+				this.indexManager.getRemoteIndex().moves[existingMove.id] = {
+					...existingMove,
+				};
+				for (const path of [oldPath, newPath]) {
+					const metadata = canonical.files[path];
+					if (metadata) {
+						this.indexManager.getRemoteIndex().files[path] = {
+							...metadata,
+						};
+					}
+				}
+				const physicalMove =
+					this.indexManager.enqueuePhysicalAction(
+						"move-remote",
+						oldPath,
+						{
+							targetPath: newPath,
+							canonicalRevision: canonical.revision,
+							expectedFingerprint:
+								canonicalSource?.remoteFingerprint,
+							origin: "move",
+						},
+					);
+				await this.executeGuardedRemoteMove(
+					oldPath,
+					newPath,
+					physicalMove.id,
+					{ content, sha256 },
+				);
+				await this.pruneRemoteFolders([oldPath]);
+				this.indexManager.completeMove(existingMove.id);
+				const pendingMoveMutation = this.indexManager
+					.getPendingMutations()
+					.find(
+						(mutation) =>
+							mutation.id === existingMove.id &&
+							mutation.type === "move",
+					);
+				if (pendingMoveMutation) {
+					this.indexManager.stageMutation(
+						pendingMoveMutation,
+					);
+				}
+				if (!(await this.saveMoveCompletionBestEffort())) {
+					throw new Error(
+						`Could not commit recovered rename: ${oldPath} -> ${newPath}`,
+					);
+				}
+				if (pendingMoveMutation) {
+					this.indexManager.confirmMutation(
+						pendingMoveMutation.id,
+					);
+				}
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+				logger.info("Existing file move recovered", {
+					oldPath,
+					newPath,
+					moveId: existingMove.id,
+					plan: "materialize-target",
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision,
+				});
+				return;
+			}
+			const pendingPut = [
+				...this.indexManager.getPendingMutations(),
+			]
+				.reverse()
+				.find(
+					(mutation) =>
+						mutation.type === "put" &&
+						mutation.path === oldPath,
+				);
+			const pendingPutAccepted = wasPendingPutAccepted(
+				pendingPut,
+				canonical.appliedMutationSeq,
+				canonicalSource,
+			);
+			const pendingPutApplied =
+				pendingPut !== undefined &&
+				wasMutationApplied(
+					pendingPut,
+					canonical.appliedMutationSeq,
+				);
+			if (pendingPutApplied && pendingPut) {
+				this.indexManager.confirmMutationAgainst(
+					pendingPut.id,
+					canonical.appliedMutationSeq,
+				);
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+			}
+			const sourceCausallyLive = pendingPut
+				? pendingPutAccepted
+				: wasRenameSourceCausallyLive(
+						oldLocalMeta,
+						canonicalSource,
+						context.baseRevision,
+					);
+			const plan = selectFileRenamePlan(
+				sourceCausallyLive,
+				canonicalSource ?? oldLocalMeta,
+				sha256,
+			);
+			logger.info("File rename planned", {
+				oldPath,
+				newPath,
+				epoch: shortenDiagnosticValue(context.epoch),
+				baseRevision: context.baseRevision,
+				sourceChangedRevision:
+					canonicalSource?.changedRevision ?? null,
+				pendingPutId: pendingPut?.id ?? null,
+				pendingPutApplied,
+				pendingPutAccepted,
+				sourceCausallyLive,
+				plan,
+			});
 
 			const newMetadata: FileMetadata = {
 				path: newPath,
@@ -2103,7 +2367,55 @@ export class SyncEngine {
 				syncedAt: Date.now(),
 			};
 
-			// Add new file to indexes
+			if (plan === "put-target") {
+				await this.putRenamedUnsyncedFile(
+					oldPath,
+					newPath,
+					newMetadata,
+					{ content, sha256 },
+					context,
+				);
+				return;
+			}
+
+			const mutation = this.indexManager.enqueueMutation("move", oldPath, {
+				targetPath: newPath,
+				resourceKind: "file",
+				epoch: context.epoch,
+				baseRevision: context.baseRevision,
+			});
+			this.indexManager.recordMove(
+				mutation.id,
+				oldPath,
+				newPath,
+				"file",
+				mutation.baseRevision ??
+					this.indexManager.getRemoteIndex().revision,
+			);
+			const physicalMove = this.indexManager.enqueuePhysicalAction(
+				"move-remote",
+				oldPath,
+				{
+					targetPath: newPath,
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision + 1,
+					expectedFingerprint:
+						canonicalSource?.remoteFingerprint ??
+						this.indexManager.getRemoteIndex().files[oldPath]
+							?.remoteFingerprint,
+					origin: "move",
+				},
+			);
+			if (oldLocalMeta) this.indexManager.markLocalFileDeleted(oldPath);
+			if (
+				canonicalSource &&
+				!this.indexManager.getRemoteIndex().files[oldPath]
+			) {
+				this.indexManager.updateRemoteFile(oldPath, {
+					...canonicalSource,
+				});
+			}
+			if (canonicalSource) this.indexManager.markRemoteFileDeleted(oldPath);
 			this.indexManager.updateLocalFile(newPath, newMetadata);
 			this.indexManager.updateRemoteFile(newPath, newMetadata);
 			if (mutation.baseRevision !== null) {
@@ -2112,21 +2424,18 @@ export class SyncEngine {
 				]!.baseRevision = mutation.baseRevision;
 			}
 
-			if (!(await this.saveRemoteIndexBestEffort())) return;
+			if (!(await this.saveRemoteIndexBestEffort())) {
+				throw new Error(
+					`Could not commit logical rename: ${oldPath} -> ${newPath}`,
+				);
+			}
 			if (
 				this.indexManager.getRemoteIndex().files[newPath]
 					?.sha256 !== newMetadata.sha256
 			) {
-				this.indexManager.completePhysicalAction(physicalMove.id);
-				this.indexManager.completeMove(mutation.id);
-				this.indexManager.stageMutation(mutation);
-				if (await this.saveRemoteIndexBestEffort()) {
-					this.indexManager.confirmMutation(mutation.id);
-				}
-				if (this.indexSaveCallback) {
-					await this.indexSaveCallback();
-				}
-				return;
+				throw new Error(
+					`Move target changed concurrently: ${newPath}`,
+				);
 			}
 			if (
 				this.indexManager.getRemoteIndex().files[newPath]?.deleted
@@ -2154,29 +2463,163 @@ export class SyncEngine {
 				oldPath,
 				newPath,
 				physicalMove.id,
+				{ content, sha256 },
 			);
 
-			// Remove source folders that became empty after the move
 			await this.pruneRemoteFolders([oldPath]);
 
-			// Save remote index after rename
 			this.indexManager.completeMove(mutation.id);
 			this.indexManager.stageMutation(mutation);
-			if (await this.saveRemoteIndexBestEffort()) {
-				this.indexManager.confirmMutation(mutation.id);
+			if (!(await this.saveMoveCompletionBestEffort())) {
+				throw new Error(
+					`Could not commit rename completion: ${oldPath} -> ${newPath}`,
+				);
 			}
-			logger.debug(`File renamed: ${oldPath} -> ${newPath}`);
-
-			// Save local index via callback
+			this.indexManager.confirmMutation(mutation.id);
 			if (this.indexSaveCallback) {
 				await this.indexSaveCallback();
 			}
+			logger.info("File rename completed", {
+				oldPath,
+				newPath,
+				plan,
+				canonicalRevision:
+					this.indexManager.getRemoteIndex().revision,
+			});
 		} catch (e) {
-			logger.error(`Error renaming file ${oldPath}:`, { error: e });
 			if (this.indexSaveCallback) {
 				await this.indexSaveCallback();
 			}
+			logger.error(`Error renaming file ${oldPath}:`, { error: e });
+			throw e;
 		}
+	}
+
+	/**
+	 * Retarget an uncommitted source put and materialize only the new path.
+	 */
+	private async putRenamedUnsyncedFile(
+		oldPath: string,
+		newPath: string,
+		metadata: FileMetadata,
+		snapshot: { content: ArrayBuffer; sha256: string },
+		context: WatcherCausalContext,
+	): Promise<void> {
+		const oldPendingPut = [
+			...this.indexManager.getPendingMutations(),
+		]
+			.reverse()
+			.find(
+				(mutation) =>
+					mutation.type === "put" &&
+					mutation.path === oldPath,
+			);
+		const cleanupAction = oldPendingPut?.sha256
+			? await this.prepareRetargetedUploadCleanup(
+					oldPath,
+					newPath,
+					oldPendingPut.sha256,
+					snapshot.sha256,
+				)
+			: undefined;
+		const mutation =
+			this.indexManager.retargetPendingPut(
+				oldPath,
+				newPath,
+				snapshot.sha256,
+			) ??
+			this.indexManager.enqueueMutation("put", newPath, {
+				sha256: snapshot.sha256,
+				baselineSha256:
+					this.indexManager.getLocalIndex().files[newPath]?.sha256,
+				epoch: context.epoch,
+				baseRevision: context.baseRevision,
+			});
+		this.indexManager.removeFromLocalIndex(oldPath);
+		if (this.indexSaveCallback) await this.indexSaveCallback();
+		await this.uploadFile(newPath, false, true, snapshot);
+		this.indexManager.updateLocalFile(newPath, metadata);
+		this.indexManager.stageMutation(mutation);
+		if (!(await this.saveRemoteIndexBestEffort())) {
+			throw new Error(`Could not commit renamed put target: ${newPath}`);
+		}
+		await this.repairMissingAcceptedUploads([newPath]);
+		this.indexManager.confirmMutation(mutation.id);
+		if (this.indexSaveCallback) await this.indexSaveCallback();
+		if (cleanupAction) {
+			try {
+				await this.deleteRemoteFile(oldPath);
+			} catch (error) {
+				logger.warn("Retargeted source upload cleanup remains pending", {
+					actionId: cleanupAction.id,
+					oldPath,
+					newPath,
+					error,
+				});
+			}
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+		}
+		logger.info("Unsynced file rename committed as target put", {
+			oldPath,
+			newPath,
+			mutationId: mutation.id,
+			mutationSeq: mutation.seq,
+			baseRevision: mutation.baseRevision,
+		});
+	}
+
+	/**
+	 * Guard cleanup of a source object uploaded before its put was retargeted.
+	 */
+	private async prepareRetargetedUploadCleanup(
+		oldPath: string,
+		newPath: string,
+		expectedOldSha256: string,
+		targetSha256: string,
+	): Promise<PendingPhysicalAction | undefined> {
+		const remotePath = joinPath(this.settings.remotePath, oldPath);
+		const resource =
+			await this.yandexClient.getLogicalResource(remotePath);
+		if (!resource) return undefined;
+		try {
+			const content =
+				await this.yandexClient.downloadFile(remotePath);
+			if ((await computeSha256(content)) !== expectedOldSha256) {
+				logger.warn(
+					"Retargeted source upload differs from the pending put",
+					{
+						oldPath,
+						newPath,
+						expectedSha256: shortenDiagnosticValue(
+							expectedOldSha256,
+						),
+					},
+				);
+				return undefined;
+			}
+		} catch (error) {
+			logger.warn("Could not verify retargeted source upload", {
+				oldPath,
+				newPath,
+				error,
+			});
+			return undefined;
+		}
+		const fingerprint =
+			resource.sha256 || resource.md5 || resource.resource_id;
+		if (!fingerprint) return undefined;
+		return this.indexManager.enqueuePhysicalAction(
+			"delete-remote",
+			oldPath,
+			{
+				targetPath: newPath,
+				canonicalRevision:
+					this.indexManager.getRemoteIndex().revision + 1,
+				expectedFingerprint: fingerprint,
+				baselineSha256: targetSha256,
+				origin: "rejected-upload",
+			},
+		);
 	}
 
 	/**
@@ -2718,6 +3161,18 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Commit physical move completion without advancing logical revisions.
+	 */
+	private async saveMoveCompletionBestEffort(): Promise<boolean> {
+		this.indexManager.beginPhysicalRewriteCommit();
+		try {
+			return await this.saveRemoteIndexBestEffort();
+		} finally {
+			this.indexManager.cancelPhysicalRewriteCommit();
+		}
+	}
+
+	/**
 	 * Repair only a missing physical object after its put won the canonical
 	 * merge. A changed existing object is left for causal reconciliation.
 	 */
@@ -2807,6 +3262,7 @@ export class SyncEngine {
 		fromPath: string,
 		toPath: string,
 		actionId?: string,
+		snapshot?: { content: ArrayBuffer; sha256: string },
 	): Promise<void> {
 		const action =
 			this.indexManager.getPendingPhysicalAction(
@@ -2851,15 +3307,78 @@ export class SyncEngine {
 			this.yandexClient.getLogicalResource(remoteTo),
 		]);
 		if (!source && target) {
+			if (
+				!(await this.remoteResourceMatchesCanonical(
+					toPath,
+					target,
+					canonical.files[toPath],
+				))
+			) {
+				throw new Error(`Move target does not match canonical: ${toPath}`);
+			}
+			const targetSnapshot =
+				(snapshot?.sha256 === canonical.files[toPath]?.sha256
+					? snapshot
+					: undefined) ??
+				(await this.readMatchingLocalSnapshot(
+					toPath,
+					canonical.files[toPath]?.sha256,
+				));
+			this.stampMovedTarget(toPath, target, targetSnapshot);
 			if (action) this.indexManager.completePhysicalAction(action.id);
 			logger.info("Guarded remote move already complete", actionContext);
 			return;
 		}
 		if (!source) {
-			throw new Error(`Move source is missing: ${fromPath}`);
+			const targetMetadata = canonical.files[toPath];
+			const repairSnapshot =
+				(snapshot?.sha256 === targetMetadata?.sha256
+					? snapshot
+					: undefined) ??
+				(await this.readMatchingLocalSnapshot(
+					toPath,
+					targetMetadata?.sha256,
+				));
+			if (!repairSnapshot || !targetMetadata || targetMetadata.deleted) {
+				throw new Error(`Move source is missing: ${fromPath}`);
+			}
+			const repairedTarget = await this.materializeMoveTarget(
+				toPath,
+				repairSnapshot,
+				targetMetadata,
+			);
+			this.stampMovedTarget(
+				toPath,
+				repairedTarget,
+				repairSnapshot,
+			);
+			if (action) this.indexManager.completePhysicalAction(action.id);
+			logger.info("Missing move source repaired from local target", {
+				...actionContext,
+				plan: "materialize-target",
+			});
+			return;
 		}
 		if (target) {
-			throw new Error(`Move target already exists: ${toPath}`);
+			if (
+				!(await this.remoteResourceMatchesCanonical(
+					toPath,
+					target,
+					canonical.files[toPath],
+				))
+			) {
+				throw new Error(`Move target already exists: ${toPath}`);
+			}
+			await this.deleteMoveSourceIfUnchanged(
+				fromPath,
+				source,
+				action,
+				canonical.files[fromPath],
+			);
+			this.stampMovedTarget(toPath, target, snapshot);
+			if (action) this.indexManager.completePhysicalAction(action.id);
+			logger.info("Materialized move source cleanup confirmed", actionContext);
+			return;
 		}
 		const sourceFingerprint =
 			source.sha256 || source.md5 || source.resource_id;
@@ -2879,7 +3398,100 @@ export class SyncEngine {
 			);
 		}
 
-		await this.yandexClient.moveResource(remoteFrom, remoteTo, false);
+		const targetMetadata = canonical.files[toPath];
+		const sourceMetadata = canonical.files[fromPath];
+		const requiresMaterialization =
+			targetMetadata &&
+			sourceMetadata &&
+			targetMetadata.sha256 !== sourceMetadata.sha256;
+		if (requiresMaterialization) {
+			const repairSnapshot =
+				(snapshot?.sha256 === targetMetadata.sha256
+					? snapshot
+					: undefined) ??
+				(await this.readMatchingLocalSnapshot(
+					toPath,
+					targetMetadata.sha256,
+				));
+			if (!repairSnapshot) {
+				throw new Error(
+					`Changed move target cannot be materialized: ${toPath}`,
+				);
+			}
+			const writtenTarget = await this.materializeMoveTarget(
+				toPath,
+				repairSnapshot,
+				targetMetadata,
+			);
+			await this.deleteMoveSourceIfUnchanged(
+				fromPath,
+				source,
+				action,
+				sourceMetadata,
+			);
+			this.stampMovedTarget(
+				toPath,
+				writtenTarget,
+				repairSnapshot,
+			);
+			if (action) this.indexManager.completePhysicalAction(action.id);
+			logger.info("Changed move target materialized", {
+				...actionContext,
+				plan: "materialize-target",
+			});
+			return;
+		}
+
+		if (
+			!action?.expectedFingerprint &&
+			!(await this.remoteResourceMatchesCanonical(
+				fromPath,
+				source,
+				sourceMetadata,
+			))
+		) {
+			throw new Error(`Move source cannot be verified: ${fromPath}`);
+		}
+		try {
+			await this.yandexClient.moveResource(
+				remoteFrom,
+				remoteTo,
+				false,
+			);
+		} catch (error) {
+			const [remainingSource, ambiguousTarget] = await Promise.all([
+				this.yandexClient.getLogicalResource(remoteFrom),
+				this.yandexClient.getLogicalResource(remoteTo),
+			]);
+			if (
+				remainingSource ||
+				!ambiguousTarget ||
+				!(await this.remoteResourceMatchesCanonical(
+					toPath,
+					ambiguousTarget,
+					targetMetadata,
+				))
+			) {
+				throw error;
+			}
+			this.stampMovedTarget(
+				toPath,
+				ambiguousTarget,
+				snapshot,
+			);
+			if (action) {
+				this.indexManager.completePhysicalAction(action.id);
+			}
+			logger.info("Ambiguous remote move confirmed by final state", {
+				...actionContext,
+				targetFingerprint: shortenDiagnosticValue(
+					ambiguousTarget.sha256 ||
+						ambiguousTarget.md5 ||
+						ambiguousTarget.resource_id,
+				),
+			});
+			return;
+		}
 		const [remainingSource, writtenTarget] = await Promise.all([
 			this.yandexClient.getLogicalResource(remoteFrom),
 			this.yandexClient.getLogicalResource(remoteTo),
@@ -2889,6 +3501,16 @@ export class SyncEngine {
 				`Move result could not be confirmed: ${fromPath} -> ${toPath}`,
 			);
 		}
+		if (
+			!(await this.remoteResourceMatchesCanonical(
+				toPath,
+				writtenTarget,
+				targetMetadata,
+			))
+		) {
+			throw new Error(`Moved target does not match canonical: ${toPath}`);
+		}
+		this.stampMovedTarget(toPath, writtenTarget, snapshot);
 		if (action) this.indexManager.completePhysicalAction(action.id);
 		if (actionId && action?.id !== actionId) {
 			this.indexManager.completePhysicalAction(actionId);
@@ -2904,15 +3526,179 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Read a local snapshot only when it still matches the canonical move hash.
+	 */
+	private async readMatchingLocalSnapshot(
+		path: string,
+		expectedSha256: string | undefined,
+	): Promise<{ content: ArrayBuffer; sha256: string } | undefined> {
+		if (!expectedSha256 || !this.vaultAdapter.fileExists(path)) {
+			return undefined;
+		}
+		const content = await this.vaultAdapter.readFile(path);
+		const sha256 = await computeSha256(content);
+		return sha256 === expectedSha256 ? { content, sha256 } : undefined;
+	}
+
+	/**
+	 * Upload a missing move target exclusively and verify its logical content.
+	 */
+	private async materializeMoveTarget(
+		path: string,
+		snapshot: { content: ArrayBuffer; sha256: string },
+		metadata: FileMetadata,
+	): Promise<YandexResource> {
+		const remotePath = joinPath(this.settings.remotePath, path);
+		try {
+			await this.yandexClient.uploadFileExclusive(
+				remotePath,
+				snapshot.content,
+			);
+		} catch (error) {
+			const concurrentTarget =
+				await this.yandexClient.getLogicalResource(remotePath);
+			if (
+				!concurrentTarget ||
+				!(await this.remoteResourceMatchesCanonical(
+					path,
+					concurrentTarget,
+					metadata,
+				))
+			) {
+				throw error;
+			}
+			return concurrentTarget;
+		}
+		const writtenTarget =
+			await this.yandexClient.getLogicalResource(remotePath);
+		if (
+			!writtenTarget ||
+			!(await this.remoteResourceMatchesCanonical(
+				path,
+				writtenTarget,
+				metadata,
+			))
+		) {
+			throw new Error(`Move target upload could not be verified: ${path}`);
+		}
+		return writtenTarget;
+	}
+
+	/**
+	 * Compare a physical remote object with canonical metadata without trusting
+	 * client clocks.
+	 */
+	private async remoteResourceMatchesCanonical(
+		path: string,
+		resource: YandexResource,
+		metadata: FileMetadata | undefined,
+	): Promise<boolean> {
+		if (!metadata || metadata.deleted) return false;
+		const fingerprint =
+			resource.sha256 || resource.md5 || resource.resource_id;
+		if (
+			metadata.remoteFingerprint &&
+			fingerprint === metadata.remoteFingerprint
+		) {
+			return true;
+		}
+		try {
+			const content = await this.yandexClient.downloadFile(
+				joinPath(this.settings.remotePath, path),
+			);
+			return (await computeSha256(content)) === metadata.sha256;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Delete a move source only while its staged identity remains unchanged.
+	 */
+	private async deleteMoveSourceIfUnchanged(
+		path: string,
+		resource: YandexResource,
+		action: ReturnType<IndexManager["getPendingPhysicalAction"]>,
+		metadata: FileMetadata | undefined,
+	): Promise<void> {
+		const fingerprint =
+			resource.sha256 || resource.md5 || resource.resource_id;
+		const matchesExpected =
+			action?.expectedFingerprint !== undefined &&
+			fingerprint === action.expectedFingerprint;
+		if (
+			!matchesExpected &&
+			!(await this.remoteResourceMatchesCanonical(path, resource, metadata))
+		) {
+			throw new Error(`Move source changed before cleanup: ${path}`);
+		}
+		const remotePath = joinPath(this.settings.remotePath, path);
+		try {
+			await this.yandexClient.deleteResource(remotePath);
+		} catch (error) {
+			if (await this.yandexClient.getLogicalResource(remotePath)) {
+				throw error;
+			}
+		}
+		if (await this.yandexClient.getLogicalResource(remotePath)) {
+			throw new Error(`Move source cleanup could not be confirmed: ${path}`);
+		}
+	}
+
+	/**
+	 * Persist verified target identity into canonical and local baselines.
+	 */
+	private stampMovedTarget(
+		path: string,
+		resource: YandexResource,
+		localSnapshot?: { content: ArrayBuffer; sha256: string },
+	): void {
+		const current = this.indexManager.getRemoteIndex().files[path];
+		if (!current || current.deleted) return;
+		const remoteMtime = new Date(resource.modified).getTime();
+		const stamped: FileMetadata = {
+			...current,
+			remoteFingerprint:
+				resource.sha256 || resource.md5 || resource.resource_id,
+			remoteMtime: Number.isFinite(remoteMtime)
+				? remoteMtime
+				: current.remoteMtime,
+		};
+		this.indexManager.updateRemoteFile(path, stamped);
+		const local = this.indexManager.getLocalIndex().files[path];
+		if (local && !local.deleted && local.sha256 === stamped.sha256) {
+			this.indexManager.updateLocalFile(path, {
+				...local,
+				remoteFingerprint: stamped.remoteFingerprint,
+				remoteMtime: stamped.remoteMtime,
+			});
+		} else if (localSnapshot?.sha256 === stamped.sha256) {
+			this.indexManager.updateLocalFile(path, {
+				...stamped,
+				mtime:
+					this.vaultAdapter.getFileMtime(path) ||
+					stamped.mtime,
+				syncedAt: Date.now(),
+			});
+		}
+	}
+
+	/**
 	 * Finish logical moves left pending by an interrupted device.
 	 */
-	private async resumePendingMoves(result: SyncResult): Promise<void> {
+	private async resumePendingMoves(
+		result: SyncResult,
+		reportUnresolved = false,
+	): Promise<void> {
 		const pendingMoves = Object.values(
 			this.indexManager.getRemoteIndex().moves,
 		).filter((move) => move.pending);
 		if (pendingMoves.length === 0) return;
 
 		let changed = false;
+		let recovered = 0;
+		let unresolved = 0;
+		const completedLocalMutationIds: string[] = [];
 		for (const move of pendingMoves) {
 			try {
 				if (
@@ -2920,7 +3706,13 @@ export class SyncEngine {
 						?.deleted
 				) {
 					this.indexManager.completeMove(move.id);
+					if (
+						this.stageRecoveredMoveMutation(move.id)
+					) {
+						completedLocalMutationIds.push(move.id);
+					}
 					changed = true;
+					recovered++;
 					continue;
 				}
 				if (move.kind === "file") {
@@ -2933,19 +3725,9 @@ export class SyncEngine {
 						!target.deleted &&
 						target.lastModifiedBy !== move.lastModifiedBy
 					) {
-						this.indexManager.completeMove(move.id);
-						const action =
-							this.indexManager.getPendingPhysicalAction(
-								"move-remote",
-								move.fromPath,
-							);
-						if (action) {
-							this.indexManager.completePhysicalAction(
-								action.id,
-							);
-						}
-						changed = true;
-						continue;
+						throw new Error(
+							`Move target changed concurrently: ${move.toPath}`,
+						);
 					}
 				}
 				if (move.kind === "folder") {
@@ -2969,7 +3751,13 @@ export class SyncEngine {
 					);
 					if (hasConcurrentSurvivor || hasRejectedTarget) {
 						this.indexManager.completeMove(move.id);
+						if (
+							this.stageRecoveredMoveMutation(move.id)
+						) {
+							completedLocalMutationIds.push(move.id);
+						}
 						changed = true;
+						recovered++;
 						continue;
 					}
 				}
@@ -2992,17 +3780,77 @@ export class SyncEngine {
 					move.toPath,
 				);
 				this.indexManager.completeMove(move.id);
+				if (this.stageRecoveredMoveMutation(move.id)) {
+					completedLocalMutationIds.push(move.id);
+				}
 				changed = true;
+				recovered++;
 			} catch (e) {
+				unresolved++;
 				logger.warn(
 					`Could not resume pending move ${move.fromPath} -> ${move.toPath}:`,
-					{ error: e },
+					{
+						finalPass: reportUnresolved,
+						error: e,
+					},
 				);
+				if (reportUnresolved) {
+					result.errors.push({
+						path: move.toPath,
+						operation: "none",
+						message: `Pending move ${move.fromPath} -> ${move.toPath}: ${
+							e instanceof Error ? e.message : String(e)
+						}`,
+					});
+				}
 			}
 		}
 		if (changed) {
-			await this.saveRemoteIndexOrAbort(result, false);
+			let committed = false;
+			this.indexManager.beginPhysicalRewriteCommit();
+			try {
+				committed = await this.saveRemoteIndexOrAbort(result, false);
+			} finally {
+				this.indexManager.cancelPhysicalRewriteCommit();
+			}
+			if (committed) {
+				for (const id of completedLocalMutationIds) {
+					this.indexManager.confirmMutation(id);
+				}
+				if (
+					completedLocalMutationIds.length > 0 &&
+					this.indexSaveCallback
+				) {
+					await this.indexSaveCallback();
+				}
+			}
 		}
+		logger[unresolved > 0 && reportUnresolved ? "warn" : "info"](
+			"Pending file move recovery completed",
+			{
+				finalPass: reportUnresolved,
+				attempted: pendingMoves.length,
+				recovered,
+				unresolved,
+			},
+		);
+	}
+
+	/**
+	 * Stage the local half of a recovered canonical move, when this device
+	 * still owns its durable FIFO mutation.
+	 */
+	private stageRecoveredMoveMutation(moveId: string): boolean {
+		const mutation = this.indexManager
+			.getPendingMutations()
+			.find(
+				(candidate) =>
+					candidate.id === moveId &&
+					candidate.type === "move",
+			);
+		if (!mutation) return false;
+		this.indexManager.stageMutation(mutation);
+		return true;
 	}
 
 	/**

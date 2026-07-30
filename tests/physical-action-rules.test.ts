@@ -102,6 +102,36 @@ test("force cleanup is authorized only by absence in the replacement epoch", () 
 	);
 });
 
+test("retargeted upload cleanup requires the accepted target put", () => {
+	const canonical = createEmptyIndex("device", "epoch");
+	const cleanup = {
+		...action("epoch", "rejected-upload"),
+		targetPath: "renamed.md",
+		baselineSha256: "target",
+	};
+	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), false);
+
+	canonical.files["renamed.md"] = {
+		path: "renamed.md",
+		sha256: "target",
+		size: 3,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 3,
+	};
+	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), true);
+
+	canonical.files["note.md"] = {
+		path: "note.md",
+		sha256: "concurrent",
+		size: 3,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 4,
+	};
+	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), false);
+});
+
 test("unknown or changed local content requires backup before deletion", () => {
 	assert.equal(shouldBackupLocalDelete("current", undefined), true);
 	assert.equal(shouldBackupLocalDelete("current", "baseline"), true);

@@ -6,14 +6,25 @@ import { App, TFile, TFolder, EventRef } from "obsidian";
 import { SyncEngine } from "./sync-engine";
 import type { YandexDiskSyncSettings } from "../types";
 import { logger } from "../utils/logger";
+import {
+	shouldRetainQueuedFileEvent,
+	type RealtimeBatchResult,
+	type RealtimeFileEvent,
+	type WatcherCausalContext,
+} from "./realtime-rules";
 
 export type DeferredWatcherEvent =
-	| { action: "upload" | "delete" | "delete-folder"; path: string }
+	| RealtimeFileEvent
+	| { action: "delete-folder"; path: string }
 	| {
-			action: "rename";
-			path: string;
-			targetPath: string;
-			kind: "file" | "folder";
+		action: "rename";
+		path: string;
+		targetPath: string;
+		kind: "file" | "folder";
+		id?: string;
+		epoch?: string | null;
+		baseRevision?: number | null;
+		createdAt?: number;
 	  };
 
 export class FileWatcher {
@@ -26,11 +37,16 @@ export class FileWatcher {
 		string,
 		{
 			timer: ReturnType<typeof setTimeout>;
-			action: "upload" | "delete";
+			event: RealtimeFileEvent;
 		}
 	>();
-	private readyFileEvents = new Map<string, "upload" | "delete">();
+	private readyFileEvents = new Map<string, RealtimeFileEvent>();
+	private submittedFileEvents = new Map<string, RealtimeFileEvent>();
+	private submittedWatcherEventIds = new Set<string>();
 	private batchFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	private deferredReplayTimer: ReturnType<typeof setTimeout> | null = null;
+	private deferredDrainPromise: Promise<void> | null = null;
+	private deferredReplayRequested = false;
 	private isEnabled = false;
 	private isLayoutReady = false;
 	private isPausedForSync = false;
@@ -38,6 +54,8 @@ export class FileWatcher {
 	private recentFolderDeletes = new Map<string, number>();
 	private deferredEvents: DeferredWatcherEvent[] = [];
 	private persistCallback: (() => void | Promise<void>) | null = null;
+	private persistChain: Promise<void> = Promise.resolve();
+	private persistError: unknown = null;
 
 	constructor(
 		app: App,
@@ -64,10 +82,15 @@ export class FileWatcher {
 	}
 
 	loadDeferredEvents(events: DeferredWatcherEvent[] | undefined): void {
-		this.deferredEvents = Array.isArray(events) ? [...events] : [];
+		this.deferredEvents = Array.isArray(events)
+			? events.map((event) => this.normalizeEvent(event))
+			: [];
 		logger.info("Loaded durable watcher event queue", {
 			pendingWatcherEvents: this.deferredEvents.length,
 		});
+		if (this.deferredEvents.length > 0) {
+			this.persistDeferredEvents();
+		}
 	}
 
 	getDeferredEvents(): DeferredWatcherEvent[] {
@@ -91,18 +114,22 @@ export class FileWatcher {
 		this.isPausedForSync = true;
 		logger.info("[FileWatcher] Paused for full sync");
 
-		for (const [path, pending] of this.debounceTimers) {
+		for (const pending of this.debounceTimers.values()) {
 			clearTimeout(pending.timer);
-			this.deferEvent({ action: pending.action, path });
+			this.deferEvent(pending.event);
 		}
 		this.debounceTimers.clear();
-		for (const [path, action] of this.readyFileEvents) {
-			this.deferEvent({ action, path });
+		for (const event of this.readyFileEvents.values()) {
+			this.deferEvent(event);
 		}
 		this.readyFileEvents.clear();
 		if (this.batchFlushTimer) {
 			clearTimeout(this.batchFlushTimer);
 			this.batchFlushTimer = null;
+		}
+		if (this.deferredReplayTimer) {
+			clearTimeout(this.deferredReplayTimer);
+			this.deferredReplayTimer = null;
 		}
 	}
 
@@ -165,18 +192,22 @@ export class FileWatcher {
 		}
 
 		// Clear all debounce timers
-		for (const [path, pending] of this.debounceTimers) {
+		for (const pending of this.debounceTimers.values()) {
 			clearTimeout(pending.timer);
-			this.deferEvent({ action: pending.action, path });
+			this.deferEvent(pending.event);
 		}
 		this.debounceTimers.clear();
-		for (const [path, action] of this.readyFileEvents) {
-			this.deferEvent({ action, path });
+		for (const event of this.readyFileEvents.values()) {
+			this.deferEvent(event);
 		}
 		this.readyFileEvents.clear();
 		if (this.batchFlushTimer) {
 			clearTimeout(this.batchFlushTimer);
 			this.batchFlushTimer = null;
+		}
+		if (this.deferredReplayTimer) {
+			clearTimeout(this.deferredReplayTimer);
+			this.deferredReplayTimer = null;
 		}
 
 		// Unsubscribe from events
@@ -246,7 +277,7 @@ export class FileWatcher {
 			return;
 		}
 		if (this.isPausedForSync) {
-			this.deferEvent({ action: "upload", path: file.path });
+			this.deferEvent(this.createFileEvent(file.path, "upload"));
 			return;
 		}
 
@@ -264,7 +295,7 @@ export class FileWatcher {
 			return;
 		}
 		if (this.isPausedForSync) {
-			this.deferEvent({ action: "upload", path: file.path });
+			this.deferEvent(this.createFileEvent(file.path, "upload"));
 			return;
 		}
 
@@ -290,13 +321,13 @@ export class FileWatcher {
 			return;
 		}
 		if (this.isPausedForSync) {
-			this.deferEvent({ action: "delete", path: file.path });
+			const event = this.createFileEvent(file.path, "delete");
+			this.deferEvent(event);
+			this.cancelPendingSync(file.path);
 			return;
 		}
 
 		logger.info(`[FileWatcher] File deleted: ${file.path}`);
-		// Cancel pending upload if exists
-		this.cancelPendingSync(file.path);
 		this.scheduleSync(file.path, "delete");
 	}
 
@@ -304,29 +335,24 @@ export class FileWatcher {
 	 * Handle file rename
 	 */
 	private handleFileRename(file: TFile, oldPath: string): void {
+		const context = this.syncEngine.getWatcherCausalContext();
+		const event: DeferredWatcherEvent = {
+			action: "rename",
+			path: oldPath,
+			targetPath: file.path,
+			kind: "file",
+			id: this.createEventId(),
+			...context,
+			createdAt: Date.now(),
+		};
+		this.deferEvent(event);
+		this.cancelPendingSync(oldPath);
 		if (this.isPausedForSync) {
-			this.deferEvent({
-				action: "rename",
-				path: oldPath,
-				targetPath: file.path,
-				kind: "file",
-			});
 			return;
 		}
 
 		logger.debug(`File renamed: ${oldPath} -> ${file.path}`);
-		// Cancel pending sync for old path
-		this.cancelPendingSync(oldPath);
-		// Perform rename
-		this.syncEngine.renameFile(oldPath, file.path).catch((e) => {
-			this.deferEvent({
-				action: "rename",
-				path: oldPath,
-				targetPath: file.path,
-				kind: "file",
-			});
-			logger.error(`Error renaming ${oldPath} -> ${file.path}:`, { error: e });
-		});
+		this.scheduleDeferredReplay();
 	}
 
 	private handleFolderDelete(folder: TFolder): void {
@@ -381,16 +407,68 @@ export class FileWatcher {
 	private deferEvent(
 		event: DeferredWatcherEvent,
 	): void {
+		event = this.normalizeEvent(event);
 		const before = this.deferredEvents.length;
+		if (event.action === "rename" && event.kind === "file") {
+			const chainedIndex = this.deferredEvents.findIndex(
+				(existing) =>
+					existing.action === "rename" &&
+					existing.kind === "file" &&
+					existing.targetPath === event.path &&
+					(!existing.id ||
+						!this.submittedWatcherEventIds.has(existing.id)),
+			);
+			if (chainedIndex >= 0) {
+				const chained = this.deferredEvents[chainedIndex];
+				if (
+					chained?.action === "rename" &&
+					chained.kind === "file"
+				) {
+					this.deferredEvents[chainedIndex] = {
+						...chained,
+						targetPath: event.targetPath,
+					};
+					logger.debug("Watcher file rename chain coalesced", {
+						eventId: chained.id,
+						oldPath: chained.path,
+						intermediatePath: event.path,
+						targetPath: event.targetPath,
+						pendingWatcherEvents: this.deferredEvents.length,
+					});
+					this.persistDeferredEvents();
+					return;
+				}
+			}
+		}
 		if (event.action === "delete-folder") {
 			const prefix = `${event.path.replace(/\/+$/, "")}/`;
 			this.deferredEvents = this.deferredEvents.filter(
 				(existing) => !existing.path.startsWith(prefix),
 			);
 		}
-		this.deferredEvents = this.deferredEvents.filter(
-			(existing) => existing.path !== event.path,
-		);
+		if (event.action === "upload" || event.action === "delete") {
+			const submittedIds = new Set(
+				this.submittedFileEvents.keys(),
+			);
+			this.deferredEvents = this.deferredEvents.filter(
+				(existing) =>
+					existing.action !== "upload" &&
+					existing.action !== "delete"
+						? true
+						: shouldRetainQueuedFileEvent(
+								existing,
+								event,
+								submittedIds,
+							),
+			);
+		} else {
+			this.deferredEvents = this.deferredEvents.filter(
+				(existing) =>
+					existing.path !== event.path ||
+					(existing.action === "upload" &&
+						this.submittedFileEvents.has(existing.id)),
+			);
+		}
 		this.deferredEvents.push(event);
 		logger.debug("Watcher event persisted for replay", {
 			action: event.action,
@@ -405,15 +483,42 @@ export class FileWatcher {
 	}
 
 	private async flushDeferredEvents(): Promise<void> {
-		const events = this.deferredEvents.splice(0);
+		if (this.deferredDrainPromise) {
+			this.deferredReplayRequested = true;
+			return await this.deferredDrainPromise;
+		}
+		const drain = this.flushDeferredEventsNow();
+		this.deferredDrainPromise = drain;
+		try {
+			await drain;
+		} finally {
+			this.deferredDrainPromise = null;
+			if (this.deferredReplayRequested && !this.isPausedForSync) {
+				this.deferredReplayRequested = false;
+				this.scheduleDeferredReplay();
+			}
+		}
+	}
+
+	private async flushDeferredEventsNow(): Promise<void> {
+		await this.waitForPersistence();
+		const events = this.deferredEvents.filter(
+			(event) =>
+				!(
+					(event.action === "upload" || event.action === "delete") &&
+					this.submittedFileEvents.has(event.id)
+				) &&
+				!(
+					event.action === "rename" &&
+					event.kind === "file" &&
+					event.id &&
+					this.submittedWatcherEventIds.has(event.id)
+				),
+		);
 		logger.info("Replaying durable watcher events", {
 			watcherEvents: events.length,
 		});
-		this.persistDeferredEvents();
-		let fileBatch: Array<{
-			path: string;
-			action: "upload" | "delete";
-		}> = [];
+		let fileBatch: RealtimeFileEvent[] = [];
 		const flushFileBatch = async (): Promise<void> => {
 			if (fileBatch.length === 0) return;
 			const batch = fileBatch;
@@ -422,13 +527,21 @@ export class FileWatcher {
 				batchSize: batch.length,
 				events: batch,
 			});
-			if (!(await this.syncEngine.syncFileBatch(batch))) {
-				for (const event of batch) {
-					this.deferEvent(event);
+			for (const event of batch) {
+				this.submittedFileEvents.set(event.id, event);
+			}
+			try {
+				const result = await this.syncEngine.syncFileBatch(batch);
+				this.applyBatchResult(result);
+				if (result.retry.length > 0) {
+					throw new Error(
+						"Realtime file batch was not fully reconciled",
+					);
 				}
-				throw new Error(
-					"Realtime file batch was not fully reconciled",
-				);
+			} finally {
+				for (const event of batch) {
+					this.submittedFileEvents.delete(event.id);
+				}
 			}
 		};
 
@@ -443,10 +556,7 @@ export class FileWatcher {
 							: undefined,
 				});
 				if (event.action === "upload" || event.action === "delete") {
-					fileBatch.push({
-						path: event.path,
-						action: event.action,
-					});
+					fileBatch.push(event);
 					continue;
 				}
 				await flushFileBatch();
@@ -456,36 +566,38 @@ export class FileWatcher {
 							event.path,
 							event.targetPath,
 						);
+						this.acknowledgeLegacyEvent(event);
 					} else {
-						await this.syncEngine.renameFile(
-							event.path,
-							event.targetPath,
-						);
+						if (event.id) {
+							this.submittedWatcherEventIds.add(event.id);
+						}
+						try {
+							await this.syncEngine.renameFile(
+								event.path,
+								event.targetPath,
+								this.getEventContext(event),
+							);
+							if (event.id) {
+								this.acknowledgeEvents([event.id]);
+							}
+						} finally {
+							if (event.id) {
+								this.submittedWatcherEventIds.delete(event.id);
+							}
+						}
 					}
 				} else if (event.action === "delete-folder") {
 					await this.syncEngine.deleteFolder(event.path);
+					this.acknowledgeLegacyEvent(event);
 				}
 			} catch (e) {
-				this.deferEvent(event);
 				logger.error(
 					`Deferred watcher event failed for ${event.path}:`,
 					{ error: e },
 				);
 			}
 		}
-		try {
-			await flushFileBatch();
-		} catch (error) {
-			for (const event of events) {
-				if (
-					event.action === "upload" ||
-					event.action === "delete"
-				) {
-					this.deferEvent(event);
-				}
-			}
-			throw error;
-		}
+		await flushFileBatch();
 		this.persistDeferredEvents();
 		logger.info("Durable watcher event replay completed", {
 			replayedEvents: events.length,
@@ -496,36 +608,48 @@ export class FileWatcher {
 	private persistDeferredEvents(): void {
 		if (!this.persistCallback) return;
 		const pendingWatcherEvents = this.deferredEvents.length;
-		void Promise.resolve(this.persistCallback()).then(
-			() => {
+		this.persistChain = this.persistChain.then(async () => {
+			try {
+				await this.persistCallback?.();
+				this.persistError = null;
 				logger.debug("Durable watcher event queue saved", {
 					pendingWatcherEvents,
 				});
-			},
-			(error) => {
+			} catch (error) {
+				this.persistError = error;
 				logger.error("Could not persist deferred watcher events:", {
 					pendingWatcherEvents,
 					error,
 				});
-			},
-		);
+			}
+		});
+	}
+
+	/**
+	 * Wait until the durable event queue is confirmed on local storage.
+	 */
+	private async waitForPersistence(): Promise<void> {
+		await this.persistChain;
+		if (this.persistError) {
+			throw new Error("Durable watcher event queue could not be saved");
+		}
 	}
 
 	/**
 	 * Schedule sync with debounce
 	 */
 	private scheduleSync(path: string, action: "upload" | "delete"): void {
-		// Cancel previous timer for this file
+		const event = this.createFileEvent(path, action);
+		this.deferEvent(event);
 		this.cancelPendingSync(path);
 
-		// Create new timer
 		const timer = setTimeout(() => {
 			this.debounceTimers.delete(path);
-			this.readyFileEvents.set(path, action);
+			this.readyFileEvents.set(path, event);
 			this.scheduleBatchFlush();
 		}, this.settings.debounceDelay);
 
-		this.debounceTimers.set(path, { timer, action });
+		this.debounceTimers.set(path, { timer, event });
 		logger.debug("Watcher event scheduled for realtime batch", {
 			action,
 			path,
@@ -542,8 +666,20 @@ export class FileWatcher {
 		if (pending) {
 			clearTimeout(pending.timer);
 			this.debounceTimers.delete(path);
+			pending.event.superseded = true;
+			this.acknowledgeEvents([pending.event.id]);
 		}
-		this.readyFileEvents.delete(path);
+		const ready = this.readyFileEvents.get(path);
+		if (ready) {
+			ready.superseded = true;
+			this.readyFileEvents.delete(path);
+			this.acknowledgeEvents([ready.id]);
+		}
+		for (const event of this.submittedFileEvents.values()) {
+			if (event.path !== path) continue;
+			event.superseded = true;
+			this.acknowledgeEvents([event.id]);
+		}
 	}
 
 	private cancelPendingDescendants(folderPath: string): number {
@@ -553,13 +689,20 @@ export class FileWatcher {
 			if (!path.startsWith(prefix)) continue;
 			clearTimeout(pending.timer);
 			this.debounceTimers.delete(path);
+			pending.event.superseded = true;
+			this.acknowledgeEvents([pending.event.id]);
 			cancelled++;
 		}
-		for (const path of this.readyFileEvents.keys()) {
+		for (const [path, event] of this.readyFileEvents) {
 			if (path.startsWith(prefix)) {
 				this.readyFileEvents.delete(path);
+				event.superseded = true;
+				this.acknowledgeEvents([event.id]);
 				cancelled++;
 			}
+		}
+		for (const event of this.submittedFileEvents.values()) {
+			if (event.path.startsWith(prefix)) event.superseded = true;
 		}
 		return cancelled;
 	}
@@ -568,28 +711,121 @@ export class FileWatcher {
 		if (this.batchFlushTimer) return;
 		this.batchFlushTimer = setTimeout(() => {
 			this.batchFlushTimer = null;
-			const events = Array.from(
-				this.readyFileEvents,
-				([path, action]) => ({ path, action }),
-			);
+			const events = Array.from(this.readyFileEvents.values());
 			this.readyFileEvents.clear();
-			void this.syncEngine
-				.syncFileBatch(events)
-				.then((completed) => {
-					if (completed) return;
-					for (const event of events) {
-						this.deferEvent(event);
-					}
+			for (const event of events) {
+				this.submittedFileEvents.set(event.id, event);
+			}
+			void this.waitForPersistence()
+				.then(async () => await this.syncEngine.syncFileBatch(events))
+				.then((result) => {
+					this.applyBatchResult(result);
 				})
 				.catch((e) => {
-					for (const event of events) {
-						this.deferEvent(event);
-					}
 					logger.error("Error synchronizing realtime file batch:", {
 						error: e,
 					});
+				})
+				.finally(() => {
+					for (const event of events) {
+						this.submittedFileEvents.delete(event.id);
+					}
 				});
 		}, 75);
+	}
+
+	private scheduleDeferredReplay(): void {
+		if (this.deferredReplayTimer || this.isPausedForSync) return;
+		this.deferredReplayTimer = setTimeout(() => {
+			this.deferredReplayTimer = null;
+			void this.flushDeferredEvents().catch((error) => {
+				logger.error("Could not drain durable watcher queue:", {
+					error,
+				});
+			});
+		}, 75);
+	}
+
+	/**
+	 * Remove only events explicitly acknowledged by the sync engine.
+	 */
+	private applyBatchResult(result: RealtimeBatchResult): void {
+		this.acknowledgeEvents([...result.completed, ...result.superseded]);
+		logger.info("Realtime file batch reconciled", {
+			completed: result.completed.length,
+			superseded: result.superseded.length,
+			retry: result.retry.length,
+		});
+	}
+
+	private acknowledgeEvents(ids: string[]): void {
+		if (ids.length === 0) return;
+		const acknowledged = new Set(ids);
+		this.deferredEvents = this.deferredEvents.filter(
+			(event) =>
+				!("id" in event) ||
+				!event.id ||
+				!acknowledged.has(event.id),
+		);
+		this.persistDeferredEvents();
+	}
+
+	private acknowledgeLegacyEvent(event: DeferredWatcherEvent): void {
+		const index = this.deferredEvents.indexOf(event);
+		if (index >= 0) {
+			this.deferredEvents.splice(index, 1);
+			this.persistDeferredEvents();
+		}
+	}
+
+	private getEventContext(event: {
+		epoch?: string | null;
+		baseRevision?: number | null;
+	}): WatcherCausalContext {
+		const current = this.syncEngine.getWatcherCausalContext();
+		return {
+			epoch: event.epoch === undefined ? current.epoch : event.epoch,
+			baseRevision:
+				event.baseRevision === undefined
+					? current.baseRevision
+					: event.baseRevision,
+		};
+	}
+
+	private normalizeEvent(
+		event: DeferredWatcherEvent,
+	): DeferredWatcherEvent {
+		if (event.action === "delete-folder") return { ...event };
+		const context = this.getEventContext(event);
+		return {
+			...event,
+			id: event.id ?? this.createEventId(),
+			...context,
+			createdAt: event.createdAt ?? Date.now(),
+		};
+	}
+
+	private createEventId(): string {
+		return (
+			globalThis.crypto?.randomUUID?.() ??
+			`${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+		);
+	}
+
+	/**
+	 * Capture the causal watermark together with a new watcher event.
+	 */
+	private createFileEvent(
+		path: string,
+		action: "upload" | "delete",
+	): RealtimeFileEvent {
+		return {
+			id: this.createEventId(),
+			path,
+			action,
+			createdAt: Date.now(),
+			...this.syncEngine.getWatcherCausalContext(),
+		};
 	}
 
 	/**

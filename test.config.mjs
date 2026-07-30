@@ -20,6 +20,9 @@ const outputFiles = [
 	join(outputDir, "logger.test.mjs"),
 	join(outputDir, "vault-adapter.test.mjs"),
 	join(outputDir, "folder-delete.test.mjs"),
+	join(outputDir, "realtime-rules.test.mjs"),
+	join(outputDir, "file-watcher.test.mjs"),
+	join(outputDir, "file-rename.test.mjs"),
 ];
 const obsidianStubPlugin = {
 	name: "obsidian-test-stub",
@@ -69,6 +72,9 @@ try {
 			"tests/logger.test.ts",
 			"tests/vault-adapter.test.ts",
 			"tests/folder-delete.test.ts",
+			"tests/realtime-rules.test.ts",
+			"tests/file-watcher.test.ts",
+			"tests/file-rename.test.ts",
 		],
 		bundle: true,
 		platform: "node",

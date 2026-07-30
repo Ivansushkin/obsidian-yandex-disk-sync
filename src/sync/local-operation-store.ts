@@ -152,6 +152,57 @@ export class LocalOperationStore {
 		return undefined;
 	}
 
+	/**
+	 * Retarget an unconfirmed put while preserving its FIFO sequence and
+	 * causal baseline.
+	 */
+	retargetLatestPut(
+		oldPath: string,
+		newPath: string,
+		sha256: string,
+		baselineSha256?: string,
+	): PendingMutation | undefined {
+		for (let index = this.pendingMutations.length - 1; index >= 0; index--) {
+			const mutation = this.pendingMutations[index];
+			if (mutation?.type !== "put" || mutation.path !== oldPath) continue;
+			mutation.path = newPath;
+			mutation.sha256 = sha256;
+			if (baselineSha256 !== undefined) {
+				mutation.baselineSha256 = baselineSha256;
+			}
+			logger.debug("Pending put retargeted", {
+				mutationId: mutation.id,
+				mutationSeq: mutation.seq,
+				baseRevision: mutation.baseRevision,
+				oldPath,
+				newPath,
+			});
+			return mutation;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Convert an uncommitted put into a delete without introducing a FIFO gap.
+	 */
+	replacePutWithDelete(id: string): PendingMutation | undefined {
+		const mutation = this.pendingMutations.find(
+			(candidate) => candidate.id === id && candidate.type === "put",
+		);
+		if (!mutation) return undefined;
+		mutation.type = "delete-file";
+		mutation.targetPath = undefined;
+		mutation.resourceKind = undefined;
+		mutation.sha256 = undefined;
+		logger.debug("Pending put superseded by delete", {
+			mutationId: mutation.id,
+			mutationSeq: mutation.seq,
+			baseRevision: mutation.baseRevision,
+			path: mutation.path,
+		});
+		return mutation;
+	}
+
 	stageMutation(
 		appliedMutationSeq: Record<string, number>,
 		mutation: PendingMutation,

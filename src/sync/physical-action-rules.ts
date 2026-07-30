@@ -18,6 +18,18 @@ export function isPhysicalDeleteAuthorized(
 	if (action.origin === "force-reset") {
 		return metadata === undefined;
 	}
+	if (action.origin === "rejected-upload") {
+		const target = action.targetPath
+			? canonical.files[action.targetPath]
+			: undefined;
+		return (
+			metadata === undefined &&
+			target !== undefined &&
+			!target.deleted &&
+			(action.baselineSha256 === undefined ||
+				target.sha256 === action.baselineSha256)
+		);
+	}
 	return metadata?.deleted === true;
 }
 

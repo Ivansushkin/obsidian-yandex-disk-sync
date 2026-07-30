@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.0.0-beta.5
+
+### Fixed
+
+- Fixed rapid create or modify followed by file rename/move. An unconfirmed
+  source upload is now retargeted to the final path while preserving its FIFO
+  sequence and causal baseline.
+- Prevented missing stale upload events from retrying after a confirmed
+  tombstone or move, while retaining genuinely unreadable files for retry.
+- Added causal rename planning for unsynchronized, previously synchronized,
+  concurrently created, and locally modified sources.
+- Made guarded file moves recover a missing physical target from the verified
+  local snapshot through an exclusive upload, verify ambiguous API outcomes,
+  and update the target server fingerprint before completion.
+- Added fingerprint-guarded cleanup for a stale physical source left by an
+  upload that was retargeted before its canonical commit.
+- Added a post-operation move recovery pass. A full reconciliation with
+  unresolved causal moves now completes with errors and does not advance the
+  observed revision.
+- Confirmed the originating device mutation watermark in the same completion
+  commit when full sync recovers an interrupted move.
+- Serialized durable watcher replay, coalesced quick file rename chains, and
+  acknowledged events by stable ID without duplicating failed entries.
+
+### Testing
+
+- Added plaintext and encrypted unsynchronized rename coverage, beta.4
+  missing-target recovery, watcher queue normalization and coalescing,
+  mutation retargeting, causal watermark, and stale-upload supersede tests.
+
 ## 2.0.0-beta.4
 
 ### Fixed
