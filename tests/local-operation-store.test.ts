@@ -99,6 +99,42 @@ test("delete supersedes an uncommitted put without a FIFO gap", () => {
 	assert.equal(applied["device-a"], 1);
 });
 
+test("full-sync no-op preserves and completes the original FIFO sequence", () => {
+	const firstStore = new LocalOperationStore("device-a");
+	firstStore.loadMutations(undefined, 1);
+	const put = firstStore.enqueueMutation(
+		"put",
+		"missing.md",
+		"epoch-a",
+		7,
+		{
+			sha256: "obsolete-content",
+			baselineSha256: "baseline",
+		},
+	);
+
+	const noop = firstStore.replacePutWithNoop(put.id);
+
+	assert.ok(noop);
+	assert.equal(noop.id, put.id);
+	assert.equal(noop.seq, put.seq);
+	assert.equal(noop.epoch, put.epoch);
+	assert.equal(noop.baseRevision, put.baseRevision);
+	assert.equal(noop.type, "noop");
+	assert.equal(noop.sha256, undefined);
+	assert.equal(noop.baselineSha256, undefined);
+
+	const reloadedStore = new LocalOperationStore("device-a");
+	reloadedStore.loadMutations(firstStore.getMutations(), 2);
+	const applied: Record<string, number> = {};
+	reloadedStore.stagePendingMutations(applied);
+	reloadedStore.confirmAppliedMutations(applied);
+
+	assert.equal(applied["device-a"], 1);
+	assert.deepEqual(reloadedStore.getMutations(), []);
+	assert.equal(reloadedStore.getNextMutationSeq(), 2);
+});
+
 test("physical actions are idempotent and survive local reload", () => {
 	const firstStore = new LocalOperationStore("device-a");
 	const first = firstStore.enqueuePhysicalAction(

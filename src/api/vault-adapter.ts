@@ -139,17 +139,6 @@ export class VaultAdapter {
 	}
 
 	/**
-	 * Read file content as string
-	 */
-	async readFileAsString(path: string): Promise<string> {
-		const file = this.getFile(path);
-		if (!file) {
-			throw new Error(`File not found: ${path}`);
-		}
-		return this.vault.read(file);
-	}
-
-	/**
 	 * Write file
 	 */
 	async writeFile(
@@ -195,36 +184,6 @@ export class VaultAdapter {
 	}
 
 	/**
-	 * Rename/move file
-	 */
-	async renameFile(oldPath: string, newPath: string): Promise<void> {
-		const file = this.getFile(oldPath);
-		if (!file) {
-			throw new Error(`File not found: ${oldPath}`);
-		}
-
-		// Ensure target folder exists
-		const dir = getDirectory(newPath);
-		if (dir && !this.folderExists(dir)) {
-			await this.createFolderRecursive(dir);
-		}
-
-		await this.vault.rename(file, normalizePath(newPath));
-		logger.debug(`Renamed file: ${oldPath} -> ${newPath}`);
-	}
-
-	/**
-	 * Create folder
-	 */
-	async createFolder(path: string): Promise<void> {
-		const normalizedPath = normalizePath(path);
-		if (!this.folderExists(normalizedPath)) {
-			await this.vault.createFolder(normalizedPath);
-			logger.debug(`Created folder: ${normalizedPath}`);
-		}
-	}
-
-	/**
 	 * Create folder with parent directories
 	 */
 	async createFolderRecursive(path: string): Promise<void> {
@@ -236,17 +195,6 @@ export class VaultAdapter {
 			if (!this.folderExists(currentPath)) {
 				await this.vault.createFolder(currentPath);
 			}
-		}
-	}
-
-	/**
-	 * Delete folder
-	 */
-	async deleteFolder(path: string): Promise<void> {
-		const folder = this.getFolder(path);
-		if (folder) {
-			await this.app.fileManager.trashFile(folder);
-			logger.debug(`Deleted folder: ${path}`);
 		}
 	}
 
@@ -399,27 +347,6 @@ export class VaultAdapter {
 	}
 
 	/**
-	 * Get file metadata
-	 */
-	async getFileMetadata(path: string): Promise<FileMetadata | null> {
-		const file = this.getFile(path);
-		if (!file) {
-			return null;
-		}
-
-		const content = await this.vault.readBinary(file);
-		const sha256 = await computeSha256(content);
-
-		return {
-			path: file.path,
-			sha256,
-			size: file.stat.size,
-			mtime: file.stat.mtime,
-			syncedAt: 0,
-		};
-	}
-
-	/**
 	 * Get metadata of all synchronizable files
 	 */
 	async getAllFileMetadata(): Promise<Map<string, FileMetadata>> {
@@ -471,11 +398,4 @@ export class VaultAdapter {
 		return file ? file.stat.mtime : null;
 	}
 
-	/**
-	 * Get file size
-	 */
-	getFileSize(path: string): number | null {
-		const file = this.getFile(path);
-		return file ? file.stat.size : null;
-	}
 }

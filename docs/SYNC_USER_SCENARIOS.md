@@ -94,6 +94,9 @@
 | SYNC-019 | P1  | Engine event приходит с большой задержкой        | Он подавляется по durable expectation, не по TTL                | auto: fault             |
 | SYNC-020 | P2  | Несколько scheduler/manual full одновременно     | Выполняется один coalesced full run                             | auto: coordinator       |
 | SYNC-021 | P2  | Realtime batch из нескольких файлов              | Контент читается и хешируется по одному разу, index commit один | auto: integration       |
+| SYNC-022 | P1  | Durable upload остался после закрытия до debounce, а файла при restart уже нет | Успешная full sync подтверждает captured ID без realtime replay и remote write | auto: `plaintext/encrypted no-op full consumes a stale watcher upload without remote write` |
+| SYNC-023 | P0  | Upload создан во время full sync                  | Новый ID не поглощается barrier и воспроизводится после full    | auto: `successful full barrier acknowledges only pre-full uploads` |
+| SYNC-024 | P0  | Full sync завершилась с ошибками при pre-full upload | Captured upload остаётся durable и повторяется позже            | auto: `failed full barrier retains every captured upload`; `failed full sync postpones watcher replay` |
 
 ## Удаление файла
 
@@ -294,6 +297,7 @@
 | DIAG-007 | P1 | Ни один index codec не читается               | Лог содержит стадии codec, размер, fingerprint и короткий SHA без index/ciphertext   | auto: index-manager |
 | DIAG-008 | P2 | Удаление папки поглощает дочерние watcher events | Лог содержит число live targets, пропущенных historical tombstones и оставшихся physical actions | auto: folder-delete |
 | DIAG-009 | P1 | После post-pass остаётся pending move          | Full sync пишет `completed with errors`, сохраняет action и не продвигает observed revision | auto: `unresolved final move recovery records a full-sync error`; manual-required |
+| DIAG-010 | P1 | Realtime batch вернул структурированный `retry` | Пишется warning-summary с `completed/superseded/retry`; событие остаётся durable без общего replay error | auto: `structured watcher retry remains durable without throwing` |
 
 ## Матрица вариантов
 

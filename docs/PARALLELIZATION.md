@@ -366,7 +366,6 @@ class Semaphore {
 
 	async acquire(): Promise<void>;
 	release(): void;
-	availablePermits(): number;
 }
 ```
 

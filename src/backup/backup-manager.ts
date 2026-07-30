@@ -6,7 +6,6 @@ import JSZip from "jszip";
 import type { YandexDiskSyncSettings, BackupInfo } from "../types";
 import { YandexDiskClient, YandexApiError } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
-import type { IndexManager } from "../sync/index-manager";
 import { joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { t } from "../i18n";
@@ -26,18 +25,15 @@ export interface BackupResult {
 export class BackupManager {
 	private yandexClient: YandexDiskClient;
 	private vaultAdapter: VaultAdapter;
-	private indexManager: IndexManager;
 	private settings: YandexDiskSyncSettings;
 
 	constructor(
 		yandexClient: YandexDiskClient,
 		vaultAdapter: VaultAdapter,
-		indexManager: IndexManager,
 		settings: YandexDiskSyncSettings,
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
-		this.indexManager = indexManager;
 		this.settings = settings;
 	}
 

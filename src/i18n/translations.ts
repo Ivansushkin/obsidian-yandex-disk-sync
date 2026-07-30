@@ -12,7 +12,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"command.show_status": "Show synchronization status",
 
 		// Status bar
-		"status.ready": "Ready",
 		"status.syncing": "Syncing...",
 		"status.error": "Error",
 		"status.paused": "Paused",
@@ -56,7 +55,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Synchronization started...",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.5 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.6 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.epoch_mismatch_blocked":
@@ -72,17 +71,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.token_missing":
 			"Please configure Yandex Disk token in plugin settings",
 		"notice.connection_test_success": "Connection successful",
-		"notice.connection_test_error": "Connection error",
 		"notice.connection_check": "Checking connection to Yandex Disk...",
-		"notice.download_started": "Downloading files from Yandex Disk...",
-		"notice.upload_started": "Uploading files to Yandex Disk...",
-		"notice.conflict_resolved": "Conflict resolved, copy created: {path}",
-		"notice.force_action_confirm": "This will overwrite {type}. Continue?",
 		"notice.backup_started": "Creating backup...",
 		"notice.backup_completed": "Backup created: {name}",
 
 		// Modal titles
-		"modal.confirm_title": "Confirm action",
 		"modal.status_title": "Synchronization status",
 
 		// Modal descriptions
@@ -102,7 +95,6 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		// Settings
 		"settings.connection_section": "Connection",
-		"settings.oauth_apps": "Getting and setting up disk OAuth token",
 		"settings.oauth_instruction_1": "1. Click 'Manage clients'",
 		"settings.oauth_instruction_2":
 			"2. Create and open a new Yandex OAuth app",
@@ -116,10 +108,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.manage_clients": "Manage clients",
 		"settings.get_token": "Get token",
 		"settings.client_id": "Client ID",
-		"settings.client_id_desc": "Client ID for Yandex OAuth application",
 		"settings.client_id_placeholder": "Enter Client ID",
 		"settings.oauth_token": "OAuth token",
-		"settings.oauth_token_desc": "Token for Yandex Disk API access",
 		"settings.oauth_token_placeholder": "Enter token",
 		"settings.remote_path": "Remote path",
 		"settings.remote_path_desc":
@@ -162,16 +152,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.information_section": "Information",
 		"settings.device_id": "Device ID",
 		"settings.device_id_desc": "Unique identifier for this device",
-		"settings.test_connection": "Test connection",
-		"settings.test_connection_desc": "Check connection to Yandex Disk",
 		"settings.sync_button": "Synchronize",
 		"settings.syncing_button": "Syncing...",
-		"settings.sync_success_button": "Synced!",
-		"settings.sync_error_button": "Error",
 		"settings.backup_section": "Backup",
 		"settings.backup_desc":
 			"Backup will be saved as a ZIP archive in the .backup folder on disk",
-		"settings.backup_last": "Last backup",
 		"settings.backup_never": "Never",
 		"settings.backup_button": "Create backup",
 		"settings.backup_show_all": "Show all backups",
@@ -213,8 +198,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_confirm_label": "Confirm password",
 		"modal.encryption_password_mismatch": "Passwords do not match",
 		"modal.encryption_enter_password": "Enter encryption password",
-		"modal.encryption_wrong_password":
-			"Wrong password. Please enter your encryption password.",
 		"modal.encryption_disable_title": "Disable encryption",
 		"modal.encryption_change_password_title": "Change encryption password",
 		"modal.encryption_enter_current_password":
@@ -276,25 +259,12 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		"generic.yes": "Yes",
 		"generic.confirm": "Confirm",
-		"generic.no": "No",
-		"generic.files": "files",
-		"generic.local": "local",
-		"generic.remote": "remote",
-		"generic.exists": "Exists",
-		"generic.none": "None",
-		"generic.unknown": "Unknown",
 
 		// Force sync
 		"settings.force_sync_section": "Force Sync",
 		"settings.force_sync_desc":
 			"Force synchronization ignores all conditions (timestamps, file hashes, indexes). Creates an exact copy in the specified direction.",
-		"settings.force_sync_from_local_name": "From local to remote",
-		"settings.force_sync_from_local_desc":
-			"Overwrite ALL files on Yandex Disk with local versions. Files not present locally will be deleted from disk.",
 		"settings.force_sync_from_local_button": "Sync from local → remote",
-		"settings.force_sync_from_remote_name": "From remote to local",
-		"settings.force_sync_from_remote_desc":
-			"Overwrite ALL local files with versions from Yandex Disk. Files not present on disk will be deleted locally.",
 		"settings.force_sync_from_remote_button": "Sync from remote → local",
 		"modal.force_sync_title": "Force sync confirmation",
 		"modal.force_sync_from_local_text":
@@ -313,17 +283,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_sync_completed":
 			"Force sync completed! ({successful} operations)",
 
-		// Diagnostics
-		"diag.sync_completed": "Synchronization completed successfully",
-		"diag.sync_failed": "Synchronization failed",
-		"diag.file_sync_started": "File synchronization started",
-		"diag.file_sync_completed": "File synchronization completed",
-		"diag.index_loaded": "Remote index loaded: {count} files",
-		"diag.index_saved": "Remote index saved",
-		"diag.folder_created": "Folder created: {path}",
-		"diag.file_uploaded": "File uploaded: {path}",
-		"diag.file_downloaded": "File downloaded: {path}",
-		"diag.file_deleted": "File deleted: {path}",
 	},
 	ru: {
 		// Commands
@@ -332,7 +291,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"command.show_status": "Показать статус синхронизации",
 
 		// Status bar
-		"status.ready": "Готов",
 		"status.syncing": "Синхронизация...",
 		"status.error": "Ошибка",
 		"status.paused": "Пауза",
@@ -377,7 +335,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Запуск синхронизации...",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.5 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.6 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.epoch_mismatch_blocked":
@@ -393,17 +351,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.token_missing":
 			"Настройте токен Яндекс Диска в настройках плагина",
 		"notice.connection_test_success": "Подключение успешно",
-		"notice.connection_test_error": "Ошибка подключения",
 		"notice.connection_check": "Проверка подключения к Яндекс Диску...",
-		"notice.download_started": "Скачивание файлов с Яндекс Диска...",
-		"notice.upload_started": "Загрузка файлов на Яндекс Диск...",
-		"notice.conflict_resolved": "Конфликт разрешён, создана копия: {path}",
-		"notice.force_action_confirm": "Это перезапишет {type}. Продолжить?",
 		"notice.backup_started": "Создание бекапа...",
 		"notice.backup_completed": "Бекап создан: {name}",
 
 		// Modal titles
-		"modal.confirm_title": "Подтверждение действия",
 		"modal.status_title": "Статус синхронизации",
 
 		// Modal descriptions
@@ -424,7 +376,6 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		// Settings
 		"settings.connection_section": "Подключение",
-		"settings.oauth_apps": "Получение и установка OAuth токена диска",
 		"settings.oauth_instruction_1": "1. Нажмите 'Управление клиентами'",
 		"settings.oauth_instruction_2":
 			"2. Создайте и откройте новое приложение Yandex OAuth",
@@ -438,10 +389,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.manage_clients": "Управление клиентами",
 		"settings.get_token": "Получить токен",
 		"settings.client_id": "Client ID",
-		"settings.client_id_desc": "Client ID для приложения Yandex OAuth",
 		"settings.client_id_placeholder": "Введите Client ID",
 		"settings.oauth_token": "OAuth токен",
-		"settings.oauth_token_desc": "Токен для доступа к Yandex Disk API",
 		"settings.oauth_token_placeholder": "Введите токен",
 		"settings.remote_path": "Путь на диске",
 		"settings.remote_path_desc":
@@ -484,16 +433,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.information_section": "Информация",
 		"settings.device_id": "ID устройства",
 		"settings.device_id_desc": "Уникальный идентификатор этого устройства",
-		"settings.test_connection": "Тестирование подключения",
-		"settings.test_connection_desc": "Проверка подключения к Yandex Disk",
 		"settings.sync_button": "Синхронизировать",
 		"settings.syncing_button": "Синхронизация...",
-		"settings.sync_success_button": "Синхронизация завершена!",
-		"settings.sync_error_button": "Ошибка",
 		"settings.backup_section": "Резервное копирование",
 		"settings.backup_desc":
 			"Бекап будет сохранен как zip архив в папку .backup на диске",
-		"settings.backup_last": "Последний бекап",
 		"settings.backup_never": "Не создавался",
 		"settings.backup_button": "Сделать бекап",
 		"settings.backup_show_all": "Показать все бекапы",
@@ -535,8 +479,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_confirm_label": "Подтверждение пароля",
 		"modal.encryption_password_mismatch": "Пароли не совпадают",
 		"modal.encryption_enter_password": "Введите пароль шифрования",
-		"modal.encryption_wrong_password":
-			"Неверный пароль. Пожалуйста, введите пароль шифрования.",
 		"modal.encryption_disable_title": "Отключение шифрования",
 		"modal.encryption_change_password_title": "Смена пароля шифрования",
 		"modal.encryption_enter_current_password":
@@ -598,25 +540,12 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		"generic.yes": "Да",
 		"generic.confirm": "Подтвердить",
-		"generic.no": "Нет",
-		"generic.files": "файлы",
-		"generic.local": "локальные",
-		"generic.remote": "удалённые",
-		"generic.exists": "Есть",
-		"generic.none": "Нет",
-		"generic.unknown": "Неизвестно",
 
 		// Force sync
 		"settings.force_sync_section": "Принудительная синхронизация",
 		"settings.force_sync_desc":
 			"Принудительная синхронизация игнорирует все условия (даты, хеши файлов, индексы). Создаёт точную копию в указанном направлении.",
-		"settings.force_sync_from_local_name": "Из локального в удалённое",
-		"settings.force_sync_from_local_desc":
-			"Перезаписать ВСЕ файлы на Яндекс.Диске локальными версиями. Файлы, отсутствующие локально, будут удалены с диска.",
 		"settings.force_sync_from_local_button": "Синхр. локальное → удалённое",
-		"settings.force_sync_from_remote_name": "Из удалённого в локальное",
-		"settings.force_sync_from_remote_desc":
-			"Перезаписать ВСЕ локальные файлы версиями с Яндекс.Диска. Файлы, отсутствующие на диске, будут удалены локально.",
 		"settings.force_sync_from_remote_button":
 			"Синхр. удалённое → локальное",
 		"modal.force_sync_title": "Подтверждение принудительной синхронизации",
@@ -636,16 +565,5 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_sync_completed":
 			"Принудительная синхронизация завершена! ({successful} операций)",
 
-		// Diagnostics
-		"diag.sync_completed": "Синхронизация успешно завершена",
-		"diag.sync_failed": "Синхронизация не удалась",
-		"diag.file_sync_started": "Синхронизация файла начата",
-		"diag.file_sync_completed": "Синхронизация файла завершена",
-		"diag.index_loaded": "Загружен удалённый индекс: {count} файлов",
-		"diag.index_saved": "Удалённый индекс сохранён",
-		"diag.folder_created": "Создана папка: {path}",
-		"diag.file_uploaded": "Файл загружен: {path}",
-		"diag.file_downloaded": "Файл скачан: {path}",
-		"diag.file_deleted": "Файл удалён: {path}",
 	},
 };

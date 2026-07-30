@@ -49,20 +49,6 @@ export function initI18n(): void {
 }
 
 /**
- * Get current language
- */
-export function getCurrentLanguage(): Language {
-    return currentLanguage;
-}
-
-/**
- * Set language manually (for testing)
- */
-export function setLanguage(language: Language): void {
-    currentLanguage = language;
-}
-
-/**
  * Get translated string by key
  */
 export function translate(key: string, params?: Record<string, string | number>): string {

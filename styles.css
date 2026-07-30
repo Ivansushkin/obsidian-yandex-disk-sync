@@ -31,18 +31,6 @@
 	font-weight: 600;
 }
 
-/* Initialization modal */
-.init-sync-info {
-	background: var(--background-secondary);
-	padding: 12px;
-	border-radius: 4px;
-	margin-bottom: 16px;
-}
-
-.init-sync-info p {
-	margin: 4px 0;
-}
-
 /* Status modal */
 .sync-status-stats {
 	background: var(--background-secondary);
@@ -53,14 +41,6 @@
 
 .sync-status-stats p {
 	margin: 8px 0;
-}
-
-/* Settings */
-.yandex-sync-settings textarea {
-	width: 100%;
-	min-height: 80px;
-	font-family: var(--font-monospace);
-	font-size: 12px;
 }
 
 /* OAuth buttons in settings - vertical layout for better responsiveness */

@@ -187,20 +187,6 @@ export class EncryptionService {
 		return crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
 	}
 
-	/**
-	 * Check if the key is initialized (i.e., `initializeKey()` was called successfully).
-	 */
-	isKeyInitialized(): boolean {
-		return this.key !== null;
-	}
-
-	/**
-	 * Return the salt for serialization.
-	 */
-	getSalt(): Uint8Array {
-		return this.salt;
-	}
-
 	// ============================================================================
 	// Private helpers
 	// ============================================================================

@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.0.0-beta.6
+
+### Fixed
+
+- Made a successful full reconciliation an ID-based barrier for stale
+  create/modify watcher uploads that were already durable before the full
+  session started.
+- Preserved uploads created during full sync, all delete/rename/folder events,
+  and every captured event when full sync completes with errors.
+- Settled pending puts against the state selected by full reconciliation:
+  accepted hashes advance the existing FIFO watermark, while superseded puts
+  become local no-ops without changing canonical files or index format.
+- Prevented covered uploads from starting a redundant realtime session after
+  full sync, including the extra encryption-manifest read in encrypted vaults.
+- Changed expected structured watcher retries to a warning summary while
+  retaining real persistence and API failures as errors.
+- Invalidated the cached remote-folder view before full and Force
+  reconciliation so externally removed folders are never assumed to exist.
+- Removed obsolete single-file sync, sequential operation, legacy adapter/API
+  helpers, unused UI state, translations, and styles superseded by the v3
+  coordinator and durable watcher pipeline.
+
+### Testing
+
+- Added full-sync barrier coverage for pre-session and in-session events,
+  failed full reconciliation, durable structured retries, and FIFO settlement
+  of accepted and superseded puts.
+- Added plaintext and encrypted full-reconciliation integration tests for a
+  stale watcher upload with no remote write and a watermark-only pending put.
+- Enabled TypeScript unused-local and unused-parameter checks for every build.
+
 ## 2.0.0-beta.5
 
 ### Fixed

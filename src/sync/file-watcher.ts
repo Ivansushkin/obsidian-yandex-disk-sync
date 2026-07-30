@@ -3,7 +3,11 @@
  */
 
 import { App, TFile, TFolder, EventRef } from "obsidian";
-import { SyncEngine } from "./sync-engine";
+import {
+	SyncEngine,
+	type SyncLifecycleContext,
+	type SyncLifecycleOutcome,
+} from "./sync-engine";
 import type { YandexDiskSyncSettings } from "../types";
 import { logger } from "../utils/logger";
 import {
@@ -56,6 +60,10 @@ export class FileWatcher {
 	private persistCallback: (() => void | Promise<void>) | null = null;
 	private persistChain: Promise<void> = Promise.resolve();
 	private persistError: unknown = null;
+	private fullSyncBarrier: {
+		sessionId: string;
+		uploadEventIds: Set<string>;
+	} | null = null;
 
 	constructor(
 		app: App,
@@ -104,7 +112,7 @@ export class FileWatcher {
 	/**
 	 * Pause file watching during full synchronization
 	 */
-	pauseForSync(): void {
+	async pauseForSync(context: SyncLifecycleContext): Promise<void> {
 		if (!this.isEnabled) {
 			return;
 		}
@@ -131,25 +139,109 @@ export class FileWatcher {
 			clearTimeout(this.deferredReplayTimer);
 			this.deferredReplayTimer = null;
 		}
+		if (context.kind === "full") {
+			this.captureFullSyncBarrier(context);
+		}
+		await this.waitForPersistence();
 	}
 
 	/**
 	 * Resume file watching after full synchronization
 	 */
-	resumeAfterSync(): void {
+	async resumeAfterSync(outcome: SyncLifecycleOutcome): Promise<void> {
 		if (!this.isEnabled) {
 			return;
 		}
 
 		this.syncPauseDepth = Math.max(0, this.syncPauseDepth - 1);
 		if (this.syncPauseDepth > 0) return;
+		this.completeFullSyncBarrier(outcome);
+		await this.waitForPersistence();
 		this.isPausedForSync = false;
 		logger.info("[FileWatcher] Resumed after full sync");
+		if (this.deferredEvents.length === 0) return;
+		if (outcome.kind === "full" && !outcome.success) {
+			logger.warn(
+				"Deferred watcher replay postponed after failed full sync",
+				{
+					sessionId: outcome.sessionId,
+					pendingWatcherEvents: this.deferredEvents.length,
+				},
+			);
+			return;
+		}
 		void this.flushDeferredEvents().catch((e) => {
 			logger.error("Failed to flush deferred watcher events:", {
 				error: e,
 			});
 		});
+	}
+
+	/**
+	 * Snapshot upload events that the upcoming full reconciliation will cover.
+	 */
+	private captureFullSyncBarrier(context: SyncLifecycleContext): void {
+		const uploadEventIds = new Set(
+			this.deferredEvents
+				.filter(
+					(event): event is RealtimeFileEvent =>
+						event.action === "upload",
+				)
+				.map((event) => event.id),
+		);
+		this.fullSyncBarrier = {
+			sessionId: context.sessionId,
+			uploadEventIds,
+		};
+		logger.info("Full sync watcher barrier captured", {
+			sessionId: context.sessionId,
+			capturedUploads: uploadEventIds.size,
+			pendingWatcherEvents: this.deferredEvents.length,
+		});
+	}
+
+	/**
+	 * Acknowledge only uploads included in a successful full reconciliation.
+	 */
+	private completeFullSyncBarrier(outcome: SyncLifecycleOutcome): void {
+		const barrier = this.fullSyncBarrier;
+		if (
+			!barrier ||
+			outcome.kind !== "full" ||
+			outcome.sessionId !== barrier.sessionId
+		) {
+			return;
+		}
+		this.fullSyncBarrier = null;
+		const currentUploadIds = new Set(
+			this.deferredEvents
+				.filter(
+					(event): event is RealtimeFileEvent =>
+						event.action === "upload",
+				)
+				.map((event) => event.id),
+		);
+		const acknowledgedIds = outcome.success
+			? [...barrier.uploadEventIds].filter((id) =>
+					currentUploadIds.has(id),
+				)
+			: [];
+		if (acknowledgedIds.length > 0) {
+			this.acknowledgeEvents(acknowledgedIds);
+		}
+		logger[outcome.success ? "info" : "warn"](
+			"Full sync watcher barrier completed",
+			{
+				sessionId: outcome.sessionId,
+				success: outcome.success,
+				capturedUploads: barrier.uploadEventIds.size,
+				acknowledgedUploads: acknowledgedIds.length,
+				uploadsCreatedDuringFull: [...currentUploadIds].filter(
+					(id) => !barrier.uploadEventIds.has(id),
+				).length,
+				pendingWatcherEvents: this.deferredEvents.length,
+			},
+		);
 	}
 
 	/**
@@ -518,6 +610,11 @@ export class FileWatcher {
 		logger.info("Replaying durable watcher events", {
 			watcherEvents: events.length,
 		});
+		const replayResult: RealtimeBatchResult = {
+			completed: [],
+			superseded: [],
+			retry: [],
+		};
 		let fileBatch: RealtimeFileEvent[] = [];
 		const flushFileBatch = async (): Promise<void> => {
 			if (fileBatch.length === 0) return;
@@ -533,11 +630,9 @@ export class FileWatcher {
 			try {
 				const result = await this.syncEngine.syncFileBatch(batch);
 				this.applyBatchResult(result);
-				if (result.retry.length > 0) {
-					throw new Error(
-						"Realtime file batch was not fully reconciled",
-					);
-				}
+				replayResult.completed.push(...result.completed);
+				replayResult.superseded.push(...result.superseded);
+				replayResult.retry.push(...result.retry);
 			} finally {
 				for (const event of batch) {
 					this.submittedFileEvents.delete(event.id);
@@ -599,10 +694,16 @@ export class FileWatcher {
 		}
 		await flushFileBatch();
 		this.persistDeferredEvents();
-		logger.info("Durable watcher event replay completed", {
-			replayedEvents: events.length,
-			pendingWatcherEvents: this.deferredEvents.length,
-		});
+		logger[replayResult.retry.length > 0 ? "warn" : "info"](
+			"Durable watcher event replay completed",
+			{
+				replayedEvents: events.length,
+				completed: replayResult.completed.length,
+				superseded: replayResult.superseded.length,
+				retry: replayResult.retry.length,
+				pendingWatcherEvents: this.deferredEvents.length,
+			},
+		);
 	}
 
 	private persistDeferredEvents(): void {
@@ -751,11 +852,14 @@ export class FileWatcher {
 	 */
 	private applyBatchResult(result: RealtimeBatchResult): void {
 		this.acknowledgeEvents([...result.completed, ...result.superseded]);
-		logger.info("Realtime file batch reconciled", {
-			completed: result.completed.length,
-			superseded: result.superseded.length,
-			retry: result.retry.length,
-		});
+		logger[result.retry.length > 0 ? "warn" : "info"](
+			"Realtime file batch reconciled",
+			{
+				completed: result.completed.length,
+				superseded: result.superseded.length,
+				retry: result.retry.length,
+			},
+		);
 	}
 
 	private acknowledgeEvents(ids: string[]): void {
@@ -828,10 +932,4 @@ export class FileWatcher {
 		};
 	}
 
-	/**
-	 * Check if watcher is active
-	 */
-	isActive(): boolean {
-		return this.isEnabled;
-	}
 }

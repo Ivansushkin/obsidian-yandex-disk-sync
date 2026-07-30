@@ -11,13 +11,6 @@ import { getFileName, getDirectory, getExtension } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { findFolderTombstone } from "./index-rules";
 
-export interface ConflictInfo {
-	path: string;
-	localMeta: FileMetadata;
-	remoteMeta: FileMetadata;
-	reason: string;
-}
-
 export class ConflictResolver {
 	/**
 	 * Determine action for file based on metadata comparison

@@ -327,6 +327,7 @@ export interface IndexMove {
 
 export type PendingMutationType =
 	| "put"
+	| "noop"
 	| "delete-file"
 	| "delete-folder"
 	| "move";
@@ -576,21 +577,6 @@ export interface YandexError {
 	description: string;
 	message?: string;
 	reason?: string;
-}
-
-export interface YandexOperationStatus {
-	status: "success" | "in-progress" | "failed";
-}
-
-// ============================================================================
-// Plugin events
-// ============================================================================
-
-export interface FileChangeEvent {
-	type: "create" | "modify" | "delete" | "rename";
-	path: string;
-	oldPath?: string;
-	timestamp: number;
 }
 
 // ============================================================================

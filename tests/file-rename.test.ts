@@ -167,6 +167,10 @@ class RenameIndexFake {
 		return this.store.retargetLatestPut(oldPath, newPath, sha256);
 	}
 
+	replacePendingPutWithNoop(id: string) {
+		return this.store.replacePutWithNoop(id);
+	}
+
 	stageMutation(mutation: PendingMutation) {
 		this.store.stageMutation(this.index.appliedMutationSeq, mutation);
 	}
@@ -892,4 +896,78 @@ test("unresolved final move recovery records a full-sync error", async () => {
 	assert.match(recoveryResult.errors[0]?.message ?? "", /Pending move/);
 	assert.equal(index.index.moves["device-a:3"]?.pending, true);
 	assert.equal(index.getPendingPhysicalActions().length, 1);
+});
+
+test("full sync settles accepted and superseded puts through one watermark", () => {
+	const yandex = new RenameYandexFake();
+	const vault = new RenameVaultFake();
+	const index = new RenameIndexFake(yandex);
+	index.index.files["accepted.md"] = {
+		path: "accepted.md",
+		sha256: "accepted-sha",
+		size: 8,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 7,
+		lastModifiedBy: "device-a",
+	};
+	index.index.files["remote-wins.md"] = {
+		path: "remote-wins.md",
+		sha256: "remote-sha",
+		size: 6,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 7,
+		lastModifiedBy: "device-b",
+	};
+	const accepted = index.enqueueMutation("put", "accepted.md", {
+		sha256: "accepted-sha",
+	});
+	const superseded = index.enqueueMutation("put", "remote-wins.md", {
+		sha256: "obsolete-local-sha",
+	});
+	const engine = new SyncEngine(
+		yandex as unknown as YandexDiskClient,
+		vault as unknown as VaultAdapter,
+		index as unknown as IndexManager,
+		{
+			...DEFAULT_SETTINGS,
+			deviceId: "device-a",
+			remotePath: "remote",
+		},
+	);
+
+	const settlement = (
+		engine as unknown as {
+			settleFullSyncPendingPuts(): {
+				pendingWatermarks: number;
+				matchingPuts: number;
+				noopPuts: number;
+			};
+		}
+	).settleFullSyncPendingPuts();
+
+	assert.deepEqual(settlement, {
+		pendingWatermarks: 2,
+		matchingPuts: 1,
+		noopPuts: 1,
+	});
+	assert.equal(index.index.files["accepted.md"]?.sha256, "accepted-sha");
+	assert.equal(index.index.files["remote-wins.md"]?.sha256, "remote-sha");
+	assert.deepEqual(
+		index.getPendingMutations().map((mutation) => ({
+			id: mutation.id,
+			type: mutation.type,
+		})),
+		[
+			{ id: accepted.id, type: "put" },
+			{ id: superseded.id, type: "noop" },
+		],
+	);
+
+	index.store.stagePendingMutations(index.index.appliedMutationSeq);
+	index.store.confirmAppliedMutations(index.index.appliedMutationSeq);
+
+	assert.equal(index.index.appliedMutationSeq["device-a"], superseded.seq);
+	assert.deepEqual(index.getPendingMutations(), []);
 });

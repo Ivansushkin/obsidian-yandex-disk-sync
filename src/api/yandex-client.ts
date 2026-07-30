@@ -604,18 +604,6 @@ export class YandexDiskClient {
 	}
 
 	/**
-	 * Download a service file with an explicit content codec while keeping its
-	 * physical path unencrypted.
-	 */
-	async downloadFileWithEncryptionService(
-		remotePath: string,
-		service: EncryptionService | null,
-	): Promise<ArrayBuffer> {
-		const raw = await this.downloadFile(remotePath, true);
-		return await this.decodeServiceFileContent(raw, service);
-	}
-
-	/**
 	 * Decode already downloaded service-file bytes with an explicit codec.
 	 * Passing undefined uses the currently configured codec, while null means
 	 * plaintext. This keeps index rollback snapshots byte-identical.
@@ -712,27 +700,6 @@ export class YandexDiskClient {
 		toPath: string,
 	): Promise<void> {
 		await this.moveResource(fromPath, toPath, false);
-	}
-
-	/**
-	 * Copy resource
-	 */
-	async copyResource(
-		fromPath: string,
-		toPath: string,
-		overwrite = false
-	): Promise<void> {
-		const encryptedFrom = await this.encryptFilePath(fromPath);
-		const encryptedTo = await this.encryptFilePath(toPath);
-		const encodedFrom = encodePathForUrl(encryptedFrom);
-		const encodedTo = encodePathForUrl(encryptedTo);
-
-		const response = await this.request(
-			"POST",
-			`/resources/copy?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`
-		);
-		await this.waitForAsyncOperation(response);
-		logger.debug(`Copied resource: ${fromPath} -> ${toPath}`);
 	}
 
 	/**

@@ -45,7 +45,6 @@ import {
 import type { EncryptionService } from "../crypto/encryption";
 import {
 	classifyIndexVersion,
-	findFolderTombstone,
 	isPathInsideFolder,
 	isStableLockStale,
 	mergeFileMutation,
@@ -407,6 +406,15 @@ export class IndexManager {
 		id: string,
 	): PendingMutation | undefined {
 		return this.operationStore.replacePutWithDelete(id);
+	}
+
+	/**
+	 * Reuse a put sequence as a watermark-only full-sync settlement.
+	 */
+	replacePendingPutWithNoop(
+		id: string,
+	): PendingMutation | undefined {
+		return this.operationStore.replacePutWithNoop(id);
 	}
 
 	consumeRejectedPuts(): Array<{
@@ -1131,16 +1139,6 @@ export class IndexManager {
 	}
 
 	/**
-	 * Return the newest folder tombstone that contains a path.
-	 */
-	getFolderTombstoneForPath(path: string): FolderTombstone | null {
-		return findFolderTombstone(
-			path,
-			this.remoteIndex.folderTombstones,
-		);
-	}
-
-	/**
 	 * Record a logical move so another device can finish a partially applied
 	 * physical rename.
 	 */
@@ -1167,13 +1165,6 @@ export class IndexManager {
 		if (!this.remoteIndex.moves[id]) return;
 		delete this.remoteIndex.moves[id];
 		this.completedMoveIds.add(id);
-	}
-
-	/**
-	 * Remove file from remote index
-	 */
-	removeFromRemoteIndex(path: string): void {
-		delete this.remoteIndex.files[path];
 	}
 
 	/**
@@ -1528,16 +1519,6 @@ export class IndexManager {
 				attempts,
 			);
 		}
-	}
-
-	private parseIndexContent(
-		content: ArrayBuffer,
-		allowLegacy: boolean,
-	): SyncIndex {
-		return this.normalizeParsedIndex(
-			this.parseIndexJson(content),
-			allowLegacy,
-		);
 	}
 
 	private parseIndexJson(content: ArrayBuffer): Partial<SyncIndex> {
@@ -2450,15 +2431,6 @@ export class IndexManager {
 	}
 
 	/**
-	 * Get raw remote user file paths without decrypting filenames.
-	 */
-	async getRemoteRawFilePaths(): Promise<string[]> {
-		return (await this.getRemoteRawFileSnapshots()).map(
-			(snapshot) => snapshot.path,
-		);
-	}
-
-	/**
 	 * Get raw remote paths and immutable server identities for guarded cleanup.
 	 */
 	async getRemoteRawFileSnapshots(): Promise<
@@ -2767,7 +2739,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.5. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.6. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

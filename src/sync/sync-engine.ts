@@ -30,7 +30,10 @@ import { computeSha256 } from "../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
 import { runWithConcurrencySettled } from "../utils/semaphore";
 import { t } from "../i18n";
-import { SyncCoordinator } from "./sync-coordinator";
+import {
+	SyncCoordinator,
+	type SyncSessionKind,
+} from "./sync-coordinator";
 import { createConfirmedBaseline } from "./baseline-rules";
 import {
 	classifyPhysicalDeleteFingerprint,
@@ -69,6 +72,15 @@ export interface SyncRunOptions {
 	beforeIndexCommit?: () => void | Promise<void>;
 }
 
+export interface SyncLifecycleContext {
+	sessionId: string;
+	kind: SyncSessionKind;
+}
+
+export interface SyncLifecycleOutcome extends SyncLifecycleContext {
+	success: boolean;
+}
+
 export class SyncEngine {
 	private yandexClient: YandexDiskClient;
 	private vaultAdapter: VaultAdapter;
@@ -86,8 +98,12 @@ export class SyncEngine {
 	private coordinator = new SyncCoordinator();
 	private expectedWatcherEvents = new Map<string, number>();
 
-	private syncPauseCallbacks: Array<() => void> = [];
-	private syncResumeCallbacks: Array<() => void> = [];
+	private syncPauseCallbacks: Array<
+		(context: SyncLifecycleContext) => void | Promise<void>
+	> = [];
+	private syncResumeCallbacks: Array<
+		(outcome: SyncLifecycleOutcome) => void | Promise<void>
+	> = [];
 
 	constructor(
 		yandexClient: YandexDiskClient,
@@ -146,9 +162,13 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Register callback to be called when full sync starts
+	 * Register a callback for the start of a reconciliation or maintenance session.
 	 */
-	onSyncPause(callback: () => void): () => void {
+	onSyncPause(
+		callback: (
+			context: SyncLifecycleContext,
+		) => void | Promise<void>,
+	): () => void {
 		this.syncPauseCallbacks.push(callback);
 		return () => {
 			const index = this.syncPauseCallbacks.indexOf(callback);
@@ -159,9 +179,13 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Register callback to be called when full sync ends
+	 * Register a callback for the end of a reconciliation or maintenance session.
 	 */
-	onSyncResume(callback: () => void): () => void {
+	onSyncResume(
+		callback: (
+			outcome: SyncLifecycleOutcome,
+		) => void | Promise<void>,
+	): () => void {
 		this.syncResumeCallbacks.push(callback);
 		return () => {
 			const index = this.syncResumeCallbacks.indexOf(callback);
@@ -205,11 +229,18 @@ export class SyncEngine {
 	 */
 	async runExclusiveMaintenance<T>(task: () => Promise<T>): Promise<T> {
 		return await this.coordinator.run("maintenance", async () => {
-			this.notifySyncPauseCallbacks();
+			const context = this.getSyncLifecycleContext();
+			let success = false;
+			await this.notifySyncPauseCallbacks(context);
 			try {
-				return await task();
+				const result = await task();
+				success = true;
+				return result;
 			} finally {
-				this.notifySyncResumeCallbacks();
+				await this.notifySyncResumeCallbacks({
+					...context,
+					success,
+				});
 			}
 		});
 	}
@@ -326,6 +357,7 @@ export class SyncEngine {
 			await this.runSyncSession(
 			options,
 			async (result, startTime) => {
+				this.yandexClient.clearFolderCache();
 				// 1. Ensure remote folder exists
 				this.updateState({
 					currentOperation: t("status.op.checking_remote_folder"),
@@ -429,7 +461,6 @@ export class SyncEngine {
 					});
 					const uploadResults = await this.executeOperationsParallel(
 						uploads,
-						result,
 						(completed) => {
 							processedOps = completed;
 							this.reportProgress(processedOps, totalOps);
@@ -466,7 +497,6 @@ export class SyncEngine {
 					const downloadResults =
 						await this.executeOperationsParallel(
 							downloads,
-							result,
 							(completed) => {
 								processedOps = uploads.length + completed;
 								this.reportProgress(processedOps, totalOps);
@@ -474,6 +504,15 @@ export class SyncEngine {
 						);
 					result.downloaded = downloadResults.succeeded;
 					result.errors.push(...downloadResults.errors);
+				}
+
+				const mutationSettlement =
+					this.settleFullSyncPendingPuts();
+				if (
+					mutationSettlement.noopPuts > 0 &&
+					this.indexSaveCallback
+				) {
+					await this.indexSaveCallback();
 				}
 
 				if (deletes.length > 0) {
@@ -492,7 +531,6 @@ export class SyncEngine {
 					deletes = this.filterCommittedDeletions(deletes);
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
-						result,
 						(completed) => {
 							processedOps =
 								uploads.length + downloads.length + completed;
@@ -609,7 +647,8 @@ export class SyncEngine {
 					hadOperations ||
 					mtimeStamped ||
 					tombstonesRemoved ||
-					baselinesChanged;
+					baselinesChanged ||
+					mutationSettlement.pendingWatermarks > 0;
 				if (!indexDirty) {
 					logger.debug(
 						"[SyncEngine] No changes detected, skipping remote index save",
@@ -650,6 +689,61 @@ export class SyncEngine {
 			return await run();
 		}
 		return await this.coordinator.run("full", run);
+	}
+
+	/**
+	 * Settle durable puts against the logical state selected by full sync.
+	 *
+	 * Matching puts only need their device watermark. Puts superseded by the
+	 * reconciled state become local no-ops so staging cannot alter canonical
+	 * file metadata.
+	 */
+	private settleFullSyncPendingPuts(): {
+		pendingWatermarks: number;
+		matchingPuts: number;
+		noopPuts: number;
+	} {
+		let matchingPuts = 0;
+		let noopPuts = 0;
+		const pending = this.indexManager.getPendingMutations();
+		const canonicalFiles = this.indexManager.getRemoteIndex().files;
+		for (const mutation of pending) {
+			if (mutation.type === "noop") continue;
+			if (mutation.type !== "put") continue;
+			const canonical = canonicalFiles[mutation.path];
+			if (
+				canonical &&
+				!canonical.deleted &&
+				mutation.sha256 !== undefined &&
+				canonical.sha256 === mutation.sha256
+			) {
+				matchingPuts++;
+				continue;
+			}
+			if (this.indexManager.replacePendingPutWithNoop(mutation.id)) {
+				noopPuts++;
+			}
+		}
+		const pendingWatermarks = this.indexManager
+			.getPendingMutations()
+			.filter(
+				(mutation) =>
+					mutation.type === "put" ||
+					mutation.type === "noop",
+			).length;
+		logger[pendingWatermarks > 0 ? "info" : "debug"](
+			"Full sync pending put settlement prepared",
+			{
+				pendingWatermarks,
+				matchingPuts,
+				noopPuts,
+			},
+		);
+		return {
+			pendingWatermarks,
+			matchingPuts,
+			noopPuts,
+		};
 	}
 
 	/**
@@ -768,6 +862,7 @@ export class SyncEngine {
 		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
+				this.yandexClient.clearFolderCache();
 				const inheritedCleanup =
 					this.indexManager.getMaintenance();
 				this.indexManager.beginForceBootstrap(true);
@@ -855,7 +950,6 @@ export class SyncEngine {
 					});
 					const uploadResults = await this.executeOperationsParallel(
 						uploads,
-						result,
 						(completed) => {
 							processedOps = completed;
 							this.reportProgress(processedOps, totalOps);
@@ -917,7 +1011,6 @@ export class SyncEngine {
 					);
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
-						result,
 						(completed) => {
 							processedOps = uploads.length + completed;
 							this.reportProgress(processedOps, totalOps);
@@ -983,6 +1076,7 @@ export class SyncEngine {
 		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
+				this.yandexClient.clearFolderCache();
 				const inheritedCleanup =
 					this.indexManager.getMaintenance();
 				this.indexManager.beginForceBootstrap(true);
@@ -1071,7 +1165,6 @@ export class SyncEngine {
 					const downloadResults =
 						await this.executeOperationsParallel(
 							downloads,
-							result,
 							(completed) => {
 								processedOps = completed;
 								this.reportProgress(processedOps, totalOps);
@@ -1158,44 +1251,6 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Execute single operation
-	 */
-	private async executeOperation(
-		op: SyncOperation,
-		result: SyncResult,
-	): Promise<void> {
-		switch (op.action) {
-			case "upload":
-				await this.uploadFile(op.path);
-				result.uploaded++;
-				break;
-
-			case "download":
-				await this.downloadFile(
-					op.path,
-					op.remoteMeta?.remoteMtime ?? op.remoteMeta?.mtime,
-				);
-				result.downloaded++;
-				break;
-
-			case "delete_remote":
-				await this.deleteRemoteFile(op.path);
-				result.deleted++;
-				break;
-
-			case "delete_local":
-				await this.deleteLocalFile(op.path);
-				result.deleted++;
-				break;
-
-			case "conflict":
-				await this.handleConflict(op);
-				result.conflicts++;
-				break;
-		}
-	}
-
-	/**
 	 * Ensure all necessary folders exist before operations
 	 */
 	private async ensureFoldersExist(
@@ -1233,7 +1288,6 @@ export class SyncEngine {
 	 */
 	private async executeOperationsParallel(
 		operations: SyncOperation[],
-		result: SyncResult,
 		onProgress?: (completed: number) => void,
 	): Promise<{ succeeded: number; errors: SyncError[] }> {
 		const tasks = operations.map((op) => async () => {
@@ -1762,18 +1816,6 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Synchronize single file (for real-time sync)
-	 */
-	async syncSingleFile(
-		path: string,
-		action: "upload" | "delete",
-	): Promise<void> {
-		return await this.enqueueRealtime(() =>
-			this.syncSingleFileNow(path, action),
-		);
-	}
-
-	/**
 	 * Apply a debounced realtime file batch with one canonical index commit.
 	 *
 	 * @returns Per-event durable outcomes used to acknowledge only completed or
@@ -2042,128 +2084,6 @@ export class SyncEngine {
 			);
 		}
 		return existing;
-	}
-
-	private async syncSingleFileNow(
-		path: string,
-		action: "upload" | "delete",
-	): Promise<void> {
-		logger.info(
-			`[SyncEngine] syncSingleFile called for ${path}, action: ${action}`,
-		);
-
-		const blockReason = await this.getSyncBlockReason(false);
-		if (blockReason) {
-			logger.warn(
-				`[SyncEngine] Skipping file sync ${path}: ${blockReason}`,
-			);
-			this.setBlockedState(blockReason);
-			return;
-		}
-		if (!this.vaultAdapter.shouldSync(path)) {
-			logger.info(`[SyncEngine] File ${path} should not be synchronized`);
-			return;
-		}
-
-		let snapshot:
-			| { content: ArrayBuffer; sha256: string }
-			| undefined;
-		if (action === "upload") {
-			try {
-				const content = await this.vaultAdapter.readFile(path);
-				snapshot = {
-					content,
-					sha256: await computeSha256(content),
-				};
-			} catch (e) {
-				logger.debug(
-					`Could not hash pending upload ${path}:`,
-					{ error: e },
-				);
-			}
-		}
-		const mutation = this.indexManager.enqueueMutation(
-			action === "upload" ? "put" : "delete-file",
-			path,
-			{
-				sha256: snapshot?.sha256,
-				baselineSha256:
-					this.indexManager.getLocalIndex().files[path]?.sha256,
-			},
-		);
-		if (action === "delete") {
-			this.indexManager.markLocalFileDeleted(path);
-		}
-		if (this.indexSaveCallback) await this.indexSaveCallback();
-
-		if (this.isPaused || this.isSyncing) {
-			logger.info(
-				`[SyncEngine] Skipping file sync ${path}: sync busy (${this.isSyncing}) or paused (${this.isPaused})`,
-			);
-			// Persist the deletion intent so the next full sync resolves it as
-			// delete_remote rather than treating the remote file as new.
-			if (action === "delete") {
-				// Persist the local index to disk so an Obsidian restart before
-				// the next full sync cannot lose the deletion intent.
-				if (this.indexSaveCallback) {
-					try {
-						await this.indexSaveCallback();
-					} catch (e) {
-						logger.error(
-							`Error persisting deletion intent for ${path}:`,
-							{ error: e },
-						);
-					}
-				}
-			}
-			return;
-		}
-
-		logger.info(`[SyncEngine] Starting file synchronization ${path}`);
-
-		try {
-			if (action === "upload") {
-				await this.uploadFile(path, false, true, snapshot);
-			} else if (action === "delete") {
-				this.indexManager.markRemoteFileDeleted(path);
-				this.indexManager.enqueuePhysicalAction(
-					"delete-remote",
-					path,
-					{
-						canonicalRevision:
-							this.indexManager.getRemoteIndex().revision + 1,
-						expectedFingerprint:
-							this.indexManager.getRemoteIndex().files[path]
-								?.remoteFingerprint,
-						origin: "exact-delete",
-					},
-				);
-				if (this.indexSaveCallback) {
-					await this.indexSaveCallback();
-				}
-			}
-			this.indexManager.stageMutation(mutation);
-
-			// Save remote index after operation to keep it in sync
-			const committed = await this.saveRemoteIndexBestEffort();
-			if (!committed) return;
-			this.indexManager.confirmMutation(mutation.id);
-
-			if (action === "delete") {
-				await this.deleteRemoteFile(path);
-				await this.pruneRemoteFolders([path]);
-			}
-			this.indexManager.markRemoteObserved();
-			logger.debug(`Remote index saved after ${action} for ${path}`);
-
-			// Save local index via callback
-			if (this.indexSaveCallback) {
-				await this.indexSaveCallback();
-				logger.debug(`Local index saved after ${action} for ${path}`);
-			}
-		} catch (e) {
-			logger.error(`Error synchronizing file ${path}:`, { error: e });
-		}
 	}
 
 	/**
@@ -2912,10 +2832,12 @@ export class SyncEngine {
 	/**
 	 * Notify listeners that sync has started.
 	 */
-	private notifySyncPauseCallbacks(): void {
+	private async notifySyncPauseCallbacks(
+		context: SyncLifecycleContext,
+	): Promise<void> {
 		for (const callback of this.syncPauseCallbacks) {
 			try {
-				callback();
+				await callback(context);
 			} catch (e) {
 				logger.error("Error in sync pause callback:", { error: e });
 			}
@@ -2925,14 +2847,27 @@ export class SyncEngine {
 	/**
 	 * Notify listeners that sync has ended.
 	 */
-	private notifySyncResumeCallbacks(): void {
+	private async notifySyncResumeCallbacks(
+		outcome: SyncLifecycleOutcome,
+	): Promise<void> {
 		for (const callback of this.syncResumeCallbacks) {
 			try {
-				callback();
+				await callback(outcome);
 			} catch (e) {
 				logger.error("Error in sync resume callback:", { error: e });
 			}
 		}
+	}
+
+	/**
+	 * Capture immutable coordinator identity for watcher lifecycle callbacks.
+	 */
+	private getSyncLifecycleContext(): SyncLifecycleContext {
+		const session = this.coordinator.getActiveSession();
+		return {
+			sessionId: session?.id ?? "uncoordinated",
+			kind: session?.kind ?? "full",
+		};
 	}
 
 	/**
@@ -2974,11 +2909,11 @@ export class SyncEngine {
 			return this.createBlockedResult(blockReason);
 		}
 
-		this.isSyncing = true;
-		this.notifySyncPauseCallbacks();
-
 		const startTime = Date.now();
 		const result = this.createEmptyResult(startTime);
+		const lifecycleContext = this.getSyncLifecycleContext();
+		this.isSyncing = true;
+		await this.notifySyncPauseCallbacks(lifecycleContext);
 		logger.info("Sync reconciliation started", this.getDiagnosticSnapshot());
 
 		try {
@@ -3057,7 +2992,10 @@ export class SyncEngine {
 			return result;
 		} finally {
 			this.isSyncing = false;
-			this.notifySyncResumeCallbacks();
+			await this.notifySyncResumeCallbacks({
+				...lifecycleContext,
+				success: result.success,
+			});
 		}
 	}
 

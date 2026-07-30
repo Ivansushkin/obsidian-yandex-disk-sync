@@ -203,6 +203,28 @@ export class LocalOperationStore {
 		return mutation;
 	}
 
+	/**
+	 * Convert a full-sync-covered put into a watermark-only FIFO mutation.
+	 */
+	replacePutWithNoop(id: string): PendingMutation | undefined {
+		const mutation = this.pendingMutations.find(
+			(candidate) => candidate.id === id && candidate.type === "put",
+		);
+		if (!mutation) return undefined;
+		mutation.type = "noop";
+		mutation.targetPath = undefined;
+		mutation.resourceKind = undefined;
+		mutation.sha256 = undefined;
+		mutation.baselineSha256 = undefined;
+		logger.debug("Pending put settled as no-op", {
+			mutationId: mutation.id,
+			mutationSeq: mutation.seq,
+			baseRevision: mutation.baseRevision,
+			path: mutation.path,
+		});
+		return mutation;
+	}
+
 	stageMutation(
 		appliedMutationSeq: Record<string, number>,
 		mutation: PendingMutation,

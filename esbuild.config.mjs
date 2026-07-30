@@ -22,7 +22,7 @@ const FILES_TO_COPY = ["manifest.json", "styles.css"];
 /**
  * Копирование файлов после сборки
  */
-function copyFiles(sourceDir, destDir) {
+function copyFiles(destDir) {
 	// Создаём директории если не существуют
 	if (!fs.existsSync(BUILD_DIR)) {
 		fs.mkdirSync(BUILD_DIR, { recursive: true });
@@ -64,7 +64,7 @@ const copyPlugin = {
 	setup(build) {
 		build.onEnd((result) => {
 			if (result.errors.length === 0) {
-				copyFiles(BUILD_DIR, TEST_VAULT_PLUGIN_DIR);
+				copyFiles(TEST_VAULT_PLUGIN_DIR);
 			}
 		});
 	},

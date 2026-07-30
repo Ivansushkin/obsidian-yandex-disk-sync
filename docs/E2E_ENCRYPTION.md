@@ -82,7 +82,6 @@ setEncryptionService(service: EncryptionService | null): void {
 | `downloadFile`          | decrypt | encryptFilename              | --                                      |
 | `deleteResource`        | --      | encryptFilename              | --                                      |
 | `moveResource`          | --      | encryptFilename (from + to)  | --                                      |
-| `copyResource`          | --      | encryptFilename (from + to)  | --                                      |
 | `getResource`           | --      | encryptFilename              | decryptFilename(path + name)            |
 | `getResourcesRecursive` | --      | encryptFilename (root)       | decryptFilename(path + name) всех items |
 | `createFolder`          | --      | encryptFilename              | --                                      |

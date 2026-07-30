@@ -253,14 +253,6 @@ export class Logger {
 		}
 	}
 
-	setMinLevel(level: LogLevel): void {
-		this.minLevel = level;
-	}
-
-	setFileEnabled(enabled: boolean): void {
-		this.fileEnabled = enabled;
-	}
-
 	/**
 	 * Check whether a message at the given level should be emitted.
 	 */

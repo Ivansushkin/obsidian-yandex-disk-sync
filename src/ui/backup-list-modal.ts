@@ -11,7 +11,6 @@ import { logger } from '../utils/logger';
 export class BackupListModal extends Modal {
 	private backupManager: BackupManager;
 	private backups: BackupInfo[] = [];
-	private isLoading = false;
 
 	constructor(app: App, backupManager: BackupManager) {
 		super(app);
@@ -30,14 +29,12 @@ export class BackupListModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 
-		this.isLoading = true;
 		const loadingEl = contentEl.createDiv({ cls: 'backup-list-loading' });
 		loadingEl.setText(t('backup_list.loading'));
 
 		try {
 			this.backups = await this.backupManager.listBackups();
 		} catch (error) {
-			this.isLoading = false;
 			logger.error('Error loading backups:', { error });
 			contentEl.empty();
 
@@ -53,7 +50,6 @@ export class BackupListModal extends Modal {
 			return;
 		}
 
-		this.isLoading = false;
 		contentEl.empty();
 
 		if (this.backups.length === 0) {

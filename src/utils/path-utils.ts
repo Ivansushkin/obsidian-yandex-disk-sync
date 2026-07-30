@@ -59,13 +59,6 @@ export function getExtension(path: string): string {
 }
 
 /**
- * Convert local path to remote path
- */
-export function toRemotePath(localPath: string, remotePath: string): string {
-	return joinPath(remotePath, localPath);
-}
-
-/**
  * Convert remote path to local path
  */
 export function toLocalPath(
@@ -86,14 +79,6 @@ export function toLocalPath(
 		return "";
 	}
 	return cleanPath;
-}
-
-/**
- * Check if path is hidden file/folder
- */
-export function isHiddenPath(path: string, configDir?: string): boolean {
-	const parts = normalizePath(path).split("/");
-	return parts.some((part) => part.startsWith(".") && (!configDir || part !== configDir));
 }
 
 /**

@@ -41,12 +41,6 @@ export class Semaphore {
 		}
 	}
 
-	/**
-	 * Get current available permits
-	 */
-	availablePermits(): number {
-		return this.permits;
-	}
 }
 
 /**

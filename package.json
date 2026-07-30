@@ -1,6 +1,6 @@
 {
 	"name": "yandex-disk-sync",
-	"version": "2.0.0-beta.5",
+	"version": "2.0.0-beta.6",
 	"description": "Sync Obsidian vault with Yandex Disk",
 	"main": "main.js",
 	"type": "module",
@@ -14,7 +14,6 @@
 	"keywords": [],
 	"license": "0-BSD",
 	"devDependencies": {
-		"@types/jszip": "^3.4.1",
 		"@types/node": "^16.11.6",
 		"esbuild": "0.25.5",
 		"eslint-plugin-obsidianmd": "0.1.9",

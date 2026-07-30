@@ -35,7 +35,7 @@ import {
 } from "./sync/file-watcher";
 import { SyncScheduler } from "./sync/sync-scheduler";
 import { SyncStatusBar } from "./ui/status-bar";
-import { SyncStatusModal, ConfirmModal } from "./ui/init-modal";
+import { SyncStatusModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
 import { BackupManager } from "./backup/backup-manager";
@@ -115,7 +115,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		errors: 0,
 	};
 
-	private isInitialized = false;
 	private regularSyncStarted = false;
 	private encryptionService: EncryptionService | null = null;
 	private encryptionBlockReason: string | null = null;
@@ -275,7 +274,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.backupManager = new BackupManager(
 			this.yandexClient,
 			this.vaultAdapter,
-			this.indexManager,
 			this.settings,
 		);
 	}
@@ -410,12 +408,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		// Subscribe to sync engine events to pause/resume file watcher
-		this.syncEngine.onSyncPause(() => {
-			this.fileWatcher.pauseForSync();
-		});
-		this.syncEngine.onSyncResume(() => {
-			this.fileWatcher.resumeAfterSync();
-		});
+		this.syncEngine.onSyncPause(
+			async (context) =>
+				await this.fileWatcher.pauseForSync(context),
+		);
+		this.syncEngine.onSyncResume(
+			async (outcome) =>
+				await this.fileWatcher.resumeAfterSync(outcome),
+		);
 
 		// Check if initial setup is needed
 		const needsInitialSync = await this.needsInitialSync();
@@ -431,7 +431,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						"Legacy sync index detected; normal synchronization is blocked until force sync.",
 					);
 					new Notice(t("notice.legacy_index_blocked"), 0);
-					this.isInitialized = true;
 					return;
 				}
 				if (e instanceof UnreadableRemoteIndexError) {
@@ -447,7 +446,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						},
 					);
 					new Notice(t("notice.unreadable_index_blocked"), 0);
-					this.isInitialized = true;
 					return;
 				}
 				if (e instanceof IndexEpochMismatchError) {
@@ -455,7 +453,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						"Canonical epoch changed; normal synchronization is blocked until Force remote.",
 					);
 					new Notice(t("notice.epoch_mismatch_blocked"), 0);
-					this.isInitialized = true;
 					return;
 				}
 				if (e instanceof AmbiguousRemoteIndexLockError) {
@@ -463,12 +460,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						"Ambiguous canonical index locks block normal synchronization.",
 					);
 					new Notice(t("notice.ambiguous_index_blocked"), 0);
-					this.isInitialized = true;
 					return;
 				}
 				if (e instanceof RemoteMaintenanceActiveError) {
 					new Notice(t("notice.encryption_remote_busy"), 0);
-					this.isInitialized = true;
 					return;
 				}
 				throw e;
@@ -477,7 +472,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.startSync();
 		}
 
-		this.isInitialized = true;
 	}
 
 	/**
@@ -944,17 +938,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		logger.info("[Main] Running initial sync check");
 		// FileWatcher will be automatically paused by sync engine callbacks
 		void this.runFullSync();
-	}
-
-	/**
-	 * Confirm action via Modal
-	 */
-	private confirmAction(message: string): Promise<boolean> {
-		return new Promise((resolve) => {
-			new ConfirmModal(this.app, message, (confirmed) => {
-				resolve(confirmed);
-			}).open();
-		});
 	}
 
 	/**

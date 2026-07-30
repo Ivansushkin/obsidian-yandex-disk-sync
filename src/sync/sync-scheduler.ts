@@ -113,24 +113,4 @@ export class SyncScheduler {
 		}
 	}
 
-	/**
-	 * Check if scheduler is running
-	 */
-	isActive(): boolean {
-		return this.isRunning;
-	}
-
-	/**
-	 * Get synchronization interval in minutes
-	 */
-	getIntervalMinutes(): number {
-		return this.settings.syncInterval;
-	}
-
-	/**
-	 * Trigger synchronization immediately (outside schedule)
-	 */
-	async triggerSync(): Promise<void> {
-		await this.runScheduledSync();
-	}
 }
