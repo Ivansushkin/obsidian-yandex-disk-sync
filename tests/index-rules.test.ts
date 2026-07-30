@@ -3,6 +3,7 @@ import test from "node:test";
 import type { FileMetadata, FolderTombstone } from "../src/types";
 import {
 	classifyIndexVersion,
+	collectFolderDeleteTargets,
 	findFolderTombstone,
 	isPathInsideFolder,
 	isStableLockStale,
@@ -58,6 +59,57 @@ test("folder matching respects segment boundaries and deep paths", () => {
 		isPathInsideFolder(`${deepFolder}/file.md`, deepFolder),
 		true,
 	);
+});
+
+test("folder delete targets skip a historical rename tombstone", () => {
+	const targets = collectFolderDeleteTargets(
+		{
+			"folder/Без названия.md": file("folder/Без названия.md", {
+				deleted: true,
+				changedRevision: 6,
+			}),
+			"folder/Чо как.md": file("folder/Чо как.md", {
+				changedRevision: 7,
+			}),
+		},
+		"folder",
+	);
+
+	assert.deepEqual(targets, {
+		knownDescendants: 2,
+		livePaths: ["folder/Чо как.md"],
+		historicalTombstonesSkipped: 1,
+	});
+});
+
+test("folder delete with only tombstones has no live targets", () => {
+	const targets = collectFolderDeleteTargets(
+		{
+			"folder/old.md": file("folder/old.md", { deleted: true }),
+		},
+		"folder",
+	);
+
+	assert.equal(targets.knownDescendants, 1);
+	assert.deepEqual(targets.livePaths, []);
+	assert.equal(targets.historicalTombstonesSkipped, 1);
+});
+
+test("folder delete targets deep descendants without matching siblings", () => {
+	const targets = collectFolderDeleteTargets(
+		{
+			"folder/deep/note.md": file("folder/deep/note.md"),
+			"folder/deep/old.md": file("folder/deep/old.md", {
+				deleted: true,
+			}),
+			"folder-copy/note.md": file("folder-copy/note.md"),
+		},
+		"folder/",
+	);
+
+	assert.deepEqual(targets.livePaths, ["folder/deep/note.md"]);
+	assert.equal(targets.knownDescendants, 2);
+	assert.equal(targets.historicalTombstonesSkipped, 1);
 });
 
 test("v1 and v2 are legacy while v3 is current", () => {

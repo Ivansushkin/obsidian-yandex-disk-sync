@@ -1,5 +1,11 @@
 import type { PendingPhysicalAction, SyncIndex } from "../types";
 
+export type PhysicalDeleteFingerprintDecision =
+	| "match"
+	| "missing-expected"
+	| "missing-current"
+	| "mismatch";
+
 /**
  * Decide whether a durable deletion is still authorized by canonical state.
  */
@@ -13,6 +19,18 @@ export function isPhysicalDeleteAuthorized(
 		return metadata === undefined;
 	}
 	return metadata?.deleted === true;
+}
+
+/**
+ * Require an exact server fingerprint match before destructive remote work.
+ */
+export function classifyPhysicalDeleteFingerprint(
+	expectedFingerprint: string | undefined,
+	currentFingerprint: string | undefined,
+): PhysicalDeleteFingerprintDecision {
+	if (!expectedFingerprint) return "missing-expected";
+	if (!currentFingerprint) return "missing-current";
+	return expectedFingerprint === currentFingerprint ? "match" : "mismatch";
 }
 
 /**

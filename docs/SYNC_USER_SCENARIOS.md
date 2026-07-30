@@ -133,6 +133,7 @@
 | FDEL-012 | P2  | Папка содержит тысячи файлов                                   | Concurrency ограничена, canonical commit один              | auto: performance       |
 | FDEL-013 | P0  | Два устройства удаляют/редактируют одну ветку                  | Результат не зависит от порядка lock acquisition           | auto: permutation       |
 | FDEL-014 | P1  | В папке появился physical orphan                               | Папка не удаляется рекурсивно без live-empty проверки      | auto: fake-yandex       |
+| FDEL-015 | P1  | Файл перенесён в папку, переименован, затем папка удалена       | Historical source tombstone не получает physical action; удаляются только текущий live-путь и пустая папка | auto: `plaintext/encrypted rename tombstone is skipped by folder delete` |
 
 ## Rename и move
 
@@ -286,6 +287,7 @@
 | DIAG-005 | P0 | Контекст содержит пароль, token или key       | Секреты маскируются до console/file output                                           | auto: logger        |
 | DIAG-006 | P1 | Force вернул `success=false`                  | Журнал содержит `completed with errors` и transaction outcome, но не сообщение об успешном завершении | auto: integration |
 | DIAG-007 | P1 | Ни один index codec не читается               | Лог содержит стадии codec, размер, fingerprint и короткий SHA без index/ciphertext   | auto: index-manager |
+| DIAG-008 | P2 | Удаление папки поглощает дочерние watcher events | Лог содержит число live targets, пропущенных historical tombstones и оставшихся physical actions | auto: folder-delete |
 
 ## Матрица вариантов
 

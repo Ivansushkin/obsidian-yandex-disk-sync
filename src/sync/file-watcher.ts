@@ -334,7 +334,11 @@ export class FileWatcher {
 			`${folder.path.replace(/\/+$/, "")}/`,
 			Date.now() + Math.max(2_000, this.settings.debounceDelay * 2),
 		);
-		this.cancelPendingDescendants(folder.path);
+		const absorbedDescendantEvents =
+			this.cancelPendingDescendants(folder.path);
+		logger.info(`[FileWatcher] Folder deleted: ${folder.path}`, {
+			absorbedDescendantEvents,
+		});
 		if (this.isPausedForSync) {
 			this.deferEvent({ action: "delete-folder", path: folder.path });
 			return;
@@ -542,18 +546,22 @@ export class FileWatcher {
 		this.readyFileEvents.delete(path);
 	}
 
-	private cancelPendingDescendants(folderPath: string): void {
+	private cancelPendingDescendants(folderPath: string): number {
 		const prefix = `${folderPath.replace(/\/+$/, "")}/`;
+		let cancelled = 0;
 		for (const [path, pending] of this.debounceTimers) {
 			if (!path.startsWith(prefix)) continue;
 			clearTimeout(pending.timer);
 			this.debounceTimers.delete(path);
+			cancelled++;
 		}
 		for (const path of this.readyFileEvents.keys()) {
 			if (path.startsWith(prefix)) {
 				this.readyFileEvents.delete(path);
+				cancelled++;
 			}
 		}
+		return cancelled;
 	}
 
 	private scheduleBatchFlush(): void {

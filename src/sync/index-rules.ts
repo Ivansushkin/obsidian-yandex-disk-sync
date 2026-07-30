@@ -22,6 +22,46 @@ export function isPathInsideFolder(path: string, folderPath: string): boolean {
 	);
 }
 
+export interface FolderDeleteTargets {
+	knownDescendants: number;
+	livePaths: string[];
+	historicalTombstonesSkipped: number;
+}
+
+/**
+ * Select live canonical descendants that require physical folder deletion.
+ */
+export function collectFolderDeleteTargets(
+	files: Record<string, FileMetadata>,
+	folderPath: string,
+): FolderDeleteTargets {
+	const normalizedFolder = folderPath.replace(/\/+$/, "");
+	const livePaths: string[] = [];
+	let knownDescendants = 0;
+	let historicalTombstonesSkipped = 0;
+
+	for (const [path, metadata] of Object.entries(files)) {
+		if (
+			path === normalizedFolder ||
+			!isPathInsideFolder(path, normalizedFolder)
+		) {
+			continue;
+		}
+		knownDescendants++;
+		if (metadata.deleted) {
+			historicalTombstonesSkipped++;
+			continue;
+		}
+		livePaths.push(path);
+	}
+
+	return {
+		knownDescendants,
+		livePaths,
+		historicalTombstonesSkipped,
+	};
+}
+
 /**
  * Select the newest folder tombstone that contains a path.
  */

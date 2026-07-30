@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.0.0-beta.4
+
+### Fixed
+
+- Prevented folder deletion from creating remote physical actions for
+  historical tombstones left by file rename operations.
+- Required an exact server fingerprint match before remote deletion. Missing
+  or changed fingerprints now defer destructive work to causal
+  reconciliation.
+- Added safe recovery for physical actions persisted by beta.3 without an
+  expected fingerprint.
+- Added folder-delete diagnostics for absorbed watcher events, live targets,
+  skipped tombstones, and remaining physical actions.
+
+### Testing
+
+- Added plaintext and encrypted rename-to-folder-delete integration coverage,
+  deep-path selection tests, and missing, changed, absent, and obsolete
+  physical-action recovery cases.
+
 ## 2.0.0-beta.3
 
 ### Fixed

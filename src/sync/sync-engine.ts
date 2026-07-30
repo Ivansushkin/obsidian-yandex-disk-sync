@@ -31,9 +31,11 @@ import { t } from "../i18n";
 import { SyncCoordinator } from "./sync-coordinator";
 import { createConfirmedBaseline } from "./baseline-rules";
 import {
+	classifyPhysicalDeleteFingerprint,
 	isPhysicalDeleteAuthorized,
 	shouldBackupLocalDelete,
 } from "./physical-action-rules";
+import { collectFolderDeleteTargets } from "./index-rules";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -1483,14 +1485,14 @@ export class SyncEngine {
 		}
 		const fingerprint =
 			resource.sha256 || resource.md5 || resource.resource_id;
-		if (
-			physicalAction.expectedFingerprint &&
-			fingerprint &&
-			physicalAction.expectedFingerprint !== fingerprint
-		) {
-			this.indexManager.completePhysicalAction(physicalAction.id);
-			logger.warn("Deferred remote deletion after fingerprint change", {
+		const fingerprintDecision = classifyPhysicalDeleteFingerprint(
+			physicalAction.expectedFingerprint,
+			fingerprint,
+		);
+		if (fingerprintDecision !== "match") {
+			logger.warn("Deferred remote deletion for causal reconciliation", {
 				...actionContext,
+				fingerprintDecision,
 				currentFingerprint: shortenDiagnosticValue(fingerprint),
 			});
 			return;
@@ -2182,30 +2184,51 @@ export class SyncEngine {
 	 */
 	async deleteFolder(path: string): Promise<void> {
 		return await this.enqueueRealtime(async () => {
-			const mutation = this.indexManager.enqueueMutation(
-				"delete-folder",
-				path,
-			);
-			if (this.indexSaveCallback) await this.indexSaveCallback();
 			const folderPath = path.replace(/\/+$/, "");
-			const prefix = `${folderPath}/`;
-			const affected = Object.keys(
+			const targets = collectFolderDeleteTargets(
 				this.indexManager.getRemoteIndex().files,
-			).filter((filePath) => filePath.startsWith(prefix));
-			if (affected.length === 0) {
-				this.indexManager.discardMutation(mutation.id);
-				if (this.indexSaveCallback) {
-					await this.indexSaveCallback();
-				}
+				folderPath,
+			);
+			const existingPhysicalActions = targets.livePaths.filter(
+				(filePath) =>
+					this.indexManager.hasPendingPhysicalAction(
+						"delete-remote",
+						filePath,
+					),
+			).length;
+			logger.info("Folder deletion planned", {
+				path: folderPath,
+				knownDescendants: targets.knownDescendants,
+				liveTargets: targets.livePaths.length,
+				historicalTombstonesSkipped:
+					targets.historicalTombstonesSkipped,
+				physicalActionsCreated:
+					targets.livePaths.length - existingPhysicalActions,
+				physicalActionsRefreshed: existingPhysicalActions,
+			});
+			if (targets.livePaths.length === 0) {
+				logger.info("Folder deletion completed without canonical changes", {
+					path: folderPath,
+					knownDescendants: targets.knownDescendants,
+					historicalTombstonesSkipped:
+						targets.historicalTombstonesSkipped,
+				});
 				return;
 			}
+
+			const mutation = this.indexManager.enqueueMutation(
+				"delete-folder",
+				folderPath,
+			);
+			if (this.indexSaveCallback) await this.indexSaveCallback();
 
 			this.indexManager.markFolderDeleted(
 				folderPath,
 				mutation.createdAt,
 				mutation.baseRevision,
 			);
-			for (const filePath of affected) {
+			const physicalActionIds: string[] = [];
+			for (const filePath of targets.livePaths) {
 				this.indexManager.markRemoteFileDeleted(
 					filePath,
 					folderPath,
@@ -2215,7 +2238,7 @@ export class SyncEngine {
 					filePath,
 					folderPath,
 				);
-				this.indexManager.enqueuePhysicalAction(
+				const physicalAction = this.indexManager.enqueuePhysicalAction(
 					"delete-remote",
 					filePath,
 					{
@@ -2227,6 +2250,7 @@ export class SyncEngine {
 						origin: "folder-delete",
 					},
 				);
+				physicalActionIds.push(physicalAction.id);
 			}
 			this.indexManager.stageMutation(mutation);
 			if (this.indexSaveCallback) await this.indexSaveCallback();
@@ -2235,7 +2259,7 @@ export class SyncEngine {
 			this.indexManager.confirmMutation(mutation.id);
 			if (this.indexSaveCallback) await this.indexSaveCallback();
 
-			const committedPaths = affected.filter((filePath) => {
+			const committedPaths = targets.livePaths.filter((filePath) => {
 				const meta =
 					this.indexManager.getRemoteIndex().files[filePath];
 				return (
@@ -2243,7 +2267,7 @@ export class SyncEngine {
 					meta.deletedByFolder === folderPath
 				);
 			});
-			await runWithConcurrencySettled(
+			const deletionResults = await runWithConcurrencySettled(
 				committedPaths.map((filePath) => async () => {
 					await this.deleteRemoteFile(filePath);
 				}),
@@ -2251,6 +2275,36 @@ export class SyncEngine {
 			);
 			await this.pruneRemoteFolders(committedPaths);
 			if (this.indexSaveCallback) await this.indexSaveCallback();
+			const pendingActionIds = new Set(
+				this.indexManager
+					.getPendingPhysicalActions()
+					.map((action) => action.id),
+			);
+			const remainingActions = physicalActionIds.filter((id) =>
+				pendingActionIds.has(id),
+			).length;
+			const failedActions = deletionResults.filter(
+				(result) => result.status === "rejected",
+			).length;
+			const diagnosticContext = {
+				path: folderPath,
+				canonicalRevision:
+					this.indexManager.getRemoteIndex().revision,
+				liveTargets: targets.livePaths.length,
+				committedTargets: committedPaths.length,
+				confirmedActions:
+					physicalActionIds.length - remainingActions,
+				remainingActions,
+				failedActions,
+			};
+			if (remainingActions > 0 || failedActions > 0) {
+				logger.warn(
+					"Folder deletion completed with pending physical actions",
+					diagnosticContext,
+				);
+			} else {
+				logger.info("Folder deletion completed", diagnosticContext);
+			}
 		});
 	}
 

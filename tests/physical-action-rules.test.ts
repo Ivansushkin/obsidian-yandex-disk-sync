@@ -5,6 +5,7 @@ import {
 	type PendingPhysicalAction,
 } from "../src/types";
 import {
+	classifyPhysicalDeleteFingerprint,
 	isPhysicalDeleteAuthorized,
 	shouldBackupLocalDelete,
 } from "../src/sync/physical-action-rules";
@@ -61,6 +62,25 @@ test("canonical tombstone authorizes exact and folder physical deletion", () => 
 			canonical,
 		),
 		true,
+	);
+});
+
+test("remote deletion requires an exact expected fingerprint", () => {
+	assert.equal(
+		classifyPhysicalDeleteFingerprint("expected", "expected"),
+		"match",
+	);
+	assert.equal(
+		classifyPhysicalDeleteFingerprint(undefined, "current"),
+		"missing-expected",
+	);
+	assert.equal(
+		classifyPhysicalDeleteFingerprint("expected", undefined),
+		"missing-current",
+	);
+	assert.equal(
+		classifyPhysicalDeleteFingerprint("expected", "changed"),
+		"mismatch",
 	);
 });
 

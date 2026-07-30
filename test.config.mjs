@@ -19,6 +19,7 @@ const outputFiles = [
 	join(outputDir, "physical-action-rules.test.mjs"),
 	join(outputDir, "logger.test.mjs"),
 	join(outputDir, "vault-adapter.test.mjs"),
+	join(outputDir, "folder-delete.test.mjs"),
 ];
 const obsidianStubPlugin = {
 	name: "obsidian-test-stub",
@@ -67,6 +68,7 @@ try {
 			"tests/physical-action-rules.test.ts",
 			"tests/logger.test.ts",
 			"tests/vault-adapter.test.ts",
+			"tests/folder-delete.test.ts",
 		],
 		bundle: true,
 		platform: "node",
