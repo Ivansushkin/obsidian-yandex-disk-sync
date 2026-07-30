@@ -67,7 +67,7 @@ export class SyncCoordinator {
 				await this.hooks.onEnter?.(kind);
 				entered = true;
 				const result = await task();
-				logger.info("Sync session completed", {
+				logger.info("Sync session task returned", {
 					sessionId,
 					sessionKind: kind,
 					durationMs: Date.now() - startedAt,

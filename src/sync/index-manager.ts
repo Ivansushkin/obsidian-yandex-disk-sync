@@ -33,6 +33,7 @@ import {
 	toLocalPath,
 } from "../utils/path-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
+import { computeSha256FromString } from "../utils/hash-utils";
 import {
 	PBKDF2_ITERATIONS,
 	AES_KEY_LENGTH,
@@ -55,6 +56,15 @@ import {
 	isOrphanIndexAmbiguous,
 	stableSerialize,
 } from "./index-transaction-rules";
+import {
+	classifyIndexMoveRecovery,
+	rollbackRawIndexSnapshot,
+	shouldRetryIndexTransaction,
+	type IndexCodec,
+	type IndexFileSnapshot,
+	type IndexTransactionOutcome,
+	type IndexTransactionStage,
+} from "./index-transaction";
 
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
 const REMOTE_INDEX_LOCK_PREFIX = ".obsidian-sync-index.lock.";
@@ -565,7 +575,10 @@ export class IndexManager {
 				return;
 			} catch (e) {
 				if (
-					!(e instanceof RemoteIndexConcurrentModificationError)
+					!(
+						e instanceof RemoteIndexTransactionError &&
+						e.retryable
+					)
 				) {
 					throw e;
 				}
@@ -573,6 +586,8 @@ export class IndexManager {
 				logger.warn("Retrying canonical index transaction", {
 					attempt: attempt + 1,
 					maxAttempts: 4,
+					outcome: e.outcome,
+					failedStage: e.stage,
 					canonicalRevision: this.remoteIndex.revision,
 					epoch: shortenDiagnosticValue(this.remoteIndex.epoch),
 					error: e,
@@ -590,7 +605,7 @@ export class IndexManager {
 		);
 	}
 
-	private async saveRemoteIndexLocked(): Promise<void> {
+	private async saveRemoteIndexLocked(): Promise<IndexTransactionOutcome> {
 		const canonicalPath = this.getRemoteIndexPath();
 		const transactionId = this.createTransactionId();
 		const lockPath = joinPath(
@@ -660,15 +675,37 @@ export class IndexManager {
 			);
 		}
 
-		let released = false;
+		let stage: IndexTransactionStage = "acquired";
+		let originalSnapshot: IndexFileSnapshot | null = null;
+		let merged: SyncIndex | null = null;
+		let writtenFingerprint: string | null = null;
 		try {
+			try {
+				originalSnapshot = await this.downloadIndexSnapshot(
+					lockPath,
+					true,
+					this.transitionIndexReadService,
+					"source",
+				);
+			} catch (sourceReadError) {
+				if (!this.replaceRemoteOnNextSave) throw sourceReadError;
+				originalSnapshot =
+					await this.downloadUnparsedIndexSnapshot(lockPath);
+				logger.warn(
+					"Force transaction captured an unreadable source index as raw bytes",
+					{
+						...transactionContext,
+						sourceReadable: false,
+						sourceFingerprint: shortenDiagnosticValue(
+							originalSnapshot.fingerprint,
+						),
+						error: sourceReadError,
+					},
+				);
+			}
 			const latest = this.replaceRemoteOnNextSave
 				? this.createReplacementBaseline()
-				: await this.downloadIndex(
-						lockPath,
-						this.allowLegacyWriteOnce,
-						this.transitionIndexReadService,
-					);
+				: originalSnapshot.index;
 			logger.debug("Latest canonical state loaded from lock", {
 				...transactionContext,
 				latestRevision: latest.revision,
@@ -687,7 +724,7 @@ export class IndexManager {
 				this.assertEpochCompatible(latest);
 				this.assertMaintenanceCompatible(latest);
 			}
-			const merged = this.mergeDesiredIndex(latest);
+			merged = this.mergeDesiredIndex(latest);
 			logger.debug("Canonical reducer completed", {
 				...transactionContext,
 				latestRevision: latest.revision,
@@ -727,12 +764,19 @@ export class IndexManager {
 				} catch (error) {
 					uploadError = error;
 				}
-				const verifiedLock = await this.downloadIndex(
+				stage = "written";
+				const verifiedLock = await this.downloadIndexSnapshot(
 					lockPath,
 					this.allowLegacyWriteOnce,
 					this.transitionIndexWriteService,
+					"target",
 				);
-				if (!this.sameValue(verifiedLock, merged)) {
+				if (!this.sameValue(verifiedLock.index, merged)) {
+					await this.logSemanticIndexMismatch(
+						merged,
+						verifiedLock.index,
+						transactionContext,
+					);
 					if (uploadError) {
 						throw uploadError instanceof Error
 							? uploadError
@@ -740,104 +784,167 @@ export class IndexManager {
 									"Lock upload failed with a non-Error value",
 								);
 					}
-					throw new RemoteIndexConcurrentModificationError(
+					throw new RemoteIndexContentMismatchError(
 						"Written lock revision or contents could not be verified",
+						stage,
 					);
 				}
+				writtenFingerprint = verifiedLock.fingerprint;
+				stage = "verified";
 				logger.debug("Written index lock verified", {
 					...transactionContext,
 					mergedRevision: merged.revision,
+					lockFingerprint: shortenDiagnosticValue(
+						writtenFingerprint,
+					),
 				});
 			}
-			const writtenLock = await this.yandexClient.getResource(
-				lockPath,
-				1,
-				0,
-				true,
-			);
-			const writtenFingerprint = this.getResourceFingerprint(writtenLock);
+			if (writtenFingerprint === null) {
+				const writtenLock = await this.yandexClient.getResource(
+					lockPath,
+					1,
+					0,
+					true,
+				);
+				writtenFingerprint =
+					this.getResourceFingerprint(writtenLock);
+				stage = "verified";
+			}
+			stage = "move-attempted";
 			try {
 				await this.yandexClient.moveResourceExclusive(
 					lockPath,
 					canonicalPath,
 				);
 			} catch (error) {
-				if (
-					!(await this.wasCanonicalCommittedDespiteError(
-						lockPath,
-						canonicalPath,
-						writtenFingerprint,
-					))
-				) {
-					throw error;
+				const recovered = await this.recoverAmbiguousFinalMove(
+					lockPath,
+					canonicalPath,
+					merged,
+					writtenFingerprint,
+				);
+				if (recovered === "concurrent") {
+					throw new RemoteIndexConcurrentModificationError(
+						"Canonical index changed during the final move",
+						stage,
+						false,
+						error,
+					);
+				}
+				if (recovered !== "committed") {
+					throw new AmbiguousRemoteIndexStateError(
+						"Canonical index move could not be resolved safely",
+						stage,
+						error,
+					);
 				}
 			}
-			const canonical = await this.yandexClient.getResource(
+			const canonicalSnapshot = await this.verifyCanonicalCommit(
+				lockPath,
 				canonicalPath,
-				1,
-				0,
-				true,
+				merged,
+				writtenFingerprint,
 			);
-			if (
-				writtenFingerprint &&
-				this.getResourceFingerprint(canonical) !== writtenFingerprint
-			) {
-				throw new RemoteIndexConcurrentModificationError(
-					"Canonical index fingerprint does not match the committed lock",
-				);
-			}
+			stage = "committed";
 			logger.debug("Canonical index fingerprint verified", {
 				...transactionContext,
 				committedRevision: merged.revision,
 				canonicalFingerprint: shortenDiagnosticValue(
-					writtenFingerprint,
+					canonicalSnapshot.fingerprint,
 				),
 			});
-			released = true;
-			this.remoteIndex = merged;
-			this.loadedRemoteIndex = this.cloneIndex(merged);
-			this.completedMoveIds.clear();
-			this.allowLegacyWriteOnce = false;
-			const replacedRemote = this.replaceRemoteOnNextSave;
-			this.replaceRemoteOnNextSave = false;
-			if (replacedRemote) {
-				this.finalizeForceEpoch(merged);
-				try {
-					await this.cleanupForceReplacedLocks();
-				} catch (cleanupError) {
-					logger.warn(
-						"Could not remove locks superseded by force sync:",
-						{ error: cleanupError },
-					);
-				}
-			}
+			await this.finalizeCommittedTransaction(merged);
 			logger.info("Canonical index transaction committed", {
 				...transactionContext,
+				outcome: "committed",
+				stage,
 				committedRevision: merged.revision,
 				canonicalFingerprint: shortenDiagnosticValue(
-					writtenFingerprint,
+					canonicalSnapshot.fingerprint,
 				),
 			});
+			return "committed";
 		} catch (e) {
+			if (
+				stage === "move-attempted" &&
+				merged &&
+				(await this.isExpectedCanonicalCommitted(
+					lockPath,
+					canonicalPath,
+					merged,
+					writtenFingerprint,
+				))
+			) {
+				stage = "committed";
+				await this.finalizeCommittedTransaction(merged);
+				logger.warn(
+					"Canonical index commit was confirmed after an ambiguous response",
+					{
+						...transactionContext,
+						outcome: "committed",
+						stage,
+						committedRevision: merged.revision,
+						error: e,
+					},
+				);
+				return "committed";
+			}
+
+			const rollbackOutcome = originalSnapshot
+				? await this.rollbackOwnedLock(
+						lockPath,
+						canonicalPath,
+						originalSnapshot,
+						transactionContext,
+					)
+				: "ambiguous";
 			logger.error("Canonical index transaction failed", {
 				...transactionContext,
-				lockAcquired: acquired,
-				canonicalReleased: released,
+				outcome: rollbackOutcome,
+				failedStage: stage,
+				expectedRevision: merged?.revision,
+				actualRevision:
+					rollbackOutcome === "rolled-back"
+						? originalSnapshot?.index.revision
+						: null,
+				expectedEpoch: shortenDiagnosticValue(merged?.epoch),
+				actualEpoch: shortenDiagnosticValue(
+					rollbackOutcome === "rolled-back"
+						? originalSnapshot?.index.epoch
+						: null,
+				),
+				expectedFingerprint: shortenDiagnosticValue(
+					writtenFingerprint,
+				),
+				actualFingerprint: shortenDiagnosticValue(
+					rollbackOutcome === "rolled-back"
+						? originalSnapshot?.fingerprint
+						: null,
+				),
 				error: e,
 			});
-			if (this.isLockContention(e)) {
-				throw new RemoteIndexConcurrentModificationError(
-					"Remote index ownership changed during commit",
+			if (rollbackOutcome === "rolled-back") {
+				throw new RemoteIndexRolledBackError(
+					e instanceof Error
+						? e.message
+						: "Canonical index transaction failed",
+					stage,
+					e,
 				);
 			}
-			throw e;
-		} finally {
-			if (!released) {
-				logger.warn("Restoring uncommitted owned index lock", {
-					...transactionContext,
-				});
-				await this.restoreOwnedLock(lockPath, canonicalPath);
+			if (rollbackOutcome === "concurrent") {
+				throw new RemoteIndexConcurrentModificationError(
+					"Canonical index changed while the transaction was active",
+					stage,
+					false,
+					e,
+				);
 			}
+			throw new AmbiguousRemoteIndexStateError(
+				"Canonical index and lock require explicit recovery",
+				stage,
+				e,
+			);
 		}
 	}
 
@@ -1191,35 +1298,109 @@ export class IndexManager {
 		allowLegacy: boolean,
 		serviceOverride?: EncryptionService | null,
 	): Promise<SyncIndex> {
-		const encActive = this.yandexClient.hasEncryptionService();
-		let data: Partial<SyncIndex>;
+		return (
+			await this.downloadIndexSnapshot(
+				path,
+				allowLegacy,
+				serviceOverride,
+			)
+		).index;
+	}
+
+	private async downloadIndexSnapshot(
+		path: string,
+		allowLegacy: boolean,
+		serviceOverride?: EncryptionService | null,
+		codecLabel?: IndexCodec,
+	): Promise<IndexFileSnapshot> {
+		const [raw, resource] = await Promise.all([
+			this.yandexClient.downloadFile(path, true),
+			this.yandexClient.getResource(path, 1, 0, true),
+		]);
+		if (!resource) {
+			throw new RemoteIndexConcurrentModificationError(
+				`Index resource disappeared while reading ${path}`,
+			);
+		}
+		const decoded = await this.decodeIndexSnapshot(
+			raw,
+			allowLegacy,
+			serviceOverride,
+			codecLabel,
+		);
+		return {
+			raw,
+			index: decoded.index,
+			fingerprint: this.getResourceFingerprint(resource),
+			codec: decoded.codec,
+		};
+	}
+
+	private async downloadUnparsedIndexSnapshot(
+		path: string,
+	): Promise<IndexFileSnapshot> {
+		const [raw, resource] = await Promise.all([
+			this.yandexClient.downloadFile(path, true),
+			this.yandexClient.getResource(path, 1, 0, true),
+		]);
+		if (!resource) {
+			throw new RemoteIndexConcurrentModificationError(
+				`Index resource disappeared while reading ${path}`,
+			);
+		}
+		return {
+			raw,
+			index: createEmptyIndex(""),
+			fingerprint: this.getResourceFingerprint(resource),
+			codec: "source",
+		};
+	}
+
+	private async decodeIndexSnapshot(
+		raw: ArrayBuffer,
+		allowLegacy: boolean,
+		serviceOverride?: EncryptionService | null,
+		codecLabel?: IndexCodec,
+	): Promise<{ index: SyncIndex; codec: IndexCodec }> {
 		if (serviceOverride !== undefined) {
 			const content =
-				await this.yandexClient.downloadFileWithEncryptionService(
-					path,
+				await this.yandexClient.decodeServiceFileContent(
+					raw,
 					serviceOverride,
 				);
-			data = JSON.parse(
-				new TextDecoder().decode(content),
-			) as Partial<SyncIndex>;
-		} else try {
-			const content = await this.yandexClient.downloadFile(
-				path,
-				!encActive,
-			);
-			data = JSON.parse(
-				new TextDecoder().decode(content),
-			) as Partial<SyncIndex>;
-		} catch {
-			const content = await this.yandexClient.downloadFile(
-				path,
-				encActive,
-			);
-			data = JSON.parse(
-				new TextDecoder().decode(content),
-			) as Partial<SyncIndex>;
+			return {
+				index: this.parseIndexContent(content, allowLegacy),
+				codec:
+					codecLabel ??
+					(serviceOverride ? "current" : "plaintext"),
+			};
 		}
 
+		try {
+			const content =
+				await this.yandexClient.decodeServiceFileContent(raw);
+			return {
+				index: this.parseIndexContent(content, allowLegacy),
+				codec: "current",
+			};
+		} catch (currentCodecError) {
+			if (!this.yandexClient.hasEncryptionService()) {
+				throw currentCodecError;
+			}
+			return {
+				index: this.parseIndexContent(raw, allowLegacy),
+				codec: "plaintext",
+			};
+		}
+	}
+
+	private parseIndexContent(
+		content: ArrayBuffer,
+		allowLegacy: boolean,
+	): SyncIndex {
+		const data = JSON.parse(
+			new TextDecoder().decode(content),
+		) as Partial<SyncIndex>;
 		const versionKind = classifyIndexVersion(data.version);
 		if (versionKind !== "current") {
 			if (allowLegacy && versionKind === "legacy") {
@@ -1236,7 +1417,7 @@ export class IndexManager {
 			throw new LegacyIndexVersionError(data.version);
 		}
 
-		return {
+		const normalized: SyncIndex = {
 			version: CURRENT_INDEX_VERSION,
 			epoch: data.epoch,
 			revision: data.revision || 0,
@@ -1246,8 +1427,11 @@ export class IndexManager {
 			folderTombstones: data.folderTombstones || {},
 			moves: data.moves || {},
 			appliedMutationSeq: data.appliedMutationSeq || {},
-			maintenance: data.maintenance,
 		};
+		if (data.maintenance !== undefined) {
+			normalized.maintenance = data.maintenance;
+		}
+		return normalized;
 	}
 
 	private normalizeLegacyIndex(data: Partial<SyncIndex>): SyncIndex {
@@ -1527,6 +1711,7 @@ export class IndexManager {
 				this.settings.remotePath,
 				resource.name,
 			);
+			await this.assertStaleLockReadable(lockPath);
 			try {
 				await this.yandexClient.moveResourceExclusive(
 					lockPath,
@@ -1539,6 +1724,39 @@ export class IndexManager {
 				if (!this.isLockContention(e)) throw e;
 			}
 		}
+	}
+
+	private async assertStaleLockReadable(lockPath: string): Promise<void> {
+		const candidates: Array<{
+			service: EncryptionService | null | undefined;
+			codec: IndexCodec;
+		}> = [
+			{
+				service: this.transitionIndexReadService,
+				codec: "source",
+			},
+			{
+				service: this.transitionIndexWriteService,
+				codec: "target",
+			},
+			{ service: undefined, codec: "current" },
+		];
+		for (const candidate of candidates) {
+			try {
+				await this.downloadIndexSnapshot(
+					lockPath,
+					true,
+					candidate.service,
+					candidate.codec,
+				);
+				return;
+			} catch {
+				// Continue with the other codec before blocking recovery.
+			}
+		}
+		throw new AmbiguousRemoteIndexLockError(
+			"Stale index lock is unreadable and cannot be published automatically",
+		);
 	}
 
 	private async cleanupStaleOrphanLocks(): Promise<void> {
@@ -1604,48 +1822,6 @@ export class IndexManager {
 		}
 	}
 
-	private async restoreOwnedLock(
-		lockPath: string,
-		canonicalPath: string,
-	): Promise<void> {
-		try {
-			await this.yandexClient.moveResourceExclusive(
-				lockPath,
-				canonicalPath,
-			);
-		} catch (e) {
-			try {
-				const canonical = await this.yandexClient.getResource(
-					canonicalPath,
-					1000,
-					0,
-					true,
-				);
-				if (!canonical) {
-					logger.warn("Could not restore owned index lock:", {
-						error: e,
-					});
-					return;
-				}
-				const ownedLock = await this.yandexClient.getResource(
-					lockPath,
-					1,
-					0,
-					true,
-				);
-				if (ownedLock) {
-					logger.warn(
-						"Preserved an ambiguous owned lock for explicit recovery",
-					);
-				}
-			} catch (cleanupError) {
-				logger.warn("Could not clean up owned index lock:", {
-					error: cleanupError,
-				});
-			}
-		}
-	}
-
 	private async wasLockAcquiredDespiteError(
 		lockPath: string,
 		canonicalPath: string,
@@ -1666,29 +1842,302 @@ export class IndexManager {
 		}
 	}
 
-	private async wasCanonicalCommittedDespiteError(
+	private async inspectExpectedIndex(
+		path: string,
+		expected: SyncIndex,
+		serviceOverride?: EncryptionService | null,
+		codecLabel?: IndexCodec,
+	): Promise<{
+		exists: boolean;
+		readable: boolean;
+		matches: boolean;
+		snapshot: IndexFileSnapshot | null;
+	}> {
+		const resource = await this.yandexClient.getResource(
+			path,
+			1,
+			0,
+			true,
+		);
+		if (!resource) {
+			return {
+				exists: false,
+				readable: false,
+				matches: false,
+				snapshot: null,
+			};
+		}
+		try {
+			const snapshot = await this.downloadIndexSnapshot(
+				path,
+				this.allowLegacyWriteOnce,
+				serviceOverride,
+				codecLabel,
+			);
+			return {
+				exists: true,
+				readable: true,
+				matches: this.sameValue(snapshot.index, expected),
+				snapshot,
+			};
+		} catch {
+			return {
+				exists: true,
+				readable: false,
+				matches: false,
+				snapshot: null,
+			};
+		}
+	}
+
+	private async recoverAmbiguousFinalMove(
 		lockPath: string,
 		canonicalPath: string,
+		expected: SyncIndex,
+		expectedFingerprint: string | null,
+	): Promise<IndexTransactionOutcome> {
+		const [canonical, lock] = await Promise.all([
+			this.inspectExpectedIndex(
+				canonicalPath,
+				expected,
+				this.transitionIndexWriteService,
+				"target",
+			),
+			this.inspectExpectedIndex(
+				lockPath,
+				expected,
+				this.transitionIndexWriteService,
+				"target",
+			),
+		]);
+		let decision = classifyIndexMoveRecovery({
+			canonicalExists: canonical.exists,
+			lockExists: lock.exists,
+			canonicalReadable: canonical.readable,
+			lockReadable: lock.readable,
+			canonicalMatchesExpected: canonical.matches,
+			lockMatchesExpected: lock.matches,
+		});
+		if (
+			decision === "committed" &&
+			expectedFingerprint &&
+			canonical.snapshot?.fingerprint !== expectedFingerprint
+		) {
+			decision = "ambiguous";
+		}
+		if (decision === "retry-move") {
+			try {
+				await this.yandexClient.moveResourceExclusive(
+					lockPath,
+					canonicalPath,
+				);
+			} catch {
+				// The read-back below is authoritative for an ambiguous API reply.
+			}
+			try {
+				await this.verifyCanonicalCommit(
+					lockPath,
+					canonicalPath,
+					expected,
+					expectedFingerprint,
+				);
+				return "committed";
+			} catch (error) {
+				if (
+					error instanceof
+					RemoteIndexConcurrentModificationError
+				) {
+					return "concurrent";
+				}
+				return "ambiguous";
+			}
+		}
+		return decision === "committed" ? "committed" : decision;
+	}
+
+	private async verifyCanonicalCommit(
+		lockPath: string,
+		canonicalPath: string,
+		expected: SyncIndex,
+		expectedFingerprint: string | null,
+	): Promise<IndexFileSnapshot> {
+		const [canonical, lock] = await Promise.all([
+			this.inspectExpectedIndex(
+				canonicalPath,
+				expected,
+				this.transitionIndexWriteService,
+				"target",
+			),
+			this.yandexClient.getResource(lockPath, 1, 0, true),
+		]);
+		if (
+			canonical.exists &&
+			canonical.readable &&
+			canonical.matches &&
+			!lock &&
+			(!expectedFingerprint ||
+				canonical.snapshot?.fingerprint === expectedFingerprint) &&
+			canonical.snapshot
+		) {
+			return canonical.snapshot;
+		}
+		if (
+			canonical.exists &&
+			canonical.readable &&
+			!canonical.matches &&
+			!lock
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Canonical index contains a different logical state",
+				"move-attempted",
+				false,
+			);
+		}
+		throw new AmbiguousRemoteIndexStateError(
+			"Canonical index commit could not be verified",
+			"move-attempted",
+		);
+	}
+
+	private async isExpectedCanonicalCommitted(
+		lockPath: string,
+		canonicalPath: string,
+		expected: SyncIndex,
 		expectedFingerprint: string | null,
 	): Promise<boolean> {
 		try {
-			const [lock, canonical] = await Promise.all([
-				this.yandexClient.getResource(lockPath, 1, 0, true),
-				this.yandexClient.getResource(
-					canonicalPath,
-					1,
-					0,
-					true,
-				),
-			]);
-			if (lock || !canonical) return false;
-			return (
-				expectedFingerprint === null ||
-				this.getResourceFingerprint(canonical) === expectedFingerprint
+			await this.verifyCanonicalCommit(
+				lockPath,
+				canonicalPath,
+				expected,
+				expectedFingerprint,
 			);
+			return true;
 		} catch {
 			return false;
 		}
+	}
+
+	private async rollbackOwnedLock(
+		lockPath: string,
+		canonicalPath: string,
+		original: IndexFileSnapshot,
+		context: Record<string, unknown>,
+	): Promise<IndexTransactionOutcome> {
+		try {
+			const outcome = await rollbackRawIndexSnapshot(
+				{
+					exists: async (path) =>
+						(await this.yandexClient.getResource(
+							path,
+							1,
+							0,
+							true,
+						)) !== null,
+					readRaw: async (path) =>
+						await this.yandexClient.downloadFile(path, true),
+					writeRaw: async (path, raw) =>
+						await this.yandexClient.uploadFile(
+							path,
+							raw,
+							true,
+							true,
+							true,
+						),
+					moveExclusive: async (fromPath, toPath) =>
+						await this.yandexClient.moveResourceExclusive(
+							fromPath,
+							toPath,
+						),
+				},
+				lockPath,
+				canonicalPath,
+				original.raw,
+				async (raw) => {
+					await this.decodeIndexSnapshot(
+						raw,
+						true,
+						this.transitionIndexReadService,
+						"source",
+					);
+				},
+			);
+			if (outcome !== "rolled-back") return outcome;
+			logger.warn("Canonical index transaction rolled back", {
+				...context,
+				outcome: "rolled-back",
+				restoredRevision: original.index.revision,
+				restoredEpoch: shortenDiagnosticValue(original.index.epoch),
+				restoredFingerprint: shortenDiagnosticValue(
+					original.fingerprint,
+				),
+			});
+			return outcome;
+		} catch (rollbackError) {
+			logger.error("Canonical index rollback is ambiguous", {
+				...context,
+				outcome: "ambiguous",
+				error: rollbackError,
+			});
+			return "ambiguous";
+		}
+	}
+
+	private async finalizeCommittedTransaction(
+		merged: SyncIndex,
+	): Promise<void> {
+		this.remoteIndex = merged;
+		this.loadedRemoteIndex = this.cloneIndex(merged);
+		this.completedMoveIds.clear();
+		this.allowLegacyWriteOnce = false;
+		const replacedRemote = this.replaceRemoteOnNextSave;
+		this.replaceRemoteOnNextSave = false;
+		if (!replacedRemote) return;
+
+		this.finalizeForceEpoch(merged);
+		try {
+			await this.cleanupForceReplacedLocks();
+		} catch (cleanupError) {
+			logger.warn("Could not remove locks superseded by force sync:", {
+				error: cleanupError,
+			});
+		}
+	}
+
+	private async logSemanticIndexMismatch(
+		expected: SyncIndex,
+		actual: SyncIndex,
+		context: Record<string, unknown>,
+	): Promise<void> {
+		const sections: Array<Record<string, unknown>> = [];
+		const keys = new Set([
+			...Object.keys(expected),
+			...Object.keys(actual),
+		]);
+		for (const key of keys) {
+			const expectedValue = stableSerialize(
+				(expected as unknown as Record<string, unknown>)[key],
+			);
+			const actualValue = stableSerialize(
+				(actual as unknown as Record<string, unknown>)[key],
+			);
+			if (expectedValue === actualValue) continue;
+			const [expectedHash, actualHash] = await Promise.all([
+				computeSha256FromString(expectedValue),
+				computeSha256FromString(actualValue),
+			]);
+			sections.push({
+				section: key,
+				expectedSize: expectedValue.length,
+				actualSize: actualValue.length,
+				expectedSha256: expectedHash.slice(0, 12),
+				actualSha256: actualHash.slice(0, 12),
+			});
+		}
+		logger.error("Written index differs after JSON roundtrip", {
+			...context,
+			sections,
+		});
 	}
 
 	private cloneIndex(index: SyncIndex): SyncIndex {
@@ -2043,13 +2492,92 @@ export class IndexManager {
 	}
 }
 
-/**
- * Thrown when an index transaction loses ownership before its final move.
- */
-export class RemoteIndexConcurrentModificationError extends Error {
-	constructor(message: string) {
+export class RemoteIndexTransactionError extends Error {
+	readonly retryable: boolean;
+	readonly cause?: unknown;
+
+	constructor(
+		message: string,
+		name: string,
+		readonly outcome: IndexTransactionOutcome,
+		readonly stage: IndexTransactionStage,
+		lockContention: boolean,
+		cause?: unknown,
+	) {
 		super(message);
-		this.name = "RemoteIndexConcurrentModificationError";
+		this.name = name;
+		this.retryable = shouldRetryIndexTransaction(
+			outcome,
+			lockContention,
+		);
+		this.cause = cause;
+	}
+}
+
+/**
+ * Thrown when another writer conclusively changed canonical index state.
+ */
+export class RemoteIndexConcurrentModificationError extends RemoteIndexTransactionError {
+	constructor(
+		message: string,
+		stage: IndexTransactionStage = "acquired",
+		lockContention = true,
+		cause?: unknown,
+	) {
+		super(
+			message,
+			"RemoteIndexConcurrentModificationError",
+			"concurrent",
+			stage,
+			lockContention,
+			cause,
+		);
+	}
+}
+
+export class RemoteIndexContentMismatchError extends RemoteIndexTransactionError {
+	constructor(message: string, stage: IndexTransactionStage) {
+		super(
+			message,
+			"RemoteIndexContentMismatchError",
+			"ambiguous",
+			stage,
+			false,
+		);
+	}
+}
+
+export class RemoteIndexRolledBackError extends RemoteIndexTransactionError {
+	constructor(
+		message: string,
+		stage: IndexTransactionStage,
+		cause?: unknown,
+	) {
+		super(
+			message,
+			"RemoteIndexRolledBackError",
+			"rolled-back",
+			stage,
+			false,
+			cause,
+		);
+	}
+}
+
+export class AmbiguousRemoteIndexStateError extends RemoteIndexTransactionError {
+	constructor(
+		message: string,
+		stage: IndexTransactionStage,
+		cause?: unknown,
+	) {
+		super(
+			message,
+			"AmbiguousRemoteIndexStateError",
+			"ambiguous",
+			stage,
+			false,
+			cause,
+		);
 	}
 }
 
@@ -2065,7 +2593,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.1. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.2. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

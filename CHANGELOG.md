@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.0.0-beta.2
+
+### Fixed
+
+- Fixed false canonical-index verification failures caused by optional
+  `undefined` fields changing during JSON upload and read-back.
+- Added byte-exact rollback of the acquired index lock for plaintext,
+  encrypted, and encryption-transition transactions.
+- Added explicit committed, rolled-back, concurrent, and ambiguous transaction
+  outcomes. Force sync now succeeds only after canonical epoch, revision,
+  logical content, and fingerprint are read back and verified.
+- Added safe recovery when a final Yandex Disk move succeeds but its API
+  response is lost. Ambiguous canonical/lock combinations are preserved for
+  explicit recovery instead of being overwritten.
+- Prevented unreadable stale locks from being published automatically.
+- Restored realtime watcher and scheduler immediately after a successful Force
+  migration from a legacy-blocked startup.
+- Added verified Force-backup diagnostics and corrected failed-session logging
+  so unsuccessful Force sync is not reported as completed successfully.
+- Preserved safe Yandex Disk API error identifiers in sanitized debug logs.
+
+### Testing
+
+- Added JSON-roundtrip, optional metadata, transaction outcome, retry, raw
+  rollback, and diagnostic-redaction regression coverage.
+
 ## 2.0.0-beta.1
 
 ### Breaking change

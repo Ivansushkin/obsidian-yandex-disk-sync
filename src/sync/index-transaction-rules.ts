@@ -9,21 +9,21 @@ export interface Page<T> {
  * Serialize JSON-compatible state with stable object-key ordering.
  */
 export function stableSerialize(value: unknown): string {
-	if (Array.isArray(value)) {
-		return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
-	}
-	if (value !== null && typeof value === "object") {
-		const entries = Object.entries(value as Record<string, unknown>).sort(
-			([left], [right]) => left.localeCompare(right),
-		);
-		return `{${entries
-			.map(
-				([key, item]) =>
-					`${JSON.stringify(key)}:${stableSerialize(item)}`,
-			)
-			.join(",")}}`;
-	}
-	return JSON.stringify(value);
+	const serialized = JSON.stringify(value, (_key, item: unknown) => {
+		if (
+			item !== null &&
+			typeof item === "object" &&
+			!Array.isArray(item)
+		) {
+			return Object.fromEntries(
+				Object.entries(item as Record<string, unknown>).sort(
+					([left], [right]) => left.localeCompare(right),
+				),
+			);
+		}
+		return item;
+	});
+	return serialized ?? "undefined";
 }
 
 /**

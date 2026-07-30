@@ -611,15 +611,23 @@ export class YandexDiskClient {
 		remotePath: string,
 		service: EncryptionService | null,
 	): Promise<ArrayBuffer> {
-		const downloadLink = await this.getDownloadLink(remotePath, true);
-		const response = await requestUrl({
-			url: downloadLink.href,
-			method: "GET",
-			throw: true,
-		});
-		return service
-			? await service.decrypt(response.arrayBuffer)
-			: response.arrayBuffer;
+		const raw = await this.downloadFile(remotePath, true);
+		return await this.decodeServiceFileContent(raw, service);
+	}
+
+	/**
+	 * Decode already downloaded service-file bytes with an explicit codec.
+	 * Passing undefined uses the currently configured codec, while null means
+	 * plaintext. This keeps index rollback snapshots byte-identical.
+	 */
+	async decodeServiceFileContent(
+		raw: ArrayBuffer,
+		service?: EncryptionService | null,
+	): Promise<ArrayBuffer> {
+		if (service === undefined) {
+			return await this.decryptContent(raw);
+		}
+		return service ? await service.decrypt(raw) : raw;
 	}
 
 	/**

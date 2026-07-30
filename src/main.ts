@@ -115,6 +115,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	};
 
 	private isInitialized = false;
+	private regularSyncStarted = false;
 	private encryptionService: EncryptionService | null = null;
 	private encryptionBlockReason: string | null = null;
 	private encryptionPromptPromise: Promise<boolean> | null = null;
@@ -812,6 +813,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			notice.hide();
 
 			if (result.success) {
+				await this.startSync();
 				new Notice(
 					t("notice.force_sync_completed", {
 						successful:
@@ -879,6 +881,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			notice.hide();
 
 			if (result.success) {
+				await this.startSync();
 				new Notice(
 					t("notice.force_sync_completed", {
 						successful:
@@ -903,6 +906,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Start regular synchronization
 	 */
 	private async startSync(): Promise<void> {
+		if (this.regularSyncStarted) {
+			logger.debug("[Main] Regular synchronization already started");
+			return;
+		}
+		this.regularSyncStarted = true;
 		logger.info("[Main] Starting regular synchronization");
 
 		// Start file watcher

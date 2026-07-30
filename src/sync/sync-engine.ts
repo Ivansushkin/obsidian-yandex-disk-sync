@@ -15,7 +15,7 @@ import { YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import {
 	IndexManager,
-	RemoteIndexConcurrentModificationError,
+	RemoteIndexTransactionError,
 } from "./index-manager";
 import { ConflictResolver } from "./conflict-resolver";
 import {
@@ -2518,9 +2518,10 @@ export class SyncEngine {
 				pendingCount: 0,
 			});
 
-			logger.info(logMessage(result), {
+			const diagnosticResult = {
 				...this.getDiagnosticSnapshot(),
 				durationMs: result.endTime - startTime,
+				success: result.success,
 				result: {
 					uploaded: result.uploaded,
 					downloaded: result.downloaded,
@@ -2528,7 +2529,15 @@ export class SyncEngine {
 					conflicts: result.conflicts,
 					errors: result.errors.length,
 				},
-			});
+			};
+			if (result.success) {
+				logger.info(logMessage(result), diagnosticResult);
+			} else {
+				logger.warn(
+					"Sync reconciliation completed with errors",
+					diagnosticResult,
+				);
+			}
 
 			return result;
 		} catch (e) {
@@ -2612,17 +2621,19 @@ export class SyncEngine {
 			}
 			return true;
 		} catch (e) {
-			if (!(e instanceof RemoteIndexConcurrentModificationError)) {
+			if (!(e instanceof RemoteIndexTransactionError)) {
 				throw e;
 			}
-			logger.warn(
-				"Remote index was modified by another device during sync; skipping index overwrite.",
-			);
+			logger.error("Canonical index transaction did not commit", {
+				outcome: e.outcome,
+				failedStage: e.stage,
+				retryable: e.retryable,
+				error: e,
+			});
 			result.errors.push({
 				path: "",
 				operation: "none",
-				message:
-					"Concurrent sync detected from another device. Index not overwritten; please run sync again to reconcile.",
+				message: `Index transaction ${e.outcome} at ${e.stage}: ${e.message}`,
 			});
 			result.success = false;
 			return false;
@@ -2642,9 +2653,14 @@ export class SyncEngine {
 			await this.cleanupRejectedUploads();
 			return true;
 		} catch (e) {
-			if (e instanceof RemoteIndexConcurrentModificationError) {
+			if (e instanceof RemoteIndexTransactionError) {
 				logger.warn(
-					"Remote index modified concurrently during single-file sync; skipping remote index save. It will be reconciled on the next full sync.",
+					"Realtime canonical index transaction did not commit",
+					{
+						outcome: e.outcome,
+						failedStage: e.stage,
+						error: e,
+					},
 				);
 				return false;
 			}

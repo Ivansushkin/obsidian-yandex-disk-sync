@@ -58,6 +58,43 @@ test("semantic index comparison ignores object insertion order", () => {
 	);
 });
 
+test("semantic index comparison uses JSON undefined semantics", () => {
+	assert.equal(
+		stableSerialize({ revision: 3, maintenance: undefined }),
+		stableSerialize({ revision: 3 }),
+	);
+	assert.equal(
+		stableSerialize([1, undefined, 3]),
+		stableSerialize([1, null, 3]),
+	);
+});
+
+test("optional metadata survives JSON roundtrip", () => {
+	const metadata = {
+		sha256: "abc",
+		size: 12,
+		mtime: 42,
+		serverMtime: undefined,
+		serverFingerprint: undefined,
+	};
+	const roundtripped = JSON.parse(
+		JSON.stringify(metadata),
+	) as typeof metadata;
+
+	assert.equal(stableSerialize(metadata), stableSerialize(roundtripped));
+});
+
+test("stable serialization keeps real value differences visible", () => {
+	assert.notEqual(
+		stableSerialize({ revision: 3, maintenance: null }),
+		stableSerialize({ revision: 3 }),
+	);
+	assert.notEqual(
+		stableSerialize({ files: [{ size: 1 }] }),
+		stableSerialize({ files: [{ size: 2 }] }),
+	);
+});
+
 test("stable pagination requires two equal deduplicated snapshots", async () => {
 	let snapshot = 0;
 	const pages = [

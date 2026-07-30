@@ -35,6 +35,29 @@ const SENSITIVE_KEYS = [
 	"accesstoken",
 	"refreshtoken",
 ];
+const SAFE_DIAGNOSTIC_KEYS = new Set([
+	"code",
+	"name",
+	"deviceid",
+	"epoch",
+	"expectedepoch",
+	"actualepoch",
+	"sessionid",
+	"sessionkind",
+	"indextransactionid",
+	"lockname",
+	"transitionid",
+	"kind",
+	"phase",
+	"outcome",
+	"failedstage",
+	"remotefingerprint",
+	"canonicalfingerprint",
+	"lockfingerprint",
+	"expectedfingerprint",
+	"actualfingerprint",
+	"restoredfingerprint",
+]);
 
 export interface LoggerConfig {
 	app?: App;
@@ -102,13 +125,19 @@ function sanitizeString(value: string): string {
 /**
  * Recursively sanitize context data to avoid leaking secrets.
  */
-function sanitizeContext(context: unknown): unknown {
+function sanitizeContext(
+	context: unknown,
+	parentKey?: string,
+): unknown {
 	if (context === null || context === undefined) {
 		return context;
 	}
 
 	if (typeof context === "string") {
-		if (looksLikeToken(context)) {
+		if (
+			!SAFE_DIAGNOSTIC_KEYS.has(parentKey ?? "") &&
+			looksLikeToken(context)
+		) {
 			return maskString(context);
 		}
 		return sanitizeString(context);
@@ -151,7 +180,7 @@ function sanitizeContext(context: unknown): unknown {
 				result[key] =
 					typeof value === "string" ? maskString(value) : "***";
 			} else {
-				result[key] = sanitizeContext(value);
+				result[key] = sanitizeContext(value, lowerKey);
 			}
 		}
 		return result;

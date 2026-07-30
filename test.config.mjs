@@ -11,12 +11,31 @@ const outputFiles = [
 	join(outputDir, "sync-coordinator.test.mjs"),
 	join(outputDir, "local-operation-store.test.mjs"),
 	join(outputDir, "index-transaction-rules.test.mjs"),
+	join(outputDir, "index-transaction.test.mjs"),
+	join(outputDir, "index-manager-transaction.test.mjs"),
 	join(outputDir, "encryption-transition.test.mjs"),
 	join(outputDir, "baseline-rules.test.mjs"),
 	join(outputDir, "path-utils.test.mjs"),
 	join(outputDir, "physical-action-rules.test.mjs"),
 	join(outputDir, "logger.test.mjs"),
 ];
+const obsidianStubPlugin = {
+	name: "obsidian-test-stub",
+	setup(build) {
+		build.onResolve({ filter: /^obsidian$/ }, () => ({
+			path: "obsidian-test-stub",
+			namespace: "test",
+		}));
+		build.onLoad(
+			{ filter: /.*/, namespace: "test" },
+			() => ({
+				contents:
+					"export async function requestUrl() { throw new Error('Unexpected Obsidian requestUrl call in unit test'); }",
+				loader: "js",
+			}),
+		);
+	},
+};
 
 try {
 	await build({
@@ -26,6 +45,8 @@ try {
 			"tests/sync-coordinator.test.ts",
 			"tests/local-operation-store.test.ts",
 			"tests/index-transaction-rules.test.ts",
+			"tests/index-transaction.test.ts",
+			"tests/index-manager-transaction.test.ts",
 			"tests/encryption-transition.test.ts",
 			"tests/baseline-rules.test.ts",
 			"tests/path-utils.test.ts",
@@ -38,6 +59,7 @@ try {
 		outdir: outputDir,
 		outExtension: { ".js": ".mjs" },
 		logLevel: "silent",
+		plugins: [obsidianStubPlugin],
 	});
 
 	const exitCode = await new Promise((resolve, reject) => {

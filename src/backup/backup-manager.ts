@@ -16,6 +16,7 @@ export interface BackupResult {
 	backupName?: string;
 	fileCount: number;
 	totalSize: number;
+	remoteFingerprint?: string;
 	error?: string;
 }
 
@@ -91,16 +92,21 @@ export class BackupManager {
 				backupName,
 			);
 			await this.yandexClient.uploadFile(backupPath, zipContent);
+			const fingerprint = await this.verifyBackupUpload(backupPath);
 
-			logger.info(
-				`Backup created successfully: ${backupName} (${files.length} files, ${totalSize} bytes)`,
-			);
+			logger.info("Backup upload verified", {
+				backupName,
+				fileCount: files.length,
+				totalSize,
+				remoteFingerprint: fingerprint,
+			});
 
 			return {
 				success: true,
 				backupName,
 				fileCount: files.length,
 				totalSize,
+				remoteFingerprint: fingerprint,
 			};
 		} catch (error) {
 			const errorMessage =
@@ -161,19 +167,25 @@ export class BackupManager {
 			const backupName = this.formatBackupName(
 				this.yandexClient.hasEncryptionService(),
 			);
-			await this.yandexClient.uploadFile(
-				joinPath(
-					this.settings.remotePath,
-					".backup",
-					backupName,
-				),
-				zipContent,
+			const backupPath = joinPath(
+				this.settings.remotePath,
+				".backup",
+				backupName,
 			);
+			await this.yandexClient.uploadFile(backupPath, zipContent);
+			const fingerprint = await this.verifyBackupUpload(backupPath);
+			logger.info("Remote snapshot backup upload verified", {
+				backupName,
+				rawObjectCount: files.length,
+				totalSize,
+				remoteFingerprint: fingerprint,
+			});
 			return {
 				success: true,
 				backupName,
 				fileCount: files.length,
 				totalSize,
+				remoteFingerprint: fingerprint,
 			};
 		} catch (error) {
 			const message =
@@ -186,6 +198,27 @@ export class BackupManager {
 				error: message,
 			};
 		}
+	}
+
+	private async verifyBackupUpload(backupPath: string): Promise<string> {
+		const resource = await this.yandexClient.getResource(
+			backupPath,
+			1,
+			0,
+			true,
+		);
+		const fingerprint = resource
+			? resource.md5 ||
+				resource.sha256 ||
+				resource.resource_id ||
+				resource.modified
+			: null;
+		if (!resource || resource.type !== "file" || !fingerprint) {
+			throw new Error(
+				"Backup upload could not be confirmed on Yandex Disk",
+			);
+		}
+		return fingerprint;
 	}
 
 	/**

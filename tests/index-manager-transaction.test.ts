@@ -1,0 +1,329 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+	IndexManager,
+	RemoteIndexRolledBackError,
+} from "../src/sync/index-manager";
+import {
+	CURRENT_INDEX_VERSION,
+	DEFAULT_SETTINGS,
+	type YandexDiskSyncSettings,
+	type YandexResource,
+} from "../src/types";
+import type { EncryptionService } from "../src/crypto/encryption";
+import type { YandexDiskClient } from "../src/api/yandex-client";
+import type { VaultAdapter } from "../src/api/vault-adapter";
+import { logger } from "../src/utils/logger";
+
+logger.configure({ consoleEnabled: false, fileEnabled: false });
+
+class XorEncryptionService {
+	constructor(private readonly key: number) {}
+
+	async encrypt(content: ArrayBuffer): Promise<ArrayBuffer> {
+		return this.transform(content);
+	}
+
+	async decrypt(content: ArrayBuffer): Promise<ArrayBuffer> {
+		return this.transform(content);
+	}
+
+	private transform(content: ArrayBuffer): ArrayBuffer {
+		const source = new Uint8Array(content);
+		const result = new Uint8Array(source.length);
+		for (let index = 0; index < source.length; index++) {
+			result[index] = source[index]! ^ this.key;
+		}
+		return result.buffer;
+	}
+}
+
+class FakeIndexYandex {
+	readonly files = new Map<string, ArrayBuffer>();
+	moveCount = 0;
+
+	constructor(
+		private readonly remotePath: string,
+		private readonly encryption: EncryptionService | null,
+		private readonly faults: {
+			throwAfterFinalMove?: boolean;
+			corruptIndexUpload?: boolean;
+		} = {},
+	) {}
+
+	hasEncryptionService(): boolean {
+		return this.encryption !== null;
+	}
+
+	async decodeServiceFileContent(
+		raw: ArrayBuffer,
+		service?: EncryptionService | null,
+	): Promise<ArrayBuffer> {
+		const codec = service === undefined ? this.encryption : service;
+		return codec ? await codec.decrypt(raw) : raw;
+	}
+
+	async downloadFile(path: string, raw = false): Promise<ArrayBuffer> {
+		const value = this.files.get(path);
+		if (!value) throw new Error(`Missing file: ${path}`);
+		const copy = value.slice(0);
+		return raw || !this.encryption
+			? copy
+			: await this.encryption.decrypt(copy);
+	}
+
+	async uploadFile(
+		path: string,
+		content: ArrayBuffer | string,
+		_skipFolderCheck = false,
+		raw = false,
+		overwrite = true,
+	): Promise<void> {
+		if (!overwrite && this.files.has(path)) {
+			throw new Error("target exists");
+		}
+		const plain =
+			typeof content === "string"
+				? new TextEncoder().encode(content).buffer
+				: content;
+		const stored =
+			raw || !this.encryption
+				? plain
+				: await this.encryption.encrypt(plain);
+		const storedCopy = stored.slice(0);
+		if (
+			this.faults.corruptIndexUpload &&
+			!raw &&
+			path.includes(".obsidian-sync-index.lock.")
+		) {
+			const bytes = new Uint8Array(storedCopy);
+			bytes[0] = (bytes[0] ?? 0) ^ 0xff;
+		}
+		this.files.set(path, storedCopy);
+	}
+
+	async uploadFileWithEncryptionService(
+		path: string,
+		content: string,
+		service: EncryptionService | null,
+		overwrite = true,
+	): Promise<void> {
+		const plain = new TextEncoder().encode(content).buffer;
+		const stored = service ? await service.encrypt(plain) : plain;
+		await this.uploadFile(path, stored, true, true, overwrite);
+	}
+
+	async uploadFileExclusive(
+		path: string,
+		content: string,
+		_rawPath = false,
+		rawContent = false,
+	): Promise<void> {
+		await this.uploadFile(path, content, true, rawContent, false);
+	}
+
+	async moveResourceExclusive(
+		fromPath: string,
+		toPath: string,
+	): Promise<void> {
+		if (this.files.has(toPath)) throw new Error("target exists");
+		const value = this.files.get(fromPath);
+		if (!value) throw new Error("source missing");
+		this.files.set(toPath, value);
+		this.files.delete(fromPath);
+		this.moveCount++;
+		if (this.faults.throwAfterFinalMove && this.moveCount === 2) {
+			throw new Error("lost final move response");
+		}
+	}
+
+	async deleteResource(path: string): Promise<void> {
+		this.files.delete(path);
+	}
+
+	async getResource(
+		path: string,
+		_limit = 1000,
+		_offset = 0,
+		_raw = false,
+	): Promise<YandexResource | null> {
+		if (path === this.remotePath) {
+			const items = [...this.files.entries()]
+				.filter(([filePath]) =>
+					filePath.startsWith(`${this.remotePath}/`),
+				)
+				.map(([filePath, content]) =>
+					this.createResource(filePath, content),
+				);
+			return {
+				name: this.remotePath,
+				path: this.remotePath,
+				type: "dir",
+				created: "2026-01-01T00:00:00Z",
+				modified: "2026-01-01T00:00:00Z",
+				_embedded: {
+					items,
+					total: items.length,
+					limit: 1000,
+					offset: 0,
+					path: this.remotePath,
+					sort: "",
+				},
+			};
+		}
+		const content = this.files.get(path);
+		return content ? this.createResource(path, content) : null;
+	}
+
+	private createResource(
+		path: string,
+		content: ArrayBuffer,
+	): YandexResource {
+		return {
+			name: path.split("/").pop() ?? path,
+			path,
+			type: "file",
+			created: "2026-01-01T00:00:00Z",
+			modified: "2026-01-01T00:00:00Z",
+			size: content.byteLength,
+			md5: this.fingerprint(content),
+		};
+	}
+
+	private fingerprint(content: ArrayBuffer): string {
+		return [...new Uint8Array(content)]
+			.reduce((value, byte) => (value * 33 + byte) >>> 0, 5381)
+			.toString(16)
+			.padStart(8, "0");
+	}
+}
+
+function createSettings(deviceId: string): YandexDiskSyncSettings {
+	return {
+		...DEFAULT_SETTINGS,
+		deviceId,
+		remotePath: "vault",
+	};
+}
+
+async function runLegacyForceCommit(
+	encryption: EncryptionService | null,
+	sourceIndex: Record<string, unknown> = {
+		version: 2,
+		lastSyncTime: 1,
+		deviceId: "old-device",
+		files: {},
+	},
+	faults: {
+		throwAfterFinalMove?: boolean;
+		corruptIndexUpload?: boolean;
+	} = {},
+): Promise<{
+	client: FakeIndexYandex;
+	manager: IndexManager;
+	canonicalPath: string;
+	originalRaw: ArrayBuffer;
+}> {
+	const client = new FakeIndexYandex("vault", encryption, faults);
+	const canonicalPath = "vault/.obsidian-sync-index.json";
+	const legacy = JSON.stringify(sourceIndex);
+	const legacyBytes = new TextEncoder().encode(legacy).buffer;
+	client.files.set(
+		canonicalPath,
+		encryption
+			? await encryption.encrypt(legacyBytes)
+			: legacyBytes,
+	);
+	const originalRaw = client.files.get(canonicalPath)!.slice(0);
+	const manager = new IndexManager(
+		client as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("new-device"),
+	);
+	manager.beginForceBootstrap(true);
+	manager.updateRemoteFile("note.md", {
+		path: "note.md",
+		sha256: "hash",
+		size: 4,
+		mtime: 10,
+		syncedAt: 10,
+		remoteMtime: undefined,
+	});
+
+	if (faults.corruptIndexUpload) {
+		return { client, manager, canonicalPath, originalRaw };
+	}
+
+	await manager.saveRemoteIndex();
+
+	const raw = client.files.get(canonicalPath)!;
+	const plain = encryption ? await encryption.decrypt(raw) : raw;
+	const canonical = JSON.parse(
+		new TextDecoder().decode(plain),
+	) as { version: number; epoch: string; revision: number };
+	assert.equal(canonical.version, CURRENT_INDEX_VERSION);
+	assert.equal(canonical.revision, 1);
+	assert.ok(canonical.epoch);
+	assert.equal(manager.getObservedEpoch(), canonical.epoch);
+	assert.equal(manager.getObservedRevision(), canonical.revision);
+	assert.equal(client.moveCount, 2);
+	assert.deepEqual(
+		[...client.files.keys()].filter((path) => path.includes(".lock.")),
+		[],
+	);
+	return { client, manager, canonicalPath, originalRaw };
+}
+
+test("plaintext legacy Force commits and verifies canonical v3", async () => {
+	await runLegacyForceCommit(null);
+});
+
+test("encrypted legacy Force commits and verifies canonical v3", async () => {
+	await runLegacyForceCommit(
+		new XorEncryptionService(0xa5) as unknown as EncryptionService,
+	);
+});
+
+test("Force replaces an unreadable prerelease v3 without epoch", async () => {
+	await runLegacyForceCommit(null, {
+		version: 3,
+		revision: 1,
+		files: {},
+	});
+});
+
+test("successful final move with a lost response still commits", async () => {
+	const { client } = await runLegacyForceCommit(
+		null,
+		undefined,
+		{ throwAfterFinalMove: true },
+	);
+	assert.equal(client.moveCount, 2);
+});
+
+test("unverified modified lock restores the encrypted source bytes", async () => {
+	const encryption =
+		new XorEncryptionService(0x5a) as unknown as EncryptionService;
+	const { client, manager, canonicalPath, originalRaw } =
+		await runLegacyForceCommit(encryption, undefined, {
+			corruptIndexUpload: true,
+		});
+	const transaction = manager as unknown as {
+		saveRemoteIndexLocked(): Promise<unknown>;
+	};
+
+	await assert.rejects(
+		transaction.saveRemoteIndexLocked(),
+		RemoteIndexRolledBackError,
+	);
+	assert.equal(
+		Buffer.from(client.files.get(canonicalPath)!).equals(
+			Buffer.from(originalRaw),
+		),
+		true,
+	);
+	assert.deepEqual(
+		[...client.files.keys()].filter((path) => path.includes(".lock.")),
+		[],
+	);
+});

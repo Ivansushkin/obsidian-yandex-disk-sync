@@ -221,6 +221,8 @@
 | FORCE-011 | P0  | Force во время active transition       | Разрешён только документированный recovery-flow                         | auto: integration     |
 | FORCE-012 | P1  | Crash до replacement commit            | Старый canonical остаётся авторитетным либо locks блокируют normal sync | auto: fault           |
 | FORCE-013 | P1  | Crash после replacement commit         | Новый epoch авторитетен, cleanup повторяем                              | auto: fault           |
+| FORCE-014 | P0  | Optional-поля index проходят JSON roundtrip | Отсутствующее поле и `undefined` семантически равны; реальные различия сохраняются | auto: `semantic index comparison uses JSON undefined semantics` |
+| FORCE-015 | P0  | Запуск после beta.1 partial Force      | Существующий v3 проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
 
 ## Сеть и Яндекс Диск API
 
@@ -238,6 +240,7 @@
 | NET-010 | P0  | Root listing меняется между страницами | Snapshot повторяется либо commit блокируется                              | auto: fake-yandex       |
 | NET-011 | P1  | 1001+ объектов в root                  | Locks после первой страницы обнаруживаются                                | auto: index-transaction |
 | NET-012 | P1  | Fingerprint отсутствует                | Destructive action блокируется или использует подтверждённую альтернативу | auto: fake-yandex       |
+| NET-013 | P0  | Сбой после перезаписи захваченного lock | Исходные raw bytes восстанавливаются и проверяются до возврата canonical; неоднозначность не ретраится | auto: index-transaction + fake-yandex |
 
 ## Масштаб, платформы и пути
 
@@ -275,6 +278,7 @@
 | DIAG-003 | P1 | `syncDotObsidian=true` и file logging включён | Текущий и legacy debug log не попадают в watcher и пользовательскую синхронизацию    | auto: path-utils    |
 | DIAG-004 | P2 | Несколько flush происходят одновременно      | Записи сериализованы, не теряются и журнал остаётся ограниченным по размеру           | auto: logger        |
 | DIAG-005 | P0 | Контекст содержит пароль, token или key       | Секреты маскируются до console/file output                                           | auto: logger        |
+| DIAG-006 | P1 | Force вернул `success=false`                  | Журнал содержит `completed with errors` и transaction outcome, но не сообщение об успешном завершении | auto: integration |
 
 ## Матрица вариантов
 

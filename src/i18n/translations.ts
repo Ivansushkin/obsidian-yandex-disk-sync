@@ -56,7 +56,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Synchronization started...",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.1 detected an index from version 1.1. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.2 detected an index from version 1.1. Update every device, create a backup, then run Force sync from local or remote.",
 		"notice.epoch_mismatch_blocked":
 			"The remote vault was reset by Force sync. Create a backup, then run Force sync from remote on this device.",
 		"notice.ambiguous_index_blocked":
@@ -375,7 +375,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Запуск синхронизации...",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.1 обнаружил индекс версии 1.1. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.2 обнаружил индекс версии 1.1. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
 		"notice.epoch_mismatch_blocked":
 			"Удалённое хранилище было сброшено через Force sync. Создайте резервную копию и выполните Force sync из удалённого хранилища на этом устройстве.",
 		"notice.ambiguous_index_blocked":

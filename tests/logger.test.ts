@@ -63,6 +63,7 @@ test("logger writes correlated sanitized diagnostics to plugin data", async () =
 		password: "do-not-log-this-password",
 		key: "do-not-log-this-encryption-key",
 		indexTransactionId: "transaction-test-1",
+		code: "DiskPathPointsToExistentDirectoryError",
 		error: new Error(
 			"request failed: Authorization: Bearer embedded-secret-token-123456",
 		),
@@ -75,6 +76,7 @@ test("logger writes correlated sanitized diagnostics to plugin data", async () =
 	assert.match(contents, /device-test/);
 	assert.match(contents, /full-test-1/);
 	assert.match(contents, /transaction-test-1/);
+	assert.match(contents, /DiskPathPointsToExistentDirectoryError/);
 	assert.doesNotMatch(contents, /abcdefghijklmnopqrstuvwxyz0123456789/);
 	assert.doesNotMatch(contents, /do-not-log-this-password/);
 	assert.doesNotMatch(contents, /do-not-log-this-encryption-key/);
