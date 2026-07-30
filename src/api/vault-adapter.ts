@@ -294,30 +294,40 @@ export class VaultAdapter {
 	async backupOverwrittenFile(
 		originalPath: string,
 		content: ArrayBuffer,
-	): Promise<string | null> {
+	): Promise<string> {
 		try {
 			const configDir = this.app.vault.configDir;
 			const ts = new Date()
 				.toISOString()
-				.replace(/[:.]/g, "-")
-				.slice(0, 19);
+				.replace(/[:.]/g, "-");
 			const safeName = originalPath.replace(/[\\/]+/g, "__");
-			const backupName = `${safeName}_${ts}`;
+			const backupName =
+				`${safeName}_${ts}_${crypto.randomUUID()}`;
 			const backupPath = obsidianNormalize(
 				`${configDir}/plugins/yandex-disk-sync/overwritten/${backupName}`,
 			);
 			const backupDir = getDirectory(backupPath);
-			if (backupDir && !this.folderExists(backupDir)) {
-				await this.createFolderRecursive(backupDir);
+			if (backupDir) {
+				await this.ensureAdapterDirectory(backupDir);
 			}
-			await this.vault.createBinary(backupPath, content);
+			await this.vault.adapter.writeBinary(backupPath, content);
+			const backupStat = await this.vault.adapter.stat(backupPath);
+			if (
+				!backupStat ||
+				backupStat.type !== "file" ||
+				backupStat.size !== content.byteLength
+			) {
+				throw new Error(
+					"Written backup could not be verified by size",
+				);
+			}
 			logger.info(`Backed up overwritten local file to: ${backupPath}`);
 			return backupPath;
 		} catch (e) {
 			logger.warn(`Failed to back up overwritten file ${originalPath}:`, {
 				error: e,
 			});
-			return null;
+			throw e;
 		}
 	}
 
@@ -332,23 +342,30 @@ export class VaultAdapter {
 		const backupDir = obsidianNormalize(
 			`${configDir}/plugins/yandex-disk-sync/overwritten`,
 		);
-		const folder = this.getFolder(backupDir);
-		if (!folder) return 0;
+		if (!(await this.vault.adapter.exists(backupDir))) return 0;
 
 		const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
 		let removed = 0;
-		for (const child of folder.children) {
-			if (!(child instanceof TFile)) continue;
-			if (child.stat.mtime < cutoff) {
-				try {
-					await this.app.fileManager.trashFile(child);
-					removed++;
-				} catch (e) {
-					logger.warn(
-						`Failed to remove stale backup ${child.path}:`,
-						{ error: e },
-					);
+		const listed = await this.vault.adapter.list(backupDir);
+		for (const backupPath of listed.files) {
+			try {
+				const stat = await this.vault.adapter.stat(backupPath);
+				if (stat?.type === "file" && stat.mtime < cutoff) {
+					if (
+						await this.vault.adapter.trashSystem(backupPath)
+					) {
+						removed++;
+					} else {
+						logger.warn(
+							`System trash is unavailable; preserving stale backup ${backupPath}`,
+						);
+					}
 				}
+			} catch (e) {
+				logger.warn(
+					`Failed to remove stale backup ${backupPath}:`,
+					{ error: e },
+				);
 			}
 		}
 		if (removed > 0) {
@@ -357,6 +374,28 @@ export class VaultAdapter {
 			);
 		}
 		return removed;
+	}
+
+	/**
+	 * Create a physical vault directory without relying on the Vault cache.
+	 * Hidden config folders are not guaranteed to be represented as TFolder.
+	 */
+	private async ensureAdapterDirectory(path: string): Promise<void> {
+		const parts = obsidianNormalize(path).split("/");
+		let currentPath = "";
+		for (const part of parts) {
+			currentPath = currentPath
+				? `${currentPath}/${part}`
+				: part;
+			if (await this.vault.adapter.exists(currentPath)) continue;
+			try {
+				await this.vault.adapter.mkdir(currentPath);
+			} catch (error) {
+				if (!(await this.vault.adapter.exists(currentPath))) {
+					throw error;
+				}
+			}
+		}
 	}
 
 	/**

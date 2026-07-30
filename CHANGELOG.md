@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.0.0-beta.3
+
+### Fixed
+
+- Fixed encrypted legacy v1/v2 indexes being reported as corrupt JSON instead
+  of producing the required Force-sync migration notice.
+- Separated index codec decoding, JSON parsing, and semantic version
+  validation so legacy, epoch, and maintenance errors are not masked by the
+  plaintext fallback.
+- Added fail-closed startup handling and sanitized diagnostics for index
+  snapshots that cannot be decoded with any permitted codec.
+- Fixed overwritten-file backups inside the hidden Obsidian plugin directory
+  by using the physical vault adapter instead of the Vault file cache.
+- Made backup names collision-resistant and verified the written file type and
+  size before allowing a destructive overwrite, delete, or rejected move to
+  continue.
+- Kept stale backups in place when system trash is unavailable instead of
+  moving them into the vault-local `.trash` synchronization scope.
+
+### Testing
+
+- Added encrypted/plaintext legacy startup, wrong-key, corrupt-index,
+  transition-codec, hidden-backup, concurrent-directory, backup-verification,
+  cleanup, and blocked-overwrite regression coverage.
+
 ## 2.0.0-beta.2
 
 ### Fixed

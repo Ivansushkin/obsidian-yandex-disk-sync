@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	IndexManager,
+	LegacyIndexVersionError,
 	RemoteIndexRolledBackError,
+	UnreadableRemoteIndexError,
 } from "../src/sync/index-manager";
 import {
 	CURRENT_INDEX_VERSION,
@@ -35,6 +37,18 @@ class XorEncryptionService {
 			result[index] = source[index]! ^ this.key;
 		}
 		return result.buffer;
+	}
+}
+
+class RejectingEncryptionService {
+	async encrypt(content: ArrayBuffer): Promise<ArrayBuffer> {
+		return content.slice(0);
+	}
+
+	async decrypt(): Promise<ArrayBuffer> {
+		const error = new Error("authentication failed");
+		error.name = "OperationError";
+		throw error;
 	}
 }
 
@@ -281,6 +295,197 @@ test("plaintext legacy Force commits and verifies canonical v3", async () => {
 test("encrypted legacy Force commits and verifies canonical v3", async () => {
 	await runLegacyForceCommit(
 		new XorEncryptionService(0xa5) as unknown as EncryptionService,
+	);
+});
+
+async function createIndexManagerWithContent(
+	content: Record<string, unknown> | string,
+	activeEncryption: EncryptionService | null,
+	storageEncryption: EncryptionService | null = activeEncryption,
+): Promise<{
+	client: FakeIndexYandex;
+	manager: IndexManager;
+	canonicalPath: string;
+}> {
+	const client = new FakeIndexYandex("vault", activeEncryption);
+	const canonicalPath = "vault/.obsidian-sync-index.json";
+	const json =
+		typeof content === "string" ? content : JSON.stringify(content);
+	const plain = new TextEncoder().encode(json).buffer;
+	client.files.set(
+		canonicalPath,
+		storageEncryption
+			? await storageEncryption.encrypt(plain)
+			: plain,
+	);
+	return {
+		client,
+		manager: new IndexManager(
+			client as unknown as YandexDiskClient,
+			{} as VaultAdapter,
+			createSettings("new-device"),
+		),
+		canonicalPath,
+	};
+}
+
+test("plaintext legacy startup preserves LegacyIndexVersionError", async () => {
+	const { manager } = await createIndexManagerWithContent(
+		{ version: 2, files: {} },
+		null,
+	);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		(error: unknown) =>
+			error instanceof LegacyIndexVersionError &&
+			error.version === 2,
+	);
+});
+
+test("encrypted legacy startup preserves LegacyIndexVersionError", async () => {
+	const encryption =
+		new XorEncryptionService(0xa5) as unknown as EncryptionService;
+	const { manager, client, canonicalPath } =
+		await createIndexManagerWithContent(
+			{ version: 2, files: {} },
+			encryption,
+		);
+	const originalRaw = client.files.get(canonicalPath)!.slice(0);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		(error: unknown) =>
+			error instanceof LegacyIndexVersionError &&
+			error.version === 2,
+	);
+	assert.deepEqual(
+		new Uint8Array(client.files.get(canonicalPath)!),
+		new Uint8Array(originalRaw),
+	);
+	assert.equal(client.moveCount, 0);
+});
+
+test("plaintext legacy index falls back from active encryption codec", async () => {
+	const encryption =
+		new XorEncryptionService(0xa5) as unknown as EncryptionService;
+	const { manager } = await createIndexManagerWithContent(
+		{ version: 2, files: {} },
+		encryption,
+		null,
+	);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		LegacyIndexVersionError,
+	);
+});
+
+test("encrypted current index loads without plaintext fallback", async () => {
+	const encryption =
+		new XorEncryptionService(0xa5) as unknown as EncryptionService;
+	const { manager } = await createIndexManagerWithContent(
+		{
+			version: CURRENT_INDEX_VERSION,
+			epoch: "epoch-current",
+			revision: 4,
+			files: {},
+		},
+		encryption,
+	);
+	const index = await manager.loadRemoteIndex();
+	assert.equal(index.epoch, "epoch-current");
+	assert.equal(index.revision, 4);
+});
+
+test("wrong encrypted index key is classified as unreadable", async () => {
+	const currentEncryption =
+		new RejectingEncryptionService() as unknown as EncryptionService;
+	const storageEncryption =
+		new XorEncryptionService(0x5a) as unknown as EncryptionService;
+	const { manager } = await createIndexManagerWithContent(
+		{
+			version: CURRENT_INDEX_VERSION,
+			epoch: "epoch-current",
+			revision: 4,
+			files: {},
+		},
+		currentEncryption,
+		storageEncryption,
+	);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		(error: unknown) =>
+			error instanceof UnreadableRemoteIndexError &&
+			error.attempts.some(
+				(attempt) =>
+					attempt.codec === "current" &&
+					attempt.stage === "decrypt" &&
+					attempt.errorName === "OperationError",
+			) &&
+			error.attempts.some(
+				(attempt) =>
+					attempt.codec === "plaintext" &&
+					attempt.stage === "json",
+			),
+	);
+});
+
+test("invalid plaintext index is classified as unreadable", async () => {
+	const { manager } = await createIndexManagerWithContent(
+		"not-json",
+		null,
+	);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		UnreadableRemoteIndexError,
+	);
+});
+
+test("semantic index version errors are not masked by codec fallback", async () => {
+	const encryption =
+		new XorEncryptionService(0xa5) as unknown as EncryptionService;
+	const { manager } = await createIndexManagerWithContent(
+		{ version: 999, files: {} },
+		encryption,
+	);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		/Remote sync index version 999 is not supported/,
+	);
+});
+
+test("explicit transition codec does not fall back to plaintext", async () => {
+	const encryption =
+		new XorEncryptionService(0xa5) as unknown as EncryptionService;
+	const { manager, client, canonicalPath } =
+		await createIndexManagerWithContent(
+			{
+				version: CURRENT_INDEX_VERSION,
+				epoch: "epoch-current",
+				revision: 1,
+				files: {},
+			},
+			encryption,
+			null,
+		);
+	const raw = client.files.get(canonicalPath)!;
+	const decoder = manager as unknown as {
+		decodeIndexSnapshot(
+			content: ArrayBuffer,
+			allowLegacy: boolean,
+			service: EncryptionService | null,
+			codec: "source",
+		): Promise<unknown>;
+	};
+	await assert.rejects(
+		decoder.decodeIndexSnapshot(
+			raw,
+			false,
+			encryption,
+			"source",
+		),
+		(error: unknown) =>
+			error instanceof UnreadableRemoteIndexError &&
+			error.attempts.length === 1 &&
+			error.attempts[0]?.codec === "source",
 	);
 });
 

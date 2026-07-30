@@ -66,6 +66,8 @@
 | INIT-016 | P2  | В remote только пустые папки                           | Папки не скачиваются и не попадают в canonical                    | auto: integration       |
 | INIT-017 | P1  | Token отсутствует или недействителен                   | Ни watcher, ни scheduler не изменяют remote                       | auto: integration       |
 | INIT-018 | P1  | Сеть недоступна при определении initial state          | Initial sync не подменяет remote пустым состоянием                | auto: fault             |
+| INIT-019 | P0  | Encrypted canonical v1/v2 с правильным ключом          | Ошибка версии не маскируется codec fallback; показывается Force-инструкция | auto: `encrypted legacy startup preserves LegacyIndexVersionError` |
+| INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable` |
 
 ## Обычный full и realtime
 
@@ -176,6 +178,7 @@
 | ENC-005 | P0  | Remote ciphertext fingerprint изменён | Изменение обнаруживается без сравнения plaintext/ciphertext SHA  | auto: integration      |
 | ENC-006 | P0  | Index/lock/manifest                   | Имена service-файлов raw, index content зашифрован, manifest raw | auto: integration      |
 | ENC-007 | P0  | Wrong-key canonical                   | Ошибка расшифровки не интерпретируется как пустой remote         | auto: fault            |
+| ENC-008 | P0  | Source/target codec во время transition | Явный codec не использует plaintext fallback                     | auto: `explicit transition codec does not fall back to plaintext` |
 
 ## Переходы шифрования
 
@@ -268,6 +271,9 @@
 | SAFE-004 | P0  | Wrong encryption key                 | Не выполняются upload/delete/cleanup               | auto: integration   |
 | SAFE-005 | P1  | Backup создан старым encryption key  | UI явно сообщает способ восстановления до rotate   | manual-required     |
 | SAFE-006 | P1  | Cleanup старых overwritten backups   | Не блокирует sync и не удаляет свежие backup       | auto: integration   |
+| SAFE-007 | P0  | `.obsidian` отсутствует в Vault cache | Backup создаётся через DataAdapter в физической plugin-папке | auto: `hidden plugin backup uses DataAdapter and preserves exact bytes` |
+| SAFE-008 | P1  | Два backup одного пути подряд        | Создаются два независимых файла с уникальными именами | auto: `hidden plugin backup uses DataAdapter and preserves exact bytes` |
+| SAFE-009 | P0  | Write или verification backup упали  | Overwrite/delete/rename блокируются, исходный файл сохраняется | auto: `failed mandatory backup prevents a local overwrite` |
 
 ## Диагностика
 
@@ -279,6 +285,7 @@
 | DIAG-004 | P2 | Несколько flush происходят одновременно      | Записи сериализованы, не теряются и журнал остаётся ограниченным по размеру           | auto: logger        |
 | DIAG-005 | P0 | Контекст содержит пароль, token или key       | Секреты маскируются до console/file output                                           | auto: logger        |
 | DIAG-006 | P1 | Force вернул `success=false`                  | Журнал содержит `completed with errors` и transaction outcome, но не сообщение об успешном завершении | auto: integration |
+| DIAG-007 | P1 | Ни один index codec не читается               | Лог содержит стадии codec, размер, fingerprint и короткий SHA без index/ciphertext   | auto: index-manager |
 
 ## Матрица вариантов
 

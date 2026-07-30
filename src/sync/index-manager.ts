@@ -33,7 +33,10 @@ import {
 	toLocalPath,
 } from "../utils/path-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
-import { computeSha256FromString } from "../utils/hash-utils";
+import {
+	computeSha256,
+	computeSha256FromString,
+} from "../utils/hash-utils";
 import {
 	PBKDF2_ITERATIONS,
 	AES_KEY_LENGTH,
@@ -79,6 +82,14 @@ const ENCRYPTION_MANIFEST_STATES: EncryptionManifestState[] = [
 	"rotating",
 	"disabling",
 ];
+
+type IndexDecodeStage = "decrypt" | "json";
+
+export interface IndexDecodeAttempt {
+	codec: IndexCodec;
+	stage: IndexDecodeStage;
+	errorName: string;
+}
 
 export class IndexManager {
 	private yandexClient: YandexDiskClient;
@@ -1322,16 +1333,18 @@ export class IndexManager {
 				`Index resource disappeared while reading ${path}`,
 			);
 		}
+		const fingerprint = this.getResourceFingerprint(resource);
 		const decoded = await this.decodeIndexSnapshot(
 			raw,
 			allowLegacy,
 			serviceOverride,
 			codecLabel,
+			fingerprint,
 		);
 		return {
 			raw,
 			index: decoded.index,
-			fingerprint: this.getResourceFingerprint(resource),
+			fingerprint,
 			codec: decoded.codec,
 		};
 	}
@@ -1361,36 +1374,116 @@ export class IndexManager {
 		allowLegacy: boolean,
 		serviceOverride?: EncryptionService | null,
 		codecLabel?: IndexCodec,
+		fingerprint: string | null = null,
 	): Promise<{ index: SyncIndex; codec: IndexCodec }> {
 		if (serviceOverride !== undefined) {
-			const content =
-				await this.yandexClient.decodeServiceFileContent(
+			const codec =
+				codecLabel ??
+				(serviceOverride ? "current" : "plaintext");
+			let content: ArrayBuffer;
+			try {
+				content =
+					await this.yandexClient.decodeServiceFileContent(
+						raw,
+						serviceOverride,
+					);
+			} catch (error) {
+				throw await this.createUnreadableIndexError(
 					raw,
-					serviceOverride,
+					fingerprint,
+					[
+						{
+							codec,
+							stage: "decrypt",
+							errorName: this.getErrorName(error),
+						},
+					],
 				);
+			}
+			let data: Partial<SyncIndex>;
+			try {
+				data = this.parseIndexJson(content);
+			} catch (error) {
+				throw await this.createUnreadableIndexError(
+					raw,
+					fingerprint,
+					[
+						{
+							codec,
+							stage: "json",
+							errorName: this.getErrorName(error),
+						},
+					],
+				);
+			}
+			logger.debug("Decoded remote index snapshot", { codec });
 			return {
-				index: this.parseIndexContent(content, allowLegacy),
-				codec:
-					codecLabel ??
-					(serviceOverride ? "current" : "plaintext"),
+				index: this.normalizeParsedIndex(data, allowLegacy),
+				codec,
 			};
 		}
 
+		const attempts: IndexDecodeAttempt[] = [];
+		let currentContent: ArrayBuffer | null = null;
 		try {
-			const content =
+			currentContent =
 				await this.yandexClient.decodeServiceFileContent(raw);
-			return {
-				index: this.parseIndexContent(content, allowLegacy),
+		} catch (error) {
+			attempts.push({
 				codec: "current",
-			};
-		} catch (currentCodecError) {
-			if (!this.yandexClient.hasEncryptionService()) {
-				throw currentCodecError;
+				stage: "decrypt",
+				errorName: this.getErrorName(error),
+			});
+		}
+		if (currentContent) {
+			try {
+				const data = this.parseIndexJson(currentContent);
+				logger.debug("Decoded remote index snapshot", {
+					codec: "current",
+				});
+				return {
+					index: this.normalizeParsedIndex(data, allowLegacy),
+					codec: "current",
+				};
+			} catch (error) {
+				if (!(error instanceof SyntaxError)) throw error;
+				attempts.push({
+					codec: "current",
+					stage: "json",
+					errorName: this.getErrorName(error),
+				});
 			}
+		}
+
+		if (!this.yandexClient.hasEncryptionService()) {
+			throw await this.createUnreadableIndexError(
+				raw,
+				fingerprint,
+				attempts,
+			);
+		}
+
+		try {
+			const data = this.parseIndexJson(raw);
+			logger.debug("Decoded remote index snapshot", {
+				codec: "plaintext",
+			});
 			return {
-				index: this.parseIndexContent(raw, allowLegacy),
+				index: this.normalizeParsedIndex(data, allowLegacy),
 				codec: "plaintext",
 			};
+		} catch (error) {
+			if (!(error instanceof SyntaxError)) throw error;
+			attempts.push({
+				codec: "plaintext",
+				stage: "json",
+				errorName: this.getErrorName(error),
+			});
+			throw await this.createUnreadableIndexError(
+				raw,
+				fingerprint,
+				attempts,
+			);
 		}
 	}
 
@@ -1398,9 +1491,22 @@ export class IndexManager {
 		content: ArrayBuffer,
 		allowLegacy: boolean,
 	): SyncIndex {
-		const data = JSON.parse(
+		return this.normalizeParsedIndex(
+			this.parseIndexJson(content),
+			allowLegacy,
+		);
+	}
+
+	private parseIndexJson(content: ArrayBuffer): Partial<SyncIndex> {
+		return JSON.parse(
 			new TextDecoder().decode(content),
 		) as Partial<SyncIndex>;
+	}
+
+	private normalizeParsedIndex(
+		data: Partial<SyncIndex>,
+		allowLegacy: boolean,
+	): SyncIndex {
 		const versionKind = classifyIndexVersion(data.version);
 		if (versionKind !== "current") {
 			if (allowLegacy && versionKind === "legacy") {
@@ -1432,6 +1538,31 @@ export class IndexManager {
 			normalized.maintenance = data.maintenance;
 		}
 		return normalized;
+	}
+
+	private async createUnreadableIndexError(
+		raw: ArrayBuffer,
+		fingerprint: string | null,
+		attempts: IndexDecodeAttempt[],
+	): Promise<UnreadableRemoteIndexError> {
+		const rawSha256 = await computeSha256(raw);
+		const error = new UnreadableRemoteIndexError({
+			rawSize: raw.byteLength,
+			fingerprint,
+			rawSha256,
+			attempts,
+		});
+		logger.warn("Remote index snapshot is unreadable", {
+			rawSize: error.rawSize,
+			fingerprint: shortenDiagnosticValue(error.fingerprint),
+			rawSha256: shortenDiagnosticValue(error.rawSha256),
+			attempts: error.attempts,
+		});
+		return error;
+	}
+
+	private getErrorName(error: unknown): string {
+		return error instanceof Error ? error.name : typeof error;
 	}
 
 	private normalizeLegacyIndex(data: Partial<SyncIndex>): SyncIndex {
@@ -2593,10 +2724,33 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.2. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.3. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;
+	}
+}
+
+export class UnreadableRemoteIndexError extends Error {
+	readonly rawSize: number;
+	readonly fingerprint: string | null;
+	readonly rawSha256: string;
+	readonly attempts: IndexDecodeAttempt[];
+
+	constructor(details: {
+		rawSize: number;
+		fingerprint: string | null;
+		rawSha256: string;
+		attempts: IndexDecodeAttempt[];
+	}) {
+		super(
+			"Remote sync index could not be decoded with any permitted codec.",
+		);
+		this.name = "UnreadableRemoteIndexError";
+		this.rawSize = details.rawSize;
+		this.fingerprint = details.fingerprint;
+		this.rawSha256 = details.rawSha256;
+		this.attempts = details.attempts.map((attempt) => ({ ...attempt }));
 	}
 }
 

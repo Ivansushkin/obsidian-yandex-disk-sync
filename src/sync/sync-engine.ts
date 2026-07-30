@@ -1376,6 +1376,7 @@ export class SyncEngine {
 					`Could not back up local ${path} before overwrite:`,
 					{ error: e },
 				);
+				throw e;
 			}
 		}
 
@@ -1627,16 +1628,10 @@ export class SyncEngine {
 						...actionContext,
 						currentSha256: shortenDiagnosticValue(sha256),
 					});
-					const backupPath =
-						await this.vaultAdapter.backupOverwrittenFile(
-							path,
-							content,
-						);
-					if (!backupPath) {
-						throw new Error(
-							`Could not create a backup before deleting ${path}`,
-						);
-					}
+					await this.vaultAdapter.backupOverwrittenFile(
+						path,
+						content,
+					);
 				}
 			} catch (e) {
 				throw new Error(
@@ -3179,16 +3174,10 @@ export class SyncEngine {
 					rejected.baselineSha256 === undefined ||
 					currentSha !== rejected.baselineSha256
 				) {
-					const backupPath =
-						await this.vaultAdapter.backupOverwrittenFile(
-							rejected.path,
-							content,
-						);
-					if (!backupPath) {
-						throw new Error(
-							`Could not create a backup before deleting ${rejected.path}`,
-						);
-					}
+					await this.vaultAdapter.backupOverwrittenFile(
+						rejected.path,
+						content,
+					);
 				}
 				this.expectWatcherEvent(rejected.path, "delete");
 				await this.vaultAdapter.deleteFile(rejected.path);

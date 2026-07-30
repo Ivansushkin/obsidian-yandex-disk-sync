@@ -23,6 +23,7 @@ import {
 	IndexManager,
 	IndexEpochMismatchError,
 	LegacyIndexVersionError,
+	UnreadableRemoteIndexError,
 	AmbiguousRemoteIndexLockError,
 	RemoteMaintenanceActiveError,
 	RemoteIndexConcurrentModificationError,
@@ -430,6 +431,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						"Legacy sync index detected; normal synchronization is blocked until force sync.",
 					);
 					new Notice(t("notice.legacy_index_blocked"), 0);
+					this.isInitialized = true;
+					return;
+				}
+				if (e instanceof UnreadableRemoteIndexError) {
+					logger.warn(
+						"Unreadable canonical index blocks normal synchronization.",
+						{
+							rawSize: e.rawSize,
+							fingerprint: shortenDiagnosticValue(
+								e.fingerprint,
+							),
+							rawSha256: shortenDiagnosticValue(e.rawSha256),
+							attempts: e.attempts,
+						},
+					);
+					new Notice(t("notice.unreadable_index_blocked"), 0);
 					this.isInitialized = true;
 					return;
 				}

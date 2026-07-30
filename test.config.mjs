@@ -18,6 +18,7 @@ const outputFiles = [
 	join(outputDir, "path-utils.test.mjs"),
 	join(outputDir, "physical-action-rules.test.mjs"),
 	join(outputDir, "logger.test.mjs"),
+	join(outputDir, "vault-adapter.test.mjs"),
 ];
 const obsidianStubPlugin = {
 	name: "obsidian-test-stub",
@@ -29,8 +30,21 @@ const obsidianStubPlugin = {
 		build.onLoad(
 			{ filter: /.*/, namespace: "test" },
 			() => ({
-				contents:
-					"export async function requestUrl() { throw new Error('Unexpected Obsidian requestUrl call in unit test'); }",
+				contents: `
+					export async function requestUrl() {
+						throw new Error("Unexpected Obsidian requestUrl call in unit test");
+					}
+					export function normalizePath(path) {
+						return path
+							.split("\\\\")
+							.join("/")
+							.split("/")
+							.filter(Boolean)
+							.join("/");
+					}
+					export class TFile {}
+					export class TFolder {}
+				`,
 				loader: "js",
 			}),
 		);
@@ -52,6 +66,7 @@ try {
 			"tests/path-utils.test.ts",
 			"tests/physical-action-rules.test.ts",
 			"tests/logger.test.ts",
+			"tests/vault-adapter.test.ts",
 		],
 		bundle: true,
 		platform: "node",
