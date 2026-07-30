@@ -2,6 +2,19 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
+## Upgrading to 2.0.0-beta.1
+
+Version 2.0.0-beta.1 uses a new synchronization index and cannot synchronize alongside
+version 1.1. Close Obsidian on other devices, back up the vault, and update the
+plugin everywhere before starting synchronization. On the device with the most
+complete data, run **Force sync → Local to remote** with backup enabled. Then
+run **Remote to local** with backup enabled on every other device.
+
+Do not start version 1.1 after the transition: it can replace the v3 index and
+restore deleted files. If that happens, disable sync everywhere, select the
+most complete local vault, inspect backup/conflict copies, and repeat the force
+sync procedure from version 2.0.0-beta.1.
+
 > **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**
 >
 > **Legal Liability**  
@@ -18,7 +31,8 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 >
 > **Synchronization Risks**
 >
-> - In case of file conflicts, the newer version replaces the older one without creating copies
+> - Conflicts create a separate conflict copy; a local version displaced by a
+>   deletion is preserved in backup
 > - Deleted files will be deleted on all devices during synchronization
 > - Automatic synchronization may lead to data loss with unstable internet connection
 > - Intensive API usage may lead to temporary account blocking by Yandex
@@ -34,7 +48,8 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 - **Real-time synchronization** — automatic upload of modified files when saving
 - **Periodic full synchronization** — check and synchronize all files by timer
 - **Two-way synchronization** — changes from any device are synchronized to all others
-- **Conflict resolution** — automatic conflict resolution (newer file wins)
+- **Conflict resolution** — causal SHA-256, server-mtime, and tombstone rules
+  with preservation of displaced local content
 - **Deletion synchronization** — deleted files are deleted on all devices
 - **Flexible filters** — configurable include/exclude file patterns
 - **Multi-device support** — work under one token on different devices
@@ -120,10 +135,15 @@ On first launch, the plugin will check for files locally and on Yandex Disk:
 
 ### Conflict Resolution
 
-When conflict occurs (file changed on multiple devices), plugin automatically selects newer version by modification time.
+Local changes are detected by SHA-256; remote changes use server mtime and a
+server fingerprint. If both sides changed, the plugin creates a conflict copy.
+An exact-file deletion wins over a concurrent edit, but displaced local content
+is first preserved in backup. A new or modified file inside a concurrently
+deleted folder survives.
 
 > **⚠️ Warning**  
-> The older version of the file will be overwritten without creating a copy. For important files, it is recommended to manually check changes before synchronization.
+> Deletions propagate to every device. Keep an independent backup for important
+> vaults, especially before Force sync.
 
 ### Backup System
 
@@ -147,7 +167,8 @@ The plugin includes a **Force Sync** feature for cases when normal two-way sync 
 Force sync ignores timestamps, file hashes, and conflict resolver — it creates an exact copy in the chosen direction.
 
 > **⚠️ Warning**
-> Force sync is destructive. The overwritten side is fully replaced. Create a backup before proceeding.
+> Force sync is destructive. The overwritten side is fully replaced. The
+> plugin requires a successful backup before it enables the operation.
 >
 > **Location**: Settings → Force Sync section.
 
@@ -155,12 +176,18 @@ Force sync ignores timestamps, file hashes, and conflict resolver — it creates
 
 The plugin supports end-to-end encryption of file content and filenames using **AES-256-GCM** with **PBKDF2** key derivation (100k iterations, HMAC-SHA256):
 
+While encryption is being enabled, disabled, or rotated, other devices block
+normal synchronization. If the initiating device is lost, recover only with
+**Force sync → Local to remote** from a verified complete local copy after
+creating a backup.
+
 - **Content encryption**: each file gets a random 12-byte IV, ensuring unique ciphertext even for identical files
 - **Filename encryption**: deterministic IV derived from the file path via SHA-256, so encrypted paths are stable across devices and sessions
 - **Key**: derived from your password + random 16-byte salt — the master key never leaves your device
 - **Multi-device**: salt is stored in a shared file `.obsidian-encrypt.json` on Yandex Disk (raw, unencrypted). When encryption is enabled on a new device, it auto-detects encrypted data, prompts for the password, and verifies it before enabling
 
 **How to enable**:
+
 1. Go to **Settings → Encryption section**
 2. Click the encryption toggle
 3. Choose whether to create a backup first
@@ -172,7 +199,10 @@ The plugin supports end-to-end encryption of file content and filenames using **
 **Password storage**: The password is stored in `data.json` (Obsidian plugin config) as a plaintext string. It is never sent to Yandex or any third party.
 
 > **⚠️ Warning**
-> Enabling encryption will re-upload ALL files to Yandex Disk in encrypted form. Old plaintext files are permanently deleted from the remote. This operation cannot be undone without the password.
+> Enabling encryption re-uploads every file in encrypted form. The old
+> plaintext set remains authoritative until the canonical commit and is then
+> deleted only by fingerprint-guarded cleanup. The resulting encrypted data
+> cannot be read without the password.
 
 ## Development
 
@@ -208,6 +238,10 @@ npm run lint
 ```
 
 ## Architecture
+
+The normative catalogue of synchronization, multi-device, failure-recovery,
+and encryption scenarios is maintained in
+[`docs/SYNC_USER_SCENARIOS.md`](docs/SYNC_USER_SCENARIOS.md).
 
 Detailed description of architecture and approaches see in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

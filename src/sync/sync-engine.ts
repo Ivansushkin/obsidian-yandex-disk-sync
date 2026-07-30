@@ -18,11 +18,22 @@ import {
 	RemoteIndexConcurrentModificationError,
 } from "./index-manager";
 import { ConflictResolver } from "./conflict-resolver";
-import { joinPath, getDirectory } from "../utils/path-utils";
+import {
+	joinPath,
+	getDirectory,
+	getExtension,
+	getFileName,
+} from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
-import { logger } from "../utils/logger";
+import { logger, shortenDiagnosticValue } from "../utils/logger";
 import { runWithConcurrencySettled } from "../utils/semaphore";
 import { t } from "../i18n";
+import { SyncCoordinator } from "./sync-coordinator";
+import { createConfirmedBaseline } from "./baseline-rules";
+import {
+	isPhysicalDeleteAuthorized,
+	shouldBackupLocalDelete,
+} from "./physical-action-rules";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -31,12 +42,16 @@ export type SyncGuardCallback = () => string | null | Promise<string | null>;
 export interface SyncRunOptions {
 	/** Skip encryption state guard for internal encryption maintenance flows. */
 	skipEncryptionGuard?: boolean;
+	/** Allow a sync nested inside the active encryption maintenance flow. */
+	skipMaintenanceGuard?: boolean;
 	/**
 	 * Skip generation of delete_remote operations. Used by encryption transition
 	 * flows where remote cleanup of stale paths is handled separately as a bulk
 	 * operation, avoiding race conditions from concurrent folder deletions.
 	 */
 	skipRemoteDeletes?: boolean;
+	/** Run after all target files are uploaded and before the canonical commit. */
+	beforeIndexCommit?: () => void | Promise<void>;
 }
 
 export class SyncEngine {
@@ -53,6 +68,8 @@ export class SyncEngine {
 	private externalBlockReason: string | null = null;
 	private isSyncing = false;
 	private isPaused = false;
+	private coordinator = new SyncCoordinator();
+	private expectedWatcherEvents = new Map<string, number>();
 
 	private syncPauseCallbacks: Array<() => void> = [];
 	private syncResumeCallbacks: Array<() => void> = [];
@@ -68,6 +85,17 @@ export class SyncEngine {
 		this.indexManager = indexManager;
 		this.conflictResolver = new ConflictResolver();
 		this.settings = settings;
+		logger.configure({
+			contextProvider: () => {
+				const session = this.coordinator.getActiveSession();
+				return session
+					? {
+							sessionId: session.id,
+							sessionKind: session.kind,
+						}
+					: undefined;
+			},
+		});
 	}
 
 	/**
@@ -157,6 +185,61 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Serialize an encryption transition and buffer watcher events until it
+	 * has fully completed.
+	 */
+	async runExclusiveMaintenance<T>(task: () => Promise<T>): Promise<T> {
+		return await this.coordinator.run("maintenance", async () => {
+			this.notifySyncPauseCallbacks();
+			try {
+				return await task();
+			} finally {
+				this.notifySyncResumeCallbacks();
+			}
+		});
+	}
+
+	/**
+	 * Consume a watcher event produced by a local mutation performed by the
+	 * sync engine itself.
+	 */
+	consumeInternalWatcherEvent(
+		path: string,
+		action: "upload" | "delete" | "rename",
+	): boolean {
+		const key = `${action}:${path}`;
+		const count = this.expectedWatcherEvents.get(key) ?? 0;
+		if (count <= 0) return false;
+		if (count === 1) {
+			this.expectedWatcherEvents.delete(key);
+		} else {
+			this.expectedWatcherEvents.set(key, count - 1);
+		}
+		logger.debug("Suppressed internal watcher event", {
+			action,
+			path,
+			remainingExpectedEvents: Math.max(0, count - 1),
+		});
+		return true;
+	}
+
+	private expectWatcherEvent(
+		path: string,
+		action: "upload" | "delete" | "rename",
+	): void {
+		const key = `${action}:${path}`;
+		this.expectedWatcherEvents.set(
+			key,
+			(this.expectedWatcherEvents.get(key) ?? 0) + 1,
+		);
+		logger.debug("Registered expected internal watcher event", {
+			action,
+			path,
+			expectedEvents: this.expectedWatcherEvents.get(key),
+		});
+	}
+
+	/**
 	 * Subscribe to state changes
 	 */
 	onStateChange(callback: SyncEventCallback): () => void {
@@ -212,7 +295,8 @@ export class SyncEngine {
 	 * Perform full synchronization
 	 */
 	async fullSync(options?: SyncRunOptions): Promise<SyncResult> {
-		return await this.runSyncSession(
+		const run = async () =>
+			await this.runSyncSession(
 			options,
 			async (result, startTime) => {
 				// 1. Ensure remote folder exists
@@ -229,6 +313,14 @@ export class SyncEngine {
 					currentOperation: t("status.op.loading_remote_index"),
 				});
 				await this.indexManager.loadRemoteIndex();
+				if (this.indexManager.replayPendingMutations()) {
+					if (this.indexSaveCallback) {
+						await this.indexSaveCallback();
+					}
+				}
+				await this.resumePendingMoves(result);
+				await this.resumePendingPhysicalActions(result);
+				if (result.errors.length > 0) return;
 
 				// 3. Build local index
 				this.updateState({
@@ -241,6 +333,15 @@ export class SyncEngine {
 					currentOperation: t("status.op.getting_remote_files"),
 				});
 				const remoteFiles = await this.indexManager.getRemoteFiles();
+				if (
+					this.reconcileCompletedPhysicalActions(
+						localFiles,
+						remoteFiles,
+					) &&
+					this.indexSaveCallback
+				) {
+					await this.indexSaveCallback();
+				}
 
 				// 5. Determine operations
 				this.updateState({
@@ -255,6 +356,13 @@ export class SyncEngine {
 					localIndex.files,
 					remoteIndex.files,
 					startTime,
+					remoteIndex.folderTombstones,
+					this.indexManager.getPendingLocalDeletePaths(),
+				);
+				const baselinesChanged = this.recordConfirmedBaselines(
+					localFiles,
+					remoteFiles,
+					operations,
 				);
 
 				logger.info(
@@ -277,7 +385,7 @@ export class SyncEngine {
 				const downloads = operations.filter(
 					(op) => op.action === "download",
 				);
-				const deletes = operations.filter(
+				let deletes = operations.filter(
 					(op) =>
 						op.action === "delete_remote" ||
 						op.action === "delete_local",
@@ -285,6 +393,7 @@ export class SyncEngine {
 				const conflicts = operations.filter(
 					(op) => op.action === "conflict",
 				);
+				let indexCommittedBeforeDeletes = false;
 
 				let mtimeStamped = false;
 				if (uploads.length > 0) {
@@ -344,6 +453,16 @@ export class SyncEngine {
 					this.updateState({
 						currentOperation: t("status.op.deleting_files"),
 					});
+					if (
+						!(await this.commitDeletionIntents(deletes, result))
+					) {
+						return;
+					}
+					await this.repairMissingAcceptedUploads(
+						uploads.map((operation) => operation.path),
+					);
+					indexCommittedBeforeDeletes = true;
+					deletes = this.filterCommittedDeletions(deletes);
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
 						result,
@@ -355,6 +474,9 @@ export class SyncEngine {
 					);
 					result.deleted = deleteResults.succeeded;
 					result.errors.push(...deleteResults.errors);
+					if (this.indexSaveCallback) {
+						await this.indexSaveCallback();
+					}
 				}
 
 				// Prune remote folders that became empty after the delete group.
@@ -440,9 +562,8 @@ export class SyncEngine {
 					return;
 				}
 
-				// Cleanup expired tombstones BEFORE deciding whether to save.
-				// This ensures removed tombstones are persisted in the same
-				// write, not deferred to the next sync.
+				// Tombstones are intentionally retained; Force sync is the only
+				// operation that compacts causal deletion history.
 				const hadOperations =
 					result.uploaded > 0 ||
 					result.downloaded > 0 ||
@@ -453,16 +574,28 @@ export class SyncEngine {
 
 				// Skip the remote index write when nothing changed during this
 				// sync: no file operations, no batch mtime stamping, and no
-				// expired tombstones. This avoids unnecessary API calls, 409
+				// tombstone changes. This avoids unnecessary API calls, 409
 				// "folder exists" noise, and reduces the window for concurrent-
 				// index conflicts between devices. The local index is still
 				// persisted by the caller via indexSaveCallback.
 				const indexDirty =
-					hadOperations || mtimeStamped || tombstonesRemoved;
+					hadOperations ||
+					mtimeStamped ||
+					tombstonesRemoved ||
+					baselinesChanged;
 				if (!indexDirty) {
 					logger.debug(
 						"[SyncEngine] No changes detected, skipping remote index save",
 					);
+					if (this.indexSaveCallback) {
+						await this.indexSaveCallback();
+					}
+					return;
+				}
+				if (
+					indexCommittedBeforeDeletes &&
+					conflicts.length === 0
+				) {
 					return;
 				}
 
@@ -470,10 +603,126 @@ export class SyncEngine {
 				if (!(await this.saveRemoteIndexOrAbort(result))) {
 					return;
 				}
+				await this.repairMissingAcceptedUploads(
+					uploads.map((operation) => operation.path),
+				);
 			},
 			(result) =>
 				`Synchronization completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
-		);
+			);
+		if (
+			options?.skipMaintenanceGuard &&
+			this.coordinator.getActiveKind() === "maintenance"
+		) {
+			return await run();
+		}
+		return await this.coordinator.run("full", run);
+	}
+
+	/**
+	 * Rewrite only the physical representation of every live canonical file
+	 * while preserving epoch, logical revisions, tombstones, moves, and
+	 * mutation watermarks.
+	 */
+	async reencodeRemoteFiles(
+		options?: SyncRunOptions,
+	): Promise<SyncResult> {
+		const run = async () =>
+			await this.runSyncSession(
+				options,
+				async (result) => {
+					const localFiles = await this.indexManager.buildLocalIndex();
+					const canonical = this.indexManager.getRemoteIndex();
+					const liveCanonical = Object.entries(canonical.files).filter(
+						([, metadata]) => !metadata.deleted,
+					);
+					for (const [path, metadata] of liveCanonical) {
+						const local = localFiles.get(path);
+						if (!local || local.sha256 !== metadata.sha256) {
+							throw new Error(
+								`Encryption preflight baseline is incomplete for ${path}`,
+							);
+						}
+					}
+
+					await this.ensureFoldersExist(
+						liveCanonical.map(([path]) => ({
+							action: "upload",
+							path,
+							reason: "Encryption transition",
+						})),
+					);
+
+					const tasks = liveCanonical.map(
+						([path, logicalMetadata]) =>
+							async () => {
+								const content =
+									await this.vaultAdapter.readFile(path);
+								const sha256 = await computeSha256(content);
+								if (sha256 !== logicalMetadata.sha256) {
+									throw new Error(
+										`File changed during encryption transition: ${path}`,
+									);
+								}
+								await this.yandexClient.uploadFile(
+									joinPath(this.settings.remotePath, path),
+									content,
+									true,
+								);
+								const stamp = await this.fetchRemoteStamp(path);
+								canonical.files[path] = {
+									...logicalMetadata,
+									size: content.byteLength,
+									sha256,
+									remoteMtime: stamp.remoteMtime,
+									remoteFingerprint:
+										stamp.remoteFingerprint,
+								};
+								this.indexManager.updateLocalFile(path, {
+									...canonical.files[path],
+								});
+							},
+					);
+					const settled = await runWithConcurrencySettled(
+						tasks,
+						Math.max(1, this.settings.maxConcurrency || 5),
+					);
+					for (let index = 0; index < settled.length; index++) {
+						const outcome = settled[index];
+						if (outcome?.status === "fulfilled") {
+							result.uploaded++;
+							continue;
+						}
+						const path = liveCanonical[index]?.[0] ?? "";
+						result.errors.push({
+							path,
+							operation: "upload",
+							message:
+								outcome?.reason instanceof Error
+									? outcome.reason.message
+									: String(outcome?.reason),
+						});
+					}
+					if (result.errors.length > 0) return;
+					await options?.beforeIndexCommit?.();
+					this.indexManager.updateSyncTime();
+					this.indexManager.beginPhysicalRewriteCommit();
+					try {
+						await this.saveRemoteIndexOrAbort(result, false);
+					} finally {
+						this.indexManager.cancelPhysicalRewriteCommit();
+					}
+				},
+				(result) =>
+					`Encryption rewrite completed: uploaded ${result.uploaded}, errors ${result.errors.length}`,
+			);
+		if (
+			options?.skipMaintenanceGuard &&
+			this.coordinator.getActiveKind() === "maintenance"
+		) {
+			return await run();
+		}
+		return await this.coordinator.run("maintenance", run);
 	}
 
 	/**
@@ -482,9 +731,17 @@ export class SyncEngine {
 	 * Files not present locally are deleted from remote.
 	 */
 	async forceSyncFromLocal(options?: SyncRunOptions): Promise<SyncResult> {
-		return await this.runSyncSession(
+		let bootstrapStarted = false;
+		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
+				const inheritedCleanup =
+					this.indexManager.getMaintenance();
+				this.indexManager.beginForceBootstrap(true);
+				if (inheritedCleanup?.phase === "cleanup") {
+					this.indexManager.setMaintenance(inheritedCleanup);
+				}
+				bootstrapStarted = true;
 				// 1. Ensure remote folder exists
 				this.updateState({
 					currentOperation: t("status.op.checking_remote_folder"),
@@ -505,6 +762,9 @@ export class SyncEngine {
 					currentOperation: t("status.op.getting_remote_files"),
 				});
 				const remoteFiles = await this.indexManager.getRemoteFiles();
+				if (inheritedCleanup) {
+					this.indexManager.clearMaintenance(inheritedCleanup.id);
+				}
 
 				// 4. Generate operations manually: all local → upload, remote-only → delete_remote
 				this.updateState({
@@ -551,9 +811,10 @@ export class SyncEngine {
 				const uploads = operations.filter(
 					(op) => op.action === "upload",
 				);
-				const deletes = operations.filter(
+				let deletes = operations.filter(
 					(op) => op.action === "delete_remote",
 				);
+				let indexCommittedBeforeDeletes = false;
 
 				if (uploads.length > 0) {
 					this.updateState({
@@ -584,12 +845,43 @@ export class SyncEngine {
 							);
 						}
 					}
+					if (uploadResults.errors.length > 0) return;
 				}
+
+				await options?.beforeIndexCommit?.();
 
 				if (deletes.length > 0) {
 					this.updateState({
 						currentOperation: t("status.op.deleting_remote_files"),
 					});
+					for (const operation of deletes) {
+						this.indexManager.enqueuePhysicalAction(
+							"delete-remote",
+							operation.path,
+							{
+								canonicalRevision:
+									this.indexManager.getRemoteIndex().revision + 1,
+								expectedFingerprint:
+									operation.remoteMeta?.remoteFingerprint,
+								origin: "force-reset",
+							},
+						);
+					}
+					if (this.indexSaveCallback) await this.indexSaveCallback();
+					this.indexManager.updateSyncTime();
+					if (!(await this.saveRemoteIndexOrAbort(result, false))) {
+						return;
+					}
+					await this.repairMissingAcceptedUploads(
+						uploads.map((operation) => operation.path),
+					);
+					indexCommittedBeforeDeletes = true;
+					deletes = deletes.filter(
+						(operation) =>
+							!this.indexManager.getRemoteIndex().files[
+								operation.path
+							],
+					);
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
 						result,
@@ -600,6 +892,9 @@ export class SyncEngine {
 					);
 					result.deleted = deleteResults.succeeded;
 					result.errors.push(...deleteResults.errors);
+					if (this.indexSaveCallback) {
+						await this.indexSaveCallback();
+					}
 
 					// Prune remote folders emptied by the delete group (centralized,
 					// once, after all parallel deletes have settled).
@@ -615,34 +910,34 @@ export class SyncEngine {
 					}
 				}
 
-				// 7. Sync indexes: remote becomes a copy of local (only for
-				// operations that actually succeeded). Entries whose upload/delete
-				// failed are left out of the remote index so that (a) the next
-				// sync retries them, and (b) other devices don't try to download
-				// files that never made it to remote and fail with 404.
+				// 7. Commit the v3 index. Failed physical deletions deliberately
+				// remain tombstoned so the next sync retries them. Failed uploads
+				// never updated the desired index and are likewise retried.
 				this.updateState({
 					currentOperation: t("status.op.saving_indexes"),
 				});
 				this.indexManager.cleanupDeletedFiles();
-				const localIndex = this.indexManager.getLocalIndex();
-				const remoteIndex = this.indexManager.getRemoteIndex();
-				const failedPaths = new Set(
-					result.errors.map((e) => e.path).filter(Boolean),
-				);
-				const newRemoteFiles: Record<string, FileMetadata> = {};
-				for (const [p, meta] of Object.entries(localIndex.files)) {
-					if (failedPaths.has(p)) continue;
-					newRemoteFiles[p] = meta;
-				}
-				remoteIndex.files = newRemoteFiles;
+				if (indexCommittedBeforeDeletes) return;
 				this.indexManager.updateSyncTime();
-				if (!(await this.saveRemoteIndexOrAbort(result))) {
+				if (!(await this.saveRemoteIndexOrAbort(result, false))) {
 					return;
 				}
+				await this.repairMissingAcceptedUploads(
+					uploads.map((operation) => operation.path),
+				);
 			},
 			(result) =>
 				`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
+		const result =
+			options?.skipMaintenanceGuard &&
+			this.coordinator.getActiveKind() === "maintenance"
+				? await run()
+				: await this.coordinator.run("force", run);
+		if (bootstrapStarted && !result.success) {
+			this.indexManager.cancelForceBootstrap();
+		}
+		return result;
 	}
 
 	/**
@@ -651,9 +946,17 @@ export class SyncEngine {
 	 * Files not present on remote are deleted locally.
 	 */
 	async forceSyncFromRemote(options?: SyncRunOptions): Promise<SyncResult> {
-		return await this.runSyncSession(
+		let bootstrapStarted = false;
+		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
+				const inheritedCleanup =
+					this.indexManager.getMaintenance();
+				this.indexManager.beginForceBootstrap(true);
+				if (inheritedCleanup?.phase === "cleanup") {
+					this.indexManager.setMaintenance(inheritedCleanup);
+				}
+				bootstrapStarted = true;
 				// 1. Ensure remote folder exists
 				this.updateState({
 					currentOperation: t("status.op.checking_remote_folder"),
@@ -669,19 +972,19 @@ export class SyncEngine {
 				});
 				const localFiles = await this.indexManager.buildLocalIndex();
 
-				// 3. Load remote index
-				this.updateState({
-					currentOperation: t("status.op.loading_remote_index"),
-				});
-				await this.indexManager.loadRemoteIndex();
-
-				// 4. Get remote files list
+				// 3. Read the authoritative physical remote snapshot. Force
+				// remote intentionally does not trust a legacy or ambiguous
+				// canonical index.
 				this.updateState({
 					currentOperation: t("status.op.getting_remote_files"),
 				});
 				const remoteFiles = await this.indexManager.getRemoteFiles();
+				if (inheritedCleanup) {
+					this.indexManager.clearMaintenance(inheritedCleanup.id);
+				}
 
-				// 5. Generate operations manually: all remote → download, local-only → delete_local
+				// 4. Generate operations manually: all remote → download,
+				// local-only → delete locally.
 				this.updateState({
 					currentOperation: t("status.op.analyzing_changes"),
 				});
@@ -711,13 +1014,13 @@ export class SyncEngine {
 					`Force sync from remote: ${operations.length} synchronization operations`,
 				);
 
-				// 6. Preflight: Create all necessary folders
+				// 5. Preflight: Create all necessary folders
 				this.updateState({
 					currentOperation: t("status.op.creating_folders"),
 				});
 				await this.ensureFoldersExist(operations);
 
-				// 7. Execute operations in parallel by type
+				// 6. Execute operations in parallel by type
 				const totalOps = operations.length;
 				let processedOps = 0;
 
@@ -743,25 +1046,47 @@ export class SyncEngine {
 						);
 					result.downloaded = downloadResults.succeeded;
 					result.errors.push(...downloadResults.errors);
+					if (downloadResults.errors.length > 0) return;
 				}
 
 				if (deletes.length > 0) {
 					this.updateState({
 						currentOperation: t("status.op.deleting_local_files"),
 					});
-					const deleteResults = await this.executeOperationsParallel(
-						deletes,
-						result,
+					const deleteResults = await runWithConcurrencySettled(
+						deletes.map((operation) => async () => {
+							await this.deleteLocalFileForForce(operation.path);
+						}),
+						Math.max(1, this.settings.maxConcurrency || 5),
 						(completed) => {
 							processedOps = downloads.length + completed;
 							this.reportProgress(processedOps, totalOps);
 						},
 					);
-					result.deleted = deleteResults.succeeded;
-					result.errors.push(...deleteResults.errors);
+					for (let index = 0; index < deleteResults.length; index++) {
+						const deletion = deleteResults[index];
+						const operation = deletes[index];
+						if (!deletion || !operation) continue;
+						if (deletion.status === "fulfilled") {
+							result.deleted++;
+							continue;
+						}
+						result.errors.push({
+							path: operation.path,
+							operation: "delete_local",
+							message:
+								deletion.reason instanceof Error
+									? deletion.reason.message
+									: String(deletion.reason),
+						});
+					}
+					if (this.indexSaveCallback) {
+						await this.indexSaveCallback();
+					}
+					if (result.errors.length > 0) return;
 				}
 
-				// 8. Sync indexes: local becomes a copy of remote (only for
+				// 7. Sync indexes: local becomes a copy of remote (only for
 				// downloads that actually succeeded). Entries whose download failed
 				// are left out of the local index so the next sync retries them and
 				// the local state does not falsely claim a file is present.
@@ -781,13 +1106,22 @@ export class SyncEngine {
 				}
 				localIndex.files = newLocalFiles;
 				this.indexManager.updateSyncTime();
-				if (!(await this.saveRemoteIndexOrAbort(result))) {
+				if (!(await this.saveRemoteIndexOrAbort(result, false))) {
 					return;
 				}
 			},
 			(result) =>
 				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
+		const result =
+			options?.skipMaintenanceGuard &&
+			this.coordinator.getActiveKind() === "maintenance"
+				? await run()
+				: await this.coordinator.run("force", run);
+		if (bootstrapStarted && !result.success) {
+			this.indexManager.cancelForceBootstrap();
+		}
+		return result;
 	}
 
 	/**
@@ -893,6 +1227,9 @@ export class SyncEngine {
 					break;
 				case "delete_local":
 					await this.deleteLocalFile(op.path);
+					if (op.remoteMeta) {
+						await this.deleteRemoteFile(op.path);
+					}
 					break;
 			}
 		});
@@ -955,10 +1292,12 @@ export class SyncEngine {
 		path: string,
 		skipFolderCheck = false,
 		stampRemoteMtime = true,
+		snapshot?: { content: ArrayBuffer; sha256: string },
 	): Promise<void> {
 		logger.debug(`Uploading file: ${path}`);
 
-		const content = await this.vaultAdapter.readFile(path);
+		const content =
+			snapshot?.content ?? (await this.vaultAdapter.readFile(path));
 		const remotePath = joinPath(this.settings.remotePath, path);
 
 		await this.yandexClient.uploadFile(
@@ -968,14 +1307,14 @@ export class SyncEngine {
 		);
 
 		// Update indexes
-		const sha256 = await computeSha256(content);
+		const sha256 = snapshot?.sha256 ?? (await computeSha256(content));
 		const mtime = this.vaultAdapter.getFileMtime(path) || Date.now();
 		const size = content.byteLength;
 		// Best-effort: if the fetch fails, leave remoteMtime undefined and the
 		// resolver falls back to the legacy mixed-clock comparison.
-		const remoteMtime = stampRemoteMtime
-			? await this.fetchServerMtime(path)
-			: undefined;
+		const remoteStamp = stampRemoteMtime
+			? await this.fetchRemoteStamp(path)
+			: {};
 
 		const metadata: FileMetadata = {
 			path,
@@ -986,10 +1325,20 @@ export class SyncEngine {
 		};
 
 		this.indexManager.updateLocalFile(path, metadata);
+		const pendingBaseRevision =
+			this.indexManager.getPendingPutBaseRevision(path);
 		// The remote index entry additionally carries the server mtime so the
 		// next sync can detect external remote modifications without involving
 		// the local clock.
-		this.indexManager.updateRemoteFile(path, { ...metadata, remoteMtime });
+		this.indexManager.updateRemoteFile(path, {
+			...metadata,
+			...remoteStamp,
+			baseRevision:
+				pendingBaseRevision === undefined
+					? this.indexManager.getCausalBaseRevision()
+					: pendingBaseRevision ??
+						this.indexManager.getRemoteIndex().revision,
+		});
 	}
 
 	/**
@@ -1030,12 +1379,14 @@ export class SyncEngine {
 			}
 		}
 
+		this.expectWatcherEvent(path, "upload");
 		await this.vaultAdapter.writeFile(path, content);
 
 		// Update indexes
 		const sha256 = await computeSha256(content);
 		const mtime = this.vaultAdapter.getFileMtime(path) || Date.now();
-		const remoteMtime = serverMtime ?? (await this.fetchServerMtime(path));
+		const remoteStamp = await this.fetchRemoteStamp(path);
+		const remoteMtime = serverMtime ?? remoteStamp.remoteMtime;
 
 		const metadata: FileMetadata = {
 			path,
@@ -1046,7 +1397,11 @@ export class SyncEngine {
 		};
 
 		this.indexManager.updateLocalFile(path, metadata);
-		this.indexManager.updateRemoteFile(path, { ...metadata, remoteMtime });
+		this.indexManager.updateRemoteFile(path, {
+			...metadata,
+			remoteMtime,
+			remoteFingerprint: remoteStamp.remoteFingerprint,
+		});
 	}
 
 	/**
@@ -1055,18 +1410,26 @@ export class SyncEngine {
 	 * deleted) or the modified timestamp is not parseable. Callers treat
 	 * undefined as "no remoteMtime known" and fall back to legacy logic.
 	 */
-	private async fetchServerMtime(path: string): Promise<number | undefined> {
+	private async fetchRemoteStamp(path: string): Promise<{
+		remoteMtime?: number;
+		remoteFingerprint?: string;
+	}> {
 		try {
 			const remotePath = joinPath(this.settings.remotePath, path);
-			const resource = await this.yandexClient.getResource(remotePath);
-			if (!resource) return undefined;
+			const resource =
+				await this.yandexClient.getLogicalResource(remotePath);
+			if (!resource) return {};
 			const ts = new Date(resource.modified).getTime();
-			return Number.isFinite(ts) ? ts : undefined;
+			return {
+				remoteMtime: Number.isFinite(ts) ? ts : undefined,
+				remoteFingerprint:
+					resource.sha256 || resource.md5 || undefined,
+			};
 		} catch (e) {
-			logger.debug(`Failed to fetch server mtime for ${path}:`, {
+			logger.debug(`Failed to fetch remote stamp for ${path}:`, {
 				error: e,
 			});
-			return undefined;
+			return {};
 		}
 	}
 
@@ -1074,14 +1437,75 @@ export class SyncEngine {
 	 * Delete file on Yandex Disk
 	 */
 	async deleteRemoteFile(path: string): Promise<void> {
-		logger.debug(`Deleting remote file: ${path}`);
+		const physicalAction =
+			this.indexManager.getPendingPhysicalAction("delete-remote", path);
+		if (!physicalAction) {
+			throw new Error(
+				`Refusing to delete ${path} without a pending physical action`,
+			);
+		}
+		const actionContext = {
+			actionId: physicalAction.id,
+			actionType: physicalAction.type,
+			origin: physicalAction.origin,
+			epoch: shortenDiagnosticValue(physicalAction.epoch),
+			canonicalRevision: physicalAction.canonicalRevision,
+			expectedChangedRevision:
+				physicalAction.expectedChangedRevision,
+			expectedFingerprint: shortenDiagnosticValue(
+				physicalAction.expectedFingerprint,
+			),
+			path,
+		};
+		logger.info("Remote physical deletion started", actionContext);
+		const canonical = await this.indexManager.readCanonicalIndex();
+		if (!isPhysicalDeleteAuthorized(physicalAction, canonical)) {
+			this.indexManager.completePhysicalAction(physicalAction.id);
+			logger.warn("Cancelled obsolete remote deletion", {
+				...actionContext,
+				currentEpoch: shortenDiagnosticValue(canonical.epoch),
+				currentRevision: canonical.revision,
+				currentChangedRevision:
+					canonical.files[path]?.changedRevision,
+				currentDeleted: canonical.files[path]?.deleted ?? null,
+			});
+			return;
+		}
 
 		const remotePath = joinPath(this.settings.remotePath, path);
+		const resource =
+			await this.yandexClient.getLogicalResource(remotePath);
+		if (!resource) {
+			this.indexManager.completePhysicalAction(physicalAction.id);
+			logger.info("Remote physical deletion already complete", actionContext);
+			return;
+		}
+		const fingerprint =
+			resource.sha256 || resource.md5 || resource.resource_id;
+		if (
+			physicalAction.expectedFingerprint &&
+			fingerprint &&
+			physicalAction.expectedFingerprint !== fingerprint
+		) {
+			this.indexManager.completePhysicalAction(physicalAction.id);
+			logger.warn("Deferred remote deletion after fingerprint change", {
+				...actionContext,
+				currentFingerprint: shortenDiagnosticValue(fingerprint),
+			});
+			return;
+		}
 		await this.yandexClient.deleteResource(remotePath);
+		if (await this.yandexClient.getLogicalResource(remotePath)) {
+			throw new Error(`Remote deletion of ${path} was not confirmed`);
+		}
+		this.indexManager.completePhysicalAction(physicalAction.id);
+		logger.info("Remote physical deletion confirmed", actionContext);
 
 		// Update indexes
-		this.indexManager.markRemoteFileDeleted(path);
-		this.indexManager.removeFromLocalIndex(path);
+		if (physicalAction.origin !== "force-reset") {
+			this.indexManager.markRemoteFileDeleted(path);
+			this.indexManager.markLocalFileDeleted(path);
+		}
 		// Note: pruning of now-empty remote folders is performed centrally
 		// after the whole delete group (see fullSync/forceSyncFromLocal) to
 		// avoid the race where parallel deletes each observe the others'
@@ -1156,13 +1580,78 @@ export class SyncEngine {
 	 * Delete local file
 	 */
 	async deleteLocalFile(path: string): Promise<void> {
-		logger.debug(`Deleting local file: ${path}`);
+		const physicalAction =
+			this.indexManager.getPendingPhysicalAction("delete-local", path);
+		if (!physicalAction) {
+			throw new Error(
+				`Refusing to delete ${path} without a pending physical action`,
+			);
+		}
+		const actionContext = {
+			actionId: physicalAction.id,
+			actionType: physicalAction.type,
+			origin: physicalAction.origin,
+			epoch: shortenDiagnosticValue(physicalAction.epoch),
+			canonicalRevision: physicalAction.canonicalRevision,
+			expectedChangedRevision:
+				physicalAction.expectedChangedRevision,
+			baselineSha256: shortenDiagnosticValue(
+				physicalAction.baselineSha256,
+			),
+			path,
+		};
+		logger.info("Local physical deletion started", actionContext);
+		const canonical = await this.indexManager.readCanonicalIndex();
+		if (!isPhysicalDeleteAuthorized(physicalAction, canonical)) {
+			this.indexManager.completePhysicalAction(physicalAction.id);
+			logger.warn("Cancelled obsolete local deletion", {
+				...actionContext,
+				currentEpoch: shortenDiagnosticValue(canonical.epoch),
+				currentRevision: canonical.revision,
+				currentChangedRevision:
+					canonical.files[path]?.changedRevision,
+				currentDeleted: canonical.files[path]?.deleted ?? null,
+			});
+			return;
+		}
 
+		const baseline = this.indexManager.getLocalIndex().files[path];
+		if (this.vaultAdapter.fileExists(path)) {
+			try {
+				const content = await this.vaultAdapter.readFile(path);
+				const sha256 = await computeSha256(content);
+				const baselineSha256 =
+					physicalAction.baselineSha256 ?? baseline?.sha256;
+				if (shouldBackupLocalDelete(sha256, baselineSha256)) {
+					logger.info("Backing up changed local file before deletion", {
+						...actionContext,
+						currentSha256: shortenDiagnosticValue(sha256),
+					});
+					const backupPath =
+						await this.vaultAdapter.backupOverwrittenFile(
+							path,
+							content,
+						);
+					if (!backupPath) {
+						throw new Error(
+							`Could not create a backup before deleting ${path}`,
+						);
+					}
+				}
+			} catch (e) {
+				throw new Error(
+					`Could not safely delete ${path}: ${(e as Error).message}`,
+				);
+			}
+		}
+		this.expectWatcherEvent(path, "delete");
 		await this.vaultAdapter.deleteFile(path);
+		this.indexManager.completePhysicalAction(physicalAction.id);
+		logger.info("Local physical deletion confirmed", actionContext);
 
 		// Update indexes
 		this.indexManager.markLocalFileDeleted(path);
-		this.indexManager.removeFromRemoteIndex(path);
+		this.indexManager.markRemoteFileDeleted(path);
 
 		// Prune local ancestor folders that became empty after this deletion,
 		// so the local tree mirrors the remote tree after a delete sync. Only
@@ -1174,6 +1663,21 @@ export class SyncEngine {
 				error: e,
 			});
 		}
+	}
+
+	/**
+	 * Apply a Force-remote snapshot locally. The mandatory vault backup is the
+	 * recovery boundary, so no tombstone is added to the new canonical epoch.
+	 */
+	private async deleteLocalFileForForce(path: string): Promise<void> {
+		if (!this.vaultAdapter.fileExists(path)) {
+			this.indexManager.removeFromLocalIndex(path);
+			return;
+		}
+		this.expectWatcherEvent(path, "delete");
+		await this.vaultAdapter.deleteFile(path);
+		this.indexManager.removeFromLocalIndex(path);
+		await this.vaultAdapter.pruneEmptyLocalAncestors(path);
 	}
 
 	/**
@@ -1192,17 +1696,13 @@ export class SyncEngine {
 			);
 
 			const localContent = await this.vaultAdapter.readFile(op.path);
+			this.expectWatcherEvent(conflictPath, "upload");
 			await this.vaultAdapter.writeFile(conflictPath, localContent);
 
-			// Upload conflict copy to disk
-			const remoteConflictPath = joinPath(
-				this.settings.remotePath,
-				conflictPath,
-			);
-			await this.yandexClient.uploadFile(
-				remoteConflictPath,
-				localContent,
-			);
+			await this.uploadFile(conflictPath, false, true, {
+				content: localContent,
+				sha256: await computeSha256(localContent),
+			});
 
 			// Download remote version
 			await this.downloadFile(
@@ -1221,6 +1721,163 @@ export class SyncEngine {
 		path: string,
 		action: "upload" | "delete",
 	): Promise<void> {
+		return await this.enqueueRealtime(() =>
+			this.syncSingleFileNow(path, action),
+		);
+	}
+
+	/**
+	 * Apply a debounced realtime file batch with one canonical index commit.
+	 *
+	 * @returns `true` only when every event is durably reconciled. A `false`
+	 * result tells the watcher to retain the batch for a later retry.
+	 */
+	async syncFileBatch(
+		events: Array<{ path: string; action: "upload" | "delete" }>,
+	): Promise<boolean> {
+		return await this.coordinator.run("realtime", async () => {
+			const blockReason = await this.getSyncBlockReason(false);
+			if (blockReason || this.isPaused) {
+				if (blockReason) this.setBlockedState(blockReason);
+				return false;
+			}
+
+			const prepared: Array<{
+				path: string;
+				action: "upload" | "delete";
+				mutation: ReturnType<IndexManager["enqueueMutation"]>;
+				snapshot?: { content: ArrayBuffer; sha256: string };
+			}> = [];
+			let preparationFailed = false;
+			for (const event of events) {
+				if (!this.vaultAdapter.shouldSync(event.path)) continue;
+				if (event.action === "upload") {
+					try {
+						const content = await this.vaultAdapter.readFile(event.path);
+						const sha256 = await computeSha256(content);
+						prepared.push({
+							...event,
+							mutation: this.indexManager.enqueueMutation(
+								"put",
+								event.path,
+								{
+									sha256,
+									baselineSha256:
+										this.indexManager.getLocalIndex().files[
+											event.path
+										]?.sha256,
+								},
+							),
+							snapshot: { content, sha256 },
+						});
+					} catch (e) {
+						logger.warn(
+							`Could not prepare realtime upload ${event.path}:`,
+							{ error: e },
+						);
+						preparationFailed = true;
+					}
+					continue;
+				}
+				this.indexManager.markLocalFileDeleted(event.path);
+				prepared.push({
+					...event,
+					mutation: this.indexManager.enqueueMutation(
+						"delete-file",
+						event.path,
+					),
+				});
+			}
+			if (prepared.length === 0) return !preparationFailed;
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+
+			const accepted: typeof prepared = [];
+			let processingFailed = false;
+			for (const item of prepared) {
+				try {
+					if (item.action === "upload") {
+						await this.uploadFile(
+							item.path,
+							false,
+							true,
+							item.snapshot,
+						);
+					} else {
+						this.indexManager.markRemoteFileDeleted(item.path);
+						this.indexManager.enqueuePhysicalAction(
+							"delete-remote",
+							item.path,
+							{
+								canonicalRevision:
+									this.indexManager.getRemoteIndex().revision + 1,
+								expectedFingerprint:
+									this.indexManager.getRemoteIndex().files[
+										item.path
+									]?.remoteFingerprint,
+								origin: "exact-delete",
+							},
+						);
+					}
+					this.indexManager.stageMutation(item.mutation);
+					accepted.push(item);
+				} catch (e) {
+					logger.error(
+						`Realtime batch stopped at ${item.path}:`,
+						{ error: e },
+					);
+					processingFailed = true;
+					break;
+				}
+			}
+			if (accepted.length === 0) return false;
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+			if (!(await this.saveRemoteIndexBestEffort())) return false;
+			await this.repairMissingAcceptedUploads(
+				accepted
+					.filter((item) => item.action === "upload")
+					.map((item) => item.path),
+			);
+			for (const item of accepted) {
+				this.indexManager.confirmMutation(item.mutation.id);
+			}
+
+			const deletes = accepted.filter(
+				(item) => item.action === "delete",
+			);
+			const deleteResults = await runWithConcurrencySettled(
+				deletes.map((item) => async () => {
+					await this.deleteRemoteFile(item.path);
+				}),
+				Math.max(1, this.settings.maxConcurrency || 5),
+			);
+			if (deletes.length > 0) {
+				await this.pruneRemoteFolders(
+					deletes.map((item) => item.path),
+				);
+			}
+			if (
+				deleteResults.every(
+					(outcome) => outcome.status === "fulfilled",
+				)
+			) {
+				this.indexManager.markRemoteObserved();
+			}
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+			return (
+				!preparationFailed &&
+				!processingFailed &&
+				accepted.length === prepared.length &&
+				deleteResults.every(
+					(outcome) => outcome.status === "fulfilled",
+				)
+			);
+		});
+	}
+
+	private async syncSingleFileNow(
+		path: string,
+		action: "upload" | "delete",
+	): Promise<void> {
 		logger.info(
 			`[SyncEngine] syncSingleFile called for ${path}, action: ${action}`,
 		);
@@ -1233,18 +1890,51 @@ export class SyncEngine {
 			this.setBlockedState(blockReason);
 			return;
 		}
+		if (!this.vaultAdapter.shouldSync(path)) {
+			logger.info(`[SyncEngine] File ${path} should not be synchronized`);
+			return;
+		}
+
+		let snapshot:
+			| { content: ArrayBuffer; sha256: string }
+			| undefined;
+		if (action === "upload") {
+			try {
+				const content = await this.vaultAdapter.readFile(path);
+				snapshot = {
+					content,
+					sha256: await computeSha256(content),
+				};
+			} catch (e) {
+				logger.debug(
+					`Could not hash pending upload ${path}:`,
+					{ error: e },
+				);
+			}
+		}
+		const mutation = this.indexManager.enqueueMutation(
+			action === "upload" ? "put" : "delete-file",
+			path,
+			{
+				sha256: snapshot?.sha256,
+				baselineSha256:
+					this.indexManager.getLocalIndex().files[path]?.sha256,
+			},
+		);
+		if (action === "delete") {
+			this.indexManager.markLocalFileDeleted(path);
+		}
+		if (this.indexSaveCallback) await this.indexSaveCallback();
 
 		if (this.isPaused || this.isSyncing) {
 			logger.info(
 				`[SyncEngine] Skipping file sync ${path}: sync busy (${this.isSyncing}) or paused (${this.isPaused})`,
 			);
-			// Persist the deletion intent so the next fullSync resolves it as
-			// delete_remote (Case 3) rather than downloading the file (Case 2/8).
+			// Persist the deletion intent so the next full sync resolves it as
+			// delete_remote rather than treating the remote file as new.
 			if (action === "delete") {
-				this.indexManager.markLocalFileDeleted(path);
-				// Persist the local index to disk; otherwise an Obsidian restart
-				// before the next full sync would lose the deletion intent and
-				// the file would be re-downloaded (Case 8: remote mtime > 0).
+				// Persist the local index to disk so an Obsidian restart before
+				// the next full sync cannot lose the deletion intent.
 				if (this.indexSaveCallback) {
 					try {
 						await this.indexSaveCallback();
@@ -1259,22 +1949,41 @@ export class SyncEngine {
 			return;
 		}
 
-		if (!this.vaultAdapter.shouldSync(path)) {
-			logger.info(`[SyncEngine] File ${path} should not be synchronized`);
-			return;
-		}
-
 		logger.info(`[SyncEngine] Starting file synchronization ${path}`);
 
 		try {
 			if (action === "upload") {
-				await this.uploadFile(path);
+				await this.uploadFile(path, false, true, snapshot);
 			} else if (action === "delete") {
-				await this.deleteRemoteFile(path);
+				this.indexManager.markRemoteFileDeleted(path);
+				this.indexManager.enqueuePhysicalAction(
+					"delete-remote",
+					path,
+					{
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision + 1,
+						expectedFingerprint:
+							this.indexManager.getRemoteIndex().files[path]
+								?.remoteFingerprint,
+						origin: "exact-delete",
+					},
+				);
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
 			}
+			this.indexManager.stageMutation(mutation);
 
 			// Save remote index after operation to keep it in sync
-			await this.saveRemoteIndexBestEffort();
+			const committed = await this.saveRemoteIndexBestEffort();
+			if (!committed) return;
+			this.indexManager.confirmMutation(mutation.id);
+
+			if (action === "delete") {
+				await this.deleteRemoteFile(path);
+				await this.pruneRemoteFolders([path]);
+			}
+			this.indexManager.markRemoteObserved();
 			logger.debug(`Remote index saved after ${action} for ${path}`);
 
 			// Save local index via callback
@@ -1291,14 +2000,49 @@ export class SyncEngine {
 	 * Rename file on Yandex Disk
 	 */
 	async renameFile(oldPath: string, newPath: string): Promise<void> {
+		return await this.enqueueRealtime(() =>
+			this.renameFileNow(oldPath, newPath),
+		);
+	}
+
+	private async renameFileNow(
+		oldPath: string,
+		newPath: string,
+	): Promise<void> {
 		const blockReason = await this.getSyncBlockReason(false);
 		if (blockReason) {
 			logger.warn(
 				`[SyncEngine] Skipping rename ${oldPath}: ${blockReason}`,
 			);
 			this.setBlockedState(blockReason);
-			return;
+			throw new Error(blockReason);
 		}
+
+		const mutation = this.indexManager.enqueueMutation("move", oldPath, {
+			targetPath: newPath,
+			resourceKind: "file",
+		});
+		this.indexManager.recordMove(
+			mutation.id,
+			oldPath,
+			newPath,
+			"file",
+			mutation.baseRevision ?? this.indexManager.getRemoteIndex().revision,
+		);
+		const physicalMove = this.indexManager.enqueuePhysicalAction(
+			"move-remote",
+			oldPath,
+			{
+				targetPath: newPath,
+				canonicalRevision:
+					this.indexManager.getRemoteIndex().revision + 1,
+				expectedFingerprint:
+					this.indexManager.getRemoteIndex().files[oldPath]
+						?.remoteFingerprint,
+				origin: "move",
+			},
+		);
+		if (this.indexSaveCallback) await this.indexSaveCallback();
 
 		if (this.isPaused || this.isSyncing) {
 			return;
@@ -1307,31 +2051,40 @@ export class SyncEngine {
 		if (!this.vaultAdapter.shouldSync(newPath)) {
 			// If new path is not synchronized, delete old one
 			if (this.vaultAdapter.shouldSync(oldPath)) {
+				this.indexManager.markRemoteFileDeleted(oldPath);
+				this.indexManager.enqueuePhysicalAction(
+					"delete-remote",
+					oldPath,
+					{
+						expectedFingerprint:
+							this.indexManager.getRemoteIndex().files[oldPath]
+								?.remoteFingerprint,
+						origin: "exact-delete",
+					},
+				);
+				this.indexManager.completePhysicalAction(physicalMove.id);
+				this.indexManager.completeMove(mutation.id);
+				this.indexManager.stageMutation(mutation);
+				if (!(await this.saveRemoteIndexBestEffort())) return;
 				await this.deleteRemoteFile(oldPath);
-				// Save remote index after deletion
-				await this.saveRemoteIndexBestEffort();
-				// Save local index via callback
+				this.indexManager.confirmMutation(mutation.id);
 				if (this.indexSaveCallback) {
 					await this.indexSaveCallback();
 				}
+			} else {
+				this.indexManager.completePhysicalAction(physicalMove.id);
+				this.indexManager.completeMove(mutation.id);
+				this.indexManager.discardMutation(mutation.id);
 			}
 			return;
 		}
 
 		try {
-			const oldRemotePath = joinPath(this.settings.remotePath, oldPath);
-			const newRemotePath = joinPath(this.settings.remotePath, newPath);
-
-			await this.yandexClient.moveResource(oldRemotePath, newRemotePath);
-
-			// Update indexes
 			const oldLocalMeta =
 				this.indexManager.getLocalIndex().files[oldPath];
 			const oldRemoteMeta =
 				this.indexManager.getRemoteIndex().files[oldPath];
 
-			// Mark old file as deleted in both indexes
-			// This is important for other devices to know the file was renamed/deleted
 			if (oldLocalMeta) {
 				this.indexManager.markLocalFileDeleted(oldPath);
 			}
@@ -1356,12 +2109,65 @@ export class SyncEngine {
 			// Add new file to indexes
 			this.indexManager.updateLocalFile(newPath, newMetadata);
 			this.indexManager.updateRemoteFile(newPath, newMetadata);
+			if (mutation.baseRevision !== null) {
+				this.indexManager.getRemoteIndex().files[
+					newPath
+				]!.baseRevision = mutation.baseRevision;
+			}
+
+			if (!(await this.saveRemoteIndexBestEffort())) return;
+			if (
+				this.indexManager.getRemoteIndex().files[newPath]
+					?.sha256 !== newMetadata.sha256
+			) {
+				this.indexManager.completePhysicalAction(physicalMove.id);
+				this.indexManager.completeMove(mutation.id);
+				this.indexManager.stageMutation(mutation);
+				if (await this.saveRemoteIndexBestEffort()) {
+					this.indexManager.confirmMutation(mutation.id);
+				}
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+				return;
+			}
+			if (
+				this.indexManager.getRemoteIndex().files[newPath]?.deleted
+			) {
+				await this.vaultAdapter.backupOverwrittenFile(
+					newPath,
+					content,
+				);
+				this.expectWatcherEvent(newPath, "delete");
+				await this.vaultAdapter.deleteFile(newPath);
+				this.indexManager.markLocalFileDeleted(newPath);
+				this.indexManager.completePhysicalAction(physicalMove.id);
+				this.indexManager.completeMove(mutation.id);
+				this.indexManager.stageMutation(mutation);
+				if (await this.saveRemoteIndexBestEffort()) {
+					this.indexManager.confirmMutation(mutation.id);
+				}
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+				return;
+			}
+
+			await this.executeGuardedRemoteMove(
+				oldPath,
+				newPath,
+				physicalMove.id,
+			);
 
 			// Remove source folders that became empty after the move
 			await this.pruneRemoteFolders([oldPath]);
 
 			// Save remote index after rename
-			await this.saveRemoteIndexBestEffort();
+			this.indexManager.completeMove(mutation.id);
+			this.indexManager.stageMutation(mutation);
+			if (await this.saveRemoteIndexBestEffort()) {
+				this.indexManager.confirmMutation(mutation.id);
+			}
 			logger.debug(`File renamed: ${oldPath} -> ${newPath}`);
 
 			// Save local index via callback
@@ -1370,32 +2176,225 @@ export class SyncEngine {
 			}
 		} catch (e) {
 			logger.error(`Error renaming file ${oldPath}:`, { error: e });
-			// If rename failed, the source remote file may still exist. Remove
-			// it before re-uploading to the destination so we don't leave a
-			// duplicate that would otherwise only be cleaned up on the next
-			// full sync (ConflictResolver Case 3). Best-effort: ignore if it's
-			// already gone (404) or if the move partially succeeded.
-			try {
-				const staleRemotePath = joinPath(
-					this.settings.remotePath,
-					oldPath,
-				);
-				await this.yandexClient.deleteResource(staleRemotePath);
-			} catch (cleanupErr) {
-				logger.warn(
-					`Failed to clean up old remote file after rename failure (${oldPath}):`,
-					{ error: cleanupErr },
-				);
-			}
-			// Re-upload the file to the destination path
-			await this.uploadFile(newPath);
-			// Save remote index after upload
-			await this.saveRemoteIndexBestEffort();
-			// Save local index via callback
 			if (this.indexSaveCallback) {
 				await this.indexSaveCallback();
 			}
 		}
+	}
+
+	/**
+	 * Synchronize deletion of a folder as one logical prefix mutation.
+	 */
+	async deleteFolder(path: string): Promise<void> {
+		return await this.enqueueRealtime(async () => {
+			const mutation = this.indexManager.enqueueMutation(
+				"delete-folder",
+				path,
+			);
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+			const folderPath = path.replace(/\/+$/, "");
+			const prefix = `${folderPath}/`;
+			const affected = Object.keys(
+				this.indexManager.getRemoteIndex().files,
+			).filter((filePath) => filePath.startsWith(prefix));
+			if (affected.length === 0) {
+				this.indexManager.discardMutation(mutation.id);
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+				return;
+			}
+
+			this.indexManager.markFolderDeleted(
+				folderPath,
+				mutation.createdAt,
+				mutation.baseRevision,
+			);
+			for (const filePath of affected) {
+				this.indexManager.markRemoteFileDeleted(
+					filePath,
+					folderPath,
+					mutation.baseRevision ?? 0,
+				);
+				this.indexManager.markLocalFileDeleted(
+					filePath,
+					folderPath,
+				);
+				this.indexManager.enqueuePhysicalAction(
+					"delete-remote",
+					filePath,
+					{
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision + 1,
+						expectedFingerprint:
+							this.indexManager.getRemoteIndex().files[filePath]
+								?.remoteFingerprint,
+						origin: "folder-delete",
+					},
+				);
+			}
+			this.indexManager.stageMutation(mutation);
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+
+			if (!(await this.saveRemoteIndexBestEffort())) return;
+			this.indexManager.confirmMutation(mutation.id);
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+
+			const committedPaths = affected.filter((filePath) => {
+				const meta =
+					this.indexManager.getRemoteIndex().files[filePath];
+				return (
+					meta?.deleted === true &&
+					meta.deletedByFolder === folderPath
+				);
+			});
+			await runWithConcurrencySettled(
+				committedPaths.map((filePath) => async () => {
+					await this.deleteRemoteFile(filePath);
+				}),
+				Math.max(1, this.settings.maxConcurrency || 5),
+			);
+			await this.pruneRemoteFolders(committedPaths);
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+		});
+	}
+
+	/**
+	 * Synchronize a folder rename while preserving a logical move marker.
+	 */
+	async renameFolder(oldPath: string, newPath: string): Promise<void> {
+		return await this.enqueueRealtime(async () => {
+			const mutation = this.indexManager.enqueueMutation(
+				"move",
+				oldPath,
+				{
+					targetPath: newPath,
+					resourceKind: "folder",
+				},
+			);
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+			const id = mutation.id;
+			const oldPrefix = `${oldPath.replace(/\/+$/, "")}/`;
+			const newPrefix = `${newPath.replace(/\/+$/, "")}/`;
+			const remoteIndex = this.indexManager.getRemoteIndex();
+			const localIndex = this.indexManager.getLocalIndex();
+			const hasIndexedDescendants =
+				Object.entries(remoteIndex.files).some(
+					([filePath, meta]) =>
+						filePath.startsWith(oldPrefix) && !meta.deleted,
+				) ||
+				Object.entries(localIndex.files).some(
+					([filePath, meta]) =>
+						filePath.startsWith(oldPrefix) && !meta.deleted,
+				);
+			if (!hasIndexedDescendants) {
+				this.indexManager.discardMutation(mutation.id);
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+				return;
+			}
+
+			this.indexManager.recordMove(
+				id,
+				oldPath,
+				newPath,
+				"folder",
+				mutation.baseRevision ??
+					this.indexManager.getRemoteIndex().revision,
+			);
+			const physicalMove = this.indexManager.enqueuePhysicalAction(
+				"move-remote",
+				oldPath,
+				{
+					targetPath: newPath,
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision + 1,
+					origin: "move",
+				},
+			);
+			this.indexManager.markFolderDeleted(
+				oldPath,
+				mutation.createdAt,
+				mutation.baseRevision,
+			);
+
+			const targetHashes = new Map<string, string>();
+			for (const [filePath, meta] of Object.entries({
+				...remoteIndex.files,
+			})) {
+				if (!filePath.startsWith(oldPrefix) || meta.deleted) continue;
+				const target = `${newPrefix}${filePath.slice(oldPrefix.length)}`;
+				this.indexManager.markRemoteFileDeleted(
+					filePath,
+					oldPath,
+					mutation.baseRevision ?? 0,
+				);
+				this.indexManager.updateRemoteFile(target, {
+					...meta,
+					path: target,
+					deleted: false,
+					deletedAt: undefined,
+				});
+				targetHashes.set(target, meta.sha256);
+			}
+			for (const [filePath, meta] of Object.entries({
+				...localIndex.files,
+			})) {
+				if (!filePath.startsWith(oldPrefix) || meta.deleted) continue;
+				this.indexManager.markLocalFileDeleted(filePath, oldPath);
+				this.indexManager.updateLocalFile(
+					`${newPrefix}${filePath.slice(oldPrefix.length)}`,
+					{
+						...meta,
+						path: `${newPrefix}${filePath.slice(oldPrefix.length)}`,
+						deleted: false,
+						deletedAt: undefined,
+					},
+				);
+			}
+
+			if (!(await this.saveRemoteIndexBestEffort())) return;
+			const hasConcurrentSurvivor = Object.entries(
+				this.indexManager.getRemoteIndex().files,
+			).some(
+				([filePath, meta]) =>
+					filePath.startsWith(oldPrefix) && !meta.deleted,
+			);
+			const hasRejectedTarget = Object.entries(
+				this.indexManager.getRemoteIndex().files,
+			).some(
+				([filePath, meta]) =>
+					filePath.startsWith(newPrefix) &&
+					(meta.deleted ||
+						(targetHashes.has(filePath) &&
+							targetHashes.get(filePath) !==
+								meta.sha256)),
+			);
+			if (hasConcurrentSurvivor || hasRejectedTarget) {
+				this.indexManager.completePhysicalAction(physicalMove.id);
+				this.indexManager.completeMove(id);
+				this.indexManager.stageMutation(mutation);
+				if (await this.saveRemoteIndexBestEffort()) {
+					this.indexManager.confirmMutation(mutation.id);
+				}
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+				return;
+			}
+			await this.executeGuardedRemoteMove(
+				oldPath,
+				newPath,
+				physicalMove.id,
+			);
+			this.indexManager.completeMove(id);
+			this.indexManager.stageMutation(mutation);
+			if (await this.saveRemoteIndexBestEffort()) {
+				this.indexManager.confirmMutation(mutation.id);
+			}
+			if (this.indexSaveCallback) await this.indexSaveCallback();
+		});
 	}
 
 	/**
@@ -1412,6 +2411,10 @@ export class SyncEngine {
 			startTime,
 			endTime: 0,
 		};
+	}
+
+	private async enqueueRealtime(task: () => Promise<void>): Promise<void> {
+		return await this.coordinator.run("realtime", task);
 	}
 
 	/**
@@ -1459,13 +2462,14 @@ export class SyncEngine {
 		body: (result: SyncResult, startTime: number) => Promise<void>,
 		logMessage: (result: SyncResult) => string,
 	): Promise<SyncResult> {
-		if (this.isSyncing) {
-			logger.warn("Synchronization already in progress");
+		if (
+			this.coordinator.getActiveKind() === "maintenance" &&
+			!options?.skipMaintenanceGuard
+		) {
 			return this.createErrorResult(
-				"Synchronization already in progress",
+				"Encryption maintenance is in progress",
 			);
 		}
-
 		if (this.isPaused) {
 			logger.warn("Synchronization is paused");
 			return this.createErrorResult("Synchronization is paused");
@@ -1483,6 +2487,7 @@ export class SyncEngine {
 
 		const startTime = Date.now();
 		const result = this.createEmptyResult(startTime);
+		logger.info("Sync reconciliation started", this.getDiagnosticSnapshot());
 
 		try {
 			this.updateState({
@@ -1494,6 +2499,12 @@ export class SyncEngine {
 			await body(result, startTime);
 
 			result.success = result.errors.length === 0;
+			if (result.success) {
+				this.indexManager.markRemoteObserved();
+				if (this.indexSaveCallback) {
+					await this.indexSaveCallback();
+				}
+			}
 			result.endTime = Date.now();
 
 			this.updateState({
@@ -1507,7 +2518,17 @@ export class SyncEngine {
 				pendingCount: 0,
 			});
 
-			logger.info(logMessage(result));
+			logger.info(logMessage(result), {
+				...this.getDiagnosticSnapshot(),
+				durationMs: result.endTime - startTime,
+				result: {
+					uploaded: result.uploaded,
+					downloaded: result.downloaded,
+					deleted: result.deleted,
+					conflicts: result.conflicts,
+					errors: result.errors.length,
+				},
+			});
 
 			return result;
 		} catch (e) {
@@ -1527,12 +2548,43 @@ export class SyncEngine {
 				progress: undefined,
 			});
 
-			logger.error("Critical synchronization error:", { error: e });
+			logger.error("Critical synchronization error:", {
+				...this.getDiagnosticSnapshot(),
+				durationMs: result.endTime - startTime,
+				error: e,
+			});
 			return result;
 		} finally {
-			this.notifySyncResumeCallbacks();
 			this.isSyncing = false;
+			this.notifySyncResumeCallbacks();
 		}
+	}
+
+	/**
+	 * Capture compact causal state at durable sync boundaries.
+	 */
+	private getDiagnosticSnapshot(): Record<string, unknown> {
+		const local = this.indexManager.getLocalIndex();
+		const canonical = this.indexManager.getRemoteIndex();
+		const maintenance = this.indexManager.getMaintenance();
+		return {
+			epoch: shortenDiagnosticValue(canonical.epoch),
+			observedEpoch: shortenDiagnosticValue(local.observedEpoch),
+			observedRevision: local.observedRevision,
+			canonicalRevision: canonical.revision,
+			pendingMutations:
+				this.indexManager.getPendingMutations().length,
+			pendingPhysicalActions:
+				this.indexManager.getPendingPhysicalActions().length,
+			maintenance: maintenance
+				? {
+						transitionId: shortenDiagnosticValue(maintenance.id),
+						kind: maintenance.kind,
+						phase: maintenance.phase,
+						cleanupPending: maintenance.cleanup.length,
+					}
+				: null,
+		};
 	}
 
 	/**
@@ -1542,9 +2594,22 @@ export class SyncEngine {
 	 * sync once we reload the newer index. Returns false (and records an error
 	 * on `result`) when the save was skipped due to a concurrent modification.
 	 */
-	private async saveRemoteIndexOrAbort(result: SyncResult): Promise<boolean> {
+	private async saveRemoteIndexOrAbort(
+		result: SyncResult,
+		includePendingMutations = true,
+	): Promise<boolean> {
 		try {
+			if (includePendingMutations) {
+				this.indexManager.stagePendingMutations();
+			}
 			await this.indexManager.saveRemoteIndex();
+			await this.cleanupRejectedUploads();
+			if (includePendingMutations) {
+				this.indexManager.confirmAppliedMutations();
+			}
+			if (this.indexSaveCallback) {
+				await this.indexSaveCallback();
+			}
 			return true;
 		} catch (e) {
 			if (!(e instanceof RemoteIndexConcurrentModificationError)) {
@@ -1571,18 +2636,643 @@ export class SyncEngine {
 	 * reload the newer remote index and reconcile. We only log a warning so
 	 * real-time editing stays non-disruptive.
 	 */
-	private async saveRemoteIndexBestEffort(): Promise<void> {
+	private async saveRemoteIndexBestEffort(): Promise<boolean> {
 		try {
 			await this.indexManager.saveRemoteIndex();
+			await this.cleanupRejectedUploads();
+			return true;
 		} catch (e) {
 			if (e instanceof RemoteIndexConcurrentModificationError) {
 				logger.warn(
 					"Remote index modified concurrently during single-file sync; skipping remote index save. It will be reconciled on the next full sync.",
 				);
-				return;
+				return false;
 			}
 			throw e;
 		}
+	}
+
+	/**
+	 * Repair only a missing physical object after its put won the canonical
+	 * merge. A changed existing object is left for causal reconciliation.
+	 */
+	private async repairMissingAcceptedUploads(
+		paths: string[],
+	): Promise<void> {
+		if (paths.length === 0) return;
+		const canonical = await this.indexManager.readCanonicalIndex();
+		const liveRemote = await this.indexManager.getRemoteFiles();
+		let repaired = false;
+		for (const path of new Set(paths)) {
+			const accepted = canonical.files[path];
+			if (!accepted || accepted.deleted) {
+				continue;
+			}
+			if (!this.vaultAdapter.fileExists(path)) continue;
+			const content = await this.vaultAdapter.readFile(path);
+			const sha256 = await computeSha256(content);
+			if (sha256 !== accepted.sha256) continue;
+			const physical = liveRemote.get(path);
+			const physicalMatches =
+				physical !== undefined &&
+				(accepted.remoteFingerprint !== undefined &&
+				physical.remoteFingerprint !== undefined
+					? accepted.remoteFingerprint ===
+						physical.remoteFingerprint
+					: typeof accepted.remoteMtime === "number" &&
+						  typeof physical.remoteMtime === "number"
+						? accepted.remoteMtime === physical.remoteMtime
+						: accepted.sha256 === physical.sha256);
+			if (
+				physical &&
+				physicalMatches
+			) {
+				continue;
+			}
+			if (physical) {
+				const remoteContent =
+					await this.yandexClient.downloadFile(
+						joinPath(this.settings.remotePath, path),
+					);
+				const remoteSha256 = await computeSha256(remoteContent);
+				if (remoteSha256 !== accepted.sha256) {
+					const conflictPath =
+						this.conflictResolver.generateConflictName(
+							path,
+							this.settings.deviceId,
+						);
+					this.expectWatcherEvent(conflictPath, "upload");
+					await this.vaultAdapter.writeFile(
+						conflictPath,
+						remoteContent,
+					);
+					await this.uploadFile(conflictPath, false, true, {
+						content: remoteContent,
+						sha256: remoteSha256,
+					});
+				} else {
+					this.indexManager.getRemoteIndex().files[path] = {
+						...accepted,
+						remoteMtime: physical.remoteMtime,
+						remoteFingerprint:
+							physical.remoteFingerprint,
+					};
+					repaired = true;
+					continue;
+				}
+			}
+			this.indexManager.getRemoteIndex().files[path] = {
+				...accepted,
+			};
+			await this.uploadFile(path, false, true, { content, sha256 });
+			repaired = true;
+		}
+		if (repaired && !(await this.saveRemoteIndexBestEffort())) {
+			throw new Error(
+				"Repaired uploads could not be confirmed in canonical index",
+			);
+		}
+	}
+
+	/**
+	 * Execute a committed move without overwriting a concurrent target and
+	 * verify the final physical state before acknowledging local work.
+	 */
+	private async executeGuardedRemoteMove(
+		fromPath: string,
+		toPath: string,
+		actionId?: string,
+	): Promise<void> {
+		const action =
+			this.indexManager.getPendingPhysicalAction(
+				"move-remote",
+				fromPath,
+			);
+		const actionContext = {
+			actionId: action?.id ?? actionId ?? null,
+			actionType: "move-remote",
+			origin: action?.origin ?? "move",
+			epoch: shortenDiagnosticValue(action?.epoch),
+			canonicalRevision: action?.canonicalRevision ?? null,
+			expectedFingerprint: shortenDiagnosticValue(
+				action?.expectedFingerprint,
+			),
+			fromPath,
+			toPath,
+		};
+		logger.info("Guarded remote move started", actionContext);
+		const canonical = await this.indexManager.readCanonicalIndex();
+		const move = Object.values(canonical.moves).find(
+			(candidate) =>
+				candidate.pending &&
+				candidate.fromPath === fromPath &&
+				candidate.toPath === toPath,
+		);
+		if (!move || canonical.files[toPath]?.deleted) {
+			if (action) this.indexManager.completePhysicalAction(action.id);
+			logger.warn("Cancelled obsolete guarded remote move", {
+				...actionContext,
+				currentRevision: canonical.revision,
+				movePending: move?.pending ?? false,
+				targetDeleted: canonical.files[toPath]?.deleted ?? null,
+			});
+			return;
+		}
+
+		const remoteFrom = joinPath(this.settings.remotePath, fromPath);
+		const remoteTo = joinPath(this.settings.remotePath, toPath);
+		const [source, target] = await Promise.all([
+			this.yandexClient.getLogicalResource(remoteFrom),
+			this.yandexClient.getLogicalResource(remoteTo),
+		]);
+		if (!source && target) {
+			if (action) this.indexManager.completePhysicalAction(action.id);
+			logger.info("Guarded remote move already complete", actionContext);
+			return;
+		}
+		if (!source) {
+			throw new Error(`Move source is missing: ${fromPath}`);
+		}
+		if (target) {
+			throw new Error(`Move target already exists: ${toPath}`);
+		}
+		const sourceFingerprint =
+			source.sha256 || source.md5 || source.resource_id;
+		if (
+			action?.expectedFingerprint &&
+			sourceFingerprint &&
+			action.expectedFingerprint !== sourceFingerprint
+		) {
+			logger.warn("Guarded remote move source fingerprint changed", {
+				...actionContext,
+				currentFingerprint: shortenDiagnosticValue(
+					sourceFingerprint,
+				),
+			});
+			throw new Error(
+				`Move source changed after commit: ${fromPath}`,
+			);
+		}
+
+		await this.yandexClient.moveResource(remoteFrom, remoteTo, false);
+		const [remainingSource, writtenTarget] = await Promise.all([
+			this.yandexClient.getLogicalResource(remoteFrom),
+			this.yandexClient.getLogicalResource(remoteTo),
+		]);
+		if (remainingSource || !writtenTarget) {
+			throw new Error(
+				`Move result could not be confirmed: ${fromPath} -> ${toPath}`,
+			);
+		}
+		if (action) this.indexManager.completePhysicalAction(action.id);
+		if (actionId && action?.id !== actionId) {
+			this.indexManager.completePhysicalAction(actionId);
+		}
+		logger.info("Guarded remote move confirmed", {
+			...actionContext,
+			targetFingerprint: shortenDiagnosticValue(
+				writtenTarget.sha256 ||
+					writtenTarget.md5 ||
+					writtenTarget.resource_id,
+			),
+		});
+	}
+
+	/**
+	 * Finish logical moves left pending by an interrupted device.
+	 */
+	private async resumePendingMoves(result: SyncResult): Promise<void> {
+		const pendingMoves = Object.values(
+			this.indexManager.getRemoteIndex().moves,
+		).filter((move) => move.pending);
+		if (pendingMoves.length === 0) return;
+
+		let changed = false;
+		for (const move of pendingMoves) {
+			try {
+				if (
+					this.indexManager.getRemoteIndex().files[move.toPath]
+						?.deleted
+				) {
+					this.indexManager.completeMove(move.id);
+					changed = true;
+					continue;
+				}
+				if (move.kind === "file") {
+					const target =
+						this.indexManager.getRemoteIndex().files[
+							move.toPath
+						];
+					if (
+						target &&
+						!target.deleted &&
+						target.lastModifiedBy !== move.lastModifiedBy
+					) {
+						this.indexManager.completeMove(move.id);
+						const action =
+							this.indexManager.getPendingPhysicalAction(
+								"move-remote",
+								move.fromPath,
+							);
+						if (action) {
+							this.indexManager.completePhysicalAction(
+								action.id,
+							);
+						}
+						changed = true;
+						continue;
+					}
+				}
+				if (move.kind === "folder") {
+					const prefix = `${move.fromPath.replace(/\/+$/, "")}/`;
+					const targetPrefix = `${move.toPath.replace(/\/+$/, "")}/`;
+					const hasConcurrentSurvivor = Object.entries(
+						this.indexManager.getRemoteIndex().files,
+					).some(
+						([path, meta]) =>
+							path.startsWith(prefix) && !meta.deleted,
+					);
+					const hasRejectedTarget = Object.entries(
+						this.indexManager.getRemoteIndex().files,
+					).some(
+						([path, meta]) =>
+							path.startsWith(targetPrefix) &&
+							(meta.deleted ||
+								(!meta.deleted &&
+									meta.lastModifiedBy !==
+										move.lastModifiedBy)),
+					);
+					if (hasConcurrentSurvivor || hasRejectedTarget) {
+						this.indexManager.completeMove(move.id);
+						changed = true;
+						continue;
+					}
+				}
+				this.indexManager.enqueuePhysicalAction(
+					"move-remote",
+					move.fromPath,
+					{
+						targetPath: move.toPath,
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision,
+						expectedFingerprint:
+							this.indexManager.getRemoteIndex().files[
+								move.fromPath
+							]?.remoteFingerprint,
+						origin: "move",
+					},
+				);
+				await this.executeGuardedRemoteMove(
+					move.fromPath,
+					move.toPath,
+				);
+				this.indexManager.completeMove(move.id);
+				changed = true;
+			} catch (e) {
+				logger.warn(
+					`Could not resume pending move ${move.fromPath} -> ${move.toPath}:`,
+					{ error: e },
+				);
+			}
+		}
+		if (changed) {
+			await this.saveRemoteIndexOrAbort(result, false);
+		}
+	}
+
+	/**
+	 * Finish canonical-authorized destructive work before scanning physical
+	 * files, so an interrupted delete cannot be mistaken for a new file.
+	 */
+	private async resumePendingPhysicalActions(
+		result: SyncResult,
+	): Promise<void> {
+		const actions = this.indexManager
+			.getPendingPhysicalActions()
+			.filter(
+				(action) =>
+					action.type === "delete-local" ||
+					action.type === "delete-remote",
+			);
+		for (const action of actions) {
+			try {
+				if (action.type === "delete-local") {
+					await this.deleteLocalFile(action.path);
+				} else {
+					await this.deleteRemoteFile(action.path);
+				}
+			} catch (error) {
+				result.errors.push({
+					path: action.path,
+					operation:
+						action.type === "delete-local"
+							? "delete_local"
+							: "delete_remote",
+					message:
+						error instanceof Error
+							? error.message
+							: String(error),
+				});
+			}
+		}
+		if (actions.length > 0 && this.indexSaveCallback) {
+			await this.indexSaveCallback();
+		}
+	}
+
+	/**
+	 * Persist a local baseline for every path whose two live copies were
+	 * confirmed equal and canonicalize an untracked physical match.
+	 */
+	private recordConfirmedBaselines(
+		localFiles: Map<string, FileMetadata>,
+		remoteFiles: Map<string, FileMetadata>,
+		operations: SyncOperation[],
+	): boolean {
+		const operatedPaths = new Set(operations.map((operation) => operation.path));
+		const remoteIndex = this.indexManager.getRemoteIndex();
+		let canonicalChanged = false;
+
+		for (const [path, localMeta] of localFiles) {
+			if (operatedPaths.has(path)) continue;
+			const remoteMeta = remoteFiles.get(path);
+			if (!remoteMeta) continue;
+			const canonical = remoteIndex.files[path];
+			const baseline = createConfirmedBaseline(
+				localMeta,
+				remoteMeta,
+				canonical,
+			);
+			this.indexManager.updateLocalFile(path, baseline);
+			if (!canonical || canonical.deleted) {
+				this.indexManager.updateRemoteFile(path, baseline);
+				canonicalChanged = true;
+			}
+		}
+		return canonicalChanged;
+	}
+
+	private reconcileCompletedPhysicalActions(
+		localFiles: Map<string, FileMetadata>,
+		remoteFiles: Map<string, FileMetadata>,
+	): boolean {
+		let changed = false;
+		for (const action of this.indexManager.getPendingPhysicalActions()) {
+			const completed =
+				(action.type === "delete-local" &&
+					!localFiles.has(action.path)) ||
+				(action.type === "delete-remote" &&
+					!remoteFiles.has(action.path)) ||
+				(action.type === "move-remote" &&
+					action.targetPath !== undefined &&
+					!remoteFiles.has(action.path) &&
+					remoteFiles.has(action.targetPath));
+			if (!completed) continue;
+			this.indexManager.completePhysicalAction(action.id);
+			changed = true;
+		}
+		return changed;
+	}
+
+	/**
+	 * Commit deletion intent before removing any physical resource.
+	 */
+	private async commitDeletionIntents(
+		operations: SyncOperation[],
+		result: SyncResult,
+	): Promise<boolean> {
+		for (const operation of operations) {
+			this.indexManager.markRemoteFileDeleted(
+				operation.path,
+				operation.folderTombstonePath,
+				operation.folderTombstonePath
+					? undefined
+					: this.indexManager.getCausalBaseRevision(),
+			);
+			this.indexManager.markLocalFileDeleted(
+				operation.path,
+				operation.folderTombstonePath,
+			);
+			this.indexManager.enqueuePhysicalAction(
+				operation.action === "delete_local"
+					? "delete-local"
+					: "delete-remote",
+				operation.path,
+				{
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision + 1,
+					expectedFingerprint:
+						operation.remoteMeta?.remoteFingerprint,
+					origin: operation.folderTombstonePath
+						? "folder-delete"
+						: "exact-delete",
+				},
+			);
+			if (operation.action === "delete_local" && operation.remoteMeta) {
+				this.indexManager.enqueuePhysicalAction(
+					"delete-remote",
+					operation.path,
+					{
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision + 1,
+						expectedFingerprint:
+							operation.remoteMeta.remoteFingerprint,
+						origin: operation.folderTombstonePath
+							? "folder-delete"
+							: "exact-delete",
+					},
+				);
+			}
+		}
+		if (this.indexSaveCallback) {
+			await this.indexSaveCallback();
+		}
+		this.indexManager.updateSyncTime();
+		return await this.saveRemoteIndexOrAbort(result);
+	}
+
+	private filterCommittedDeletions(
+		operations: SyncOperation[],
+	): SyncOperation[] {
+		const canonicalFiles = this.indexManager.getRemoteIndex().files;
+		return operations.filter((operation) => {
+			const canonical = canonicalFiles[operation.path];
+			if (!canonical?.deleted) return false;
+			const actionType =
+				operation.action === "delete_local"
+					? "delete-local"
+					: "delete-remote";
+			this.indexManager.enqueuePhysicalAction(actionType, operation.path, {
+				canonicalRevision:
+					this.indexManager.getRemoteIndex().revision,
+				expectedChangedRevision: canonical.changedRevision,
+			});
+			if (operation.action === "delete_local" && operation.remoteMeta) {
+				this.indexManager.enqueuePhysicalAction(
+					"delete-remote",
+					operation.path,
+					{
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision,
+						expectedChangedRevision:
+							canonical.changedRevision,
+					},
+				);
+			}
+			return true;
+		});
+	}
+
+	/**
+	 * Remove a put rejected by a concurrent tombstone only when the live
+	 * server object is still the exact upload that lost the merge.
+	 */
+	private async cleanupRejectedUploads(): Promise<void> {
+		for (const rejected of this.indexManager.consumeRejectedPuts()) {
+			if (rejected.reason === "conflict") {
+				await this.preserveRejectedConcurrentPut(rejected.path);
+				continue;
+			}
+			if (this.vaultAdapter.fileExists(rejected.path)) {
+				const content =
+					await this.vaultAdapter.readFile(rejected.path);
+				const currentSha = await computeSha256(content);
+				const localAction =
+					this.indexManager.enqueuePhysicalAction(
+					"delete-local",
+					rejected.path,
+					{
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision,
+						origin: "rejected-upload",
+						baselineSha256: rejected.baselineSha256,
+					},
+				);
+				if (this.indexSaveCallback) await this.indexSaveCallback();
+				const canonical =
+					await this.indexManager.readCanonicalIndex();
+				if (
+					!isPhysicalDeleteAuthorized(localAction, canonical)
+				) {
+					this.indexManager.completePhysicalAction(
+						localAction.id,
+					);
+					continue;
+				}
+				if (
+					rejected.baselineSha256 === undefined ||
+					currentSha !== rejected.baselineSha256
+				) {
+					const backupPath =
+						await this.vaultAdapter.backupOverwrittenFile(
+							rejected.path,
+							content,
+						);
+					if (!backupPath) {
+						throw new Error(
+							`Could not create a backup before deleting ${rejected.path}`,
+						);
+					}
+				}
+				this.expectWatcherEvent(rejected.path, "delete");
+				await this.vaultAdapter.deleteFile(rejected.path);
+				this.indexManager.completePhysicalAction(localAction.id);
+				this.indexManager.markLocalFileDeleted(rejected.path);
+				if (this.indexSaveCallback) await this.indexSaveCallback();
+			}
+			try {
+				this.indexManager.enqueuePhysicalAction(
+					"delete-remote",
+					rejected.path,
+					{
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision,
+						expectedFingerprint:
+							rejected.remoteFingerprint,
+						origin: "rejected-upload",
+					},
+				);
+				await this.deleteRemoteFile(rejected.path);
+			} catch (e) {
+				logger.warn(
+					`Could not clean up rejected upload ${rejected.path}:`,
+					{ error: e },
+				);
+			}
+		}
+	}
+
+	/**
+	 * Preserve the losing side of a concurrent live put as a conflict copy,
+	 * then restore the canonical winner at the original path.
+	 */
+	private async preserveRejectedConcurrentPut(path: string): Promise<void> {
+		if (!this.vaultAdapter.fileExists(path)) return;
+		const localContent = await this.vaultAdapter.readFile(path);
+		const localSha256 = await computeSha256(localContent);
+		const currentCanonical =
+			await this.indexManager.readCanonicalIndex();
+		const directory = getDirectory(path);
+		const fileName = getFileName(path);
+		const extension = getExtension(path);
+		const baseName = extension
+			? fileName.slice(0, -(extension.length + 1))
+			: fileName;
+		const conflictPrefix = `${
+			directory ? `${directory}/` : ""
+		}${baseName}_conflict_`;
+		const existingConflict = Object.entries(
+			currentCanonical.files,
+		).find(
+			([candidatePath, metadata]) =>
+				candidatePath.startsWith(conflictPrefix) &&
+				!metadata.deleted &&
+				metadata.sha256 === localSha256 &&
+				(extension
+					? candidatePath.endsWith(`.${extension}`)
+					: !getFileName(candidatePath).includes(".")),
+		)?.[0];
+		const conflictPath =
+			existingConflict ??
+			this.conflictResolver.generateConflictName(
+				path,
+				this.settings.deviceId,
+			);
+		this.expectWatcherEvent(conflictPath, "upload");
+		await this.vaultAdapter.writeFile(conflictPath, localContent);
+		if (!existingConflict) {
+			await this.uploadFile(conflictPath, false, true, {
+				content: localContent,
+				sha256: localSha256,
+			});
+			if (!(await this.saveRemoteIndexBestEffort())) {
+				throw new Error(
+					`Could not commit conflict copy for ${path}`,
+				);
+			}
+		}
+
+		const canonical = await this.indexManager.readCanonicalIndex();
+		const winner = canonical.files[path];
+		if (!winner || winner.deleted) return;
+		const remotePath = joinPath(this.settings.remotePath, path);
+		const physical =
+			await this.yandexClient.getLogicalResource(remotePath);
+		const fingerprint =
+			physical?.sha256 || physical?.md5 || physical?.resource_id;
+		if (
+			!physical ||
+			(winner.remoteFingerprint &&
+				fingerprint !== winner.remoteFingerprint)
+		) {
+			throw new Error(
+				`Canonical winner for ${path} is not physically available yet`,
+			);
+		}
+		await this.downloadFile(
+			path,
+			new Date(physical.modified).getTime(),
+		);
 	}
 
 	/**

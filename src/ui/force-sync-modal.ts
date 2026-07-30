@@ -7,6 +7,7 @@ export class ForceSyncModal extends Modal {
 	private direction: ForceSyncDirection;
 	private onBackup: () => Promise<{ success: boolean }>;
 	private onAction: (action: "proceed" | "cancel") => void;
+	private settled = false;
 
 	constructor(
 		app: App,
@@ -47,25 +48,22 @@ export class ForceSyncModal extends Modal {
 					.onClick(async () => {
 						btn.setDisabled(true);
 						btn.setButtonText(t("settings.backup_in_progress"));
-						await this.onBackup();
-						this.close();
-						this.onAction("proceed");
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.force_sync_proceed_button"))
-					.onClick(() => {
-						this.close();
-						this.onAction("proceed");
+						const result = await this.onBackup();
+						if (!result.success) {
+							btn.setDisabled(false);
+							btn.setButtonText(
+								t("modal.force_sync_backup_button"),
+							);
+							return;
+						}
+						this.finish("proceed");
 					})
 			)
 			.addButton((btn) =>
 				btn
 					.setButtonText(t("modal.cancel_button"))
 					.onClick(() => {
-						this.close();
-						this.onAction("cancel");
+						this.finish("cancel");
 					})
 			);
 		setting.settingEl.addClass("force-sync-modal-buttons");
@@ -74,5 +72,16 @@ export class ForceSyncModal extends Modal {
 	onClose(): void {
 		const { contentEl } = this;
 		contentEl.empty();
+		if (!this.settled) {
+			this.settled = true;
+			this.onAction("cancel");
+		}
+	}
+
+	private finish(action: "proceed" | "cancel"): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.onAction(action);
+		this.close();
 	}
 }

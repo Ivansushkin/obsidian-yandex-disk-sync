@@ -22,6 +22,18 @@ export default tseslint.config(
 		},
 	},
 	...obsidianmd.configs.recommended,
+	{
+		files: ["tests/**/*.ts", "test.config.mjs"],
+		languageOptions: {
+			globals: {
+				...globals.node,
+			},
+		},
+		rules: {
+			"import/no-nodejs-modules": "off",
+			"@typescript-eslint/no-floating-promises": "off",
+		},
+	},
 	globalIgnores([
 		"node_modules",
 		"dist",

@@ -7,7 +7,7 @@ import type { YandexDiskSyncSettings, BackupInfo } from "../types";
 import { YandexDiskClient, YandexApiError } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import type { IndexManager } from "../sync/index-manager";
-import { joinPath } from "../utils/path-utils";
+import { joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { t } from "../i18n";
 
@@ -51,15 +51,6 @@ export class BackupManager {
 			const files = this.vaultAdapter.getAllSyncableFiles();
 			logger.info(`Found ${files.length} files to backup`);
 
-			if (files.length === 0) {
-				return {
-					success: false,
-					fileCount: 0,
-					totalSize: 0,
-					error: "No files to backup",
-				};
-			}
-
 			// Create ZIP archive
 			const zip = new JSZip();
 			let totalSize = 0;
@@ -74,7 +65,7 @@ export class BackupManager {
 						`Failed to read file for backup: ${file.path}`,
 						{ error },
 					);
-					// Continue with other files
+					throw error;
 				}
 			}
 
@@ -121,6 +112,78 @@ export class BackupManager {
 				fileCount: 0,
 				totalSize: 0,
 				error: errorMessage,
+			};
+		}
+	}
+
+	/**
+	 * Back up the raw remote snapshot before Force local replaces its epoch.
+	 * Raw ciphertext and service metadata make this independent from a
+	 * potentially ambiguous canonical index.
+	 */
+	async createRemoteSnapshotBackup(): Promise<BackupResult> {
+		try {
+			const resources =
+				await this.yandexClient.getResourcesRecursive(
+					this.settings.remotePath,
+					true,
+				);
+			const files = resources.filter((resource) => {
+				if (resource.type !== "file") return false;
+				const relative = toLocalPath(
+					resource.path,
+					this.settings.remotePath,
+				);
+				return (
+					relative !== ".backup" &&
+					!relative.startsWith(".backup/")
+				);
+			});
+			const zip = new JSZip();
+			let totalSize = 0;
+			for (const file of files) {
+				const relative = toLocalPath(
+					file.path,
+					this.settings.remotePath,
+				);
+				const content = await this.yandexClient.downloadFile(
+					file.path,
+					true,
+				);
+				zip.file(`remote-raw/${relative}`, content);
+				totalSize += content.byteLength;
+			}
+			const zipContent = await zip.generateAsync({
+				type: "arraybuffer",
+				compression: "DEFLATE",
+				compressionOptions: { level: 6 },
+			});
+			const backupName = this.formatBackupName(
+				this.yandexClient.hasEncryptionService(),
+			);
+			await this.yandexClient.uploadFile(
+				joinPath(
+					this.settings.remotePath,
+					".backup",
+					backupName,
+				),
+				zipContent,
+			);
+			return {
+				success: true,
+				backupName,
+				fileCount: files.length,
+				totalSize,
+			};
+		} catch (error) {
+			const message =
+				error instanceof Error ? error.message : String(error);
+			logger.error("Remote snapshot backup failed:", { error });
+			return {
+				success: false,
+				fileCount: 0,
+				totalSize: 0,
+				error: message,
 			};
 		}
 	}

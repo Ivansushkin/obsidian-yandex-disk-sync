@@ -9,6 +9,10 @@ const PROTECTED_PATHS = [
 	'.obsidian-encrypt.json',
 ];
 
+const PROTECTED_PATH_PREFIXES = [".obsidian-sync-index.lock."];
+const PLUGIN_DATA_DIRECTORY = "plugins/yandex-disk-sync";
+const LEGACY_LOG_DIRECTORY = "yandex-disk-sync";
+
 /**
  * Path normalization (remove leading/trailing slashes, replace backslashes)
  */
@@ -100,7 +104,11 @@ export function isProtectedPath(path: string): boolean {
 	const parts = normalized.split("/");
 
 	// Check if any part of the path matches protected paths
-	return parts.some((part) => PROTECTED_PATHS.includes(part));
+	return parts.some(
+		(part) =>
+			PROTECTED_PATHS.includes(part) ||
+			PROTECTED_PATH_PREFIXES.some((prefix) => part.startsWith(prefix)),
+	);
 }
 
 /**
@@ -145,6 +153,19 @@ export function shouldSyncFile(
 		return false;
 	}
 
+	if (configDir) {
+		const pluginDataPath = joinPath(configDir, PLUGIN_DATA_DIRECTORY);
+		const legacyLogPath = joinPath(configDir, LEGACY_LOG_DIRECTORY);
+		if (
+			normalized === pluginDataPath ||
+			normalized.startsWith(`${pluginDataPath}/`) ||
+			normalized === legacyLogPath ||
+			normalized.startsWith(`${legacyLogPath}/`)
+		) {
+			return false;
+		}
+	}
+
 	// Check config directory
 	if (configDir && normalized.startsWith(configDir)) {
 		if (!syncDotObsidian) {
@@ -179,6 +200,8 @@ export function encodePathForUrl(path: string): string {
  * Generate unique device ID
  */
 export function generateDeviceId(): string {
+	const uuid = globalThis.crypto?.randomUUID?.();
+	if (uuid) return `device_${uuid}`;
 	const timestamp = Date.now().toString(36);
 	const random = Math.random().toString(36).substring(2, 10);
 	return `device_${timestamp}_${random}`;

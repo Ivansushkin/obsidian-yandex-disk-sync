@@ -179,6 +179,15 @@ export class YandexDiskClient {
 	}
 
 	/**
+	 * Convert raw Yandex resource metadata to the active logical path.
+	 */
+	async toLogicalResource(
+		resource: YandexResource,
+	): Promise<YandexResource> {
+		return await this.decryptResource(resource);
+	}
+
+	/**
 	 * Get resource information (file or folder)
 	 */
 	async getResource(
@@ -204,6 +213,21 @@ export class YandexDiskClient {
 			}
 			throw e;
 		}
+	}
+
+	/**
+	 * Get a resource addressed by its logical, unencrypted path.
+	 */
+	async getLogicalResource(path: string): Promise<YandexResource | null> {
+		const target = await this.encryptFilePath(path);
+		return await this.getResource(target, 1000, 0, true);
+	}
+
+	/**
+	 * Resolve a logical path to the physical remote path for transition cleanup.
+	 */
+	async getPhysicalPath(path: string): Promise<string> {
+		return await this.encryptFilePath(path);
 	}
 
 	/**
@@ -353,6 +377,21 @@ export class YandexDiskClient {
 	}
 
 	/**
+	 * Check a physical transition-cleanup folder without applying path
+	 * encryption.
+	 */
+	async isRawFolderEmpty(remotePath: string): Promise<boolean> {
+		const resource = await this.getResource(
+			remotePath,
+			1000,
+			0,
+			true,
+		);
+		if (!resource) return true;
+		return (resource._embedded?.items ?? []).length === 0;
+	}
+
+	/**
 	 * Get upload link for file
 	 */
 	async getUploadLink(
@@ -385,7 +424,8 @@ export class YandexDiskClient {
 		remotePath: string,
 		content: ArrayBuffer | string,
 		skipFolderCheck = false,
-		raw = false
+		raw = false,
+		overwrite = true,
 	): Promise<void> {
 		// Ensure parent folder exists (if not skipped) — derive the parent from
 		// the encrypted target path so encrypted folder segments are created.
@@ -394,7 +434,7 @@ export class YandexDiskClient {
 		}
 
 		try {
-			await this.putFile(remotePath, content, raw);
+			await this.putFile(remotePath, content, raw, overwrite);
 			logger.debug(`Uploaded file: ${remotePath}`);
 			return;
 		} catch (e) {
@@ -419,9 +459,30 @@ export class YandexDiskClient {
 				{ error: e }
 			);
 			await this.ensureUploadParent(remotePath, raw);
-			await this.putFile(remotePath, content, raw);
+			await this.putFile(remotePath, content, raw, overwrite);
 			logger.debug(`Uploaded file after folder retry: ${remotePath}`);
 		}
+	}
+
+	/**
+	 * Upload a file only when the target path does not already exist.
+	 *
+	 * The Yandex upload link carries `overwrite=false`, so a competing writer
+	 * receives HTTP 409 instead of replacing the existing resource.
+	 */
+	async uploadFileExclusive(
+		remotePath: string,
+		content: ArrayBuffer | string,
+		skipFolderCheck = false,
+		raw = false,
+	): Promise<void> {
+		await this.uploadFile(
+			remotePath,
+			content,
+			skipFolderCheck,
+			raw,
+			false,
+		);
 	}
 
 	/**
@@ -448,7 +509,8 @@ export class YandexDiskClient {
 	private async putFile(
 		remotePath: string,
 		content: ArrayBuffer | string,
-		raw: boolean
+		raw: boolean,
+		overwrite: boolean,
 	): Promise<void> {
 		const bytes =
 			typeof content === "string"
@@ -460,14 +522,50 @@ export class YandexDiskClient {
 			: await this.encryptContent(bytes.buffer);
 
 		// Get upload link with optionally encrypted path
-		const uploadLink = await this.getUploadLink(remotePath, true, raw);
+		const uploadLink = await this.getUploadLink(
+			remotePath,
+			overwrite,
+			raw,
+		);
 
-		await requestUrl({
-			url: uploadLink.href,
-			method: "PUT",
-			body: bodyContent,
-			throw: true,
-		});
+		let lastError: Error | null = null;
+		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+			try {
+				const response = await requestUrl({
+					url: uploadLink.href,
+					method: "PUT",
+					body: bodyContent,
+					throw: false,
+				});
+				if (response.status >= 200 && response.status < 300) return;
+
+				const errorData = response.json as YandexError;
+				const error = new YandexApiError(
+					errorData?.description ||
+						`Upload HTTP ${response.status}`,
+					response.status,
+					errorData?.error,
+				);
+				if (
+					!this.isTransientStatus(response.status) ||
+					attempt === this.maxRetries
+				) {
+					throw error;
+				}
+				lastError = error;
+			} catch (e) {
+				if (
+					e instanceof YandexApiError &&
+					!this.isTransientStatus(e.status)
+				) {
+					throw e;
+				}
+				lastError = e as Error;
+				if (attempt === this.maxRetries) break;
+			}
+			await this.sleep(this.getRetryDelay(attempt));
+		}
+		throw lastError || new Error("Upload failed");
 	}
 
 	/**
@@ -506,6 +604,46 @@ export class YandexDiskClient {
 	}
 
 	/**
+	 * Download a service file with an explicit content codec while keeping its
+	 * physical path unencrypted.
+	 */
+	async downloadFileWithEncryptionService(
+		remotePath: string,
+		service: EncryptionService | null,
+	): Promise<ArrayBuffer> {
+		const downloadLink = await this.getDownloadLink(remotePath, true);
+		const response = await requestUrl({
+			url: downloadLink.href,
+			method: "GET",
+			throw: true,
+		});
+		return service
+			? await service.decrypt(response.arrayBuffer)
+			: response.arrayBuffer;
+	}
+
+	/**
+	 * Upload a service file with an explicit content codec while keeping its
+	 * physical path unencrypted.
+	 */
+	async uploadFileWithEncryptionService(
+		remotePath: string,
+		content: string,
+		service: EncryptionService | null,
+		overwrite = true,
+	): Promise<void> {
+		const plain = new TextEncoder().encode(content).buffer;
+		const encoded = service ? await service.encrypt(plain) : plain;
+		await this.uploadFile(
+			remotePath,
+			encoded,
+			true,
+			true,
+			overwrite,
+		);
+	}
+
+	/**
 	 * Delete file or folder.
 	 * When `raw` is true, skips path encryption.
 	 */
@@ -517,10 +655,11 @@ export class YandexDiskClient {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
 		try {
-			await this.request(
+			const response = await this.request(
 				"DELETE",
 				`/resources?path=${encodedPath}&permanently=${permanently}`
 			);
+			await this.waitForAsyncOperation(response);
 			logger.debug(`Deleted resource: ${path}`);
 		} catch (e: unknown) {
 			// Ignore error if resource doesn't exist
@@ -549,11 +688,22 @@ export class YandexDiskClient {
 			await this.createFolderRecursive(parentPath);
 		}
 
-		await this.request(
+		const response = await this.request(
 			"POST",
 			`/resources/move?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`
 		);
+		await this.waitForAsyncOperation(response);
 		logger.debug(`Moved resource: ${fromPath} -> ${toPath}`);
+	}
+
+	/**
+	 * Atomically move a resource without replacing an existing target.
+	 */
+	async moveResourceExclusive(
+		fromPath: string,
+		toPath: string,
+	): Promise<void> {
+		await this.moveResource(fromPath, toPath, false);
 	}
 
 	/**
@@ -569,10 +719,11 @@ export class YandexDiskClient {
 		const encodedFrom = encodePathForUrl(encryptedFrom);
 		const encodedTo = encodePathForUrl(encryptedTo);
 
-		await this.request(
+		const response = await this.request(
 			"POST",
 			`/resources/copy?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`
 		);
+		await this.waitForAsyncOperation(response);
 		logger.debug(`Copied resource: ${fromPath} -> ${toPath}`);
 	}
 
@@ -621,7 +772,9 @@ export class YandexDiskClient {
 				const errorData = response.json as YandexError;
 
 				// Errors that can be retried
-				if (response.status === 429 || response.status === 503) {
+				if (
+					this.isTransientStatus(response.status)
+				) {
 					lastError = new YandexApiError(
 						errorData?.description ||
 						"Rate limit or service unavailable",
@@ -636,7 +789,7 @@ export class YandexDiskClient {
 					});
 
 					if (attempt < this.maxRetries) {
-						const delay = this.retryDelay * Math.pow(2, attempt);
+						const delay = this.getRetryDelay(attempt);
 						logger.warn(
 							`Retrying API request in ${delay}ms`
 						);
@@ -669,7 +822,7 @@ export class YandexDiskClient {
 				});
 
 				if (attempt < this.maxRetries) {
-					const delay = this.retryDelay * Math.pow(2, attempt);
+					const delay = this.getRetryDelay(attempt);
 					logger.warn(
 						`Network error, retry in ${delay}ms:`
 					);
@@ -683,6 +836,80 @@ export class YandexDiskClient {
 
 	private sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	private getRetryDelay(attempt: number): number {
+		return (
+			this.retryDelay * Math.pow(2, attempt) +
+			Math.floor(Math.random() * this.retryDelay)
+		);
+	}
+
+	private isTransientStatus(status: number): boolean {
+		return status === 423 || status === 429 || status === 503;
+	}
+
+	/**
+	 * Wait for a server-side operation returned as HTTP 202.
+	 */
+	private async waitForAsyncOperation(
+		response: RequestUrlResponse,
+	): Promise<void> {
+		if (response.status !== 202) return;
+		const href = (response.json as { href?: unknown } | null)?.href;
+		if (typeof href !== "string" || !href) return;
+		const operationUrl = href.startsWith("http")
+			? href
+			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
+
+		for (let attempt = 0; attempt < 120; attempt++) {
+			const operationResponse = await requestUrl({
+				url: operationUrl,
+				method: "GET",
+				headers: {
+					Authorization: `OAuth ${this.token}`,
+				},
+				throw: false,
+			});
+			if (
+				operationResponse.status < 200 ||
+				operationResponse.status >= 300
+			) {
+				if (
+					(operationResponse.status === 409 ||
+						this.isTransientStatus(
+							operationResponse.status,
+						)) &&
+					attempt < 119
+				) {
+					await this.sleep(this.getRetryDelay(attempt % 4));
+					continue;
+				}
+				throw new YandexApiError(
+					`Operation status HTTP ${operationResponse.status}`,
+					operationResponse.status,
+				);
+			}
+			const rawStatus = (
+				operationResponse.json as { status?: unknown } | null
+			)?.status;
+			const status =
+				typeof rawStatus === "string"
+					? rawStatus.toLowerCase()
+					: "";
+			if (status === "success") return;
+			if (status === "failed") {
+				throw new YandexApiError(
+					"Yandex Disk asynchronous operation failed",
+					409,
+				);
+			}
+			await this.sleep(500);
+		}
+		throw new YandexApiError(
+			"Yandex Disk asynchronous operation timed out",
+			408,
+		);
 	}
 
 	private isNotFoundError(e: unknown): boolean {

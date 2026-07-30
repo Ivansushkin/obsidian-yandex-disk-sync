@@ -2,17 +2,14 @@
  * Synchronization conflict resolution
  */
 
-import type { FileMetadata, SyncOperation } from "../types";
+import type {
+	FileMetadata,
+	FolderTombstone,
+	SyncOperation,
+} from "../types";
 import { getFileName, getDirectory, getExtension } from "../utils/path-utils";
 import { logger } from "../utils/logger";
-
-/**
- * Tolerance applied when comparing the server-side mtime of a remote resource
- * against the server-side mtime stored in the remote index. Both values come
- * from the Yandex Disk API clock, so this only needs to absorb minor jitter
- * (re-reads, caching, sub-second rounding) — not inter-device clock skew.
- */
-const CONFLICT_REMOTE_MTIME_TOLERANCE = 5000;
+import { findFolderTombstone } from "./index-rules";
 
 export interface ConflictInfo {
 	path: string;
@@ -32,6 +29,7 @@ export class ConflictResolver {
 		localIndexMeta: FileMetadata | null,
 		remoteIndexMeta: FileMetadata | null,
 		syncStartTime?: number,
+		pendingLocalDelete = false,
 	): SyncOperation {
 		// Case 1: File only local (not on disk and not in remote index)
 		if (localMeta && !remoteMeta && !remoteIndexMeta) {
@@ -53,8 +51,61 @@ export class ConflictResolver {
 			};
 		}
 
+		if (remoteIndexMeta?.deleted) {
+			if (localMeta && pendingLocalDelete) {
+				return {
+					action: "delete_local",
+					path,
+					reason: "Resuming a committed local physical deletion",
+					localMeta,
+					remoteMeta: remoteMeta || undefined,
+				};
+			}
+			if (localMeta && (!localIndexMeta || localIndexMeta.deleted)) {
+				return {
+					action: "upload",
+					path,
+					reason:
+						"New file restores a previously deleted path",
+					localMeta,
+					remoteMeta: remoteMeta || undefined,
+				};
+			}
+			if (localMeta) {
+				return {
+					action: "delete_local",
+					path,
+					reason: "Exact-file remote deletion wins",
+					localMeta,
+					remoteMeta: remoteMeta || undefined,
+				};
+			}
+			if (remoteMeta) {
+				return {
+					action: "delete_remote",
+					path,
+					reason:
+						"Removing a physical file rejected by its tombstone",
+					remoteMeta,
+				};
+			}
+		}
+
 		// Case 3: File deleted locally (was in local index, exists on disk)
 		if (!localMeta && remoteMeta && localIndexMeta?.deleted) {
+			if (
+				localIndexMeta.deletedByFolder &&
+				remoteIndexMeta &&
+				!remoteIndexMeta.deleted
+			) {
+				return {
+					action: "download",
+					path,
+					reason:
+						"Concurrent descendant survived folder deletion",
+					remoteMeta,
+				};
+			}
 			return {
 				action: "delete_remote",
 				path,
@@ -75,6 +126,21 @@ export class ConflictResolver {
 
 		// Case 5: File was deleted locally, but not on disk (already synchronized)
 		if (!localMeta && !remoteMeta) {
+			if (localIndexMeta?.deleted && !remoteIndexMeta?.deleted) {
+				return {
+					action: "none",
+					path,
+					reason:
+						"Stale local deletion has no pending causal mutation",
+				};
+			}
+			if (remoteIndexMeta?.deleted && !localIndexMeta?.deleted) {
+				return {
+					action: "delete_local",
+					path,
+					reason: "Applying a committed remote deletion",
+				};
+			}
 			return {
 				action: "none",
 				path,
@@ -84,44 +150,6 @@ export class ConflictResolver {
 
 		// Case 6: Both files exist - compare them
 		if (localMeta && remoteMeta) {
-			// When encryption is active, Yandex Disk returns the sha256 of the
-			// *encrypted* content, which never matches the local plaintext
-			// sha256. The remote index, however, stores the plaintext sha256
-			// from the last sync. If the local sha256 still matches the remote
-			// index, the local file has not changed since the last sync.
-			if (
-				remoteIndexMeta &&
-				localMeta.sha256 === remoteIndexMeta.sha256
-			) {
-				// Local unchanged. But the remote may have been modified
-				// externally (Yandex web UI, another client that did not update
-				// the index, etc.). Detect that by comparing the *server* mtime
-				// we stored in the remote index against the server mtime we now
-				// observe. If we don't have a stored remote mtime (older plugin
-				// wrote this entry, or it was never (re)synced by this version),
-				// there is no reliable way to tell — keep the legacy behavior of
-				// treating the file as unchanged.
-				const indexRemoteMtime = remoteIndexMeta.remoteMtime;
-				const currentRemoteMtime = remoteMeta.remoteMtime;
-				const remotelyChanged =
-					typeof indexRemoteMtime === "number" &&
-					Number.isFinite(indexRemoteMtime) &&
-					typeof currentRemoteMtime === "number" &&
-					Number.isFinite(currentRemoteMtime) &&
-					currentRemoteMtime - indexRemoteMtime >
-						CONFLICT_REMOTE_MTIME_TOLERANCE;
-				if (!remotelyChanged) {
-					return {
-						action: "none",
-						path,
-						reason: "Files match index (encryption)",
-						localMeta,
-						remoteMeta,
-					};
-				}
-				// Fall through: remote changed externally, let compareFiles
-				// decide the direction.
-			}
 			return this.compareFiles(
 				path,
 				localMeta,
@@ -134,38 +162,32 @@ export class ConflictResolver {
 
 		// Case 7: File exists only locally, but was in remote index (deleted on disk)
 		if (localMeta && !remoteMeta && remoteIndexMeta) {
-			// Check if local file was modified after deletion on disk
-			if (localMeta.mtime > (remoteIndexMeta.deletedAt || 0)) {
+			if (
+				!remoteIndexMeta.deleted &&
+				localMeta.sha256 === remoteIndexMeta.sha256
+			) {
 				return {
 					action: "upload",
 					path,
-					reason: "Local file modified after deletion on disk",
+					reason:
+						"Repairing a physical file missing from canonical state",
 					localMeta,
 				};
 			}
 			return {
 				action: "delete_local",
 				path,
-				reason: "File deleted on disk",
+				reason: "Exact-file remote deletion wins",
 				localMeta,
 			};
 		}
 
 		// Case 8: File exists only on disk, but was in local index (deleted locally)
 		if (!localMeta && remoteMeta && localIndexMeta) {
-			// Check if remote file was modified after local deletion
-			if (remoteMeta.mtime > (localIndexMeta.deletedAt || 0)) {
-				return {
-					action: "download",
-					path,
-					reason: "Remote file modified after local deletion",
-					remoteMeta,
-				};
-			}
 			return {
 				action: "delete_remote",
 				path,
-				reason: "File deleted locally",
+				reason: "Exact-file local deletion wins",
 				remoteMeta,
 			};
 		}
@@ -184,10 +206,9 @@ export class ConflictResolver {
 	 * ({@link FileMetadata.remoteMtime}), a two-sided comparison is used that
 	 * detects local changes via content hash (both plaintext, works under
 	 * encryption) and remote changes via server mtime (both from the Yandex
-	 * clock, immune to device clock skew). When the stored remote mtime is
-	 * unavailable (entries written by an older plugin version or never
-	 * re-synced by this version), the legacy mixed-clock comparison is used
-	 * to avoid regressing existing behavior.
+	 * clock, immune to device clock skew). When a server-mtime baseline is
+	 * unavailable, server fingerprints are used if possible; otherwise the
+	 * result is conservative and never compares client clocks.
 	 */
 	private compareFiles(
 		path: string,
@@ -197,9 +218,7 @@ export class ConflictResolver {
 		remoteIndexMeta: FileMetadata | null,
 		_syncStartTime?: number,
 	): SyncOperation {
-		// Hashes match - files are identical (covers the unencrypted case where
-		// Yandex's sha256 is the plaintext sha256, and any case where content
-		// hashes are directly comparable).
+		// Direct hash equality is available in plaintext mode.
 		if (localMeta.sha256 === remoteMeta.sha256) {
 			return {
 				action: "none",
@@ -210,162 +229,108 @@ export class ConflictResolver {
 			};
 		}
 
-		const indexRemoteMtime = remoteIndexMeta?.remoteMtime;
-		const currentRemoteMtime = remoteMeta.remoteMtime;
-		const remoteMtimeKnown =
-			!!remoteIndexMeta &&
-			typeof indexRemoteMtime === "number" &&
-			Number.isFinite(indexRemoteMtime) &&
-			typeof currentRemoteMtime === "number" &&
-			Number.isFinite(currentRemoteMtime);
-
-		if (remoteMtimeKnown) {
-			// Local change detection — content based. Both hashes are of the
-			// plaintext (local filesystem + index), so this is reliable under
-			// encryption too. When there is no local index entry, treat the
-			// local file as changed (conservative: we don't know its last
-			// synced state, so we must not silently drop it).
-			const localChanged =
-				!localIndexMeta || localMeta.sha256 !== localIndexMeta.sha256;
-
-			// Remote change detection — server mtime based. Both timestamps
-			// come from Yandex Disk, so this is immune to client clock skew and
-			// to the local/server mtime semantic mismatch that plagued the
-			// legacy comparison.
-			const remotelyChanged =
-				currentRemoteMtime - indexRemoteMtime >
-				CONFLICT_REMOTE_MTIME_TOLERANCE;
-
-			if (localChanged && remotelyChanged) {
-				logger.warn(`Conflict for file: ${path}`);
+		if (!localIndexMeta) {
+			if (
+				remoteIndexMeta &&
+				localMeta.sha256 === remoteIndexMeta.sha256 &&
+				!this.hasPhysicalRemoteDrift(remoteMeta, remoteIndexMeta)
+			) {
 				return {
-					action: "conflict",
+					action: "none",
 					path,
-					reason: "Both local and remote changed since last sync (server mtime)",
+					reason: "First sync found identical plaintext content",
 					localMeta,
 					remoteMeta,
 				};
 			}
-			if (localChanged) {
-				return {
-					action: "upload",
-					path,
-					reason: "Local file changed since last sync",
-					localMeta,
-					remoteMeta,
-				};
-			}
-			if (remotelyChanged) {
-				return {
-					action: "download",
-					path,
-					reason: "Remote file changed since last sync",
-					localMeta,
-					remoteMeta,
-				};
-			}
+			logger.warn(`First-sync conflict for file: ${path}`);
 			return {
-				action: "none",
+				action: "conflict",
 				path,
-				reason: "Neither side changed since last sync",
+				reason:
+					"Different local and remote files share a path without a baseline",
 				localMeta,
 				remoteMeta,
 			};
 		}
 
-		// Legacy fallback: no reliable server-side mtime baseline. Preserve the
-		// previous mixed-clock behavior so we don't regress on indexes written
-		// by older plugin versions.
-		return this.compareFilesLegacy(path, localMeta, remoteMeta);
-	}
+		const localChanged =
+			localMeta.sha256 !== localIndexMeta.sha256;
+		const canonicalChanged =
+			!remoteIndexMeta ||
+			remoteIndexMeta.deleted !== localIndexMeta.deleted ||
+			remoteIndexMeta.changedRevision !==
+				localIndexMeta.changedRevision ||
+			remoteIndexMeta.sha256 !== localIndexMeta.sha256;
+		const remotelyChanged =
+			canonicalChanged ||
+			this.hasPhysicalRemoteDrift(remoteMeta, remoteIndexMeta);
 
-	/**
-	 * Legacy mixed-clock comparison used when the remote index entry does not
-	 * carry a server-side mtime. Retained verbatim for behavioral parity with
-	 * plugin versions that did not populate {@link FileMetadata.remoteMtime}.
-	 */
-	private compareFilesLegacy(
-		path: string,
-		localMeta: FileMetadata,
-		remoteMeta: FileMetadata,
-	): SyncOperation {
-		const timeDiff = localMeta.mtime - remoteMeta.mtime;
-		const currentTime = Date.now();
-
-		const TIME_TOLERANCE = 1000;
-		const EXTENDED_TIME_TOLERANCE = 5000;
-		const FRESH_FILE_THRESHOLD = 5000;
-
-		if (Math.abs(timeDiff) > EXTENDED_TIME_TOLERANCE) {
-			if (timeDiff > 0) {
-				return {
-					action: "upload",
-					path,
-					reason: "Local file is significantly newer",
-					localMeta,
-					remoteMeta,
-				};
-			}
-			return {
-				action: "download",
-				path,
-				reason: "Remote file is significantly newer",
-				localMeta,
-				remoteMeta,
-			};
-		}
-
-		const localFileAge = currentTime - localMeta.mtime;
-		const remoteFileAge = currentTime - remoteMeta.mtime;
-		const isLocalFresh = localFileAge < FRESH_FILE_THRESHOLD;
-		const isRemoteFresh = remoteFileAge < FRESH_FILE_THRESHOLD;
-
-		if (isLocalFresh || isRemoteFresh) {
-			if (timeDiff > 0) {
-				return {
-					action: "upload",
-					path,
-					reason: "Fresh local file is newer",
-					localMeta,
-					remoteMeta,
-				};
-			}
-			return {
-				action: "download",
-				path,
-				reason: "Fresh remote file is newer",
-				localMeta,
-				remoteMeta,
-			};
-		}
-
-		if (Math.abs(timeDiff) <= TIME_TOLERANCE) {
+		if (localChanged && remotelyChanged) {
 			logger.warn(`Conflict for file: ${path}`);
 			return {
 				action: "conflict",
 				path,
-				reason: "Very similar modification times but different content",
+				reason:
+					"Both local and canonical/remote changed since the device baseline",
 				localMeta,
 				remoteMeta,
 			};
 		}
-
-		if (timeDiff > 0) {
+		if (localChanged) {
 			return {
 				action: "upload",
 				path,
-				reason: "Local file is slightly newer",
+				reason: "Only local content changed since the device baseline",
+				localMeta,
+				remoteMeta,
+			};
+		}
+		if (remotelyChanged) {
+			return {
+				action: "download",
+				path,
+				reason:
+					"Only canonical/remote content changed since the device baseline",
 				localMeta,
 				remoteMeta,
 			};
 		}
 		return {
-			action: "download",
+			action: "none",
 			path,
-			reason: "Remote file is slightly newer",
+			reason: "Neither side changed since the device baseline",
 			localMeta,
 			remoteMeta,
 		};
+	}
+
+	/**
+	 * Detect physical remote changes without comparing client and server clocks.
+	 */
+	private hasPhysicalRemoteDrift(
+		remoteMeta: FileMetadata,
+		remoteIndexMeta: FileMetadata | null,
+	): boolean {
+		if (!remoteIndexMeta) return true;
+		if (
+			remoteIndexMeta.remoteFingerprint !== undefined &&
+			remoteMeta.remoteFingerprint !== undefined
+		) {
+			return (
+				remoteIndexMeta.remoteFingerprint !==
+				remoteMeta.remoteFingerprint
+			);
+		}
+		if (
+			typeof remoteIndexMeta.remoteMtime === "number" &&
+			Number.isFinite(remoteIndexMeta.remoteMtime) &&
+			typeof remoteMeta.remoteMtime === "number" &&
+			Number.isFinite(remoteMeta.remoteMtime)
+		) {
+			return remoteIndexMeta.remoteMtime !== remoteMeta.remoteMtime;
+		}
+		return remoteMeta.sha256 !== remoteIndexMeta.sha256;
 	}
 
 	/**
@@ -426,6 +391,8 @@ export class ConflictResolver {
 		localIndex: Record<string, FileMetadata>,
 		remoteIndex: Record<string, FileMetadata>,
 		syncStartTime?: number,
+		folderTombstones: Record<string, FolderTombstone> = {},
+		pendingLocalDeletes: ReadonlySet<string> = new Set(),
 	): SyncOperation[] {
 		const allPaths = this.collectAllPaths(
 			localFiles,
@@ -441,15 +408,94 @@ export class ConflictResolver {
 			const remoteMeta = remoteFiles.get(path) || null;
 			const localIndexMeta = localIndex[path] || null;
 			const remoteIndexMeta = remoteIndex[path] || null;
+			const folderTombstone = findFolderTombstone(
+				path,
+				folderTombstones,
+			);
+			const tombstoneApplies =
+				folderTombstone !== null &&
+				(remoteIndexMeta?.changedRevision ?? 0) <
+					folderTombstone.changedRevision;
+
+			if (tombstoneApplies) {
+				const localChanged =
+					localMeta !== null &&
+					(localIndexMeta === null ||
+						localMeta.sha256 !== localIndexMeta.sha256);
+				const remoteChanged =
+					remoteMeta !== null &&
+					(remoteIndexMeta === null ||
+						(remoteMeta.remoteFingerprint !== undefined &&
+							remoteIndexMeta.remoteFingerprint !== undefined &&
+							remoteMeta.remoteFingerprint !==
+								remoteIndexMeta.remoteFingerprint) ||
+						(typeof remoteMeta.remoteMtime === "number" &&
+							typeof remoteIndexMeta.remoteMtime === "number" &&
+							remoteMeta.remoteMtime !==
+								remoteIndexMeta.remoteMtime));
+				if (localChanged && remoteChanged) {
+					operations.push({
+						action: "conflict",
+						path,
+						reason:
+							"Both descendants changed during folder deletion",
+						localMeta,
+						remoteMeta,
+					});
+					continue;
+				}
+				if (localChanged) {
+					operations.push({
+						action: "upload",
+						path,
+						reason:
+							"New or modified file survives concurrent folder deletion",
+						localMeta,
+						remoteMeta: remoteMeta || undefined,
+					});
+					continue;
+				}
+				if (remoteChanged) {
+					operations.push({
+						action: "download",
+						path,
+						reason:
+							"New or modified remote file survives concurrent folder deletion",
+						remoteMeta,
+					});
+					continue;
+				}
+				if (localMeta) {
+					operations.push({
+						action: "delete_local",
+						path,
+						reason: "Parent folder was deleted",
+						localMeta,
+						folderTombstonePath: folderTombstone?.path,
+					});
+					continue;
+				}
+				if (remoteMeta) {
+					operations.push({
+						action: "delete_remote",
+						path,
+						reason: "Parent folder was deleted",
+						remoteMeta,
+						folderTombstonePath: folderTombstone?.path,
+					});
+					continue;
+				}
+			}
 
 			const operation = this.resolveAction(
 				path,
 				localMeta,
 				remoteMeta,
 				localIndexMeta,
-				remoteIndexMeta,
-				syncStartTime,
-			);
+					remoteIndexMeta,
+					syncStartTime,
+					pendingLocalDeletes.has(path),
+				);
 
 			if (operation.action !== "none") {
 				operations.push(operation);

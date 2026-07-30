@@ -95,6 +95,41 @@ export interface EncryptionManifestCipherParams {
 	ivLength: number;
 }
 
+export type EncryptionTransitionPhase =
+	| "prepared"
+	| "files-copied"
+	| "index-committed"
+	| "stable"
+	| "cleanup";
+
+export interface EncryptionTransitionDescriptor {
+	/** Stable transition identifier */
+	id: string;
+	/** Current durable transition phase */
+	phase: EncryptionTransitionPhase;
+	/** Source encryption revision, or null for plaintext */
+	sourceRevision: number | null;
+	/** Target encryption revision, or null for plaintext */
+	targetRevision: number | null;
+	/** Device responsible for recovery */
+	initiatedBy: string;
+	/** Source encryption mode used before the canonical commit */
+	source?: EncryptionModeDescriptor;
+	/** Target encryption mode used after the canonical commit */
+	target?: EncryptionModeDescriptor;
+}
+
+export interface EncryptionModeDescriptor {
+	/** Whether user files and canonical index content are encrypted */
+	enabled: boolean;
+	/** Key revision, or null for plaintext */
+	revision: number | null;
+	/** Base64-encoded PBKDF2 salt, or null for plaintext */
+	salt: string | null;
+	/** Password verifier, or null for plaintext */
+	verifier: string | null;
+}
+
 export interface EncryptionManifest {
 	/** Manifest format version */
 	version: 2;
@@ -114,6 +149,8 @@ export interface EncryptionManifest {
 	updatedAt: number;
 	/** Device ID that wrote the manifest */
 	updatedBy: string;
+	/** Recovery metadata present only while encryption is transitioning */
+	transition?: EncryptionTransitionDescriptor;
 }
 
 export interface LegacyEncryptionManifest {
@@ -146,12 +183,76 @@ export type RemoteEncryptionManifest =
 export interface SyncIndex {
 	/** Index format version */
 	version: number;
+	/** Causal history generation replaced only by an explicit Force sync */
+	epoch: string;
+	/** Monotonic revision of the authoritative remote index */
+	revision: number;
 	/** Last synchronization time (timestamp) */
 	lastSyncTime: number;
 	/** Device ID that created the index */
 	deviceId: string;
 	/** File map: path -> metadata */
 	files: Record<string, FileMetadata>;
+	/** Folder deletion markers keyed by normalized folder path */
+	folderTombstones: Record<string, FolderTombstone>;
+	/** Pending logical moves keyed by mutation ID */
+	moves: Record<string, IndexMove>;
+	/** Highest contiguous mutation sequence accepted for each device */
+	appliedMutationSeq: Record<string, number>;
+	/** Distributed encryption maintenance owned through the index transaction */
+	maintenance?: IndexMaintenance;
+}
+
+export interface IndexMaintenanceCleanupAction {
+	/** Raw physical path that belongs to the obsolete encryption mode */
+	path: string;
+	/** Immutable server fingerprint captured before the transition commit */
+	expectedFingerprint: string;
+}
+
+export interface IndexMaintenance {
+	/** Globally unique transition identifier */
+	id: string;
+	/** Maintenance operation kind */
+	kind: "enable" | "disable" | "rotate";
+	/** Durable phase used for crash recovery */
+	phase: EncryptionTransitionPhase;
+	/** Installation that acquired the distributed transition ownership */
+	initiatedBy: string;
+	/** Canonical revision observed before maintenance started */
+	sourceRevision: number;
+	/** Canonical revision that switched authority to the target mode */
+	targetRevision: number | null;
+	/** Source encryption mode */
+	source: EncryptionModeDescriptor;
+	/** Target encryption mode */
+	target: EncryptionModeDescriptor;
+	/** Guarded cleanup work that any target-capable device may resume */
+	cleanup: IndexMaintenanceCleanupAction[];
+}
+
+/**
+ * Device-local causal baseline. It is deliberately not shaped as a canonical
+ * index: reading remote state must not advance what this installation has
+ * fully observed and applied.
+ */
+export interface LocalSyncState {
+	/** Local state format version */
+	version: 1;
+	/** Installation identifier that owns pending FIFO sequences */
+	deviceId: string;
+	/** Canonical epoch last fully applied on this installation */
+	observedEpoch: string | null;
+	/** Canonical revision last fully applied on this installation */
+	observedRevision: number;
+	/** Last successful local reconciliation time */
+	lastSyncTime: number;
+	/** Per-path plaintext baselines and canonical causal metadata */
+	files: Record<string, FileMetadata>;
+	/** Folder tombstones last observed by this installation */
+	folderTombstones: Record<string, FolderTombstone>;
+	/** Next sequence reserved for a new local mutation */
+	nextMutationSeq: number;
 }
 
 export interface FileMetadata {
@@ -176,22 +277,164 @@ export interface FileMetadata {
 	 * comparison logic in that case.
 	 */
 	remoteMtime?: number;
+	/** Server content fingerprint used for guarded cleanup */
+	remoteFingerprint?: string;
 	/** Soft delete flag */
 	deleted?: boolean;
 	/** Deletion time (timestamp) */
 	deletedAt?: number;
+	/** Folder tombstone that caused this derived file deletion */
+	deletedByFolder?: string;
 	/** Device ID that last modified the file */
 	lastModifiedBy?: string;
+	/** Remote index revision that last changed this entry */
+	changedRevision?: number;
+	/** Revision visible to the device when this change was created */
+	baseRevision?: number;
 }
 
-export const CURRENT_INDEX_VERSION = 2;
+export interface FolderTombstone {
+	/** Normalized folder path */
+	path: string;
+	/** Deletion timestamp for diagnostics only */
+	deletedAt: number;
+	/** Revision that accepted the deletion */
+	changedRevision: number;
+	/** Revision visible to the deleting device */
+	baseRevision: number;
+	/** Device that created the deletion */
+	lastModifiedBy: string;
+}
 
-export function createEmptyIndex(deviceId: string): SyncIndex {
+export interface IndexMove {
+	/** Stable mutation identifier */
+	id: string;
+	/** Source path */
+	fromPath: string;
+	/** Destination path */
+	toPath: string;
+	/** Whether the moved resource is a file or folder */
+	kind: "file" | "folder";
+	/** Revision visible when the move was created */
+	baseRevision: number;
+	/** Revision that accepted the move */
+	changedRevision: number;
+	/** Whether the physical move is still pending */
+	pending: boolean;
+	/** Device that created the move */
+	lastModifiedBy: string;
+}
+
+export type PendingMutationType =
+	| "put"
+	| "delete-file"
+	| "delete-folder"
+	| "move";
+
+export interface PendingMutation {
+	/** Globally unique, stable mutation identifier */
+	id: string;
+	/** Monotonic sequence scoped to the originating device */
+	seq: number;
+	/** Canonical epoch in which this mutation was created */
+	epoch: string | null;
+	/** Mutation kind */
+	type: PendingMutationType;
+	/** Revision visible when the local event occurred, or null on first sync */
+	baseRevision: number | null;
+	/** Source or affected path */
+	path: string;
+	/** Destination path for move mutations */
+	targetPath?: string;
+	/** Resource kind for move mutations */
+	resourceKind?: "file" | "folder";
+	/** Plaintext content hash for put mutations */
+	sha256?: string;
+	/** Last confirmed local hash before the put changed the in-memory entry */
+	baselineSha256?: string;
+	/** Creation timestamp for diagnostics and FIFO ordering */
+	createdAt: number;
+}
+
+export type PendingPhysicalActionType =
+	| "delete-local"
+	| "delete-remote"
+	| "move-remote"
+	| "guarded-cleanup";
+
+export type PendingPhysicalActionOrigin =
+	| "exact-delete"
+	| "folder-delete"
+	| "move"
+	| "rejected-upload"
+	| "encryption-cleanup"
+	| "force-reset";
+
+/**
+ * Durable local work that must happen after its canonical intent is committed.
+ */
+export interface PendingPhysicalAction {
+	/** Stable identifier used for idempotent retries */
+	id: string;
+	/** Physical operation kind */
+	type: PendingPhysicalActionType;
+	/** Canonical epoch that authorized this action */
+	epoch: string | null;
+	/** Logical operation that created this physical work */
+	origin: PendingPhysicalActionOrigin;
+	/** Source or affected logical path */
+	path: string;
+	/** Destination logical path for move operations */
+	targetPath?: string;
+	/** Canonical revision that authorized this action */
+	canonicalRevision: number;
+	/** Server fingerprint required by guarded cleanup */
+	expectedFingerprint?: string;
+	/** Canonical file revision that authorized a destructive action */
+	expectedChangedRevision?: number;
+	/** Target fingerprint used to verify a completed move */
+	expectedTargetFingerprint?: string;
+	/** Plaintext baseline used to decide whether local backup is required */
+	baselineSha256?: string;
+	/** Creation timestamp used to retain FIFO ordering */
+	createdAt: number;
+}
+
+export const CURRENT_INDEX_VERSION = 3;
+
+export function createSyncEpoch(): string {
+	const uuid = globalThis.crypto?.randomUUID?.();
+	if (uuid) return uuid;
+	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function createEmptyIndex(
+	deviceId: string,
+	epoch = createSyncEpoch(),
+): SyncIndex {
 	return {
 		version: CURRENT_INDEX_VERSION,
+		epoch,
+		revision: 0,
 		lastSyncTime: 0,
 		deviceId,
 		files: {},
+		folderTombstones: {},
+		moves: {},
+		appliedMutationSeq: {},
+	};
+}
+
+export function createEmptyLocalState(deviceId: string): LocalSyncState {
+	return {
+		version: 1,
+		deviceId,
+		observedEpoch: null,
+		observedRevision: 0,
+		lastSyncTime: 0,
+		files: {},
+		folderTombstones: {},
+		nextMutationSeq: 1,
 	};
 }
 
@@ -251,6 +494,8 @@ export interface SyncOperation {
 	localMeta?: FileMetadata;
 	/** Remote metadata (if available) */
 	remoteMeta?: FileMetadata;
+	/** Folder tombstone responsible for a derived deletion */
+	folderTombstonePath?: string;
 }
 
 export interface SyncResult {

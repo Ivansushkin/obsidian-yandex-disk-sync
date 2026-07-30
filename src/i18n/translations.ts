@@ -55,6 +55,12 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		// Notices
 		"notice.sync_started": "Synchronization started...",
+		"notice.legacy_index_blocked":
+			"Plugin 2.0.0-beta.1 detected an index from version 1.1. Update every device, create a backup, then run Force sync from local or remote.",
+		"notice.epoch_mismatch_blocked":
+			"The remote vault was reset by Force sync. Create a backup, then run Force sync from remote on this device.",
+		"notice.ambiguous_index_blocked":
+			"Several index locks were found. Normal sync is blocked; create a backup and use Force sync to choose the authoritative side.",
 		"notice.sync_completed":
 			"Synchronization completed! ({successful} operations)",
 		"notice.sync_error": "Synchronization completed with errors: {errors}",
@@ -296,9 +302,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_warning":
 			"WARNING: This operation is destructive and cannot be undone. Changes made after the sync on the overwritten side may be lost.",
 		"modal.force_sync_recommend_backup":
-			"It is strongly recommended to create a backup before proceeding.",
+			"A successful backup is required before Force sync can start.",
 		"modal.force_sync_backup_button": "Create backup and proceed",
-		"modal.force_sync_proceed_button": "Proceed without backup",
 		"notice.force_sync_from_local_started":
 			"Forcing sync from local to remote...",
 		"notice.force_sync_from_remote_started":
@@ -369,6 +374,12 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		// Notices
 		"notice.sync_started": "Запуск синхронизации...",
+		"notice.legacy_index_blocked":
+			"Плагин 2.0.0-beta.1 обнаружил индекс версии 1.1. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+		"notice.epoch_mismatch_blocked":
+			"Удалённое хранилище было сброшено через Force sync. Создайте резервную копию и выполните Force sync из удалённого хранилища на этом устройстве.",
+		"notice.ambiguous_index_blocked":
+			"Обнаружено несколько lock-файлов индекса. Обычная синхронизация заблокирована; создайте бекап и выберите авторитетную сторону через Force sync.",
 		"notice.sync_completed":
 			"Синхронизация завершена! ({successful} операций)",
 		"notice.sync_error": "Синхронизация завершена с ошибками: {errors}",
@@ -612,9 +623,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_warning":
 			"ВНИМАНИЕ: Операция является деструктивной и не может быть отменена. Изменения, сделанные после синхронизации на перезаписываемой стороне, могут быть потеряны.",
 		"modal.force_sync_recommend_backup":
-			"Настоятельно рекомендуется создать бекап перед выполнением.",
+			"Перед запуском Force sync необходимо успешно создать бекап.",
 		"modal.force_sync_backup_button": "Создать бекап и продолжить",
-		"modal.force_sync_proceed_button": "Продолжить без бекапа",
 		"notice.force_sync_from_local_started":
 			"Принудительная синхронизация из локального в удалённое...",
 		"notice.force_sync_from_remote_started":

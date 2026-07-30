@@ -10,8 +10,9 @@ import type { App } from "obsidian";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LOG_PREFIX = "[YandexSync]";
-const DEFAULT_LOG_RELATIVE_PATH = "yandex-disk-sync/debug.log";
-const DEFAULT_MAX_LOG_SIZE = 1024 * 1024; // 1 MB
+export const DEFAULT_LOG_RELATIVE_PATH =
+	"plugins/yandex-disk-sync/debug.log";
+export const DEFAULT_MAX_LOG_SIZE = 5 * 1024 * 1024;
 const FLUSH_DELAY_MS = 100;
 
 const LEVEL_PRIORITY: Record<LogLevel, number> = {
@@ -27,6 +28,10 @@ const SENSITIVE_KEYS = [
 	"password",
 	"yandextokensecret",
 	"encryptionpassword",
+	"encryptionkey",
+	"keymaterial",
+	"key",
+	"secret",
 	"accesstoken",
 	"refreshtoken",
 ];
@@ -38,6 +43,8 @@ export interface LoggerConfig {
 	fileEnabled?: boolean;
 	logFilePath?: string;
 	maxFileSize?: number;
+	baseContext?: Record<string, unknown>;
+	contextProvider?: () => Record<string, unknown> | undefined;
 }
 
 /**
@@ -58,11 +65,38 @@ function maskString(value: string): string {
 }
 
 /**
+ * Shorten a non-secret diagnostic identifier while keeping it recognizable
+ * across related log entries.
+ */
+export function shortenDiagnosticValue(
+	value: string | null | undefined,
+): string | null {
+	if (!value) return null;
+	if (value.length <= 16) return value;
+	return `${value.slice(0, 8)}...${value.slice(-4)}`;
+}
+
+/**
  * Heuristic check for values that look like secret tokens.
  */
 function looksLikeToken(value: string): boolean {
 	// Long base64-ish or random token strings
 	return value.length > 30 && /^[A-Za-z0-9_.\-/+=]+$/.test(value);
+}
+
+/**
+ * Redact common inline credential forms that may appear inside error messages
+ * or stack traces where there is no enclosing object key to inspect.
+ */
+function sanitizeString(value: string): string {
+	const assignment =
+		/(["']?(?:token|authorization|password|secret|access[_-]?token|refresh[_-]?token|encryption[_-]?key)["']?\s*[:=]\s*["']?)(?:Bearer\s+|OAuth\s+)?([^"'\s,;&}]+)/gi;
+	return value
+		.replace(assignment, "$1***")
+		.replace(
+			/\b(Bearer|OAuth)\s+[A-Za-z0-9_.\-/+=]{12,}/gi,
+			"$1 ***",
+		);
 }
 
 /**
@@ -77,7 +111,7 @@ function sanitizeContext(context: unknown): unknown {
 		if (looksLikeToken(context)) {
 			return maskString(context);
 		}
-		return context;
+		return sanitizeString(context);
 	}
 
 	if (typeof context === "number" || typeof context === "boolean") {
@@ -95,10 +129,10 @@ function sanitizeContext(context: unknown): unknown {
 		if (context instanceof Error) {
 			const result: Record<string, unknown> = {
 				name: context.name,
-				message: context.message,
+				message: sanitizeString(context.message),
 			};
 			if (context.stack) {
-				result.stack = context.stack;
+				result.stack = sanitizeString(context.stack);
 			}
 			const code = (context as { code?: unknown }).code;
 			if (code !== undefined) {
@@ -133,16 +167,21 @@ function sanitizeContext(context: unknown): unknown {
 /**
  * Plugin logger with console and optional file output.
  */
-class Logger {
+export class Logger {
 	private app: App | null = null;
 	private minLevel: LogLevel = "info";
 	private consoleEnabled = true;
 	private fileEnabled = false;
 	private logFilePath = DEFAULT_LOG_RELATIVE_PATH;
 	private maxFileSize = DEFAULT_MAX_LOG_SIZE;
+	private baseContext: Record<string, unknown> = {};
+	private contextProvider:
+		| (() => Record<string, unknown> | undefined)
+		| null = null;
 
 	private buffer: string[] = [];
-	private flushTimeout: number | null = null;
+	private flushTimeout: ReturnType<typeof setTimeout> | null = null;
+	private flushChain: Promise<void> = Promise.resolve();
 
 	/**
 	 * Resolve the final log file path inside the vault's config directory.
@@ -177,6 +216,12 @@ class Logger {
 		if (config.maxFileSize !== undefined) {
 			this.maxFileSize = config.maxFileSize;
 		}
+		if (config.baseContext !== undefined) {
+			this.baseContext = { ...config.baseContext };
+		}
+		if (config.contextProvider !== undefined) {
+			this.contextProvider = config.contextProvider;
+		}
 	}
 
 	setMinLevel(level: LogLevel): void {
@@ -204,8 +249,22 @@ class Logger {
 	): string {
 		const timestamp = formatTimestamp(new Date());
 		let entry = `${timestamp} [${level.toUpperCase()}] ${LOG_PREFIX} ${message}`;
-		if (context && Object.keys(context).length > 0) {
-			const sanitized = sanitizeContext(context);
+		let dynamicContext: Record<string, unknown> = {};
+		try {
+			dynamicContext = this.contextProvider?.() ?? {};
+		} catch (error) {
+			dynamicContext = {
+				contextProviderError:
+					error instanceof Error ? error.message : String(error),
+			};
+		}
+		const mergedContext = {
+			...this.baseContext,
+			...dynamicContext,
+			...context,
+		};
+		if (Object.keys(mergedContext).length > 0) {
+			const sanitized = sanitizeContext(mergedContext);
 			const json = JSON.stringify(sanitized, null, 2);
 			entry += "\n  " + json.replace(/\n/g, "\n  ");
 		}
@@ -254,7 +313,7 @@ class Logger {
 		if (this.flushTimeout !== null) {
 			return;
 		}
-		this.flushTimeout = window.setTimeout(() => {
+		this.flushTimeout = globalThis.setTimeout(() => {
 			void this.flush();
 		}, FLUSH_DELAY_MS);
 	}
@@ -262,29 +321,56 @@ class Logger {
 	/**
 	 * Flush buffered entries to the log file.
 	 */
-	private async flush(): Promise<void> {
-		this.flushTimeout = null;
-		if (this.buffer.length === 0 || !this.app) {
-			return;
+	async flush(): Promise<void> {
+		if (this.flushTimeout !== null) {
+			globalThis.clearTimeout(this.flushTimeout);
+			this.flushTimeout = null;
 		}
+		this.flushChain = this.flushChain.then(
+			async () => await this.flushBufferedEntries(),
+			async () => await this.flushBufferedEntries(),
+		);
+		await this.flushChain;
+	}
 
-		const entries = this.buffer.splice(0, this.buffer.length);
-		const content = entries.join("\n") + "\n";
+	/**
+	 * Serialize file writes so overlapping timers cannot overwrite newer
+	 * diagnostic entries with an older read-modify-write snapshot.
+	 */
+	private async flushBufferedEntries(): Promise<void> {
+		if (!this.app) return;
 		const adapter = this.app.vault.adapter;
 		const logPath = this.getResolvedLogPath();
 
-		try {
-			const exists = await adapter.exists(logPath);
-			if (exists) {
+		while (this.buffer.length > 0) {
+			const entries = this.buffer.splice(0, this.buffer.length);
+			const content = entries.join("\n") + "\n";
+			try {
+				const exists = await adapter.exists(logPath);
+				if (!exists) {
+					await this.ensureDirectory(logPath);
+					await adapter.write(logPath, this.trimLog(content));
+					continue;
+				}
+				const stat = await adapter.stat(logPath);
+				const contentSize = new TextEncoder().encode(content).byteLength;
+				if (
+					stat &&
+					stat.size + contentSize <= this.maxFileSize
+				) {
+					await adapter.append(logPath, content);
+					continue;
+				}
 				const existing = await adapter.read(logPath);
-				const trimmed = this.trimLog(existing);
-				await adapter.write(logPath, trimmed + content);
-			} else {
-				await this.ensureDirectory(logPath);
-				await adapter.write(logPath, content);
+				await adapter.write(
+					logPath,
+					this.trimLog(existing + content),
+				);
+			} catch (e) {
+				this.buffer.unshift(...entries);
+				console.error(`${LOG_PREFIX} Failed to write log file:`, e);
+				return;
 			}
-		} catch (e) {
-			console.error(`${LOG_PREFIX} Failed to write log file:`, e);
 		}
 	}
 
@@ -311,11 +397,13 @@ class Logger {
 	 * Trim the log file to the configured maximum size, keeping the most recent entries.
 	 */
 	private trimLog(content: string): string {
-		if (content.length <= this.maxFileSize) {
+		const encoded = new TextEncoder().encode(content);
+		if (encoded.byteLength <= this.maxFileSize) {
 			return content;
 		}
-		// Try to trim at a line boundary.
-		const slice = content.slice(-this.maxFileSize);
+		const slice = new TextDecoder().decode(
+			encoded.slice(encoded.byteLength - this.maxFileSize),
+		);
 		const lineBreak = slice.indexOf("\n");
 		if (lineBreak === -1) {
 			return slice;
@@ -350,22 +438,26 @@ class Logger {
 	async clearLogs(): Promise<void> {
 		this.buffer = [];
 		if (this.flushTimeout !== null) {
-			window.clearTimeout(this.flushTimeout);
+			globalThis.clearTimeout(this.flushTimeout);
 			this.flushTimeout = null;
 		}
 		if (!this.app) {
 			return;
 		}
-		const adapter = this.app.vault.adapter;
-		const logPath = this.getResolvedLogPath();
-		try {
-			const exists = await adapter.exists(logPath);
-			if (exists) {
-				await adapter.write(logPath, "");
+		this.flushChain = this.flushChain.then(async () => {
+			if (!this.app) return;
+			const adapter = this.app.vault.adapter;
+			const logPath = this.getResolvedLogPath();
+			try {
+				const exists = await adapter.exists(logPath);
+				if (exists) {
+					await adapter.write(logPath, "");
+				}
+			} catch (e) {
+				console.error(`${LOG_PREFIX} Failed to clear log file:`, e);
 			}
-		} catch (e) {
-			console.error(`${LOG_PREFIX} Failed to clear log file:`, e);
-		}
+		});
+		await this.flushChain;
 	}
 
 	debug(message: string, context?: Record<string, unknown>): void {

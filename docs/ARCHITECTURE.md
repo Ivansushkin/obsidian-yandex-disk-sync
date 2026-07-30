@@ -4,6 +4,9 @@
 
 Плагин реализует двустороннюю синхронизацию файлов между локальным vault Obsidian и облачным хранилищем Яндекс Диск. Архитектура построена на модульном подходе с чётким разделением ответственности.
 
+Нормативные пользовательские сценарии и критерии приёмки описаны в
+[`SYNC_USER_SCENARIOS.md`](SYNC_USER_SCENARIOS.md).
+
 ## Структура проекта
 
 ```
@@ -19,6 +22,10 @@ src/
 ├── sync/
 │   ├── sync-engine.ts      # Основной движок синхронизации
 │   ├── index-manager.ts    # Управление индексами файлов
+│   ├── sync-coordinator.ts # Единая последовательная очередь сессий
+│   ├── local-operation-store.ts # Durable FIFO mutations/actions
+│   ├── index-transaction-rules.ts # Lock, pagination, stable comparison
+│   ├── index-rules.ts      # Причинный reducer
 │   ├── conflict-resolver.ts # Разрешение конфликтов
 │   ├── file-watcher.ts     # Отслеживание изменений файлов
 │   └── sync-scheduler.ts   # Планировщик периодической синхронизации
@@ -27,7 +34,8 @@ src/
 │   └── backup-manager.ts   # Управление резервным копированием
 │
 ├── crypto/
-│   └── encryption.ts       # E2E encryption service (Web Crypto API)
+│   ├── encryption.ts       # E2E encryption service (Web Crypto API)
+│   └── encryption-transition.ts # Решения crash recovery
 │
 ├── ui/
 │   ├── status-bar.ts       # Индикатор статуса в статус-баре
@@ -58,9 +66,7 @@ src/
 HTTP клиент для взаимодействия с Yandex Disk REST API.
 
 - `getResource(path)` — получить метаданные файла/папки
-- `getResource(path)` — получить метаданные файла/папки
 - `getResourcesRecursive(path)` — рекурсивный список всех файлов
-- `listFolder(path)` — список файлов в папке
 - `uploadFile(path, content)` — загрузить файл
 - `downloadFile(path)` — скачать файл
 - `deleteResource(path)` — удалить файл/папку
@@ -69,7 +75,8 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 **Особенности реализации:**
 
 - Двухшаговая загрузка файлов (получение upload URL → PUT контента)
-- Автоматический retry с exponential backoff для 429/503 ошибок
+- Автоматический retry с exponential backoff и jitter для 423/429/503;
+  конфликт 409 обрабатывается причинно в lock/upload/move workflows
 - Пагинация для больших директорий
 - Обработка rate limiting
 
@@ -101,10 +108,24 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 
 ```typescript
 interface SyncIndex {
-	version: number; // Версия формата индекса
+	version: 3;
+	epoch: string; // Generation, replaced only by explicit Force sync
+	revision: number; // Общая причинная ревизия
 	lastSyncTime: number; // Время последней синхронизации
 	deviceId: string; // ID устройства
 	files: Record<string, FileMetadata>;
+	folderTombstones: Record<string, FolderTombstone>;
+	moves: Record<string, IndexMove>;
+	appliedMutationSeq: Record<string, number>;
+	maintenance?: IndexMaintenance;
+}
+
+interface LocalSyncState {
+	version: 1;
+	observedEpoch: string | null;
+	observedRevision: number;
+	files: Record<string, FileMetadata>; // Last applied baseline
+	nextMutationSeq: number;
 }
 
 interface FileMetadata {
@@ -115,13 +136,35 @@ interface FileMetadata {
 	syncedAt: number; // Время последней синхронизации
 	deleted?: boolean; // Флаг удаления
 	deletedAt?: number; // Время удаления
+	changedRevision?: number;
+	baseRevision?: number;
 }
 ```
 
-**Два индекса:**
+**Хранение и транзакция:**
 
-1. **Локальный индекс** — хранится в data.json плагина
-2. **Удалённый индекс** — файл `.sync-index.json` на Яндекс Диске
+`LocalSyncState`, FIFO-очередь мутаций, durable watcher events и очередь
+незавершённых физических действий хранятся атомарно в `data.json`. Чтение
+canonical index не продвигает `observedRevision`: она меняется только после
+полного успешного reconciliation. Мутации нумеруются
+монотонным `seq` для каждого устройства, а индекс хранит только непрерывный
+high-watermark `appliedMutationSeq`.
+Авторитетное состояние находится в одном файле
+`.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
+перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,
+обновляется и перемещается обратно с `overwrite=false`. Неизменившийся за две
+минуты единственный lock восстанавливается другим устройством. Несколько lock
+или lock с той же ревизией, но другим содержимым, блокируют обычную
+синхронизацию до явного Force sync. Список lock читается с полной пагинацией;
+транзакция требует два последовательных одинаковых снимка root listing.
+
+`SyncCoordinator` последовательно выполняет full, Force, realtime batch и
+encryption maintenance. Повторные full-запросы объединяются в один запуск.
+Watcher-события, уже находившиеся в debounce-очереди, переносятся в durable
+буфер и воспроизводятся после полного освобождения сессии.
+
+Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
+обновить все устройства до 2.0.0-beta.1 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 
@@ -130,35 +173,44 @@ interface FileMetadata {
 **Алгоритм полной синхронизации:**
 
 ```
-1. Построить локальный индекс (сканирование vault)
-2. Загрузить удалённый индекс с Яндекс Диска
+1. Загрузить canonical index и возобновить durable physical actions
+2. Построить локальный снимок vault
 3. Получить список файлов с Яндекс Диска
 4. Сравнить индексы и определить операции
-5. Выполнить операции (upload/download/delete)
-6. Сохранить обновлённые индексы
+5. Для удалений сначала зафиксировать tombstone в удалённом индексе
+6. Выполнить upload/download; перед delete повторно проверить canonical и
+   server fingerprint
+7. Подтвердить непрерывный mutation `seq` и удалить его из локальной очереди
+8. Завершить сохранённые `PendingPhysicalAction` после фактического действия
 ```
 
 **Логика определения операций:**
 
-| Локально        | На диске        | Действие      |
-| --------------- | --------------- | ------------- |
-| Новый файл      | Нет             | Upload        |
-| Нет             | Новый файл      | Download      |
-| Изменён (новее) | Есть            | Upload        |
-| Есть            | Изменён (новее) | Download      |
-| Удалён          | Есть            | Delete remote |
-| Есть            | Удалён          | Delete local  |
+| Локально               | На диске                 | Действие      |
+| ---------------------- | ------------------------ | ------------- |
+| Новый файл             | Нет                      | Upload        |
+| Нет                    | Новый файл               | Download      |
+| Изменён от baseline    | Не изменён от baseline   | Upload        |
+| Не изменён от baseline | Изменён canonical/remote | Download      |
+| Изменены обе стороны   | Изменены обе стороны     | Conflict copy |
+| Удалён                 | Есть                     | Delete remote |
+| Есть                   | Удалён                   | Delete local  |
 
 ### ConflictResolver (sync/conflict-resolver.ts)
 
 Разрешение конфликтов синхронизации.
 
-**Стратегии:**
+**Правила:**
 
-- `newerWins` — более новый файл по mtime побеждает
-- `localWins` — локальная версия имеет приоритет
-- `remoteWins` — удалённая версия имеет приоритет
-- `keepBoth` — создать копию с суффиксом `.conflict`
+- локальное изменение определяется по SHA-256;
+- удалённое изменение определяется сначала по server fingerprint, затем по
+  любому изменению server mtime относительно baseline;
+- точечное удаление побеждает конкурентное изменение, изменённая локальная
+  копия сохраняется в backup;
+- новый или изменённый потомок переживает конкурентное удаление папки;
+- неизменённый потомок удаляется;
+- локальный файл без baseline на первой синхронизации считается новым; при
+  разных файлах с одинаковым путём создаётся conflict copy.
 
 ### FileWatcher (sync/file-watcher.ts)
 
@@ -170,6 +222,10 @@ interface FileMetadata {
 - `vault.on('modify')` — изменение файла → upload (с debounce)
 - `vault.on('delete')` — удаление файла → delete remote
 - `vault.on('rename')` — переименование → move remote
+- события удаления/rename папок объединяются в одну префиксную мутацию
+- пользовательские события во время полной синхронизации буферизуются, а
+  события, созданные самим движком, подавляются по зарегистрированному пути
+- deferred watcher events сохраняются в `data.json` до воспроизведения
 
 **Debouncing:**
 
@@ -340,12 +396,17 @@ interface StorageClient {
 
 ### Отладка
 
-Включите логирование в консоли разработчика:
+Включите **Настройки → Yandex Disk Sync → Логирование → Включить
+отладочное логирование**. Журнал записывается в
+`.obsidian/plugins/yandex-disk-sync/debug.log`, ограничивается 5 МБ и никогда
+не включается в пользовательскую синхронизацию, даже если включена
+синхронизация папки настроек.
 
-```javascript
-// В logger.ts уровень debug
-logger.setLevel("debug");
-```
+Каждая сессия получает `sessionId`; canonical-транзакция дополнительно
+получает `indexTransactionId`. На durable-границах журнал содержит epoch,
+observed/canonical revision, mutation/action ID, ожидаемые fingerprint и фазы
+перехода шифрования. Токены, пароли и ключи очищаются централизованно перед
+выводом.
 
 ## Параллелизация операций
 
@@ -519,8 +580,7 @@ Force Sync — функция принудительной синхрониза�
 
 - Пояснение операции в зависимости от направления
 - Предупреждение о деструктивности операции
-- Кнопка создания бекапа перед выполнением
-- Кнопка продолжения без бекапа
+- Единственная кнопка продолжения сначала создаёт обязательный бекап
 - Кнопка отмены
 
 ### Force Sync From Local
@@ -533,10 +593,9 @@ Force Sync — функция принудительной синхрониза�
 1. Построить локальный индекс (сканирование vault)
 2. Получить список файлов с Яндекс.Диска
 3. Все локальные файлы → upload (принудительно)
-4. Все удалённые файлы, которых нет локально → delete_remote
-   (пропускается при SyncRunOptions.skipRemoteDeletes=true — используется
-   при смене состояния шифрования, где cleanup выполняется отдельно)
-5. Удалённый индекс = копия локального индекса
+4. Создать новый `epoch` и canonical snapshot только из локального vault
+5. Удалить remote-only объекты guarded-действиями по fingerprint
+6. Очистить старые locks только после подтверждённого replacement commit
 ```
 
 ### Force Sync From Remote
@@ -547,17 +606,20 @@ Force Sync — функция принудительной синхрониза�
 
 ```
 1. Построить локальный индекс (для определения удаляемых файлов)
-2. Загрузить удалённый индекс
-3. Получить список файлов с Яндекс.Диска
+2. Получить фактический список файлов с Яндекс.Диска, не используя
+   legacy/ambiguous index как источник истины
 4. Все удалённые файлы → download (принудительно)
 5. Все локальные файлы, которых нет на диске → delete_local
-6. Локальный индекс = копия удалённого индекса
+6. Создать новый `epoch`, canonical и local baseline из применённого remote
+   snapshot
 ```
 
 ### Особенности реализации
 
 - **Не использует ConflictResolver** — операции генерируются вручную без сравнения
 - **Не использует сравнение mtime/sha256** — безусловная перезапись
+- **Всегда требует backup** — Force local сохраняет raw remote snapshot,
+  Force remote сохраняет локальный vault
 - **FileWatcher приостанавливается** через существующие `syncPauseCallbacks`
 - **Прогресс отображается** через штатную систему `updateState()`
 - **Параллелизация** через `executeOperationsParallel()`
