@@ -86,6 +86,31 @@ class FakeIndexYandex {
 			: await this.encryption.decrypt(copy);
 	}
 
+	async downloadStableRawFile(path: string): Promise<{
+		raw: ArrayBuffer;
+		resource: YandexResource;
+		fingerprint: string;
+	} | null> {
+		const resource = await this.getResource(path);
+		if (!resource) return null;
+		const raw = await this.downloadFile(path, true);
+		return {
+			raw,
+			resource,
+			fingerprint: this.getContentFingerprint(resource)!,
+		};
+	}
+
+	getContentFingerprint(resource: YandexResource | null): string | null {
+		if (!resource) return null;
+		if (resource.sha256) return `sha256:${resource.sha256}`;
+		if (resource.md5) return `md5:${resource.md5}`;
+		if (resource.modified) {
+			return `modified:${resource.modified}:size:${resource.size ?? -1}`;
+		}
+		return null;
+	}
+
 	async uploadFile(
 		path: string,
 		content: ArrayBuffer | string,
@@ -295,6 +320,67 @@ test("plaintext legacy Force commits and verifies canonical v3", async () => {
 test("encrypted legacy Force commits and verifies canonical v3", async () => {
 	await runLegacyForceCommit(
 		new XorEncryptionService(0xa5) as unknown as EncryptionService,
+	);
+});
+
+test("encryption manifest validation token detects unchanged and changed content", async () => {
+	const client = new FakeIndexYandex("vault", null);
+	const manifestPath = "vault/.obsidian-encrypt.json";
+	const manifest = {
+		version: 2,
+		state: "enabled",
+		revision: 1,
+		salt: "c2FsdA==",
+		verifier: "dmVyaWZpZXI=",
+		updatedAt: 1,
+		updatedBy: "device-a",
+	};
+	client.files.set(
+		manifestPath,
+		new TextEncoder().encode(JSON.stringify(manifest)).buffer,
+	);
+	const manager = new IndexManager(
+		client as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("device-a"),
+	);
+	const read = await manager.downloadEncryptionManifestForGuard();
+	assert.equal(
+		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
+		true,
+	);
+	client.files.set(
+		manifestPath,
+		new TextEncoder().encode(
+			JSON.stringify({ ...manifest, revision: 2 }),
+		).buffer,
+	);
+	assert.equal(
+		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
+		false,
+	);
+});
+
+test("absent manifest token detects a newly created manifest", async () => {
+	const client = new FakeIndexYandex("vault", null);
+	const manager = new IndexManager(
+		client as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("device-a"),
+	);
+	const read = await manager.downloadEncryptionManifestForGuard();
+	assert.equal(read.validationToken, "absent");
+	assert.equal(
+		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
+		true,
+	);
+	client.files.set(
+		"vault/.obsidian-encrypt.json",
+		new TextEncoder().encode("{}").buffer,
+	);
+	assert.equal(
+		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
+		false,
 	);
 });
 

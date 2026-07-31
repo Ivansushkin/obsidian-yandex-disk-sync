@@ -226,3 +226,43 @@ for (const encrypted of [false, true]) {
 		assert.deepEqual(index.store.getMutations(), []);
 	});
 }
+
+test("strict no-op validates encryption only once", async () => {
+	const { engine } = createHarness(true);
+	const calls: Array<string | undefined> = [];
+	let pausedBeforeGuard = false;
+	engine.onSyncPause(() => {
+		pausedBeforeGuard = true;
+	});
+	engine.setSyncGuardCallback((validationToken) => {
+		assert.equal(pausedBeforeGuard, true);
+		calls.push(validationToken);
+		return {
+			blockReason: null,
+			validationToken: validationToken ?? "manifest-v1",
+		};
+	});
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, true);
+	assert.deepEqual(calls, [undefined]);
+});
+
+test("dirty full validates the manifest token before commit", async () => {
+	const { engine, index } = createHarness(true);
+	index.enqueuePut("missing.md", "obsolete-local-sha");
+	const calls: Array<string | undefined> = [];
+	engine.setSyncGuardCallback((validationToken) => {
+		calls.push(validationToken);
+		return {
+			blockReason: null,
+			validationToken: validationToken ?? "manifest-v1",
+		};
+	});
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, true);
+	assert.deepEqual(calls, [undefined, "manifest-v1"]);
+});

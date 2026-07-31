@@ -13,11 +13,16 @@ import type {
 	YandexDiskSyncSettings,
 } from "../types";
 import { INITIAL_SYNC_STATE } from "../types";
-import { YandexDiskClient } from "../api/yandex-client";
+import { YandexApiError, YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import {
 	IndexManager,
+	AmbiguousRemoteIndexLockError,
+	IndexEpochMismatchError,
+	LegacyIndexVersionError,
+	RemoteMaintenanceActiveError,
 	RemoteIndexTransactionError,
+	UnreadableRemoteIndexError,
 } from "./index-manager";
 import { ConflictResolver } from "./conflict-resolver";
 import {
@@ -55,9 +60,17 @@ import {
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
-export type SyncGuardCallback = () => string | null | Promise<string | null>;
+interface SyncGuardResult {
+	blockReason: string | null;
+	validationToken?: string;
+}
+export type SyncGuardCallback = (
+	validationToken?: string,
+) => SyncGuardResult | Promise<SyncGuardResult>;
 
 export interface SyncRunOptions {
+	/** Use the startup discovery path inside the regular full-sync session. */
+	startup?: boolean;
 	/** Skip encryption state guard for internal encryption maintenance flows. */
 	skipEncryptionGuard?: boolean;
 	/** Allow a sync nested inside the active encryption maintenance flow. */
@@ -97,6 +110,7 @@ export class SyncEngine {
 	private isPaused = false;
 	private coordinator = new SyncCoordinator();
 	private expectedWatcherEvents = new Map<string, number>();
+	private realtimeGuardValidationToken: string | undefined;
 
 	private syncPauseCallbacks: Array<
 		(context: SyncLifecycleContext) => void | Promise<void>
@@ -356,14 +370,16 @@ export class SyncEngine {
 		const run = async () =>
 			await this.runSyncSession(
 			options,
-			async (result, startTime) => {
+			async (result, startTime, validationToken) => {
 				this.yandexClient.clearFolderCache();
 				// 1. Ensure remote folder exists
 				this.updateState({
 					currentOperation: t("status.op.checking_remote_folder"),
 				});
-				const remoteExists = await this.indexManager.remotePathExists();
-				if (!remoteExists) {
+				if (
+					!options?.startup &&
+					!(await this.indexManager.remotePathExists())
+				) {
 					await this.indexManager.createRemotePath();
 				}
 
@@ -371,7 +387,14 @@ export class SyncEngine {
 				this.updateState({
 					currentOperation: t("status.op.loading_remote_index"),
 				});
-				await this.indexManager.loadRemoteIndex();
+				await this.indexManager.loadRemoteIndex(
+					false,
+					options?.startup,
+				);
+				const hadPendingCausalWork =
+					this.indexManager.getPendingMutations().length > 0 ||
+					this.indexManager.getPendingPhysicalActions().length > 0 ||
+					Object.keys(this.indexManager.getRemoteIndex().moves).length > 0;
 				if (this.indexManager.replayPendingMutations()) {
 					if (this.indexSaveCallback) {
 						await this.indexSaveCallback();
@@ -612,21 +635,6 @@ export class SyncEngine {
 					currentOperation: t("status.op.saving_indexes"),
 				});
 
-				// A long sync may have taken minutes, during which another device could
-				// have flipped the remote encryption state (enable/rotate/disable). If
-				// so, abort before committing the index so we don't record a sync
-				// against a now-stale encryption context. File transfers that already
-				// landed are harmless and will be reconciled on the next sync.
-				const staleReason = await this.getSyncBlockReason(false);
-				if (staleReason) {
-					result.errors.push({
-						path: "",
-						operation: "none",
-						message: `Sync aborted before saving: ${staleReason}`,
-					});
-					return;
-				}
-
 				// Tombstones are intentionally retained; Force sync is the only
 				// operation that compacts causal deletion history.
 				const hadOperations =
@@ -649,6 +657,29 @@ export class SyncEngine {
 					tombstonesRemoved ||
 					baselinesChanged ||
 					mutationSettlement.pendingWatermarks > 0;
+				const strictNoOp = !indexDirty && !hadPendingCausalWork;
+				if (!strictNoOp) {
+					const guard = await this.getSyncGuardResult(
+						options?.skipEncryptionGuard,
+						validationToken,
+					);
+					if (guard.blockReason) {
+						result.errors.push({
+							path: "",
+							operation: "none",
+							code: "encryption-state-changed",
+							message: `Sync aborted before saving: ${guard.blockReason}`,
+						});
+						return;
+					}
+					logger.debug("Encryption guard validation completed", {
+						validation: "unchanged",
+					});
+				} else {
+					logger.debug("Encryption guard validation skipped", {
+						validation: "strict-noop",
+					});
+				}
 				if (!indexDirty) {
 					logger.debug(
 						"[SyncEngine] No changes detected, skipping remote index save",
@@ -1826,12 +1857,14 @@ export class SyncEngine {
 	): Promise<RealtimeBatchResult> {
 		return await this.coordinator.run("realtime", async () => {
 			const batchResult = createRealtimeBatchResult();
-			const blockReason = await this.getSyncBlockReason(false);
+			const { blockReason, validationToken } =
+				await this.getSyncGuardResult(false);
 			if (blockReason || this.isPaused) {
 				if (blockReason) this.setBlockedState(blockReason);
 				batchResult.retry.push(...events.map((event) => event.id));
 				return batchResult;
 			}
+			this.realtimeGuardValidationToken = validationToken;
 
 			const prepared: Array<{
 				id: string;
@@ -2049,6 +2082,8 @@ export class SyncEngine {
 				});
 			}
 			return batchResult;
+		}).finally(() => {
+			this.realtimeGuardValidationToken = undefined;
 		});
 	}
 
@@ -2096,7 +2131,9 @@ export class SyncEngine {
 	): Promise<void> {
 		return await this.enqueueRealtime(() =>
 			this.renameFileNow(oldPath, newPath, context),
-		);
+		).finally(() => {
+			this.realtimeGuardValidationToken = undefined;
+		});
 	}
 
 	private async renameFileNow(
@@ -2104,7 +2141,8 @@ export class SyncEngine {
 		newPath: string,
 		context = this.getWatcherCausalContext(),
 	): Promise<void> {
-		const blockReason = await this.getSyncBlockReason(false);
+		const { blockReason, validationToken } =
+			await this.getSyncGuardResult(false);
 		if (blockReason) {
 			logger.warn(
 				`[SyncEngine] Skipping rename ${oldPath}: ${blockReason}`,
@@ -2112,6 +2150,7 @@ export class SyncEngine {
 			this.setBlockedState(blockReason);
 			throw new Error(blockReason);
 		}
+		this.realtimeGuardValidationToken = validationToken;
 
 		if (!this.vaultAdapter.shouldSync(newPath)) {
 			if (this.vaultAdapter.shouldSync(oldPath)) {
@@ -2886,7 +2925,11 @@ export class SyncEngine {
 	 */
 	private async runSyncSession(
 		options: SyncRunOptions | undefined,
-		body: (result: SyncResult, startTime: number) => Promise<void>,
+		body: (
+			result: SyncResult,
+			startTime: number,
+			validationToken?: string,
+		) => Promise<void>,
 		logMessage: (result: SyncResult) => string,
 	): Promise<SyncResult> {
 		if (
@@ -2902,28 +2945,35 @@ export class SyncEngine {
 			return this.createErrorResult("Synchronization is paused");
 		}
 
-		const blockReason = await this.getSyncBlockReason(
-			options?.skipEncryptionGuard,
-		);
-		if (blockReason) {
-			return this.createBlockedResult(blockReason);
-		}
-
 		const startTime = Date.now();
 		const result = this.createEmptyResult(startTime);
 		const lifecycleContext = this.getSyncLifecycleContext();
+		const apiReadsBefore = this.yandexClient.getApiReadMetrics?.();
 		this.isSyncing = true;
 		await this.notifySyncPauseCallbacks(lifecycleContext);
 		logger.info("Sync reconciliation started", this.getDiagnosticSnapshot());
 
 		try {
-			this.updateState({
-				status: "syncing",
-				currentOperation: t("status.op.preparing"),
-				progress: 0,
-			});
+			const guard = await this.getSyncGuardResult(
+				options?.skipEncryptionGuard,
+			);
+			if (guard.blockReason) {
+				result.errors.push({
+					path: "",
+					operation: "none",
+					code: "encryption-blocked",
+					message: guard.blockReason,
+				});
+				this.setBlockedState(guard.blockReason);
+			} else {
+				this.updateState({
+					status: "syncing",
+					currentOperation: t("status.op.preparing"),
+					progress: 0,
+				});
 
-			await body(result, startTime);
+				await body(result, startTime, guard.validationToken);
+			}
 
 			result.success = result.errors.length === 0;
 			if (result.success) {
@@ -2934,20 +2984,26 @@ export class SyncEngine {
 			}
 			result.endTime = Date.now();
 
-			this.updateState({
-				status: result.success ? "idle" : "error",
-				lastSyncTime: result.endTime,
-				errorMessage: result.success
-					? undefined
-					: `Errors: ${result.errors.length}`,
-				currentOperation: undefined,
-				progress: undefined,
-				pendingCount: 0,
-			});
+			if (!guard.blockReason) {
+				this.updateState({
+					status: result.success ? "idle" : "error",
+					lastSyncTime: result.endTime,
+					errorMessage: result.success
+						? undefined
+						: `Errors: ${result.errors.length}`,
+					currentOperation: undefined,
+					progress: undefined,
+					pendingCount: 0,
+				});
+			}
 
 			const diagnosticResult = {
 				...this.getDiagnosticSnapshot(),
 				durationMs: result.endTime - startTime,
+				apiReads: this.diffApiReadMetrics(
+					apiReadsBefore,
+					this.yandexClient.getApiReadMetrics?.(),
+				),
 				success: result.success,
 				result: {
 					uploaded: result.uploaded,
@@ -2973,6 +3029,7 @@ export class SyncEngine {
 			result.errors.push({
 				path: "",
 				operation: "none",
+				code: this.classifySyncError(error),
 				message: error.message,
 			});
 			result.endTime = Date.now();
@@ -2987,6 +3044,10 @@ export class SyncEngine {
 			logger.error("Critical synchronization error:", {
 				...this.getDiagnosticSnapshot(),
 				durationMs: result.endTime - startTime,
+				apiReads: this.diffApiReadMetrics(
+					apiReadsBefore,
+					this.yandexClient.getApiReadMetrics?.(),
+				),
 				error: e,
 			});
 			return result;
@@ -3024,6 +3085,39 @@ export class SyncEngine {
 					}
 				: null,
 		};
+	}
+
+	private diffApiReadMetrics(
+		before?: ReturnType<YandexDiskClient["getApiReadMetrics"]>,
+		after?: ReturnType<YandexDiskClient["getApiReadMetrics"]>,
+	): ReturnType<YandexDiskClient["getApiReadMetrics"]> | undefined {
+		if (!before || !after) return undefined;
+		return {
+			manifest: after.manifest - before.manifest,
+			index: after.index - before.index,
+			root: after.root - before.root,
+			tree: after.tree - before.tree,
+			other: after.other - before.other,
+		};
+	}
+
+	private classifySyncError(error: Error): string | undefined {
+		if (
+			error instanceof YandexApiError &&
+			(error.status === 401 || error.status === 403)
+		) {
+			return "authentication";
+		}
+		if (error instanceof LegacyIndexVersionError) return "legacy-index";
+		if (error instanceof UnreadableRemoteIndexError) return "unreadable-index";
+		if (error instanceof IndexEpochMismatchError) return "epoch-mismatch";
+		if (error instanceof AmbiguousRemoteIndexLockError) {
+			return "ambiguous-index-lock";
+		}
+		if (error instanceof RemoteMaintenanceActiveError) {
+			return "remote-maintenance";
+		}
+		return undefined;
 	}
 
 	/**
@@ -3079,6 +3173,19 @@ export class SyncEngine {
 	 */
 	private async saveRemoteIndexBestEffort(): Promise<boolean> {
 		try {
+			if (this.realtimeGuardValidationToken !== undefined) {
+				const guard = await this.getSyncGuardResult(
+					false,
+					this.realtimeGuardValidationToken,
+				);
+				if (guard.blockReason) {
+					this.setBlockedState(guard.blockReason);
+					logger.warn(
+						"Realtime canonical commit blocked by changed encryption state",
+					);
+					return false;
+				}
+			}
 			await this.indexManager.saveRemoteIndex();
 			await this.cleanupRejectedUploads();
 			return true;
@@ -4136,24 +4243,20 @@ export class SyncEngine {
 		};
 	}
 
-	private async getSyncBlockReason(
+	private async getSyncGuardResult(
 		skipGuard?: boolean,
-	): Promise<string | null> {
+		validationToken?: string,
+	): Promise<SyncGuardResult> {
 		if (skipGuard) {
-			return null;
+			return { blockReason: null };
 		}
 		if (this.externalBlockReason) {
-			return this.externalBlockReason;
+			return { blockReason: this.externalBlockReason };
 		}
 		if (!this.syncGuardCallback) {
-			return null;
+			return { blockReason: null };
 		}
-		return await this.syncGuardCallback();
-	}
-
-	private createBlockedResult(reason: string): SyncResult {
-		this.setBlockedState(reason);
-		return this.createErrorResult(reason);
+		return await this.syncGuardCallback(validationToken);
 	}
 
 	private setBlockedState(reason: string): void {

@@ -165,8 +165,17 @@ Watcher-события, уже находившиеся в debounce-очеред
 а также delete, rename и folder-события воспроизводятся после полного
 освобождения сессии. Неуспешная full sync не подтверждает события.
 
+Startup является обычной coordinator-сессией `fullSync({ startup: true })`.
+Watcher durable-буфер включается до первого чтения encryption manifest.
+Manifest и canonical читаются единым stable raw-примитивом
+`metadata → download → metadata`; неизменность подтверждается по `sha256`,
+затем `md5`, затем паре `server modified + size`. Canonical и lock находятся
+одним стабильным root listing, после чего physical tree сканируется отдельно
+с ограниченной параллельностью папок. Перед записью manifest проверяется по
+session token; для строгого no-op финальный запрос не выполняется.
+
 Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.6 и явно выполнить Force sync.
+обновить все устройства до 2.0.0-beta.7 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 

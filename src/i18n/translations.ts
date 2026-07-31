@@ -55,7 +55,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Synchronization started...",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.6 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.7 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.epoch_mismatch_blocked":
@@ -242,6 +242,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Encryption password was changed on another device. Enter the new password to continue synchronization.",
 		"notice.encryption_state_check_failed":
 			"Failed to check remote encryption state: {error}",
+		"notice.encryption_state_changed":
+			"Remote encryption state changed during synchronization. The current session was stopped safely.",
 		"notice.encryption_sync_failed":
 			"Encryption sync failed with {errors} errors",
 		"notice.encryption_disable_partial":
@@ -335,7 +337,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Запуск синхронизации...",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.6 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.7 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.epoch_mismatch_blocked":
@@ -523,6 +525,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Пароль шифрования был изменён на другом устройстве. Введите новый пароль, чтобы продолжить синхронизацию.",
 		"notice.encryption_state_check_failed":
 			"Не удалось проверить состояние шифрования на диске: {error}",
+		"notice.encryption_state_changed":
+			"Состояние шифрования на диске изменилось во время синхронизации. Текущая сессия безопасно остановлена.",
 		"notice.encryption_sync_failed":
 			"Синхронизация шифрования завершилась с ошибками: {errors}",
 		"notice.encryption_disable_partial":

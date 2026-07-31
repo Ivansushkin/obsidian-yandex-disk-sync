@@ -52,6 +52,7 @@ export async function collectStablePaginatedItems<T>(
 	getPath: (item: T) => string,
 	getVersion: (item: T) => string,
 	maxSnapshots = 4,
+	getSnapshotVersion?: () => string,
 ): Promise<T[]> {
 	let previousSignature: string | null = null;
 	for (let attempt = 0; attempt < maxSnapshots; attempt++) {
@@ -64,7 +65,10 @@ export async function collectStablePaginatedItems<T>(
 			getPath(left).localeCompare(getPath(right)),
 		);
 		const signature = stableSerialize(
-			items.map((item) => [getPath(item), getVersion(item)]),
+			[
+				getSnapshotVersion?.() ?? "",
+				items.map((item) => [getPath(item), getVersion(item)]),
+			],
 		);
 		if (signature === previousSignature) return items;
 		previousSignature = signature;

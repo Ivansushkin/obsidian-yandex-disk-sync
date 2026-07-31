@@ -15,20 +15,16 @@ import {
 	EncryptionTransitionPhase,
 	EncryptionModeDescriptor,
 	IndexMaintenance,
+	SyncResult,
 } from "./types";
 import { YandexDiskSyncSettingTab } from "./settings";
 import { YandexDiskClient } from "./api/yandex-client";
 import { VaultAdapter } from "./api/vault-adapter";
 import {
 	IndexManager,
-	IndexEpochMismatchError,
-	LegacyIndexVersionError,
-	UnreadableRemoteIndexError,
-	AmbiguousRemoteIndexLockError,
-	RemoteMaintenanceActiveError,
 	RemoteIndexConcurrentModificationError,
 } from "./sync/index-manager";
-import { SyncEngine } from "./sync/sync-engine";
+import { SyncEngine, type SyncRunOptions } from "./sync/sync-engine";
 import {
 	DeferredWatcherEvent,
 	FileWatcher,
@@ -246,15 +242,35 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.syncEngine.setIndexSaveCallback(async () => {
 			await this.saveLocalIndex();
 		});
-		this.syncEngine.setSyncGuardCallback(async () => {
+		this.syncEngine.setSyncGuardCallback(async (validationToken) => {
 			if (!this.settings.yandexTokenSecret) {
-				return null;
+				return { blockReason: null };
 			}
-			const ready = await this.ensureEncryptionReady({ prompt: true });
-			return ready
-				? null
-				: (this.encryptionBlockReason ??
-						t("notice.encryption_password_required"));
+			if (validationToken !== undefined) {
+				const unchanged =
+					await this.indexManager.isEncryptionManifestTokenCurrent(
+						validationToken,
+					);
+				return {
+					blockReason: unchanged
+						? null
+						: t("notice.encryption_state_changed"),
+					validationToken,
+				};
+			}
+			const manifestRead =
+				await this.indexManager.downloadEncryptionManifestForGuard();
+			const ready = await this.ensureEncryptionReady(
+				{ prompt: true },
+				manifestRead,
+			);
+			return {
+				blockReason: ready
+					? null
+					: (this.encryptionBlockReason ??
+							t("notice.encryption_password_required")),
+				validationToken: manifestRead.validationToken,
+			};
 		});
 
 		// Create file watcher
@@ -381,16 +397,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			});
 		}
 
-		// Check remote encryption state before loading index or starting sync.
-		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
-			return;
-		}
-
 		if (
 			this.indexManager
 				.getPendingPhysicalActions()
 				.some((action) => action.type === "guarded-cleanup")
 		) {
+			if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+				return;
+			}
 			await this.syncEngine.runExclusiveMaintenance(async () => {
 				await this.resumeGuardedCleanupActions();
 			});
@@ -417,195 +431,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				await this.fileWatcher.resumeAfterSync(outcome),
 		);
 
-		// Check if initial setup is needed
-		const needsInitialSync = await this.needsInitialSync();
-		if (needsInitialSync) {
-			await this.checkAndRunInitialSync();
-		} else {
-			try {
-				await this.indexManager.loadRemoteIndex();
-				await this.resumeCanonicalMaintenanceCleanup();
-			} catch (e) {
-				if (e instanceof LegacyIndexVersionError) {
-					logger.warn(
-						"Legacy sync index detected; normal synchronization is blocked until force sync.",
-					);
-					new Notice(t("notice.legacy_index_blocked"), 0);
-					return;
-				}
-				if (e instanceof UnreadableRemoteIndexError) {
-					logger.warn(
-						"Unreadable canonical index blocks normal synchronization.",
-						{
-							rawSize: e.rawSize,
-							fingerprint: shortenDiagnosticValue(
-								e.fingerprint,
-							),
-							rawSha256: shortenDiagnosticValue(e.rawSha256),
-							attempts: e.attempts,
-						},
-					);
-					new Notice(t("notice.unreadable_index_blocked"), 0);
-					return;
-				}
-				if (e instanceof IndexEpochMismatchError) {
-					logger.warn(
-						"Canonical epoch changed; normal synchronization is blocked until Force remote.",
-					);
-					new Notice(t("notice.epoch_mismatch_blocked"), 0);
-					return;
-				}
-				if (e instanceof AmbiguousRemoteIndexLockError) {
-					logger.warn(
-						"Ambiguous canonical index locks block normal synchronization.",
-					);
-					new Notice(t("notice.ambiguous_index_blocked"), 0);
-					return;
-				}
-				if (e instanceof RemoteMaintenanceActiveError) {
-					new Notice(t("notice.encryption_remote_busy"), 0);
-					return;
-				}
-				throw e;
-			}
-			// Start regular synchronization
-			await this.startSync();
-		}
-
-	}
-
-	/**
-	 * Check whether an initial sync is required.
-	 */
-	private async needsInitialSync(): Promise<boolean> {
-		try {
-			// Check whether a remote index exists
-			const remoteIndexExists =
-				await this.indexManager.remoteIndexExists();
-			if (remoteIndexExists) {
-				// Existing remote index means this is not the first sync
-				logger.info("Remote index exists, skipping initial sync");
-				return false;
-			}
-
-			// Check the local index
-			const localIndex = this.indexManager.getLocalIndex();
-			if (localIndex.lastSyncTime > 0) {
-				// A previous sync was recorded, so this is not the first sync
-				logger.info("Local index has sync time, skipping initial sync");
-				return false;
-			}
-
-			// Otherwise an initial sync is needed
-			logger.info("Initial sync needed");
-			return true;
-		} catch (e) {
-			logger.warn("Error checking initial sync status:", { error: e });
-			// If the check fails, assume an initial sync is required
-			return true;
-		}
-	}
-
-	/**
-	 * Check and run initial synchronization
-	 */
-	private async checkAndRunInitialSync(): Promise<void> {
-		try {
-			new Notice(t("notice.connection_check"));
-
-			// Check token
-			const tokenValid = await this.yandexClient.checkToken();
-			if (!tokenValid) {
-				new Notice(t("notice.token_invalid"));
-				return;
-			}
-
-			new Notice(t("notice.sync_started"));
-			await this.runInitialSync();
-			await this.startSync();
-		} catch (e) {
-			logger.error("Error during initial setup:", { error: e });
-			new Notice(`Initialization error: ${(e as Error).message}`);
-		}
-	}
-
-	/**
-	 * Run initial synchronization with merge strategy
-	 */
-	private async runInitialSync(): Promise<void> {
-		try {
-			if (!(await this.ensureEncryptionReady({ prompt: true }))) {
-				return;
-			}
-
-			// Create remote folder if not exists
-			const exists = await this.indexManager.remotePathExists();
-			if (!exists) {
-				await this.indexManager.createRemotePath();
-			}
-
-			// Always load remote index for merge strategy
-			await this.indexManager.loadRemoteIndex();
-
-			// Run full synchronization
-			const result = await this.syncEngine.fullSync();
-
-			this.lastSyncStats = {
-				uploaded: result.uploaded,
-				downloaded: result.downloaded,
-				deleted: result.deleted,
-				errors: result.errors.length,
-			};
-
-			// Save updated index after sync
-			await this.saveData({
-				settings: this.settings,
-				localState: this.indexManager.getLocalIndexData(),
-				pendingMutations: this.indexManager.getPendingMutations(),
-				pendingPhysicalActions:
-					this.indexManager.getPendingPhysicalActions(),
-				pendingWatcherEvents:
-					this.fileWatcher.getDeferredEvents(),
-				encryptionTransition: this.encryptionTransition,
-				lastSyncStats: this.lastSyncStats,
-			} as PluginData);
-
-			if (result.success) {
-				new Notice(
-					t("notice.sync_completed", {
-						successful:
-							result.uploaded +
-							result.downloaded +
-							result.deleted,
-					}),
-				);
-			} else {
-				new Notice(
-					t("notice.sync_error", { errors: result.errors.length }),
-				);
-			}
-		} catch (e) {
-			logger.error("Error during initial synchronization:", { error: e });
-			new Notice(`Sync error: ${(e as Error).message}`);
-		}
+		await this.startSync(true);
 	}
 
 	/**
 	 * Run full synchronization
 	 */
-	async runFullSync(): Promise<void> {
+	async runFullSync(options?: SyncRunOptions): Promise<SyncResult | null> {
 		if (!this.settings.yandexTokenSecret) {
 			new Notice(t("notice.token_missing"));
-			return;
-		}
-		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
-			return;
+			return null;
 		}
 
 		new Notice(t("notice.sync_started"));
 
 		try {
-			const result = await this.syncEngine.fullSync();
+			const result = await this.syncEngine.fullSync(options);
 
 			this.lastSyncStats = {
 				uploaded: result.uploaded,
@@ -627,6 +468,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				lastSyncStats: this.lastSyncStats,
 			} as PluginData);
 
+			if (this.handleBlockingSyncResult(result)) {
+				return result;
+			}
 			if (result.success) {
 				new Notice(
 					t("notice.sync_completed", {
@@ -641,10 +485,47 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					t("notice.sync_error", { errors: result.errors.length }),
 				);
 			}
+			return result;
 		} catch (e) {
 			logger.error("Sync error:", { error: e });
 			new Notice(`Sync error: ${(e as Error).message}`);
+			return null;
 		}
+	}
+
+	private handleBlockingSyncResult(result: SyncResult): boolean {
+		const blockingError = result.errors.find((error) =>
+			[
+				"legacy-index",
+				"unreadable-index",
+				"epoch-mismatch",
+				"ambiguous-index-lock",
+				"remote-maintenance",
+				"encryption-blocked",
+				"authentication",
+			].includes(error.code ?? ""),
+		);
+		if (!blockingError) return false;
+
+		this.fileWatcher.stop();
+		this.syncScheduler.stop();
+		this.regularSyncStarted = false;
+		const noticeKey = {
+			"legacy-index": "notice.legacy_index_blocked",
+			"unreadable-index": "notice.unreadable_index_blocked",
+			"epoch-mismatch": "notice.epoch_mismatch_blocked",
+			"ambiguous-index-lock": "notice.ambiguous_index_blocked",
+			"remote-maintenance": "notice.encryption_remote_busy",
+			"encryption-blocked": null,
+			"authentication": "notice.token_invalid",
+		}[blockingError.code ?? ""];
+		if (noticeKey) {
+			new Notice(t(noticeKey), 0);
+		}
+		logger.warn("Synchronization blocked", {
+			code: blockingError.code,
+		});
+		return true;
 	}
 
 	/**
@@ -916,7 +797,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Start regular synchronization
 	 */
-	private async startSync(): Promise<void> {
+	private async startSync(startup = false): Promise<void> {
 		if (this.regularSyncStarted) {
 			logger.debug("[Main] Regular synchronization already started");
 			return;
@@ -937,6 +818,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Run initial sync immediately to check for changes
 		logger.info("[Main] Running initial sync check");
 		// FileWatcher will be automatically paused by sync engine callbacks
+		if (startup) {
+			const result = await this.runFullSync({ startup: true });
+			if (result?.success) {
+				await this.syncEngine.runExclusiveMaintenance(async () => {
+					await this.resumeCanonicalMaintenanceCleanup();
+				});
+			}
+			return;
+		}
 		void this.runFullSync();
 	}
 
@@ -1645,10 +1535,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private async ensureEncryptionReady(
 		options: EncryptionReadyOptions,
+		knownManifest?: { manifest: RemoteEncryptionManifest | null },
 	): Promise<boolean> {
 		try {
 			const manifest =
-				await this.indexManager.downloadEncryptionManifest();
+				knownManifest !== undefined
+					? knownManifest.manifest
+					: await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
 				if (this.settings.enableEncryption) {
 					// Encryption was disabled on another device — auto-sync local state
@@ -2381,8 +2274,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.encryptionBlockReason = reason;
 		this.syncEngine?.setExternalBlockReason(reason);
 		if (reason) {
-			this.fileWatcher?.stop();
-			this.syncScheduler?.stop();
+			if (!this.syncEngine?.isSyncInProgress()) {
+				this.fileWatcher?.stop();
+				this.syncScheduler?.stop();
+			}
 			if (changed) {
 				new Notice(reason, 10000);
 			}

@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.0.0-beta.7
+
+### Changed
+
+- Unified startup with the existing coordinated full-sync path, so encryption
+  validation, watcher buffering, index discovery, and reconciliation happen in
+  one session.
+- Added stable raw service-file reads guarded by content identity before and
+  after download. Encryption manifests and canonical indexes reuse this single
+  primitive without changing their remote formats.
+- Reused the stable paginated root listing for canonical and lock discovery,
+  and removed the separate startup existence probes.
+- Parallelized independent remote-folder reads with bounded concurrency while
+  preserving sequential pagination and excluding the protected `.backup` tree.
+- Added per-session API read summaries and a cheap manifest-token validation
+  before writes; strict no-op reconciliation skips the final validation read.
+
+### Testing
+
+- Added stable-read coverage for unchanged, changed, and resource-ID-only
+  metadata, plus bounded tree traversal and protected backup exclusion.
+- Added guard lifecycle coverage proving watcher pause precedes remote
+  validation, strict no-op validates once, and dirty full sync validates again
+  before commit.
+- Added root-state identity coverage to stable pagination.
+
 ## 2.0.0-beta.6
 
 ### Fixed

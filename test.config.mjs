@@ -24,6 +24,7 @@ const outputFiles = [
 	join(outputDir, "file-watcher.test.mjs"),
 	join(outputDir, "file-rename.test.mjs"),
 	join(outputDir, "full-sync-barrier.test.mjs"),
+	join(outputDir, "yandex-client.test.mjs"),
 ];
 const obsidianStubPlugin = {
 	name: "obsidian-test-stub",
@@ -77,6 +78,7 @@ try {
 			"tests/file-watcher.test.ts",
 			"tests/file-rename.test.ts",
 			"tests/full-sync-barrier.test.ts",
+			"tests/yandex-client.test.ts",
 		],
 		bundle: true,
 		platform: "node",

@@ -68,6 +68,7 @@
 | INIT-018 | P1  | Сеть недоступна при определении initial state          | Initial sync не подменяет remote пустым состоянием                | auto: fault             |
 | INIT-019 | P0  | Encrypted canonical v1/v2 с правильным ключом          | Ошибка версии не маскируется codec fallback; показывается Force-инструкция | auto: `encrypted legacy startup preserves LegacyIndexVersionError` |
 | INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable` |
+| INIT-021 | P0  | Watcher-событие возникает до/во время startup encryption guard | Событие durable-буферизуется; blocked/failed startup его не теряет | auto: `strict no-op validates encryption only once`; integration |
 
 ## Обычный full и realtime
 
@@ -264,6 +265,8 @@
 | PERF-004 | P2  | 5 000 файлов удаляются одной папкой | Один tombstone commit, bounded delete concurrency                    | auto: benchmark     |
 | PERF-005 | P2  | Realtime edit при большом index     | Один index rewrite, без повторного SHA/read файла                    | auto: benchmark     |
 | PERF-006 | P2  | Mobile с ограниченной памятью       | Нет одновременного хранения нескольких полных file-content snapshots | manual-required     |
+| PERF-007 | P2  | Encrypted no-op startup, 9 local/9 remote | Не более 13 GET, `0/0/0`, без index write и post-full realtime | manual-required; integration |
+| PERF-008 | P2  | Remote tree содержит независимые папки и `.backup` | Папки читаются с bounded concurrency, `.backup` не обходится | auto: `remote tree uses bounded folder concurrency and skips backup` |
 | PATH-001 | P1  | Unicode и emoji в имени             | Logical/physical mapping обратим                                     | auto: parameterized |
 | PATH-002 | P1  | Пробелы, `%`, `#`, `?`, `+`         | API path кодируется один раз                                         | auto: parameterized |
 | PATH-003 | P1  | Имена, различающиеся регистром      | Поведение соответствует платформе и не объединяет entries молча      | manual-required     |
@@ -298,6 +301,7 @@
 | DIAG-008 | P2 | Удаление папки поглощает дочерние watcher events | Лог содержит число live targets, пропущенных historical tombstones и оставшихся physical actions | auto: folder-delete |
 | DIAG-009 | P1 | После post-pass остаётся pending move          | Full sync пишет `completed with errors`, сохраняет action и не продвигает observed revision | auto: `unresolved final move recovery records a full-sync error`; manual-required |
 | DIAG-010 | P1 | Realtime batch вернул структурированный `retry` | Пишется warning-summary с `completed/superseded/retry`; событие остаётся durable без общего replay error | auto: `structured watcher retry remains durable without throwing` |
+| DIAG-011 | P2 | Startup/full завершён без изменений             | Summary содержит GET по manifest/index/root/tree, concurrency и длительность без путей/ciphertext | auto: integration; manual-required |
 
 ## Матрица вариантов
 

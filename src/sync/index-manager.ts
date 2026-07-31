@@ -84,6 +84,11 @@ const ENCRYPTION_MANIFEST_STATES: EncryptionManifestState[] = [
 
 type IndexDecodeStage = "decrypt" | "json";
 
+interface EncryptionManifestRead {
+	manifest: RemoteEncryptionManifest | null;
+	validationToken: string;
+}
+
 export interface IndexDecodeAttempt {
 	codec: IndexCodec;
 	stage: IndexDecodeStage;
@@ -547,9 +552,21 @@ export class IndexManager {
 	/**
 	 * Load remote index from Yandex Disk
 	 */
-	async loadRemoteIndex(allowLegacy = false): Promise<SyncIndex> {
-		let indexPath = await this.waitForCanonicalIndex();
-		if (!indexPath) {
+	async loadRemoteIndex(
+		allowLegacy = false,
+		stableRootDiscovery = false,
+	): Promise<SyncIndex> {
+		let discovery: {
+			path: string | null;
+			resource?: YandexResource;
+			rootExists?: boolean;
+		} = stableRootDiscovery
+			? await this.waitForCanonicalIndexFromStableRoot()
+			: { path: await this.waitForCanonicalIndex() };
+		if (!discovery.path) {
+			if (stableRootDiscovery && discovery.rootExists === false) {
+				await this.createRemotePath();
+			}
 			const initial = createEmptyIndex(this.settings.deviceId);
 			try {
 				await this.yandexClient.uploadFileExclusive(
@@ -561,8 +578,10 @@ export class IndexManager {
 			} catch (error) {
 				if (!this.isLockContention(error)) throw error;
 			}
-			indexPath = await this.waitForCanonicalIndex();
-			if (!indexPath) {
+			discovery = stableRootDiscovery
+				? await this.waitForCanonicalIndexFromStableRoot()
+				: { path: await this.waitForCanonicalIndex() };
+			if (!discovery.path) {
 				throw new RemoteIndexConcurrentModificationError(
 					"Canonical index could not be initialized",
 				);
@@ -570,10 +589,15 @@ export class IndexManager {
 		}
 
 		try {
-			this.remoteIndex = await this.downloadIndex(
-				indexPath,
-				allowLegacy,
-			);
+			this.remoteIndex = (
+				await this.downloadIndexSnapshot(
+					discovery.path,
+					allowLegacy,
+					undefined,
+					undefined,
+					discovery.resource,
+				)
+			).index;
 			this.loadedRemoteIndex = this.cloneIndex(this.remoteIndex);
 			this.assertEpochCompatible(this.remoteIndex);
 			this.assertMaintenanceCompatible(this.remoteIndex);
@@ -1176,6 +1200,7 @@ export class IndexManager {
 		const resources = await this.yandexClient.getResourcesRecursive(
 			this.settings.remotePath,
 			true,
+			Math.min(this.settings.maxConcurrency, 4),
 		);
 
 		const result = new Map<string, FileMetadata>();
@@ -1264,20 +1289,6 @@ export class IndexManager {
 	}
 
 	/**
-	 * Check if remote index file exists
-	 */
-	async remoteIndexExists(): Promise<boolean> {
-		const canonical = await this.yandexClient.getResource(
-			this.getRemoteIndexPath(),
-			1000,
-			0,
-			true,
-		);
-		if (canonical) return true;
-		return (await this.getIndexLocks()).length > 0;
-	}
-
-	/**
 	 * Create remote folder
 	 */
 	async createRemotePath(): Promise<void> {
@@ -1313,6 +1324,43 @@ export class IndexManager {
 				);
 			}
 
+			await this.recoverStaleLock(locks);
+			await this.wait(INDEX_LOCK_RETRY_MS);
+		}
+		throw new RemoteIndexLockedError(
+			"Remote index is locked by another device",
+		);
+	}
+
+	private async waitForCanonicalIndexFromStableRoot(): Promise<{
+		path: string | null;
+		resource?: YandexResource;
+		rootExists: boolean;
+	}> {
+		const canonicalPath = this.getRemoteIndexPath();
+		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
+			const { resources, rootExists } =
+				await this.getStableRootListing();
+			const canonical = resources.find(
+				(resource) =>
+					resource.type === "file" &&
+					resource.name === REMOTE_INDEX_FILENAME,
+			);
+			const locks = this.selectIndexLocks(resources);
+			if (canonical) {
+				if (!this.replaceRemoteOnNextSave) {
+					await this.cleanupStaleOrphanLocks(locks);
+				}
+				return { path: canonicalPath, resource: canonical, rootExists };
+			}
+			if (locks.length === 0 || this.replaceRemoteOnNextSave) {
+				return { path: null, rootExists };
+			}
+			if (locks.length > 1) {
+				throw new AmbiguousRemoteIndexLockError(
+					"Multiple remote index locks require an explicit force sync",
+				);
+			}
 			await this.recoverStaleLock(locks);
 			await this.wait(INDEX_LOCK_RETRY_MS);
 		}
@@ -1357,28 +1405,28 @@ export class IndexManager {
 		allowLegacy: boolean,
 		serviceOverride?: EncryptionService | null,
 		codecLabel?: IndexCodec,
+		expectedResource?: YandexResource,
 	): Promise<IndexFileSnapshot> {
-		const [raw, resource] = await Promise.all([
-			this.yandexClient.downloadFile(path, true),
-			this.yandexClient.getResource(path, 1, 0, true),
-		]);
-		if (!resource) {
+		const snapshot = await this.yandexClient.downloadStableRawFile(
+			path,
+			expectedResource,
+		);
+		if (!snapshot) {
 			throw new RemoteIndexConcurrentModificationError(
 				`Index resource disappeared while reading ${path}`,
 			);
 		}
-		const fingerprint = this.getResourceFingerprint(resource);
 		const decoded = await this.decodeIndexSnapshot(
-			raw,
+			snapshot.raw,
 			allowLegacy,
 			serviceOverride,
 			codecLabel,
-			fingerprint,
+			snapshot.fingerprint,
 		);
 		return {
-			raw,
+			raw: snapshot.raw,
 			index: decoded.index,
-			fingerprint,
+			fingerprint: snapshot.fingerprint,
 			codec: decoded.codec,
 		};
 	}
@@ -1386,19 +1434,16 @@ export class IndexManager {
 	private async downloadUnparsedIndexSnapshot(
 		path: string,
 	): Promise<IndexFileSnapshot> {
-		const [raw, resource] = await Promise.all([
-			this.yandexClient.downloadFile(path, true),
-			this.yandexClient.getResource(path, 1, 0, true),
-		]);
-		if (!resource) {
+		const snapshot = await this.yandexClient.downloadStableRawFile(path);
+		if (!snapshot) {
 			throw new RemoteIndexConcurrentModificationError(
 				`Index resource disappeared while reading ${path}`,
 			);
 		}
 		return {
-			raw,
+			raw: snapshot.raw,
 			index: createEmptyIndex(""),
-			fingerprint: this.getResourceFingerprint(resource),
+			fingerprint: snapshot.fingerprint,
 			codec: "source",
 		};
 	}
@@ -1799,6 +1844,16 @@ export class IndexManager {
 	}
 
 	private async getIndexLocks(): Promise<YandexResource[]> {
+		return this.selectIndexLocks(
+			(await this.getStableRootListing()).resources,
+		);
+	}
+
+	private async getStableRootListing(): Promise<{
+		resources: YandexResource[];
+		rootExists: boolean;
+	}> {
+		let rootExists = false;
 		const resources = await collectStablePaginatedItems(
 			async (limit, offset) => {
 				const root = await this.yandexClient.getResource(
@@ -1807,6 +1862,7 @@ export class IndexManager {
 					offset,
 					true,
 				);
+				if (offset === 0) rootExists = root !== null;
 				return {
 					items: root?._embedded?.items ?? [],
 					total: root?._embedded?.total ?? 0,
@@ -1819,7 +1875,13 @@ export class IndexManager {
 					resource.md5 || resource.sha256 || "",
 					resource.modified || "",
 				].join(":"),
+			4,
+			() => (rootExists ? "exists" : "missing"),
 		);
+		return { resources, rootExists };
+	}
+
+	private selectIndexLocks(resources: YandexResource[]): YandexResource[] {
 		return resources.filter(
 			(resource) =>
 				resource.type === "file" &&
@@ -1914,8 +1976,10 @@ export class IndexManager {
 		);
 	}
 
-	private async cleanupStaleOrphanLocks(): Promise<void> {
-		const locks = await this.getIndexLocks();
+	private async cleanupStaleOrphanLocks(
+		knownLocks?: YandexResource[],
+	): Promise<void> {
+		const locks = knownLocks ?? (await this.getIndexLocks());
 		if (locks.length > 1) {
 			throw new AmbiguousRemoteIndexLockError(
 				"Multiple orphan index locks require an explicit force sync",
@@ -2310,13 +2374,7 @@ export class IndexManager {
 	private getResourceFingerprint(
 		resource: YandexResource | null,
 	): string | null {
-		return resource
-			? resource.md5 ||
-					resource.sha256 ||
-					resource.resource_id ||
-					resource.modified ||
-					null
-			: null;
+		return this.yandexClient.getContentFingerprint(resource);
 	}
 
 	private createTransactionId(): string {
@@ -2393,29 +2451,49 @@ export class IndexManager {
 	 * Returns null only if manifest file doesn't exist.
 	 */
 	async downloadEncryptionManifest(): Promise<RemoteEncryptionManifest | null> {
-		try {
-			const resource = await this.yandexClient.getResource(
-				this.getEncryptionManifestPath(),
-				1000,
-				0,
-				true,
-			);
-			if (!resource) return null;
+		return (await this.downloadEncryptionManifestForGuard()).manifest;
+	}
 
-			const content = await this.yandexClient.downloadFile(
+	/** Read the manifest and retain its opaque content-version validation token. */
+	async downloadEncryptionManifestForGuard(): Promise<EncryptionManifestRead> {
+		try {
+			const snapshot = await this.yandexClient.downloadStableRawFile(
 				this.getEncryptionManifestPath(),
-				true,
 			);
+			if (!snapshot) {
+				return { manifest: null, validationToken: "absent" };
+			}
 			const data = JSON.parse(
-				new TextDecoder().decode(content),
+				new TextDecoder().decode(snapshot.raw),
 			) as Record<string, unknown>;
-			return this.parseEncryptionManifest(data);
+			return {
+				manifest: this.parseEncryptionManifest(data),
+				validationToken: `present:${snapshot.fingerprint}`,
+			};
 		} catch (e) {
 			if (this.isNotFoundError(e)) {
-				return null;
+				return { manifest: null, validationToken: "absent" };
 			}
 			throw e;
 		}
+	}
+
+	/** Validate a manifest token without downloading unchanged content. */
+	async isEncryptionManifestTokenCurrent(token: string): Promise<boolean> {
+		const resource = await this.yandexClient.getResource(
+			this.getEncryptionManifestPath(),
+			1,
+			0,
+			true,
+		);
+		if (token === "absent") return resource === null;
+		if (!resource) return false;
+		const fingerprint = this.yandexClient.getContentFingerprint(resource);
+		if (!fingerprint) {
+			const current = await this.downloadEncryptionManifestForGuard();
+			return current.validationToken === token;
+		}
+		return token === `present:${fingerprint}`;
 	}
 
 	/**
@@ -2441,6 +2519,7 @@ export class IndexManager {
 			resources = await this.yandexClient.getResourcesRecursive(
 				this.settings.remotePath,
 				true,
+				Math.min(this.settings.maxConcurrency, 4),
 			);
 		} catch (e) {
 			if (this.isNotFoundError(e)) {
@@ -2739,7 +2818,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.6. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.7. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

@@ -132,6 +132,24 @@ test("changing pagination fails closed", async () => {
 	);
 });
 
+test("stable pagination includes the root state in its snapshot identity", async () => {
+	const states = ["missing", "exists", "exists"];
+	let snapshot = -1;
+	let rootState = "missing";
+	const items = await collectStablePaginatedItems(
+		async () => {
+			rootState = states[++snapshot] ?? "exists";
+			return { items: [], total: 0 };
+		},
+		(item: { path: string }) => item.path,
+		() => "",
+		4,
+		() => rootState,
+	);
+	assert.deepEqual(items, []);
+	assert.equal(snapshot, 2);
+});
+
 test("maintenance claim is rejected after a concurrent canonical revision", () => {
 	assert.equal(
 		didCanonicalChangeBeforeMaintenanceClaim(7, 8),

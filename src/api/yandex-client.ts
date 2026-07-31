@@ -12,6 +12,7 @@ import type {
 import type { EncryptionService } from "../crypto/encryption";
 import { logger } from "../utils/logger";
 import { encodePathForUrl, isProtectedPath, normalizePath } from "../utils/path-utils";
+import { runWithConcurrency } from "../utils/semaphore";
 
 const API_BASE_URL = "https://cloud-api.yandex.net/v1/disk";
 
@@ -21,6 +22,14 @@ export interface YandexClientConfig {
 	retryDelay?: number;
 }
 
+interface StableRawFileSnapshot {
+	raw: ArrayBuffer;
+	resource: YandexResource;
+	fingerprint: string;
+}
+
+type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
+
 export class YandexDiskClient {
 	private token: string;
 	private maxRetries: number;
@@ -28,6 +37,13 @@ export class YandexDiskClient {
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionService | null = null;
 	private remotePath = "";
+	private apiReadMetrics: Record<ApiReadCategory, number> = {
+		manifest: 0,
+		index: 0,
+		root: 0,
+		tree: 0,
+		other: 0,
+	};
 
 	constructor(config: YandexClientConfig) {
 		this.token = config.token;
@@ -73,6 +89,82 @@ export class YandexDiskClient {
 	 */
 	clearFolderCache(): void {
 		this.folderCache.clear();
+	}
+
+	/** Return a copy of cumulative API GET counters for session diagnostics. */
+	getApiReadMetrics(): Record<ApiReadCategory, number> {
+		return { ...this.apiReadMetrics };
+	}
+
+	/**
+	 * Read a raw service file while proving that its remote content identity
+	 * did not change between metadata observations.
+	 */
+	async downloadStableRawFile(
+		path: string,
+		expectedResource?: YandexResource,
+	): Promise<StableRawFileSnapshot | null> {
+		const startedAt = Date.now();
+		const before =
+			expectedResource ??
+			(await this.getResource(path, 1, 0, true));
+		if (!before) return null;
+		if (!this.getContentFingerprint(before)) {
+			throw new Error("Remote service file has no stable content fingerprint");
+		}
+
+		const raw = await this.downloadFile(path, true);
+		const after = await this.getResource(path, 1, 0, true);
+		if (!after) {
+			throw new Error("Remote service file disappeared while being read");
+		}
+		const matchingFingerprint = this.getMatchingContentFingerprint(
+			before,
+			after,
+		);
+		const afterFingerprint = this.getContentFingerprint(after);
+		if (!matchingFingerprint || !afterFingerprint) {
+			throw new Error("Remote service file changed while being read");
+		}
+		logger.debug("Stable raw service-file read completed", {
+			durationMs: Date.now() - startedAt,
+			rawSize: raw.byteLength,
+		});
+		return { raw, resource: after, fingerprint: afterFingerprint };
+	}
+
+	/**
+	 * Return a content-version fingerprint suitable for guarding service-file
+	 * reads. A resource ID alone is intentionally insufficient after overwrite.
+	 */
+	getContentFingerprint(resource: YandexResource | null): string | null {
+		if (!resource) return null;
+		if (resource.sha256) return `sha256:${resource.sha256}`;
+		if (resource.md5) return `md5:${resource.md5}`;
+		if (resource.modified) {
+			return `modified:${resource.modified}:size:${resource.size ?? -1}`;
+		}
+		return null;
+	}
+
+	private getMatchingContentFingerprint(
+		before: YandexResource,
+		after: YandexResource,
+	): string | null {
+		if (before.sha256 && after.sha256) {
+			return before.sha256 === after.sha256
+				? `sha256:${after.sha256}`
+				: null;
+		}
+		if (before.md5 && after.md5) {
+			return before.md5 === after.md5 ? `md5:${after.md5}` : null;
+		}
+		if (before.modified && after.modified) {
+			return before.modified === after.modified && before.size === after.size
+				? `modified:${after.modified}:size:${after.size ?? -1}`
+				: null;
+		}
+		return null;
 	}
 
 	/**
@@ -233,55 +325,71 @@ export class YandexDiskClient {
 	/**
 	 * Recursively get all files in folder
 	 */
-	async getResourcesRecursive(path: string, raw = false): Promise<YandexResource[]> {
+	async getResourcesRecursive(
+		path: string,
+		raw = false,
+		concurrency = 4,
+	): Promise<YandexResource[]> {
+		const startedAt = Date.now();
 		const results: YandexResource[] = [];
-		const queue: string[] = [path];
+		const visited = new Set<string>();
+		let level = [path];
+		const limit = Math.max(1, Math.min(concurrency, 4));
 
-		while (queue.length > 0) {
-			const currentPath = queue.shift()!;
-			let offset = 0;
-			const limit = 1000;
+		while (level.length > 0) {
+			const currentLevel = [...new Set(level)]
+				.filter((currentPath) => !visited.has(currentPath))
+				.sort((left, right) => left.localeCompare(right));
+			for (const currentPath of currentLevel) visited.add(currentPath);
+			const batches = await runWithConcurrency(
+				currentLevel.map((currentPath) => async () =>
+					await this.readDirectoryPageSet(currentPath, raw),
+				),
+				limit,
+			);
+			level = batches.flatMap((batch) => batch.directories);
+			for (const batch of batches) results.push(...batch.files);
+		}
+		logger.debug("Remote tree traversal completed", {
+			folders: visited.size,
+			files: results.length,
+			concurrency: limit,
+			durationMs: Date.now() - startedAt,
+		});
 
-			while (true) {
-				// Always fetch raw: directory paths must stay encrypted so the
-				// next traversal request hits the correct remote path. Only file
-				// results are decrypted before being returned to the caller.
-				const resource = await this.getResource(
-					currentPath,
-					limit,
-					offset,
-					true
-				);
-				if (!resource) break;
-				if (resource.type === "file") {
-					results.push(raw ? resource : await this.decryptResource(resource));
-					break;
-				}
+		return results.sort((left, right) =>
+			(left.path || left.name).localeCompare(right.path || right.name),
+		);
+	}
 
-				if (resource._embedded) {
-					for (const item of resource._embedded.items) {
-						if (item.type === "dir") {
-							queue.push(item.path);
-						} else {
-							results.push(raw ? item : await this.decryptResource(item));
-						}
-					}
-
-					// Check if there are more elements
-					if (
-						offset + resource._embedded.items.length >=
-						resource._embedded.total
-					) {
-						break;
-					}
-					offset += limit;
+	private async readDirectoryPageSet(
+		path: string,
+		raw: boolean,
+	): Promise<{ files: YandexResource[]; directories: string[] }> {
+		const files: YandexResource[] = [];
+		const directories: string[] = [];
+		let offset = 0;
+		const limit = 1000;
+		while (true) {
+			const resource = await this.getResource(path, limit, offset, true);
+			if (!resource) break;
+			if (resource.type === "file") {
+				files.push(raw ? resource : await this.decryptResource(resource));
+				break;
+			}
+			const embedded = resource._embedded;
+			if (!embedded) break;
+			for (const item of embedded.items) {
+				if (item.type === "dir") {
+					if (!isProtectedPath(item.path)) directories.push(item.path);
 				} else {
-					break;
+					files.push(raw ? item : await this.decryptResource(item));
 				}
 			}
+			if (offset + embedded.items.length >= embedded.total) break;
+			offset += limit;
 		}
-
-		return results;
+		return { files, directories };
 	}
 
 	/**
@@ -730,6 +838,9 @@ export class YandexDiskClient {
 
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			try {
+				if (method === "GET") {
+					this.recordApiRead(endpoint);
+				}
 				logger.debug(`API request: ${method} ${endpoint}`, {
 					attempt: attempt + 1,
 					maxRetries: this.maxRetries,
@@ -807,6 +918,21 @@ export class YandexDiskClient {
 		}
 
 		throw lastError || new Error("Unknown error");
+	}
+
+	private recordApiRead(endpoint: string): void {
+		let category: ApiReadCategory = "other";
+		if (endpoint.includes(".obsidian-encrypt.json")) {
+			category = "manifest";
+		} else if (endpoint.includes(".obsidian-sync-index")) {
+			category = "index";
+		} else if (endpoint.startsWith("/resources?")) {
+			const query = endpoint.slice(endpoint.indexOf("?") + 1);
+			const encodedPath = new URLSearchParams(query).get("path") ?? "";
+			const path = normalizePath(encodedPath.replace(/^disk:\//, ""));
+			category = path === this.remotePath ? "root" : "tree";
+		}
+		this.apiReadMetrics[category]++;
 	}
 
 	private sleep(ms: number): Promise<void> {
