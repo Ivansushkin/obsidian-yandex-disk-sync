@@ -2,9 +2,9 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-## Upgrading to 2.0.0-beta.7
+## Upgrading to 2.0.0-beta.8
 
-Version 2.0.0-beta.7 uses a new synchronization index and cannot synchronize
+Version 2.0.0-beta.8 uses a new synchronization index and cannot synchronize
 alongside versions that use legacy index v1/v2, including 1.1 and
 1.2.0-beta.5. Close Obsidian on other devices, back up the vault, and update
 the plugin everywhere before starting synchronization. On the device with the
@@ -14,7 +14,7 @@ Then run **Remote to local** with backup enabled on every other device.
 Do not start an older plugin version after the transition: it can replace the
 v3 index and restore deleted files. If that happens, disable sync everywhere,
 select the most complete local vault, inspect backup/conflict copies, and
-repeat the force sync procedure from version 2.0.0-beta.7.
+repeat the force sync procedure from version 2.0.0-beta.8.
 
 > **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**
 >
@@ -22,7 +22,9 @@ repeat the force sync procedure from version 2.0.0-beta.7.
 > The author is not responsible for the safety and security of your data. Install and use the plugin at your own risk. All plugin code is open source, and you can independently verify its security.
 >
 > **Data Security**  
-> The OAuth token is stored locally in Obsidian settings and is not transmitted to third parties. Never share your token with the developer or other persons. It is recommended to use a token with minimal necessary permissions (`cloud_api:disk.app_folder`).
+> The OAuth token is stored as plaintext in local Obsidian plugin data and is
+> not transmitted to third parties. Never share it with the developer or other
+> persons. Use a token with minimal permissions (`cloud_api:disk.app_folder`).
 >
 > **Yandex Disk API Limitations (as of this document's writing)**
 >
@@ -62,7 +64,7 @@ repeat the force sync procedure from version 2.0.0-beta.7.
 
 ### Manual
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from [latest release](../../releases)
+1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/Ivansushkin/obsidian-yandex-disk-sync/releases)
 2. Create `yandex-disk-sync` folder in `<Vault>/.obsidian/plugins/`
 3. Copy downloaded files to created folder
 4. Restart Obsidian
@@ -152,9 +154,11 @@ Plugin includes built-in backup system for creating ZIP archives of your vault:
 
 - **Create backups**: Plugin settings → Backup section → "Create backup" button
 - **Backup location**: Backups are stored in `.backup` folder on Yandex Disk
-- **Backup format**: `backup_YYYY-MM-DD_HH-MM-SS.zip`
+- **Backup format**: `backup_YYYY-MM-DD_HH-MM-SS.zip`; encrypted backups use
+  `backup_YYYY-MM-DD_HH-MM-SS.enc.zip`
 - **Content**: All files subject to synchronization according to filters
-- **Sync**: Last backup time is synchronized between devices
+- **Availability**: Every device reads the shared backup list directly from
+  the protected remote `.backup` folder
 
 **Note**: `.backup` folder is protected and excluded from synchronization operations.
 
@@ -230,7 +234,8 @@ npm run dev
 npm run build
 ```
 
-Built files will be in `build/` folder and automatically copied to test vault.
+Built files are written to `build/`. When `YANDEX_PLUGIN_PATH` is set, the
+build also copies release artifacts to that test-vault plugin directory.
 
 ### Linting
 
@@ -248,7 +253,8 @@ Detailed description of architecture and approaches see in [docs/ARCHITECTURE.md
 
 ## Security
 
-- OAuth token is stored locally encrypted in Obsidian settings
+- OAuth token is stored as plaintext in local plugin data because Obsidian
+  mobile plugins do not provide a portable OS keychain API
 - Token is not logged and not transmitted to third parties
 - Recommended to use token with minimal necessary permissions (`cloud_api:disk.app_folder`)
 - When removing the plugin, the token is **not** automatically deleted — delete it manually from Obsidian settings

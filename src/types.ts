@@ -7,7 +7,7 @@
 // ============================================================================
 
 export interface YandexDiskSyncSettings {
-	/** OAuth token secret name (stored in SecretStorage) */
+	/** OAuth token stored only in local plugin data */
 	yandexTokenSecret: string;
 	/** Client ID for Yandex OAuth application */
 	clientId: string;

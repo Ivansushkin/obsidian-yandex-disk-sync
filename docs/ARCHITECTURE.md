@@ -35,7 +35,7 @@ src/
 │
 ├── crypto/
 │   ├── encryption.ts       # E2E encryption service (Web Crypto API)
-│   └── encryption-transition.ts # Решения crash recovery
+│   └── encryption-transition.ts # Общий transition executor и crash recovery
 │
 ├── ui/
 │   ├── status-bar.ts       # Индикатор статуса в статус-баре
@@ -46,6 +46,7 @@ src/
 └── utils/
     ├── path-utils.ts       # Утилиты для работы с путями
     ├── hash-utils.ts       # Вычисление SHA256 хешей
+    ├── resource-fingerprint.ts # Service/physical fingerprint rules
     ├── semaphore.ts        # Контроль параллелизации
     └── logger.ts           # Логирование
 ```
@@ -60,6 +61,13 @@ src/
 - Регистрацию команд
 - Обработку жизненного цикла (onload/onunload)
 - Координацию между модулями
+
+Enable, disable и rotate используют один `EncryptionTransitionController`.
+Контроллер выполняет общий причинный workflow поверх существующих
+`SyncEngine` и `IndexManager`: maintenance claim, re-encode, manifest/index
+commit, guarded cleanup и recovery. Mode-specific код определяет только
+source/target режим и способ публикации manifest. Этот же completion path
+используется после Force recovery незавершённого transition.
 
 ### YandexDiskClient (api/yandex-client.ts)
 
@@ -175,7 +183,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.7 и явно выполнить Force sync.
+обновить все устройства до 2.0.0-beta.8 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 
@@ -337,7 +345,8 @@ OAuth токен хранится в `data.json` плагина. Рекомен�
 
 - Не коммитить data.json в git
 - Использовать токен с минимальными правами
-- В будущем: интеграция с SecretStorage Obsidian
+- Учитывать, что token хранится в открытом виде: у мобильных плагинов Obsidian
+  нет переносимого доступа к системному хранилищу ключей
 
 ### Валидация путей
 
@@ -526,7 +535,7 @@ await runWithConcurrencySettled(tasks, maxConcurrency, onProgress);
 
 ### Настройки производительности
 
-**maxConcurrency** (1-20, по умолчанию 5):
+**maxConcurrency** (1-20, по умолчанию 10):
 
 - Контролирует количество одновременных операций
 - Можно настроить через Settings → Automatic sync
@@ -565,18 +574,20 @@ backup/
 
 - Создание ZIP-архивов всех синхронизируемых файлов
 - Загрузку бекапов на Яндекс.Диск в защищенную папку `.backup`
-- Управление метаданными бекапов в индексе синхронизации
+- Проверку созданного remote-файла по physical fingerprint
+- Создание raw remote snapshot перед Force local
 
 ### Интеграция с синхронизацией
 
-- **IndexManager** хранит время последнего бекапа в `SyncIndex.lastBackupTime`
-- Время бекапа синхронизируется между всеми устройствами
+- Canonical index не содержит время или список backup
+- Каждое устройство читает общий список напрямую из remote `.backup`
 - Папка `.backup` жестко исключена из операций синхронизации
 
 ### Формат бекапов
 
 - **Расширение**: `.zip`
-- **Именование**: `backup_YYYY-MM-DD_HH-MM-SS.zip`
+- **Именование**: `backup_YYYY-MM-DD_HH-MM-SS.zip` для plaintext и
+  `backup_YYYY-MM-DD_HH-MM-SS.enc.zip` при активном encryption codec
 - **Содержимое**: Все файлы, подлежащие синхронизации
 - **Расположение**: `{remotePath}/.backup/`
 
@@ -657,7 +668,8 @@ Force Sync — функция принудительной синхрониза�
 - [x] Прогресс-бар для больших операций
 - [x] Force Sync (From Local / From Remote)
 - [ ] UI для просмотра истории конфликтов
-- [ ] Интеграция с SecretStorage для токена
+- [ ] Перенести token в системное хранилище, если Obsidian предоставит
+  переносимый API для desktop и mobile
 - [ ] Поддержка Yandex Disk App Folder API
-- [ ] Unit и integration тесты
+- [x] Unit и fake integration тесты
 - [ ] Adaptive concurrency (автоматическое снижение при 429)

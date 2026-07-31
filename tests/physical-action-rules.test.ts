@@ -3,9 +3,11 @@ import test from "node:test";
 import {
 	createEmptyIndex,
 	type PendingPhysicalAction,
+	type YandexResource,
 } from "../src/types";
 import {
 	classifyPhysicalDeleteFingerprint,
+	classifyPhysicalDeleteResource,
 	isPhysicalDeleteAuthorized,
 	shouldBackupLocalDelete,
 } from "../src/sync/physical-action-rules";
@@ -82,6 +84,26 @@ test("remote deletion requires an exact expected fingerprint", () => {
 		classifyPhysicalDeleteFingerprint("expected", "changed"),
 		"mismatch",
 	);
+});
+
+test("beta.7 physical actions accept every current server identity", () => {
+	const resource: YandexResource = {
+		path: "disk:/vault/note.md",
+		name: "note.md",
+		type: "file",
+		created: "2026-07-31T00:00:00Z",
+		modified: "2026-07-31T00:00:01Z",
+		size: 3,
+		sha256: "sha",
+		md5: "md5",
+		resource_id: "resource-id",
+	};
+	for (const expected of ["sha", "md5", "resource-id", resource.modified]) {
+		assert.equal(
+			classifyPhysicalDeleteResource(expected, resource),
+			"match",
+		);
+	}
 });
 
 test("force cleanup is authorized only by absence in the replacement epoch", () => {

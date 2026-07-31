@@ -1,38 +1,116 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import { t } from "../i18n";
 
-export class EnableEncryptionModal extends Modal {
-	private resolve: (value: string | null) => void;
+/** Resolve a modal promise exactly once and provide a close fallback. */
+abstract class ResolvableModal<T> extends Modal {
 	private resolved = false;
-	private createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>;
+
+	constructor(
+		app: App,
+		private readonly resolveResult: (value: T) => void,
+		private readonly closeFallback: T,
+	) {
+		super(app);
+	}
+
+	protected finish(value: T): void {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.resolveResult(value);
+	}
+
+	onClose(): void {
+		this.finish(this.closeFallback);
+		this.contentEl.empty();
+	}
+}
+
+/** Share password input, confirmation, submit, and cancel behavior. */
+abstract class PasswordModal extends ResolvableModal<string | null> {
 	private passwordInput!: HTMLInputElement;
-	private confirmInput!: HTMLInputElement;
-	private errorEl!: HTMLElement;
+	private confirmInput: HTMLInputElement | null = null;
+	private errorEl: HTMLElement | null = null;
+
+	constructor(app: App, resolve: (value: string | null) => void) {
+		super(app, resolve, null);
+	}
+
+	protected renderPasswordFields(confirm: boolean): void {
+		this.passwordInput = this.contentEl.createEl("input", {
+			type: "password",
+			placeholder: t("modal.encryption_password_label"),
+		});
+		this.passwordInput.addClass("encryption-password-input");
+		if (!confirm) return;
+
+		this.confirmInput = this.contentEl.createEl("input", {
+			type: "password",
+			placeholder: t("modal.encryption_confirm_label"),
+		});
+		this.confirmInput.addClass("encryption-password-input");
+		this.errorEl = this.contentEl.createEl("p", {
+			text: t("modal.encryption_password_mismatch"),
+		});
+		this.errorEl.addClass("encryption-password-error");
+	}
+
+	protected getPassword(): string | null {
+		const password = this.passwordInput.value;
+		if (
+			!password ||
+			(this.confirmInput !== null &&
+				password !== this.confirmInput.value)
+		) {
+			this.errorEl?.addClass("is-visible");
+			return null;
+		}
+		return password;
+	}
+
+	protected getPasswordInput(): HTMLInputElement {
+		return this.passwordInput;
+	}
+
+	protected addSubmitButtons(
+		buttonText: string,
+		onSubmit: (password: string) => boolean | Promise<boolean>,
+	): void {
+		const setting = new Setting(this.contentEl)
+			.addButton((button) =>
+				button
+					.setButtonText(buttonText)
+					.setCta()
+					.onClick(async () => {
+						const password = this.getPassword();
+						if (!password || !(await onSubmit(password))) return;
+						this.finish(password);
+						this.close();
+					}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText(t("modal.cancel_button"))
+					.onClick(() => this.cancel()),
+			);
+		setting.settingEl.addClass("force-sync-modal-buttons");
+	}
+
+	protected cancel(): void {
+		this.finish(null);
+		this.close();
+	}
+}
+
+export class EnableEncryptionModal extends PasswordModal {
+	private createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>;
 
 	constructor(
 		app: App,
 		resolve: (value: string | null) => void,
 		createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>
 	) {
-		super(app);
-		this.resolve = resolve;
+		super(app, resolve);
 		this.createBackup = createBackup;
-	}
-
-	private finish(value: string | null): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.resolve(value);
-	}
-
-	private getPassword(): string | null {
-		const pw = this.passwordInput.value;
-		const confirmPw = this.confirmInput.value;
-		if (!pw || pw !== confirmPw) {
-			this.errorEl.addClass("is-visible");
-			return null;
-		}
-		return pw;
 	}
 
 	onOpen(): void {
@@ -48,22 +126,7 @@ export class EnableEncryptionModal extends Modal {
 			text: t("modal.encryption_enter_password"),
 		});
 
-		this.passwordInput = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_password_label"),
-		});
-		this.passwordInput.addClass("encryption-password-input");
-
-		this.confirmInput = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_confirm_label"),
-		});
-		this.confirmInput.addClass("encryption-password-input");
-
-		this.errorEl = contentEl.createEl("p", {
-			text: t("modal.encryption_password_mismatch"),
-		});
-		this.errorEl.addClass("encryption-password-error");
+		this.renderPasswordFields(true);
 
 		const setting = new Setting(contentEl)
 			.addButton((btn) =>
@@ -91,34 +154,16 @@ export class EnableEncryptionModal extends Modal {
 			.addButton((btn) =>
 				btn
 					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(null);
-						this.close();
-					})
+					.onClick(() => this.cancel())
 			);
 		setting.settingEl.addClass("force-sync-modal-buttons");
 	}
 
-	onClose(): void {
-		this.finish(null);
-		const { contentEl } = this;
-		contentEl.empty();
-	}
 }
 
-export class DisableEncryptionModal extends Modal {
-	private resolve: (value: boolean) => void;
-	private resolved = false;
-
+export class DisableEncryptionModal extends ResolvableModal<boolean> {
 	constructor(app: App, resolve: (value: boolean) => void) {
-		super(app);
-		this.resolve = resolve;
-	}
-
-	private finish(value: boolean): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.resolve(value);
+		super(app, resolve, false);
 	}
 
 	onOpen(): void {
@@ -151,43 +196,29 @@ export class DisableEncryptionModal extends Modal {
 		setting.settingEl.addClass("force-sync-modal-buttons");
 	}
 
-	onClose(): void {
-		this.finish(false);
-		const { contentEl } = this;
-		contentEl.empty();
-	}
 }
 
-export class VerifyPasswordModal extends Modal {
-	private resolve: (value: string | null) => void;
-	private resolved = false;
+export class VerifyPasswordModal extends PasswordModal {
 	private verifyPassword: (password: string) => Promise<boolean>;
-	private input!: HTMLInputElement;
 
 	constructor(
 		app: App,
 		resolve: (value: string | null) => void,
 		verifyPassword: (password: string) => Promise<boolean>
 	) {
-		super(app);
-		this.resolve = resolve;
+		super(app, resolve);
 		this.verifyPassword = verifyPassword;
 	}
 
-	private finish(value: string | null): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.resolve(value);
-	}
-
 	private clearError(): void {
-		this.input.removeClass("is-error");
+		this.getPasswordInput().removeClass("is-error");
 	}
 
 	private setError(): void {
-		this.input.addClass("is-error");
-		this.input.value = "";
-		this.input.focus();
+		const input = this.getPasswordInput();
+		input.addClass("is-error");
+		input.value = "";
+		input.focus();
 		new Notice(t("notice.encryption_wrong_password"));
 	}
 
@@ -200,73 +231,20 @@ export class VerifyPasswordModal extends Modal {
 			text: t("modal.encryption_enter_current_password"),
 		});
 
-		this.input = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_password_label"),
+		this.renderPasswordFields(false);
+		this.getPasswordInput().oninput = () => this.clearError();
+		this.addSubmitButtons(t("generic.confirm"), async (password) => {
+			if (await this.verifyPassword(password)) return true;
+			this.setError();
+			return false;
 		});
-		this.input.addClass("encryption-password-input");
-		this.input.oninput = () => this.clearError();
-
-		const setting = new Setting(contentEl)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("generic.confirm"))
-					.setCta()
-					.onClick(async () => {
-						const pw = this.input.value;
-						if (!pw) return;
-						if (!(await this.verifyPassword(pw))) {
-							this.setError();
-							return;
-						}
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(null);
-						this.close();
-					})
-			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
 	}
 
-	onClose(): void {
-		this.finish(null);
-		const { contentEl } = this;
-		contentEl.empty();
-	}
 }
 
-export class ChangePasswordModal extends Modal {
-	private resolve: (value: string | null) => void;
-	private resolved = false;
-	private passwordInput!: HTMLInputElement;
-	private confirmInput!: HTMLInputElement;
-	private errorEl!: HTMLElement;
-
+export class ChangePasswordModal extends PasswordModal {
 	constructor(app: App, resolve: (value: string | null) => void) {
-		super(app);
-		this.resolve = resolve;
-	}
-
-	private finish(value: string | null): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.resolve(value);
-	}
-
-	private getPassword(): string | null {
-		const pw = this.passwordInput.value;
-		const confirmPw = this.confirmInput.value;
-		if (!pw || pw !== confirmPw) {
-			this.errorEl.addClass("is-visible");
-			return null;
-		}
-		return pw;
+		super(app, resolve);
 	}
 
 	onOpen(): void {
@@ -278,57 +256,16 @@ export class ChangePasswordModal extends Modal {
 			text: t("modal.encryption_enter_password"),
 		});
 
-		this.passwordInput = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_password_label"),
-		});
-		this.passwordInput.addClass("encryption-password-input");
-
-		this.confirmInput = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_confirm_label"),
-		});
-		this.confirmInput.addClass("encryption-password-input");
-
-		this.errorEl = contentEl.createEl("p", {
-			text: t("modal.encryption_password_mismatch"),
-		});
-		this.errorEl.addClass("encryption-password-error");
-
-		const setting = new Setting(contentEl)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.encryption_change_password_button"))
-					.setCta()
-					.onClick(() => {
-						const pw = this.getPassword();
-						if (!pw) return;
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(null);
-						this.close();
-					})
-			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
+		this.renderPasswordFields(true);
+		this.addSubmitButtons(
+			t("modal.encryption_change_password_button"),
+			() => true,
+		);
 	}
 
-	onClose(): void {
-		this.finish(null);
-		const { contentEl } = this;
-		contentEl.empty();
-	}
 }
 
-export class ConnectEncryptedVaultModal extends Modal {
-	private resolve: (value: string | null) => void;
-	private resolved = false;
-	private input!: HTMLInputElement;
+export class ConnectEncryptedVaultModal extends PasswordModal {
 	private title: string;
 	private description: string;
 	private buttonText: string;
@@ -340,23 +277,10 @@ export class ConnectEncryptedVaultModal extends Modal {
 		description: string,
 		buttonText: string
 	) {
-		super(app);
-		this.resolve = resolve;
+		super(app, resolve);
 		this.title = title;
 		this.description = description;
 		this.buttonText = buttonText;
-	}
-
-	private finish(value: string | null): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.resolve(value);
-	}
-
-	private getPassword(): string | null {
-		const pw = this.input.value;
-		if (!pw) return null;
-		return pw;
 	}
 
 	onOpen(): void {
@@ -369,38 +293,8 @@ export class ConnectEncryptedVaultModal extends Modal {
 			text: t("modal.encryption_connect_privacy"),
 		});
 
-		this.input = contentEl.createEl("input", {
-			type: "password",
-			placeholder: t("modal.encryption_password_label"),
-		});
-		this.input.addClass("encryption-password-input");
-
-		const setting = new Setting(contentEl)
-			.addButton((btn) =>
-				btn
-					.setButtonText(this.buttonText)
-					.setCta()
-					.onClick(() => {
-						const pw = this.getPassword();
-						if (!pw) return;
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(null);
-						this.close();
-					})
-			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
+		this.renderPasswordFields(false);
+		this.addSubmitButtons(this.buttonText, () => true);
 	}
 
-	onClose(): void {
-		this.finish(null);
-		const { contentEl } = this;
-		contentEl.empty();
-	}
 }

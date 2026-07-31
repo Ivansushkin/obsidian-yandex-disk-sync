@@ -9,6 +9,7 @@ import { VaultAdapter } from "../api/vault-adapter";
 import { joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { t } from "../i18n";
+import { getPhysicalResourceFingerprint } from "../utils/resource-fingerprint";
 
 export interface BackupResult {
 	success: boolean;
@@ -203,12 +204,7 @@ export class BackupManager {
 			0,
 			true,
 		);
-		const fingerprint = resource
-			? resource.md5 ||
-				resource.sha256 ||
-				resource.resource_id ||
-				resource.modified
-			: null;
+		const fingerprint = getPhysicalResourceFingerprint(resource);
 		if (!resource || resource.type !== "file" || !fingerprint) {
 			throw new Error(
 				"Backup upload could not be confirmed on Yandex Disk",

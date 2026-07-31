@@ -9,6 +9,7 @@ import type {
 	SyncError,
 	FileMetadata,
 	PendingPhysicalAction,
+	IndexMaintenance,
 	YandexResource,
 	YandexDiskSyncSettings,
 } from "../types";
@@ -30,6 +31,7 @@ import {
 	getDirectory,
 	getExtension,
 	getFileName,
+	getAncestorDirectoriesDeepestFirst,
 } from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
@@ -41,10 +43,14 @@ import {
 } from "./sync-coordinator";
 import { createConfirmedBaseline } from "./baseline-rules";
 import {
-	classifyPhysicalDeleteFingerprint,
+	classifyPhysicalDeleteResource,
 	isPhysicalDeleteAuthorized,
 	shouldBackupLocalDelete,
 } from "./physical-action-rules";
+import {
+	getPhysicalResourceFingerprint,
+	matchesPhysicalResourceFingerprint,
+} from "../utils/resource-fingerprint";
 import { collectFolderDeleteTargets } from "./index-rules";
 import {
 	createRealtimeBatchResult,
@@ -452,10 +458,7 @@ export class SyncEngine {
 				);
 
 				// 6. Preflight: Create all necessary folders
-				this.updateState({
-					currentOperation: t("status.op.creating_folders"),
-				});
-				await this.ensureFoldersExist(operations);
+				await this.prepareOperationFolders(operations);
 
 				// 7. Execute operations in parallel by type
 				const totalOps = operations.length;
@@ -477,41 +480,15 @@ export class SyncEngine {
 				);
 				let indexCommittedBeforeDeletes = false;
 
-				let mtimeStamped = false;
-				if (uploads.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.uploading_files"),
-					});
-					const uploadResults = await this.executeOperationsParallel(
-						uploads,
-						(completed) => {
-							processedOps = completed;
-							this.reportProgress(processedOps, totalOps);
-						},
-					);
-					result.uploaded = uploadResults.succeeded;
-					result.errors.push(...uploadResults.errors);
-
-					// Batch-fill `remoteMtime` on the remote index entries just
-					// created by the upload group. uploads ran with
-					// `stampRemoteMtime=false`, so a single re-read of the remote
-					// file list replaces N per-file `getResource` calls. Best-effort:
-					// on failure the entries stay without `remoteMtime` and the
-					// conflict resolver falls back to legacy comparison.
-					if (uploadResults.succeeded > 0) {
-						try {
-							const liveRemote =
-								await this.indexManager.getRemoteFiles();
-							mtimeStamped =
-								this.indexManager.applyServerMtimes(liveRemote);
-						} catch (e) {
-							logger.warn(
-								"Batch server mtime re-read after uploads failed; entries will use legacy comparison:",
-								{ error: e },
-							);
-						}
-					}
-				}
+				const mtimeStamped = await this.executeBulkUploads(
+					uploads,
+					result,
+					(completed) => {
+						processedOps = completed;
+						this.reportProgress(processedOps, totalOps);
+					},
+					"Batch server metadata re-read after uploads failed",
+				);
 
 				if (downloads.length > 0) {
 					this.updateState({
@@ -713,13 +690,7 @@ export class SyncEngine {
 			(result) =>
 				`Full reconciliation completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
 			);
-		if (
-			options?.skipMaintenanceGuard &&
-			this.coordinator.getActiveKind() === "maintenance"
-		) {
-			return await run();
-		}
-		return await this.coordinator.run("full", run);
+		return await this.runCoordinatedSession("full", options, run);
 	}
 
 	/**
@@ -874,13 +845,7 @@ export class SyncEngine {
 				(result) =>
 					`Encryption rewrite completed: uploaded ${result.uploaded}, errors ${result.errors.length}`,
 			);
-		if (
-			options?.skipMaintenanceGuard &&
-			this.coordinator.getActiveKind() === "maintenance"
-		) {
-			return await run();
-		}
-		return await this.coordinator.run("maintenance", run);
+		return await this.runCoordinatedSession("maintenance", options, run);
 	}
 
 	/**
@@ -893,22 +858,8 @@ export class SyncEngine {
 		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
-				this.yandexClient.clearFolderCache();
-				const inheritedCleanup =
-					this.indexManager.getMaintenance();
-				this.indexManager.beginForceBootstrap(true);
-				if (inheritedCleanup?.phase === "cleanup") {
-					this.indexManager.setMaintenance(inheritedCleanup);
-				}
 				bootstrapStarted = true;
-				// 1. Ensure remote folder exists
-				this.updateState({
-					currentOperation: t("status.op.checking_remote_folder"),
-				});
-				const remoteExists = await this.indexManager.remotePathExists();
-				if (!remoteExists) {
-					await this.indexManager.createRemotePath();
-				}
+				const inheritedCleanup = await this.prepareForceBootstrap();
 
 				// 2. Build local index
 				this.updateState({
@@ -957,11 +908,8 @@ export class SyncEngine {
 					`Force sync from local: ${operations.length} synchronization operations`,
 				);
 
-				// 5. Preflight: Create all necessary folders
-				this.updateState({
-					currentOperation: t("status.op.creating_folders"),
-				});
-				await this.ensureFoldersExist(operations);
+					// 5. Preflight: Create all necessary folders
+					await this.prepareOperationFolders(operations);
 
 				// 6. Execute operations in parallel by type
 				const totalOps = operations.length;
@@ -975,36 +923,16 @@ export class SyncEngine {
 				);
 				let indexCommittedBeforeDeletes = false;
 
-				if (uploads.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.uploading_files"),
-					});
-					const uploadResults = await this.executeOperationsParallel(
-						uploads,
-						(completed) => {
-							processedOps = completed;
-							this.reportProgress(processedOps, totalOps);
-						},
-					);
-					result.uploaded = uploadResults.succeeded;
-					result.errors.push(...uploadResults.errors);
-
-					// Batch-fill `remoteMtime` on the remote index entries just
-					// created by the upload group (see fullSync for rationale).
-					if (uploadResults.succeeded > 0) {
-						try {
-							const liveRemote =
-								await this.indexManager.getRemoteFiles();
-							this.indexManager.applyServerMtimes(liveRemote);
-						} catch (e) {
-							logger.warn(
-								"Batch server mtime re-read after force uploads failed; entries will use legacy comparison:",
-								{ error: e },
-							);
-						}
-					}
-					if (uploadResults.errors.length > 0) return;
-				}
+				await this.executeBulkUploads(
+					uploads,
+					result,
+					(completed) => {
+						processedOps = completed;
+						this.reportProgress(processedOps, totalOps);
+					},
+					"Batch server metadata re-read after force uploads failed",
+				);
+				if (result.errors.length > 0) return;
 
 				await options?.beforeIndexCommit?.();
 
@@ -1086,11 +1014,7 @@ export class SyncEngine {
 			(result) =>
 				`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
-		const result =
-			options?.skipMaintenanceGuard &&
-			this.coordinator.getActiveKind() === "maintenance"
-				? await run()
-				: await this.coordinator.run("force", run);
+		const result = await this.runCoordinatedSession("force", options, run);
 		if (bootstrapStarted && !result.success) {
 			this.indexManager.cancelForceBootstrap();
 		}
@@ -1107,22 +1031,8 @@ export class SyncEngine {
 		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
-				this.yandexClient.clearFolderCache();
-				const inheritedCleanup =
-					this.indexManager.getMaintenance();
-				this.indexManager.beginForceBootstrap(true);
-				if (inheritedCleanup?.phase === "cleanup") {
-					this.indexManager.setMaintenance(inheritedCleanup);
-				}
 				bootstrapStarted = true;
-				// 1. Ensure remote folder exists
-				this.updateState({
-					currentOperation: t("status.op.checking_remote_folder"),
-				});
-				const remoteExists = await this.indexManager.remotePathExists();
-				if (!remoteExists) {
-					await this.indexManager.createRemotePath();
-				}
+				const inheritedCleanup = await this.prepareForceBootstrap();
 
 				// 2. Build local index (to know what to delete)
 				this.updateState({
@@ -1172,11 +1082,8 @@ export class SyncEngine {
 					`Force sync from remote: ${operations.length} synchronization operations`,
 				);
 
-				// 5. Preflight: Create all necessary folders
-				this.updateState({
-					currentOperation: t("status.op.creating_folders"),
-				});
-				await this.ensureFoldersExist(operations);
+					// 5. Preflight: Create all necessary folders
+					await this.prepareOperationFolders(operations);
 
 				// 6. Execute operations in parallel by type
 				const totalOps = operations.length;
@@ -1270,20 +1177,70 @@ export class SyncEngine {
 			(result) =>
 				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
-		const result =
-			options?.skipMaintenanceGuard &&
-			this.coordinator.getActiveKind() === "maintenance"
-				? await run()
-				: await this.coordinator.run("force", run);
+		const result = await this.runCoordinatedSession("force", options, run);
 		if (bootstrapStarted && !result.success) {
 			this.indexManager.cancelForceBootstrap();
 		}
 		return result;
 	}
 
-	/**
-	 * Ensure all necessary folders exist before operations
-	 */
+	/** Initialize one Force epoch while preserving resumable cleanup metadata. */
+	private async prepareForceBootstrap(): Promise<IndexMaintenance | undefined> {
+		this.yandexClient.clearFolderCache();
+		const inheritedCleanup = this.indexManager.getMaintenance();
+		this.indexManager.beginForceBootstrap(true);
+		if (inheritedCleanup?.phase === "cleanup") {
+			this.indexManager.setMaintenance(inheritedCleanup);
+		}
+		this.updateState({
+			currentOperation: t("status.op.checking_remote_folder"),
+		});
+		if (!(await this.indexManager.remotePathExists())) {
+			await this.indexManager.createRemotePath();
+		}
+		return inheritedCleanup;
+	}
+
+	/** Execute bulk uploads and stamp server-owned metadata with one tree read. */
+	private async executeBulkUploads(
+		uploads: SyncOperation[],
+		result: SyncResult,
+		onProgress: (completed: number) => void,
+		failureMessage: string,
+	): Promise<boolean> {
+		if (uploads.length === 0) return false;
+		this.updateState({
+			currentOperation: t("status.op.uploading_files"),
+		});
+		const outcomes = await this.executeOperationsParallel(
+			uploads,
+			onProgress,
+		);
+		result.uploaded = outcomes.succeeded;
+		result.errors.push(...outcomes.errors);
+		if (outcomes.succeeded === 0) return false;
+		try {
+			const liveRemote = await this.indexManager.getRemoteFiles();
+			return this.indexManager.applyServerMtimes(liveRemote);
+		} catch (error) {
+			logger.warn(`${failureMessage}; entries keep fallback metadata`, {
+				error,
+			});
+			return false;
+		}
+	}
+
+	/** Update progress and ensure upload destination folders exist. */
+	private async prepareOperationFolders(
+		operations: SyncOperation[],
+	): Promise<void> {
+		this.updateState({
+			currentOperation: t("status.op.creating_folders"),
+		});
+		await this.ensureFoldersExist(operations);
+	}
+
+	/** Ensure all necessary folders exist before operations. */
 	private async ensureFoldersExist(
 		operations: SyncOperation[],
 	): Promise<void> {
@@ -1542,7 +1499,7 @@ export class SyncEngine {
 			return {
 				remoteMtime: Number.isFinite(ts) ? ts : undefined,
 				remoteFingerprint:
-					resource.sha256 || resource.md5 || undefined,
+					getPhysicalResourceFingerprint(resource) ?? undefined,
 			};
 		} catch (e) {
 			logger.debug(`Failed to fetch remote stamp for ${path}:`, {
@@ -1552,23 +1509,45 @@ export class SyncEngine {
 		}
 	}
 
+	/** Return a durable physical action or fail before destructive work. */
+	private requirePhysicalAction(
+		type: PendingPhysicalAction["type"],
+		path: string,
+	): PendingPhysicalAction {
+		const action = this.indexManager.getPendingPhysicalAction(type, path);
+		if (!action) {
+			throw new Error(
+				`Refusing to process ${path} without a pending physical action`,
+			);
+		}
+		return action;
+	}
+
+	/** Build the common secret-safe physical-action log context. */
+	private getPhysicalActionLogContext(
+		action: PendingPhysicalAction,
+		path: string,
+	): Record<string, unknown> {
+		return {
+			actionId: action.id,
+			actionType: action.type,
+			origin: action.origin,
+			epoch: shortenDiagnosticValue(action.epoch),
+			canonicalRevision: action.canonicalRevision,
+			path,
+		};
+	}
+
 	/**
 	 * Delete file on Yandex Disk
 	 */
 	async deleteRemoteFile(path: string): Promise<void> {
-		const physicalAction =
-			this.indexManager.getPendingPhysicalAction("delete-remote", path);
-		if (!physicalAction) {
-			throw new Error(
-				`Refusing to delete ${path} without a pending physical action`,
-			);
-		}
+		const physicalAction = this.requirePhysicalAction(
+			"delete-remote",
+			path,
+		);
 		const actionContext = {
-			actionId: physicalAction.id,
-			actionType: physicalAction.type,
-			origin: physicalAction.origin,
-			epoch: shortenDiagnosticValue(physicalAction.epoch),
-			canonicalRevision: physicalAction.canonicalRevision,
+			...this.getPhysicalActionLogContext(physicalAction, path),
 			expectedChangedRevision:
 				physicalAction.expectedChangedRevision,
 			expectedFingerprint: shortenDiagnosticValue(
@@ -1615,11 +1594,10 @@ export class SyncEngine {
 			logger.info("Remote physical deletion already complete", actionContext);
 			return;
 		}
-		const fingerprint =
-			resource.sha256 || resource.md5 || resource.resource_id;
-		const fingerprintDecision = classifyPhysicalDeleteFingerprint(
+		const fingerprint = getPhysicalResourceFingerprint(resource);
+		const fingerprintDecision = classifyPhysicalDeleteResource(
 			physicalAction.expectedFingerprint,
-			fingerprint,
+			resource,
 		);
 		if (fingerprintDecision !== "match") {
 			logger.warn("Deferred remote deletion for causal reconciliation", {
@@ -1666,25 +1644,17 @@ export class SyncEngine {
 	 * left untouched this round and retried on the next sync.
 	 */
 	private async pruneRemoteFolders(localPaths: string[]): Promise<void> {
-		const candidates = new Set<string>();
-		for (const filePath of localPaths) {
-			const segments = filePath.split("/");
-			for (let i = 1; i < segments.length; i++) {
-				candidates.add(segments.slice(0, i).join("/"));
-			}
-		}
-		if (candidates.size === 0) return;
+		const candidates = getAncestorDirectoriesDeepestFirst(localPaths);
+		if (candidates.length === 0) return;
 
 		const remoteFiles = this.indexManager.getRemoteIndex().files;
-		const emptyDirs = Array.from(candidates).filter((dir) => {
+		const emptyDirs = candidates.filter((dir) => {
 			const prefix = dir + "/";
 			return !Object.keys(remoteFiles).some(
 				(fp) => !remoteFiles[fp]?.deleted && fp.startsWith(prefix),
 			);
 		});
 		if (emptyDirs.length === 0) return;
-
-		emptyDirs.sort((a, b) => b.split("/").length - a.split("/").length);
 
 		for (const dir of emptyDirs) {
 			const remoteDir = joinPath(this.settings.remotePath, dir);
@@ -1718,19 +1688,12 @@ export class SyncEngine {
 	 * Delete local file
 	 */
 	async deleteLocalFile(path: string): Promise<void> {
-		const physicalAction =
-			this.indexManager.getPendingPhysicalAction("delete-local", path);
-		if (!physicalAction) {
-			throw new Error(
-				`Refusing to delete ${path} without a pending physical action`,
-			);
-		}
+		const physicalAction = this.requirePhysicalAction(
+			"delete-local",
+			path,
+		);
 		const actionContext = {
-			actionId: physicalAction.id,
-			actionType: physicalAction.type,
-			origin: physicalAction.origin,
-			epoch: shortenDiagnosticValue(physicalAction.epoch),
-			canonicalRevision: physicalAction.canonicalRevision,
+			...this.getPhysicalActionLogContext(physicalAction, path),
 			expectedChangedRevision:
 				physicalAction.expectedChangedRevision,
 			baselineSha256: shortenDiagnosticValue(
@@ -2564,8 +2527,7 @@ export class SyncEngine {
 			});
 			return undefined;
 		}
-		const fingerprint =
-			resource.sha256 || resource.md5 || resource.resource_id;
+		const fingerprint = getPhysicalResourceFingerprint(resource);
 		if (!fingerprint) return undefined;
 		return this.indexManager.enqueuePhysicalAction(
 			"delete-remote",
@@ -2866,6 +2828,21 @@ export class SyncEngine {
 
 	private async enqueueRealtime(task: () => Promise<void>): Promise<void> {
 		return await this.coordinator.run("realtime", task);
+	}
+
+	/** Dispatch a session while allowing an owned maintenance body to nest. */
+	private async runCoordinatedSession<T>(
+		kind: SyncSessionKind,
+		options: SyncRunOptions | undefined,
+		run: () => Promise<T>,
+	): Promise<T> {
+		if (
+			options?.skipMaintenanceGuard &&
+			this.coordinator.getActiveKind() === "maintenance"
+		) {
+			return await run();
+		}
+		return await this.coordinator.run(kind, run);
 	}
 
 	/**
@@ -3425,12 +3402,13 @@ export class SyncEngine {
 			logger.info("Materialized move source cleanup confirmed", actionContext);
 			return;
 		}
-		const sourceFingerprint =
-			source.sha256 || source.md5 || source.resource_id;
+		const sourceFingerprint = getPhysicalResourceFingerprint(source);
 		if (
 			action?.expectedFingerprint &&
-			sourceFingerprint &&
-			action.expectedFingerprint !== sourceFingerprint
+			!matchesPhysicalResourceFingerprint(
+				action.expectedFingerprint,
+				source,
+			)
 		) {
 			logger.warn("Guarded remote move source fingerprint changed", {
 				...actionContext,
@@ -3530,9 +3508,7 @@ export class SyncEngine {
 			logger.info("Ambiguous remote move confirmed by final state", {
 				...actionContext,
 				targetFingerprint: shortenDiagnosticValue(
-					ambiguousTarget.sha256 ||
-						ambiguousTarget.md5 ||
-						ambiguousTarget.resource_id,
+					getPhysicalResourceFingerprint(ambiguousTarget),
 				),
 			});
 			return;
@@ -3563,9 +3539,7 @@ export class SyncEngine {
 		logger.info("Guarded remote move confirmed", {
 			...actionContext,
 			targetFingerprint: shortenDiagnosticValue(
-				writtenTarget.sha256 ||
-					writtenTarget.md5 ||
-					writtenTarget.resource_id,
+				getPhysicalResourceFingerprint(writtenTarget),
 			),
 		});
 	}
@@ -3639,11 +3613,12 @@ export class SyncEngine {
 		metadata: FileMetadata | undefined,
 	): Promise<boolean> {
 		if (!metadata || metadata.deleted) return false;
-		const fingerprint =
-			resource.sha256 || resource.md5 || resource.resource_id;
 		if (
 			metadata.remoteFingerprint &&
-			fingerprint === metadata.remoteFingerprint
+			matchesPhysicalResourceFingerprint(
+				metadata.remoteFingerprint,
+				resource,
+			)
 		) {
 			return true;
 		}
@@ -3666,11 +3641,12 @@ export class SyncEngine {
 		action: ReturnType<IndexManager["getPendingPhysicalAction"]>,
 		metadata: FileMetadata | undefined,
 	): Promise<void> {
-		const fingerprint =
-			resource.sha256 || resource.md5 || resource.resource_id;
 		const matchesExpected =
 			action?.expectedFingerprint !== undefined &&
-			fingerprint === action.expectedFingerprint;
+			matchesPhysicalResourceFingerprint(
+				action.expectedFingerprint,
+				resource,
+			);
 		if (
 			!matchesExpected &&
 			!(await this.remoteResourceMatchesCanonical(path, resource, metadata))
@@ -3704,7 +3680,7 @@ export class SyncEngine {
 		const stamped: FileMetadata = {
 			...current,
 			remoteFingerprint:
-				resource.sha256 || resource.md5 || resource.resource_id,
+				getPhysicalResourceFingerprint(resource) ?? undefined,
 			remoteMtime: Number.isFinite(remoteMtime)
 				? remoteMtime
 				: current.remoteMtime,
@@ -4210,12 +4186,13 @@ export class SyncEngine {
 		const remotePath = joinPath(this.settings.remotePath, path);
 		const physical =
 			await this.yandexClient.getLogicalResource(remotePath);
-		const fingerprint =
-			physical?.sha256 || physical?.md5 || physical?.resource_id;
 		if (
 			!physical ||
 			(winner.remoteFingerprint &&
-				fingerprint !== winner.remoteFingerprint)
+				!matchesPhysicalResourceFingerprint(
+					winner.remoteFingerprint,
+					physical,
+				))
 		) {
 			throw new Error(
 				`Canonical winner for ${path} is not physically available yet`,

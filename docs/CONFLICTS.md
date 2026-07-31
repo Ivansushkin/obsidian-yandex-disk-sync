@@ -54,8 +54,8 @@ Folder tombstone против неизменённого потомка → по
 
 Настройки в `Settings → Automatic sync`:
 
-- **Debounce delay:** 2000ms - задержка перед real-time sync
-- **Max concurrent operations:** 5 - параллельные операции
+- **Debounce delay:** 1000ms по умолчанию — задержка перед real-time sync
+- **Max concurrent operations:** 10 по умолчанию — параллельные операции
 - **Enable realtime sync:** Включает/выключает FileWatcher
 
 ## Мониторинг

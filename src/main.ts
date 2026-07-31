@@ -37,6 +37,7 @@ import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
 import { BackupManager } from "./backup/backup-manager";
 import {
 	generateDeviceId,
+	getAncestorDirectoriesDeepestFirst,
 	isProtectedPath,
 	joinPath,
 	toLocalPath,
@@ -49,7 +50,16 @@ import {
 	AES_KEY_LENGTH,
 	IV_LENGTH,
 } from "./crypto/encryption";
-import { decideEncryptionRecovery } from "./crypto/encryption-transition";
+import {
+	decideEncryptionRecovery,
+	EncryptionTransitionController,
+	type LocalEncryptionSnapshot,
+	type LocalEncryptionTransition,
+} from "./crypto/encryption-transition";
+import {
+	getPhysicalResourceFingerprint,
+	matchesPhysicalResourceFingerprint,
+} from "./utils/resource-fingerprint";
 
 interface PluginData {
 	settings: YandexDiskSyncSettings;
@@ -64,26 +74,6 @@ interface PluginData {
 		deleted: number;
 		errors: number;
 	};
-}
-
-interface LocalEncryptionSnapshot {
-	enabled: boolean;
-	salt: string | null;
-	password: string | null;
-	revision: number | null;
-}
-
-interface LocalEncryptionTransition {
-	id: string;
-	kind: "enable" | "disable" | "rotate";
-	phase: EncryptionTransitionPhase;
-	source: LocalEncryptionSnapshot;
-	target: LocalEncryptionSnapshot;
-	sourceRawPaths: string[];
-	targetRawPaths: string[];
-	sourceFingerprints: Record<string, string>;
-	targetFingerprints: Record<string, string>;
-	sourceCanonicalRevision: number;
 }
 
 interface EncryptionReadyOptions {
@@ -113,6 +103,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private regularSyncStarted = false;
 	private encryptionService: EncryptionService | null = null;
+	private encryptionTransitionController!: EncryptionTransitionController;
 	private encryptionBlockReason: string | null = null;
 	private encryptionPromptPromise: Promise<boolean> | null = null;
 	private encryptionTransition: LocalEncryptionTransition | null = null;
@@ -193,18 +184,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		// Save index (sync version - onunload is not async)
-		void this.saveData({
-			settings: this.settings,
-			localState: this.indexManager?.getLocalIndexData() ?? null,
-			pendingMutations:
-				this.indexManager?.getPendingMutations() ?? [],
-			pendingPhysicalActions:
-				this.indexManager?.getPendingPhysicalActions() ?? [],
-			pendingWatcherEvents:
-				this.fileWatcher?.getDeferredEvents() ?? [],
-			encryptionTransition: this.encryptionTransition,
-			lastSyncStats: this.lastSyncStats,
-		} as PluginData);
+		void this.persistPluginData();
 
 		logger.info("Yandex Disk Sync plugin unloaded");
 		void logger.flush();
@@ -237,10 +217,62 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.indexManager,
 			this.settings,
 		);
+		this.encryptionTransitionController =
+			new EncryptionTransitionController(
+				this.indexManager,
+				this.syncEngine,
+				{
+					claim: async (transition) =>
+						await this.claimEncryptionMaintenance(transition),
+					applyTarget: async (snapshot) =>
+						await this.applyEncryptionSnapshot(snapshot),
+					resolveTargetPaths: async (transition) =>
+						await this.resolveTransitionTargetPaths(transition),
+					assertSourceUnchanged: async (transition) =>
+						await this.assertTransitionSourceUnchanged(transition),
+					captureTargetFingerprints: async (transition) =>
+						await this.captureTransitionTargetFingerprints(transition),
+					setPhase: async (phase) =>
+						await this.setEncryptionTransitionPhase(phase),
+					stageMaintenance: async (transition, phase) =>
+						await this.stageCanonicalMaintenance(transition, phase),
+					commitMaintenance: async (transition, phase, cleanup) =>
+						await this.commitCanonicalMaintenance(
+							transition,
+							phase,
+							cleanup,
+						),
+					publishStable: async (snapshot) =>
+						await this.publishStableEncryptionSnapshot(snapshot),
+					prepareCleanup: async (paths, fingerprints) =>
+						await this.prepareGuardedCleanup(paths, fingerprints),
+					deletePaths: async (paths, fingerprints) =>
+						await this.deleteRemoteRawPaths(paths, fingerprints),
+					deleteFolders: async (paths) =>
+						await this.deleteRemoteRawFolders(paths),
+					finishMaintenance: async (transition) =>
+						await this.finishCanonicalMaintenanceIfCleanupComplete(
+							transition,
+						),
+					clearLocalTransition: async () => {
+						this.encryptionTransition = null;
+						await this.saveSettings();
+					},
+					recover: async () =>
+						await this.recoverEncryptionTransition(),
+					clearBlock: () => this.setEncryptionBlock(null),
+					createSyncFailure: (errorCount) =>
+						new Error(
+							t("notice.encryption_sync_failed", {
+								errors: errorCount,
+							}),
+						),
+				},
+			);
 
 		// Set callback for saving local index after auto-sync operations
 		this.syncEngine.setIndexSaveCallback(async () => {
-			await this.saveLocalIndex();
+			await this.persistPluginData();
 		});
 		this.syncEngine.setSyncGuardCallback(async (validationToken) => {
 			if (!this.settings.yandexTokenSecret) {
@@ -280,7 +312,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.settings,
 		);
 		this.fileWatcher.setPersistCallback(async () => {
-			await this.saveLocalIndex();
+			await this.persistPluginData();
 		});
 
 		// Create sync scheduler
@@ -448,25 +480,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		try {
 			const result = await this.syncEngine.fullSync(options);
 
-			this.lastSyncStats = {
-				uploaded: result.uploaded,
-				downloaded: result.downloaded,
-				deleted: result.deleted,
-				errors: result.errors.length,
-			};
+			this.updateLastSyncStats(result);
 
 			// Save updated index after sync
-			await this.saveData({
-				settings: this.settings,
-				localState: this.indexManager.getLocalIndexData(),
-				pendingMutations: this.indexManager.getPendingMutations(),
-				pendingPhysicalActions:
-					this.indexManager.getPendingPhysicalActions(),
-				pendingWatcherEvents:
-					this.fileWatcher.getDeferredEvents(),
-				encryptionTransition: this.encryptionTransition,
-				lastSyncStats: this.lastSyncStats,
-			} as PluginData);
+			await this.persistPluginData();
 
 			if (this.handleBlockingSyncResult(result)) {
 				return result;
@@ -549,6 +566,45 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 	}
 
+	/** Run the shared confirmed Force UI and persistence lifecycle. */
+	private async runConfirmedForceSync(
+		direction: "from_local" | "from_remote",
+		task: () => Promise<SyncResult>,
+	): Promise<void> {
+		if (!(await this.confirmForceSync(direction))) return;
+		const notice = new Notice(
+			t(
+				direction === "from_local"
+					? "notice.force_sync_from_local_started"
+					: "notice.force_sync_from_remote_started",
+			),
+			600000,
+		);
+		try {
+			const result = await task();
+			this.updateLastSyncStats(result);
+			await this.persistPluginData();
+			notice.hide();
+			if (!result.success) {
+				new Notice(
+					t("notice.sync_error", { errors: result.errors.length }),
+				);
+				return;
+			}
+			await this.startSync();
+			new Notice(
+				t("notice.force_sync_completed", {
+					successful:
+						result.uploaded + result.downloaded + result.deleted,
+				}),
+			);
+		} catch (error) {
+			notice.hide();
+			logger.error("Force sync error:", { error });
+			new Notice(`Force sync error: ${(error as Error).message}`);
+		}
+	}
+
 	/**
 	 * Run force synchronization from local to remote
 	 */
@@ -569,17 +625,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return;
 		}
 
-		const confirmed = await this.confirmForceSync("from_local");
-		if (!confirmed) {
-			return;
-		}
-
-		const notice = new Notice(
-			t("notice.force_sync_from_local_started"),
-			600000,
-		);
-
-		try {
+		await this.runConfirmedForceSync("from_local", async () => {
 			const obsoleteSnapshots = recoversAbandonedTransition
 				? await this.indexManager.getRemoteRawFileSnapshots()
 				: [];
@@ -619,14 +665,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							snapshot.fingerprint,
 						]),
 					);
-					const cleanup = obsolete.map((snapshot) => ({
-						path: snapshot.path,
-						expectedFingerprint: snapshot.fingerprint,
-					}));
-					const descriptor =
-						await this.createEncryptionModeDescriptor(
-							stableSnapshot,
-						);
 					const recoveryTransition: LocalEncryptionTransition = {
 						id:
 							remoteManifest.transition?.id ??
@@ -647,83 +685,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						sourceCanonicalRevision:
 							this.indexManager.getRemoteIndex().revision,
 					};
-					this.indexManager.setMaintenance({
-						id: recoveryTransition.id,
-						kind: recoveryTransition.kind,
-						phase: "cleanup",
-						initiatedBy: this.settings.deviceId,
-						sourceRevision:
-							recoveryTransition.sourceCanonicalRevision,
-						targetRevision:
-							this.indexManager.getRemoteIndex().revision +
-							1,
-						source: descriptor,
-						target: descriptor,
-						cleanup,
-					});
-					await this.indexManager.saveRemoteIndex();
-					await this.publishStableEncryptionSnapshot(
-						stableSnapshot,
-					);
-					await this.prepareGuardedCleanup(
-						obsoletePaths,
-						fingerprints,
-					);
-					await this.deleteRemoteRawPaths(
-						obsoletePaths,
-						fingerprints,
-					);
-					await this.deleteRemoteRawFolders(obsoletePaths);
-					await this.finishCanonicalMaintenanceIfCleanupComplete(
+					await this.encryptionTransitionController.completeTarget(
 						recoveryTransition,
 					);
-					this.encryptionTransition = null;
-					await this.saveSettings();
-					this.setEncryptionBlock(null);
 				});
 			}
-
-			this.lastSyncStats = {
-				uploaded: result.uploaded,
-				downloaded: result.downloaded,
-				deleted: result.deleted,
-				errors: result.errors.length,
-			};
-
-			await this.saveData({
-				settings: this.settings,
-				localState: this.indexManager.getLocalIndexData(),
-				pendingMutations: this.indexManager.getPendingMutations(),
-				pendingPhysicalActions:
-					this.indexManager.getPendingPhysicalActions(),
-				pendingWatcherEvents:
-					this.fileWatcher.getDeferredEvents(),
-				encryptionTransition: this.encryptionTransition,
-				lastSyncStats: this.lastSyncStats,
-			} as PluginData);
-
-			notice.hide();
-
-			if (result.success) {
-				await this.startSync();
-				new Notice(
-					t("notice.force_sync_completed", {
-						successful:
-							result.uploaded +
-							result.downloaded +
-							result.deleted,
-					}),
-				);
-			} else {
-				new Notice(
-					t("notice.sync_error", { errors: result.errors.length }),
-				);
-			}
-		} catch (e) {
-			notice.hide();
-			logger.error("Force sync error:", { error: e });
-			new Notice(`Force sync error: ${(e as Error).message}`);
-		}
+			return result;
+		});
 	}
 
 	/**
@@ -738,60 +706,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return;
 		}
 
-		const confirmed = await this.confirmForceSync("from_remote");
-		if (!confirmed) {
-			return;
-		}
-
-		const notice = new Notice(
-			t("notice.force_sync_from_remote_started"),
-			600000,
+		await this.runConfirmedForceSync(
+			"from_remote",
+			async () => await this.syncEngine.forceSyncFromRemote(),
 		);
-
-		try {
-			const result = await this.syncEngine.forceSyncFromRemote();
-
-			this.lastSyncStats = {
-				uploaded: result.uploaded,
-				downloaded: result.downloaded,
-				deleted: result.deleted,
-				errors: result.errors.length,
-			};
-
-			await this.saveData({
-				settings: this.settings,
-				localState: this.indexManager.getLocalIndexData(),
-				pendingMutations: this.indexManager.getPendingMutations(),
-				pendingPhysicalActions:
-					this.indexManager.getPendingPhysicalActions(),
-				pendingWatcherEvents:
-					this.fileWatcher.getDeferredEvents(),
-				encryptionTransition: this.encryptionTransition,
-				lastSyncStats: this.lastSyncStats,
-			} as PluginData);
-
-			notice.hide();
-
-			if (result.success) {
-				await this.startSync();
-				new Notice(
-					t("notice.force_sync_completed", {
-						successful:
-							result.uploaded +
-							result.downloaded +
-							result.deleted,
-					}),
-				);
-			} else {
-				new Notice(
-					t("notice.sync_error", { errors: result.errors.length }),
-				);
-			}
-		} catch (e) {
-			notice.hide();
-			logger.error("Force sync error:", { error: e });
-			new Notice(`Force sync error: ${(e as Error).message}`);
-		}
 	}
 
 	/**
@@ -947,18 +865,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.syncScheduler?.stop();
 		}
 
-		await this.saveData({
-			settings: this.settings,
-			localState: this.indexManager?.getLocalIndexData() ?? null,
-			pendingMutations:
-				this.indexManager?.getPendingMutations() ?? [],
-			pendingPhysicalActions:
-				this.indexManager?.getPendingPhysicalActions() ?? [],
-			pendingWatcherEvents:
-				this.fileWatcher?.getDeferredEvents() ?? [],
-			encryptionTransition: this.encryptionTransition,
-			lastSyncStats: this.lastSyncStats,
-		} as PluginData);
+		await this.persistPluginData();
 	}
 
 	// ============================================================================
@@ -1040,101 +947,24 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				sourceFiles.map((file) => [file.path, file.fingerprint]),
 			),
 		);
-
-		try {
-			await this.claimEncryptionMaintenance(transition);
-			const targetService =
-				await this.applyEncryptionSnapshot(target);
-			await this.resolveTransitionTargetPaths(transition);
-			await this.indexManager.uploadEncryptionManifest(
-				await this.createEncryptionManifest(
-					service,
-					saltBase64,
-					"enabling",
-					revision,
-					transition,
-				),
-			);
-
-			logger.info("Re-uploading all files with encryption...");
-			this.indexManager.setIndexTransitionServices(
-				null,
-				targetService,
-			);
-			const result = await this.syncEngine.reencodeRemoteFiles({
-				skipEncryptionGuard: true,
-				skipMaintenanceGuard: true,
-				beforeIndexCommit: async () => {
-					await this.assertTransitionSourceUnchanged(transition);
-					await this.captureTransitionTargetFingerprints(transition);
-					await this.setEncryptionTransitionPhase("files-copied");
-					await this.stageCanonicalMaintenance(
-						transition,
-						"index-committed",
-					);
-					await this.indexManager.uploadEncryptionManifest(
-						await this.createEncryptionManifest(
-							service,
-							saltBase64,
-							"enabling",
-							revision,
-							transition,
-						),
-					);
-				},
-			});
-			this.indexManager.clearIndexTransitionServices();
-			if (!result.success) {
-				throw new Error(
-					t("notice.encryption_sync_failed", {
-						errors: result.errors.length,
-					}),
-				);
-			}
-			await this.setEncryptionTransitionPhase("index-committed");
-			await this.indexManager.uploadEncryptionManifest(
-				await this.createEncryptionManifest(
-					service,
-					saltBase64,
-					"enabling",
-					revision,
-					transition,
-				),
-			);
-			const cleanup = oldRawPaths.flatMap((path) => {
-				const expectedFingerprint =
-					transition.sourceFingerprints[path];
-				return expectedFingerprint
-					? [{ path, expectedFingerprint }]
-					: [];
-			});
-			await this.commitCanonicalMaintenance(
-				transition,
-				"cleanup",
-				cleanup,
-			);
-			await this.publishStableEncryptionSnapshot(target);
-			await this.prepareGuardedCleanup(
-				oldRawPaths,
-				transition.sourceFingerprints,
-			);
-			await this.deleteRemoteRawPaths(
-				oldRawPaths,
-				transition.sourceFingerprints,
-			);
-			await this.deleteRemoteRawFolders(oldRawPaths);
-			await this.finishCanonicalMaintenanceIfCleanupComplete(
+		const publishEnablingManifest =
+			this.createEncryptionManifestPublisher(
+				service,
+				saltBase64,
+				"enabling",
+				revision,
 				transition,
 			);
-			this.encryptionTransition = null;
-			await this.saveSettings();
-			this.setEncryptionBlock(null);
-			logger.info("Encryption enabled");
-		} catch (error) {
-			this.indexManager.clearIndexTransitionServices();
-			await this.recoverEncryptionTransition();
-			throw error;
-		}
+
+		logger.info("Re-uploading all files with encryption...");
+		await this.encryptionTransitionController.execute({
+			transition,
+			sourceService: null,
+			publishPrepared: publishEnablingManifest,
+			publishFilesCopied: publishEnablingManifest,
+			publishIndexCommitted: publishEnablingManifest,
+		});
+		logger.info("Encryption enabled");
 	}
 
 	/**
@@ -1187,110 +1017,28 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			);
 
 			try {
-				await this.claimEncryptionMaintenance(transition);
-				if (this.encryptionService && this.settings.encryptionSalt) {
-					const revision = this.settings.encryptionRevision ?? 1;
-					await this.indexManager.uploadEncryptionManifest(
-						await this.createEncryptionManifest(
-							this.encryptionService,
-							this.settings.encryptionSalt,
-							"disabling",
-							revision,
-							transition,
-						),
-					);
-				}
-
-				const targetService =
-					await this.applyEncryptionSnapshot(target);
-				await this.resolveTransitionTargetPaths(transition);
-
+				const publishDisablingManifest =
+					sourceService && source.salt
+						? this.createEncryptionManifestPublisher(
+								sourceService,
+								source.salt,
+								"disabling",
+								source.revision ?? 1,
+								transition,
+							)
+						: async () => undefined;
 				logger.info("Re-uploading all files as plaintext...");
-				this.indexManager.setIndexTransitionServices(
+				await this.encryptionTransitionController.execute({
+					transition,
 					sourceService,
-					targetService,
-				);
-				const result = await this.syncEngine.reencodeRemoteFiles({
-					skipEncryptionGuard: true,
-					skipMaintenanceGuard: true,
-					beforeIndexCommit: async () => {
-						await this.assertTransitionSourceUnchanged(
-							transition,
-						);
-						await this.captureTransitionTargetFingerprints(
-							transition,
-						);
-						await this.setEncryptionTransitionPhase("files-copied");
-						await this.stageCanonicalMaintenance(
-							transition,
-							"index-committed",
-						);
-						if (sourceService && source.salt) {
-							await this.indexManager.uploadEncryptionManifest(
-								await this.createEncryptionManifest(
-									sourceService,
-									source.salt,
-									"disabling",
-									source.revision ?? 1,
-									transition,
-								),
-							);
-						}
-					},
+					beforeApplyTarget: publishDisablingManifest,
+					publishFilesCopied: publishDisablingManifest,
+					publishIndexCommitted: publishDisablingManifest,
 				});
-				this.indexManager.clearIndexTransitionServices();
-				if (!result.success) {
-					throw new Error(
-						t("notice.encryption_sync_failed", {
-							errors: result.errors.length,
-						}),
-					);
-				}
-				await this.setEncryptionTransitionPhase("index-committed");
-				if (sourceService && source.salt) {
-					await this.indexManager.uploadEncryptionManifest(
-						await this.createEncryptionManifest(
-							sourceService,
-							source.salt,
-							"disabling",
-							source.revision ?? 1,
-							transition,
-						),
-					);
-				}
-				const cleanup = oldRawPaths.flatMap((path) => {
-					const expectedFingerprint =
-						transition.sourceFingerprints[path];
-					return expectedFingerprint
-						? [{ path, expectedFingerprint }]
-						: [];
-				});
-				await this.commitCanonicalMaintenance(
-					transition,
-					"cleanup",
-					cleanup,
-				);
-				await this.publishStableEncryptionSnapshot(target);
-				await this.prepareGuardedCleanup(
-					oldRawPaths,
-					transition.sourceFingerprints,
-				);
-				await this.deleteRemoteRawPaths(
-					oldRawPaths,
-					transition.sourceFingerprints,
-				);
-				await this.deleteRemoteRawFolders(oldRawPaths);
-				await this.finishCanonicalMaintenanceIfCleanupComplete(
-					transition,
-				);
-				this.encryptionTransition = null;
-				await this.saveSettings();
 			} catch (error) {
-				this.indexManager.clearIndexTransitionServices();
 				logger.warn("Encryption disable rolled back:", {
 					error,
 				});
-				await this.recoverEncryptionTransition();
 				partialErrors = true;
 			}
 		} else {
@@ -1393,101 +1141,25 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			),
 		);
 
-		try {
-			await this.claimEncryptionMaintenance(transition);
-			const targetService =
-				await this.applyEncryptionSnapshot(target);
-			await this.resolveTransitionTargetPaths(transition);
-			await this.indexManager.uploadEncryptionManifest(
-				await this.createEncryptionManifest(
-					service,
-					saltBase64,
-					"rotating",
-					revision,
-					transition,
-				),
-			);
-			logger.info(
-				"Re-uploading all files after encryption password rotation...",
-			);
-			this.indexManager.setIndexTransitionServices(
-				sourceService,
-				targetService,
-			);
-			const result = await this.syncEngine.reencodeRemoteFiles({
-				skipEncryptionGuard: true,
-				skipMaintenanceGuard: true,
-				beforeIndexCommit: async () => {
-					await this.assertTransitionSourceUnchanged(transition);
-					await this.captureTransitionTargetFingerprints(transition);
-					await this.setEncryptionTransitionPhase("files-copied");
-					await this.stageCanonicalMaintenance(
-						transition,
-						"index-committed",
-					);
-					await this.indexManager.uploadEncryptionManifest(
-						await this.createEncryptionManifest(
-							service,
-							saltBase64,
-							"rotating",
-							revision,
-							transition,
-						),
-					);
-				},
-			});
-			this.indexManager.clearIndexTransitionServices();
-			if (!result.success) {
-				throw new Error(
-					t("notice.encryption_sync_failed", {
-						errors: result.errors.length,
-					}),
-				);
-			}
-			await this.setEncryptionTransitionPhase("index-committed");
-			await this.indexManager.uploadEncryptionManifest(
-				await this.createEncryptionManifest(
-					service,
-					saltBase64,
-					"rotating",
-					revision,
-					transition,
-				),
-			);
-			const cleanup = oldRawPaths.flatMap((path) => {
-				const expectedFingerprint =
-					transition.sourceFingerprints[path];
-				return expectedFingerprint
-					? [{ path, expectedFingerprint }]
-					: [];
-			});
-			await this.commitCanonicalMaintenance(
-				transition,
-				"cleanup",
-				cleanup,
-			);
-			await this.publishStableEncryptionSnapshot(target);
-			await this.prepareGuardedCleanup(
-				oldRawPaths,
-				transition.sourceFingerprints,
-			);
-			await this.deleteRemoteRawPaths(
-				oldRawPaths,
-				transition.sourceFingerprints,
-			);
-			await this.deleteRemoteRawFolders(oldRawPaths);
-			await this.finishCanonicalMaintenanceIfCleanupComplete(
+		const publishRotatingManifest =
+			this.createEncryptionManifestPublisher(
+				service,
+				saltBase64,
+				"rotating",
+				revision,
 				transition,
 			);
-			this.encryptionTransition = null;
-			await this.saveSettings();
-			this.setEncryptionBlock(null);
-			logger.info("Encryption password rotated");
-		} catch (error) {
-			this.indexManager.clearIndexTransitionServices();
-			await this.recoverEncryptionTransition();
-			throw error;
-		}
+		logger.info(
+			"Re-uploading all files after encryption password rotation...",
+		);
+		await this.encryptionTransitionController.execute({
+			transition,
+			sourceService,
+			publishPrepared: publishRotatingManifest,
+			publishFilesCopied: publishRotatingManifest,
+			publishIndexCommitted: publishRotatingManifest,
+		});
+		logger.info("Encryption password rotated");
 	}
 
 	/**
@@ -1785,6 +1457,26 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					}
 				: undefined,
 		};
+	}
+
+	/** Build a reusable publisher for one transition manifest state. */
+	private createEncryptionManifestPublisher(
+		service: EncryptionService,
+		salt: string,
+		state: EncryptionManifest["state"],
+		revision: number,
+		transition: LocalEncryptionTransition,
+	): () => Promise<void> {
+		return async () =>
+			await this.indexManager.uploadEncryptionManifest(
+				await this.createEncryptionManifest(
+					service,
+					salt,
+					state,
+					revision,
+					transition,
+				),
+			);
 	}
 
 	private captureEncryptionSnapshot(): LocalEncryptionSnapshot {
@@ -2207,31 +1899,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (decision === "finish-target") {
 			await this.applyEncryptionSnapshot(transition.target);
 			await this.indexManager.loadRemoteIndex();
-			const cleanup = transition.sourceRawPaths.flatMap((path) => {
-				const expectedFingerprint =
-					transition.sourceFingerprints[path];
-				return expectedFingerprint
-					? [{ path, expectedFingerprint }]
-					: [];
-			});
-			await this.commitCanonicalMaintenance(
-				transition,
-				"cleanup",
-				cleanup,
-			);
-			await this.publishStableEncryptionSnapshot(transition.target);
-			await this.prepareGuardedCleanup(
-				transition.sourceRawPaths,
-				transition.sourceFingerprints,
-			);
-			await this.deleteRemoteRawPaths(
-				transition.sourceRawPaths,
-				transition.sourceFingerprints,
-			);
-			await this.deleteRemoteRawFolders(transition.sourceRawPaths);
-			await this.finishCanonicalMaintenanceIfCleanupComplete(
-				transition,
-			);
+			await this.encryptionTransitionController.completeTarget(transition);
+			return;
 		} else {
 			await this.applyEncryptionSnapshot(transition.source);
 			await this.indexManager.loadRemoteIndex();
@@ -2322,12 +1991,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						});
 						continue;
 					}
-					const current =
-						resource.md5 ||
-						resource.sha256 ||
-						resource.resource_id ||
-						resource.modified;
-					if (!expected || current !== expected) {
+					const current = getPhysicalResourceFingerprint(resource);
+					if (
+						!matchesPhysicalResourceFingerprint(expected, resource)
+					) {
 						logger.warn("Skipped changed encryption cleanup target", {
 							...transitionContext,
 							path,
@@ -2454,18 +2121,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	): Promise<void> {
 		if (rawFilePaths.length === 0) return;
 
-		const folders = new Set<string>();
-		for (const filePath of rawFilePaths) {
-			const segments = filePath.split("/");
-			for (let i = 1; i < segments.length; i++) {
-				folders.add(segments.slice(0, i).join("/"));
-			}
-		}
-		if (folders.size === 0) return;
-
-		const sorted = Array.from(folders).sort(
-			(a, b) => b.split("/").length - a.split("/").length,
-		);
+		const sorted = getAncestorDirectoriesDeepestFirst(rawFilePaths);
+		if (sorted.length === 0) return;
 
 		logger.info(`Cleaning up ${sorted.length} old remote folders...`);
 		for (const folder of sorted) {
@@ -2556,17 +2213,32 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Save local index to plugin data
 	 */
-	private async saveLocalIndex(): Promise<void> {
-		await this.saveData({
+	private buildPluginData(): PluginData {
+		return {
 			settings: this.settings,
-			localState: this.indexManager.getLocalIndexData(),
-			pendingMutations: this.indexManager.getPendingMutations(),
+			localState: this.indexManager?.getLocalIndexData() ?? null,
+			pendingMutations: this.indexManager?.getPendingMutations() ?? [],
 			pendingPhysicalActions:
-				this.indexManager.getPendingPhysicalActions(),
+				this.indexManager?.getPendingPhysicalActions() ?? [],
 			pendingWatcherEvents:
-				this.fileWatcher.getDeferredEvents(),
+				this.fileWatcher?.getDeferredEvents() ?? [],
 			encryptionTransition: this.encryptionTransition,
 			lastSyncStats: this.lastSyncStats,
-		} as PluginData);
+		};
+	}
+
+	/** Update the UI summary from one completed synchronization result. */
+	private updateLastSyncStats(result: SyncResult): void {
+		this.lastSyncStats = {
+			uploaded: result.uploaded,
+			downloaded: result.downloaded,
+			deleted: result.deleted,
+			errors: result.errors.length,
+		};
+	}
+
+	/** Persist one coherent snapshot of every device-local sync queue. */
+	private async persistPluginData(): Promise<void> {
+		await this.saveData(this.buildPluginData());
 	}
 }

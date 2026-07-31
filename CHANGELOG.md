@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.0.0-beta.8
+
+### Changed
+
+- Consolidated enable, disable, rotate, interrupted-transition recovery, and
+  Force recovery around one encryption transition executor while preserving
+  canonical index v3 and encryption manifest v2.
+- Unified service-file and physical-resource fingerprint rules. Existing
+  beta.7 pending actions remain valid when their stored identity is SHA-256,
+  MD5, resource ID, or server modification time.
+- Reused one plugin-data snapshot builder for lifecycle persistence, one Force
+  UI lifecycle, one watcher upload path, and one durable watcher drain.
+- Reused shared ancestor traversal and baseline drift rules for ordinary sync,
+  folder tombstones, and encryption cleanup.
+- Consolidated index codec attempts, stale-lock observation, sync coordinator
+  dispatch, Force bootstrap, and bulk upload paths without adding remote
+  formats or API calls.
+- Reused a resolve-once modal base lifecycle for all encryption dialogs.
+
+### Testing
+
+- Added compatibility coverage for beta.7 physical fingerprints and strict
+  service-file fingerprints that never trust resource ID alone.
+- Added shared encryption executor coverage for all three transition kinds and
+  verified transition codecs are cleared after re-encode failure.
+- Retained all beta.7 startup, Force, multi-device causal, encryption, watcher,
+  and index transaction tests.
+
 ## 2.0.0-beta.7
 
 ### Changed

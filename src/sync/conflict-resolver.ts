@@ -10,6 +10,11 @@ import type {
 import { getFileName, getDirectory, getExtension } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { findFolderTombstone } from "./index-rules";
+import {
+	getRemotePhysicalDrift,
+	hasCanonicalMetadataChanged,
+	hasLocalContentChanged,
+} from "./baseline-rules";
 
 export class ConflictResolver {
 	/**
@@ -247,14 +252,14 @@ export class ConflictResolver {
 			};
 		}
 
-		const localChanged =
-			localMeta.sha256 !== localIndexMeta.sha256;
-		const canonicalChanged =
-			!remoteIndexMeta ||
-			remoteIndexMeta.deleted !== localIndexMeta.deleted ||
-			remoteIndexMeta.changedRevision !==
-				localIndexMeta.changedRevision ||
-			remoteIndexMeta.sha256 !== localIndexMeta.sha256;
+		const localChanged = hasLocalContentChanged(
+			localMeta,
+			localIndexMeta,
+		);
+		const canonicalChanged = hasCanonicalMetadataChanged(
+			remoteIndexMeta,
+			localIndexMeta,
+		);
 		const remotelyChanged =
 			canonicalChanged ||
 			this.hasPhysicalRemoteDrift(remoteMeta, remoteIndexMeta);
@@ -305,25 +310,10 @@ export class ConflictResolver {
 		remoteMeta: FileMetadata,
 		remoteIndexMeta: FileMetadata | null,
 	): boolean {
-		if (!remoteIndexMeta) return true;
-		if (
-			remoteIndexMeta.remoteFingerprint !== undefined &&
-			remoteMeta.remoteFingerprint !== undefined
-		) {
-			return (
-				remoteIndexMeta.remoteFingerprint !==
-				remoteMeta.remoteFingerprint
-			);
-		}
-		if (
-			typeof remoteIndexMeta.remoteMtime === "number" &&
-			Number.isFinite(remoteIndexMeta.remoteMtime) &&
-			typeof remoteMeta.remoteMtime === "number" &&
-			Number.isFinite(remoteMeta.remoteMtime)
-		) {
-			return remoteIndexMeta.remoteMtime !== remoteMeta.remoteMtime;
-		}
-		return remoteMeta.sha256 !== remoteIndexMeta.sha256;
+		return (
+			getRemotePhysicalDrift(remoteMeta, remoteIndexMeta) ??
+			remoteMeta.sha256 !== remoteIndexMeta?.sha256
+		);
 	}
 
 	/**
@@ -413,19 +403,11 @@ export class ConflictResolver {
 			if (tombstoneApplies) {
 				const localChanged =
 					localMeta !== null &&
-					(localIndexMeta === null ||
-						localMeta.sha256 !== localIndexMeta.sha256);
+					hasLocalContentChanged(localMeta, localIndexMeta);
 				const remoteChanged =
 					remoteMeta !== null &&
-					(remoteIndexMeta === null ||
-						(remoteMeta.remoteFingerprint !== undefined &&
-							remoteIndexMeta.remoteFingerprint !== undefined &&
-							remoteMeta.remoteFingerprint !==
-								remoteIndexMeta.remoteFingerprint) ||
-						(typeof remoteMeta.remoteMtime === "number" &&
-							typeof remoteIndexMeta.remoteMtime === "number" &&
-							remoteMeta.remoteMtime !==
-								remoteIndexMeta.remoteMtime));
+					(getRemotePhysicalDrift(remoteMeta, remoteIndexMeta) ??
+						false);
 				if (localChanged && remoteChanged) {
 					operations.push({
 						action: "conflict",

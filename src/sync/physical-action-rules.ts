@@ -1,4 +1,12 @@
-import type { PendingPhysicalAction, SyncIndex } from "../types";
+import type {
+	PendingPhysicalAction,
+	SyncIndex,
+	YandexResource,
+} from "../types";
+import {
+	getPhysicalResourceFingerprint,
+	matchesPhysicalResourceFingerprint,
+} from "../utils/resource-fingerprint";
 
 export type PhysicalDeleteFingerprintDecision =
 	| "match"
@@ -43,6 +51,21 @@ export function classifyPhysicalDeleteFingerprint(
 	if (!expectedFingerprint) return "missing-expected";
 	if (!currentFingerprint) return "missing-current";
 	return expectedFingerprint === currentFingerprint ? "match" : "mismatch";
+}
+
+/**
+ * Classify a destructive guard against current Yandex resource metadata.
+ * Legacy beta fingerprints may refer to any server identity field.
+ */
+export function classifyPhysicalDeleteResource(
+	expectedFingerprint: string | undefined,
+	resource: YandexResource | null,
+): PhysicalDeleteFingerprintDecision {
+	if (!expectedFingerprint) return "missing-expected";
+	if (!getPhysicalResourceFingerprint(resource)) return "missing-current";
+	return matchesPhysicalResourceFingerprint(expectedFingerprint, resource)
+		? "match"
+		: "mismatch";
 }
 
 /**

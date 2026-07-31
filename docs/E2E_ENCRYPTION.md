@@ -112,9 +112,15 @@ Enable, disable и rotate выполняются как эксклюзивная
 FileWatcher сохраняет пользовательские события на протяжении всего перехода и
 воспроизводит их только после финального manifest.
 
-### 2.4 main.ts
+### 2.4 EncryptionTransitionController и main wiring
 
-Управление жизненным циклом шифрования.
+`src/crypto/encryption-transition.ts` содержит общий executor для enable,
+disable и rotate. Он переиспользует существующие `SyncEngine` и
+`IndexManager` для maintenance claim, physical re-encode, canonical commit,
+публикации target mode и guarded cleanup. `main.ts` инициализирует зависимости,
+хранит device-local transition snapshot и оставляет UI/lifecycle wrappers.
+Mode-specific код задаёт source/target key и состояние manifest, но не
+дублирует фазовый workflow.
 
 #### Инициализация (`onload()`)
 
@@ -153,7 +159,8 @@ manifest и начинается guarded cleanup старых файлов.
 а cleanup старого набора повторяется идемпотентно. Файл удаляется только при
 совпадении сохранённого fingerprint.
 
-При смене пароля используется отдельный метод `rotateEncryptionPassword(newPassword)`:
+Публичный метод `rotateEncryptionPassword(newPassword)` передаёт source/target
+параметры тому же transition executor:
 
 1. Сохраняет raw paths и fingerprints старого набора.
 2. Генерирует новый salt/key/verifier и увеличивает `revision`.
@@ -220,7 +227,9 @@ scheduler и realtime watcher через guard в `SyncEngine`.
 
 ### 2.5 encryption-modals.ts (`src/ui/encryption-modals.ts`)
 
-Все модалки шифрования — классы, наследующие `Modal`:
+Все модалки шифрования используют общий resolve-once lifecycle. Password
+dialogs наследуются от внутреннего `PasswordModal`, который расширяет
+`ResolvableModal`:
 
 | Класс                        | Назначение                                           | Кол-во полей     | Кнопки                                                  |
 | ---------------------------- | ---------------------------------------------------- | ---------------- | ------------------------------------------------------- |
@@ -232,8 +241,9 @@ scheduler и realtime watcher через guard в `SyncEngine`.
 
 Общий паттерн для всех модалок:
 
-- `private finish(value)` — разрешает Promise с защитой от повторного вызова (`resolved` guard)
-- `onClose()` — прототипный метод, вызывает `finish(null/false)` как fallback
+- `ResolvableModal.finish(value)` разрешает Promise с защитой от повторного вызова
+- `ResolvableModal.onClose()` вызывает `finish(null/false)` как fallback
+- `PasswordModal` переиспользует password input, confirm validation и submit/cancel buttons
 - Кнопки вызывают `this.finish(value)` **до** `this.close()`, чтобы `onClose()` не перезаписал результат
 - `Setting` + `addButton()` + класс `force-sync-modal-buttons` для вертикального расположения кнопок
 
@@ -324,6 +334,10 @@ Legacy формат v1 поддерживается для чтения:
 
 Для v1 нет `verifier`, поэтому пароль проверяется строгим чтением encrypted index.
 Новые записи всегда используют v2.
+
+Во время transition manifest v2 дополнительно содержит `transition` с ID,
+phase, initiating device, source/target revisions и mode descriptors. Пароли и
+ключи в manifest не записываются.
 
 Manifest хранится на Яндекс.Диске как `/Приложение/ваш-vault/.obsidian-encrypt.json`.
 
@@ -426,6 +440,7 @@ Device B (encryption was disabled elsewhere, opens Obsidian):
 11. **Remote manifest v2** — единый сигнал для multi-device включения, rotation и временных состояний
 12. **Fail-closed sync guard** — sync не запускается без актуального ключа или при незавершённой remote-операции
 13. **Verifier вместо index-check** — пароль проверяется через AES-GCM verifier, а не через чтение индекса
+14. **Единый EncryptionTransitionController** — enable, disable, rotate и recovery используют один фазовый executor
 
 ## 6. Форматы
 
@@ -490,3 +505,4 @@ Device B (encryption was disabled elsewhere, opens Obsidian):
 | 13   | Distributed maintenance, physical re-encode без Force и guarded cleanup                 | Done   |
 | 14   | `ensureEncryptionReady`: авто-отключение при пропавшем манифесте вместо блокировки sync | Done   |
 | 15   | `encryptionStateChangeCallback`: авто-обновление toggle при connect и авто-отключении   | Done   |
+| 16   | EncryptionTransitionController: общий enable/disable/rotate/Force recovery workflow    | Done   |

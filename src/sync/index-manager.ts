@@ -44,6 +44,10 @@ import {
 } from "../crypto/encryption";
 import type { EncryptionService } from "../crypto/encryption";
 import {
+	getPhysicalResourceFingerprint,
+	getStableContentFingerprint,
+} from "../utils/resource-fingerprint";
+import {
 	classifyIndexVersion,
 	isPathInsideFolder,
 	isStableLockStale,
@@ -94,6 +98,10 @@ export interface IndexDecodeAttempt {
 	stage: IndexDecodeStage;
 	errorName: string;
 }
+
+type IndexCodecAttemptResult =
+	| { data: Partial<SyncIndex> }
+	| { attempt: IndexDecodeAttempt };
 
 export class IndexManager {
 	private yandexClient: YandexDiskClient;
@@ -1244,7 +1252,7 @@ export class IndexManager {
 				path: localPath,
 				sha256: resource.sha256 || "",
 				remoteFingerprint:
-					resource.sha256 || resource.md5 || undefined,
+					getPhysicalResourceFingerprint(resource) ?? undefined,
 				size: resource.size || 0,
 				mtime,
 				// Server-side modification time, stored separately so remote-side
@@ -1459,80 +1467,39 @@ export class IndexManager {
 			const codec =
 				codecLabel ??
 				(serviceOverride ? "current" : "plaintext");
-			let content: ArrayBuffer;
-			try {
-				content =
-					await this.yandexClient.decodeServiceFileContent(
-						raw,
-						serviceOverride,
-					);
-			} catch (error) {
+			const decoded = await this.tryDecodeIndexCodec(
+				raw,
+				serviceOverride,
+				codec,
+			);
+			if ("attempt" in decoded) {
 				throw await this.createUnreadableIndexError(
 					raw,
 					fingerprint,
-					[
-						{
-							codec,
-							stage: "decrypt",
-							errorName: this.getErrorName(error),
-						},
-					],
-				);
-			}
-			let data: Partial<SyncIndex>;
-			try {
-				data = this.parseIndexJson(content);
-			} catch (error) {
-				throw await this.createUnreadableIndexError(
-					raw,
-					fingerprint,
-					[
-						{
-							codec,
-							stage: "json",
-							errorName: this.getErrorName(error),
-						},
-					],
+					[decoded.attempt],
 				);
 			}
 			logger.debug("Decoded remote index snapshot", { codec });
 			return {
-				index: this.normalizeParsedIndex(data, allowLegacy),
+				index: this.normalizeParsedIndex(decoded.data, allowLegacy),
 				codec,
 			};
 		}
 
 		const attempts: IndexDecodeAttempt[] = [];
-		let currentContent: ArrayBuffer | null = null;
-		try {
-			currentContent =
-				await this.yandexClient.decodeServiceFileContent(raw);
-		} catch (error) {
-			attempts.push({
+		const current = await this.tryDecodeIndexCodec(
+			raw,
+			undefined,
+			"current",
+		);
+		if ("data" in current) {
+			logger.debug("Decoded remote index snapshot", { codec: "current" });
+			return {
+				index: this.normalizeParsedIndex(current.data, allowLegacy),
 				codec: "current",
-				stage: "decrypt",
-				errorName: this.getErrorName(error),
-			});
+			};
 		}
-		if (currentContent) {
-			try {
-				const data = this.parseIndexJson(currentContent);
-				logger.debug("Decoded remote index snapshot", {
-					codec: "current",
-				});
-				return {
-					index: this.normalizeParsedIndex(data, allowLegacy),
-					codec: "current",
-				};
-			} catch (error) {
-				if (!(error instanceof SyntaxError)) throw error;
-				attempts.push({
-					codec: "current",
-					stage: "json",
-					errorName: this.getErrorName(error),
-				});
-			}
-		}
+		attempts.push(current.attempt);
 
 		if (!this.yandexClient.hasEncryptionService()) {
 			throw await this.createUnreadableIndexError(
@@ -1542,27 +1509,53 @@ export class IndexManager {
 			);
 		}
 
-		try {
-			const data = this.parseIndexJson(raw);
+		const plaintext = await this.tryDecodeIndexCodec(
+			raw,
+			null,
+			"plaintext",
+		);
+		if ("data" in plaintext) {
 			logger.debug("Decoded remote index snapshot", {
 				codec: "plaintext",
 			});
 			return {
-				index: this.normalizeParsedIndex(data, allowLegacy),
+				index: this.normalizeParsedIndex(plaintext.data, allowLegacy),
 				codec: "plaintext",
 			};
+		}
+		attempts.push(plaintext.attempt);
+		throw await this.createUnreadableIndexError(raw, fingerprint, attempts);
+	}
+
+	/** Decode and parse one codec without catching semantic index errors. */
+	private async tryDecodeIndexCodec(
+		raw: ArrayBuffer,
+		service: EncryptionService | null | undefined,
+		codec: IndexCodec,
+	): Promise<IndexCodecAttemptResult> {
+		let content: ArrayBuffer;
+		try {
+			content = await this.yandexClient.decodeServiceFileContent(raw, service);
+		} catch (error) {
+			return {
+				attempt: {
+					codec,
+					stage: "decrypt",
+					errorName: this.getErrorName(error),
+				},
+			};
+		}
+		try {
+			return { data: this.parseIndexJson(content) };
 		} catch (error) {
 			if (!(error instanceof SyntaxError)) throw error;
-			attempts.push({
-				codec: "plaintext",
-				stage: "json",
-				errorName: this.getErrorName(error),
-			});
-			throw await this.createUnreadableIndexError(
-				raw,
-				fingerprint,
-				attempts,
-			);
+			return {
+				attempt: {
+					codec,
+					stage: "json",
+					errorName: this.getErrorName(error),
+				},
+			};
 		}
 	}
 
@@ -1872,8 +1865,7 @@ export class IndexManager {
 			(resource) =>
 				[
 					resource.resource_id || "",
-					resource.md5 || resource.sha256 || "",
-					resource.modified || "",
+					getStableContentFingerprint(resource) || "",
 				].join(":"),
 			4,
 			() => (rootExists ? "exists" : "missing"),
@@ -1889,6 +1881,32 @@ export class IndexManager {
 		);
 	}
 
+	/**
+	 * Observe one lock lease using content identity that changes on overwrite.
+	 */
+	private isObservedLockStale(resource: YandexResource): boolean {
+		const fingerprint = getStableContentFingerprint(resource);
+		if (!fingerprint) {
+			throw new AmbiguousRemoteIndexLockError(
+				"Index lock has no stable content identity",
+			);
+		}
+		const now = Date.now();
+		const observed = this.observedLocks.get(resource.name);
+		if (!observed || observed.fingerprint !== fingerprint) {
+			this.observedLocks.set(resource.name, {
+				fingerprint,
+				firstSeenAt: now,
+			});
+			return false;
+		}
+		return isStableLockStale(
+			observed.firstSeenAt,
+			now,
+			INDEX_LOCK_STALE_MS,
+		);
+	}
+
 	private async recoverStaleLock(
 		knownLocks?: YandexResource[],
 	): Promise<void> {
@@ -1901,28 +1919,7 @@ export class IndexManager {
 		}
 
 		for (const resource of locks) {
-			const fingerprint =
-				resource.md5 ||
-				resource.sha256 ||
-				resource.resource_id ||
-				resource.modified;
-			const observed = this.observedLocks.get(resource.name);
-			if (!observed || observed.fingerprint !== fingerprint) {
-				this.observedLocks.set(resource.name, {
-					fingerprint,
-					firstSeenAt: Date.now(),
-				});
-				continue;
-			}
-			if (
-				!isStableLockStale(
-					observed.firstSeenAt,
-					Date.now(),
-					INDEX_LOCK_STALE_MS,
-				)
-			) {
-				continue;
-			}
+			if (!this.isObservedLockStale(resource)) continue;
 
 			const lockPath = joinPath(
 				this.settings.remotePath,
@@ -1986,28 +1983,7 @@ export class IndexManager {
 			);
 		}
 		for (const resource of locks) {
-			const fingerprint =
-				resource.md5 ||
-				resource.sha256 ||
-				resource.resource_id ||
-				resource.modified;
-			const observed = this.observedLocks.get(resource.name);
-			if (!observed || observed.fingerprint !== fingerprint) {
-				this.observedLocks.set(resource.name, {
-					fingerprint,
-					firstSeenAt: Date.now(),
-				});
-				continue;
-			}
-			if (
-				!isStableLockStale(
-					observed.firstSeenAt,
-					Date.now(),
-					INDEX_LOCK_STALE_MS,
-				)
-			) {
-				continue;
-			}
+			if (!this.isObservedLockStale(resource)) continue;
 			const canonical = await this.downloadIndex(
 				this.getRemoteIndexPath(),
 				this.allowLegacyWriteOnce,
@@ -2542,11 +2518,7 @@ export class IndexManager {
 				continue;
 			}
 
-			const fingerprint =
-				resource.md5 ||
-				resource.sha256 ||
-				resource.resource_id ||
-				resource.modified;
+			const fingerprint = getPhysicalResourceFingerprint(resource);
 			if (!fingerprint) continue;
 			result.push({ path: localPath, fingerprint });
 		}
@@ -2818,7 +2790,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.7. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.8. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

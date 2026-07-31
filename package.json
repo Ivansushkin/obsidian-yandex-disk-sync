@@ -1,6 +1,6 @@
 {
 	"name": "yandex-disk-sync",
-	"version": "2.0.0-beta.7",
+	"version": "2.0.0-beta.8",
 	"description": "Sync Obsidian vault with Yandex Disk",
 	"main": "main.js",
 	"type": "module",
@@ -9,7 +9,7 @@
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"test": "node test.config.mjs",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
-		"lint": "eslint ."
+		"lint": "eslint . --max-warnings 0"
 	},
 	"keywords": [],
 	"license": "0-BSD",

@@ -13,6 +13,10 @@ import type { EncryptionService } from "../crypto/encryption";
 import { logger } from "../utils/logger";
 import { encodePathForUrl, isProtectedPath, normalizePath } from "../utils/path-utils";
 import { runWithConcurrency } from "../utils/semaphore";
+import {
+	getMatchingStableContentFingerprint,
+	getStableContentFingerprint,
+} from "../utils/resource-fingerprint";
 
 const API_BASE_URL = "https://cloud-api.yandex.net/v1/disk";
 
@@ -138,33 +142,14 @@ export class YandexDiskClient {
 	 * reads. A resource ID alone is intentionally insufficient after overwrite.
 	 */
 	getContentFingerprint(resource: YandexResource | null): string | null {
-		if (!resource) return null;
-		if (resource.sha256) return `sha256:${resource.sha256}`;
-		if (resource.md5) return `md5:${resource.md5}`;
-		if (resource.modified) {
-			return `modified:${resource.modified}:size:${resource.size ?? -1}`;
-		}
-		return null;
+		return getStableContentFingerprint(resource);
 	}
 
 	private getMatchingContentFingerprint(
 		before: YandexResource,
 		after: YandexResource,
 	): string | null {
-		if (before.sha256 && after.sha256) {
-			return before.sha256 === after.sha256
-				? `sha256:${after.sha256}`
-				: null;
-		}
-		if (before.md5 && after.md5) {
-			return before.md5 === after.md5 ? `md5:${after.md5}` : null;
-		}
-		if (before.modified && after.modified) {
-			return before.modified === after.modified && before.size === after.size
-				? `modified:${after.modified}:size:${after.size ?? -1}`
-				: null;
-		}
-		return null;
+		return getMatchingStableContentFingerprint(before, after);
 	}
 
 	/**

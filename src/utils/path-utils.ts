@@ -50,6 +50,27 @@ export function getDirectory(path: string): string {
 }
 
 /**
+ * Collect unique ancestor directories for file paths, deepest directories first.
+ */
+export function getAncestorDirectoriesDeepestFirst(
+	filePaths: Iterable<string>,
+): string[] {
+	const directories = new Set<string>();
+	for (const filePath of filePaths) {
+		let directory = getDirectory(filePath);
+		while (directory) {
+			directories.add(directory);
+			directory = getDirectory(directory);
+		}
+	}
+	return [...directories].sort((left, right) => {
+		const depthDifference =
+			right.split("/").length - left.split("/").length;
+		return depthDifference || left.localeCompare(right);
+	});
+}
+
+/**
  * Get file extension
  */
 export function getExtension(path: string): string {

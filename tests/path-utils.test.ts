@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	getAncestorDirectoriesDeepestFirst,
 	shouldSyncFile,
 	toLocalPath,
 } from "../src/utils/path-utils";
@@ -71,5 +72,16 @@ test("transition physical paths use one root-relative representation", () => {
 			"obsidian-sync",
 		),
 		"plain/folder/file.md",
+	);
+});
+
+test("ancestor directories are unique and deepest first", () => {
+	assert.deepEqual(
+		getAncestorDirectoriesDeepestFirst([
+			"a/b/c/one.md",
+			"a/b/two.md",
+			"a/d/three.md",
+		]),
+		["a/b/c", "a/b", "a/d", "a"],
 	);
 });

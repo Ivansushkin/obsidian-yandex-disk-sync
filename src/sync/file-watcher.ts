@@ -122,23 +122,7 @@ export class FileWatcher {
 		this.isPausedForSync = true;
 		logger.info("[FileWatcher] Paused for full sync");
 
-		for (const pending of this.debounceTimers.values()) {
-			clearTimeout(pending.timer);
-			this.deferEvent(pending.event);
-		}
-		this.debounceTimers.clear();
-		for (const event of this.readyFileEvents.values()) {
-			this.deferEvent(event);
-		}
-		this.readyFileEvents.clear();
-		if (this.batchFlushTimer) {
-			clearTimeout(this.batchFlushTimer);
-			this.batchFlushTimer = null;
-		}
-		if (this.deferredReplayTimer) {
-			clearTimeout(this.deferredReplayTimer);
-			this.deferredReplayTimer = null;
-		}
+		this.drainPendingFileEvents();
 		if (context.kind === "full") {
 			this.captureFullSyncBarrier(context);
 		}
@@ -283,24 +267,7 @@ export class FileWatcher {
 			return;
 		}
 
-		// Clear all debounce timers
-		for (const pending of this.debounceTimers.values()) {
-			clearTimeout(pending.timer);
-			this.deferEvent(pending.event);
-		}
-		this.debounceTimers.clear();
-		for (const event of this.readyFileEvents.values()) {
-			this.deferEvent(event);
-		}
-		this.readyFileEvents.clear();
-		if (this.batchFlushTimer) {
-			clearTimeout(this.batchFlushTimer);
-			this.batchFlushTimer = null;
-		}
-		if (this.deferredReplayTimer) {
-			clearTimeout(this.deferredReplayTimer);
-			this.deferredReplayTimer = null;
-		}
+		this.drainPendingFileEvents();
 
 		// Unsubscribe from events
 		for (const ref of this.eventRefs) {
@@ -363,24 +330,21 @@ export class FileWatcher {
 	 * Handle file creation
 	 */
 	private handleFileCreate(file: TFile): void {
-		if (
-			this.syncEngine.consumeInternalWatcherEvent(file.path, "upload")
-		) {
-			return;
-		}
-		if (this.isPausedForSync) {
-			this.deferEvent(this.createFileEvent(file.path, "upload"));
-			return;
-		}
-
-		logger.debug(`File created: ${file.path}`);
-		this.scheduleSync(file.path, "upload");
+		this.handleFileUpload(file, "created");
 	}
 
 	/**
 	 * Handle file modification
 	 */
 	private handleFileModify(file: TFile): void {
+		this.handleFileUpload(file, "modified");
+	}
+
+	/** Route create and modify events through one durable upload path. */
+	private handleFileUpload(
+		file: TFile,
+		reason: "created" | "modified",
+	): void {
 		if (
 			this.syncEngine.consumeInternalWatcherEvent(file.path, "upload")
 		) {
@@ -391,8 +355,29 @@ export class FileWatcher {
 			return;
 		}
 
-		logger.debug(`File modified: ${file.path}`);
+		logger.debug(`File ${reason}: ${file.path}`);
 		this.scheduleSync(file.path, "upload");
+	}
+
+	/** Move queued file events into durable storage and cancel drain timers. */
+	private drainPendingFileEvents(): void {
+		for (const pending of this.debounceTimers.values()) {
+			clearTimeout(pending.timer);
+			this.deferEvent(pending.event);
+		}
+		this.debounceTimers.clear();
+		for (const event of this.readyFileEvents.values()) {
+			this.deferEvent(event);
+		}
+		this.readyFileEvents.clear();
+		if (this.batchFlushTimer) {
+			clearTimeout(this.batchFlushTimer);
+			this.batchFlushTimer = null;
+		}
+		if (this.deferredReplayTimer) {
+			clearTimeout(this.deferredReplayTimer);
+			this.deferredReplayTimer = null;
+		}
 	}
 
 	/**

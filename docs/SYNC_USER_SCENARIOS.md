@@ -189,6 +189,7 @@
 | ENC-006 | P0  | Index/lock/manifest                   | Имена service-файлов raw, index content зашифрован, manifest raw | auto: integration      |
 | ENC-007 | P0  | Wrong-key canonical                   | Ошибка расшифровки не интерпретируется как пустой remote         | auto: fault            |
 | ENC-008 | P0  | Source/target codec во время transition | Явный codec не использует plaintext fallback                     | auto: `explicit transition codec does not fall back to plaintext` |
+| ENC-009 | P0  | Сбой enable/disable/rotate после установки transition codec | Общий executor всегда очищает source/target codec и запускает causal recovery | auto: `transition services are cleared after a failed re-encode`; fault matrix |
 
 ## Переходы шифрования
 
@@ -254,6 +255,7 @@
 | NET-011 | P1  | 1001+ объектов в root                  | Locks после первой страницы обнаруживаются                                | auto: index-transaction |
 | NET-012 | P1  | Fingerprint отсутствует                | Destructive action блокируется или использует подтверждённую альтернативу | auto: fake-yandex       |
 | NET-013 | P0  | Сбой после перезаписи захваченного lock | Исходные raw bytes восстанавливаются и проверяются до возврата canonical; неоднозначность не ретраится | auto: index-transaction + fake-yandex |
+| NET-014 | P0  | Pending action создан beta.7 с SHA-256, MD5, resource ID или modified | Beta.8 принимает совпадение с любым доступным server identity, но новый destructive action использует единый strongest fingerprint | auto: `physical fingerprints accept every beta.7 server identity` |
 
 ## Масштаб, платформы и пути
 
@@ -302,6 +304,7 @@
 | DIAG-009 | P1 | После post-pass остаётся pending move          | Full sync пишет `completed with errors`, сохраняет action и не продвигает observed revision | auto: `unresolved final move recovery records a full-sync error`; manual-required |
 | DIAG-010 | P1 | Realtime batch вернул структурированный `retry` | Пишется warning-summary с `completed/superseded/retry`; событие остаётся durable без общего replay error | auto: `structured watcher retry remains durable without throwing` |
 | DIAG-011 | P2 | Startup/full завершён без изменений             | Summary содержит GET по manifest/index/root/tree, concurrency и длительность без путей/ciphertext | auto: integration; manual-required |
+| DIAG-012 | P1 | Enable, disable и rotate падают на одинаковой фазе | Все три режима проходят один executor, сохраняют одинаковый phase/recovery contract и не оставляют transition codec | auto: `all rewrite modes use the same post-commit cleanup`; fault matrix |
 
 ## Матрица вариантов
 
