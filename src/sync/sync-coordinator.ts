@@ -18,6 +18,25 @@ export interface SyncSessionHooks {
 	onExit?: (kind: SyncSessionKind) => void | Promise<void>;
 }
 
+export interface QueuedSyncSession {
+	id: string;
+	kind: SyncSessionKind;
+}
+
+export type SyncSessionSettlement<T> =
+	| { status: "fulfilled"; value: T }
+	| { status: "rejected"; reason: unknown };
+
+export interface SyncRunHooks<T> {
+	/** Run local preparation before the session enters the shared queue. */
+	prepare?: (session: QueuedSyncSession) => void | Promise<void>;
+	/** Persist acknowledgement while the session still owns the coordinator. */
+	settle?: (
+		settlement: SyncSessionSettlement<T>,
+		session: ActiveSyncSession,
+	) => void | Promise<void>;
+}
+
 /**
  * Serializes every synchronization entry point before any asynchronous guard
  * or remote operation can run.
@@ -34,7 +53,11 @@ export class SyncCoordinator {
 	/**
 	 * Run one exclusive session. Concurrent full-sync requests share one result.
 	 */
-	run<T>(kind: SyncSessionKind, task: () => Promise<T>): Promise<T> {
+	run<T>(
+		kind: SyncSessionKind,
+		task: () => Promise<T>,
+		runHooks: SyncRunHooks<T> = {},
+	): Promise<T> {
 		if (kind === "full" && this.pendingFull) {
 			logger.debug("Coalesced full sync request into pending session", {
 				activeSessionId: this.activeSession?.id ?? null,
@@ -42,8 +65,31 @@ export class SyncCoordinator {
 			return this.pendingFull as Promise<T>;
 		}
 
-		const enqueuedAt = Date.now();
 		const sessionId = this.createSessionId(kind);
+		const execute = async (): Promise<T> => {
+			await runHooks.prepare?.({ id: sessionId, kind });
+			return await this.enqueueSession(kind, sessionId, task, runHooks);
+		};
+		const run = execute();
+		if (kind === "full") {
+			const shared = run.finally(() => {
+				if (this.pendingFull === shared) {
+					this.pendingFull = null;
+				}
+			});
+			this.pendingFull = shared;
+			return shared;
+		}
+		return run;
+	}
+
+	private enqueueSession<T>(
+		kind: SyncSessionKind,
+		sessionId: string,
+		task: () => Promise<T>,
+		runHooks: SyncRunHooks<T>,
+	): Promise<T> {
+		const enqueuedAt = Date.now();
 		logger.debug("Sync session queued", {
 			sessionId,
 			sessionKind: kind,
@@ -63,10 +109,16 @@ export class SyncCoordinator {
 				queueWaitMs: startedAt - enqueuedAt,
 			});
 			let entered = false;
+			let fulfilledSettlementAttempted = false;
 			try {
 				await this.hooks.onEnter?.(kind);
 				entered = true;
 				const result = await task();
+				fulfilledSettlementAttempted = true;
+				await runHooks.settle?.(
+					{ status: "fulfilled", value: result },
+					this.activeSession,
+				);
 				logger.info("Sync session task returned", {
 					sessionId,
 					sessionKind: kind,
@@ -74,6 +126,20 @@ export class SyncCoordinator {
 				});
 				return result;
 			} catch (error) {
+				try {
+					if (!fulfilledSettlementAttempted && this.activeSession) {
+						await runHooks.settle?.(
+							{ status: "rejected", reason: error },
+							this.activeSession,
+						);
+					}
+				} catch (settlementError) {
+					logger.error("Sync session settlement failed", {
+						sessionId,
+						sessionKind: kind,
+						error: settlementError,
+					});
+				}
 				logger.error("Sync session failed", {
 					sessionId,
 					sessionKind: kind,
@@ -96,15 +162,6 @@ export class SyncCoordinator {
 			() => undefined,
 			() => undefined,
 		);
-		if (kind === "full") {
-			const shared = run.finally(() => {
-				if (this.pendingFull === shared) {
-					this.pendingFull = null;
-				}
-			});
-			this.pendingFull = shared;
-			return shared;
-		}
 		return run;
 	}
 

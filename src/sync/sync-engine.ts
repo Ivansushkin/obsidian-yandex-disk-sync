@@ -59,6 +59,7 @@ import {
 	wasMutationApplied,
 	wasPendingPutAccepted,
 	wasRenameSourceCausallyLive,
+	type FileRenameOutcome,
 	type RealtimeBatchResult,
 	type RealtimeFileEvent,
 	type WatcherCausalContext,
@@ -94,6 +95,7 @@ export interface SyncRunOptions {
 export interface SyncLifecycleContext {
 	sessionId: string;
 	kind: SyncSessionKind;
+	startup?: boolean;
 }
 
 export interface SyncLifecycleOutcome extends SyncLifecycleContext {
@@ -119,6 +121,9 @@ export class SyncEngine {
 	private realtimeGuardValidationToken: string | undefined;
 
 	private syncPauseCallbacks: Array<
+		(context: SyncLifecycleContext) => void | Promise<void>
+	> = [];
+	private syncPrepareCallbacks: Array<
 		(context: SyncLifecycleContext) => void | Promise<void>
 	> = [];
 	private syncResumeCallbacks: Array<
@@ -195,6 +200,19 @@ export class SyncEngine {
 			if (index >= 0) {
 				this.syncPauseCallbacks.splice(index, 1);
 			}
+		};
+	}
+
+	/** Register local preparation that must finish before a full session queues. */
+	onSyncPrepare(
+		callback: (
+			context: SyncLifecycleContext,
+		) => void | Promise<void>,
+	): () => void {
+		this.syncPrepareCallbacks.push(callback);
+		return () => {
+			const index = this.syncPrepareCallbacks.indexOf(callback);
+			if (index >= 0) this.syncPrepareCallbacks.splice(index, 1);
 		};
 	}
 
@@ -690,7 +708,16 @@ export class SyncEngine {
 			(result) =>
 				`Full reconciliation completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
 			);
-		return await this.runCoordinatedSession("full", options, run);
+		try {
+			return await this.runCoordinatedSession("full", options, run);
+		} catch (error) {
+			const message =
+				error instanceof Error ? error.message : String(error);
+			logger.warn("Full reconciliation preparation failed", {
+				error,
+			});
+			return this.createErrorResult(message);
+		}
 	}
 
 	/**
@@ -1817,6 +1844,10 @@ export class SyncEngine {
 	 */
 	async syncFileBatch(
 		events: RealtimeFileEvent[],
+		settle?: (
+			result: RealtimeBatchResult,
+			context: SyncLifecycleContext,
+		) => void | Promise<void>,
 	): Promise<RealtimeBatchResult> {
 		return await this.coordinator.run("realtime", async () => {
 			const batchResult = createRealtimeBatchResult();
@@ -1832,7 +1863,7 @@ export class SyncEngine {
 			const prepared: Array<{
 				id: string;
 				path: string;
-				action: "upload" | "delete";
+				action: "upload" | "delete" | "noop";
 				mutation: ReturnType<IndexManager["enqueueMutation"]>;
 				snapshot?: { content: ArrayBuffer; sha256: string };
 			}> = [];
@@ -1919,11 +1950,51 @@ export class SyncEngine {
 					}
 					continue;
 				}
-				this.indexManager.markLocalFileDeleted(event.path);
 				const pendingPut = this.reusePendingFileMutation(
 					event,
 					"put",
 				);
+				const canonicalSource =
+					this.indexManager.getRemoteIndex().files[event.path];
+				const baselineSource =
+					this.indexManager.getLocalIndex().files[event.path];
+				const pendingPutApplied =
+					pendingPut !== undefined &&
+					wasMutationApplied(
+						pendingPut,
+						this.indexManager.getRemoteIndex().appliedMutationSeq,
+					);
+				if (
+					pendingPut &&
+					!pendingPutApplied &&
+					(!canonicalSource || canonicalSource.deleted) &&
+					(!baselineSource || baselineSource.deleted)
+				) {
+					const noop =
+						this.indexManager.replacePendingPutWithNoop(pendingPut.id);
+					if (noop) {
+						prepared.push({
+							...event,
+							action: "noop",
+							mutation: noop,
+						});
+						continue;
+					}
+				}
+				if (
+					!pendingPut &&
+					(!canonicalSource || canonicalSource.deleted) &&
+					(!baselineSource || baselineSource.deleted)
+				) {
+					batchResult.superseded.push(event.id);
+					logger.debug("Realtime delete reduced to local no-op", {
+						eventId: event.id,
+						path: event.path,
+						reason: "source-never-causally-live",
+					});
+					continue;
+				}
+				this.indexManager.markLocalFileDeleted(event.path);
 				prepared.push({
 					...event,
 					mutation:
@@ -1958,7 +2029,7 @@ export class SyncEngine {
 							true,
 							item.snapshot,
 						);
-					} else {
+					} else if (item.action === "delete") {
 						this.indexManager.markRemoteFileDeleted(item.path);
 						this.indexManager.enqueuePhysicalAction(
 							"delete-remote",
@@ -2021,6 +2092,11 @@ export class SyncEngine {
 			)) {
 				batchResult.completed.push(item.id);
 			}
+			for (const item of accepted.filter(
+				(event) => event.action === "noop",
+			)) {
+				batchResult.superseded.push(item.id);
+			}
 			for (const item of deletes) {
 				batchResult.completed.push(item.id);
 			}
@@ -2045,6 +2121,15 @@ export class SyncEngine {
 				});
 			}
 			return batchResult;
+		}, {
+			settle: async (outcome, session) => {
+				if (outcome.status === "fulfilled") {
+					await settle?.(outcome.value, {
+						sessionId: session.id,
+						kind: session.kind,
+					});
+				}
+			},
 		}).finally(() => {
 			this.realtimeGuardValidationToken = undefined;
 		});
@@ -2091,10 +2176,22 @@ export class SyncEngine {
 		oldPath: string,
 		newPath: string,
 		context?: WatcherCausalContext,
-	): Promise<void> {
-		return await this.enqueueRealtime(() =>
-			this.renameFileNow(oldPath, newPath, context),
-		).finally(() => {
+		settle?: (
+			outcome: FileRenameOutcome,
+			lifecycle: SyncLifecycleContext,
+		) => void | Promise<void>,
+	): Promise<FileRenameOutcome> {
+		return await this.coordinator.run("realtime", () =>
+			this.renameFileNow(oldPath, newPath, context), {
+			settle: async (outcome, session) => {
+				if (outcome.status === "fulfilled") {
+					await settle?.(outcome.value, {
+						sessionId: session.id,
+						kind: session.kind,
+					});
+				}
+			},
+		}).finally(() => {
 			this.realtimeGuardValidationToken = undefined;
 		});
 	}
@@ -2103,7 +2200,43 @@ export class SyncEngine {
 		oldPath: string,
 		newPath: string,
 		context = this.getWatcherCausalContext(),
-	): Promise<void> {
+	): Promise<FileRenameOutcome> {
+		let targetSnapshot:
+			| { content: ArrayBuffer; sha256: string; mtime: number }
+			| undefined;
+		if (this.vaultAdapter.shouldSync(newPath)) {
+			if (!this.vaultAdapter.fileExists(newPath)) {
+				return {
+					status: "retry",
+					canonicalRevision: null,
+					epoch: context.epoch,
+					reason: "target-missing-before-remote",
+					remoteStarted: false,
+				};
+			}
+			try {
+				const content = await this.vaultAdapter.readFile(newPath);
+				targetSnapshot = {
+					content,
+					sha256: await computeSha256(content),
+					mtime:
+						this.vaultAdapter.getFileMtime(newPath) || Date.now(),
+				};
+			} catch (error) {
+				logger.warn("File rename target snapshot is not available", {
+					oldPath,
+					newPath,
+					error,
+				});
+				return {
+					status: "retry",
+					canonicalRevision: null,
+					epoch: context.epoch,
+					reason: "target-read-failed-before-remote",
+					remoteStarted: false,
+				};
+			}
+		}
 		const { blockReason, validationToken } =
 			await this.getSyncGuardResult(false);
 		if (blockReason) {
@@ -2111,7 +2244,13 @@ export class SyncEngine {
 				`[SyncEngine] Skipping rename ${oldPath}: ${blockReason}`,
 			);
 			this.setBlockedState(blockReason);
-			throw new Error(blockReason);
+			return {
+				status: "retry",
+				canonicalRevision: null,
+				epoch: context.epoch,
+				reason: blockReason,
+				remoteStarted: true,
+			};
 		}
 		this.realtimeGuardValidationToken = validationToken;
 
@@ -2134,24 +2273,39 @@ export class SyncEngine {
 					},
 				);
 				this.indexManager.stageMutation(mutation);
-				if (!(await this.saveRemoteIndexBestEffort())) return;
+				if (!(await this.saveRemoteIndexBestEffort())) {
+					return {
+						status: "retry",
+						plan: "delete-source",
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision,
+						epoch: this.indexManager.getRemoteIndex().epoch,
+						reason: "canonical-commit-not-confirmed",
+						remoteStarted: true,
+					};
+				}
 				await this.deleteRemoteFile(oldPath);
 				this.indexManager.confirmMutation(mutation.id);
 				if (this.indexSaveCallback) {
 					await this.indexSaveCallback();
 				}
 			}
-			return;
+			return {
+				status: "completed",
+				plan: "delete-source",
+				canonicalRevision: this.indexManager.getRemoteIndex().revision,
+				epoch: this.indexManager.getRemoteIndex().epoch,
+				remoteStarted: true,
+			};
 		}
 
 		try {
-			const content = await this.vaultAdapter.readFile(newPath);
-			const sha256 = await computeSha256(content);
-			const mtime = this.vaultAdapter.getFileMtime(newPath) || Date.now();
+			const { content, sha256, mtime } = targetSnapshot!;
 			const oldLocalMeta =
 				this.indexManager.getLocalIndex().files[oldPath];
 			const canonical = await this.indexManager.readCanonicalIndex();
 			const canonicalSource = canonical.files[oldPath];
+			const canonicalTarget = canonical.files[newPath];
 			const existingMove = Object.values(canonical.moves).find(
 				(move) =>
 					move.pending &&
@@ -2159,6 +2313,61 @@ export class SyncEngine {
 					move.fromPath === oldPath &&
 					move.toPath === newPath,
 			);
+			const sourceIsSettled =
+				!canonicalSource ||
+				canonicalSource.deleted ||
+				(context.baseRevision !== null &&
+					(canonicalSource.changedRevision ?? 0) > context.baseRevision);
+			if (
+				canonicalTarget &&
+				!existingMove &&
+				!canonicalTarget.deleted &&
+				canonicalTarget.sha256 === sha256 &&
+				sourceIsSettled
+			) {
+				const remotePath = joinPath(this.settings.remotePath, newPath);
+				const physical =
+					await this.yandexClient.getLogicalResource(remotePath);
+				let physicalMatches =
+					physical !== null &&
+					canonicalTarget.remoteFingerprint !== undefined &&
+					matchesPhysicalResourceFingerprint(
+						canonicalTarget.remoteFingerprint,
+						physical,
+					);
+				if (physical && !canonicalTarget.remoteFingerprint) {
+					const remoteContent =
+						await this.yandexClient.downloadFile(remotePath);
+					physicalMatches =
+						(await computeSha256(remoteContent)) === sha256;
+				}
+				if (physical && physicalMatches) {
+					this.indexManager.getRemoteIndex().files[newPath] = {
+						...canonicalTarget,
+					};
+					this.stampMovedTarget(newPath, physical, {
+						content,
+						sha256,
+					});
+					this.indexManager.removeFromLocalIndex(oldPath);
+					if (this.indexSaveCallback) {
+						await this.indexSaveCallback();
+					}
+					logger.info("File rename already applied", {
+						oldPath,
+						newPath,
+						plan: "already-applied",
+						canonicalRevision: canonical.revision,
+					});
+					return {
+						status: "completed",
+						plan: "already-applied",
+						canonicalRevision: canonical.revision,
+						epoch: canonical.epoch,
+						remoteStarted: true,
+					};
+				}
+			}
 			if (existingMove) {
 				this.indexManager.getRemoteIndex().moves[existingMove.id] = {
 					...existingMove,
@@ -2224,7 +2433,14 @@ export class SyncEngine {
 					canonicalRevision:
 						this.indexManager.getRemoteIndex().revision,
 				});
-				return;
+				return {
+					status: "completed",
+					plan: "materialize-target",
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision,
+					epoch: this.indexManager.getRemoteIndex().epoch,
+					remoteStarted: true,
+				};
 			}
 			const pendingPut = [
 				...this.indexManager.getPendingMutations(),
@@ -2293,11 +2509,17 @@ export class SyncEngine {
 				await this.putRenamedUnsyncedFile(
 					oldPath,
 					newPath,
-					newMetadata,
 					{ content, sha256 },
 					context,
 				);
-				return;
+				return {
+					status: "completed",
+					plan,
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision,
+					epoch: this.indexManager.getRemoteIndex().epoch,
+					remoteStarted: true,
+				};
 			}
 
 			const mutation = this.indexManager.enqueueMutation("move", oldPath, {
@@ -2378,7 +2600,15 @@ export class SyncEngine {
 				if (this.indexSaveCallback) {
 					await this.indexSaveCallback();
 				}
-				return;
+				return {
+					status: "superseded",
+					plan,
+					canonicalRevision:
+						this.indexManager.getRemoteIndex().revision,
+					epoch: this.indexManager.getRemoteIndex().epoch,
+					reason: "target-deleted-concurrently",
+					remoteStarted: true,
+				};
 			}
 
 			await this.executeGuardedRemoteMove(
@@ -2408,6 +2638,13 @@ export class SyncEngine {
 				canonicalRevision:
 					this.indexManager.getRemoteIndex().revision,
 			});
+			return {
+				status: "completed",
+				plan,
+				canonicalRevision: this.indexManager.getRemoteIndex().revision,
+				epoch: this.indexManager.getRemoteIndex().epoch,
+				remoteStarted: true,
+			};
 		} catch (e) {
 			if (this.indexSaveCallback) {
 				await this.indexSaveCallback();
@@ -2423,7 +2660,6 @@ export class SyncEngine {
 	private async putRenamedUnsyncedFile(
 		oldPath: string,
 		newPath: string,
-		metadata: FileMetadata,
 		snapshot: { content: ArrayBuffer; sha256: string },
 		context: WatcherCausalContext,
 	): Promise<void> {
@@ -2460,12 +2696,24 @@ export class SyncEngine {
 		this.indexManager.removeFromLocalIndex(oldPath);
 		if (this.indexSaveCallback) await this.indexSaveCallback();
 		await this.uploadFile(newPath, false, true, snapshot);
-		this.indexManager.updateLocalFile(newPath, metadata);
 		this.indexManager.stageMutation(mutation);
 		if (!(await this.saveRemoteIndexBestEffort())) {
 			throw new Error(`Could not commit renamed put target: ${newPath}`);
 		}
 		await this.repairMissingAcceptedUploads([newPath]);
+		const local = this.indexManager.getLocalIndex().files[newPath];
+		const canonical = this.indexManager.getRemoteIndex().files[newPath];
+		if (
+			local &&
+			canonical &&
+			!canonical.deleted &&
+			local.sha256 === canonical.sha256
+		) {
+			this.indexManager.updateLocalFile(
+				newPath,
+				createConfirmedBaseline(local, canonical, canonical),
+			);
+		}
 		this.indexManager.confirmMutation(mutation.id);
 		if (this.indexSaveCallback) await this.indexSaveCallback();
 		if (cleanupAction) {
@@ -2546,7 +2794,10 @@ export class SyncEngine {
 	/**
 	 * Synchronize deletion of a folder as one logical prefix mutation.
 	 */
-	async deleteFolder(path: string): Promise<void> {
+	async deleteFolder(
+		path: string,
+		settle?: (context: SyncLifecycleContext) => void | Promise<void>,
+	): Promise<void> {
 		return await this.enqueueRealtime(async () => {
 			const folderPath = path.replace(/\/+$/, "");
 			const targets = collectFolderDeleteTargets(
@@ -2669,13 +2920,17 @@ export class SyncEngine {
 			} else {
 				logger.info("Folder deletion completed", diagnosticContext);
 			}
-		});
+		}, settle);
 	}
 
 	/**
 	 * Synchronize a folder rename while preserving a logical move marker.
 	 */
-	async renameFolder(oldPath: string, newPath: string): Promise<void> {
+	async renameFolder(
+		oldPath: string,
+		newPath: string,
+		settle?: (context: SyncLifecycleContext) => void | Promise<void>,
+	): Promise<void> {
 		return await this.enqueueRealtime(async () => {
 			const mutation = this.indexManager.enqueueMutation(
 				"move",
@@ -2807,7 +3062,7 @@ export class SyncEngine {
 				this.indexManager.confirmMutation(mutation.id);
 			}
 			if (this.indexSaveCallback) await this.indexSaveCallback();
-		});
+		}, settle);
 	}
 
 	/**
@@ -2826,8 +3081,20 @@ export class SyncEngine {
 		};
 	}
 
-	private async enqueueRealtime(task: () => Promise<void>): Promise<void> {
-		return await this.coordinator.run("realtime", task);
+	private async enqueueRealtime(
+		task: () => Promise<void>,
+		settle?: (context: SyncLifecycleContext) => void | Promise<void>,
+	): Promise<void> {
+		return await this.coordinator.run("realtime", task, {
+			settle: async (outcome, session) => {
+				if (outcome.status === "fulfilled") {
+					await settle?.({
+						sessionId: session.id,
+						kind: session.kind,
+					});
+				}
+			},
+		});
 	}
 
 	/** Dispatch a session while allowing an owned maintenance body to nest. */
@@ -2842,7 +3109,21 @@ export class SyncEngine {
 		) {
 			return await run();
 		}
-		return await this.coordinator.run(kind, run);
+		return await this.coordinator.run(kind, run, {
+			prepare:
+				kind === "full"
+					? async (session) => {
+							const context: SyncLifecycleContext = {
+								sessionId: session.id,
+								kind: session.kind,
+								startup: options?.startup,
+							};
+							for (const callback of this.syncPrepareCallbacks) {
+								await callback(context);
+							}
+						}
+					: undefined,
+		});
 	}
 
 	/**

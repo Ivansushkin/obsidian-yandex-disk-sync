@@ -157,6 +157,9 @@ function createHarness(encrypted: boolean) {
 	);
 	(watcher as unknown as WatcherAccess).isEnabled = true;
 	watcher.setPersistCallback(async () => {});
+	engine.onSyncPrepare(
+		async (context) => await watcher.prepareForSync(context),
+	);
 	engine.onSyncPause(
 		async (context) => await watcher.pauseForSync(context),
 	);

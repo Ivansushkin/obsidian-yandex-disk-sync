@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { App } from "obsidian";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { SyncEngine } from "../src/sync/sync-engine";
+import { ConflictResolver } from "../src/sync/conflict-resolver";
+import { FileWatcher } from "../src/sync/file-watcher";
 import type { IndexManager } from "../src/sync/index-manager";
 import { LocalOperationStore } from "../src/sync/local-operation-store";
 import { computeSha256 } from "../src/utils/hash-utils";
@@ -357,6 +360,91 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			index.index.appliedMutationSeq["device-a"],
 			original.seq,
 		);
+		const confirmed = index.local.files["deep/Б.md"];
+		assert.ok(confirmed);
+		assert.equal(
+			confirmed.remoteFingerprint,
+			await computeSha256(content("target")),
+		);
+		assert.equal(
+			confirmed.remoteMtime,
+			new Date("2026-07-30T00:00:00.000Z").getTime(),
+		);
+		const canonical = index.index.files["deep/Б.md"];
+		assert.ok(canonical);
+		const operations = new ConflictResolver().determineOperations(
+			new Map([["deep/Б.md", { ...confirmed }]]),
+			new Map([["deep/Б.md", { ...canonical }]]),
+			index.local.files,
+			index.index.files,
+			Date.now(),
+			index.index.folderTombstones,
+			new Set(),
+		);
+		assert.deepEqual(operations, []);
+	});
+
+	test(`${mode} durable create rename and deep move materializes only final path`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		vault.files.set("deep/C.md", content("final-target"));
+		const index = new RenameIndexFake(yandex);
+		index.enqueueMutation("put", "A.md", {
+			sha256: "initial",
+			epoch: "epoch-a",
+			baseRevision: 7,
+		});
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+		const watcher = new FileWatcher(
+			{} as App,
+			engine,
+			DEFAULT_SETTINGS,
+		);
+		watcher.setPersistCallback(async () => {});
+		watcher.loadDeferredEvents([
+			{
+				id: "rename-a-b",
+				action: "rename",
+				path: "A.md",
+				targetPath: "B.md",
+				kind: "file",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 1,
+			},
+			{
+				id: "rename-b-c",
+				action: "rename",
+				path: "B.md",
+				targetPath: "deep/C.md",
+				kind: "file",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 2,
+			},
+		]);
+
+		await (
+			watcher as unknown as { flushDeferredEventsNow(): Promise<void> }
+		).flushDeferredEventsNow();
+
+		assert.deepEqual(yandex.uploads, ["remote/deep/C.md"]);
+		assert.equal(yandex.resources.has("remote/A.md"), false);
+		assert.equal(yandex.resources.has("remote/B.md"), false);
+		assert.equal(yandex.resources.has("remote/deep/C.md"), true);
+		assert.deepEqual(index.getPendingMutations(), []);
+		assert.deepEqual(index.getPendingPhysicalActions(), []);
+		assert.deepEqual(watcher.getDeferredEvents(), []);
 	});
 
 	test(`${mode} retargeted put removes its verified stale physical source`, async () => {
@@ -745,6 +833,59 @@ test("rename replay completes an already materialized canonical move", async () 
 	assert.deepEqual(yandex.moves, []);
 	assert.deepEqual(index.index.moves, {});
 	assert.deepEqual(index.getPendingPhysicalActions(), []);
+});
+
+test("rename acknowledgement replay detects an already applied target", async () => {
+	const yandex = new RenameYandexFake();
+	const vault = new RenameVaultFake();
+	const targetContent = content("already-applied");
+	const targetSha = await computeSha256(targetContent);
+	vault.files.set("B.md", targetContent);
+	await yandex.uploadFile("remote/B.md", targetContent);
+	yandex.uploads.length = 0;
+	const index = new RenameIndexFake(yandex);
+	index.index.files["A.md"] = {
+		path: "A.md",
+		sha256: targetSha,
+		size: targetContent.byteLength,
+		mtime: 1,
+		syncedAt: 1,
+		deleted: true,
+		changedRevision: 8,
+		lastModifiedBy: "device-a",
+	};
+	index.index.files["B.md"] = {
+		path: "B.md",
+		sha256: targetSha,
+		size: targetContent.byteLength,
+		mtime: 1,
+		syncedAt: 1,
+		remoteFingerprint: targetSha,
+		changedRevision: 8,
+		lastModifiedBy: "device-a",
+	};
+	index.index.revision = 8;
+	const engine = new SyncEngine(
+		yandex as unknown as YandexDiskClient,
+		vault as unknown as VaultAdapter,
+		index as unknown as IndexManager,
+		{
+			...DEFAULT_SETTINGS,
+			deviceId: "device-a",
+			remotePath: "remote",
+		},
+	);
+
+	const outcome = await engine.renameFile("A.md", "B.md", {
+		epoch: "epoch-a",
+		baseRevision: 7,
+	});
+
+	assert.equal(outcome.plan, "already-applied");
+	assert.equal(outcome.canonicalRevision, 8);
+	assert.deepEqual(yandex.uploads, []);
+	assert.deepEqual(yandex.moves, []);
+	assert.equal(index.index.revision, 8);
 });
 
 test("lost remote move response is confirmed from final state", async () => {

@@ -167,11 +167,13 @@ high-watermark `appliedMutationSeq`.
 
 `SyncCoordinator` последовательно выполняет full, Force, realtime batch и
 encryption maintenance. Повторные full-запросы объединяются в один запуск.
-Watcher-события, уже находившиеся в debounce-очереди, переносятся в durable
-буфер до full sync. Успешная full sync подтверждает по ID только ранее
-накопленные upload-события, покрытые её локальным снимком. Более новые upload,
-а также delete, rename и folder-события воспроизводятся после полного
-освобождения сессии. Неуспешная full sync не подтверждает события.
+Watcher использует один durable drain для upload, delete, rename и folder
+events. Перед постановкой full sync в очередь локальный `prepare`-этап
+замораживает новые realtime-сессии и завершает destructive/rename events,
+существовавшие на cutoff. Upload-события cutoff покрывает full barrier.
+Acknowledgement и causal rebase выполняются в `settle` до освобождения
+coordinator-сессии и сохраняются в `data.json`. Более новые события остаются
+durable для следующего drain; неуспешная full sync их не подтверждает.
 
 Startup является обычной coordinator-сессией `fullSync({ startup: true })`.
 Watcher durable-буфер включается до первого чтения encryption manifest.
@@ -183,7 +185,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.8 и явно выполнить Force sync.
+обновить все устройства до 2.0.0-beta.9 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 
@@ -250,10 +252,13 @@ session token; для строгого no-op финальный запрос н�
 - каждое файловое событие сохраняется в `data.json` с `id`, `epoch`,
   `baseRevision` и временем создания до постановки realtime-сессии
 - modify заменяет ещё не начатый upload того же пути; быстрые file rename
-  coalesce до конечного target, а повторно созданный old path остаётся
-  отдельным событием
+  coalesce до конечного target; successor running-rename получает
+  подтверждённую canonical revision либо безопасно rebase-ится, если
+  промежуточный target исчез до remote-действий; повторно созданный old path
+  остаётся отдельным событием
 - событие удаляется только по ID после результата `completed` или
-  `superseded`; `retry` остаётся в durable-очереди
+  `superseded`; acknowledgement сохраняется внутри исходной
+  coordinator-сессии, а `retry` остаётся в durable-очереди
 
 **Debouncing:**
 

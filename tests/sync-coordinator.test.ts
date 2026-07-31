@@ -71,3 +71,47 @@ test("coordinator clears active metadata when enter hook fails", async () => {
 	assert.equal(coordinator.getActiveSession(), null);
 	assert.equal(coordinator.getActiveKind(), null);
 });
+
+test("full preparation and execution are shared by concurrent callers", async () => {
+	const coordinator = new SyncCoordinator();
+	let prepares = 0;
+	let executions = 0;
+	const hooks = {
+		prepare: async () => {
+			prepares++;
+			await Promise.resolve();
+		},
+	};
+
+	await Promise.all([
+		coordinator.run("full", async () => ++executions, hooks),
+		coordinator.run("full", async () => ++executions, hooks),
+	]);
+	assert.equal(prepares, 1);
+	assert.equal(executions, 1);
+});
+
+test("settlement completes before the next session starts", async () => {
+	const coordinator = new SyncCoordinator();
+	const order: string[] = [];
+	const first = coordinator.run(
+		"realtime",
+		async () => {
+			order.push("task");
+			return 1;
+		},
+		{
+			settle: async () => {
+				order.push("settle-start");
+				await Promise.resolve();
+				order.push("settle-end");
+			},
+		},
+	);
+	const second = coordinator.run("full", async () => {
+		order.push("next");
+	});
+	await Promise.all([first, second]);
+
+	assert.deepEqual(order, ["task", "settle-start", "settle-end", "next"]);
+});

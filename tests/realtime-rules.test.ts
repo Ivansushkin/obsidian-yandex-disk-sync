@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	isMissingUploadSuperseded,
+	reduceQueuedFileRename,
 	selectFileRenamePlan,
 	shouldRetainQueuedFileEvent,
 	wasPendingPutAccepted,
 	wasRenameSourceCausallyLive,
 	type RealtimeFileEvent,
+	type DurableFileRenameEvent,
 } from "../src/sync/realtime-rules";
 import type {
 	FileMetadata,
@@ -26,6 +28,23 @@ function metadata(
 		syncedAt: 1,
 		deleted: options?.deleted,
 		changedRevision: options?.changedRevision,
+	};
+}
+
+function renameEvent(
+	id: string,
+	path: string,
+	targetPath: string,
+): DurableFileRenameEvent {
+	return {
+		id,
+		action: "rename",
+		path,
+		targetPath,
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
 	};
 }
 
@@ -182,4 +201,31 @@ test("queued modify replaces an older event but not submitted work", () => {
 		),
 		true,
 	);
+});
+
+test("queued rename chain reduces to its final target", () => {
+	const first = renameEvent("rename-a", "A.md", "B.md");
+	const reduction = reduceQueuedFileRename(
+		[first],
+		renameEvent("rename-b", "B.md", "deep/C.md"),
+		new Set(),
+	);
+
+	assert.equal(reduction.disposition, "rebased");
+	assert.deepEqual(reduction.events, [
+		{ ...first, targetPath: "deep/C.md" },
+	]);
+});
+
+test("running rename keeps its successor as separate causal work", () => {
+	const first = renameEvent("rename-a", "A.md", "B.md");
+	const second = renameEvent("rename-b", "B.md", "deep/C.md");
+	const reduction = reduceQueuedFileRename(
+		[first],
+		second,
+		new Set([first.id]),
+	);
+
+	assert.equal(reduction.disposition, "running");
+	assert.deepEqual(reduction.events, [first, second]);
 });

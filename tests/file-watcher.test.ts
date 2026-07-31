@@ -3,12 +3,34 @@ import test from "node:test";
 import type { App } from "obsidian";
 import { FileWatcher, type DeferredWatcherEvent } from "../src/sync/file-watcher";
 import type { SyncEngine } from "../src/sync/sync-engine";
+import type { RealtimeFileEvent } from "../src/sync/realtime-rules";
 import { DEFAULT_SETTINGS } from "../src/types";
 
 interface FileWatcherTestAccess {
 	isEnabled: boolean;
-	deferEvent(event: DeferredWatcherEvent): void;
+	submittedFileEvents: Map<string, {
+		id: string;
+		path: string;
+		action: "upload" | "delete";
+		epoch: string | null;
+		baseRevision: number | null;
+		createdAt: number;
+		superseded?: boolean;
+	}>;
+	submittedWatcherEventIds: Set<string>;
+	deferEvent(event: DeferredWatcherEvent): boolean;
 	flushDeferredEventsNow(): Promise<void>;
+	settleRenameEvent(
+		event: DeferredWatcherEvent,
+		outcome: {
+			status: "completed" | "superseded" | "retry";
+			canonicalRevision: number | null;
+			epoch: string | null;
+			reason?: string;
+			remoteStarted: boolean;
+		},
+	): Promise<void>;
+	cancelPendingSync(path: string): void;
 	captureFullSyncBarrier(context: {
 		sessionId: string;
 		kind: "full";
@@ -116,6 +138,189 @@ test("new file at the old path survives a queued rename", () => {
 	assert.deepEqual(
 		watcher.getDeferredEvents().map((event) => event.action),
 		["rename", "upload"],
+	);
+});
+
+test("running rename keeps successor and safely rebases a missing target", async () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+
+	access.deferEvent({
+		id: "rename-a",
+		action: "rename",
+		path: "A.md",
+		targetPath: "B.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
+	});
+	access.submittedWatcherEventIds.add("rename-a");
+	access.deferEvent({
+		id: "rename-b",
+		action: "rename",
+		path: "B.md",
+		targetPath: "deep/C.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 2,
+	});
+
+	const [predecessor] = watcher.getDeferredEvents();
+	assert.ok(predecessor);
+	await access.settleRenameEvent(predecessor, {
+		status: "retry",
+		canonicalRevision: null,
+		epoch: "epoch-a",
+		reason: "target-missing-before-remote",
+		remoteStarted: false,
+	});
+
+	assert.deepEqual(
+		watcher.getDeferredEvents().map((event) => ({
+			path: event.path,
+			targetPath:
+				event.action === "rename" ? event.targetPath : undefined,
+		})),
+		[{ path: "A.md", targetPath: "deep/C.md" }],
+	);
+});
+
+test("completed running rename advances successor causal revision", async () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	const first: DeferredWatcherEvent = {
+		id: "rename-a",
+		action: "rename",
+		path: "A.md",
+		targetPath: "B.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
+	};
+	access.deferEvent(first);
+	access.submittedWatcherEventIds.add("rename-a");
+	access.deferEvent({
+		id: "rename-b",
+		action: "rename",
+		path: "B.md",
+		targetPath: "C.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 2,
+	});
+
+	await access.settleRenameEvent(first, {
+		status: "completed",
+		canonicalRevision: 9,
+		epoch: "epoch-a",
+		remoteStarted: true,
+	});
+
+	const [successor] = watcher.getDeferredEvents();
+	assert.ok(successor && "baseRevision" in successor);
+	assert.equal(successor.baseRevision, 9);
+});
+
+test("queued target modify is absorbed but recreate of source remains", () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.deferEvent({
+		id: "rename-a",
+		action: "rename",
+		path: "A.md",
+		targetPath: "B.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
+	});
+
+	assert.equal(
+		access.deferEvent({
+			id: "modify-b",
+			action: "upload",
+			path: "B.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 2,
+		}),
+		false,
+	);
+	assert.equal(
+		access.deferEvent({
+			id: "recreate-a",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 3,
+		}),
+		true,
+	);
+	assert.deepEqual(
+		watcher.getDeferredEvents().map((event) =>
+			"id" in event ? event.id : null,
+		),
+		["rename-a", "recreate-a"],
+	);
+});
+
+test("submitted upload is acknowledged only by coordinator settlement", () => {
+	const watcher = createWatcher();
+	const event: RealtimeFileEvent = {
+		id: "upload-a",
+		action: "upload" as const,
+		path: "A.md",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
+	};
+	watcher.loadDeferredEvents([event]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.submittedFileEvents.set(event.id, event);
+
+	access.cancelPendingSync("A.md");
+
+	assert.equal(event.superseded, true);
+	assert.equal(watcher.getDeferredEvents().length, 1);
+});
+
+test("queued rename followed by delete reduces to source deletion", () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.deferEvent({
+		id: "rename-a",
+		action: "rename",
+		path: "A.md",
+		targetPath: "B.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
+	});
+	access.deferEvent({
+		id: "delete-b",
+		action: "delete",
+		path: "B.md",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 2,
+	});
+
+	assert.deepEqual(
+		watcher.getDeferredEvents().map((event) => ({
+			action: event.action,
+			path: event.path,
+		})),
+		[{ action: "delete", path: "A.md" }],
 	);
 });
 
@@ -338,4 +543,99 @@ test("structured watcher retry remains durable without throwing", async () => {
 		),
 		["retry-upload"],
 	);
+});
+
+test("unresolved pre-full rename blocks normal full but not startup classification", async () => {
+	const retryOutcome = {
+		status: "retry" as const,
+		canonicalRevision: null,
+		epoch: "epoch-a",
+		reason: "maintenance-active",
+		remoteStarted: false,
+	};
+	const syncEngine = {
+		getWatcherCausalContext: () => ({
+			epoch: "epoch-a",
+			baseRevision: 7,
+		}),
+		renameFile: async (
+			_oldPath: string,
+			_newPath: string,
+			_context: unknown,
+			settle: (outcome: typeof retryOutcome) => Promise<void>,
+		) => {
+			await settle(retryOutcome);
+			return retryOutcome;
+		},
+	} as unknown as SyncEngine;
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.isEnabled = true;
+	watcher.loadDeferredEvents([
+		{
+			id: "rename-a",
+			action: "rename",
+			path: "A.md",
+			targetPath: "B.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+	]);
+
+	await assert.rejects(
+		watcher.prepareForSync({ sessionId: "full-1", kind: "full" }),
+		/left 1 unresolved event/,
+	);
+	await watcher.prepareForSync({
+		sessionId: "full-2",
+		kind: "full",
+		startup: true,
+	});
+	assert.equal(watcher.getDeferredEvents().length, 1);
+});
+
+test("ambiguous rename failure does not execute its successor", async () => {
+	let renameCalls = 0;
+	const syncEngine = {
+		getWatcherCausalContext: () => ({
+			epoch: "epoch-a",
+			baseRevision: 7,
+		}),
+		renameFile: async () => {
+			renameCalls++;
+			throw new Error("ambiguous canonical transaction");
+		},
+	} as unknown as SyncEngine;
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
+	watcher.loadDeferredEvents([
+		{
+			id: "rename-a",
+			action: "rename",
+			path: "A.md",
+			targetPath: "B.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+		{
+			id: "rename-b",
+			action: "rename",
+			path: "B.md",
+			targetPath: "C.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 2,
+		},
+	]);
+
+	await (
+		watcher as unknown as FileWatcherTestAccess
+	).flushDeferredEventsNow();
+
+	assert.equal(renameCalls, 1);
+	assert.equal(watcher.getDeferredEvents().length, 2);
 });

@@ -26,9 +26,15 @@
 
 ```typescript
 // В SyncEngine
+onSyncPrepare((context) => fileWatcher.prepareForSync(context));
 onSyncPause(() => fileWatcher.pauseForSync());
 onSyncResume(() => fileWatcher.resumeAfterSync());
 ```
+
+`prepareForSync` фиксирует ID событий на cutoff до постановки full в очередь.
+Delete, rename и folder events этого набора завершаются заранее, upload
+остаётся full-barrier. Результат realtime-сессии подтверждается и сохраняется
+через coordinator `settle` до запуска следующей сессии.
 
 ### 2. Причинная логика разрешения конфликтов
 
@@ -88,10 +94,10 @@ Status bar показывает:
 ## Архитектура
 
 ```
-FileWatcher ←─── pauseForSync()
-    ↓              resumeAfterSync()
-SyncEngine ────→ onSyncPause() callback
-    ↓              onSyncResume() callback
+FileWatcher ←─── prepareForSync() → pauseForSync()
+    ↓              settle()          resumeAfterSync()
+SyncEngine ────→ onSyncPrepare() / onSyncPause()
+    ↓              onSyncResume()
 ConflictResolver ──→ compareFiles() с улучшенной логикой
 ```
 

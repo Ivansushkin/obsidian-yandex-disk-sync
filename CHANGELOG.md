@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.0.0-beta.9
+
+### Fixed
+
+- Serialized debounce, replay, file rename, and folder work through one durable
+  watcher drain. Event acknowledgement is now persisted while the originating
+  coordinator session still owns the queue.
+- Added a pre-full watcher cutoff: older delete, rename, and folder events
+  settle before reconciliation, while uploads remain covered by the existing
+  ID-based full barrier and newer events stay durable.
+- Rebased queued and running rename chains without treating a missing
+  intermediate path as an API failure. Rename-to-delete and pre-snapshot target
+  modifications now reduce without stale remote operations.
+- Recognized already-applied rename targets after restart without another
+  upload, move, delete, or canonical commit.
+- Preserved confirmed server fingerprint, server mtime, and causal revision in
+  the local baseline after `put-target`, preventing a redundant next-full
+  download.
+
+### Testing
+
+- Added queued/running rename reducer, coordinator prepare/settle ordering,
+  rename/delete, rename/modify, recreate, and already-applied recovery tests.
+- Retained plaintext/encrypted rename, full barrier, multi-device causal,
+  physical fingerprint, index transaction, Force, and encryption coverage.
+
 ## 2.0.0-beta.8
 
 ### Changed

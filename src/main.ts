@@ -454,6 +454,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		// Subscribe to sync engine events to pause/resume file watcher
+		this.syncEngine.onSyncPrepare(
+			async (context) =>
+				await this.fileWatcher.prepareForSync(context),
+		);
 		this.syncEngine.onSyncPause(
 			async (context) =>
 				await this.fileWatcher.pauseForSync(context),

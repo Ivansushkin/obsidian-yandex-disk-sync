@@ -28,6 +28,71 @@ export type FileRenamePlan =
 	| "remote-move"
 	| "materialize-target";
 
+export type FileRenameOutcomePlan =
+	| FileRenamePlan
+	| "delete-source"
+	| "already-applied";
+
+export interface FileRenameOutcome {
+	status: "completed" | "superseded" | "retry";
+	plan?: FileRenameOutcomePlan;
+	canonicalRevision: number | null;
+	epoch: string | null;
+	reason?: string;
+	/** True once an API read or write may have observed or changed remote state. */
+	remoteStarted: boolean;
+}
+
+export interface DurableFileRenameEvent extends WatcherCausalContext {
+	id: string;
+	action: "rename";
+	path: string;
+	targetPath: string;
+	kind: "file";
+	createdAt: number;
+}
+
+export interface RenameChainReduction {
+	events: DurableFileRenameEvent[];
+	disposition: "queued" | "rebased" | "running";
+	predecessorId?: string;
+}
+
+/**
+ * Reduce a newly observed rename against queued work without rewriting an
+ * already running predecessor. Recreated source paths remain separate events.
+ */
+export function reduceQueuedFileRename(
+	existing: DurableFileRenameEvent[],
+	incoming: DurableFileRenameEvent,
+	runningIds: ReadonlySet<string>,
+): RenameChainReduction {
+	const predecessorIndex = existing.findIndex(
+		(event) => event.targetPath === incoming.path,
+	);
+	if (predecessorIndex < 0) {
+		return { events: [...existing, incoming], disposition: "queued" };
+	}
+	const predecessor = existing[predecessorIndex]!;
+	if (runningIds.has(predecessor.id)) {
+		return {
+			events: [...existing, incoming],
+			disposition: "running",
+			predecessorId: predecessor.id,
+		};
+	}
+	const reduced = [...existing];
+	reduced[predecessorIndex] = {
+		...predecessor,
+		targetPath: incoming.targetPath,
+	};
+	return {
+		events: reduced,
+		disposition: "rebased",
+		predecessorId: predecessor.id,
+	};
+}
+
 /**
  * Decide whether the source belonged to the state observed by the rename.
  */
