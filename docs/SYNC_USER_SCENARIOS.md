@@ -99,6 +99,7 @@
 | SYNC-023 | P0  | Upload создан во время full sync                  | Новый ID не поглощается barrier и воспроизводится после full    | auto: `successful full barrier acknowledges only pre-full uploads` |
 | SYNC-024 | P0  | Full sync завершилась с ошибками при pre-full upload | Captured upload остаётся durable и повторяется позже            | auto: `failed full barrier retains every captured upload`; `failed full sync postpones watcher replay` |
 | SYNC-025 | P0  | Успешный realtime `put-target`, затем full sync       | Confirmed baseline сохраняет fingerprint/mtime/revision; full выполняет `0/0/0` без index commit | auto: `plaintext/encrypted unsynced rename retargets the pending put`; integration |
+| SYNC-026 | P0  | Retry существовал до full/maintenance                 | Старый retry не запускается повторно сразу после сессии; автоматически replay-ятся только новые/изменённые за время паузы события | auto: `successful session replays only watcher events created while paused`; `failed session does not replay watcher events created while paused` |
 
 ## Удаление файла
 
@@ -164,6 +165,9 @@
 | MOVE-018 | P0  | Successor появился до или после snapshot predecessor | До snapshot цепочка rebase-ится; после snapshot successor использует подтверждённую revision | auto: `running rename keeps successor and safely rebases a missing target`; `completed running rename advances successor causal revision` |
 | MOVE-019 | P0  | Rename → delete target до commit                       | Операция становится delete причинного source либо noop для никогда не принятого put | auto: `queued rename followed by delete reduces to source deletion`; integration |
 | MOVE-020 | P0  | Full запрошен во время watcher drain                   | Cutoff destructive/rename events settle до full; более новые events остаются durable | auto: `settlement completes before the next session starts`; integration |
+| MOVE-021 | P0  | Durable rename, source и target уже отсутствуют после full | Событие становится superseded без remote read/write и удаляется из durable queue | auto: `plaintext/encrypted full supersedes a stale rename after both paths settle` |
+| MOVE-022 | P0  | Durable rename, target уже подтверждён local/canonical | Событие подтверждается как `already-applied` без нового commit/upload/move/delete | auto: `full acknowledges an already applied rename target without remote write` |
+| MOVE-023 | P0  | Source остаётся causal-live, target отсутствует после full | Событие остаётся durable, full получает `watcher-rename-unresolved` и не продвигает observed revision | auto: `full leaves an ambiguous causal rename durable and reports an error` |
 
 ## Несколько устройств
 
@@ -182,6 +186,7 @@
 | MULTI-011 | P0  | `syncDotObsidian=true`                              | `data.json`, пароль и causal state плагина не синхронизируются как user files | auto: vault-adapter |
 | MULTI-012 | P1  | Устройство offline во время Force                   | При возврате old epoch блокируется                                            | auto: two-device    |
 | MULTI-013 | P0  | Concurrent source edit/delete и target put во время rename-chain | Более новый source не удаляется, независимый target не перезаписывается, merge читает последнюю revision под lock | auto: `source changed after rename base survives as a concurrent file`; permutation |
+| MULTI-014 | P0  | Source создан или изменён другим устройством после baseRevision stale rename | Более новый source сохраняется, missing-target rename становится superseded без destructive action | auto: `post-full rename preserves newer sources and blocks causal ambiguity`; two-device |
 
 ## Стабильное шифрование
 
@@ -312,6 +317,7 @@
 | DIAG-011 | P2 | Startup/full завершён без изменений             | Summary содержит GET по manifest/index/root/tree, concurrency и длительность без путей/ciphertext | auto: integration; manual-required |
 | DIAG-012 | P1 | Enable, disable и rotate падают на одинаковой фазе | Все три режима проходят один executor, сохраняют одинаковый phase/recovery contract и не оставляют transition codec | auto: `all rewrite modes use the same post-commit cleanup`; fault matrix |
 | DIAG-013 | P1 | Rename superseded/rebased ожидаемым локальным событием | Лог содержит event ID, исходный session ID и `rebased`/`already-applied` без повторных error stack | auto: file-watcher; manual-required |
+| DIAG-014 | P1 | Startup завершён без canonical maintenance/cleanup | После full не создаётся пустая maintenance/realtime-сессия; summary содержит post-full rename settlement и число новых replay events | auto: full-sync-barrier; manual-required |
 
 ## Матрица вариантов
 

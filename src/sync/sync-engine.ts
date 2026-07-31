@@ -53,6 +53,7 @@ import {
 } from "../utils/resource-fingerprint";
 import { collectFolderDeleteTargets } from "./index-rules";
 import {
+	classifyPostFullRename,
 	createRealtimeBatchResult,
 	isMissingUploadSuperseded,
 	selectFileRenamePlan,
@@ -60,6 +61,7 @@ import {
 	wasPendingPutAccepted,
 	wasRenameSourceCausallyLive,
 	type FileRenameOutcome,
+	type DurableFileRenameEvent,
 	type RealtimeBatchResult,
 	type RealtimeFileEvent,
 	type WatcherCausalContext,
@@ -128,6 +130,12 @@ export class SyncEngine {
 	> = [];
 	private syncResumeCallbacks: Array<
 		(outcome: SyncLifecycleOutcome) => void | Promise<void>
+	> = [];
+	private syncFinalizeCallbacks: Array<
+		(
+			context: SyncLifecycleContext,
+			result: SyncResult,
+		) => void | Promise<void>
 	> = [];
 
 	constructor(
@@ -230,6 +238,23 @@ export class SyncEngine {
 			if (index >= 0) {
 				this.syncResumeCallbacks.splice(index, 1);
 			}
+		};
+	}
+
+	/**
+	 * Register reconciliation settlement that must finish before a successful
+	 * result advances the local observed revision.
+	 */
+	onSyncFinalize(
+		callback: (
+			context: SyncLifecycleContext,
+			result: SyncResult,
+		) => void | Promise<void>,
+	): () => void {
+		this.syncFinalizeCallbacks.push(callback);
+		return () => {
+			const index = this.syncFinalizeCallbacks.indexOf(callback);
+			if (index >= 0) this.syncFinalizeCallbacks.splice(index, 1);
 		};
 	}
 
@@ -385,6 +410,48 @@ export class SyncEngine {
 			baseRevision:
 				local.observedEpoch === null ? null : local.observedRevision,
 		};
+	}
+
+	/**
+	 * Classify a missing-target watcher rename from the final in-memory state of
+	 * a successful full reconciliation without performing remote operations.
+	 */
+	classifyPostFullRename(
+		event: DurableFileRenameEvent,
+	): FileRenameOutcome {
+		const canonical = this.indexManager.getRemoteIndex();
+		const local = this.indexManager.getLocalIndex();
+		const relatedPaths = new Set([event.path, event.targetPath]);
+		const hasPendingWork =
+			this.indexManager.getPendingMutations().some(
+				(mutation) =>
+					relatedPaths.has(mutation.path) ||
+					(mutation.targetPath !== undefined &&
+						relatedPaths.has(mutation.targetPath)),
+			) ||
+			this.indexManager.getPendingPhysicalActions().some(
+				(action) =>
+					relatedPaths.has(action.path) ||
+					(action.targetPath !== undefined &&
+						relatedPaths.has(action.targetPath)),
+			) ||
+			Object.values(canonical.moves).some(
+				(move) =>
+					move.pending &&
+					(relatedPaths.has(move.fromPath) ||
+						relatedPaths.has(move.toPath)),
+			);
+		return classifyPostFullRename(event, {
+			canonicalEpoch: canonical.epoch,
+			canonicalRevision: canonical.revision,
+			canonicalSource: canonical.files[event.path],
+			canonicalTarget: canonical.files[event.targetPath],
+			localTarget: local.files[event.targetPath],
+			targetExists:
+				this.vaultAdapter.shouldSync(event.targetPath) &&
+				this.vaultAdapter.fileExists(event.targetPath),
+			hasPendingWork,
+		});
 	}
 
 	/**
@@ -3156,6 +3223,16 @@ export class SyncEngine {
 		}
 	}
 
+	/** Run durable reconciliation settlement before marking remote state observed. */
+	private async notifySyncFinalizeCallbacks(
+		context: SyncLifecycleContext,
+		result: SyncResult,
+	): Promise<void> {
+		for (const callback of this.syncFinalizeCallbacks) {
+			await callback(context, result);
+		}
+	}
+
 	/**
 	 * Capture immutable coordinator identity for watcher lifecycle callbacks.
 	 */
@@ -3233,6 +3310,12 @@ export class SyncEngine {
 				await body(result, startTime, guard.validationToken);
 			}
 
+			if (result.errors.length === 0) {
+				await this.notifySyncFinalizeCallbacks(
+					lifecycleContext,
+					result,
+				);
+			}
 			result.success = result.errors.length === 0;
 			if (result.success) {
 				this.indexManager.markRemoteObserved();

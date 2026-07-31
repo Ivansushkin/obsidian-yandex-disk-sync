@@ -58,6 +58,16 @@ export interface RenameChainReduction {
 	predecessorId?: string;
 }
 
+export interface PostFullRenameState {
+	canonicalEpoch: string;
+	canonicalRevision: number;
+	canonicalSource?: FileMetadata;
+	canonicalTarget?: FileMetadata;
+	localTarget?: FileMetadata;
+	targetExists: boolean;
+	hasPendingWork: boolean;
+}
+
 /**
  * Reduce a newly observed rename against queued work without rewriting an
  * already running predecessor. Recreated source paths remain separate events.
@@ -105,6 +115,86 @@ export function wasRenameSourceCausallyLive(
 	if (!canonicalSource || canonicalSource.deleted) return false;
 	if (baseRevision === null) return false;
 	return (canonicalSource.changedRevision ?? 0) <= baseRevision;
+}
+
+/**
+ * Classify a missing-target rename after a successful full reconciliation.
+ * This decision is logical-only and never authorizes a physical operation.
+ */
+export function classifyPostFullRename(
+	event: DurableFileRenameEvent,
+	state: PostFullRenameState,
+): FileRenameOutcome {
+	const baseRevision = event.baseRevision;
+	const sourceIsNewer =
+		state.canonicalSource !== undefined &&
+		!state.canonicalSource.deleted &&
+		baseRevision !== null &&
+		(state.canonicalSource.changedRevision ?? 0) > baseRevision;
+	const sourceIsSettled =
+		state.canonicalSource === undefined ||
+		state.canonicalSource.deleted === true;
+	const targetIsConfirmed =
+		state.targetExists &&
+		state.canonicalTarget !== undefined &&
+		!state.canonicalTarget.deleted &&
+		state.localTarget !== undefined &&
+		!state.localTarget.deleted &&
+		state.localTarget.sha256 === state.canonicalTarget.sha256;
+	const baseOutcome = {
+		canonicalRevision: state.canonicalRevision,
+		epoch: state.canonicalEpoch,
+		remoteStarted: false,
+	} as const;
+
+	if (event.epoch !== null && event.epoch !== state.canonicalEpoch) {
+		return {
+			...baseOutcome,
+			status: "superseded",
+			reason: "epoch-replaced-by-full",
+		};
+	}
+	if (state.hasPendingWork) {
+		return {
+			...baseOutcome,
+			status: "retry",
+			reason: "related-causal-work-pending",
+		};
+	}
+	if (targetIsConfirmed && (sourceIsSettled || sourceIsNewer)) {
+		return {
+			...baseOutcome,
+			status: "completed",
+			plan: "already-applied",
+			reason: sourceIsNewer
+				? "target-applied-concurrent-source-preserved"
+				: "target-applied-by-full",
+		};
+	}
+	if (
+		!state.targetExists &&
+		(state.canonicalTarget === undefined || state.canonicalTarget.deleted)
+	) {
+		if (sourceIsSettled) {
+			return {
+				...baseOutcome,
+				status: "superseded",
+				reason: "source-and-target-settled-by-full",
+			};
+		}
+		if (sourceIsNewer) {
+			return {
+				...baseOutcome,
+				status: "superseded",
+				reason: "concurrent-source-preserved",
+			};
+		}
+	}
+	return {
+		...baseOutcome,
+		status: "retry",
+		reason: "post-full-rename-ambiguous",
+	};
 }
 
 /**

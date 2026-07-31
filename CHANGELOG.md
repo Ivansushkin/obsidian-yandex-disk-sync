@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.0.0-beta.10
+
+### Fixed
+
+- Settled missing-target durable renames from the final logical state selected
+  by a successful full reconciliation. Already-applied and obsolete events are
+  acknowledged without remote operations, while ambiguous causal sources stay
+  durable and make the full result unsuccessful.
+- Prevented pre-full watcher retries from being replayed immediately after the
+  same full or maintenance session. Only events created or changed while the
+  watcher is paused are replayed automatically.
+- Skipped the empty post-startup maintenance session when canonical contains no
+  encryption cleanup work, and made watcher lifecycle diagnostics report the
+  actual session kind.
+
+### Testing
+
+- Added plaintext/encrypted stale-rename settlement, already-applied target,
+  ambiguous causal source, epoch replacement, concurrent source, and paused
+  watcher replay coverage.
+- Retained all beta.9 index transaction, multi-device causal, Force,
+  encryption-transition, physical cleanup, and startup performance tests.
+
 ## 2.0.0-beta.9
 
 ### Fixed

@@ -172,8 +172,12 @@ events. Перед постановкой full sync в очередь локал
 замораживает новые realtime-сессии и завершает destructive/rename events,
 существовавшие на cutoff. Upload-события cutoff покрывает full barrier.
 Acknowledgement и causal rebase выполняются в `settle` до освобождения
-coordinator-сессии и сохраняются в `data.json`. Более новые события остаются
-durable для следующего drain; неуспешная full sync их не подтверждает.
+coordinator-сессии и сохраняются в `data.json`. Missing-target rename без
+remote side effects может быть отложен до конца full: уже подтверждённый или
+логически вытесненный путь поглощается по свежему local/canonical состоянию,
+а неоднозначный causal source оставляет full неуспешной. После resume
+автоматически запускаются только события, созданные либо изменённые во время
+паузы; неуспешная сессия ничего не подтверждает и не replay-ит.
 
 Startup является обычной coordinator-сессией `fullSync({ startup: true })`.
 Watcher durable-буфер включается до первого чтения encryption manifest.
@@ -185,7 +189,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.9 и явно выполнить Force sync.
+обновить все устройства до 2.0.0-beta.10 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 

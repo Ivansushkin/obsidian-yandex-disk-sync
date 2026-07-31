@@ -22,6 +22,7 @@ class FullSyncIndexFake {
 	readonly localFiles = new Map<string, FileMetadata>();
 	readonly remoteFiles = new Map<string, FileMetadata>();
 	remoteSaveCount = 0;
+	onBuildLocalIndex: (() => void) | null = null;
 
 	constructor() {
 		this.index.revision = 7;
@@ -67,6 +68,7 @@ class FullSyncIndexFake {
 	}
 
 	async buildLocalIndex() {
+		this.onBuildLocalIndex?.();
 		return new Map(this.localFiles);
 	}
 
@@ -133,6 +135,7 @@ interface WatcherAccess {
 
 function createHarness(encrypted: boolean) {
 	const index = new FullSyncIndexFake();
+	const vaultFiles = new Set<string>();
 	let folderCacheClearCount = 0;
 	const yandexClient = {
 		clearFolderCache: () => {
@@ -141,7 +144,10 @@ function createHarness(encrypted: boolean) {
 	};
 	const engine = new SyncEngine(
 		yandexClient as unknown as YandexDiskClient,
-		{} as VaultAdapter,
+		{
+			shouldSync: () => true,
+			fileExists: (path: string) => vaultFiles.has(path),
+		} as unknown as VaultAdapter,
 		index as unknown as IndexManager,
 		{
 			...DEFAULT_SETTINGS,
@@ -163,6 +169,10 @@ function createHarness(encrypted: boolean) {
 	engine.onSyncPause(
 		async (context) => await watcher.pauseForSync(context),
 	);
+	engine.onSyncFinalize(
+		async (context, result) =>
+			await watcher.settleAfterReconciliation(context, result),
+	);
 	engine.onSyncResume(
 		async (outcome) => await watcher.resumeAfterSync(outcome),
 	);
@@ -170,7 +180,21 @@ function createHarness(encrypted: boolean) {
 		engine,
 		index,
 		watcher,
+		vaultFiles,
 		getFolderCacheClearCount: () => folderCacheClearCount,
+	};
+}
+
+function renameEvent(id: string): DeferredWatcherEvent {
+	return {
+		id,
+		action: "rename",
+		path: "A.md",
+		targetPath: "B.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
 	};
 }
 
@@ -228,7 +252,102 @@ for (const encrypted of [false, true]) {
 		);
 		assert.deepEqual(index.store.getMutations(), []);
 	});
+
+	test(`${mode} full supersedes a stale rename after both paths settle`, async () => {
+		const { engine, index, watcher } = createHarness(encrypted);
+		watcher.loadDeferredEvents([renameEvent("stale-rename")]);
+
+		const result = await engine.fullSync();
+
+		assert.equal(result.success, true);
+		assert.equal(index.remoteSaveCount, 0);
+		assert.deepEqual(watcher.getDeferredEvents(), []);
+	});
 }
+
+test("full leaves an ambiguous causal rename durable and reports an error", async () => {
+	const { engine, index, watcher, vaultFiles } = createHarness(false);
+	const source = {
+		path: "A.md",
+		sha256: "source-sha",
+		size: 1,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 7,
+	};
+	index.index.files["A.md"] = { ...source };
+	index.local.files["A.md"] = { ...source };
+	index.localFiles.set("A.md", { ...source });
+	index.remoteFiles.set("A.md", { ...source });
+	vaultFiles.add("A.md");
+	watcher.loadDeferredEvents([renameEvent("ambiguous-rename")]);
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, false);
+	assert.equal(
+		result.errors.some(
+			(error) => error.code === "watcher-rename-unresolved",
+		),
+		true,
+	);
+	assert.equal(watcher.getDeferredEvents().length, 1);
+	assert.equal(index.local.observedRevision, 7);
+});
+
+test("full acknowledges an already applied rename target without remote write", async () => {
+	const { engine, index, watcher, vaultFiles } = createHarness(false);
+	const target = {
+		path: "B.md",
+		sha256: "target-sha",
+		size: 1,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 7,
+		remoteFingerprint: "target-fingerprint",
+	};
+	index.index.files["B.md"] = { ...target };
+	index.local.files["B.md"] = { ...target };
+	index.localFiles.set("B.md", { ...target });
+	index.remoteFiles.set("B.md", { ...target });
+	index.onBuildLocalIndex = () => vaultFiles.add("B.md");
+	watcher.loadDeferredEvents([renameEvent("applied-rename")]);
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, true);
+	assert.equal(index.remoteSaveCount, 0);
+	assert.deepEqual(watcher.getDeferredEvents(), []);
+});
+
+test("post-full rename acknowledgement persists before observed revision advances", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	index.index.revision = 8;
+	const persisted: Array<{
+		pendingEvents: number;
+		observedRevision: number;
+	}> = [];
+	watcher.setPersistCallback(async () => {
+		persisted.push({
+			pendingEvents: watcher.getDeferredEvents().length,
+			observedRevision: index.local.observedRevision,
+		});
+	});
+	watcher.loadDeferredEvents([renameEvent("stale-rename")]);
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, true);
+	assert.equal(index.local.observedRevision, 8);
+	assert.equal(
+		persisted.some(
+			(snapshot) =>
+				snapshot.pendingEvents === 0 &&
+				snapshot.observedRevision === 7,
+		),
+		true,
+	);
+});
 
 test("strict no-op validates encryption only once", async () => {
 	const { engine } = createHarness(true);

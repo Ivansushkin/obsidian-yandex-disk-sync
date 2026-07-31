@@ -55,7 +55,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Synchronization started...",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.9 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.10 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.epoch_mismatch_blocked":
@@ -337,7 +337,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Notices
 		"notice.sync_started": "Запуск синхронизации...",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.9 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.10 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.epoch_mismatch_blocked":

@@ -20,6 +20,7 @@ interface FileWatcherTestAccess {
 	submittedWatcherEventIds: Set<string>;
 	deferEvent(event: DeferredWatcherEvent): boolean;
 	flushDeferredEventsNow(): Promise<void>;
+	flushDeferredEvents(onlyIds?: ReadonlySet<string>): Promise<void>;
 	settleRenameEvent(
 		event: DeferredWatcherEvent,
 		outcome: {
@@ -414,6 +415,80 @@ test("failed full barrier retains every captured upload", () => {
 	);
 });
 
+test("successful session replays only watcher events created while paused", async () => {
+	const watcher = createWatcher();
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.isEnabled = true;
+	watcher.loadDeferredEvents([
+		{
+			id: "old-rename",
+			action: "rename",
+			path: "A.md",
+			targetPath: "B.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+	]);
+	const replayed: string[][] = [];
+	access.flushDeferredEvents = async (onlyIds) => {
+		replayed.push([...(onlyIds ?? [])]);
+	};
+
+	await watcher.pauseForSync({
+		sessionId: "maintenance-1",
+		kind: "maintenance",
+	});
+	access.deferEvent({
+		id: "new-upload",
+		action: "upload",
+		path: "new.md",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 2,
+	});
+	await watcher.resumeAfterSync({
+		sessionId: "maintenance-1",
+		kind: "maintenance",
+		success: true,
+	});
+
+	assert.deepEqual(replayed, [["new-upload"]]);
+});
+
+test("failed session does not replay watcher events created while paused", async () => {
+	const watcher = createWatcher();
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.isEnabled = true;
+	watcher.loadDeferredEvents([]);
+	let replayed = false;
+	access.flushDeferredEvents = async () => {
+		replayed = true;
+	};
+
+	await watcher.pauseForSync({
+		sessionId: "maintenance-1",
+		kind: "maintenance",
+	});
+	access.deferEvent({
+		id: "new-upload",
+		action: "upload",
+		path: "new.md",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 2,
+	});
+	await watcher.resumeAfterSync({
+		sessionId: "maintenance-1",
+		kind: "maintenance",
+		success: false,
+	});
+
+	assert.equal(replayed, false);
+	assert.equal(watcher.getDeferredEvents().length, 1);
+});
+
 test("full barrier acknowledgement is persisted before resume completes", async () => {
 	const watcher = createWatcher();
 	watcher.loadDeferredEvents([
@@ -593,6 +668,50 @@ test("unresolved pre-full rename blocks normal full but not startup classificati
 		kind: "full",
 		startup: true,
 	});
+	assert.equal(watcher.getDeferredEvents().length, 1);
+});
+
+test("missing-target rename without remote work is deferred to normal full", async () => {
+	const retryOutcome = {
+		status: "retry" as const,
+		canonicalRevision: null,
+		epoch: "epoch-a",
+		reason: "target-missing-before-remote",
+		remoteStarted: false,
+	};
+	const syncEngine = {
+		getWatcherCausalContext: () => ({
+			epoch: "epoch-a",
+			baseRevision: 7,
+		}),
+		renameFile: async (
+			_oldPath: string,
+			_newPath: string,
+			_context: unknown,
+			settle: (outcome: typeof retryOutcome) => Promise<void>,
+		) => {
+			await settle(retryOutcome);
+			return retryOutcome;
+		},
+	} as unknown as SyncEngine;
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.isEnabled = true;
+	watcher.loadDeferredEvents([
+		{
+			id: "rename-a",
+			action: "rename",
+			path: "A.md",
+			targetPath: "B.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+	]);
+
+	await watcher.prepareForSync({ sessionId: "full-1", kind: "full" });
+
 	assert.equal(watcher.getDeferredEvents().length, 1);
 });
 

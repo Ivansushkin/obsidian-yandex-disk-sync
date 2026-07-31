@@ -462,6 +462,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			async (context) =>
 				await this.fileWatcher.pauseForSync(context),
 		);
+		this.syncEngine.onSyncFinalize(
+			async (context, result) =>
+				await this.fileWatcher.settleAfterReconciliation(
+					context,
+					result,
+				),
+		);
 		this.syncEngine.onSyncResume(
 			async (outcome) =>
 				await this.fileWatcher.resumeAfterSync(outcome),
@@ -742,7 +749,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// FileWatcher will be automatically paused by sync engine callbacks
 		if (startup) {
 			const result = await this.runFullSync({ startup: true });
-			if (result?.success) {
+			const maintenance = this.indexManager.getMaintenance();
+			const hasGuardedCleanup = this.indexManager
+				.getPendingPhysicalActions()
+				.some((action) => action.type === "guarded-cleanup");
+			if (
+				result?.success &&
+				(maintenance?.phase === "cleanup" || hasGuardedCleanup)
+			) {
 				await this.syncEngine.runExclusiveMaintenance(async () => {
 					await this.resumeCanonicalMaintenanceCleanup();
 				});

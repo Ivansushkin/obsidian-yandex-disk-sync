@@ -8,7 +8,7 @@ import {
 	type SyncLifecycleContext,
 	type SyncLifecycleOutcome,
 } from "./sync-engine";
-import type { YandexDiskSyncSettings } from "../types";
+import type { SyncResult, YandexDiskSyncSettings } from "../types";
 import { logger } from "../utils/logger";
 import {
 	reduceQueuedFileRename,
@@ -74,12 +74,18 @@ export class FileWatcher {
 	private fullSyncBarrier: {
 		sessionId: string;
 		uploadEventIds: Set<string>;
+		renameCandidateIds: Set<string>;
+		alreadyAppliedRenames: number;
+		supersededRenames: number;
+		unresolvedRenames: number;
 	} | null = null;
 	private preparedFullBarrier: {
 		sessionId: string;
 		uploadEventIds: Set<string>;
 		cutoffEventIds: Set<string>;
+		renameCandidateIds: Set<string>;
 	} | null = null;
+	private pausedEventSignatures: Map<string, string> | null = null;
 
 	constructor(
 		app: App,
@@ -150,6 +156,7 @@ export class FileWatcher {
 			sessionId: context.sessionId,
 			uploadEventIds,
 			cutoffEventIds,
+			renameCandidateIds: new Set(),
 		};
 		logger.info("Full sync watcher drain prepared", {
 			sessionId: context.sessionId,
@@ -172,15 +179,27 @@ export class FileWatcher {
 				const id = this.getEventId(event);
 				return id !== null && destructiveIds.has(id);
 			});
-			if (unresolved.length > 0 && !context.startup) {
+			const reconcilableIds =
+				this.preparedFullBarrier?.renameCandidateIds ?? new Set<string>();
+			const blocking = unresolved.filter((event) => {
+				const id = this.getEventId(event);
+				return id === null || !reconcilableIds.has(id);
+			});
+			if (blocking.length > 0 && !context.startup) {
 				throw new Error(
-					`Pre-full watcher drain left ${unresolved.length} unresolved event(s)`,
+					`Pre-full watcher drain left ${blocking.length} unresolved event(s)`,
 				);
 			}
-			if (unresolved.length > 0) {
+			if (blocking.length > 0) {
 				logger.warn("Startup continues with durable watcher work blocked", {
 					sessionId: context.sessionId,
-					unresolvedEvents: unresolved.length,
+					unresolvedEvents: blocking.length,
+				});
+			}
+			if (reconcilableIds.size > 0) {
+				logger.info("Watcher rename deferred to full reconciliation", {
+					sessionId: context.sessionId,
+					candidates: reconcilableIds.size,
 				});
 			}
 		} catch (error) {
@@ -202,9 +221,17 @@ export class FileWatcher {
 		if (this.syncPauseDepth > 1) return;
 		this.isPausedForSync = true;
 		this.isPreparingFullSync = false;
-		logger.info("[FileWatcher] Paused for full sync");
+		logger.info("[FileWatcher] Paused for sync session", {
+			sessionKind: context.kind,
+		});
 
 		this.drainPendingFileEvents();
+		this.pausedEventSignatures = new Map(
+			this.deferredEvents.flatMap((event) => {
+				const id = this.getEventId(event);
+				return id ? [[id, this.getEventSignature(event)]] : [];
+			}),
+		);
 		if (context.kind === "full") {
 			this.captureFullSyncBarrier(context);
 		}
@@ -221,23 +248,41 @@ export class FileWatcher {
 
 		this.syncPauseDepth = Math.max(0, this.syncPauseDepth - 1);
 		if (this.syncPauseDepth > 0) return;
+		const pausedEventSignatures = this.pausedEventSignatures;
+		this.pausedEventSignatures = null;
 		this.completeFullSyncBarrier(outcome);
 		await this.waitForPersistence();
 		this.isPausedForSync = false;
 		this.isPreparingFullSync = false;
-		logger.info("[FileWatcher] Resumed after full sync");
+		const replayIds = new Set(
+			this.deferredEvents.flatMap((event) => {
+				const id = this.getEventId(event);
+				if (!id) return [];
+				const previous = pausedEventSignatures?.get(id);
+				return previous === undefined ||
+					previous !== this.getEventSignature(event)
+					? [id]
+					: [];
+			}),
+		);
+		logger.info("[FileWatcher] Resumed after sync session", {
+			sessionKind: outcome.kind,
+			newEventsReplayed: outcome.success ? replayIds.size : 0,
+		});
 		if (this.deferredEvents.length === 0) return;
-		if (outcome.kind === "full" && !outcome.success) {
+		if (!outcome.success) {
 			logger.warn(
-				"Deferred watcher replay postponed after failed full sync",
+				"Deferred watcher replay postponed after failed sync session",
 				{
 					sessionId: outcome.sessionId,
+					sessionKind: outcome.kind,
 					pendingWatcherEvents: this.deferredEvents.length,
 				},
 			);
 			return;
 		}
-		void this.flushDeferredEvents().catch((e) => {
+		if (replayIds.size === 0) return;
+		void this.flushDeferredEvents(replayIds).catch((e) => {
 			logger.error("Failed to flush deferred watcher events:", {
 				error: e,
 			});
@@ -261,11 +306,77 @@ export class FileWatcher {
 		this.fullSyncBarrier = {
 			sessionId: context.sessionId,
 			uploadEventIds,
+			renameCandidateIds:
+				prepared?.sessionId === context.sessionId
+					? prepared.renameCandidateIds
+					: new Set(),
+			alreadyAppliedRenames: 0,
+			supersededRenames: 0,
+			unresolvedRenames: 0,
 		};
 		logger.info("Full sync watcher barrier captured", {
 			sessionId: context.sessionId,
 			cutoffEvents: prepared?.cutoffEventIds.size ?? 0,
 			capturedUploads: uploadEventIds.size,
+			renameCandidates:
+				this.fullSyncBarrier.renameCandidateIds.size,
+			pendingWatcherEvents: this.deferredEvents.length,
+		});
+	}
+
+	/**
+	 * Settle missing-target rename candidates from the logical state selected by
+	 * full reconciliation before the observed revision can advance.
+	 */
+	async settleAfterReconciliation(
+		context: SyncLifecycleContext,
+		result: SyncResult,
+	): Promise<void> {
+		const barrier = this.fullSyncBarrier;
+		if (
+			context.kind !== "full" ||
+			!barrier ||
+			barrier.sessionId !== context.sessionId ||
+			result.errors.length > 0
+		) {
+			return;
+		}
+
+		for (const eventId of barrier.renameCandidateIds) {
+			const event = this.deferredEvents.find(
+				(candidate): candidate is DurableFileRenameEvent =>
+					this.isDurableFileRename(candidate) &&
+					candidate.id === eventId,
+			);
+			if (!event) continue;
+			const outcome = this.syncEngine.classifyPostFullRename(event);
+			if (outcome.status === "completed") {
+				this.acknowledgeEvents([event.id]);
+				barrier.alreadyAppliedRenames++;
+				continue;
+			}
+			if (outcome.status === "superseded") {
+				this.acknowledgeEvents([event.id]);
+				barrier.supersededRenames++;
+				continue;
+			}
+			barrier.unresolvedRenames++;
+			result.errors.push({
+				path: event.path,
+				operation: "none",
+				code: "watcher-rename-unresolved",
+				message: `Watcher rename remains ambiguous after full reconciliation: ${outcome.reason ?? "unknown"}`,
+			});
+		}
+		await this.waitForPersistence();
+		logger[
+			barrier.unresolvedRenames > 0 ? "warn" : "info"
+		]("Post-full watcher rename settlement completed", {
+			sessionId: context.sessionId,
+			candidates: barrier.renameCandidateIds.size,
+			alreadyApplied: barrier.alreadyAppliedRenames,
+			superseded: barrier.supersededRenames,
+			unresolved: barrier.unresolvedRenames,
 			pendingWatcherEvents: this.deferredEvents.length,
 		});
 	}
@@ -306,6 +417,10 @@ export class FileWatcher {
 				success: outcome.success,
 				capturedUploads: barrier.uploadEventIds.size,
 				acknowledgedUploads: acknowledgedIds.length,
+				renameCandidates: barrier.renameCandidateIds.size,
+				alreadyAppliedRenames: barrier.alreadyAppliedRenames,
+				supersededRenames: barrier.supersededRenames,
+				unresolvedRenames: barrier.unresolvedRenames,
 				uploadsCreatedDuringFull: [...currentUploadIds].filter(
 					(id) => !barrier.uploadEventIds.has(id),
 				).length,
@@ -868,6 +983,8 @@ export class FileWatcher {
 		}
 		await flushFileBatch();
 		this.persistDeferredEvents();
+		const deferredToFull =
+			this.preparedFullBarrier?.renameCandidateIds.size ?? 0;
 		logger[replayResult.retry.length > 0 ? "warn" : "info"](
 			"Durable watcher event replay completed",
 			{
@@ -875,6 +992,7 @@ export class FileWatcher {
 				completed: replayResult.completed.length,
 				superseded: replayResult.superseded.length,
 				retry: replayResult.retry.length,
+				deferredToFull,
 				pendingWatcherEvents: this.deferredEvents.length,
 			},
 		);
@@ -1074,6 +1192,22 @@ export class FileWatcher {
 			});
 			return;
 		}
+		if (
+			outcome.status === "retry" &&
+			!outcome.remoteStarted &&
+			outcome.reason === "target-missing-before-remote" &&
+			this.preparedFullBarrier?.cutoffEventIds.has(event.id)
+		) {
+			this.preparedFullBarrier.renameCandidateIds.add(event.id);
+			logger.info("Watcher rename awaits post-full settlement", {
+				sessionId: lifecycle?.sessionId ?? null,
+				eventId: event.id,
+				oldPath: event.path,
+				targetPath: event.targetPath,
+				reason: outcome.reason,
+			});
+			return;
+		}
 
 		if (outcome.status === "retry") {
 			if (!replayResult?.retry.includes(event.id)) {
@@ -1160,6 +1294,19 @@ export class FileWatcher {
 
 	private getEventId(event: DeferredWatcherEvent): string | null {
 		return "id" in event && event.id ? event.id : null;
+	}
+
+	private getEventSignature(event: DeferredWatcherEvent): string {
+		return [
+			event.action,
+			event.path,
+			event.action === "rename" ? event.targetPath : "",
+			event.action === "rename" ? event.kind : "",
+			"epoch" in event ? (event.epoch ?? "") : "",
+			"baseRevision" in event
+				? (event.baseRevision?.toString() ?? "")
+				: "",
+		].join("\u0000");
 	}
 
 	private isDurableFileRename(

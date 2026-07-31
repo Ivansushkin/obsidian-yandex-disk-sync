@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	classifyPostFullRename,
 	isMissingUploadSuperseded,
 	reduceQueuedFileRename,
 	selectFileRenamePlan,
@@ -153,6 +154,84 @@ test("rename planner distinguishes target put, move, and materialization", () =>
 		selectFileRenamePlan(true, metadata("A.md"), "changed"),
 		"materialize-target",
 	);
+});
+
+test("post-full rename settles absent paths and confirmed targets", () => {
+	const event = renameEvent("rename-a", "A.md", "B.md");
+	const absent = classifyPostFullRename(event, {
+		canonicalEpoch: "epoch-a",
+		canonicalRevision: 8,
+		targetExists: false,
+		hasPendingWork: false,
+	});
+	assert.equal(absent.status, "superseded");
+	assert.equal(absent.reason, "source-and-target-settled-by-full");
+
+	const target = metadata("B.md", {
+		changedRevision: 8,
+		sha256: "target-sha",
+	});
+	const applied = classifyPostFullRename(event, {
+		canonicalEpoch: "epoch-a",
+		canonicalRevision: 8,
+		canonicalSource: metadata("A.md", {
+			deleted: true,
+			changedRevision: 8,
+		}),
+		canonicalTarget: target,
+		localTarget: { ...target },
+		targetExists: true,
+		hasPendingWork: false,
+	});
+	assert.equal(applied.status, "completed");
+	assert.equal(applied.plan, "already-applied");
+});
+
+test("post-full rename preserves newer sources and blocks causal ambiguity", () => {
+	const event = renameEvent("rename-a", "A.md", "B.md");
+	const newerSource = classifyPostFullRename(event, {
+		canonicalEpoch: "epoch-a",
+		canonicalRevision: 9,
+		canonicalSource: metadata("A.md", { changedRevision: 9 }),
+		targetExists: false,
+		hasPendingWork: false,
+	});
+	assert.equal(newerSource.status, "superseded");
+	assert.equal(newerSource.reason, "concurrent-source-preserved");
+
+	const causalSource = classifyPostFullRename(event, {
+		canonicalEpoch: "epoch-a",
+		canonicalRevision: 8,
+		canonicalSource: metadata("A.md", { changedRevision: 7 }),
+		targetExists: false,
+		hasPendingWork: false,
+	});
+	assert.equal(causalSource.status, "retry");
+	assert.equal(causalSource.reason, "post-full-rename-ambiguous");
+
+	const pending = classifyPostFullRename(event, {
+		canonicalEpoch: "epoch-a",
+		canonicalRevision: 8,
+		targetExists: false,
+		hasPendingWork: true,
+	});
+	assert.equal(pending.status, "retry");
+	assert.equal(pending.reason, "related-causal-work-pending");
+});
+
+test("post-full rename from a replaced epoch is superseded", () => {
+	const outcome = classifyPostFullRename(
+		renameEvent("rename-a", "A.md", "B.md"),
+		{
+			canonicalEpoch: "epoch-b",
+			canonicalRevision: 1,
+			canonicalSource: metadata("A.md", { changedRevision: 1 }),
+			targetExists: false,
+			hasPendingWork: true,
+		},
+	);
+	assert.equal(outcome.status, "superseded");
+	assert.equal(outcome.reason, "epoch-replaced-by-full");
 });
 
 test("missing old upload is superseded only by durable causal evidence", () => {
