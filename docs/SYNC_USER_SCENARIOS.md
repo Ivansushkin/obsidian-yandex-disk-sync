@@ -159,7 +159,7 @@
 | MOVE-011 | P1  | Async move failed/timeout                              | Move остаётся pending, оба пути проверяются повторно               | auto: fake-yandex |
 | MOVE-012 | P0  | Create → rename до начала upload                       | Загружается только target; source не получает tombstone, move или physical action | auto: `plaintext/encrypted unsynced rename retargets the pending put` |
 | MOVE-013 | P0  | Modify существующего файла → rename до upload          | Target содержит новый SHA; старый physical удаляется только после fingerprint guard | auto: `plaintext/encrypted modified source rename materializes target before cleanup` |
-| MOVE-014 | P0  | Beta.4: canonical target live, source/target physical отсутствуют | Target materialize из совпадающего local snapshot, move/action завершаются за один full | auto: `beta.4 missing move target is materialized and completed` |
+| MOVE-014 | P0  | После прерванного move canonical target live, а source/target physical отсутствуют | Target materialize из совпадающего local snapshot, move/action завершаются за один full | auto: `missing move target is materialized and completed` |
 | MOVE-015 | P1  | Create A → rename A→B → создать новый A                | Rename и новый put имеют разные ID; canonical сохраняет оба файла | auto: `new file at the old path survives a queued rename`; manual-required |
 | MOVE-016 | P1  | Быстрые move A→B→C                                     | Не начатая цепочка coalesce до A→C; начатые шаги завершаются последовательно и идемпотентно | auto: `quick file rename chain coalesces to the final target`; manual-required |
 | MOVE-017 | P0  | Create → rename → deep move при занятом coordinator   | Queued цепочка становится одним A→C; submitted upload причинно передаёт accepted revision конечному rename | auto: `plaintext/encrypted durable create rename and deep move materializes only final path`; `plaintext/encrypted running upload hands its committed revision to a deep rename`; manual-required |
@@ -249,7 +249,7 @@
 | FORCE-012 | P1  | Crash до replacement commit            | Старый canonical остаётся авторитетным либо locks блокируют normal sync | auto: fault           |
 | FORCE-013 | P1  | Crash после replacement commit         | Новый epoch авторитетен, cleanup повторяем                              | auto: fault           |
 | FORCE-014 | P0  | Optional-поля index проходят JSON roundtrip | Отсутствующее поле и `undefined` семантически равны; реальные различия сохраняются | auto: `semantic index comparison uses JSON undefined semantics` |
-| FORCE-015 | P0  | Запуск после beta.1 partial Force      | Существующий v3 проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
+| FORCE-015 | P0  | Перезапуск после частично завершённого Force | Существующий v3 проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
 
 ## Сеть и Яндекс Диск API
 
@@ -268,7 +268,7 @@
 | NET-011 | P1  | 1001+ объектов в root                  | Locks после первой страницы обнаруживаются                                | auto: index-transaction |
 | NET-012 | P1  | Fingerprint отсутствует                | Destructive action блокируется или использует подтверждённую альтернативу | auto: fake-yandex       |
 | NET-013 | P0  | Сбой после перезаписи захваченного lock | Исходные raw bytes восстанавливаются и проверяются до возврата canonical; неоднозначность не ретраится | auto: index-transaction + fake-yandex |
-| NET-014 | P0  | Pending action создан beta.7 с SHA-256, MD5, resource ID или modified | Beta.8 принимает совпадение с любым доступным server identity, но новый destructive action использует единый strongest fingerprint | auto: `physical fingerprints accept every beta.7 server identity` |
+| NET-014 | P0  | Persisted action содержит SHA-256, MD5, resource ID или modified | Совпадение принимается по любой поддерживаемой server identity, но новый destructive action использует единый strongest fingerprint | auto: `physical fingerprints accept every persisted server identity` |
 
 ## Масштаб, платформы и пути
 

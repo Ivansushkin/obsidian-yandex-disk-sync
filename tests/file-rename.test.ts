@@ -846,7 +846,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 	});
 }
 
-test("beta.4 missing move target is materialized and completed", async () => {
+test("missing move target is materialized and completed", async () => {
 	const yandex = new RenameYandexFake();
 	const vault = new RenameVaultFake();
 	const targetContent = content("recovered");

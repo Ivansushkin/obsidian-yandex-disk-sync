@@ -21,7 +21,7 @@ function createResource(
 	};
 }
 
-test("physical fingerprints accept every beta.7 server identity", () => {
+test("physical fingerprints accept every persisted server identity", () => {
 	const resource = createResource({
 		sha256: "sha-value",
 		md5: "md5-value",

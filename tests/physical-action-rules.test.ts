@@ -86,7 +86,7 @@ test("remote deletion requires an exact expected fingerprint", () => {
 	);
 });
 
-test("beta.7 physical actions accept every current server identity", () => {
+test("persisted physical actions accept every current server identity", () => {
 	const resource: YandexResource = {
 		path: "disk:/vault/note.md",
 		name: "note.md",

@@ -57,7 +57,7 @@ export function getPhysicalResourceFingerprint(
 }
 
 /**
- * Match fingerprints written by any beta.7 physical-resource code path.
+ * Match any supported fingerprint persisted for a physical resource.
  */
 export function matchesPhysicalResourceFingerprint(
 	expected: string | undefined,
