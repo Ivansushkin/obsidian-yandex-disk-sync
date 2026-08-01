@@ -337,12 +337,11 @@ logger.error(`Task ${i} failed:`, error);
 
 ### Progress tracking
 
-Progress обновляется в реальном времени:
+Progress обновляется после завершения каждой единицы известной пачки:
 
 ```typescript
 const onProgress = (completed: number, total: number) => {
-	const progress = Math.round((completed / total) * 100);
-	this.updateState({ progress, pendingCount: total - completed });
+	this.setSyncPhase("applying", operation, { completed, total });
 };
 
 await runWithConcurrency(tasks, concurrency, onProgress);
@@ -353,8 +352,12 @@ await runWithConcurrency(tasks, concurrency, onProgress);
 Status bar показывает:
 
 - Текущую операцию: "Uploading files..."
-- Progress: 45%
-- Осталось файлов: 55
+- Выполненные единицы известной пачки: `45/100`
+- Только название фазы для сетевых операций с неизвестной длительностью
+
+При переходе к другой фазе предыдущий `N/M` очищается. Процент и отдельный
+`pendingCount` не вычисляются, потому что длительность файлов и сетевых фаз
+неравномерна.
 
 ## API Reference
 

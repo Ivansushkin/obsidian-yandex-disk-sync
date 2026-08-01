@@ -130,6 +130,7 @@ export class EncryptionTransitionController {
 
 	/** Complete the post-commit target publication and guarded cleanup. */
 	async completeTarget(transition: LocalEncryptionTransition): Promise<void> {
+		this.syncEngine.showMaintenanceCleanupPhase();
 		const cleanup = transition.sourceRawPaths.flatMap((path) => {
 			const expectedFingerprint = transition.sourceFingerprints[path];
 			return expectedFingerprint ? [{ path, expectedFingerprint }] : [];

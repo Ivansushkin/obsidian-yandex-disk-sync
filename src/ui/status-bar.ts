@@ -2,6 +2,7 @@
  * Synchronization status indicator in status bar
  */
 
+import { setIcon } from "obsidian";
 import type { SyncState, SyncStatus } from "../types";
 import { SyncEngine } from "../sync/sync-engine";
 import { t } from "../i18n";
@@ -40,11 +41,17 @@ export class SyncStatusBar {
 	 * Update display
 	 */
 	private updateDisplay(state: SyncState): void {
-		const icon = this.getStatusIcon(state.status);
 		const text = this.getStatusText(state);
 
 		this.statusBarEl.empty();
-		this.statusBarEl.createSpan({ text: `${icon} ${text}` });
+		const iconEl = this.statusBarEl.createSpan({
+			cls: "yandex-sync-status-icon",
+		});
+		setIcon(iconEl, this.getStatusIcon(state.status));
+		this.statusBarEl.createSpan({
+			cls: "yandex-sync-status-text",
+			text,
+		});
 
 		// Update the CSS class for styling
 		this.statusBarEl.removeClass(
@@ -68,21 +75,21 @@ export class SyncStatusBar {
 	private getStatusIcon(status: SyncStatus): string {
 		switch (status) {
 			case "idle":
-				return "[ ]";
+				return "cloud-check";
 			case "syncing":
-				return "[~]";
+				return "refresh-cw";
 			case "error":
-				return "[!]";
+				return "triangle-alert";
 			case "paused":
-				return "[||]";
+				return "pause-circle";
 			case "offline":
-				return "[X]";
+				return "cloud-off";
 			case "initializing":
-				return "[...]";
+				return "loader-circle";
 			case "encryption-required":
-				return "[!]";
+				return "lock-keyhole";
 			default:
-				return "[-]";
+				return "cloud";
 		}
 	}
 
@@ -98,10 +105,7 @@ export class SyncStatusBar {
 				return t("status.ready_full");
 
 			case "syncing":
-				if (state.progress !== undefined) {
-					return `YD: ${state.progress}%`;
-				}
-				return t("status.syncing");
+				return `YD: ${formatSyncActivity(state)}`;
 
 			case "error":
 				return t("status.error");
@@ -135,11 +139,30 @@ export class SyncStatusBar {
 				break;
 			case "syncing":
 				lines.push(t("status.tooltip.syncing"));
+				if (state.sessionKind) {
+					lines.push(
+						t("status.tooltip.session", {
+							session: t(`status.session.${state.sessionKind}`),
+						}),
+					);
+				}
 				if (state.currentOperation) {
 					lines.push(t("status.tooltip.syncing_current", { operation: state.currentOperation }));
 				}
-				if (state.pendingCount > 0) {
-					lines.push(t("status.tooltip.syncing_pending", { count: state.pendingCount }));
+				if (state.progress) {
+					lines.push(
+						t("status.tooltip.progress", {
+							completed: state.progress.completed,
+							total: state.progress.total,
+						}),
+					);
+				}
+				if (state.startedAt) {
+					lines.push(
+						t("status.tooltip.started", {
+							datetime: this.formatDateTime(state.startedAt),
+						}),
+					);
 				}
 				break;
 			case "error":
@@ -205,4 +228,11 @@ export class SyncStatusBar {
 			this.unsubscribe = null;
 		}
 	}
+}
+
+/** Format one sync activity consistently for the status bar and Notice. */
+export function formatSyncActivity(state: SyncState): string {
+	const operation = state.currentOperation ?? t("status.syncing");
+	if (!state.progress || state.progress.total <= 0) return operation;
+	return `${operation} ${state.progress.completed}/${state.progress.total}`;
 }

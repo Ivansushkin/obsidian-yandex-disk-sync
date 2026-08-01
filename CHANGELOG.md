@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.0.0-beta.12
+
+### Changed
+
+- Made the coordinator-backed `SyncState` the single activity source for the
+  status bar and user-visible synchronization Notice.
+- Replaced synthetic percentage progress with named synchronization phases and
+  determinate `N/M` counts only while processing a known set of work items.
+- Made manual full, Force, and encryption-transition actions reuse one
+  persistent Notice from preparation through the final success, error, or
+  actionable blocking result.
+- Switched the status bar to built-in Obsidian icons with an animated active
+  state, and expanded its tooltip with session, phase, start time, progress,
+  and last successful synchronization.
+- Removed the settings-page connection probe before manual full sync. Access
+  and authentication are now classified by the coordinated synchronization
+  itself without a silent delay before UI activity appears.
+
+### Testing
+
+- Added UI-state coverage for phase progress reset, pre-watcher full activity,
+  indeterminate formatting, and `N/M` formatting.
+- Retained the beta.11 causal upload-to-rename, multi-device, Force,
+  encryption-transition, physical cleanup, and startup regression coverage.
+
 ## 2.0.0-beta.11
 
 ### Fixed

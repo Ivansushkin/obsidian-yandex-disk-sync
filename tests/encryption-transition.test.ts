@@ -131,6 +131,7 @@ test("all rewrite modes use the same post-commit cleanup", async () => {
 			clearIndexTransitionServices: () => undefined,
 		} as unknown as IndexManager;
 		const syncEngine = {
+			showMaintenanceCleanupPhase: () => calls.push("cleanup-phase"),
 			reencodeRemoteFiles: async (options: {
 				beforeIndexCommit(): Promise<void>;
 			}) => {
@@ -187,6 +188,7 @@ test("all rewrite modes use the same post-commit cleanup", async () => {
 
 		await controller.execute({ transition, sourceService: null });
 		assert.deepEqual(calls, [
+			"cleanup-phase",
 			"commit-cleanup",
 			"publish-stable",
 			"prepare-cleanup",

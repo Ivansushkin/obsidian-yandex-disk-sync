@@ -198,7 +198,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.11 и явно выполнить Force sync.
+обновить все устройства до 2.0.0-beta.12 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 
@@ -670,8 +670,24 @@ Force Sync — функция принудительной синхрониза�
 - **Всегда требует backup** — Force local сохраняет raw remote snapshot,
   Force remote сохраняет локальный vault
 - **FileWatcher приостанавливается** через существующие `syncPauseCallbacks`
-- **Прогресс отображается** через штатную систему `updateState()`
+- **Прогресс отображается** через единый `SyncState`: название фазы всегда,
+  `N/M` только для известного набора операций
 - **Параллелизация** через `executeOperationsParallel()`
+
+### Состояние синхронизации и уведомления
+
+`SyncCoordinator` назначает каждой full, realtime, Force или maintenance-сессии
+идентификатор и тип. `SyncEngine` публикует через один `SyncState` стабильную
+фазу, время начала и опциональный прогресс `{ completed, total }`. Смена фазы
+удаляет прогресс предыдущей фазы, поэтому завершённая пачка не оставляет
+устаревший `N/M` во время записи canonical index или physical cleanup.
+
+`SyncStatusBar` форматирует это состояние для status bar. То же чистое
+форматирование переиспользует один обновляемый `Notice` ручной full, Force и
+enable/disable/rotate. Startup, scheduler и realtime отражаются только в
+status bar; блокировки, требующие действия пользователя, показываются одним
+deduplicated persistent Notice. UI-состояние не сохраняется в `data.json` и не
+участвует в causal merge, lock-транзакции или выборе encryption codec.
 
 ### UI в настройках
 

@@ -13,6 +13,9 @@ import type {
 	IndexMaintenance,
 	YandexResource,
 	YandexDiskSyncSettings,
+	SyncPhase,
+	SyncProgress,
+	SyncSessionKind,
 } from "../types";
 import { INITIAL_SYNC_STATE } from "../types";
 import { YandexApiError, YandexDiskClient } from "../api/yandex-client";
@@ -40,7 +43,8 @@ import { runWithConcurrencySettled } from "../utils/semaphore";
 import { t } from "../i18n";
 import {
 	SyncCoordinator,
-	type SyncSessionKind,
+	type ActiveSyncSession,
+	type QueuedSyncSession,
 } from "./sync-coordinator";
 import { createConfirmedBaseline } from "./baseline-rules";
 import {
@@ -130,7 +134,8 @@ export class SyncEngine {
 	private externalBlockReason: string | null = null;
 	private isSyncing = false;
 	private isPaused = false;
-	private coordinator = new SyncCoordinator();
+	private coordinator: SyncCoordinator;
+	private uiOwnerSessionId: string | null = null;
 	private expectedWatcherEvents = new Map<string, number>();
 	private realtimeGuardValidationToken: string | undefined;
 
@@ -161,6 +166,12 @@ export class SyncEngine {
 		this.indexManager = indexManager;
 		this.conflictResolver = new ConflictResolver();
 		this.settings = settings;
+		this.coordinator = new SyncCoordinator({
+			onQueued: (session) => this.handleSessionQueued(session),
+			onEnter: (session) => this.handleSessionEnter(session),
+			onExit: (session, success, error) =>
+				this.handleSessionExit(session, success, error),
+		});
 		logger.configure({
 			contextProvider: () => {
 				const session = this.coordinator.getActiveSession();
@@ -201,7 +212,7 @@ export class SyncEngine {
 				errorMessage: undefined,
 				currentOperation: undefined,
 				progress: undefined,
-				pendingCount: 0,
+				phase: undefined,
 			});
 		}
 	}
@@ -288,7 +299,7 @@ export class SyncEngine {
 	 * Check if synchronization is in progress
 	 */
 	isSyncInProgress(): boolean {
-		return this.isSyncing;
+		return this.isSyncing || this.uiOwnerSessionId !== null;
 	}
 
 	/**
@@ -318,6 +329,20 @@ export class SyncEngine {
 				});
 			}
 		});
+	}
+
+	/** Show post-commit maintenance cleanup without replacing session ownership. */
+	showMaintenanceCleanupPhase(): void {
+		if (this.coordinator.getActiveKind() === "maintenance") {
+			this.setSyncPhase("cleanup");
+		}
+	}
+
+	/** Keep an outer full activity visible while pre-full realtime work drains. */
+	showFullQueueWaitPhase(sessionId: string): void {
+		if (this.uiOwnerSessionId === sessionId) {
+			this.setSyncPhase("queued");
+		}
 	}
 
 	/**
@@ -394,12 +419,136 @@ export class SyncEngine {
 		this.notifyStateChange();
 	}
 
+	/** Start representing a coordinator session without replacing an outer owner. */
+	private beginUiActivity(
+		sessionId: string,
+		sessionKind: SyncSessionKind,
+		phase: SyncPhase,
+		startedAt = Date.now(),
+	): boolean {
+		if (this.uiOwnerSessionId && this.uiOwnerSessionId !== sessionId) {
+			return false;
+		}
+		const existingOwner = this.uiOwnerSessionId === sessionId;
+		this.uiOwnerSessionId = sessionId;
+		this.updateState({
+			status: "syncing",
+			errorMessage: undefined,
+			sessionId,
+			sessionKind,
+			startedAt: existingOwner
+				? (this.state.startedAt ?? startedAt)
+				: startedAt,
+		});
+		this.setSyncPhase(phase);
+		return true;
+	}
+
+	/** Update one honest phase and clear stale determinate progress by default. */
+	private setSyncPhase(
+		phase: SyncPhase,
+		currentOperation = this.getPhaseLabel(phase),
+		progress?: SyncProgress,
+	): void {
+		this.updateState({
+			phase,
+			currentOperation,
+			progress:
+				progress && progress.total > 0
+					? {
+							completed: Math.min(
+								Math.max(0, progress.completed),
+								progress.total,
+							),
+							total: progress.total,
+						}
+					: undefined,
+		});
+	}
+
+	/** Resolve the localized default operation text for a stable phase. */
+	private getPhaseLabel(phase: SyncPhase): string {
+		const keys: Record<SyncPhase, Parameters<typeof t>[0]> = {
+			"preparing-local": "status.op.preparing_local",
+			queued: "status.op.queued",
+			validating: "status.op.validating",
+			"checking-remote": "status.op.checking_remote_folder",
+			"loading-index": "status.op.loading_remote_index",
+			"scanning-local": "status.op.scanning_local_files",
+			"scanning-remote": "status.op.getting_remote_files",
+			analyzing: "status.op.analyzing_changes",
+			"creating-folders": "status.op.creating_folders",
+			applying: "status.op.applying_changes",
+			"saving-index": "status.op.saving_indexes",
+			cleanup: "status.op.cleanup",
+			finalizing: "status.op.finalizing",
+		};
+		return t(keys[phase]);
+	}
+
+	/** Represent a session as waiting without replacing an outer UI owner. */
+	private handleSessionQueued(session: QueuedSyncSession): void {
+		this.beginUiActivity(
+			session.id,
+			session.kind,
+			"queued",
+			session.enqueuedAt,
+		);
+	}
+
+	/** Represent a coordinator session after it obtains exclusive ownership. */
+	private handleSessionEnter(session: ActiveSyncSession): void {
+		this.beginUiActivity(
+			session.id,
+			session.kind,
+			"validating",
+			session.enqueuedAt,
+		);
+	}
+
+	/** Publish the terminal status only after coordinator settlement completes. */
+	private handleSessionExit(
+		session: ActiveSyncSession,
+		success: boolean,
+		error?: unknown,
+	): void {
+		if (this.uiOwnerSessionId !== session.id) return;
+		this.uiOwnerSessionId = null;
+		const failed = !success || this.state.status === "error";
+		const blocked = this.state.status === "encryption-required";
+		this.updateState({
+			status: blocked ? "encryption-required" : failed ? "error" : "idle",
+			lastSyncTime:
+				!failed && !blocked ? Date.now() : this.state.lastSyncTime,
+			errorMessage:
+				error instanceof Error
+					? error.message
+					: failed
+						? this.state.errorMessage
+						: undefined,
+			sessionId: undefined,
+			sessionKind: undefined,
+			phase: undefined,
+			startedAt: undefined,
+			currentOperation: undefined,
+			progress: undefined,
+		});
+	}
+
 	/**
 	 * Pause synchronization
 	 */
 	pause(): void {
 		this.isPaused = true;
-		this.updateState({ status: "paused" });
+		this.updateState({
+			status: "paused",
+			sessionId: undefined,
+			sessionKind: undefined,
+			phase: undefined,
+			startedAt: undefined,
+			currentOperation: undefined,
+			progress: undefined,
+		});
 		logger.info("Synchronization paused");
 	}
 
@@ -408,7 +557,10 @@ export class SyncEngine {
 	 */
 	resume(): void {
 		this.isPaused = false;
-		this.updateState({ status: "idle" });
+		this.updateState({
+			status: "idle",
+			errorMessage: undefined,
+		});
 		logger.info("Synchronization resumed");
 	}
 
@@ -476,9 +628,7 @@ export class SyncEngine {
 			async (result, startTime, validationToken) => {
 				this.yandexClient.clearFolderCache();
 				// 1. Ensure remote folder exists
-				this.updateState({
-					currentOperation: t("status.op.checking_remote_folder"),
-				});
+				this.setSyncPhase("checking-remote");
 				if (
 					!options?.startup &&
 					!(await this.indexManager.remotePathExists())
@@ -487,9 +637,7 @@ export class SyncEngine {
 				}
 
 				// 2. Load remote index
-				this.updateState({
-					currentOperation: t("status.op.loading_remote_index"),
-				});
+				this.setSyncPhase("loading-index");
 				await this.indexManager.loadRemoteIndex(
 					false,
 					options?.startup,
@@ -503,20 +651,19 @@ export class SyncEngine {
 						await this.indexSaveCallback();
 					}
 				}
+				if (this.hasPendingPhysicalWork()) {
+					this.setSyncPhase("cleanup");
+				}
 				await this.resumePendingMoves(result);
 				await this.resumePendingPhysicalActions(result);
 				if (result.errors.length > 0) return;
 
 				// 3. Build local index
-				this.updateState({
-					currentOperation: t("status.op.scanning_local_files"),
-				});
+				this.setSyncPhase("scanning-local");
 				const localFiles = await this.indexManager.buildLocalIndex();
 
 				// 4. Get remote files list
-				this.updateState({
-					currentOperation: t("status.op.getting_remote_files"),
-				});
+				this.setSyncPhase("scanning-remote");
 				const remoteFiles = await this.indexManager.getRemoteFiles();
 				if (
 					this.reconcileCompletedPhysicalActions(
@@ -529,9 +676,7 @@ export class SyncEngine {
 				}
 
 				// 5. Determine operations
-				this.updateState({
-					currentOperation: t("status.op.analyzing_changes"),
-				});
+				this.setSyncPhase("analyzing");
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
 
@@ -588,9 +733,10 @@ export class SyncEngine {
 				);
 
 				if (downloads.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.downloading_files"),
-					});
+					this.setSyncPhase(
+						"applying",
+						t("status.op.downloading_files"),
+					);
 					const downloadResults =
 						await this.executeOperationsParallel(
 							downloads,
@@ -613,9 +759,10 @@ export class SyncEngine {
 				}
 
 				if (deletes.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.deleting_files"),
-					});
+					this.setSyncPhase(
+						"applying",
+						t("status.op.deleting_files"),
+					);
 					if (
 						!(await this.commitDeletionIntents(deletes, result))
 					) {
@@ -661,9 +808,10 @@ export class SyncEngine {
 				}
 
 				if (conflicts.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.resolving_conflicts"),
-					});
+					this.setSyncPhase(
+						"applying",
+						t("status.op.resolving_conflicts"),
+					);
 					for (const op of conflicts) {
 						if (this.isPaused) {
 							result.success = false;
@@ -676,15 +824,11 @@ export class SyncEngine {
 						}
 
 						processedOps++;
-						this.updateState({
-							currentOperation: t("status.op.conflict", {
-								path: op.path,
-							}),
-							progress: Math.round(
-								(processedOps / totalOps) * 100,
-							),
-							pendingCount: totalOps - processedOps,
-						});
+						this.setSyncPhase(
+							"applying",
+							t("status.op.conflict", { path: op.path }),
+							{ completed: processedOps, total: totalOps },
+						);
 
 						try {
 							await this.handleConflict(op);
@@ -705,9 +849,7 @@ export class SyncEngine {
 				}
 
 				// 8. Save indexes
-				this.updateState({
-					currentOperation: t("status.op.saving_indexes"),
-				});
+				this.setSyncPhase("saving-index");
 
 				// Tombstones are intentionally retained; Force sync is the only
 				// operation that compacts causal deletion history.
@@ -761,6 +903,9 @@ export class SyncEngine {
 					if (this.indexSaveCallback) {
 						await this.indexSaveCallback();
 					}
+					if (this.hasPendingPhysicalWork()) {
+						this.setSyncPhase("cleanup");
+					}
 					await this.resumePendingPhysicalActions(result);
 					await this.resumePendingMoves(result, true);
 					return;
@@ -769,6 +914,9 @@ export class SyncEngine {
 					indexCommittedBeforeDeletes &&
 					conflicts.length === 0
 				) {
+					if (this.hasPendingPhysicalWork()) {
+						this.setSyncPhase("cleanup");
+					}
 					await this.resumePendingPhysicalActions(result);
 					await this.resumePendingMoves(result, true);
 					return;
@@ -781,6 +929,9 @@ export class SyncEngine {
 				await this.repairMissingAcceptedUploads(
 					uploads.map((operation) => operation.path),
 				);
+				if (this.hasPendingPhysicalWork()) {
+					this.setSyncPhase("cleanup");
+				}
 				await this.resumePendingPhysicalActions(result);
 				await this.resumePendingMoves(result, true);
 			},
@@ -797,6 +948,16 @@ export class SyncEngine {
 			});
 			return this.createErrorResult(message);
 		}
+	}
+
+	/** Return whether a full session still has guarded physical work to resume. */
+	private hasPendingPhysicalWork(): boolean {
+		return (
+			this.indexManager.getPendingPhysicalActions().length > 0 ||
+			Object.values(this.indexManager.getRemoteIndex().moves).some(
+				(move) => move.pending,
+			)
+		);
 	}
 
 	/**
@@ -866,6 +1027,7 @@ export class SyncEngine {
 			await this.runSyncSession(
 				options,
 				async (result) => {
+					this.setSyncPhase("scanning-local");
 					const localFiles = await this.indexManager.buildLocalIndex();
 					const canonical = this.indexManager.getRemoteIndex();
 					const liveCanonical = Object.entries(canonical.files).filter(
@@ -918,9 +1080,15 @@ export class SyncEngine {
 								});
 							},
 					);
+					this.setSyncPhase(
+						"applying",
+						t("status.op.reencoding_files"),
+					);
 					const settled = await runWithConcurrencySettled(
 						tasks,
 						Math.max(1, this.settings.maxConcurrency || 5),
+						(completed, total) =>
+							this.reportProgress(completed, total),
 					);
 					for (let index = 0; index < settled.length; index++) {
 						const outcome = settled[index];
@@ -939,6 +1107,7 @@ export class SyncEngine {
 						});
 					}
 					if (result.errors.length > 0) return;
+					this.setSyncPhase("saving-index");
 					await options?.beforeIndexCommit?.();
 					this.indexManager.updateSyncTime();
 					this.indexManager.beginPhysicalRewriteCommit();
@@ -968,24 +1137,18 @@ export class SyncEngine {
 				const inheritedCleanup = await this.prepareForceBootstrap();
 
 				// 2. Build local index
-				this.updateState({
-					currentOperation: t("status.op.scanning_local_files"),
-				});
+				this.setSyncPhase("scanning-local");
 				const localFiles = await this.indexManager.buildLocalIndex();
 
 				// 3. Get remote files list
-				this.updateState({
-					currentOperation: t("status.op.getting_remote_files"),
-				});
+				this.setSyncPhase("scanning-remote");
 				const remoteFiles = await this.indexManager.getRemoteFiles();
 				if (inheritedCleanup) {
 					this.indexManager.clearMaintenance(inheritedCleanup.id);
 				}
 
 				// 4. Generate operations manually: all local → upload, remote-only → delete_remote
-				this.updateState({
-					currentOperation: t("status.op.analyzing_changes"),
-				});
+				this.setSyncPhase("analyzing");
 				const operations: SyncOperation[] = [];
 
 				for (const [path, meta] of localFiles) {
@@ -1043,9 +1206,10 @@ export class SyncEngine {
 				await options?.beforeIndexCommit?.();
 
 				if (deletes.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.deleting_remote_files"),
-					});
+					this.setSyncPhase(
+						"applying",
+						t("status.op.deleting_remote_files"),
+					);
 					for (const operation of deletes) {
 						this.indexManager.enqueuePhysicalAction(
 							"delete-remote",
@@ -1104,9 +1268,7 @@ export class SyncEngine {
 				// 7. Commit the v3 index. Failed physical deletions deliberately
 				// remain tombstoned so the next sync retries them. Failed uploads
 				// never updated the desired index and are likewise retried.
-				this.updateState({
-					currentOperation: t("status.op.saving_indexes"),
-				});
+				this.setSyncPhase("saving-index");
 				this.indexManager.cleanupDeletedFiles();
 				if (indexCommittedBeforeDeletes) return;
 				this.indexManager.updateSyncTime();
@@ -1141,17 +1303,13 @@ export class SyncEngine {
 				const inheritedCleanup = await this.prepareForceBootstrap();
 
 				// 2. Build local index (to know what to delete)
-				this.updateState({
-					currentOperation: t("status.op.scanning_local_files"),
-				});
+				this.setSyncPhase("scanning-local");
 				const localFiles = await this.indexManager.buildLocalIndex();
 
 				// 3. Read the authoritative physical remote snapshot. Force
 				// remote intentionally does not trust a legacy or ambiguous
 				// canonical index.
-				this.updateState({
-					currentOperation: t("status.op.getting_remote_files"),
-				});
+				this.setSyncPhase("scanning-remote");
 				const remoteFiles = await this.indexManager.getRemoteFiles();
 				if (inheritedCleanup) {
 					this.indexManager.clearMaintenance(inheritedCleanup.id);
@@ -1159,9 +1317,7 @@ export class SyncEngine {
 
 				// 4. Generate operations manually: all remote → download,
 				// local-only → delete locally.
-				this.updateState({
-					currentOperation: t("status.op.analyzing_changes"),
-				});
+				this.setSyncPhase("analyzing");
 				const operations: SyncOperation[] = [];
 
 				for (const [path, meta] of remoteFiles) {
@@ -1203,9 +1359,10 @@ export class SyncEngine {
 				);
 
 				if (downloads.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.downloading_files"),
-					});
+					this.setSyncPhase(
+						"applying",
+						t("status.op.downloading_files"),
+					);
 					const downloadResults =
 						await this.executeOperationsParallel(
 							downloads,
@@ -1220,9 +1377,10 @@ export class SyncEngine {
 				}
 
 				if (deletes.length > 0) {
-					this.updateState({
-						currentOperation: t("status.op.deleting_local_files"),
-					});
+					this.setSyncPhase(
+						"applying",
+						t("status.op.deleting_local_files"),
+					);
 					const deleteResults = await runWithConcurrencySettled(
 						deletes.map((operation) => async () => {
 							await this.deleteLocalFileForForce(operation.path);
@@ -1260,9 +1418,7 @@ export class SyncEngine {
 				// downloads that actually succeeded). Entries whose download failed
 				// are left out of the local index so the next sync retries them and
 				// the local state does not falsely claim a file is present.
-				this.updateState({
-					currentOperation: t("status.op.saving_indexes"),
-				});
+				this.setSyncPhase("saving-index");
 				this.indexManager.cleanupDeletedFiles();
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
@@ -1298,9 +1454,7 @@ export class SyncEngine {
 		if (inheritedCleanup?.phase === "cleanup") {
 			this.indexManager.setMaintenance(inheritedCleanup);
 		}
-		this.updateState({
-			currentOperation: t("status.op.checking_remote_folder"),
-		});
+		this.setSyncPhase("checking-remote");
 		if (!(await this.indexManager.remotePathExists())) {
 			await this.indexManager.createRemotePath();
 		}
@@ -1315,9 +1469,7 @@ export class SyncEngine {
 		failureMessage: string,
 	): Promise<boolean> {
 		if (uploads.length === 0) return false;
-		this.updateState({
-			currentOperation: t("status.op.uploading_files"),
-		});
+		this.setSyncPhase("applying", t("status.op.uploading_files"));
 		const outcomes = await this.executeOperationsParallel(
 			uploads,
 			onProgress,
@@ -1340,9 +1492,7 @@ export class SyncEngine {
 	private async prepareOperationFolders(
 		operations: SyncOperation[],
 	): Promise<void> {
-		this.updateState({
-			currentOperation: t("status.op.creating_folders"),
-		});
+		this.setSyncPhase("creating-folders");
 		await this.ensureFoldersExist(operations);
 	}
 
@@ -1947,6 +2097,11 @@ export class SyncEngine {
 				return batchResult;
 			}
 			this.realtimeGuardValidationToken = validationToken;
+			this.setSyncPhase(
+				"applying",
+				t("status.op.applying_realtime"),
+				{ completed: 0, total: events.length },
+			);
 
 			const prepared: PreparedRealtimeItem[] = [];
 			for (const event of events) {
@@ -2185,6 +2340,7 @@ export class SyncEngine {
 				accepted.push(item);
 			}
 			if (accepted.length === 0) return batchResult;
+			this.setSyncPhase("saving-index");
 			if (!(await this.saveRemoteIndexBestEffort())) {
 				batchResult.retry.push(
 					...accepted
@@ -2215,6 +2371,9 @@ export class SyncEngine {
 			const deletes = accepted.filter(
 				(item) => item.action === "delete",
 			);
+			if (deletes.length > 0) {
+				this.setSyncPhase("cleanup");
+			}
 			const deleteResults = await runWithConcurrencySettled(
 				deletes.map((item) => async () => {
 					await this.deleteRemoteFile(item.path);
@@ -2248,6 +2407,16 @@ export class SyncEngine {
 				this.indexManager.markRemoteObserved();
 			}
 			if (this.indexSaveCallback) await this.indexSaveCallback();
+			this.setSyncPhase(
+				"applying",
+				t("status.op.applying_realtime"),
+				{
+					completed:
+						batchResult.completed.length +
+						batchResult.superseded.length,
+					total: events.length,
+				},
+			);
 			if (failedIndex >= 0) {
 				logger.warn("Realtime file batch completed with retry events", {
 					completed: batchResult.completed.length,
@@ -2479,8 +2648,13 @@ export class SyncEngine {
 			lifecycle: SyncLifecycleContext,
 		) => void | Promise<void>,
 	): Promise<FileRenameOutcome> {
-		return await this.coordinator.run("realtime", () =>
-			this.renameFileNow(oldPath, newPath, context), {
+		return await this.coordinator.run("realtime", () => {
+			this.setSyncPhase(
+				"applying",
+				t("status.op.renaming_file"),
+			);
+			return this.renameFileNow(oldPath, newPath, context);
+		}, {
 			settle: async (outcome, session) => {
 				if (outcome.status === "fulfilled") {
 					await settle?.(outcome.value, {
@@ -3383,7 +3557,13 @@ export class SyncEngine {
 		task: () => Promise<void>,
 		settle?: (context: SyncLifecycleContext) => void | Promise<void>,
 	): Promise<void> {
-		return await this.coordinator.run("realtime", task, {
+		return await this.coordinator.run("realtime", async () => {
+			this.setSyncPhase(
+				"applying",
+				t("status.op.applying_realtime"),
+			);
+			await task();
+		}, {
 			settle: async (outcome, session) => {
 				if (outcome.status === "fulfilled") {
 					await settle?.({
@@ -3407,21 +3587,51 @@ export class SyncEngine {
 		) {
 			return await run();
 		}
-		return await this.coordinator.run(kind, run, {
-			prepare:
-				kind === "full"
-					? async (session) => {
-							const context: SyncLifecycleContext = {
-								sessionId: session.id,
-								kind: session.kind,
-								startup: options?.startup,
-							};
-							for (const callback of this.syncPrepareCallbacks) {
-								await callback(context);
+		let preparedSessionId: string | null = null;
+		try {
+			return await this.coordinator.run(kind, run, {
+				prepare:
+					kind === "full"
+						? async (session) => {
+								preparedSessionId = session.id;
+								this.beginUiActivity(
+									session.id,
+									session.kind,
+									"preparing-local",
+								);
+								const context: SyncLifecycleContext = {
+									sessionId: session.id,
+									kind: session.kind,
+									startup: options?.startup,
+								};
+								for (const callback of this.syncPrepareCallbacks) {
+									await callback(context);
+								}
 							}
-						}
-					: undefined,
-		});
+						: undefined,
+			});
+		} catch (error) {
+			if (
+				preparedSessionId &&
+				this.uiOwnerSessionId === preparedSessionId
+			) {
+				this.uiOwnerSessionId = null;
+				this.updateState({
+					status: "error",
+					errorMessage:
+						error instanceof Error
+							? error.message
+							: String(error),
+					sessionId: undefined,
+					sessionKind: undefined,
+					phase: undefined,
+					startedAt: undefined,
+					currentOperation: undefined,
+					progress: undefined,
+				});
+			}
+			throw error;
+		}
 	}
 
 	/**
@@ -3479,11 +3689,12 @@ export class SyncEngine {
 	 * Update progress state during operation execution.
 	 */
 	private reportProgress(processedOps: number, totalOps: number): void {
-		const progress = Math.round((processedOps / totalOps) * 100);
-		this.updateState({
-			progress,
-			pendingCount: totalOps - processedOps,
-		});
+		if (totalOps <= 0) return;
+		this.setSyncPhase(
+			"applying",
+			this.state.currentOperation ?? this.getPhaseLabel("applying"),
+			{ completed: processedOps, total: totalOps },
+		);
 	}
 
 	/**
@@ -3520,6 +3731,7 @@ export class SyncEngine {
 		logger.info("Sync reconciliation started", this.getDiagnosticSnapshot());
 
 		try {
+			this.setSyncPhase("validating");
 			const guard = await this.getSyncGuardResult(
 				options?.skipEncryptionGuard,
 			);
@@ -3532,16 +3744,11 @@ export class SyncEngine {
 				});
 				this.setBlockedState(guard.blockReason);
 			} else {
-				this.updateState({
-					status: "syncing",
-					currentOperation: t("status.op.preparing"),
-					progress: 0,
-				});
-
 				await body(result, startTime, guard.validationToken);
 			}
 
 			if (result.errors.length === 0) {
+				this.setSyncPhase("finalizing");
 				await this.notifySyncFinalizeCallbacks(
 					lifecycleContext,
 					result,
@@ -3558,14 +3765,15 @@ export class SyncEngine {
 
 			if (!guard.blockReason) {
 				this.updateState({
-					status: result.success ? "idle" : "error",
-					lastSyncTime: result.endTime,
+					status: result.success ? "syncing" : "error",
+					lastSyncTime: result.success
+						? result.endTime
+						: this.state.lastSyncTime,
 					errorMessage: result.success
 						? undefined
-						: `Errors: ${result.errors.length}`,
-					currentOperation: undefined,
-					progress: undefined,
-					pendingCount: 0,
+						: t("status.error_count", {
+								errors: result.errors.length,
+							}),
 				});
 			}
 
@@ -3609,7 +3817,6 @@ export class SyncEngine {
 			this.updateState({
 				status: "error",
 				errorMessage: error.message,
-				currentOperation: undefined,
 				progress: undefined,
 			});
 
@@ -4849,8 +5056,8 @@ export class SyncEngine {
 			status: "encryption-required",
 			errorMessage: reason,
 			currentOperation: undefined,
+			phase: undefined,
 			progress: undefined,
-			pendingCount: 0,
 		});
 	}
 }

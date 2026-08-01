@@ -179,6 +179,7 @@ export class FileWatcher {
 			capturedUploads: uploadEventIds.size,
 			causalChainEvents: causalChainIds.size,
 		});
+		this.syncEngine.showFullQueueWaitPhase(context.sessionId);
 
 		try {
 			await this.waitForPersistence();

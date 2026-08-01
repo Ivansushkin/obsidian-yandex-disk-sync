@@ -26,6 +26,7 @@ const outputFiles = [
 	join(outputDir, "full-sync-barrier.test.mjs"),
 	join(outputDir, "yandex-client.test.mjs"),
 	join(outputDir, "resource-fingerprint.test.mjs"),
+	join(outputDir, "sync-ui.test.mjs"),
 ];
 const obsidianStubPlugin = {
 	name: "obsidian-test-stub",
@@ -50,7 +51,8 @@ const obsidianStubPlugin = {
 							.join("/");
 					}
 					export class TFile {}
-					export class TFolder {}
+				export class TFolder {}
+					export function setIcon() {}
 				`,
 				loader: "js",
 			}),
@@ -81,6 +83,7 @@ try {
 			"tests/full-sync-barrier.test.ts",
 			"tests/yandex-client.test.ts",
 			"tests/resource-fingerprint.test.ts",
+			"tests/sync-ui.test.ts",
 		],
 		bundle: true,
 		platform: "node",

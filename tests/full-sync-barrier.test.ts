@@ -13,6 +13,8 @@ import {
 	DEFAULT_SETTINGS,
 	type FileMetadata,
 	type PendingMutation,
+	type SyncPhase,
+	type SyncProgress,
 } from "../src/types";
 
 class FullSyncIndexFake {
@@ -387,4 +389,45 @@ test("dirty full validates the manifest token before commit", async () => {
 
 	assert.equal(result.success, true);
 	assert.deepEqual(calls, [undefined, "manifest-v1"]);
+});
+
+test("full UI activity starts before watcher preparation", async () => {
+	const { engine } = createHarness(false);
+	const phases: Array<SyncPhase | undefined> = [];
+	let stateDuringPreparation = engine.getState();
+	engine.onStateChange((state) => phases.push(state.phase));
+	engine.onSyncPrepare(() => {
+		stateDuringPreparation = engine.getState();
+	});
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, true);
+	assert.equal(phases.includes("preparing-local"), true);
+	assert.equal(stateDuringPreparation.status, "syncing");
+	assert.equal(stateDuringPreparation.sessionKind, "full");
+	assert.equal(stateDuringPreparation.phase, "queued");
+});
+
+test("changing sync phase clears progress from the previous phase", () => {
+	const { engine } = createHarness(false);
+	const access = engine as unknown as {
+		setSyncPhase(
+			phase: SyncPhase,
+			operation?: string,
+			progress?: SyncProgress,
+		): void;
+	};
+
+	access.setSyncPhase("applying", "Applying", {
+		completed: 3,
+		total: 3,
+	});
+	assert.deepEqual(engine.getState().progress, {
+		completed: 3,
+		total: 3,
+	});
+
+	access.setSyncPhase("saving-index", "Saving index");
+	assert.equal(engine.getState().progress, undefined);
 });

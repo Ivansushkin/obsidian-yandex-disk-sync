@@ -103,10 +103,11 @@ setEncryptionService(service: EncryptionService | null): void {
 ### 2.3 SyncEngine (`src/sync/sync-engine.ts`)
 
 Шифрование прозрачно для движка синхронизации: оно выполняется внутри
-`YandexDiskClient` при upload/download. Прогресс длительных операций
-включения/отключения шифрования и смены пароля отображается через общий
-`onProgress` колбэк `SyncEngine` (`updateState` → status bar), который
-получает `(processedCount / totalCount * 100)`.
+`YandexDiskClient` при upload/download. Длительные операции включения,
+отключения и смены пароля публикуют фазы через общий `SyncState`. Status bar и
+единственный обновляемый Notice показывают `N/M` только во время обработки
+известного набора файлов; проверка manifest, commit index и guarded cleanup
+остаются честными indeterminate-фазами без искусственного процента.
 
 Enable, disable и rotate выполняются как эксклюзивная maintenance-операция.
 FileWatcher сохраняет пользовательские события на протяжении всего перехода и
@@ -474,16 +475,20 @@ Device B (encryption was disabled elsewhere, opens Obsidian):
 
 ## 8. UI нотификации
 
-| Операция                                      | Notice (persistent, 0)                | Финальный Notice                                      |
-| --------------------------------------------- | ------------------------------------- | ----------------------------------------------------- |
-| Включение шифрования                          | `notice.encryption_syncing`           | `notice.encryption_enabled`                           |
-| Отключение шифрования (успешно)               | `notice.encryption_disabling`         | `notice.encryption_disabled`                          |
-| Отключение шифрования (с ошибками)            | `notice.encryption_disabling`         | `notice.encryption_disable_partial` (30s, из main.ts) |
-| Авто-отключение при пропавшем remote manifest | --                                    | `notice.encryption_disabled_remotely` (10s)           |
-| Неверный пароль (verify)                      | -- (Notice с ошибкой)                 | модалка не закрывается, `is-error`                    |
-| Подключение второго устройства                | `notice.encryption_password_required` | `notice.encryption_connected`                         |
-| Смена пароля                                  | `notice.encryption_password_rotating` | `notice.encryption_password_changed`                  |
-| Требуется пароль                              | `notice.encryption_password_required` | status bar `YD: Требуется пароль шифрования`          |
+Enable, disable и rotate используют один persistent Notice. Во время операции
+его текст берётся из того же `SyncState`, что и status bar; после результата
+меняется сообщение того же экземпляра.
+
+| Операция                                      | Начальный текст                        | Итог того же Notice                                      |
+| --------------------------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| Включение шифрования                          | `notice.encryption_syncing`            | `notice.encryption_enabled` (5s)                         |
+| Отключение шифрования (успешно)               | `notice.encryption_disabling`          | `notice.encryption_disabled` (5s)                        |
+| Отключение шифрования (с ошибками)            | `notice.encryption_disabling`          | `notice.encryption_disable_partial` (10s)                |
+| Авто-отключение при пропавшем remote manifest | --                                     | `notice.encryption_disabled_remotely` (10s)              |
+| Неверный пароль или transitional manifest     | --                                     | один persistent deduplicated blocking Notice             |
+| Подключение второго устройства                | `notice.encryption_password_required`  | `notice.encryption_connected`                            |
+| Смена пароля                                  | `notice.encryption_password_rotating`  | `notice.encryption_password_changed` (5s)                 |
+| Требуется пароль                              | --                                     | persistent Notice и status bar encryption-required state |
 
 ## 9. История реализации
 
@@ -492,7 +497,7 @@ Device B (encryption was disabled elsewhere, opens Obsidian):
 | 0    | i18n ключи (translations.ts)                                                            | Done   |
 | 1    | types.ts (поля) + encryption.ts (ядро)                                                  | Done   |
 | 2    | yandex-client.ts (прозрачное шифрование)                                                | Done   |
-| 3    | sync-engine.ts (прогресс-колбэк)                                                        | Done   |
+| 3    | sync-engine.ts (`SyncState` с фазой и determinate `N/M`)                                | Done   |
 | 4    | index-manager.ts (salt upload/download)                                                 | Done   |
 | 5    | main.ts (initEncryption, enableEncryption, ensureEncryptionReady)                       | Done   |
 | 6    | settings.ts (UI + error handling + infoblock)                                           | Done   |

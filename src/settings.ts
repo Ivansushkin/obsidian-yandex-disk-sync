@@ -91,14 +91,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		const password = await this.promptNewEncryptionPassword();
 		if (!password) return;
 
-		const notice = new Notice(t("notice.encryption_syncing"), 0);
 		try {
 			await this.plugin.enableEncryption(password);
-			notice.hide();
-			new Notice(t("notice.encryption_enabled"));
-		} catch (e) {
-			notice.hide();
-			new Notice(e instanceof Error ? e.message : String(e));
+		} catch {
+			// The plugin owns the single progress and result Notice.
 		}
 	}
 
@@ -111,16 +107,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		});
 		if (!confirmed) return;
 
-		const notice = new Notice(t("notice.encryption_disabling"), 0);
 		try {
-			const { hadErrors } = await this.plugin.disableEncryption({ reuploadPlaintext: true });
-			notice.hide();
-			if (!hadErrors) {
-				new Notice(t("notice.encryption_disabled"));
-			}
-		} catch (e) {
-			notice.hide();
-			new Notice(e instanceof Error ? e.message : String(e));
+			await this.plugin.disableEncryption({ reuploadPlaintext: true });
+		} catch {
+			// The plugin owns the single progress and result Notice.
 		}
 	}
 
@@ -233,10 +223,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			syncButton.setDisabled(true);
 			syncButton.setButtonText(t("settings.syncing_button"));
 			try {
-				const result = await this.plugin.testConnection();
-				if (!result.success) {
-					return;
-				}
 				await this.plugin.runFullSync();
 			} catch {
 				// errors are surfaced via Notice inside runFullSync
@@ -405,14 +391,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 								});
 								if (!newPassword) return;
 
-								const notice = new Notice(t("notice.encryption_password_rotating"), 0);
 								try {
 									await this.plugin.rotateEncryptionPassword(newPassword);
-									notice.hide();
-									new Notice(t("notice.encryption_password_changed"));
-								} catch (e) {
-									notice.hide();
-									new Notice(e instanceof Error ? e.message : String(e));
+								} catch {
+									// The plugin owns the single progress and result Notice.
 								}
 							} finally {
 								if (spinner && encryptionToggle) {

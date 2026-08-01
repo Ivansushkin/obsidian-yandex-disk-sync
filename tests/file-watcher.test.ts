@@ -800,6 +800,7 @@ test("startup blocks before reconciliation when an upload rename chain is unreso
 			epoch: "epoch-a",
 			baseRevision: 7,
 		}),
+		showFullQueueWaitPhase: () => undefined,
 		syncFileBatch: async () => ({
 			completed: [],
 			superseded: [],
@@ -859,6 +860,7 @@ test("unresolved pre-full rename blocks normal full but not startup classificati
 			epoch: "epoch-a",
 			baseRevision: 7,
 		}),
+		showFullQueueWaitPhase: () => undefined,
 		renameFile: async (
 			_oldPath: string,
 			_newPath: string,
@@ -910,6 +912,7 @@ test("missing-target rename without remote work is deferred to normal full", asy
 			epoch: "epoch-a",
 			baseRevision: 7,
 		}),
+		showFullQueueWaitPhase: () => undefined,
 		renameFile: async (
 			_oldPath: string,
 			_newPath: string,

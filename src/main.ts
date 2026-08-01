@@ -30,7 +30,10 @@ import {
 	FileWatcher,
 } from "./sync/file-watcher";
 import { SyncScheduler } from "./sync/sync-scheduler";
-import { SyncStatusBar } from "./ui/status-bar";
+import {
+	formatSyncActivity,
+	SyncStatusBar,
+} from "./ui/status-bar";
 import { SyncStatusModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
@@ -93,6 +96,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private backupManager!: BackupManager;
 	private statusBar: SyncStatusBar | null = null;
 	private sidebarButton: HTMLElement | null = null;
+	private activeSyncNotice: Notice | null = null;
+	private syncNoticeUnsubscribe: (() => void) | null = null;
+	private syncNoticeHideTimer: number | null = null;
+	private activeManualFullPromise: Promise<SyncResult | null> | null = null;
+	private blockingNotice: { code: string; notice: Notice } | null = null;
 
 	private lastSyncStats = {
 		uploaded: 0,
@@ -182,6 +190,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.sidebarButton.remove();
 			this.sidebarButton = null;
 		}
+		this.disposeSyncNotice();
+		this.blockingNotice?.notice.hide();
+		this.blockingNotice = null;
 
 		// Save index (sync version - onunload is not async)
 		void this.persistPluginData();
@@ -480,48 +491,195 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Run full synchronization
 	 */
-	async runFullSync(options?: SyncRunOptions): Promise<SyncResult | null> {
+	async runFullSync(
+		options?: SyncRunOptions,
+		showProgressNotice = !options?.startup,
+	): Promise<SyncResult | null> {
 		if (!this.settings.yandexTokenSecret) {
-			new Notice(t("notice.token_missing"));
+			this.showBlockingNotice("token-missing", t("notice.token_missing"));
 			return null;
 		}
+		if (showProgressNotice && this.activeManualFullPromise) {
+			return await this.activeManualFullPromise;
+		}
+		if (showProgressNotice) {
+			this.beginSyncNotice(t("notice.sync_started"));
+		}
 
-		new Notice(t("notice.sync_started"));
+		const run = async (): Promise<SyncResult | null> => {
+			try {
+				const result = await this.syncEngine.fullSync(options);
 
-		try {
-			const result = await this.syncEngine.fullSync(options);
+				this.updateLastSyncStats(result);
 
-			this.updateLastSyncStats(result);
+				// Save updated index after sync
+				await this.persistPluginData();
 
-			// Save updated index after sync
-			await this.persistPluginData();
-
-			if (this.handleBlockingSyncResult(result)) {
+				if (this.handleBlockingSyncResult(result, showProgressNotice)) {
+					return result;
+				}
+				if (result.success) this.clearBlockingNotice();
+				if (showProgressNotice) {
+					const successful =
+						result.uploaded + result.downloaded + result.deleted;
+					this.finishSyncNotice(
+						result.success
+							? successful === 0
+								? t("notice.sync_no_changes")
+								: t("notice.sync_completed", { successful })
+							: t("notice.sync_error", {
+									errors: result.errors.length,
+								}),
+						result.success ? 5000 : 10000,
+					);
+				}
 				return result;
+			} catch (e) {
+				logger.error("Sync error:", { error: e });
+				if (showProgressNotice) {
+					this.finishSyncNotice(
+						t("notice.sync_exception", {
+							message: e instanceof Error ? e.message : String(e),
+						}),
+						10000,
+					);
+				}
+				return null;
 			}
-			if (result.success) {
-				new Notice(
-					t("notice.sync_completed", {
-						successful:
-							result.uploaded +
-							result.downloaded +
-							result.deleted,
-					}),
-				);
-			} else {
-				new Notice(
-					t("notice.sync_error", { errors: result.errors.length }),
-				);
+		};
+
+		const promise = run();
+		if (!showProgressNotice) return await promise;
+		this.activeManualFullPromise = promise.finally(() => {
+			if (this.activeManualFullPromise === trackedPromise) {
+				this.activeManualFullPromise = null;
 			}
-			return result;
-		} catch (e) {
-			logger.error("Sync error:", { error: e });
-			new Notice(`Sync error: ${(e as Error).message}`);
-			return null;
-		}
+		});
+		const trackedPromise = this.activeManualFullPromise;
+		return await trackedPromise;
 	}
 
-	private handleBlockingSyncResult(result: SyncResult): boolean {
+	/** Show one live Notice backed by the same state as the status bar. */
+	private beginSyncNotice(initialMessage: string): Notice {
+		if (this.syncNoticeHideTimer !== null) {
+			window.clearTimeout(this.syncNoticeHideTimer);
+			this.syncNoticeHideTimer = null;
+		}
+		const reusableBlockingNotice = this.activeSyncNotice
+			? null
+			: (this.blockingNotice?.notice ?? null);
+		if (reusableBlockingNotice) this.blockingNotice = null;
+		const notice =
+			this.activeSyncNotice ??
+			reusableBlockingNotice ??
+			new Notice(initialMessage, 0);
+		notice.setMessage(initialMessage);
+		this.activeSyncNotice = notice;
+		if (!this.syncNoticeUnsubscribe) {
+			this.syncNoticeUnsubscribe = this.syncEngine.onStateChange((state) => {
+				if (state.status !== "syncing" || !this.activeSyncNotice) return;
+				this.activeSyncNotice.setMessage(
+					t("notice.sync_progress", {
+						operation: formatSyncActivity(state),
+					}),
+				);
+			});
+		}
+		return notice;
+	}
+
+	/** Turn the active progress Notice into its final state. */
+	private finishSyncNotice(message: string, durationMs: number): void {
+		const notice = this.activeSyncNotice;
+		this.syncNoticeUnsubscribe?.();
+		this.syncNoticeUnsubscribe = null;
+		if (!notice) {
+			new Notice(message, durationMs);
+			return;
+		}
+		notice.setMessage(message);
+		if (durationMs <= 0) return;
+		this.syncNoticeHideTimer = window.setTimeout(() => {
+			notice.hide();
+			if (this.activeSyncNotice === notice) {
+				this.activeSyncNotice = null;
+			}
+			this.syncNoticeHideTimer = null;
+		}, durationMs);
+	}
+
+	/** Close transient synchronization UI and detach its state subscription. */
+	private disposeSyncNotice(): void {
+		if (this.syncNoticeHideTimer !== null) {
+			window.clearTimeout(this.syncNoticeHideTimer);
+			this.syncNoticeHideTimer = null;
+		}
+		this.syncNoticeUnsubscribe?.();
+		this.syncNoticeUnsubscribe = null;
+		this.activeSyncNotice?.hide();
+		this.activeSyncNotice = null;
+	}
+
+	/** Hide a blocking Notice when its code matches the resolved condition. */
+	private clearBlockingNotice(code?: string): void {
+		if (code && this.blockingNotice?.code !== code) return;
+		this.blockingNotice?.notice.hide();
+		this.blockingNotice = null;
+	}
+
+	/** Present one persistent actionable block, reusing progress UI when possible. */
+	private showBlockingNotice(
+		code: string,
+		message: string,
+		reuseProgressNotice = false,
+	): void {
+		if (reuseProgressNotice && this.activeSyncNotice) {
+			this.finishSyncNotice(message, 0);
+			this.blockingNotice?.notice.hide();
+			this.blockingNotice = {
+				code,
+				notice: this.activeSyncNotice,
+			};
+			this.activeSyncNotice = null;
+			return;
+		}
+		if (this.blockingNotice?.code === code) {
+			this.blockingNotice.notice.setMessage(message);
+			return;
+		}
+		this.blockingNotice?.notice.hide();
+		this.blockingNotice = {
+			code,
+			notice: new Notice(message, 0),
+		};
+	}
+
+	/** Choose persistent or timed encryption error presentation by actionability. */
+	private finishEncryptionError(error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		const actionableMessages = new Set([
+			t("notice.encryption_wrong_password"),
+			t("notice.encryption_password_required"),
+			t("notice.encryption_password_changed_remote"),
+			t("notice.encryption_remote_busy"),
+		]);
+		if (
+			actionableMessages.has(message) ||
+			this.syncEngine.getState().status === "encryption-required"
+		) {
+			this.showBlockingNotice("encryption-state", message, true);
+			return;
+		}
+		this.finishSyncNotice(
+			t("notice.encryption_transition_error", { message }),
+			10000,
+		);
+	}
+
+	private handleBlockingSyncResult(
+		result: SyncResult,
+		reuseProgressNotice = false,
+	): boolean {
 		const blockingError = result.errors.find((error) =>
 			[
 				"legacy-index",
@@ -547,9 +705,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			"encryption-blocked": null,
 			"authentication": "notice.token_invalid",
 		}[blockingError.code ?? ""];
-		if (noticeKey) {
-			new Notice(t(noticeKey), 0);
-		}
+		const message = noticeKey ? t(noticeKey) : blockingError.message;
+		this.showBlockingNotice(
+			blockingError.code ?? "unknown",
+			message,
+			reuseProgressNotice,
+		);
 		logger.warn("Synchronization blocked", {
 			code: blockingError.code,
 		});
@@ -583,36 +744,42 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		task: () => Promise<SyncResult>,
 	): Promise<void> {
 		if (!(await this.confirmForceSync(direction))) return;
-		const notice = new Notice(
+		this.beginSyncNotice(
 			t(
 				direction === "from_local"
 					? "notice.force_sync_from_local_started"
 					: "notice.force_sync_from_remote_started",
 			),
-			600000,
 		);
 		try {
 			const result = await task();
 			this.updateLastSyncStats(result);
 			await this.persistPluginData();
-			notice.hide();
 			if (!result.success) {
-				new Notice(
+				this.finishSyncNotice(
 					t("notice.sync_error", { errors: result.errors.length }),
+					10000,
 				);
 				return;
 			}
 			await this.startSync();
-			new Notice(
+			this.clearBlockingNotice();
+			this.finishSyncNotice(
 				t("notice.force_sync_completed", {
 					successful:
 						result.uploaded + result.downloaded + result.deleted,
 				}),
+				5000,
 			);
 		} catch (error) {
-			notice.hide();
 			logger.error("Force sync error:", { error });
-			new Notice(`Force sync error: ${(error as Error).message}`);
+			this.finishSyncNotice(
+				t("notice.force_sync_exception", {
+					message:
+						error instanceof Error ? error.message : String(error),
+				}),
+				10000,
+			);
 		}
 	}
 
@@ -621,7 +788,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	async runForceSyncFromLocal(): Promise<void> {
 		if (!this.settings.yandexTokenSecret) {
-			new Notice(t("notice.token_missing"));
+			this.showBlockingNotice("token-missing", t("notice.token_missing"));
 			return;
 		}
 		const remoteManifest =
@@ -710,7 +877,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	async runForceSyncFromRemote(): Promise<void> {
 		if (!this.settings.yandexTokenSecret) {
-			new Notice(t("notice.token_missing"));
+			this.showBlockingNotice("token-missing", t("notice.token_missing"));
 			return;
 		}
 		if (!(await this.ensureEncryptionReady({ prompt: true }))) {
@@ -763,7 +930,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 			return;
 		}
-		void this.runFullSync();
+		await this.runFullSync(undefined, false);
 	}
 
 	/**
@@ -918,8 +1085,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			logger.warn("Failed to initialize encryption:", { error: e });
 			this.encryptionService = null;
 			this.yandexClient.setEncryptionService(null);
-
-			new Notice(t("notice.encryption_wrong_password"));
+			this.setEncryptionBlock(t("notice.encryption_wrong_password"));
 		}
 	}
 
@@ -927,9 +1093,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Enable encryption or connect to an already encrypted remote vault.
 	 */
 	async enableEncryption(password: string): Promise<void> {
-		await this.syncEngine.runExclusiveMaintenance(async () => {
-			await this.enableEncryptionNow(password);
-		});
+		this.beginSyncNotice(t("notice.encryption_syncing"));
+		try {
+			await this.syncEngine.runExclusiveMaintenance(async () => {
+				await this.enableEncryptionNow(password);
+			});
+			this.clearBlockingNotice();
+			this.finishSyncNotice(t("notice.encryption_enabled"), 5000);
+		} catch (error) {
+			this.finishEncryptionError(error);
+			throw error;
+		}
 	}
 
 	private async enableEncryptionNow(password: string): Promise<void> {
@@ -997,9 +1171,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	async disableEncryption(options?: {
 		reuploadPlaintext?: boolean;
 	}): Promise<{ hadErrors: boolean }> {
-		return await this.syncEngine.runExclusiveMaintenance(async () =>
-			this.disableEncryptionNow(options),
-		);
+		this.beginSyncNotice(t("notice.encryption_disabling"));
+		try {
+			const result = await this.syncEngine.runExclusiveMaintenance(
+				async () => this.disableEncryptionNow(options),
+			);
+			this.finishSyncNotice(
+				result.hadErrors
+					? t("notice.encryption_disable_partial")
+					: t("notice.encryption_disabled"),
+				result.hadErrors ? 10000 : 5000,
+			);
+			return result;
+		} catch (error) {
+			this.finishEncryptionError(error);
+			throw error;
+		}
 	}
 
 	private async disableEncryptionNow(options?: {
@@ -1065,7 +1252,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		if (partialErrors) {
-			new Notice(t("notice.encryption_disable_partial"), 30000);
 			return { hadErrors: true };
 		}
 
@@ -1111,9 +1297,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Rotate the encryption password and re-upload all files with a new key.
 	 */
 	async rotateEncryptionPassword(newPassword: string): Promise<void> {
-		await this.syncEngine.runExclusiveMaintenance(async () => {
-			await this.rotateEncryptionPasswordNow(newPassword);
-		});
+		this.beginSyncNotice(t("notice.encryption_password_rotating"));
+		try {
+			await this.syncEngine.runExclusiveMaintenance(async () => {
+				await this.rotateEncryptionPasswordNow(newPassword);
+			});
+			this.finishSyncNotice(
+				t("notice.encryption_password_changed"),
+				5000,
+			);
+		} catch (error) {
+			this.finishEncryptionError(error);
+			throw error;
+		}
 	}
 
 	private async rotateEncryptionPasswordNow(
@@ -1367,8 +1563,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.encryptionService = null;
 			this.yandexClient.setEncryptionService(null);
 			const message = e instanceof Error ? e.message : String(e);
-			this.setEncryptionBlock(t("notice.encryption_password_required"));
-			new Notice(message);
+			this.setEncryptionBlock(message);
 			return false;
 		}
 	}
@@ -1965,9 +2160,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.fileWatcher?.stop();
 				this.syncScheduler?.stop();
 			}
-			if (changed) {
-				new Notice(reason, 10000);
+			if (changed || this.blockingNotice?.code !== "encryption-state") {
+				this.showBlockingNotice("encryption-state", reason);
 			}
+		} else {
+			this.clearBlockingNotice("encryption-state");
 		}
 	}
 
@@ -2162,29 +2359,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					error: e,
 				});
 			}
-		}
-	}
-
-	/**
-	 * Test connection to Yandex Disk
-	 */
-	async testConnection(): Promise<{ success: boolean; message: string }> {
-		if (!this.settings.yandexTokenSecret) {
-			return { success: false, message: t("notice.token_missing") };
-		}
-
-		try {
-			const valid = await this.yandexClient.checkToken();
-			if (valid) {
-				return {
-					success: true,
-					message: t("notice.connection_test_success"),
-				};
-			} else {
-				return { success: false, message: t("notice.token_invalid") };
-			}
-		} catch (e) {
-			return { success: false, message: (e as Error).message };
 		}
 	}
 

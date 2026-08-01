@@ -25,7 +25,9 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.tooltip.idle": "Status: Ready for synchronization",
 		"status.tooltip.syncing": "Status: Synchronizing...",
 		"status.tooltip.syncing_current": "Operation: {operation}",
-		"status.tooltip.syncing_pending": "Remaining: {count} files",
+		"status.tooltip.session": "Session: {session}",
+		"status.tooltip.progress": "Progress: {completed}/{total}",
+		"status.tooltip.started": "Started: {datetime}",
 		"status.tooltip.error": "Status: Error",
 		"status.tooltip.error_details": "Error: {message}",
 		"status.tooltip.paused": "Status: Paused",
@@ -34,9 +36,15 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.tooltip.encryption_required":
 			"Status: Synchronization is blocked until encryption password is entered",
 		"status.tooltip.last_sync": "Last synchronization: {datetime}",
+		"status.session.full": "Full sync",
+		"status.session.force": "Force sync",
+		"status.session.realtime": "Realtime sync",
+		"status.session.maintenance": "Encryption maintenance",
 
 		// Operation statuses
-		"status.op.preparing": "Preparing...",
+		"status.op.preparing_local": "Preparing local changes...",
+		"status.op.queued": "Waiting for synchronization queue...",
+		"status.op.validating": "Checking synchronization state...",
 		"status.op.checking_remote_folder": "Checking remote folder...",
 		"status.op.loading_remote_index": "Loading remote index...",
 		"status.op.scanning_local_files": "Scanning local files...",
@@ -50,12 +58,25 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.op.deleting_local_files": "Deleting local files...",
 		"status.op.resolving_conflicts": "Resolving conflicts...",
 		"status.op.saving_indexes": "Saving indexes...",
+		"status.op.applying_changes": "Applying changes...",
+		"status.op.applying_realtime": "Synchronizing local changes...",
+		"status.op.renaming_file": "Moving file...",
+		"status.op.reencoding_files": "Re-encoding files...",
+		"status.op.cleanup": "Cleaning up old data...",
+		"status.op.finalizing": "Finalizing synchronization...",
+		"status.error_count": "Errors: {errors}",
 		"status.op.conflict": "Conflict: {path}",
 
 		// Notices
 		"notice.sync_started": "Synchronization started...",
+		"notice.sync_progress": "Synchronization: {operation}",
+		"notice.sync_no_changes": "Synchronization completed: no changes",
+		"notice.sync_exception": "Synchronization failed: {message}",
+		"notice.force_sync_exception": "Force sync failed: {message}",
+		"notice.encryption_transition_error":
+			"Encryption operation failed: {message}",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.11 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.12 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.epoch_mismatch_blocked":
@@ -70,8 +91,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.token_invalid": "Error: invalid Yandex Disk token",
 		"notice.token_missing":
 			"Please configure Yandex Disk token in plugin settings",
-		"notice.connection_test_success": "Connection successful",
-		"notice.connection_check": "Checking connection to Yandex Disk...",
 		"notice.backup_started": "Creating backup...",
 		"notice.backup_completed": "Backup created: {name}",
 
@@ -306,7 +325,9 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.tooltip.idle": "Статус: Готов к синхронизации",
 		"status.tooltip.syncing": "Статус: Синхронизация...",
 		"status.tooltip.syncing_current": "Операция: {operation}",
-		"status.tooltip.syncing_pending": "Осталось: {count} файлов",
+		"status.tooltip.session": "Сессия: {session}",
+		"status.tooltip.progress": "Прогресс: {completed}/{total}",
+		"status.tooltip.started": "Начало: {datetime}",
 		"status.tooltip.error": "Статус: Ошибка",
 		"status.tooltip.error_details": "Ошибка: {message}",
 		"status.tooltip.paused": "Статус: Приостановлено",
@@ -315,9 +336,15 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.tooltip.encryption_required":
 			"Статус: Синхронизация заблокирована до ввода пароля шифрования",
 		"status.tooltip.last_sync": "Последняя синхронизация: {datetime}",
+		"status.session.full": "Полная синхронизация",
+		"status.session.force": "Принудительная синхронизация",
+		"status.session.realtime": "Синхронизация изменений",
+		"status.session.maintenance": "Обслуживание шифрования",
 
 		// Operation statuses
-		"status.op.preparing": "Подготовка...",
+		"status.op.preparing_local": "Подготовка локальных изменений...",
+		"status.op.queued": "Ожидание очереди синхронизации...",
+		"status.op.validating": "Проверка состояния синхронизации...",
 		"status.op.checking_remote_folder": "Проверка удалённой папки...",
 		"status.op.loading_remote_index": "Загрузка удалённого индекса...",
 		"status.op.scanning_local_files": "Сканирование локальных файлов...",
@@ -332,12 +359,26 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.op.deleting_local_files": "Удаление локальных файлов...",
 		"status.op.resolving_conflicts": "Разрешение конфликтов...",
 		"status.op.saving_indexes": "Сохранение индексов...",
+		"status.op.applying_changes": "Применение изменений...",
+		"status.op.applying_realtime": "Синхронизация локальных изменений...",
+		"status.op.renaming_file": "Перемещение файла...",
+		"status.op.reencoding_files": "Перекодирование файлов...",
+		"status.op.cleanup": "Очистка старых данных...",
+		"status.op.finalizing": "Завершение синхронизации...",
+		"status.error_count": "Ошибок: {errors}",
 		"status.op.conflict": "Конфликт: {path}",
 
 		// Notices
 		"notice.sync_started": "Запуск синхронизации...",
+		"notice.sync_progress": "Синхронизация: {operation}",
+		"notice.sync_no_changes": "Синхронизация завершена: изменений нет",
+		"notice.sync_exception": "Ошибка синхронизации: {message}",
+		"notice.force_sync_exception":
+			"Ошибка принудительной синхронизации: {message}",
+		"notice.encryption_transition_error":
+			"Ошибка операции шифрования: {message}",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.11 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.12 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.epoch_mismatch_blocked":
@@ -352,8 +393,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.token_invalid": "Ошибка: неверный токен Яндекс Диска",
 		"notice.token_missing":
 			"Настройте токен Яндекс Диска в настройках плагина",
-		"notice.connection_test_success": "Подключение успешно",
-		"notice.connection_check": "Проверка подключения к Яндекс Диску...",
 		"notice.backup_started": "Создание бекапа...",
 		"notice.backup_completed": "Бекап создан: {name}",
 

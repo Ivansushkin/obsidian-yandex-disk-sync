@@ -322,6 +322,19 @@
 | DIAG-014 | P1 | Startup завершён без canonical maintenance/cleanup | После full не создаётся пустая maintenance/realtime-сессия; summary содержит post-full rename settlement и число новых replay events | auto: full-sync-barrier; manual-required |
 | DIAG-015 | P1 | Submitted upload причинно передан rename              | Лог содержит predecessor event ID, mutation sequence, handoff state и accepted revision; rename не маскируется как независимый `put-target` | auto: file-watcher + file-rename; manual-required |
 
+## UI синхронизации
+
+| ID     | P  | Сценарий | Ожидаемый результат | Проверка |
+| ------ | -- | -------- | -------------------- | -------- |
+| UI-001 | P1 | Пользователь запускает manual full | Один persistent Notice появляется до watcher drain, обновляется тем же экземпляром по фазам и через 5 секунд скрывается после успеха | auto: `full UI activity starts before watcher preparation`; integration; manual-required |
+| UI-002 | P0 | Manual full ожидает медленную realtime rename-цепочку | Внешняя full-сессия сохраняет UI ownership: сначала видны подготовка и ожидание; внутренняя realtime-сессия не закрывает и не подменяет Notice | integration plaintext/encrypted; manual-required |
+| UI-003 | P1 | No-op full | Видны подготовка, scan, анализ и завершение без `0%`; итог сообщает об отсутствии изменений, canonical не записывается | auto: full-sync-barrier + sync-ui; manual-required |
+| UI-004 | P1 | Standalone realtime batch | Status bar показывает realtime и монотонный `N/M` по durable events; progress Notice не создаётся | integration plaintext/encrypted; manual-required |
+| UI-005 | P1 | Startup либо scheduler full | Все реальные фазы видны в status bar, progress Notice не создаётся; блокировка создаёт один persistent Notice | integration; manual-required |
+| UI-006 | P0 | Force local/remote с обязательным backup | Один Notice живёт от подтверждённого backup через Force и restart watcher/scheduler до финального успеха либо ошибки | integration; manual-required |
+| UI-007 | P0 | Enable, disable или rotate encryption | Один Notice отражает maintenance/re-encode/commit/cleanup; вложенная операция не вытесняет внешнюю maintenance-сессию | auto: encryption transition; fault matrix; manual-required |
+| UI-008 | P0 | Auth, legacy, epoch, wrong password или ambiguous lock блокируют sync | Нет ложного success; пользователь получает один дедуплицированный persistent Notice, watcher/scheduler остановлены | integration; manual-required |
+
 ## Матрица вариантов
 
 Каждый новый алгоритм проверяется минимум pairwise-набором по следующим осям.

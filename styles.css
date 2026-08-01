@@ -4,6 +4,29 @@
 .yandex-sync-status {
 	cursor: pointer;
 	padding: 0 8px;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.yandex-sync-status-icon {
+	display: inline-flex;
+}
+
+.yandex-sync-status-icon svg {
+	width: 14px;
+	height: 14px;
+}
+
+.yandex-sync-status.sync-syncing .yandex-sync-status-icon svg,
+.yandex-sync-status.sync-initializing .yandex-sync-status-icon svg {
+	animation: yandex-sync-spin 1.2s linear infinite;
+}
+
+@keyframes yandex-sync-spin {
+	to {
+		transform: rotate(360deg);
+	}
 }
 
 .yandex-sync-status.sync-idle {

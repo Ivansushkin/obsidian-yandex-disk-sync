@@ -452,6 +452,34 @@ export type SyncStatus =
 	| "initializing"
 	| "encryption-required";
 
+export type SyncSessionKind =
+	| "full"
+	| "force"
+	| "realtime"
+	| "maintenance";
+
+export type SyncPhase =
+	| "preparing-local"
+	| "queued"
+	| "validating"
+	| "checking-remote"
+	| "loading-index"
+	| "scanning-local"
+	| "scanning-remote"
+	| "analyzing"
+	| "creating-folders"
+	| "applying"
+	| "saving-index"
+	| "cleanup"
+	| "finalizing";
+
+export interface SyncProgress {
+	/** Number of completed work items in the current determinate phase. */
+	completed: number;
+	/** Total work items known for the current determinate phase. */
+	total: number;
+}
+
 export interface SyncState {
 	/** Current synchronization status */
 	status: SyncStatus;
@@ -459,17 +487,22 @@ export interface SyncState {
 	errorMessage?: string;
 	/** Last successful sync time */
 	lastSyncTime?: number;
-	/** Number of files pending synchronization */
-	pendingCount: number;
-	/** Current operation progress (0-100) */
-	progress?: number;
+	/** Coordinator session currently represented by the UI. */
+	sessionId?: string;
+	/** Kind of coordinator session represented by the UI. */
+	sessionKind?: SyncSessionKind;
+	/** Stable machine-readable phase for presentation and diagnostics. */
+	phase?: SyncPhase;
+	/** Wall-clock time when the represented activity was requested. */
+	startedAt?: number;
+	/** Determinate progress, present only when the work-item total is known. */
+	progress?: SyncProgress;
 	/** Current operation description */
 	currentOperation?: string;
 }
 
 export const INITIAL_SYNC_STATE: SyncState = {
 	status: "idle",
-	pendingCount: 0,
 };
 
 // ============================================================================

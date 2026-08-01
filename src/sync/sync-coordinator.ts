@@ -1,10 +1,7 @@
 import { logger } from "../utils/logger";
+import type { SyncSessionKind } from "../types";
 
-export type SyncSessionKind =
-	| "full"
-	| "force"
-	| "realtime"
-	| "maintenance";
+export type { SyncSessionKind } from "../types";
 
 export interface ActiveSyncSession {
 	id: string;
@@ -14,13 +11,19 @@ export interface ActiveSyncSession {
 }
 
 export interface SyncSessionHooks {
-	onEnter?: (kind: SyncSessionKind) => void | Promise<void>;
-	onExit?: (kind: SyncSessionKind) => void | Promise<void>;
+	onQueued?: (session: QueuedSyncSession) => void | Promise<void>;
+	onEnter?: (session: ActiveSyncSession) => void | Promise<void>;
+	onExit?: (
+		session: ActiveSyncSession,
+		success: boolean,
+		error?: unknown,
+	) => void | Promise<void>;
 }
 
 export interface QueuedSyncSession {
 	id: string;
 	kind: SyncSessionKind;
+	enqueuedAt?: number;
 }
 
 export type SyncSessionSettlement<T> =
@@ -90,11 +93,17 @@ export class SyncCoordinator {
 		runHooks: SyncRunHooks<T>,
 	): Promise<T> {
 		const enqueuedAt = Date.now();
+		const queuedSession: QueuedSyncSession = {
+			id: sessionId,
+			kind,
+			enqueuedAt,
+		};
 		logger.debug("Sync session queued", {
 			sessionId,
 			sessionKind: kind,
 		});
-		const run = this.tail.then(async () => {
+		const queued = Promise.resolve(this.hooks.onQueued?.(queuedSession));
+		const run = Promise.all([this.tail, queued]).then(async () => {
 			const startedAt = Date.now();
 			this.activeKind = kind;
 			this.activeSession = {
@@ -111,7 +120,7 @@ export class SyncCoordinator {
 			let entered = false;
 			let fulfilledSettlementAttempted = false;
 			try {
-				await this.hooks.onEnter?.(kind);
+				await this.hooks.onEnter?.(this.activeSession);
 				entered = true;
 				const result = await task();
 				fulfilledSettlementAttempted = true;
@@ -146,11 +155,22 @@ export class SyncCoordinator {
 					durationMs: Date.now() - startedAt,
 					error,
 				});
+				if (entered && this.activeSession) {
+					await this.hooks.onExit?.(
+						this.activeSession,
+						false,
+						error,
+					);
+					entered = false;
+				}
 				throw error;
 			} finally {
 				try {
-					if (entered) {
-						await this.hooks.onExit?.(kind);
+					if (entered && this.activeSession) {
+						await this.hooks.onExit?.(
+							this.activeSession,
+							true,
+						);
 					}
 				} finally {
 					this.activeKind = null;
