@@ -39,6 +39,7 @@ import {
 } from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
+import { findErrorCause } from "../utils/error-utils";
 import { runWithConcurrencySettled } from "../utils/semaphore";
 import { t } from "../i18n";
 import {
@@ -108,6 +109,8 @@ export interface SyncRunOptions {
 	skipRemoteDeletes?: boolean;
 	/** Run after all target files are uploaded and before the canonical commit. */
 	beforeIndexCommit?: () => void | Promise<void>;
+	/** Prevent an epoch race from scheduling more than one immediate follow-up. */
+	epochRetry?: boolean;
 }
 
 export interface SyncLifecycleContext {
@@ -118,6 +121,7 @@ export interface SyncLifecycleContext {
 
 export interface SyncLifecycleOutcome extends SyncLifecycleContext {
 	success: boolean;
+	epochAdopted?: boolean;
 }
 
 export class SyncEngine {
@@ -138,6 +142,7 @@ export class SyncEngine {
 	private uiOwnerSessionId: string | null = null;
 	private expectedWatcherEvents = new Map<string, number>();
 	private realtimeGuardValidationToken: string | undefined;
+	private epochReplacementPending = false;
 
 	private syncPauseCallbacks: Array<
 		(context: SyncLifecycleContext) => void | Promise<void>
@@ -622,10 +627,15 @@ export class SyncEngine {
 	 * Perform full synchronization
 	 */
 	async fullSync(options?: SyncRunOptions): Promise<SyncResult> {
-		const run = async () =>
-			await this.runSyncSession(
-			options,
-			async (result, startTime, validationToken) => {
+		let adoptionSnapshot: ReturnType<
+			IndexManager["captureLocalCausalState"]
+		> | null = null;
+		let adoptedEpoch: string | null = null;
+		const run = async () => {
+			try {
+				const result = await this.runSyncSession(
+				options,
+				async (result, startTime, validationToken) => {
 				this.yandexClient.clearFolderCache();
 				// 1. Ensure remote folder exists
 				this.setSyncPhase("checking-remote");
@@ -641,12 +651,38 @@ export class SyncEngine {
 				await this.indexManager.loadRemoteIndex(
 					false,
 					options?.startup,
+					true,
 				);
+				const localStateBeforeAdoption = this.indexManager.getLocalIndex();
+				const canonicalEpoch = this.indexManager.getRemoteIndex().epoch;
+				const replacesObservedEpoch =
+					localStateBeforeAdoption.observedEpoch !== null &&
+					localStateBeforeAdoption.observedEpoch !== canonicalEpoch;
+				const migratesLegacyBaseline =
+					localStateBeforeAdoption.observedEpoch === null &&
+					Object.keys(localStateBeforeAdoption.files).length > 0;
+				if (replacesObservedEpoch || migratesLegacyBaseline) {
+					adoptionSnapshot =
+						this.indexManager.captureLocalCausalState();
+					adoptedEpoch = canonicalEpoch;
+					this.indexManager.beginEpochAdoption(canonicalEpoch);
+					result.epochAdopted = true;
+					logger.info("Replacement canonical epoch will be reconciled", {
+						previousEpoch: shortenDiagnosticValue(
+							localStateBeforeAdoption.observedEpoch,
+						),
+						canonicalEpoch: shortenDiagnosticValue(canonicalEpoch),
+						legacyBaseline: migratesLegacyBaseline,
+						baselineFiles: Object.keys(
+							adoptionSnapshot.state.files,
+						).length,
+					});
+				}
 				const hadPendingCausalWork =
 					this.indexManager.getPendingMutations().length > 0 ||
 					this.indexManager.getPendingPhysicalActions().length > 0 ||
 					Object.keys(this.indexManager.getRemoteIndex().moves).length > 0;
-				if (this.indexManager.replayPendingMutations()) {
+				if (!adoptionSnapshot && this.indexManager.replayPendingMutations()) {
 					if (this.indexSaveCallback) {
 						await this.indexSaveCallback();
 					}
@@ -680,15 +716,22 @@ export class SyncEngine {
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
 
-				const operations = this.conflictResolver.determineOperations(
-					localFiles,
-					remoteFiles,
-					localIndex.files,
-					remoteIndex.files,
-					startTime,
-					remoteIndex.folderTombstones,
-					this.indexManager.getPendingLocalDeletePaths(),
-				);
+				const operations = adoptionSnapshot
+					? this.conflictResolver.determineEpochAdoptionOperations(
+							localFiles,
+							remoteFiles,
+							adoptionSnapshot.state.files,
+							remoteIndex.files,
+						)
+					: this.conflictResolver.determineOperations(
+							localFiles,
+							remoteFiles,
+							localIndex.files,
+							remoteIndex.files,
+							startTime,
+							remoteIndex.folderTombstones,
+							this.indexManager.getPendingLocalDeletePaths(),
+						);
 				const baselinesChanged = this.recordConfirmedBaselines(
 					localFiles,
 					remoteFiles,
@@ -938,9 +981,35 @@ export class SyncEngine {
 			(result) =>
 				`Full reconciliation completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
 			);
+				if (adoptionSnapshot && !result.success) {
+					this.indexManager.restoreLocalCausalState(adoptionSnapshot);
+					if (this.indexSaveCallback) await this.indexSaveCallback();
+				}
+				if (adoptedEpoch) {
+					result.epochAdopted = result.success;
+					logger[result.success ? "info" : "warn"](
+						result.success
+							? "Replacement canonical epoch reconciled"
+							: "Replacement canonical epoch reconciliation deferred",
+						{
+							epoch: shortenDiagnosticValue(adoptedEpoch),
+							success: result.success,
+							conflicts: result.conflicts,
+						},
+					);
+				}
+				return result;
+			} finally {
+				this.indexManager.endEpochAdoption?.();
+			}
+		};
 		try {
 			return await this.runCoordinatedSession("full", options, run);
 		} catch (error) {
+			if (adoptionSnapshot) {
+				this.indexManager.restoreLocalCausalState(adoptionSnapshot);
+				if (this.indexSaveCallback) await this.indexSaveCallback();
+			}
 			const message =
 				error instanceof Error ? error.message : String(error);
 			logger.warn("Full reconciliation preparation failed", {
@@ -2087,7 +2156,7 @@ export class SyncEngine {
 			context: SyncLifecycleContext,
 		) => void | Promise<void>,
 	): Promise<RealtimeBatchResult> {
-		return await this.coordinator.run("realtime", async () => {
+		const batchResult = await this.coordinator.run("realtime", async () => {
 			const batchResult = createRealtimeBatchResult();
 			const { blockReason, validationToken } =
 				await this.getSyncGuardResult(false);
@@ -2437,6 +2506,10 @@ export class SyncEngine {
 		}).finally(() => {
 			this.realtimeGuardValidationToken = undefined;
 		});
+		if (this.epochReplacementPending) {
+			batchResult.requiresFullSync = "epoch-replaced";
+		}
+		return batchResult;
 	}
 
 	/** Keep an uncommitted put available for its durable rename successor. */
@@ -2752,8 +2825,13 @@ export class SyncEngine {
 						canonicalRevision:
 							this.indexManager.getRemoteIndex().revision,
 						epoch: this.indexManager.getRemoteIndex().epoch,
-						reason: "canonical-commit-not-confirmed",
+						reason: this.epochReplacementPending
+							? "epoch-replaced"
+							: "canonical-commit-not-confirmed",
 						remoteStarted: true,
+						requiresFullSync: this.epochReplacementPending
+							? "epoch-replaced"
+							: undefined,
 					};
 				}
 				await this.deleteRemoteFile(oldPath);
@@ -2837,6 +2915,9 @@ export class SyncEngine {
 						canonicalRevision: canonical.revision,
 						epoch: canonical.epoch,
 						remoteStarted: true,
+						requiresFullSync: this.epochReplacementPending
+							? "epoch-replaced"
+							: undefined,
 					};
 				}
 			}
@@ -2912,6 +2993,9 @@ export class SyncEngine {
 						this.indexManager.getRemoteIndex().revision,
 					epoch: this.indexManager.getRemoteIndex().epoch,
 					remoteStarted: true,
+					requiresFullSync: this.epochReplacementPending
+						? "epoch-replaced"
+						: undefined,
 				};
 			}
 			const pendingPut = [
@@ -2978,12 +3062,24 @@ export class SyncEngine {
 			};
 
 			if (plan === "put-target") {
-				await this.putRenamedUnsyncedFile(
+				const committed = await this.putRenamedUnsyncedFile(
 					oldPath,
 					newPath,
 					{ content, sha256 },
 					context,
 				);
+				if (!committed) {
+					return {
+						status: "retry",
+						plan,
+						canonicalRevision: null,
+						epoch: context.epoch,
+						reason: this.epochReplacementPending
+							? "epoch-replaced"
+							: "index-commit-not-confirmed",
+						remoteStarted: true,
+					};
+				}
 				return {
 					status: "completed",
 					plan,
@@ -3041,9 +3137,16 @@ export class SyncEngine {
 			}
 
 			if (!(await this.saveRemoteIndexBestEffort())) {
-				throw new Error(
-					`Could not commit logical rename: ${oldPath} -> ${newPath}`,
-				);
+				return {
+					status: "retry",
+					plan,
+					canonicalRevision: null,
+					epoch: context.epoch,
+					reason: this.epochReplacementPending
+						? "epoch-replaced"
+						: "index-commit-not-confirmed",
+					remoteStarted: true,
+				};
 			}
 			if (
 				this.indexManager.getRemoteIndex().files[newPath]
@@ -3134,7 +3237,7 @@ export class SyncEngine {
 		newPath: string,
 		snapshot: { content: ArrayBuffer; sha256: string },
 		context: WatcherCausalContext,
-	): Promise<void> {
+	): Promise<boolean> {
 		const oldPendingPut = [
 			...this.indexManager.getPendingMutations(),
 		]
@@ -3170,7 +3273,7 @@ export class SyncEngine {
 		await this.uploadFile(newPath, false, true, snapshot);
 		this.indexManager.stageMutation(mutation);
 		if (!(await this.saveRemoteIndexBestEffort())) {
-			throw new Error(`Could not commit renamed put target: ${newPath}`);
+			return false;
 		}
 		await this.repairMissingAcceptedUploads([newPath]);
 		const local = this.indexManager.getLocalIndex().files[newPath];
@@ -3208,6 +3311,7 @@ export class SyncEngine {
 			mutationSeq: mutation.seq,
 			baseRevision: mutation.baseRevision,
 		});
+		return true;
 	}
 
 	/**
@@ -3748,6 +3852,11 @@ export class SyncEngine {
 			}
 
 			if (result.errors.length === 0) {
+				if (result.epochAdopted) {
+					await this.indexManager.assertCanonicalEpoch(
+						this.indexManager.getRemoteIndex().epoch,
+					);
+				}
 				this.setSyncPhase("finalizing");
 				await this.notifySyncFinalizeCallbacks(
 					lifecycleContext,
@@ -3835,6 +3944,7 @@ export class SyncEngine {
 			await this.notifySyncResumeCallbacks({
 				...lifecycleContext,
 				success: result.success,
+				epochAdopted: result.success && result.epochAdopted,
 			});
 		}
 	}
@@ -3881,19 +3991,27 @@ export class SyncEngine {
 	}
 
 	private classifySyncError(error: Error): string | undefined {
-		if (
-			error instanceof YandexApiError &&
-			(error.status === 401 || error.status === 403)
-		) {
+		const apiError = findErrorCause(
+			error,
+			(candidate): candidate is YandexApiError =>
+				candidate instanceof YandexApiError,
+		);
+		if (apiError && (apiError.status === 401 || apiError.status === 403)) {
 			return "authentication";
 		}
-		if (error instanceof LegacyIndexVersionError) return "legacy-index";
-		if (error instanceof UnreadableRemoteIndexError) return "unreadable-index";
-		if (error instanceof IndexEpochMismatchError) return "epoch-mismatch";
-		if (error instanceof AmbiguousRemoteIndexLockError) {
+		if (findErrorCause(error, (candidate) => candidate instanceof LegacyIndexVersionError)) {
+			return "legacy-index";
+		}
+		if (findErrorCause(error, (candidate) => candidate instanceof UnreadableRemoteIndexError)) {
+			return "unreadable-index";
+		}
+		if (findErrorCause(error, (candidate) => candidate instanceof IndexEpochMismatchError)) {
+			return "epoch-replaced-during-sync";
+		}
+		if (findErrorCause(error, (candidate) => candidate instanceof AmbiguousRemoteIndexLockError)) {
 			return "ambiguous-index-lock";
 		}
-		if (error instanceof RemoteMaintenanceActiveError) {
+		if (findErrorCause(error, (candidate) => candidate instanceof RemoteMaintenanceActiveError)) {
 			return "remote-maintenance";
 		}
 		return undefined;
@@ -3936,6 +4054,7 @@ export class SyncEngine {
 			result.errors.push({
 				path: "",
 				operation: "none",
+				code: this.classifySyncError(e),
 				message: `Index transaction ${e.outcome} at ${e.stage}: ${e.message}`,
 			});
 			result.success = false;
@@ -3970,6 +4089,14 @@ export class SyncEngine {
 			return true;
 		} catch (e) {
 			if (e instanceof RemoteIndexTransactionError) {
+				if (
+					findErrorCause(
+						e,
+						(candidate) => candidate instanceof IndexEpochMismatchError,
+					)
+				) {
+					this.epochReplacementPending = true;
+				}
 				logger.warn(
 					"Realtime canonical index transaction did not commit",
 					{
@@ -3982,6 +4109,13 @@ export class SyncEngine {
 			}
 			throw e;
 		}
+	}
+
+	/** Consume the one-shot request emitted by a realtime epoch replacement. */
+	consumeEpochReplacementRequest(): boolean {
+		const pending = this.epochReplacementPending;
+		this.epochReplacementPending = false;
+		return pending;
 	}
 
 	/**

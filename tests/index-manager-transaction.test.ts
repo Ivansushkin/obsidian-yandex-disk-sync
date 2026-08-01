@@ -4,6 +4,7 @@ import {
 	IndexManager,
 	LegacyIndexVersionError,
 	RemoteIndexRolledBackError,
+	IndexEpochMismatchError,
 	UnreadableRemoteIndexError,
 } from "../src/sync/index-manager";
 import {
@@ -481,6 +482,31 @@ test("encrypted current index loads without plaintext fallback", async () => {
 	assert.equal(index.revision, 4);
 });
 
+test("only full discovery may load a replacement current epoch", async () => {
+	const { manager } = await createIndexManagerWithContent(
+		{
+			version: CURRENT_INDEX_VERSION,
+			epoch: "epoch-b",
+			revision: 4,
+			files: {},
+		},
+		null,
+	);
+	manager.loadLocalIndexFromData({
+		version: 1,
+		deviceId: "new-device",
+		observedEpoch: "epoch-a",
+		observedRevision: 3,
+		files: {},
+		folderTombstones: {},
+		nextMutationSeq: 1,
+	});
+	await assert.rejects(manager.loadRemoteIndex(), IndexEpochMismatchError);
+	const replacement = await manager.loadRemoteIndex(false, false, true);
+	assert.equal(replacement.epoch, "epoch-b");
+	assert.equal(manager.getObservedEpoch(), "epoch-a");
+});
+
 test("wrong encrypted index key is classified as unreadable", async () => {
 	const currentEncryption =
 		new RejectingEncryptionService() as unknown as EncryptionService;
@@ -617,4 +643,45 @@ test("unverified modified lock restores the encrypted source bytes", async () =>
 		[...client.files.keys()].filter((path) => path.includes(".lock.")),
 		[],
 	);
+});
+
+test("semantic epoch rollback is not retried while transient rollback is", () => {
+	const semantic = new RemoteIndexRolledBackError(
+		"rolled back",
+		"acquired",
+		new IndexEpochMismatchError("epoch-a", "epoch-b"),
+	);
+	const transient = new RemoteIndexRolledBackError(
+		"rolled back",
+		"acquired",
+		new TypeError("fetch failed"),
+	);
+	assert.equal(semantic.retryable, false);
+	assert.equal(transient.retryable, true);
+});
+
+test("legacy local index becomes an unobserved v3 baseline", () => {
+	const manager = new IndexManager(
+		new FakeIndexYandex("vault", null) as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("device-a"),
+	);
+	manager.loadLegacyLocalIndexFromData({
+		lastSyncTime: 10,
+		files: {
+			"note.md": {
+				path: "note.md",
+				sha256: "legacy-sha",
+				size: 7,
+				mtime: 8,
+				syncedAt: 9,
+			},
+			"invalid.md": { path: "invalid.md" },
+		},
+	});
+	const local = manager.getLocalIndex();
+	assert.equal(local.observedEpoch, null);
+	assert.equal(local.observedRevision, 0);
+	assert.equal(local.files["note.md"]?.sha256, "legacy-sha");
+	assert.equal(local.files["invalid.md"], undefined);
 });

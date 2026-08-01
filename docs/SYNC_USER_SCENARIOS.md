@@ -36,7 +36,7 @@
 | INV-006 | Принятый canonical put в итоге имеет соответствующий physical-файл с подтверждённым fingerprint.        |
 | INV-007 | Старое physical action не применяется к более новому canonical-состоянию.                               |
 | INV-008 | Операция подтверждается только непрерывным per-device FIFO watermark своего epoch.                      |
-| INV-009 | Force создаёт новый epoch; старые устройства не воспроизводят операции предыдущего epoch автоматически. |
+| INV-009 | Force создаёт новый epoch; другое устройство принимает его full sync, не replay-ит старые physical actions и заново причинно применяет локальный drift. |
 | INV-010 | Local `observedRevision` изменяется только после полностью применённого canonical-состояния.            |
 | INV-011 | Клиентские часы разных устройств не участвуют в выборе победителя.                                      |
 | INV-012 | Service-файлы, lock и данные самого плагина не попадают в пользовательскую синхронизацию.               |
@@ -61,7 +61,7 @@
 | INIT-011 | P1  | Canonical v1/v2                                        | Normal sync блокируется с инструкцией Force                       | auto: integration       |
 | INIT-012 | P1  | Предрелизный v3 без epoch                              | Normal sync блокируется как legacy prerelease state               | auto: integration       |
 | INIT-013 | P1  | Новый девайс, canonical current epoch                  | Выполняется initial merge; epoch принимается после reconciliation | auto: integration       |
-| INIT-014 | P0  | Старый девайс с другим непустым epoch                  | Normal sync блокируется; предлагается Force remote                | auto: integration       |
+| INIT-014 | P0  | Старый девайс с другим непустым epoch                  | Full принимает новый epoch и выполняет трёхсторонний merge без Force | auto: `a full sync accepts a replacement epoch without Force ping-pong`; two-device |
 | INIT-015 | P1  | Первый запуск прерван после remote scan                | Следующий запуск повторяет merge без потери состояния             | auto: fault             |
 | INIT-016 | P2  | В remote только пустые папки                           | Папки не скачиваются и не попадают в canonical                    | auto: integration       |
 | INIT-017 | P1  | Token отсутствует или недействителен                   | Ни watcher, ни scheduler не изменяют remote                       | auto: integration       |
@@ -69,6 +69,7 @@
 | INIT-019 | P0  | Encrypted canonical v1/v2 с правильным ключом          | Ошибка версии не маскируется codec fallback; показывается Force-инструкция | auto: `encrypted legacy startup preserves LegacyIndexVersionError` |
 | INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable` |
 | INIT-021 | P0  | Watcher-событие возникает до/во время startup encryption guard | Событие durable-буферизуется; blocked/failed startup его не теряет | auto: `strict no-op validates encryption only once`; integration |
+| INIT-022 | P0  | Устройство 1.1 обновляется после Force на другом устройстве | Legacy `localIndex` преобразуется в baseline до первого save; local drift участвует в adoption merge | auto: `legacy local index becomes an unobserved v3 baseline`; integration |
 
 ## Обычный full и realtime
 
@@ -101,6 +102,7 @@
 | SYNC-025 | P0  | Успешный realtime `put-target`, затем full sync       | Confirmed baseline сохраняет fingerprint/mtime/revision; full выполняет `0/0/0` без index commit | auto: `plaintext/encrypted unsynced rename retargets the pending put`; integration |
 | SYNC-026 | P0  | Retry существовал до full/maintenance                 | Старый retry не запускается повторно сразу после сессии; автоматически replay-ятся только новые/изменённые за время паузы события | auto: `successful session replays only watcher events created while paused`; `failed session does not replay watcher events created while paused` |
 | SYNC-027 | P0  | Manual/startup full запрошен во время upload → rename chain | Связанные upload и rename завершаются до reconciliation; неоднозначная цепочка блокирует full и старый путь не скачивается | auto: `startup blocks before reconciliation when an upload rename chain is unresolved`; integration |
+| SYNC-028 | P0  | Realtime commit обнаруживает новый epoch | Транзакция откатывается без четырёх retry, событие остаётся durable и ставится один coalesced full; повторная замена завершает full с `epoch-replaced-during-sync` | auto: transaction retry classification; integration plaintext/encrypted |
 
 ## Удаление файла
 
@@ -186,7 +188,7 @@
 | MULTI-009 | P0  | Три устройства доставляют операции в разном порядке | Одинаковый causal graph даёт одинаковый итог                                  | auto: permutation   |
 | MULTI-010 | P0  | Vault/profile скопирован на второе устройство       | Устройства получают разные installation device IDs                            | auto: integration   |
 | MULTI-011 | P0  | `syncDotObsidian=true`                              | `data.json`, пароль и causal state плагина не синхронизируются как user files | auto: vault-adapter |
-| MULTI-012 | P1  | Устройство offline во время Force                   | При возврате old epoch блокируется                                            | auto: two-device    |
+| MULTI-012 | P1  | Устройство offline во время Force                   | При возврате принимает последний remote epoch; локальный drift причинно вливается | auto: two-device    |
 | MULTI-013 | P0  | Concurrent source edit/delete и target put во время rename-chain | Более новый source не удаляется, независимый target не перезаписывается, merge читает последнюю revision под lock | auto: `source changed after rename base survives as a concurrent file`; permutation |
 | MULTI-014 | P0  | Source создан или изменён другим устройством после baseRevision stale rename | Более новый source сохраняется, missing-target rename становится superseded без destructive action | auto: `post-full rename preserves newer sources and blocks causal ambiguity`; two-device |
 
@@ -242,7 +244,7 @@
 | FORCE-005 | P1  | Несколько locks                        | Оба направления Force работоспособны; cleanup после commit              | auto: integration     |
 | FORCE-006 | P1  | Canonical отсутствует                  | Force создаёт новый canonical                                           | auto: integration     |
 | FORCE-007 | P0  | Старые pending mutations инициатора    | Они не переходят в новый epoch                                          | auto: operation-store |
-| FORCE-008 | P0  | Старый девайс возвращается после Force | Normal sync блокируется по epoch mismatch                               | auto: two-device      |
+| FORCE-008 | P0  | Старый девайс возвращается после Force | Normal full принимает новый epoch, сохраняет локальные изменения и очищает старые causal queues | auto: `a full sync accepts a replacement epoch without Force ping-pong`; two-device |
 | FORCE-009 | P0  | Force local encrypted                  | Logical snapshot и новый epoch записываются текущим ключом              | auto: integration     |
 | FORCE-010 | P0  | Force remote encrypted                 | Physical ciphertext читается текущим ключом и перестраивает canonical   | auto: integration     |
 | FORCE-011 | P0  | Force во время active transition       | Разрешён только документированный recovery-flow                         | auto: integration     |
@@ -250,6 +252,11 @@
 | FORCE-013 | P1  | Crash после replacement commit         | Новый epoch авторитетен, cleanup повторяем                              | auto: fault           |
 | FORCE-014 | P0  | Optional-поля index проходят JSON roundtrip | Отсутствующее поле и `undefined` семантически равны; реальные различия сохраняются | auto: `semantic index comparison uses JSON undefined semantics` |
 | FORCE-015 | P0  | Перезапуск после частично завершённого Force | Существующий v3 проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
+| FORCE-016 | P0  | Device 1 выполняет Force local, device 2 остаётся на старом epoch | Device 2 выполняет обычный full, принимает remote и больше не требует Force | integration plaintext/encrypted; manual-required |
+| FORCE-017 | P0  | После этого device 2 явно выполняет Force remote | Device 1 принимает следующее поколение обычным full; ping-pong требований Force отсутствует | two-device plaintext/encrypted; manual-required |
+| FORCE-018 | P0  | Local и remote одновременно изменились между epoch | Создаётся одна conflict copy, remote остаётся на исходном пути | auto: `epoch adoption restores a remote deletion and conflicts on two live edits`; two-device |
+| FORCE-019 | P0  | Remote delete и local edit между epoch | Локальный edit восстанавливает путь новым put | auto: `epoch adoption restores a remote deletion and conflicts on two live edits` |
+| FORCE-020 | P0  | Старый folder delete не знает нового remote-потомка | Неизвестный потомок скачивается и не удаляется | auto: `unknown remote child survives an old device folder deletion` |
 
 ## Сеть и Яндекс Диск API
 
@@ -333,7 +340,8 @@
 | UI-005 | P1 | Startup либо scheduler full | Все реальные фазы видны в status bar, progress Notice не создаётся; блокировка создаёт один persistent Notice | integration; manual-required |
 | UI-006 | P0 | Force local/remote с обязательным backup | Один Notice живёт от подтверждённого backup через Force и restart watcher/scheduler до финального успеха либо ошибки | integration; manual-required |
 | UI-007 | P0 | Enable, disable или rotate encryption | Один Notice отражает maintenance/re-encode/commit/cleanup; вложенная операция не вытесняет внешнюю maintenance-сессию | auto: encryption transition; fault matrix; manual-required |
-| UI-008 | P0 | Auth, legacy, epoch, wrong password или ambiguous lock блокируют sync | Нет ложного success; пользователь получает один дедуплицированный persistent Notice, watcher/scheduler остановлены | integration; manual-required |
+| UI-008 | P0 | Auth, legacy, wrong password или ambiguous lock блокируют sync | Нет ложного success; пользователь получает один дедуплицированный persistent Notice, watcher/scheduler остановлены | integration; manual-required |
+| UI-009 | P1 | Экран настроек открыт без токена либо с 401/403 | Backup API не вызывается при пустом токене; показывается «Статус резервных копий недоступен» без ERROR-spam | unit; manual-required |
 
 ## Матрица вариантов
 

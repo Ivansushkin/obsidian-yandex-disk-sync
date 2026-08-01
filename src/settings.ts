@@ -16,9 +16,11 @@ import {
 	VerifyPasswordModal,
 } from "./ui/encryption-modals";
 import type { BackupInfo, RemoteEncryptionManifest } from "./types";
+import { YandexApiError } from "./api/yandex-client";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
+	private backupStatusPromise: Promise<string> | null = null;
 
 	constructor(app: App, plugin: YandexDiskSyncPlugin) {
 		super(app, plugin);
@@ -26,22 +28,30 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	private async getLastBackupText(): Promise<string> {
-		try {
-			const backupManager = this.plugin.getBackupManager();
-			if (!backupManager) {
-				return t("settings.backup_never");
-			}
-			const backups: BackupInfo[] = await backupManager.listBackups();
-			if (backups.length > 0) {
-				const backup = backups[0];
-				if (backup) {
-					return backup.created.toLocaleString();
-				}
-			}
-		} catch {
-			// If error loading backups, just show "Never"
+		if (!this.plugin.settings.yandexTokenSecret.trim()) {
+			return t("settings.backup_unavailable");
 		}
-		return t("settings.backup_never");
+		if (this.backupStatusPromise) return await this.backupStatusPromise;
+		this.backupStatusPromise = this.loadLastBackupText().finally(() => {
+			this.backupStatusPromise = null;
+		});
+		return await this.backupStatusPromise;
+	}
+
+	private async loadLastBackupText(): Promise<string> {
+		try {
+			const backups: BackupInfo[] =
+				await this.plugin.getBackupManager().listBackups();
+			return backups[0]?.created.toLocaleString() ?? t("settings.backup_never");
+		} catch (error) {
+			if (
+				!(error instanceof YandexApiError) ||
+				(error.status !== 401 && error.status !== 403)
+			) {
+				logger.debug("Passive backup status is unavailable", { error });
+			}
+			return t("settings.backup_unavailable");
+		}
 	}
 
 	hide(): void {

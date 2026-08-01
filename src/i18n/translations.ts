@@ -76,11 +76,13 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.1 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.1.1 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
-		"notice.epoch_mismatch_blocked":
-			"The remote vault was reset by Force sync. Create a backup, then run Force sync from remote on this device.",
+		"notice.epoch_adopted":
+			"The new remote snapshot was accepted and local changes were merged.",
+		"notice.epoch_adopted_conflicts":
+			"The new remote snapshot was accepted; local changes were merged with {conflicts} conflict copies.",
 		"notice.ambiguous_index_blocked":
 			"Several index locks were found. Normal sync is blocked; create a backup and use Force sync to choose the authoritative side.",
 		"notice.sync_completed":
@@ -177,6 +179,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.backup_desc":
 			"Backup will be saved as a ZIP archive in the .backup folder on disk",
 		"settings.backup_never": "Never",
+		"settings.backup_unavailable": "Backup status unavailable",
 		"settings.backup_button": "Create backup",
 		"settings.backup_show_all": "Show all backups",
 		"settings.backup_in_progress": "Creating...",
@@ -378,11 +381,13 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.1 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.1.1 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
-		"notice.epoch_mismatch_blocked":
-			"Удалённое хранилище было сброшено через Force sync. Создайте резервную копию и выполните Force sync из удалённого хранилища на этом устройстве.",
+		"notice.epoch_adopted":
+			"Новое удалённое состояние принято, локальные изменения объединены.",
+		"notice.epoch_adopted_conflicts":
+			"Новое удалённое состояние принято; локальные изменения объединены, создано конфликтных копий: {conflicts}.",
 		"notice.ambiguous_index_blocked":
 			"Обнаружено несколько lock-файлов индекса. Обычная синхронизация заблокирована; создайте бекап и выберите авторитетную сторону через Force sync.",
 		"notice.sync_completed":
@@ -480,6 +485,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.backup_desc":
 			"Бекап будет сохранен как zip архив в папку .backup на диске",
 		"settings.backup_never": "Не создавался",
+		"settings.backup_unavailable": "Статус резервных копий недоступен",
 		"settings.backup_button": "Сделать бекап",
 		"settings.backup_show_all": "Показать все бекапы",
 		"settings.backup_in_progress": "Создание...",

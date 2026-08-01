@@ -244,3 +244,94 @@ test("same plaintext hash on encrypted first sync creates a baseline without upl
 	);
 	assert.equal(operation.action, "none");
 });
+
+test("epoch adoption reapplies local changes and accepts remote-only changes", () => {
+	const resolver = new ConflictResolver();
+	const baseline = {
+		"local-edit.md": file("local-edit.md", "base"),
+		"remote-edit.md": file("remote-edit.md", "base"),
+		"local-delete.md": file("local-delete.md", "base"),
+		"remote-delete.md": file("remote-delete.md", "base"),
+	};
+	const canonical = {
+		"local-edit.md": file("local-edit.md", "base"),
+		"remote-edit.md": file("remote-edit.md", "remote"),
+		"local-delete.md": file("local-delete.md", "base"),
+	};
+	const remote = new Map(
+		Object.entries(canonical).map(([path, metadata]) => [path, metadata]),
+	);
+	const operations = resolver.determineEpochAdoptionOperations(
+		new Map([
+			["local-edit.md", file("local-edit.md", "local")],
+			["remote-edit.md", file("remote-edit.md", "base")],
+			["remote-delete.md", file("remote-delete.md", "base")],
+		]),
+		remote,
+		baseline,
+		canonical,
+	);
+	assert.deepEqual(
+		Object.fromEntries(operations.map((operation) => [operation.path, operation.action])),
+		{
+			"local-edit.md": "upload",
+			"remote-edit.md": "download",
+			"local-delete.md": "delete_remote",
+			"remote-delete.md": "delete_local",
+		},
+	);
+});
+
+test("epoch adoption restores a remote deletion and conflicts on two live edits", () => {
+	const resolver = new ConflictResolver();
+	const baseline = {
+		"restore.md": file("restore.md", "base"),
+		"conflict.md": file("conflict.md", "base"),
+	};
+	const canonical = {
+		"conflict.md": file("conflict.md", "remote"),
+	};
+	const operations = resolver.determineEpochAdoptionOperations(
+		new Map([
+			["restore.md", file("restore.md", "local")],
+			["conflict.md", file("conflict.md", "local")],
+		]),
+		new Map([["conflict.md", canonical["conflict.md"]]]),
+		baseline,
+		canonical,
+	);
+	assert.deepEqual(
+		Object.fromEntries(operations.map((operation) => [operation.path, operation.action])),
+		{ "restore.md": "upload", "conflict.md": "conflict" },
+	);
+});
+
+test("unknown remote child survives an old device folder deletion", () => {
+	const resolver = new ConflictResolver();
+	const child = file("folder/new-child.md", "remote");
+	const operations = resolver.determineEpochAdoptionOperations(
+		new Map(),
+		new Map([[child.path, child]]),
+		{},
+		{ [child.path]: child },
+	);
+	assert.equal(operations[0]?.action, "download");
+});
+
+test("epoch adoption still detects external physical remote edits", () => {
+	const resolver = new ConflictResolver();
+	const baseline = file("note.md", "base", {
+		remoteFingerprint: "old-physical",
+	});
+	const canonical = { ...baseline };
+	const physical = file("note.md", "ciphertext", {
+		remoteFingerprint: "new-physical",
+	});
+	const operations = resolver.determineEpochAdoptionOperations(
+		new Map([["note.md", { ...baseline }]]),
+		new Map([["note.md", physical]]),
+		{ "note.md": baseline },
+		{ "note.md": canonical },
+	);
+	assert.equal(operations[0]?.action, "download");
+});

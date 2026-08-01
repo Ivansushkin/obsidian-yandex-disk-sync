@@ -320,7 +320,6 @@ export class BackupManager {
 				logger.info("Backup folder does not exist yet");
 				return [];
 			}
-			logger.error("Error listing backups:", { error });
 			throw error;
 		}
 	}

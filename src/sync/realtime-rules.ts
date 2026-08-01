@@ -40,6 +40,7 @@ export interface RealtimeBatchResult {
 	superseded: string[];
 	retry: string[];
 	uploadReceipts: UploadCausalReceipt[];
+	requiresFullSync?: "epoch-replaced";
 }
 
 export type FileRenamePlan =
@@ -60,6 +61,7 @@ export interface FileRenameOutcome {
 	reason?: string;
 	/** True once an API read or write may have observed or changed remote state. */
 	remoteStarted: boolean;
+	requiresFullSync?: "epoch-replaced";
 }
 
 export interface DurableFileRenameEvent extends WatcherCausalContext {

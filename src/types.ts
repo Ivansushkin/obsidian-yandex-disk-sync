@@ -549,6 +549,8 @@ export interface SyncResult {
 	startTime: number;
 	/** Synchronization end time */
 	endTime: number;
+	/** Whether this full run accepted a replacement canonical epoch */
+	epochAdopted?: boolean;
 }
 
 export interface SyncError {

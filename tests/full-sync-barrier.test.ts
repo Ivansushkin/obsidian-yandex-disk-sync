@@ -4,7 +4,11 @@ import type { App } from "obsidian";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { FileWatcher, type DeferredWatcherEvent } from "../src/sync/file-watcher";
-import type { IndexManager } from "../src/sync/index-manager";
+import {
+	IndexEpochMismatchError,
+	RemoteIndexRolledBackError,
+	type IndexManager,
+} from "../src/sync/index-manager";
 import { LocalOperationStore } from "../src/sync/local-operation-store";
 import { SyncEngine } from "../src/sync/sync-engine";
 import {
@@ -38,6 +42,30 @@ class FullSyncIndexFake {
 	}
 
 	async loadRemoteIndex() {}
+	async assertCanonicalEpoch(epoch: string) {
+		assert.equal(this.index.epoch, epoch);
+	}
+
+	captureLocalCausalState() {
+		return {
+			state: structuredClone(this.local),
+			mutations: this.store.getMutations(),
+			physicalActions: this.store.getPhysicalActions(),
+		};
+	}
+
+	beginEpochAdoption(epoch: string) {
+		this.store.resetForEpoch(epoch);
+		this.local.nextMutationSeq = 1;
+	}
+
+	endEpochAdoption() {}
+
+	restoreLocalCausalState(snapshot: ReturnType<FullSyncIndexFake["captureLocalCausalState"]>) {
+		Object.assign(this.local, structuredClone(snapshot.state));
+		this.store.loadMutations(snapshot.mutations, snapshot.state.nextMutationSeq);
+		this.store.loadPhysicalActions(snapshot.physicalActions);
+	}
 
 	replayPendingMutations() {
 		const before = this.store.getMutations().length;
@@ -266,6 +294,47 @@ for (const encrypted of [false, true]) {
 		assert.deepEqual(watcher.getDeferredEvents(), []);
 	});
 }
+
+test("a full sync accepts a replacement epoch without Force ping-pong", async () => {
+	const { engine, index } = createHarness(false);
+	const baseline = {
+		path: "same.md",
+		sha256: "same",
+		size: 1,
+		mtime: 1,
+		syncedAt: 1,
+	};
+	index.local.files[baseline.path] = { ...baseline };
+	index.localFiles.set(baseline.path, { ...baseline });
+	index.remoteFiles.set(baseline.path, { ...baseline });
+	index.index.files[baseline.path] = { ...baseline };
+	index.enqueuePut("obsolete.md", "obsolete");
+	index.index.epoch = "epoch-b";
+
+	const result = await engine.fullSync();
+
+	assert.equal(result.success, true);
+	assert.equal(result.epochAdopted, true);
+	assert.equal(index.local.observedEpoch, "epoch-b");
+	assert.deepEqual(index.store.getMutations(), []);
+	assert.equal(index.remoteSaveCount, 0);
+});
+
+test("recursive transaction cause keeps the epoch replacement classification", () => {
+	const { engine } = createHarness(false);
+	const access = engine as unknown as {
+		classifySyncError(error: Error): string | undefined;
+	};
+	const error = new RemoteIndexRolledBackError(
+		"rolled back",
+		"acquired",
+		new IndexEpochMismatchError("epoch-a", "epoch-b"),
+	);
+	assert.equal(
+		access.classifySyncError(error),
+		"epoch-replaced-during-sync",
+	);
+});
 
 test("full leaves an ambiguous causal rename durable and reports an error", async () => {
 	const { engine, index, watcher, vaultFiles } = createHarness(false);

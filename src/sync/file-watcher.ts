@@ -71,10 +71,14 @@ export class FileWatcher {
 	private recentFolderDeletes = new Map<string, number>();
 	private deferredEvents: DeferredWatcherEvent[] = [];
 	private persistCallback: (() => void | Promise<void>) | null = null;
+	private fullSyncRequestCallback: (() => void | Promise<void>) | null = null;
+	private epochReplacementObserved = false;
+	private epochFullSyncRequest: Promise<void> | null = null;
 	private persistChain: Promise<void> = Promise.resolve();
 	private persistError: unknown = null;
 	private fullSyncBarrier: {
 		sessionId: string;
+		cutoffEventIds: Set<string>;
 		uploadEventIds: Set<string>;
 		renameCandidateIds: Set<string>;
 		alreadyAppliedRenames: number;
@@ -132,6 +136,11 @@ export class FileWatcher {
 
 	setPersistCallback(callback: () => void | Promise<void>): void {
 		this.persistCallback = callback;
+	}
+
+	/** Request one coalesced full reconciliation after realtime sees a new epoch. */
+	setFullSyncRequestCallback(callback: () => void | Promise<void>): void {
+		this.fullSyncRequestCallback = callback;
 	}
 
 	/**
@@ -202,6 +211,13 @@ export class FileWatcher {
 				const id = this.getEventId(event);
 				return id === null || !reconcilableIds.has(id);
 			});
+			if (this.epochReplacementObserved) {
+				blocking.length = 0;
+				logger.info("Pre-full watcher work deferred to epoch adoption", {
+					sessionId: context.sessionId,
+					cutoffEvents: cutoffEventIds.size,
+				});
+			}
 			const unresolvedCausalChain = blocking.some((event) => {
 				const id = this.getEventId(event);
 				return id !== null && causalChainIds.has(id);
@@ -289,6 +305,32 @@ export class FileWatcher {
 					: [];
 			}),
 		);
+		if (outcome.success && outcome.epochAdopted) {
+			const context = this.syncEngine.getWatcherCausalContext();
+			for (const event of this.deferredEvents) {
+				const id = this.getEventId(event);
+				if (!id || !replayIds.has(id)) continue;
+				event.epoch = context.epoch;
+				event.baseRevision = context.baseRevision;
+				if (event.action === "upload") {
+					event.mutationId = undefined;
+					event.mutationSeq = undefined;
+				}
+				if (
+					event.action === "rename" &&
+					event.kind === "file" &&
+					event.predecessorUploadId &&
+					!this.deferredEvents.some(
+						(candidate) =>
+							this.getEventId(candidate) ===
+							event.predecessorUploadId,
+					)
+				) {
+					event.predecessorUploadId = undefined;
+				}
+			}
+			this.persistDeferredEvents();
+		}
 		logger.info("[FileWatcher] Resumed after sync session", {
 			sessionKind: outcome.kind,
 			newEventsReplayed: outcome.success ? replayIds.size : 0,
@@ -329,6 +371,10 @@ export class FileWatcher {
 		this.preparedFullBarrier = null;
 		this.fullSyncBarrier = {
 			sessionId: context.sessionId,
+			cutoffEventIds:
+				prepared?.sessionId === context.sessionId
+					? prepared.cutoffEventIds
+					: new Set(),
 			uploadEventIds,
 			renameCandidateIds:
 				prepared?.sessionId === context.sessionId
@@ -363,6 +409,17 @@ export class FileWatcher {
 			barrier.sessionId !== context.sessionId ||
 			result.errors.length > 0
 		) {
+			return;
+		}
+		if (result.epochAdopted) {
+			this.acknowledgeEvents([...barrier.cutoffEventIds]);
+			this.epochReplacementObserved = false;
+			await this.waitForPersistence();
+			logger.info("Watcher events settled by epoch adoption", {
+				sessionId: context.sessionId,
+				acknowledgedEvents: barrier.cutoffEventIds.size,
+				pendingWatcherEvents: this.deferredEvents.length,
+			});
 			return;
 		}
 
@@ -1019,6 +1076,10 @@ export class FileWatcher {
 		}
 		await flushFileBatch();
 		this.persistDeferredEvents();
+		if (this.syncEngine.consumeEpochReplacementRequest?.()) {
+			this.epochReplacementObserved = true;
+			this.requestEpochFullSync();
+		}
 		const deferredToFull =
 			this.preparedFullBarrier?.renameCandidateIds.size ?? 0;
 		logger[replayResult.retry.length > 0 ? "warn" : "info"](
@@ -1032,6 +1093,19 @@ export class FileWatcher {
 				pendingWatcherEvents: this.deferredEvents.length,
 			},
 		);
+	}
+
+	private requestEpochFullSync(): void {
+		if (!this.fullSyncRequestCallback || this.epochFullSyncRequest) return;
+		const request = Promise.resolve(this.fullSyncRequestCallback()).then(
+			() => undefined,
+		);
+		this.epochFullSyncRequest = request.finally(() => {
+			if (this.epochFullSyncRequest === tracked) {
+				this.epochFullSyncRequest = null;
+			}
+		});
+		const tracked = this.epochFullSyncRequest;
 	}
 
 	private persistDeferredEvents(): void {
@@ -1164,6 +1238,9 @@ export class FileWatcher {
 	 * Remove only events explicitly acknowledged by the sync engine.
 	 */
 	private applyBatchResult(result: RealtimeBatchResult): void {
+		if (result.requiresFullSync === "epoch-replaced") {
+			this.epochReplacementObserved = true;
+		}
 		this.applyUploadCausalReceipts(result);
 		this.acknowledgeEvents([...result.completed, ...result.superseded]);
 		logger[result.retry.length > 0 ? "warn" : "info"](
@@ -1172,6 +1249,7 @@ export class FileWatcher {
 				completed: result.completed.length,
 				superseded: result.superseded.length,
 				retry: result.retry.length,
+				requiresFullSync: result.requiresFullSync ?? null,
 			},
 		);
 	}
@@ -1246,6 +1324,9 @@ export class FileWatcher {
 		lifecycle?: SyncLifecycleContext,
 		replayResult?: RealtimeBatchResult,
 	): Promise<void> {
+		if (outcome.requiresFullSync === "epoch-replaced") {
+			this.epochReplacementObserved = true;
+		}
 		const successor = this.deferredEvents.find(
 			(candidate): candidate is DurableFileRenameEvent =>
 				this.isDurableFileRename(candidate) &&

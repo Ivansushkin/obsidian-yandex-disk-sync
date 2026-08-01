@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.0-beta.1.1
+
+### Fixed
+
+- Removed the cross-device Force sync loop. Devices now accept a valid epoch
+  created by Force through a normal full sync instead of requesting another
+  Force operation.
+- Added three-way reconciliation against the previous device baseline when an
+  epoch changes, preserving local create, modify, delete, rename, and folder
+  operations while producing conflict copies for concurrent edits.
+- Prevented semantic epoch changes from triggering repeated index retries or
+  destructive physical actions. Realtime work remains durable and schedules
+  one coalesced full reconciliation.
+- Migrated the legacy 1.1 local index into the device baseline before the first
+  v3 save, allowing updated devices to merge local changes after another
+  device performs Force sync.
+- Avoided passive backup-status API requests when the token is missing and
+  removed duplicate authorization error logging from the settings screen.
+
 ## 2.0.0-beta.1
 
 ### Breaking change

@@ -16,6 +16,7 @@ import {
 	EncryptionModeDescriptor,
 	IndexMaintenance,
 	SyncResult,
+	FileMetadata,
 } from "./types";
 import { YandexDiskSyncSettingTab } from "./settings";
 import { YandexDiskClient } from "./api/yandex-client";
@@ -67,6 +68,10 @@ import {
 interface PluginData {
 	settings: YandexDiskSyncSettings;
 	localState: Partial<LocalSyncState> | null;
+	localIndex?: {
+		lastSyncTime?: number;
+		files?: Record<string, Partial<FileMetadata>>;
+	} | null;
 	pendingMutations?: PendingMutation[];
 	pendingPhysicalActions?: PendingPhysicalAction[];
 	pendingWatcherEvents?: DeferredWatcherEvent[];
@@ -100,7 +105,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private syncNoticeUnsubscribe: (() => void) | null = null;
 	private syncNoticeHideTimer: number | null = null;
 	private activeManualFullPromise: Promise<SyncResult | null> | null = null;
+	private epochRecoveryTimer: number | null = null;
 	private blockingNotice: { code: string; notice: Notice } | null = null;
+	private loadedPluginData: PluginData | null = null;
 
 	private lastSyncStats = {
 		uploaded: 0,
@@ -191,6 +198,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.sidebarButton = null;
 		}
 		this.disposeSyncNotice();
+		if (this.epochRecoveryTimer !== null) {
+			window.clearTimeout(this.epochRecoveryTimer);
+			this.epochRecoveryTimer = null;
+		}
 		this.blockingNotice?.notice.hide();
 		this.blockingNotice = null;
 
@@ -220,6 +231,26 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.vaultAdapter,
 			this.settings,
 		);
+		if (this.loadedPluginData?.localState) {
+			this.indexManager.loadLocalIndexFromData(
+				this.loadedPluginData.localState,
+			);
+		} else if (this.loadedPluginData?.localIndex) {
+			this.indexManager.loadLegacyLocalIndexFromData(
+				this.loadedPluginData.localIndex,
+			);
+		}
+		this.indexManager.loadPendingMutations(
+			this.loadedPluginData?.pendingMutations,
+		);
+		this.indexManager.loadPendingPhysicalActions(
+			this.loadedPluginData?.pendingPhysicalActions,
+		);
+		if (this.loadedPluginData?.localIndex) {
+			this.loadedPluginData.localState =
+				this.indexManager.getLocalIndexData();
+			this.loadedPluginData.localIndex = null;
+		}
 
 		// Create sync engine
 		this.syncEngine = new SyncEngine(
@@ -325,6 +356,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.fileWatcher.setPersistCallback(async () => {
 			await this.persistPluginData();
 		});
+		this.fileWatcher.setFullSyncRequestCallback(async () => {
+			await this.runFullSync(undefined, false);
+		});
+		this.fileWatcher.loadDeferredEvents(
+			this.loadedPluginData?.pendingWatcherEvents,
+		);
 
 		// Create sync scheduler
 		this.syncScheduler = new SyncScheduler(this.syncEngine, this.settings);
@@ -421,9 +458,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Restore all local causal state before any recovery path can persist
 		// settings again.
-		const data = (await this.loadData()) as PluginData | null;
+		const data = this.loadedPluginData;
 		if (data?.localState) {
 			this.indexManager.loadLocalIndexFromData(data.localState);
+		} else if (data?.localIndex) {
+			this.indexManager.loadLegacyLocalIndexFromData(data.localIndex);
 		}
 		this.indexManager.loadPendingMutations(data?.pendingMutations);
 		this.indexManager.loadPendingPhysicalActions(
@@ -514,16 +553,40 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 				// Save updated index after sync
 				await this.persistPluginData();
+				if (
+					!options?.epochRetry &&
+					result.errors.some(
+						(error) => error.code === "epoch-replaced-during-sync",
+					)
+				) {
+					this.queueEpochRecoveryFull(options);
+				}
 
 				if (this.handleBlockingSyncResult(result, showProgressNotice)) {
 					return result;
 				}
 				if (result.success) this.clearBlockingNotice();
+				if (result.epochAdopted && !showProgressNotice) {
+					new Notice(
+						result.conflicts > 0
+							? t("notice.epoch_adopted_conflicts", {
+									conflicts: result.conflicts,
+								})
+							: t("notice.epoch_adopted"),
+						5000,
+					);
+				}
 				if (showProgressNotice) {
 					const successful =
 						result.uploaded + result.downloaded + result.deleted;
 					this.finishSyncNotice(
-						result.success
+						result.epochAdopted
+							? result.conflicts > 0
+								? t("notice.epoch_adopted_conflicts", {
+										conflicts: result.conflicts,
+									})
+								: t("notice.epoch_adopted")
+							: result.success
 							? successful === 0
 								? t("notice.sync_no_changes")
 								: t("notice.sync_completed", { successful })
@@ -557,6 +620,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 		const trackedPromise = this.activeManualFullPromise;
 		return await trackedPromise;
+	}
+
+	private queueEpochRecoveryFull(options?: SyncRunOptions): void {
+		if (this.epochRecoveryTimer !== null) return;
+		this.epochRecoveryTimer = window.setTimeout(() => {
+			this.epochRecoveryTimer = null;
+			void this.runFullSync(
+				{ ...options, startup: false, epochRetry: true },
+				false,
+			);
+		}, 0);
 	}
 
 	/** Show one live Notice backed by the same state as the status bar. */
@@ -684,7 +758,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			[
 				"legacy-index",
 				"unreadable-index",
-				"epoch-mismatch",
 				"ambiguous-index-lock",
 				"remote-maintenance",
 				"encryption-blocked",
@@ -699,7 +772,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const noticeKey = {
 			"legacy-index": "notice.legacy_index_blocked",
 			"unreadable-index": "notice.unreadable_index_blocked",
-			"epoch-mismatch": "notice.epoch_mismatch_blocked",
 			"ambiguous-index-lock": "notice.ambiguous_index_blocked",
 			"remote-maintenance": "notice.encryption_remote_busy",
 			"encryption-blocked": null,
@@ -938,7 +1010,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	async loadSettings(): Promise<void> {
 		const data = (await this.loadData()) as PluginData | null;
+		this.loadedPluginData = data;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
+		if (data?.lastSyncStats) this.lastSyncStats = data.lastSyncStats;
 		this.encryptionTransition = data?.encryptionTransition ?? null;
 		if (
 			this.encryptionTransition &&
@@ -2406,17 +2480,31 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Save local index to plugin data
 	 */
 	private buildPluginData(): PluginData {
-		return {
+		const data: PluginData = {
 			settings: this.settings,
-			localState: this.indexManager?.getLocalIndexData() ?? null,
-			pendingMutations: this.indexManager?.getPendingMutations() ?? [],
+			localState:
+				this.indexManager?.getLocalIndexData() ??
+				this.loadedPluginData?.localState ??
+				null,
+			pendingMutations:
+				this.indexManager?.getPendingMutations() ??
+				this.loadedPluginData?.pendingMutations ??
+				[],
 			pendingPhysicalActions:
-				this.indexManager?.getPendingPhysicalActions() ?? [],
+				this.indexManager?.getPendingPhysicalActions() ??
+				this.loadedPluginData?.pendingPhysicalActions ??
+				[],
 			pendingWatcherEvents:
-				this.fileWatcher?.getDeferredEvents() ?? [],
+				this.fileWatcher?.getDeferredEvents() ??
+				this.loadedPluginData?.pendingWatcherEvents ??
+				[],
 			encryptionTransition: this.encryptionTransition,
 			lastSyncStats: this.lastSyncStats,
 		};
+		if (!this.indexManager && this.loadedPluginData?.localIndex) {
+			data.localIndex = this.loadedPluginData.localIndex;
+		}
+		return data;
 	}
 
 	/** Update the UI summary from one completed synchronization result. */

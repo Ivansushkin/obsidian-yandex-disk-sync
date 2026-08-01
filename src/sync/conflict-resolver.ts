@@ -18,6 +18,161 @@ import {
 
 export class ConflictResolver {
 	/**
+	 * Reconcile a replacement canonical epoch against the last fully applied
+	 * device baseline. Revisions are intentionally ignored across epochs;
+	 * content and existence form the three-way merge boundary.
+	 */
+	determineEpochAdoptionOperations(
+		localFiles: Map<string, FileMetadata>,
+		remoteFiles: Map<string, FileMetadata>,
+		previousBaseline: Record<string, FileMetadata>,
+		canonicalFiles: Record<string, FileMetadata>,
+	): SyncOperation[] {
+		const allPaths = this.collectAllPaths(
+			localFiles,
+			remoteFiles,
+			previousBaseline,
+			canonicalFiles,
+		);
+		const operations: SyncOperation[] = [];
+		for (const path of allPaths) {
+			const local = localFiles.get(path) ?? null;
+			const physical = remoteFiles.get(path) ?? null;
+			const baseline = previousBaseline[path] ?? null;
+			const canonicalEntry = canonicalFiles[path] ?? null;
+			const remoteLive = canonicalEntry && !canonicalEntry.deleted
+				? {
+						...canonicalEntry,
+						remoteMtime:
+							physical?.remoteMtime ?? canonicalEntry.remoteMtime,
+						remoteFingerprint:
+							physical?.remoteFingerprint ??
+							canonicalEntry.remoteFingerprint,
+					}
+				: null;
+
+			const baselineLive = baseline !== null && !baseline.deleted;
+			const localChanged = baselineLive
+				? local === null || local.sha256 !== baseline.sha256
+				: local !== null;
+			const logicalRemoteChanged = baselineLive
+				? remoteLive === null || remoteLive.sha256 !== baseline.sha256
+				: remoteLive !== null;
+			const physicalRemoteChanged = remoteLive
+				? physical === null ||
+					(getRemotePhysicalDrift(physical, canonicalEntry) ?? false)
+				: false;
+			const remoteChanged =
+				logicalRemoteChanged || physicalRemoteChanged;
+
+			let operation: SyncOperation;
+			if (
+				local &&
+				remoteLive &&
+				!physical &&
+				local.sha256 === remoteLive.sha256
+			) {
+				operation = {
+					action: "upload",
+					path,
+					reason: "Repairing physical content in replacement epoch",
+					localMeta: local,
+				};
+			} else if (
+				local &&
+				remoteLive &&
+				local.sha256 === remoteLive.sha256 &&
+				!physicalRemoteChanged
+			) {
+				operation = {
+					action: "none",
+					path,
+					reason: "Replacement epoch contains identical content",
+					localMeta: local,
+					remoteMeta: remoteLive,
+				};
+			} else if (localChanged && remoteChanged) {
+				operation = this.resolveConcurrentEpochChange(
+					path,
+					local,
+					remoteLive,
+				);
+			} else if (localChanged) {
+				operation = local
+					? {
+							action: "upload",
+							path,
+							reason: "Local change is reapplied to replacement epoch",
+							localMeta: local,
+							remoteMeta: remoteLive ?? undefined,
+						}
+					: remoteLive
+						? {
+								action: "delete_remote",
+								path,
+								reason: "Local deletion is reapplied to replacement epoch",
+								remoteMeta: remoteLive,
+							}
+						: { action: "none", path, reason: "Path is absent" };
+			} else if (remoteChanged) {
+				operation = remoteLive
+					? {
+							action: "download",
+							path,
+							reason: "Replacement epoch changed remote content",
+							localMeta: local ?? undefined,
+							remoteMeta: remoteLive,
+						}
+					: local
+						? {
+								action: "delete_local",
+								path,
+								reason: "Replacement epoch deleted the path",
+								localMeta: local,
+							}
+						: { action: "none", path, reason: "Path is absent" };
+			} else {
+				operation = { action: "none", path, reason: "Path is unchanged" };
+			}
+			if (operation.action !== "none") operations.push(operation);
+		}
+		return operations;
+	}
+
+	private resolveConcurrentEpochChange(
+		path: string,
+		local: FileMetadata | null,
+		remote: FileMetadata | null,
+	): SyncOperation {
+		if (local && remote) {
+			return {
+				action: "conflict",
+				path,
+				reason: "Local and replacement epoch both changed the file",
+				localMeta: local,
+				remoteMeta: remote,
+			};
+		}
+		if (local) {
+			return {
+				action: "upload",
+				path,
+				reason: "Local content restores a remotely deleted path",
+				localMeta: local,
+			};
+		}
+		if (remote) {
+			return {
+				action: "delete_remote",
+				path,
+				reason: "Local deletion wins in the replacement epoch",
+				remoteMeta: remote,
+			};
+		}
+		return { action: "none", path, reason: "Path is absent" };
+	}
+
+	/**
 	 * Determine action for file based on metadata comparison
 	 */
 	resolveAction(

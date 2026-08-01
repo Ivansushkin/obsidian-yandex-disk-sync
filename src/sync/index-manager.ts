@@ -33,6 +33,7 @@ import {
 	toLocalPath,
 } from "../utils/path-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
+import { findErrorCause } from "../utils/error-utils";
 import {
 	computeSha256,
 	computeSha256FromString,
@@ -99,6 +100,12 @@ export interface IndexDecodeAttempt {
 	errorName: string;
 }
 
+export interface LocalCausalSnapshot {
+	state: LocalSyncState;
+	mutations: PendingMutation[];
+	physicalActions: PendingPhysicalAction[];
+}
+
 type IndexCodecAttemptResult =
 	| { data: Partial<SyncIndex> }
 	| { attempt: IndexDecodeAttempt };
@@ -129,6 +136,7 @@ export class IndexManager {
 	private transitionIndexReadService: EncryptionService | null | undefined;
 	private transitionIndexWriteService: EncryptionService | null | undefined;
 	private physicalRewriteOnNextSave = false;
+	private epochAdoptionTarget: string | null = null;
 
 	constructor(
 		yandexClient: YandexDiskClient,
@@ -169,6 +177,37 @@ export class IndexManager {
 		this.transitionIndexWriteService = undefined;
 	}
 
+	/** Allow one full reconciliation to commit against a replacement epoch. */
+	beginEpochAdoption(epoch: string): void {
+		this.epochAdoptionTarget = epoch;
+		this.operationStore.resetForEpoch(epoch);
+		this.localState.nextMutationSeq = 1;
+	}
+
+	/** Remove the temporary cross-epoch write authorization. */
+	endEpochAdoption(): void {
+		this.epochAdoptionTarget = null;
+	}
+
+	/** Capture local causal state so a failed adoption can be retried safely. */
+	captureLocalCausalState(): LocalCausalSnapshot {
+		return {
+			state: this.cloneValue(this.localState),
+			mutations: this.operationStore.getMutations(),
+			physicalActions: this.operationStore.getPhysicalActions(),
+		};
+	}
+
+	/** Restore the previous device baseline after an unsuccessful adoption. */
+	restoreLocalCausalState(snapshot: LocalCausalSnapshot): void {
+		this.localState = this.cloneValue(snapshot.state);
+		this.operationStore.loadMutations(
+			snapshot.mutations,
+			snapshot.state.nextMutationSeq,
+		);
+		this.operationStore.loadPhysicalActions(snapshot.physicalActions);
+	}
+
 	beginPhysicalRewriteCommit(): void {
 		this.physicalRewriteOnNextSave = true;
 	}
@@ -195,6 +234,22 @@ export class IndexManager {
 	 * Mark the currently loaded canonical state as fully reconciled locally.
 	 */
 	markRemoteObserved(): void {
+		if (this.epochAdoptionTarget === this.remoteIndex.epoch) {
+			const adoptedFiles: Record<string, FileMetadata> = {};
+			for (const [path, canonical] of Object.entries(
+				this.remoteIndex.files,
+			)) {
+				const local = this.localState.files[path];
+				adoptedFiles[path] = {
+					...canonical,
+					mtime:
+						local && local.sha256 === canonical.sha256
+							? local.mtime
+							: canonical.mtime,
+				};
+			}
+			this.localState.files = adoptedFiles;
+		}
 		for (const [path, baseline] of Object.entries(this.localState.files)) {
 			const canonical = this.remoteIndex.files[path];
 			if (!canonical) continue;
@@ -270,6 +325,39 @@ export class IndexManager {
 		} else {
 			this.localState = createEmptyLocalState(this.settings.deviceId);
 		}
+	}
+
+	/**
+	 * Convert the version 1.1 local index into a content baseline without
+	 * claiming that any v3 epoch has already been observed.
+	 */
+	loadLegacyLocalIndexFromData(data: {
+		lastSyncTime?: number;
+		files?: Record<string, Partial<FileMetadata>>;
+	} | null): void {
+		const files: Record<string, FileMetadata> = {};
+		for (const [path, metadata] of Object.entries(data?.files ?? {})) {
+			if (typeof metadata.sha256 !== "string") continue;
+			files[path] = {
+				path,
+				sha256: metadata.sha256,
+				size: typeof metadata.size === "number" ? metadata.size : 0,
+				mtime: typeof metadata.mtime === "number" ? metadata.mtime : 0,
+				syncedAt:
+					typeof metadata.syncedAt === "number" ? metadata.syncedAt : 0,
+				deleted: metadata.deleted,
+				deletedAt: metadata.deletedAt,
+				lastModifiedBy: metadata.lastModifiedBy,
+			};
+		}
+		this.localState = {
+			...createEmptyLocalState(this.settings.deviceId),
+			lastSyncTime: data?.lastSyncTime ?? 0,
+			files,
+		};
+		logger.info("Migrated legacy device baseline", {
+			baselineFiles: Object.keys(files).length,
+		});
 	}
 
 	/**
@@ -563,6 +651,7 @@ export class IndexManager {
 	async loadRemoteIndex(
 		allowLegacy = false,
 		stableRootDiscovery = false,
+		allowEpochAdoption = false,
 	): Promise<SyncIndex> {
 		let discovery: {
 			path: string | null;
@@ -607,7 +696,9 @@ export class IndexManager {
 				)
 			).index;
 			this.loadedRemoteIndex = this.cloneIndex(this.remoteIndex);
-			this.assertEpochCompatible(this.remoteIndex);
+			if (!allowEpochAdoption) {
+				this.assertEpochCompatible(this.remoteIndex);
+			}
 			this.assertMaintenanceCompatible(this.remoteIndex);
 			logger.info(
 				`Loaded remote index revision ${this.remoteIndex.revision}: ${
@@ -633,6 +724,14 @@ export class IndexManager {
 			);
 		}
 		return await this.downloadIndex(path, false);
+	}
+
+	/** Verify that Force did not replace the adopted generation mid-session. */
+	async assertCanonicalEpoch(epoch: string): Promise<void> {
+		const canonical = await this.readCanonicalIndex();
+		if (canonical.epoch !== epoch) {
+			throw new IndexEpochMismatchError(epoch, canonical.epoch);
+		}
 	}
 
 	getMaintenance(): IndexMaintenance | undefined {
@@ -2364,7 +2463,8 @@ export class IndexManager {
 		if (
 			observedEpoch &&
 			index.epoch !== observedEpoch &&
-			!this.allowLegacyWriteOnce
+			!this.allowLegacyWriteOnce &&
+			index.epoch !== this.epochAdoptionTarget
 		) {
 			throw new IndexEpochMismatchError(observedEpoch, index.epoch);
 		}
@@ -2689,6 +2789,35 @@ export class IndexManager {
 	}
 }
 
+function isTransientIndexCause(error: unknown): boolean {
+	const semantic = findErrorCause(
+		error,
+		(candidate): candidate is IndexEpochMismatchError | RemoteMaintenanceActiveError =>
+			candidate instanceof IndexEpochMismatchError ||
+			candidate instanceof RemoteMaintenanceActiveError,
+	);
+	if (semantic) return false;
+	const apiError = findErrorCause(
+		error,
+		(candidate): candidate is YandexApiError => candidate instanceof YandexApiError,
+	);
+	if (apiError) {
+		return [409, 423, 429, 503].includes(apiError.status);
+	}
+	return (
+		findErrorCause(
+			error,
+			(candidate) =>
+				candidate instanceof TypeError ||
+				candidate.name === "AbortError" ||
+				candidate.name === "TimeoutError" ||
+				/(?:network|fetch|timed? out|econn|socket)/i.test(
+					candidate.message,
+				),
+		) !== null
+	);
+}
+
 export class RemoteIndexTransactionError extends Error {
 	readonly retryable: boolean;
 	readonly cause?: unknown;
@@ -2700,13 +2829,13 @@ export class RemoteIndexTransactionError extends Error {
 		readonly stage: IndexTransactionStage,
 		lockContention: boolean,
 		cause?: unknown,
+		retryableOverride?: boolean,
 	) {
 		super(message);
 		this.name = name;
-		this.retryable = shouldRetryIndexTransaction(
-			outcome,
-			lockContention,
-		);
+		this.retryable =
+			retryableOverride ??
+			shouldRetryIndexTransaction(outcome, lockContention);
 		this.cause = cause;
 	}
 }
@@ -2757,6 +2886,7 @@ export class RemoteIndexRolledBackError extends RemoteIndexTransactionError {
 			stage,
 			false,
 			cause,
+			isTransientIndexCause(cause),
 		);
 	}
 }
@@ -2790,7 +2920,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.1. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.1.1. Run an explicit force sync to create index v3.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;
@@ -2833,7 +2963,7 @@ export class IndexEpochMismatchError extends Error {
 		readonly canonicalEpoch: string,
 	) {
 		super(
-			"Canonical sync history was replaced by Force sync on another device. Create a backup and run Force sync from remote.",
+			"Canonical sync history changed and requires a full reconciliation.",
 		);
 		this.name = "IndexEpochMismatchError";
 	}

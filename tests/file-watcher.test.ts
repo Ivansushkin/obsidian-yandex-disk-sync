@@ -753,6 +753,48 @@ test("failed full sync postpones watcher replay", async () => {
 	);
 });
 
+test("realtime epoch replacement requests one full and keeps the event durable", async () => {
+	let epochSignal = true;
+	let fullRequests = 0;
+	const syncEngine = {
+		getWatcherCausalContext: () => ({
+			epoch: "epoch-a",
+			baseRevision: 7,
+		}),
+		syncFileBatch: async (events: RealtimeFileEvent[]) => ({
+			completed: [],
+			superseded: [],
+			retry: events.map((event) => event.id),
+			uploadReceipts: [],
+		}),
+		consumeEpochReplacementRequest: () => {
+			const current = epochSignal;
+			epochSignal = false;
+			return current;
+		},
+	} as unknown as SyncEngine;
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
+	watcher.setFullSyncRequestCallback(async () => {
+		fullRequests++;
+	});
+	watcher.loadDeferredEvents([
+		{
+			id: "old-epoch-upload",
+			action: "upload",
+			path: "note.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+	]);
+
+	await (watcher as unknown as FileWatcherTestAccess).flushDeferredEventsNow();
+	await Promise.resolve();
+
+	assert.equal(fullRequests, 1);
+	assert.equal(watcher.getDeferredEvents().length, 1);
+});
+
 test("structured watcher retry remains durable without throwing", async () => {
 	const syncEngine = {
 		getWatcherCausalContext: () => ({
