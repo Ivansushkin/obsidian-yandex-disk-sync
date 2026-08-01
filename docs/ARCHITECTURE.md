@@ -179,6 +179,15 @@ remote side effects может быть отложен до конца full: у�
 автоматически запускаются только события, созданные либо изменённые во время
 паузы; неуспешная сессия ничего не подтверждает и не replay-ит.
 
+Если rename появляется во время уже submitted upload, watcher сохраняет
+локальную связь между ID событий и mutation sequence. Upload, принятый
+canonical, передаёт rename подтверждённую revision внутри coordinator
+settlement; upload до commit retarget-ится с сохранением FIFO sequence. Full
+barrier не поглощает upload, на который ссылается rename: вся причинная цепочка
+должна завершиться до reconciliation. После realtime upload проверяются только
+затронутые physical paths; полный remote-tree scan остаётся обязанностью full
+sync для external edit и orphan detection.
+
 Startup является обычной coordinator-сессией `fullSync({ startup: true })`.
 Watcher durable-буфер включается до первого чтения encryption manifest.
 Manifest и canonical читаются единым stable raw-примитивом
@@ -189,7 +198,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.10 и явно выполнить Force sync.
+обновить все устройства до 2.0.0-beta.11 и явно выполнить Force sync.
 
 ### SyncEngine (sync/sync-engine.ts)
 

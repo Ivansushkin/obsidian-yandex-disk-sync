@@ -100,6 +100,7 @@
 | SYNC-024 | P0  | Full sync завершилась с ошибками при pre-full upload | Captured upload остаётся durable и повторяется позже            | auto: `failed full barrier retains every captured upload`; `failed full sync postpones watcher replay` |
 | SYNC-025 | P0  | Успешный realtime `put-target`, затем full sync       | Confirmed baseline сохраняет fingerprint/mtime/revision; full выполняет `0/0/0` без index commit | auto: `plaintext/encrypted unsynced rename retargets the pending put`; integration |
 | SYNC-026 | P0  | Retry существовал до full/maintenance                 | Старый retry не запускается повторно сразу после сессии; автоматически replay-ятся только новые/изменённые за время паузы события | auto: `successful session replays only watcher events created while paused`; `failed session does not replay watcher events created while paused` |
+| SYNC-027 | P0  | Manual/startup full запрошен во время upload → rename chain | Связанные upload и rename завершаются до reconciliation; неоднозначная цепочка блокирует full и старый путь не скачивается | auto: `startup blocks before reconciliation when an upload rename chain is unresolved`; integration |
 
 ## Удаление файла
 
@@ -161,13 +162,14 @@
 | MOVE-014 | P0  | Beta.4: canonical target live, source/target physical отсутствуют | Target materialize из совпадающего local snapshot, move/action завершаются за один full | auto: `beta.4 missing move target is materialized and completed` |
 | MOVE-015 | P1  | Create A → rename A→B → создать новый A                | Rename и новый put имеют разные ID; canonical сохраняет оба файла | auto: `new file at the old path survives a queued rename`; manual-required |
 | MOVE-016 | P1  | Быстрые move A→B→C                                     | Не начатая цепочка coalesce до A→C; начатые шаги завершаются последовательно и идемпотентно | auto: `quick file rename chain coalesces to the final target`; manual-required |
-| MOVE-017 | P0  | Create → rename → deep move при занятом coordinator   | Queued цепочка становится одним A→C, running predecessor causal-settle выполняется до successor | auto: `plaintext/encrypted durable create rename and deep move materializes only final path`; `running rename keeps its successor as separate causal work`; manual-required |
-| MOVE-018 | P0  | Successor появился до или после snapshot predecessor | До snapshot цепочка rebase-ится; после snapshot successor использует подтверждённую revision | auto: `running rename keeps successor and safely rebases a missing target`; `completed running rename advances successor causal revision` |
+| MOVE-017 | P0  | Create → rename → deep move при занятом coordinator   | Queued цепочка становится одним A→C; submitted upload причинно передаёт accepted revision конечному rename | auto: `plaintext/encrypted durable create rename and deep move materializes only final path`; `plaintext/encrypted running upload hands its committed revision to a deep rename`; manual-required |
+| MOVE-018 | P0  | Successor появился до или после snapshot predecessor | До physical/index commit put retarget-ится; после начала commit successor использует подтверждённую revision | auto: `plaintext/encrypted rename after physical upload retargets before canonical commit`; `accepted submitted upload advances its rename before acknowledgement` |
 | MOVE-019 | P0  | Rename → delete target до commit                       | Операция становится delete причинного source либо noop для никогда не принятого put | auto: `queued rename followed by delete reduces to source deletion`; integration |
 | MOVE-020 | P0  | Full запрошен во время watcher drain                   | Cutoff destructive/rename events settle до full; более новые events остаются durable | auto: `settlement completes before the next session starts`; integration |
 | MOVE-021 | P0  | Durable rename, source и target уже отсутствуют после full | Событие становится superseded без remote read/write и удаляется из durable queue | auto: `plaintext/encrypted full supersedes a stale rename after both paths settle` |
 | MOVE-022 | P0  | Durable rename, target уже подтверждён local/canonical | Событие подтверждается как `already-applied` без нового commit/upload/move/delete | auto: `full acknowledges an already applied rename target without remote write` |
 | MOVE-023 | P0  | Source остаётся causal-live, target отсутствует после full | Событие остаётся durable, full получает `watcher-rename-unresolved` и не продвигает observed revision | auto: `full leaves an ambiguous causal rename durable and reports an error` |
+| MOVE-024 | P0  | Rename появляется после начала canonical transaction upload | Upload подтверждается watermark/SHA, successor получает committed revision, old tombstone и final live фиксируются как causal move | auto: `plaintext/encrypted running upload hands its committed revision to a deep rename`; `plaintext/encrypted accepted upload receipt recovers after watcher settlement crash` |
 
 ## Несколько устройств
 
@@ -318,6 +320,7 @@
 | DIAG-012 | P1 | Enable, disable и rotate падают на одинаковой фазе | Все три режима проходят один executor, сохраняют одинаковый phase/recovery contract и не оставляют transition codec | auto: `all rewrite modes use the same post-commit cleanup`; fault matrix |
 | DIAG-013 | P1 | Rename superseded/rebased ожидаемым локальным событием | Лог содержит event ID, исходный session ID и `rebased`/`already-applied` без повторных error stack | auto: file-watcher; manual-required |
 | DIAG-014 | P1 | Startup завершён без canonical maintenance/cleanup | После full не создаётся пустая maintenance/realtime-сессия; summary содержит post-full rename settlement и число новых replay events | auto: full-sync-barrier; manual-required |
+| DIAG-015 | P1 | Submitted upload причинно передан rename              | Лог содержит predecessor event ID, mutation sequence, handoff state и accepted revision; rename не маскируется как независимый `put-target` | auto: file-watcher + file-rename; manual-required |
 
 ## Матрица вариантов
 

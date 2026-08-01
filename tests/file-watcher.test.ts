@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { App } from "obsidian";
+import { TFile, type App } from "obsidian";
 import { FileWatcher, type DeferredWatcherEvent } from "../src/sync/file-watcher";
 import type { SyncEngine } from "../src/sync/sync-engine";
 import type { RealtimeFileEvent } from "../src/sync/realtime-rules";
@@ -8,6 +8,7 @@ import { DEFAULT_SETTINGS } from "../src/types";
 
 interface FileWatcherTestAccess {
 	isEnabled: boolean;
+	deferredEvents: DeferredWatcherEvent[];
 	submittedFileEvents: Map<string, {
 		id: string;
 		path: string;
@@ -16,9 +17,15 @@ interface FileWatcherTestAccess {
 		baseRevision: number | null;
 		createdAt: number;
 		superseded?: boolean;
+		mutationId?: string;
+		mutationSeq?: number;
+		snapshotSha256?: string;
+		supersededByRenameId?: string;
 	}>;
 	submittedWatcherEventIds: Set<string>;
 	deferEvent(event: DeferredWatcherEvent): boolean;
+	handleFileRename(file: TFile, oldPath: string): void;
+	drainPendingFileEvents(): void;
 	flushDeferredEventsNow(): Promise<void>;
 	flushDeferredEvents(onlyIds?: ReadonlySet<string>): Promise<void>;
 	settleRenameEvent(
@@ -31,6 +38,21 @@ interface FileWatcherTestAccess {
 			remoteStarted: boolean;
 		},
 	): Promise<void>;
+	applyBatchResult(result: {
+		completed: string[];
+		superseded: string[];
+		retry: string[];
+		uploadReceipts: Array<{
+			eventId: string;
+			path: string;
+			status: "pending-put" | "accepted-put" | "rejected-put";
+			epoch: string | null;
+			canonicalRevision: number | null;
+			mutationId?: string;
+			mutationSeq?: number;
+			sha256?: string;
+		}>;
+	}): void;
 	cancelPendingSync(path: string): void;
 	captureFullSyncBarrier(context: {
 		sessionId: string;
@@ -293,6 +315,156 @@ test("submitted upload is acknowledged only by coordinator settlement", () => {
 	assert.equal(watcher.getDeferredEvents().length, 1);
 });
 
+test("file rename durably links the newest submitted source upload", () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([
+		{
+			id: "upload-old",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+		{
+			id: "upload-current",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 2,
+		},
+	]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	for (const event of access.deferredEvents) {
+		if (event.action === "upload") {
+			access.submittedFileEvents.set(event.id, event);
+		}
+	}
+	const target = new TFile();
+	(target as TFile & { path: string }).path = "deep/B.md";
+
+	access.handleFileRename(target, "A.md");
+
+	const rename = watcher.getDeferredEvents().find(
+		(event) => event.action === "rename",
+	);
+	assert.ok(rename?.action === "rename" && rename.kind === "file");
+	assert.equal(rename.predecessorUploadId, "upload-current");
+	assert.equal(
+		access.submittedFileEvents.get("upload-current")?.supersededByRenameId,
+		rename.id,
+	);
+	access.drainPendingFileEvents();
+});
+
+test("accepted submitted upload advances its rename before acknowledgement", async () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([
+		{
+			id: "upload-a",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+			mutationId: "device-a:1",
+			mutationSeq: 1,
+			snapshotSha256: "sha-a",
+			superseded: true,
+			supersededByRenameId: "rename-a",
+		},
+		{
+			id: "rename-a",
+			action: "rename",
+			path: "A.md",
+			targetPath: "deep/C.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 2,
+			predecessorUploadId: "upload-a",
+		},
+	]);
+	const persistedQueues: DeferredWatcherEvent[][] = [];
+	watcher.setPersistCallback(async () => {
+		persistedQueues.push(structuredClone(watcher.getDeferredEvents()));
+	});
+
+	(watcher as unknown as FileWatcherTestAccess).applyBatchResult({
+		completed: ["upload-a"],
+		superseded: [],
+		retry: [],
+		uploadReceipts: [
+			{
+				eventId: "upload-a",
+				path: "A.md",
+				status: "accepted-put",
+				epoch: "epoch-a",
+				canonicalRevision: 8,
+				mutationId: "device-a:1",
+				mutationSeq: 1,
+				sha256: "sha-a",
+			},
+		],
+	});
+	await Promise.resolve();
+
+	const [rename] = watcher.getDeferredEvents();
+	assert.ok(rename?.action === "rename" && rename.kind === "file");
+	assert.equal(rename.baseRevision, 8);
+	assert.equal(rename.predecessorUploadId, undefined);
+	assert.equal(persistedQueues.at(-1)?.length, 1);
+});
+
+test("pending submitted upload leaves its put for rename retarget", () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([
+		{
+			id: "upload-a",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+		{
+			id: "rename-a",
+			action: "rename",
+			path: "A.md",
+			targetPath: "B.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 2,
+			predecessorUploadId: "upload-a",
+		},
+	]);
+
+	(watcher as unknown as FileWatcherTestAccess).applyBatchResult({
+		completed: [],
+		superseded: ["upload-a"],
+		retry: [],
+		uploadReceipts: [
+			{
+				eventId: "upload-a",
+				path: "A.md",
+				status: "pending-put",
+				epoch: "epoch-a",
+				canonicalRevision: null,
+				mutationId: "device-a:1",
+				mutationSeq: 1,
+				sha256: "sha-a",
+			},
+		],
+	});
+
+	const [rename] = watcher.getDeferredEvents();
+	assert.ok(rename?.action === "rename" && rename.kind === "file");
+	assert.equal(rename.baseRevision, 7);
+	assert.equal(rename.predecessorUploadId, undefined);
+});
+
 test("queued rename followed by delete reduces to source deletion", () => {
 	const watcher = createWatcher();
 	watcher.loadDeferredEvents([]);
@@ -533,12 +705,13 @@ test("failed full sync postpones watcher replay", async () => {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		}),
-		syncFileBatch: async () => {
+			syncFileBatch: async () => {
 			fileBatchCalls++;
 			return {
 				completed: [],
 				superseded: [],
-				retry: ["covered-upload"],
+					retry: ["covered-upload"],
+					uploadReceipts: [],
 			};
 		},
 	} as unknown as SyncEngine;
@@ -590,6 +763,7 @@ test("structured watcher retry remains durable without throwing", async () => {
 			completed: [],
 			superseded: [],
 			retry: ["retry-upload"],
+			uploadReceipts: [],
 		}),
 	} as unknown as SyncEngine;
 	const watcher = new FileWatcher(
@@ -617,6 +791,58 @@ test("structured watcher retry remains durable without throwing", async () => {
 			"id" in event ? event.id : event.path,
 		),
 		["retry-upload"],
+	);
+});
+
+test("startup blocks before reconciliation when an upload rename chain is unresolved", async () => {
+	const syncEngine = {
+		getWatcherCausalContext: () => ({
+			epoch: "epoch-a",
+			baseRevision: 7,
+		}),
+		syncFileBatch: async () => ({
+			completed: [],
+			superseded: [],
+			retry: ["upload-a"],
+			uploadReceipts: [],
+		}),
+	} as unknown as SyncEngine;
+	const watcher = new FileWatcher(
+		{} as App,
+		syncEngine,
+		DEFAULT_SETTINGS,
+	);
+	watcher.loadDeferredEvents([
+		{
+			id: "upload-a",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		},
+		{
+			id: "rename-a",
+			action: "rename",
+			path: "A.md",
+			targetPath: "B.md",
+			kind: "file",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 2,
+			predecessorUploadId: "upload-a",
+		},
+	]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.isEnabled = true;
+
+	await assert.rejects(
+		watcher.prepareForSync({
+			sessionId: "full-startup",
+			kind: "full",
+			startup: true,
+		}),
+		/Pre-full watcher drain left 2 unresolved event/,
 	);
 });
 

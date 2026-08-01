@@ -6,6 +6,7 @@ import type { VaultAdapter } from "../src/api/vault-adapter";
 import { SyncEngine } from "../src/sync/sync-engine";
 import { ConflictResolver } from "../src/sync/conflict-resolver";
 import { FileWatcher } from "../src/sync/file-watcher";
+import type { RealtimeFileEvent } from "../src/sync/realtime-rules";
 import type { IndexManager } from "../src/sync/index-manager";
 import { LocalOperationStore } from "../src/sync/local-operation-store";
 import { computeSha256 } from "../src/utils/hash-utils";
@@ -50,6 +51,7 @@ class RenameYandexFake {
 	readonly uploads: string[] = [];
 	readonly moves: Array<{ from: string; to: string }> = [];
 	moveThrowsAfterSuccess = false;
+	afterUpload?: () => void;
 
 	async uploadFile(path: string, content: ArrayBuffer) {
 		const copy = content.slice(0);
@@ -59,6 +61,7 @@ class RenameYandexFake {
 			modified: "2026-07-30T00:00:00.000Z",
 		});
 		this.uploads.push(path);
+		this.afterUpload?.();
 	}
 
 	async uploadFileExclusive(path: string, content: ArrayBuffer) {
@@ -117,6 +120,8 @@ class RenameIndexFake {
 	readonly index = createEmptyIndex("device-a", "epoch-a");
 	readonly local = createEmptyLocalState("device-a");
 	readonly store = new LocalOperationStore("device-a");
+	beforeSave?: () => void;
+	remoteFileScans = 0;
 
 	constructor(private readonly yandex: RenameYandexFake) {
 		this.index.revision = 7;
@@ -281,6 +286,7 @@ class RenameIndexFake {
 	}
 
 	async saveRemoteIndex() {
+		this.beforeSave?.();
 		this.index.revision++;
 	}
 
@@ -289,6 +295,7 @@ class RenameIndexFake {
 	cancelPhysicalRewriteCommit() {}
 
 	async getRemoteFiles() {
+		this.remoteFileScans++;
 		const result = new Map<string, FileMetadata>();
 		for (const [path, resource] of this.yandex.resources) {
 			const logicalPath = path.replace(/^remote\//, "");
@@ -445,6 +452,248 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		assert.deepEqual(index.getPendingMutations(), []);
 		assert.deepEqual(index.getPendingPhysicalActions(), []);
 		assert.deepEqual(watcher.getDeferredEvents(), []);
+		assert.equal(index.remoteFileScans, 0);
+	});
+
+	test(`${mode} running upload hands its committed revision to a deep rename`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		const sourceContent = content("");
+		const targetContent = content("final-target");
+		vault.files.set("A.md", sourceContent);
+		const index = new RenameIndexFake(yandex);
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+		const watcher = new FileWatcher(
+			{} as App,
+			engine,
+			DEFAULT_SETTINGS,
+		);
+		watcher.setPersistCallback(async () => {});
+		watcher.loadDeferredEvents([
+			{
+				id: "upload-a",
+				action: "upload",
+				path: "A.md",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 1,
+			},
+		]);
+		const access = watcher as unknown as {
+			deferredEvents: Array<{
+				id?: string;
+				action: string;
+				path: string;
+				superseded?: boolean;
+				supersededByRenameId?: string;
+			}>;
+			deferEvent(event: {
+				id: string;
+				action: "rename";
+				path: string;
+				targetPath: string;
+				kind: "file";
+				epoch: string;
+				baseRevision: number;
+				createdAt: number;
+				predecessorUploadId: string;
+			}): boolean;
+			flushDeferredEventsNow(): Promise<void>;
+		};
+		index.beforeSave = () => {
+			index.beforeSave = undefined;
+			const predecessor = access.deferredEvents.find(
+				(event) => event.id === "upload-a",
+			);
+			assert.ok(predecessor);
+			predecessor.superseded = true;
+			predecessor.supersededByRenameId = "rename-a-c";
+			vault.files.delete("A.md");
+			vault.files.set("deep/C.md", targetContent);
+			access.deferEvent({
+				id: "rename-a-c",
+				action: "rename",
+				path: "A.md",
+				targetPath: "deep/C.md",
+				kind: "file",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 2,
+				predecessorUploadId: "upload-a",
+			});
+		};
+
+		await access.flushDeferredEventsNow();
+		const [rename] = watcher.getDeferredEvents();
+		assert.ok(rename?.action === "rename" && rename.kind === "file");
+		assert.equal(rename.baseRevision, 8);
+		assert.equal(rename.predecessorUploadId, undefined);
+
+		await access.flushDeferredEventsNow();
+
+		assert.equal(index.index.files["A.md"]?.deleted, true);
+		assert.equal(index.index.files["deep/C.md"]?.deleted, undefined);
+		assert.equal(yandex.resources.has("remote/A.md"), false);
+		assert.equal(yandex.resources.has("remote/deep/C.md"), true);
+		assert.deepEqual(index.getPendingMutations(), []);
+		assert.deepEqual(index.getPendingPhysicalActions(), []);
+		assert.deepEqual(watcher.getDeferredEvents(), []);
+		assert.equal(index.remoteFileScans, 0);
+	});
+
+	test(`${mode} rename after physical upload retargets before canonical commit`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		const sourceContent = content("source");
+		const targetContent = content("target");
+		vault.files.set("A.md", sourceContent);
+		const index = new RenameIndexFake(yandex);
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+		const event: RealtimeFileEvent = {
+			id: "upload-a",
+			action: "upload" as const,
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		};
+		yandex.afterUpload = () => {
+			yandex.afterUpload = undefined;
+			event.superseded = true;
+			event.supersededByRenameId = "rename-a-b";
+			vault.files.delete("A.md");
+			vault.files.set("B.md", targetContent);
+		};
+
+		const uploadResult = await engine.syncFileBatch([event]);
+
+		assert.deepEqual(uploadResult.superseded, ["upload-a"]);
+		assert.equal(uploadResult.uploadReceipts[0]?.status, "pending-put");
+		assert.equal(index.index.files["A.md"], undefined);
+		assert.equal(index.getPendingMutations()[0]?.path, "A.md");
+		assert.equal(yandex.resources.has("remote/A.md"), true);
+
+		await engine.renameFile("A.md", "B.md", {
+			epoch: "epoch-a",
+			baseRevision: 7,
+		});
+
+		assert.equal(index.index.files["A.md"], undefined);
+		assert.equal(index.index.files["B.md"]?.deleted, undefined);
+		assert.equal(yandex.resources.has("remote/A.md"), false);
+		assert.equal(yandex.resources.has("remote/B.md"), true);
+		assert.deepEqual(index.getPendingMutations(), []);
+	});
+
+	test(`${mode} accepted upload receipt recovers after watcher settlement crash`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		const sourceContent = content("accepted");
+		const sourceSha = await computeSha256(sourceContent);
+		await yandex.uploadFile("remote/A.md", sourceContent);
+		yandex.uploads.length = 0;
+		const index = new RenameIndexFake(yandex);
+		index.index.revision = 8;
+		index.index.appliedMutationSeq["device-a"] = 1;
+		index.index.files["A.md"] = {
+			path: "A.md",
+			sha256: sourceSha,
+			size: sourceContent.byteLength,
+			mtime: 1,
+			syncedAt: 1,
+			changedRevision: 8,
+			remoteFingerprint: sourceSha,
+			lastModifiedBy: "device-a",
+		};
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+		const event: RealtimeFileEvent = {
+			id: "upload-a",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+			mutationId: "device-a:1",
+			mutationSeq: 1,
+			snapshotSha256: sourceSha,
+			superseded: true,
+			supersededByRenameId: "rename-a-b",
+		};
+
+		const recovered = await engine.syncFileBatch([event]);
+
+		assert.deepEqual(yandex.uploads, []);
+		assert.deepEqual(recovered.completed, ["upload-a"]);
+		assert.equal(recovered.uploadReceipts[0]?.status, "accepted-put");
+		assert.equal(recovered.uploadReceipts[0]?.canonicalRevision, 8);
+		assert.equal(index.local.files["A.md"]?.sha256, sourceSha);
+	});
+
+	test(`${mode} non-rename supersession does not strand a running put`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		vault.files.set("A.md", content("source"));
+		const index = new RenameIndexFake(yandex);
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+		const event: RealtimeFileEvent = {
+			id: "upload-a",
+			action: "upload",
+			path: "A.md",
+			epoch: "epoch-a",
+			baseRevision: 7,
+			createdAt: 1,
+		};
+		yandex.afterUpload = () => {
+			yandex.afterUpload = undefined;
+			event.superseded = true;
+		};
+
+		const uploadResult = await engine.syncFileBatch([event]);
+
+		assert.deepEqual(uploadResult.completed, ["upload-a"]);
+		assert.equal(index.index.files["A.md"]?.deleted, undefined);
+		assert.equal(yandex.resources.has("remote/A.md"), true);
+		assert.deepEqual(index.getPendingMutations(), []);
 	});
 
 	test(`${mode} retargeted put removes its verified stale physical source`, async () => {

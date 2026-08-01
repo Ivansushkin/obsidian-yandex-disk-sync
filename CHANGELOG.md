@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.0.0-beta.11
+
+### Fixed
+
+- Preserved the causal relationship between a submitted upload and a rename
+  that arrives while its canonical transaction is running. The rename now
+  observes the accepted upload revision instead of publishing its target as an
+  unrelated file and leaving the original path live.
+- Retargeted uploads superseded before canonical commit while retaining their
+  FIFO mutation sequence and guarded cleanup of any already-uploaded source.
+- Recovered accepted upload receipts after restart from the durable mutation
+  identity, canonical device watermark, epoch, and plaintext SHA-256.
+- Made full sync drain upload events referenced by rename chains before
+  reconciliation, preventing the old path from being downloaded while causal
+  work remains unresolved.
+
+### Performance
+
+- Replaced the full remote-tree traversal after a realtime upload with targeted
+  canonical and physical verification of only the accepted paths.
+
+### Testing
+
+- Added plaintext/encrypted coverage for rename before canonical commit,
+  rename during commit, crash before watcher settlement, atomic handoff, and
+  startup blocking of unresolved upload-to-rename chains.
+
 ## 2.0.0-beta.10
 
 ### Fixed

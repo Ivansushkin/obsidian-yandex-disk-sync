@@ -8,6 +8,7 @@ import type {
 	SyncOperation,
 	SyncError,
 	FileMetadata,
+	PendingMutation,
 	PendingPhysicalAction,
 	IndexMaintenance,
 	YandexResource,
@@ -64,6 +65,7 @@ import {
 	type DurableFileRenameEvent,
 	type RealtimeBatchResult,
 	type RealtimeFileEvent,
+	type UploadCausalReceipt,
 	type WatcherCausalContext,
 } from "./realtime-rules";
 
@@ -72,6 +74,16 @@ export type IndexSaveCallback = () => void | Promise<void>;
 interface SyncGuardResult {
 	blockReason: string | null;
 	validationToken?: string;
+}
+
+interface PreparedRealtimeItem {
+	id: string;
+	path: string;
+	action: "upload" | "delete" | "noop";
+	mutation: PendingMutation;
+	snapshot?: { content: ArrayBuffer; sha256: string };
+	event?: RealtimeFileEvent;
+	uploadedMetadata?: FileMetadata;
 }
 export type SyncGuardCallback = (
 	validationToken?: string,
@@ -1463,45 +1475,54 @@ export class SyncEngine {
 		stampRemoteMtime = true,
 		snapshot?: { content: ArrayBuffer; sha256: string },
 	): Promise<void> {
-		logger.debug(`Uploading file: ${path}`);
-
 		const content =
 			snapshot?.content ?? (await this.vaultAdapter.readFile(path));
-		const remotePath = joinPath(this.settings.remotePath, path);
+		const sha256 = snapshot?.sha256 ?? (await computeSha256(content));
+		const metadata = await this.materializeUploadedFile(
+			path,
+			{ content, sha256 },
+			skipFolderCheck,
+			stampRemoteMtime,
+		);
+		this.applyUploadedFileMetadata(path, metadata);
+	}
 
+	/** Upload a stable snapshot without publishing it in either sync index. */
+	private async materializeUploadedFile(
+		path: string,
+		snapshot: { content: ArrayBuffer; sha256: string },
+		skipFolderCheck: boolean,
+		stampRemoteMtime: boolean,
+	): Promise<FileMetadata> {
+		logger.debug(`Uploading file: ${path}`);
 		await this.yandexClient.uploadFile(
-			remotePath,
-			content,
+			joinPath(this.settings.remotePath, path),
+			snapshot.content,
 			skipFolderCheck,
 		);
-
-		// Update indexes
-		const sha256 = snapshot?.sha256 ?? (await computeSha256(content));
-		const mtime = this.vaultAdapter.getFileMtime(path) || Date.now();
-		const size = content.byteLength;
-		// Best-effort: if the fetch fails, leave remoteMtime undefined and the
-		// resolver falls back to the legacy mixed-clock comparison.
 		const remoteStamp = stampRemoteMtime
 			? await this.fetchRemoteStamp(path)
 			: {};
-
-		const metadata: FileMetadata = {
+		return {
 			path,
-			sha256,
-			size,
-			mtime,
+			sha256: snapshot.sha256,
+			size: snapshot.content.byteLength,
+			mtime: this.vaultAdapter.getFileMtime(path) || Date.now(),
 			syncedAt: Date.now(),
+			...remoteStamp,
 		};
+	}
 
+	/** Publish metadata only after a realtime upload is still causally current. */
+	private applyUploadedFileMetadata(
+		path: string,
+		metadata: FileMetadata,
+	): void {
 		this.indexManager.updateLocalFile(path, metadata);
 		const pendingBaseRevision =
 			this.indexManager.getPendingPutBaseRevision(path);
-		// The remote index entry additionally carries the server mtime so the
-		// next sync can detect external remote modifications without involving
-		// the local clock.
 		this.indexManager.updateRemoteFile(path, {
 			...metadata,
-			...remoteStamp,
 			baseRevision:
 				pendingBaseRevision === undefined
 					? this.indexManager.getCausalBaseRevision()
@@ -1927,13 +1948,7 @@ export class SyncEngine {
 			}
 			this.realtimeGuardValidationToken = validationToken;
 
-			const prepared: Array<{
-				id: string;
-				path: string;
-				action: "upload" | "delete" | "noop";
-				mutation: ReturnType<IndexManager["enqueueMutation"]>;
-				snapshot?: { content: ArrayBuffer; sha256: string };
-			}> = [];
+			const prepared: PreparedRealtimeItem[] = [];
 			for (const event of events) {
 				if (!this.vaultAdapter.shouldSync(event.path)) {
 					batchResult.completed.push(event.id);
@@ -1941,11 +1956,19 @@ export class SyncEngine {
 				}
 				if (event.action === "upload") {
 					if (event.superseded) {
-						batchResult.superseded.push(event.id);
+						const receipt = await this.recoverUploadCausalReceipt(
+							event,
+						);
+						batchResult.uploadReceipts.push(receipt);
+						batchResult[
+							receipt.status === "accepted-put"
+								? "completed"
+								: "superseded"
+						].push(event.id);
 						logger.debug("Realtime upload event superseded", {
 							eventId: event.id,
 							path: event.path,
-							reason: "replaced-by-newer-event",
+							reason: receipt.status,
 							epoch: shortenDiagnosticValue(event.epoch),
 							baseRevision: event.baseRevision,
 						});
@@ -1986,27 +2009,34 @@ export class SyncEngine {
 					try {
 						const content = await this.vaultAdapter.readFile(event.path);
 						const sha256 = await computeSha256(content);
-						prepared.push({
-							...event,
-							mutation:
-								this.reusePendingFileMutation(
-									event,
-									"put",
+						const mutation =
+							this.reusePendingFileMutation(
+								event,
+								"put",
+								sha256,
+							) ??
+							this.indexManager.enqueueMutation(
+								"put",
+								event.path,
+								{
 									sha256,
-								) ??
-								this.indexManager.enqueueMutation(
-									"put",
-									event.path,
-									{
-										sha256,
-										baselineSha256:
-											this.indexManager.getLocalIndex()
-												.files[event.path]?.sha256,
-										epoch: event.epoch,
-										baseRevision: event.baseRevision,
-									},
-								),
+									baselineSha256:
+										this.indexManager.getLocalIndex()
+											.files[event.path]?.sha256,
+									epoch: event.epoch,
+									baseRevision: event.baseRevision,
+								},
+							);
+						event.mutationId = mutation.id;
+						event.mutationSeq = mutation.seq;
+						event.snapshotSha256 = sha256;
+						prepared.push({
+							id: event.id,
+							path: event.path,
+							action: event.action,
+							mutation,
 							snapshot: { content, sha256 },
+							event,
 						});
 					} catch (e) {
 						logger.warn(
@@ -2084,18 +2114,28 @@ export class SyncEngine {
 			if (prepared.length === 0) return batchResult;
 			if (this.indexSaveCallback) await this.indexSaveCallback();
 
+			const ready: typeof prepared = [];
 			const accepted: typeof prepared = [];
 			let failedIndex = -1;
 			for (let index = 0; index < prepared.length; index++) {
 				const item = prepared[index]!;
 				try {
 					if (item.action === "upload") {
-						await this.uploadFile(
+						if (this.isUploadHandedOffToRename(item.event)) {
+							this.recordPendingUploadHandoff(batchResult, item);
+							continue;
+						}
+						item.uploadedMetadata =
+							await this.materializeUploadedFile(
 							item.path,
+							item.snapshot!,
 							false,
 							true,
-							item.snapshot,
-						);
+							);
+						if (this.isUploadHandedOffToRename(item.event)) {
+							this.recordPendingUploadHandoff(batchResult, item);
+							continue;
+						}
 					} else if (item.action === "delete") {
 						this.indexManager.markRemoteFileDeleted(item.path);
 						this.indexManager.enqueuePhysicalAction(
@@ -2112,8 +2152,7 @@ export class SyncEngine {
 							},
 						);
 					}
-					this.indexManager.stageMutation(item.mutation);
-					accepted.push(item);
+					ready.push(item);
 				} catch (e) {
 					logger.error(
 						`Realtime batch stopped at ${item.path}:`,
@@ -2126,8 +2165,26 @@ export class SyncEngine {
 					break;
 				}
 			}
-			if (accepted.length === 0) return batchResult;
+			if (ready.length === 0) return batchResult;
 			if (this.indexSaveCallback) await this.indexSaveCallback();
+			for (const item of ready) {
+				if (
+					item.action === "upload" &&
+					this.isUploadHandedOffToRename(item.event)
+				) {
+					this.recordPendingUploadHandoff(batchResult, item);
+					continue;
+				}
+				if (item.action === "upload") {
+					this.applyUploadedFileMetadata(
+						item.path,
+						item.uploadedMetadata!,
+					);
+				}
+				this.indexManager.stageMutation(item.mutation);
+				accepted.push(item);
+			}
+			if (accepted.length === 0) return batchResult;
 			if (!(await this.saveRemoteIndexBestEffort())) {
 				batchResult.retry.push(
 					...accepted
@@ -2139,8 +2196,18 @@ export class SyncEngine {
 			await this.repairMissingAcceptedUploads(
 				accepted
 					.filter((item) => item.action === "upload")
-					.map((item) => item.path),
+					.map((item) => ({
+						path: item.path,
+						snapshot: item.snapshot,
+					})),
 			);
+			for (const item of accepted.filter(
+				(event) => event.action === "upload",
+			)) {
+				batchResult.uploadReceipts.push(
+					this.createCommittedUploadReceipt(item),
+				);
+			}
 			for (const item of accepted) {
 				this.indexManager.confirmMutation(item.mutation.id);
 			}
@@ -2173,6 +2240,7 @@ export class SyncEngine {
 				);
 			}
 			if (
+				deletes.length > 0 &&
 				deleteResults.every(
 					(outcome) => outcome.status === "fulfilled",
 				)
@@ -2202,6 +2270,148 @@ export class SyncEngine {
 		});
 	}
 
+	/** Keep an uncommitted put available for its durable rename successor. */
+	private recordPendingUploadHandoff(
+		result: RealtimeBatchResult,
+		item: PreparedRealtimeItem,
+	): void {
+		if (!result.superseded.includes(item.id)) {
+			result.superseded.push(item.id);
+		}
+		if (!result.uploadReceipts.some((receipt) => receipt.eventId === item.id)) {
+			result.uploadReceipts.push({
+				eventId: item.id,
+				path: item.path,
+				status: "pending-put",
+				epoch: item.mutation.epoch,
+				canonicalRevision: null,
+				mutationId: item.mutation.id,
+				mutationSeq: item.mutation.seq,
+				sha256: item.mutation.sha256,
+			});
+		}
+		logger.info("Realtime upload retargeted before canonical commit", {
+			eventId: item.id,
+			path: item.path,
+			mutationId: item.mutation.id,
+			mutationSeq: item.mutation.seq,
+			state: "pending-put",
+		});
+	}
+
+	private isUploadHandedOffToRename(
+		event: RealtimeFileEvent | undefined,
+	): boolean {
+		return event?.superseded === true && Boolean(event.supersededByRenameId);
+	}
+
+	/** Reconstruct an in-flight upload outcome after restart or late rename. */
+	private async recoverUploadCausalReceipt(
+		event: RealtimeFileEvent,
+	): Promise<UploadCausalReceipt> {
+		const fallback: UploadCausalReceipt = {
+			eventId: event.id,
+			path: event.path,
+			status: "rejected-put",
+			epoch: event.epoch,
+			canonicalRevision: null,
+			mutationId: event.mutationId,
+			mutationSeq: event.mutationSeq,
+			sha256: event.snapshotSha256,
+		};
+		if (
+			!event.supersededByRenameId ||
+			!event.mutationId ||
+			event.mutationSeq === undefined ||
+			!event.snapshotSha256
+		) {
+			return fallback;
+		}
+		const canonical = await this.indexManager.readCanonicalIndex();
+		const pending = this.indexManager
+			.getPendingMutations()
+			.find((mutation) => mutation.id === event.mutationId);
+		const applied = this.isUploadEventApplied(event, canonical.appliedMutationSeq);
+		const source = canonical.files[event.path];
+		if (
+			applied &&
+			canonical.epoch === event.epoch &&
+			source &&
+			!source.deleted &&
+			source.sha256 === event.snapshotSha256
+		) {
+			this.indexManager.updateLocalFile(event.path, {
+				...source,
+				path: event.path,
+			});
+			return {
+				...fallback,
+				status: "accepted-put",
+				epoch: canonical.epoch,
+				canonicalRevision: canonical.revision,
+			};
+		}
+		if (pending && !applied && pending.type === "put") {
+			return {
+				...fallback,
+				status: "pending-put",
+			};
+		}
+		return {
+			...fallback,
+			epoch: canonical.epoch,
+			canonicalRevision: canonical.revision,
+		};
+	}
+
+	/** Classify a just-committed upload using canonical watermark and content. */
+	private createCommittedUploadReceipt(
+		item: PreparedRealtimeItem,
+	): UploadCausalReceipt {
+		const canonical = this.indexManager.getRemoteIndex();
+		const source = canonical.files[item.path];
+		const accepted =
+			this.isUploadEventApplied(
+				item.event ?? {
+					id: item.id,
+					path: item.path,
+					action: "upload",
+					createdAt: item.mutation.createdAt,
+					epoch: item.mutation.epoch,
+					baseRevision: item.mutation.baseRevision,
+					mutationId: item.mutation.id,
+					mutationSeq: item.mutation.seq,
+					snapshotSha256: item.mutation.sha256,
+				},
+				canonical.appliedMutationSeq,
+			) &&
+			canonical.epoch === item.mutation.epoch &&
+			source !== undefined &&
+			!source.deleted &&
+			source.sha256 === item.snapshot?.sha256;
+		return {
+			eventId: item.id,
+			path: item.path,
+			status: accepted ? "accepted-put" : "rejected-put",
+			epoch: canonical.epoch,
+			canonicalRevision: canonical.revision,
+			mutationId: item.mutation.id,
+			mutationSeq: item.mutation.seq,
+			sha256: item.snapshot?.sha256,
+		};
+	}
+
+	private isUploadEventApplied(
+		event: RealtimeFileEvent,
+		appliedMutationSeq: Record<string, number>,
+	): boolean {
+		if (!event.mutationId || event.mutationSeq === undefined) return false;
+		const separator = event.mutationId.lastIndexOf(":");
+		if (separator <= 0) return false;
+		const deviceId = event.mutationId.slice(0, separator);
+		return (appliedMutationSeq[deviceId] ?? 0) >= event.mutationSeq;
+	}
+
 	/**
 	 * Reuse durable file work without allocating a second FIFO sequence.
 	 */
@@ -2212,6 +2422,27 @@ export class SyncEngine {
 	): ReturnType<IndexManager["enqueueMutation"]> | undefined {
 		const appliedMutationSeq =
 			this.indexManager.getRemoteIndex().appliedMutationSeq;
+		const byEventId = event.mutationId
+			? this.indexManager
+					.getPendingMutations()
+					.find(
+						(mutation) =>
+							mutation.id === event.mutationId &&
+							mutation.type === type,
+					)
+			: undefined;
+		if (byEventId && !wasMutationApplied(byEventId, appliedMutationSeq)) {
+			if (type === "put" && sha256) {
+				return (
+					this.indexManager.retargetPendingPut(
+						byEventId.path,
+						event.path,
+						sha256,
+					) ?? byEventId
+				);
+			}
+			return byEventId;
+		}
 		const existing = [
 			...this.indexManager.getPendingMutations(),
 		]
@@ -2538,13 +2769,13 @@ export class SyncEngine {
 					await this.indexSaveCallback();
 				}
 			}
-			const sourceCausallyLive = pendingPut
-				? pendingPutAccepted
-				: wasRenameSourceCausallyLive(
-						oldLocalMeta,
-						canonicalSource,
-						context.baseRevision,
-					);
+			const sourceCausallyLive =
+				pendingPutAccepted ||
+				wasRenameSourceCausallyLive(
+					oldLocalMeta,
+					canonicalSource,
+					context.baseRevision,
+				);
 			const plan = selectFileRenamePlan(
 				sourceCausallyLive,
 				canonicalSource ?? oldLocalMeta,
@@ -3563,43 +3794,52 @@ export class SyncEngine {
 	 * merge. A changed existing object is left for causal reconciliation.
 	 */
 	private async repairMissingAcceptedUploads(
-		paths: string[],
+		items: Array<
+			| string
+			| {
+					path: string;
+					snapshot?: { content: ArrayBuffer; sha256: string };
+			  }
+		>,
 	): Promise<void> {
-		if (paths.length === 0) return;
+		if (items.length === 0) return;
 		const canonical = await this.indexManager.readCanonicalIndex();
-		const liveRemote = await this.indexManager.getRemoteFiles();
 		let repaired = false;
-		for (const path of new Set(paths)) {
+		const snapshots = new Map<string, { content: ArrayBuffer; sha256: string }>();
+		for (const item of items) {
+			if (typeof item !== "string" && item.snapshot) {
+				snapshots.set(item.path, item.snapshot);
+			}
+		}
+		const paths = new Set(
+			items.map((item) => (typeof item === "string" ? item : item.path)),
+		);
+		for (const path of paths) {
 			const accepted = canonical.files[path];
 			if (!accepted || accepted.deleted) {
 				continue;
 			}
-			if (!this.vaultAdapter.fileExists(path)) continue;
-			const content = await this.vaultAdapter.readFile(path);
-			const sha256 = await computeSha256(content);
-			if (sha256 !== accepted.sha256) continue;
-			const physical = liveRemote.get(path);
+			let snapshot = snapshots.get(path);
+			if (!snapshot && this.vaultAdapter.fileExists(path)) {
+				const content = await this.vaultAdapter.readFile(path);
+				snapshot = { content, sha256: await computeSha256(content) };
+			}
+			if (!snapshot || snapshot.sha256 !== accepted.sha256) continue;
+			const remotePath = joinPath(this.settings.remotePath, path);
+			const physical = await this.yandexClient.getLogicalResource(remotePath);
 			const physicalMatches =
-				physical !== undefined &&
-				(accepted.remoteFingerprint !== undefined &&
-				physical.remoteFingerprint !== undefined
-					? accepted.remoteFingerprint ===
-						physical.remoteFingerprint
-					: typeof accepted.remoteMtime === "number" &&
-						  typeof physical.remoteMtime === "number"
-						? accepted.remoteMtime === physical.remoteMtime
-						: accepted.sha256 === physical.sha256);
-			if (
-				physical &&
-				physicalMatches
-			) {
+				physical !== null &&
+				accepted.remoteFingerprint !== undefined &&
+				matchesPhysicalResourceFingerprint(
+					accepted.remoteFingerprint,
+					physical,
+				);
+			if (physicalMatches) {
 				continue;
 			}
 			if (physical) {
 				const remoteContent =
-					await this.yandexClient.downloadFile(
-						joinPath(this.settings.remotePath, path),
-					);
+					await this.yandexClient.downloadFile(remotePath);
 				const remoteSha256 = await computeSha256(remoteContent);
 				if (remoteSha256 !== accepted.sha256) {
 					const conflictPath =
@@ -3617,11 +3857,15 @@ export class SyncEngine {
 						sha256: remoteSha256,
 					});
 				} else {
+					const remoteFingerprint =
+						getPhysicalResourceFingerprint(physical) ?? undefined;
+					const remoteMtime = new Date(physical.modified).getTime();
 					this.indexManager.getRemoteIndex().files[path] = {
 						...accepted,
-						remoteMtime: physical.remoteMtime,
-						remoteFingerprint:
-							physical.remoteFingerprint,
+						remoteMtime: Number.isFinite(remoteMtime)
+							? remoteMtime
+							: accepted.remoteMtime,
+						remoteFingerprint,
 					};
 					repaired = true;
 					continue;
@@ -3630,7 +3874,7 @@ export class SyncEngine {
 			this.indexManager.getRemoteIndex().files[path] = {
 				...accepted,
 			};
-			await this.uploadFile(path, false, true, { content, sha256 });
+			await this.uploadFile(path, false, true, snapshot);
 			repaired = true;
 		}
 		if (repaired && !(await this.saveRemoteIndexBestEffort())) {

@@ -10,6 +10,13 @@ export interface RealtimeFileEvent extends WatcherCausalContext {
 	path: string;
 	action: "upload" | "delete";
 	createdAt: number;
+	/** Durable identity of the put allocated before a remote upload starts. */
+	mutationId?: string;
+	mutationSeq?: number;
+	/** Plaintext snapshot identity used to recover an accepted put after crash. */
+	snapshotSha256?: string;
+	/** Rename that causally consumes this upload, when one arrived in flight. */
+	supersededByRenameId?: string;
 	/**
 	 * Mutable only while the event is waiting in the coordinator. Once a
 	 * physical upload starts, a later rename observes the upload result.
@@ -17,10 +24,22 @@ export interface RealtimeFileEvent extends WatcherCausalContext {
 	superseded?: boolean;
 }
 
+export interface UploadCausalReceipt {
+	eventId: string;
+	path: string;
+	status: "pending-put" | "accepted-put" | "rejected-put";
+	epoch: string | null;
+	canonicalRevision: number | null;
+	mutationId?: string;
+	mutationSeq?: number;
+	sha256?: string;
+}
+
 export interface RealtimeBatchResult {
 	completed: string[];
 	superseded: string[];
 	retry: string[];
+	uploadReceipts: UploadCausalReceipt[];
 }
 
 export type FileRenamePlan =
@@ -50,6 +69,8 @@ export interface DurableFileRenameEvent extends WatcherCausalContext {
 	targetPath: string;
 	kind: "file";
 	createdAt: number;
+	/** Submitted upload whose accepted state must be observed before this rename. */
+	predecessorUploadId?: string;
 }
 
 export interface RenameChainReduction {
@@ -271,5 +292,6 @@ export function createRealtimeBatchResult(): RealtimeBatchResult {
 		completed: [],
 		superseded: [],
 		retry: [],
+		uploadReceipts: [],
 	};
 }

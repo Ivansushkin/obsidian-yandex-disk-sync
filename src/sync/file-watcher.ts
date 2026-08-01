@@ -17,6 +17,7 @@ import {
 	type FileRenameOutcome,
 	type RealtimeBatchResult,
 	type RealtimeFileEvent,
+	type UploadCausalReceipt,
 	type WatcherCausalContext,
 } from "./realtime-rules";
 
@@ -39,6 +40,7 @@ export type DeferredWatcherEvent =
 		epoch?: string | null;
 		baseRevision?: number | null;
 		createdAt?: number;
+		predecessorUploadId?: string;
 	  };
 
 export class FileWatcher {
@@ -84,6 +86,7 @@ export class FileWatcher {
 		uploadEventIds: Set<string>;
 		cutoffEventIds: Set<string>;
 		renameCandidateIds: Set<string>;
+		causalChainIds: Set<string>;
 	} | null = null;
 	private pausedEventSignatures: Map<string, string> | null = null;
 
@@ -145,9 +148,20 @@ export class FileWatcher {
 				return id ? [id] : [];
 			}),
 		);
+		const causalChainIds = new Set(
+			this.deferredEvents.flatMap((event) =>
+				this.isDurableFileRename(event) &&
+				event.predecessorUploadId &&
+				cutoffEventIds.has(event.id)
+					? [event.id, event.predecessorUploadId]
+					: [],
+			),
+		);
 		const uploadEventIds = new Set(
 			this.deferredEvents.flatMap((event) =>
-				event.action === "upload" && cutoffEventIds.has(event.id)
+				event.action === "upload" &&
+				cutoffEventIds.has(event.id) &&
+				!causalChainIds.has(event.id)
 					? [event.id]
 					: [],
 			),
@@ -157,11 +171,13 @@ export class FileWatcher {
 			uploadEventIds,
 			cutoffEventIds,
 			renameCandidateIds: new Set(),
+			causalChainIds,
 		};
 		logger.info("Full sync watcher drain prepared", {
 			sessionId: context.sessionId,
 			cutoffEvents: cutoffEventIds.size,
 			capturedUploads: uploadEventIds.size,
+			causalChainEvents: causalChainIds.size,
 		});
 
 		try {
@@ -185,7 +201,14 @@ export class FileWatcher {
 				const id = this.getEventId(event);
 				return id === null || !reconcilableIds.has(id);
 			});
-			if (blocking.length > 0 && !context.startup) {
+			const unresolvedCausalChain = blocking.some((event) => {
+				const id = this.getEventId(event);
+				return id !== null && causalChainIds.has(id);
+			});
+			if (
+				blocking.length > 0 &&
+				(!context.startup || unresolvedCausalChain)
+			) {
 				throw new Error(
 					`Pre-full watcher drain left ${blocking.length} unresolved event(s)`,
 				);
@@ -614,6 +637,12 @@ export class FileWatcher {
 	 */
 	private handleFileRename(file: TFile, oldPath: string): void {
 		const context = this.syncEngine.getWatcherCausalContext();
+		const predecessorUpload = [...this.submittedFileEvents.values()]
+			.filter(
+				(event) =>
+					event.action === "upload" && event.path === oldPath,
+			)
+			.sort((left, right) => right.createdAt - left.createdAt)[0];
 		const event: DeferredWatcherEvent = {
 			action: "rename",
 			path: oldPath,
@@ -622,7 +651,12 @@ export class FileWatcher {
 			id: this.createEventId(),
 			...context,
 			createdAt: Date.now(),
+			predecessorUploadId: predecessorUpload?.id,
 		};
+		if (predecessorUpload) {
+			predecessorUpload.superseded = true;
+			predecessorUpload.supersededByRenameId = event.id;
+		}
 		this.deferEvent(event);
 		this.cancelPendingSync(oldPath);
 		if (this.isWatcherFrozen()) {
@@ -848,6 +882,7 @@ export class FileWatcher {
 			completed: [],
 			superseded: [],
 			retry: [],
+			uploadReceipts: [],
 		};
 		let fileBatch: RealtimeFileEvent[] = [];
 		const flushFileBatch = async (): Promise<boolean> => {
@@ -1128,6 +1163,7 @@ export class FileWatcher {
 	 * Remove only events explicitly acknowledged by the sync engine.
 	 */
 	private applyBatchResult(result: RealtimeBatchResult): void {
+		this.applyUploadCausalReceipts(result);
 		this.acknowledgeEvents([...result.completed, ...result.superseded]);
 		logger[result.retry.length > 0 ? "warn" : "info"](
 			"Realtime file batch reconciled",
@@ -1137,6 +1173,51 @@ export class FileWatcher {
 				retry: result.retry.length,
 			},
 		);
+	}
+
+	/**
+	 * Transfer a verified upload result to its durable rename successor before
+	 * the predecessor event is acknowledged.
+	 */
+	private applyUploadCausalReceipts(result: RealtimeBatchResult): void {
+		const receipts = new Map(
+			(result.uploadReceipts ?? []).map((receipt) => [
+				receipt.eventId,
+				receipt,
+			]),
+		);
+		const settledIds = new Set([
+			...result.completed,
+			...result.superseded,
+		]);
+		for (const candidate of this.deferredEvents) {
+			if (!this.isDurableFileRename(candidate)) continue;
+			const predecessorId = candidate.predecessorUploadId;
+			if (!predecessorId || !settledIds.has(predecessorId)) continue;
+			const receipt = receipts.get(predecessorId);
+			if (receipt?.status === "accepted-put") {
+				candidate.baseRevision = receipt.canonicalRevision;
+				candidate.epoch = receipt.epoch;
+			}
+			candidate.predecessorUploadId = undefined;
+			this.logUploadHandoff(candidate, receipt);
+		}
+	}
+
+	private logUploadHandoff(
+		rename: DurableFileRenameEvent,
+		receipt: UploadCausalReceipt | undefined,
+	): void {
+		logger.info("Watcher upload handed off to rename", {
+			eventId: rename.id,
+			predecessorUploadId: receipt?.eventId ?? null,
+			oldPath: rename.path,
+			targetPath: rename.targetPath,
+			state: receipt?.status ?? "not-committed",
+			canonicalRevision: receipt?.canonicalRevision ?? null,
+			mutationId: receipt?.mutationId ?? null,
+			mutationSeq: receipt?.mutationSeq ?? null,
+		});
 	}
 
 	private async settleFileBatch(
@@ -1305,6 +1386,9 @@ export class FileWatcher {
 			"epoch" in event ? (event.epoch ?? "") : "",
 			"baseRevision" in event
 				? (event.baseRevision?.toString() ?? "")
+				: "",
+			event.action === "rename" && event.kind === "file"
+				? (event.predecessorUploadId ?? "")
 				: "",
 		].join("\u0000");
 	}
