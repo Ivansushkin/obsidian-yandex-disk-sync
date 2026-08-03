@@ -659,6 +659,60 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		assert.equal(index.local.files["A.md"]?.sha256, sourceSha);
 	});
 
+	test(`${mode} applied edit replay is acknowledged without a second upload`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		const latestContent = content("latest edit");
+		const latestSha = await computeSha256(latestContent);
+		vault.files.set("note.md", latestContent);
+		await yandex.uploadFile("remote/note.md", latestContent);
+		yandex.uploads.length = 0;
+		const index = new RenameIndexFake(yandex);
+		index.index.revision = 36;
+		index.index.appliedMutationSeq["device-a"] = 7;
+		index.index.files["note.md"] = {
+			path: "note.md",
+			sha256: latestSha,
+			size: latestContent.byteLength,
+			mtime: 1,
+			syncedAt: 1,
+			changedRevision: 36,
+			baseRevision: 35,
+			remoteFingerprint: latestSha,
+			lastModifiedBy: "device-a",
+			mutationSeq: 7,
+		};
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+
+		const replay = await engine.syncFileBatch([
+			{
+				id: "upload-7",
+				action: "upload",
+				path: "note.md",
+				epoch: "epoch-a",
+				baseRevision: 35,
+				createdAt: 1,
+				mutationId: "device-a:7",
+				mutationSeq: 7,
+				snapshotSha256: latestSha,
+			},
+		]);
+
+		assert.deepEqual(yandex.uploads, []);
+		assert.deepEqual(replay.completed, ["upload-7"]);
+		assert.equal(replay.uploadReceipts[0]?.reason, "idempotent");
+	});
+
 	test(`${mode} non-rename supersession does not strand a running put`, async () => {
 		const yandex = new RenameYandexFake();
 		const vault = new RenameVaultFake();
@@ -693,6 +747,60 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		assert.deepEqual(uploadResult.completed, ["upload-a"]);
 		assert.equal(index.index.files["A.md"]?.deleted, undefined);
 		assert.equal(yandex.resources.has("remote/A.md"), true);
+		assert.deepEqual(index.getPendingMutations(), []);
+	});
+
+	test(`${mode} queued edit coalesces a persisted predecessor without FIFO gap`, async () => {
+		const yandex = new RenameYandexFake();
+		const vault = new RenameVaultFake();
+		const latestContent = content("latest");
+		vault.files.set("note.md", latestContent);
+		const index = new RenameIndexFake(yandex);
+		const previous = index.enqueueMutation("put", "note.md", {
+			sha256: "previous",
+			epoch: "epoch-a",
+			baseRevision: 7,
+		});
+		const engine = new SyncEngine(
+			yandex as unknown as YandexDiskClient,
+			vault as unknown as VaultAdapter,
+			index as unknown as IndexManager,
+			{
+				...DEFAULT_SETTINGS,
+				deviceId: "device-a",
+				remotePath: "remote",
+				enableEncryption: mode === "encrypted",
+			},
+		);
+
+		const batch = await engine.syncFileBatch([
+			{
+				id: "upload-previous",
+				action: "upload",
+				path: "note.md",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 1,
+				mutationId: previous.id,
+				mutationSeq: previous.seq,
+				snapshotSha256: "previous",
+				superseded: true,
+			},
+			{
+				id: "upload-latest",
+				action: "upload",
+				path: "note.md",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 2,
+			},
+		]);
+
+		assert.deepEqual(yandex.uploads, ["remote/note.md"]);
+		assert.deepEqual(batch.superseded, ["upload-previous"]);
+		assert.deepEqual(batch.completed, ["upload-latest"]);
+		assert.equal(index.index.appliedMutationSeq["device-a"], 2);
+		assert.equal(index.index.files["note.md"]?.mutationSeq, 2);
 		assert.deepEqual(index.getPendingMutations(), []);
 	});
 

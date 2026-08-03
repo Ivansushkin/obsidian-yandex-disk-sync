@@ -47,6 +47,10 @@ Folder tombstone против неизменённого потомка → по
 Folder move против target с тем же SHA → target считается уже materialized
 Folder move против target с другим SHA → вся операция блокируется до решения
 пользователя; частичный move, tombstone и physical cleanup не выполняются
+Последовательные edits одного installation ID → сравнить mutation sequence и
+непрерывный watermark текущего epoch; старый base revision не создаёт conflict
+Edits разных installation ID → использовать baseline/base revision; разные SHA
+после общего baseline создают одну conflict copy
 Нет локального baseline на первой синхронизации → локальный файл новый;
 разный remote-файл с тем же путём создаёт conflict copy
 ```

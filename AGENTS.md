@@ -91,7 +91,7 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of older builds and 2.0.0-beta.2 is unsupported. Legacy index v1-v3 blocks
+- Concurrent use of older builds and 2.0.0-beta.3 is unsupported. Legacy index v1-v3 blocks
   normal sync until explicit Force sync with backup.
 - Do not change index v4, manifest v2, epoch/revision, mutation FIFO, or the
   persisted physical-action schema without a separate migration design,

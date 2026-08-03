@@ -46,6 +46,13 @@ interface FileWatcherTestAccess {
 			eventId: string;
 			path: string;
 			status: "pending-put" | "accepted-put" | "rejected-put";
+			reason:
+				| "accepted-put"
+				| "coalesced"
+				| "idempotent"
+				| "stale-same-device"
+				| "foreign-conflict"
+				| "unresolved";
 			epoch: string | null;
 			canonicalRevision: number | null;
 			mutationId?: string;
@@ -442,6 +449,7 @@ test("accepted submitted upload advances its rename before acknowledgement", asy
 				eventId: "upload-a",
 				path: "A.md",
 				status: "accepted-put",
+				reason: "accepted-put",
 				epoch: "epoch-a",
 				canonicalRevision: 8,
 				mutationId: "device-a:1",
@@ -492,6 +500,7 @@ test("pending submitted upload leaves its put for rename retarget", () => {
 				eventId: "upload-a",
 				path: "A.md",
 				status: "pending-put",
+				reason: "coalesced",
 				epoch: "epoch-a",
 				canonicalRevision: null,
 				mutationId: "device-a:1",
@@ -505,6 +514,59 @@ test("pending submitted upload leaves its put for rename retarget", () => {
 	assert.ok(rename?.action === "rename" && rename.kind === "file");
 	assert.equal(rename.baseRevision, 7);
 	assert.equal(rename.predecessorUploadId, undefined);
+});
+
+test("accepted upload advances a later queued edit of the same path", () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([
+		{
+			id: "upload-previous",
+			action: "upload",
+			path: "note.md",
+			epoch: "epoch-a",
+			baseRevision: 35,
+			createdAt: 1,
+			mutationId: "device-a:7",
+			mutationSeq: 7,
+			snapshotSha256: "previous",
+			superseded: true,
+		},
+		{
+			id: "upload-latest",
+			action: "upload",
+			path: "note.md",
+			epoch: "epoch-a",
+			baseRevision: 35,
+			createdAt: 2,
+			mutationId: "device-a:8",
+			mutationSeq: 8,
+			snapshotSha256: "latest",
+		},
+	]);
+
+	(watcher as unknown as FileWatcherTestAccess).applyBatchResult({
+		completed: ["upload-previous"],
+		superseded: [],
+		retry: [],
+		uploadReceipts: [
+			{
+				eventId: "upload-previous",
+				path: "note.md",
+				status: "accepted-put",
+				reason: "accepted-put",
+				epoch: "epoch-a",
+				canonicalRevision: 36,
+				mutationId: "device-a:7",
+				mutationSeq: 7,
+				sha256: "previous",
+			},
+		],
+	});
+
+	const [successor] = watcher.getDeferredEvents();
+	assert.equal(successor?.action, "upload");
+	assert.equal(successor?.baseRevision, 36);
+	assert.equal(successor?.mutationSeq, 8);
 });
 
 test("queued rename followed by delete reduces to source deletion", () => {

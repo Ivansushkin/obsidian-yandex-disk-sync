@@ -398,6 +398,7 @@ async function createIndexManagerWithContent(
 	content: object | string,
 	activeEncryption: EncryptionService | null,
 	storageEncryption: EncryptionService | null = activeEncryption,
+	deviceId = "new-device",
 ): Promise<{
 	client: FakeIndexYandex;
 	manager: IndexManager;
@@ -419,7 +420,7 @@ async function createIndexManagerWithContent(
 		manager: new IndexManager(
 			client as unknown as YandexDiskClient,
 			{} as VaultAdapter,
-			createSettings("new-device"),
+			createSettings(deviceId),
 		),
 		canonicalPath,
 	};
@@ -524,6 +525,143 @@ test("malformed current v4 is rejected as a semantic index error", async () => {
 			error instanceof InvalidCurrentIndexError &&
 			error.section === "files",
 	);
+});
+
+test("file mutation sequence cannot exceed its device watermark", async () => {
+	const invalid = createEmptyIndex("device-current", "epoch-current");
+	invalid.revision = 4;
+	invalid.files["note.md"] = {
+		path: "note.md",
+		sha256: "hash",
+		size: 4,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 4,
+		baseRevision: 3,
+		lastModifiedBy: "device-a",
+		mutationSeq: 2,
+	};
+	invalid.appliedMutationSeq["device-a"] = 1;
+	const { manager } = await createIndexManagerWithContent(invalid, null);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		(error: unknown) =>
+			error instanceof InvalidCurrentIndexError &&
+			error.section === "files",
+	);
+});
+
+test("canonical transaction accepts a continuous same-device edit", async () => {
+	const current = createEmptyIndex("device-a", "epoch-a");
+	current.revision = 36;
+	current.files["note.md"] = {
+		path: "note.md",
+		sha256: "previous",
+		size: 8,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 36,
+		baseRevision: 35,
+		lastModifiedBy: "device-a",
+		mutationSeq: 7,
+	};
+	current.appliedMutationSeq["device-a"] = 7;
+	const { manager, client, canonicalPath } =
+		await createIndexManagerWithContent(
+			current,
+			null,
+			null,
+			"device-a",
+		);
+	manager.loadLocalIndexFromData({
+		version: 1,
+		deviceId: "device-a",
+		observedEpoch: "epoch-a",
+		observedRevision: 35,
+		files: { "note.md": { ...current.files["note.md"] } },
+		folderTombstones: {},
+		nextMutationSeq: 8,
+	});
+	manager.loadPendingMutations(undefined);
+	await manager.loadRemoteIndex();
+	const mutation = manager.enqueueMutation("put", "note.md", {
+		sha256: "latest",
+		baseRevision: 35,
+		epoch: "epoch-a",
+	});
+	assert.equal(mutation.seq, 8);
+	manager.updateRemoteFile("note.md", {
+		...current.files["note.md"],
+		sha256: "latest",
+		baseRevision: 35,
+		mutationSeq: mutation.seq,
+	});
+	manager.stageMutation(mutation);
+	await manager.saveRemoteIndex();
+
+	const canonical = JSON.parse(
+		new TextDecoder().decode(client.files.get(canonicalPath)),
+	) as ReturnType<typeof createEmptyIndex>;
+	assert.equal(canonical.revision, 37);
+	assert.equal(canonical.files["note.md"]?.sha256, "latest");
+	assert.equal(canonical.files["note.md"]?.mutationSeq, 8);
+	assert.equal(canonical.appliedMutationSeq["device-a"], 8);
+	assert.deepEqual(manager.consumeRejectedPuts(), []);
+});
+
+test("canonical transaction still rejects a concurrent foreign edit", async () => {
+	const current = createEmptyIndex("device-b", "epoch-a");
+	current.revision = 36;
+	current.files["note.md"] = {
+		path: "note.md",
+		sha256: "device-b",
+		size: 8,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 36,
+		baseRevision: 35,
+		lastModifiedBy: "device-b",
+		mutationSeq: 3,
+	};
+	current.appliedMutationSeq = { "device-a": 7, "device-b": 3 };
+	const { manager } = await createIndexManagerWithContent(
+		current,
+		null,
+		null,
+		"device-a",
+	);
+	manager.loadLocalIndexFromData({
+		version: 1,
+		deviceId: "device-a",
+		observedEpoch: "epoch-a",
+		observedRevision: 35,
+		files: {},
+		folderTombstones: {},
+		nextMutationSeq: 8,
+	});
+	manager.loadPendingMutations(undefined);
+	await manager.loadRemoteIndex();
+	const mutation = manager.enqueueMutation("put", "note.md", {
+		sha256: "device-a",
+		baseRevision: 35,
+		epoch: "epoch-a",
+	});
+	manager.updateRemoteFile("note.md", {
+		...current.files["note.md"],
+		sha256: "device-a",
+		remoteFingerprint: "uploaded-device-a",
+		lastModifiedBy: "device-a",
+		baseRevision: 35,
+		mutationSeq: mutation.seq,
+	});
+	manager.stageMutation(mutation);
+	await manager.saveRemoteIndex();
+
+	assert.equal(
+		manager.getRemoteIndex().files["note.md"]?.sha256,
+		"device-b",
+	);
+	assert.equal(manager.consumeRejectedPuts()[0]?.reason, "conflict");
 });
 
 test("wrong encrypted index key is classified as unreadable", async () => {

@@ -158,6 +158,12 @@ canonical index не продвигает `observedRevision`: она меняе�
 полного успешного reconciliation. Мутации нумеруются
 монотонным `seq` для каждого устройства, а индекс хранит только непрерывный
 high-watermark `appliedMutationSeq`.
+Последовательный edit того же installation ID считается причинным successor,
+если его sequence непрерывно достигнут watermark текущего epoch. Поэтому
+устаревший `baseRevision`, снятый до завершения предыдущего upload, не создаёт
+ложный конфликт. Для другого device ID по-прежнему применяется сравнение с
+baseline/base revision; одинаковый sequence с разным logical state и FIFO gap
+блокируют commit как повреждённое причинное состояние.
 Авторитетное состояние находится в одном файле
 `.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
 перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,
@@ -200,7 +206,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1-v3 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.2 и один раз выполнить Force sync на
+обновить все устройства до 2.0.0-beta.3 и один раз выполнить Force sync на
 авторитетном устройстве. Index v4 хранит `mutationSeq` в file metadata,
 folder tombstones и moves. Folder move фиксирует logical intent одной revision,
 а физически выполняется как ограниченная пачка guarded file moves; folder-level

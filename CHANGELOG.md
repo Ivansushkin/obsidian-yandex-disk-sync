@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.0-beta.3
+
+### Fixed
+
+- Continuous edits from one installation now follow the per-device mutation
+  watermark even when a later snapshot retains an older full-sync revision.
+  They no longer create false conflict copies.
+- Upload receipts now advance a later queued edit of the same path. Applied
+  uploads left by a crash are acknowledged without uploading the same content
+  again.
+- Same-device stale replays and idempotent puts are distinguished from real
+  cross-device conflicts. FIFO gaps and divergent states with the same
+  sequence fail closed without advancing the canonical watermark.
+- Current v4 validation now rejects metadata whose mutation sequence exceeds
+  the corresponding device watermark.
+
 ## 2.0.0-beta.2
 
 ### Fixed

@@ -2,9 +2,9 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-## Upgrading to 2.0.0-beta.2
+## Upgrading to 2.0.0-beta.3
 
-Version 2.0.0-beta.2 uses canonical index v4 and cannot synchronize alongside
+Version 2.0.0-beta.3 uses canonical index v4 and cannot synchronize alongside
 1.1, 1.2 beta, or earlier 2.0 beta builds that use index v1-v3. Stop sync on
 every device and restore the intended local folder structure on the device
 with the most complete data. Update the plugin everywhere, then run one
@@ -15,7 +15,7 @@ required.
 Do not start an older plugin version after the transition: it can replace the
 v4 index or restore deleted files. If that happens, disable sync everywhere,
 select the most complete local vault, inspect backup/conflict copies, and
-repeat the force sync procedure from version 2.0.0-beta.2.
+repeat the force sync procedure from version 2.0.0-beta.3.
 
 > **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**
 >
@@ -141,6 +141,8 @@ On first launch, the plugin will check for files locally and on Yandex Disk:
 
 Local changes are detected by SHA-256; remote changes use server mtime and a
 server fingerprint. If both sides changed, the plugin creates a conflict copy.
+Sequential edits from the same plugin installation remain causal even when a
+previous upload is still completing; they do not create conflict copies.
 An exact-file deletion wins over a concurrent edit, but displaced local content
 is first preserved in backup. A new or modified file inside a concurrently
 deleted folder survives.

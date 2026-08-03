@@ -21,13 +21,16 @@ test("P0 and P1 scenario evidence does not use generic test labels", () => {
 	);
 });
 
-test("beta.2 causal blockers have exact automated evidence", () => {
+test("beta.3 causal blockers have exact automated evidence", () => {
 	for (const id of [
 		"MOVE-029",
 		"MOVE-030",
 		"FDEL-017",
 		"SYNC-030",
 		"INDEX-001",
+		"SYNC-031",
+		"MULTI-017",
+		"DIAG-017",
 	]) {
 		const line = catalog
 			.split("\n")

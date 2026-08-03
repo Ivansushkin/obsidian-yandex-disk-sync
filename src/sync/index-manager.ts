@@ -50,6 +50,7 @@ import {
 } from "../utils/resource-fingerprint";
 import {
 	canApplyDestructiveFolderMutation,
+	classifyFileMutation,
 	classifyIndexVersion,
 	isPathInsideFolder,
 	isStableLockStale,
@@ -236,6 +237,38 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		assertIndexSection(isJsonRecord(action), "maintenance.cleanup", "entry must be an object");
 		assertIndexSection(typeof action.path === "string" && action.path.length > 0, "maintenance.cleanup", "path is required");
 		assertIndexSection(typeof action.expectedFingerprint === "string" && action.expectedFingerprint.length > 0, "maintenance.cleanup", "expectedFingerprint is required");
+	}
+}
+
+function validateCurrentIndexCausality(index: SyncIndex): void {
+	const validateEntry = (
+		section: string,
+		entry: Pick<FileMetadata, "lastModifiedBy" | "mutationSeq">,
+	): void => {
+		if (entry.mutationSeq === undefined) return;
+		if (entry.mutationSeq === 0) return;
+		assertIndexSection(
+			typeof entry.lastModifiedBy === "string" &&
+				entry.lastModifiedBy.length > 0,
+			section,
+			"positive mutationSeq requires lastModifiedBy",
+		);
+		assertIndexSection(
+			(index.appliedMutationSeq[entry.lastModifiedBy] ?? 0) >=
+				entry.mutationSeq,
+			section,
+			"mutationSeq exceeds its device watermark",
+		);
+	};
+
+	for (const metadata of Object.values(index.files)) {
+		validateEntry("files", metadata);
+	}
+	for (const tombstone of Object.values(index.folderTombstones)) {
+		validateEntry("folderTombstones", tombstone);
+	}
+	for (const move of Object.values(index.moves)) {
+		validateEntry("moves", move);
 	}
 }
 
@@ -1896,6 +1929,7 @@ export class IndexManager {
 			);
 		}
 		validateCurrentIndexShape(data);
+		validateCurrentIndexCausality(data);
 		return this.cloneIndex(data);
 	}
 
@@ -2030,16 +2064,45 @@ export class IndexManager {
 					"new logical state is missing mutationSeq",
 				);
 			}
+			if (logicalChange && desired.mutationSeq === 0) {
+				throw new InvalidCurrentIndexError(
+					"files",
+					"normal logical mutation must have mutationSeq greater than zero",
+				);
+			}
 			const mutationBase = desired.baseRevision ?? baseRevision;
+			const mutationDevice =
+				desired.lastModifiedBy ?? this.settings.deviceId;
+			const causalContext = {
+				currentWatermark:
+					latest.appliedMutationSeq[mutationDevice] ?? 0,
+				desiredWatermark:
+					this.remoteIndex.appliedMutationSeq[mutationDevice] ?? 0,
+			};
+			const decision = classifyFileMutation(
+				current,
+				desired,
+				mutationBase,
+				causalContext,
+			);
+			if (decision === "fifo-gap" || decision === "invalid-sequence") {
+				throw new InvalidCurrentIndexError(
+					"files",
+					`causal mutation rejected: ${decision}`,
+				);
+			}
 			const next = mergeFileMutation(
 				current,
 				desired,
 				mutationBase,
 				nextRevision,
 				this.settings.deviceId,
+				causalContext,
+				decision,
 			);
 			if (next === current || !next) {
 				if (
+					decision === "concurrent-foreign" &&
 					desired.deletedByFolder &&
 					current &&
 					!current.deleted
@@ -2051,12 +2114,19 @@ export class IndexManager {
 					changed = true;
 					continue;
 				}
-				if (!desired.deleted && current && desired.remoteFingerprint) {
+				if (
+					!desired.deleted &&
+					current &&
+					desired.remoteFingerprint &&
+					(decision === "concurrent-foreign" ||
+						decision === "rejected-by-delete")
+				) {
 					this.rejectedPuts.push({
 						path,
-						reason: current.deleted
-							? "delete"
-							: "conflict",
+						reason:
+							decision === "rejected-by-delete"
+								? "delete"
+								: "conflict",
 						remoteFingerprint: desired.remoteFingerprint,
 						baselineSha256:
 							this.operationStore.findLatestPutBaselineSha(
@@ -2064,6 +2134,14 @@ export class IndexManager {
 							),
 					});
 				}
+				logger.debug("File mutation reduced without logical write", {
+					path,
+					decision,
+					baseRevision: mutationBase,
+					currentRevision: current?.changedRevision ?? null,
+					mutationSeq: desired.mutationSeq ?? null,
+					deviceId: shortenDiagnosticValue(mutationDevice),
+				});
 				continue;
 			}
 
@@ -2082,10 +2160,23 @@ export class IndexManager {
 			) {
 				continue;
 			}
-			if (tombstone.mutationSeq === undefined) {
+			if (
+				tombstone.mutationSeq === undefined ||
+				tombstone.mutationSeq === 0
+			) {
 				throw new InvalidCurrentIndexError(
 					"folderTombstones",
-					"new logical state is missing mutationSeq",
+					"new logical state requires mutationSeq greater than zero",
+				);
+			}
+			if (
+				(this.remoteIndex.appliedMutationSeq[
+					tombstone.lastModifiedBy
+				] ?? 0) < tombstone.mutationSeq
+			) {
+				throw new InvalidCurrentIndexError(
+					"folderTombstones",
+					"mutationSeq exceeds its staged device watermark",
 				);
 			}
 			merged.folderTombstones[path] = {
@@ -2123,10 +2214,19 @@ export class IndexManager {
 			if (this.sameValue(move, this.loadedRemoteIndex.moves[id])) {
 				continue;
 			}
-			if (move.mutationSeq === undefined) {
+			if (move.mutationSeq === undefined || move.mutationSeq === 0) {
 				throw new InvalidCurrentIndexError(
 					"moves",
-					"new logical state is missing mutationSeq",
+					"new logical state requires mutationSeq greater than zero",
+				);
+			}
+			if (
+				(this.remoteIndex.appliedMutationSeq[move.lastModifiedBy] ?? 0) <
+				move.mutationSeq
+			) {
+				throw new InvalidCurrentIndexError(
+					"moves",
+					"mutationSeq exceeds its staged device watermark",
 				);
 			}
 			merged.moves[id] = {
@@ -3157,7 +3257,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.2. Update every device and run one explicit force sync to create index v4.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.3. Update every device and run one explicit force sync to create index v4.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

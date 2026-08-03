@@ -30,6 +30,13 @@ export interface UploadCausalReceipt {
 	eventId: string;
 	path: string;
 	status: "pending-put" | "accepted-put" | "rejected-put";
+	reason:
+		| "accepted-put"
+		| "coalesced"
+		| "idempotent"
+		| "stale-same-device"
+		| "foreign-conflict"
+		| "unresolved";
 	epoch: string | null;
 	canonicalRevision: number | null;
 	mutationId?: string;

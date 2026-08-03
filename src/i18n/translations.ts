@@ -76,7 +76,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.2 detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
+			"Plugin 2.0.0-beta.3 detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.invalid_index_blocked":
@@ -383,7 +383,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.2 обнаружил старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
+			"Плагин 2.0.0-beta.3 обнаружил старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.invalid_index_blocked":

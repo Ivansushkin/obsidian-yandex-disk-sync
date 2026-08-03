@@ -356,7 +356,7 @@
 | FDEL-016  | P0 | Folder delete после собственных revisions при старом observedRevision | Потомки с меньшим same-device sequence удаляются; foreign/newer сохраняются | manual-required |
 | MULTI-016 | P0 | Другой device меняет child во время folder move/delete | Foreign child и отличающийся target не удаляются и не перезаписываются | manual-required |
 | SYNC-029  | P0 | Full запускается при unresolved parent move/action | Full останавливается до local/remote scan, не создаёт compensating operations | manual-required |
-| MIG-004   | P0 | Переход beta.1.1 index v3 на beta.2 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | manual-required |
+| MIG-004   | P0 | Переход beta.1.1 index v3 на beta.3 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | manual-required |
 | DIAG-016  | P1 | Folder reducer и recovery | Лог содержит parent event/mutation, sequence, absorbed/rebased, survivor/conflict/unresolved counts без expected coalescing ERROR | manual-required |
 | MOVE-029  | P0 | Одновременно ожидают unrelated и nested folder moves, затем приходит child rename | Выбирается только содержащий child source и самый глубокий causal parent; unrelated move не влияет | auto: `child rename selects the deepest matching folder parent` |
 | MOVE-030  | P0 | Folder move встречает существующий target с другим SHA | Ноль canonical/physical writes; source и local target сохраняются; event остаётся durable с `folder-target-conflict` | auto: `folder target conflict performs no canonical or physical writes` |
@@ -364,6 +364,14 @@
 | SYNC-030  | P0 | Full обнаруживает новое локальное удаление файла | До tombstone сохраняется FIFO mutation; canonical получает sequence и watermark; existing foreign tombstone сохраняет attribution | auto: `full-discovered logical delete receives and confirms a FIFO sequence`; `applying a canonical tombstone preserves foreign causal attribution` |
 | INDEX-001 | P0 | JSON декодирован, но current v4 имеет неверную структуру | Возвращается semantic invalid-index; codec fallback и remote mutation не выполняются; Force остаётся доступным после backup | auto: `malformed current v4 is rejected as a semantic index error` |
 | PERF-008  | P1 | Folder move/delete на 10 000 descendants | Планирование использует Set/Map, targeted API calls линейны, concurrency ≤ 4, index commits ≤ 2 | auto: `folder delete target planning handles ten thousand descendants`; move/API/commit manual-required |
+
+## Последовательное редактирование и causal FIFO
+
+| ID        | P  | Сценарий | Ожидаемый результат | Проверка |
+| --------- | -- | -------- | -------------------- | -------- |
+| SYNC-031  | P0 | Один device продолжает редактировать файл, пока предыдущий upload/commit ещё выполняется | Последний snapshot становится canonical; собственная предыдущая revision не создаёт conflict copy; следующий full `0/0/0` | auto: `continuous same-device edit ignores an older base revision`; `canonical transaction accepts a continuous same-device edit`; manual: `docs/SMOKE_TESTS.md` TC-03 |
+| MULTI-017 | P0 | Foreign edit коммитится между двумя mutations первого device | Следующий put первого device не получает same-device приоритет и создаёт ровно одну настоящую conflict copy | auto: `foreign edit keeps base-revision conflict rules`; `canonical transaction still rejects a concurrent foreign edit`; manual: `docs/SMOKE_TESTS.md` TC-04 |
+| DIAG-017  | P1 | Continuous edit, replay и FIFO corruption | Лог различает `accepted-put`, `coalesced`, `idempotent`, `stale-same-device`, `foreign-conflict`, `unresolved`; expected coalescing не пишет error stack | auto: `accepted upload advances a later queued edit of the same path`; `plaintext applied edit replay is acknowledged without a second upload`; `encrypted applied edit replay is acknowledged without a second upload` |
 
 ## Матрица вариантов
 

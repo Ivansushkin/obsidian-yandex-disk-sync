@@ -151,6 +151,100 @@ export function isCausalSameDevicePredecessor(
 	);
 }
 
+export type FileMutationDecision =
+	| "apply"
+	| "idempotent"
+	| "stale-same-device"
+	| "concurrent-foreign"
+	| "rejected-by-delete"
+	| "fifo-gap"
+	| "invalid-sequence";
+
+export interface FileMutationCausalContext {
+	currentWatermark: number;
+	desiredWatermark: number;
+}
+
+function hasSameLogicalFileState(
+	current: FileMetadata,
+	incoming: FileMetadata,
+): boolean {
+	return (
+		current.sha256 === incoming.sha256 &&
+		Boolean(current.deleted) === Boolean(incoming.deleted) &&
+		(current.deletedByFolder ?? null) ===
+			(incoming.deletedByFolder ?? null)
+	);
+}
+
+/**
+ * Classify a logical file mutation without comparing client clocks.
+ *
+ * A continuous per-device watermark proves causality even when a later local
+ * snapshot was captured from an older full-sync revision.
+ */
+export function classifyFileMutation(
+	current: FileMetadata | undefined,
+	incoming: FileMetadata,
+	baseRevision: number,
+	causal?: FileMutationCausalContext,
+): FileMutationDecision {
+	const incomingDevice = incoming.lastModifiedBy;
+	const incomingSequence = incoming.mutationSeq;
+	if (causal && incomingSequence !== undefined) {
+		if (incomingSequence === 0) return "invalid-sequence";
+		if (causal.desiredWatermark < incomingSequence) return "fifo-gap";
+	}
+
+	const sameDevice =
+		current !== undefined &&
+		incomingDevice !== undefined &&
+		current.lastModifiedBy === incomingDevice &&
+		typeof current.mutationSeq === "number" &&
+		typeof incomingSequence === "number";
+	if (sameDevice) {
+		const currentSequence = current.mutationSeq!;
+		if (incomingSequence === currentSequence) {
+			return hasSameLogicalFileState(current, incoming)
+				? "idempotent"
+				: "invalid-sequence";
+		}
+		if (incomingSequence < currentSequence) {
+			return "stale-same-device";
+		}
+		if (!causal) return "apply";
+		if (incomingSequence <= causal.currentWatermark) {
+			return "stale-same-device";
+		}
+		return "apply";
+	}
+
+	if (incoming.deleted) {
+		if (
+			incoming.deletedByFolder &&
+			current &&
+			!current.deleted &&
+			(current.changedRevision ?? 0) > baseRevision
+		) {
+			return "concurrent-foreign";
+		}
+		return "apply";
+	}
+	if (
+		current &&
+		!current.deleted &&
+		(current.changedRevision ?? 0) > baseRevision &&
+		current.sha256 !== incoming.sha256
+	) {
+		return "concurrent-foreign";
+	}
+	if (!current?.deleted) return "apply";
+	if (current.deletedByFolder) return "apply";
+	return (current.changedRevision ?? 0) <= baseRevision
+		? "apply"
+		: "rejected-by-delete";
+}
+
 /**
  * Decide whether an incoming file state may replace the current state.
  *
@@ -162,35 +256,8 @@ export function shouldApplyFileMutation(
 	incoming: FileMetadata,
 	baseRevision: number,
 ): boolean {
-	if (incoming.deleted) {
-		if (
-			incoming.deletedByFolder &&
-				current &&
-				!current.deleted &&
-				(current.changedRevision ?? 0) > baseRevision &&
-				!isCausalSameDevicePredecessor(
-					current,
-					incoming.lastModifiedBy,
-					incoming.mutationSeq,
-				)
-			) {
-				return false;
-		}
-		return true;
-	}
-	if (
-		current &&
-		!current.deleted &&
-		(current.changedRevision ?? 0) > baseRevision &&
-		current.sha256 !== incoming.sha256
-	) {
-		return false;
-	}
-	if (!current?.deleted) return true;
-	if (current.deletedByFolder) {
-		return true;
-	}
-	return (current.changedRevision ?? 0) <= baseRevision;
+	const decision = classifyFileMutation(current, incoming, baseRevision);
+	return decision === "apply" || decision === "idempotent";
 }
 
 /**
@@ -202,8 +269,14 @@ export function mergeFileMutation(
 	baseRevision: number,
 	nextRevision: number,
 	deviceId: string,
+	causal?: FileMutationCausalContext,
+	classifiedDecision?: FileMutationDecision,
 ): FileMetadata | undefined {
-	if (!shouldApplyFileMutation(current, incoming, baseRevision)) {
+	const decision =
+		classifiedDecision ??
+		classifyFileMutation(current, incoming, baseRevision, causal);
+	if (decision === "idempotent") return current;
+	if (decision !== "apply") {
 		return current;
 	}
 	return {

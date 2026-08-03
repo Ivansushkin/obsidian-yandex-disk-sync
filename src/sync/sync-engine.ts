@@ -2292,20 +2292,73 @@ export class SyncEngine {
 					continue;
 				}
 				if (event.action === "upload") {
+					const recovered = this.classifyAppliedUploadEvent(event);
+					if (recovered) {
+						batchResult.uploadReceipts.push(recovered);
+						if (recovered.status === "accepted-put") {
+							batchResult.completed.push(event.id);
+						} else if (recovered.reason === "stale-same-device") {
+							batchResult.superseded.push(event.id);
+						} else {
+							batchResult.retry.push(event.id);
+						}
+						logger.info("Realtime upload recovered before physical write", {
+							eventId: event.id,
+							path: event.path,
+							mutationId: event.mutationId ?? null,
+							mutationSeq: event.mutationSeq ?? null,
+							reason: recovered.reason,
+							canonicalRevision: recovered.canonicalRevision,
+						});
+						continue;
+					}
 					if (event.superseded) {
 						const receipt = await this.recoverUploadCausalReceipt(
 							event,
 						);
+						if (
+							receipt.status === "pending-put" &&
+							!event.supersededByRenameId &&
+							event.mutationId
+						) {
+							const noop =
+								this.indexManager.replacePendingPutWithNoop(
+									event.mutationId,
+								);
+							if (noop) {
+								prepared.push({
+									...event,
+									action: "noop",
+									mutation: noop,
+								});
+								logger.debug(
+									"Superseded upload retained as FIFO no-op",
+									{
+										eventId: event.id,
+										path: event.path,
+										mutationId: noop.id,
+										mutationSeq: noop.seq,
+									},
+								);
+								continue;
+							}
+						}
 						batchResult.uploadReceipts.push(receipt);
-						batchResult[
-							receipt.status === "accepted-put"
-								? "completed"
-								: "superseded"
-						].push(event.id);
+						if (
+							receipt.reason === "foreign-conflict" ||
+							(receipt.reason === "unresolved" &&
+								receipt.status !== "pending-put")
+						) {
+							batchResult.retry.push(event.id);
+						} else if (receipt.status === "accepted-put") {
+							batchResult.completed.push(event.id);
+						} else {
+							batchResult.superseded.push(event.id);
+						}
 						logger.debug("Realtime upload event superseded", {
 							eventId: event.id,
 							path: event.path,
-							reason: receipt.status,
+							reason: receipt.reason,
 							epoch: shortenDiagnosticValue(event.epoch),
 							baseRevision: event.baseRevision,
 						});
@@ -2649,6 +2702,7 @@ export class SyncEngine {
 				eventId: item.id,
 				path: item.path,
 				status: "pending-put",
+				reason: "coalesced",
 				epoch: item.mutation.epoch,
 				canonicalRevision: null,
 				mutationId: item.mutation.id,
@@ -2679,6 +2733,7 @@ export class SyncEngine {
 			eventId: event.id,
 			path: event.path,
 			status: "rejected-put",
+			reason: "coalesced",
 			epoch: event.epoch,
 			canonicalRevision: null,
 			mutationId: event.mutationId,
@@ -2686,7 +2741,6 @@ export class SyncEngine {
 			sha256: event.snapshotSha256,
 		};
 		if (
-			!event.supersededByRenameId ||
 			!event.mutationId ||
 			event.mutationSeq === undefined ||
 			!event.snapshotSha256
@@ -2713,6 +2767,7 @@ export class SyncEngine {
 			return {
 				...fallback,
 				status: "accepted-put",
+				reason: "idempotent",
 				epoch: canonical.epoch,
 				canonicalRevision: canonical.revision,
 			};
@@ -2721,10 +2776,44 @@ export class SyncEngine {
 			return {
 				...fallback,
 				status: "pending-put",
+				reason: event.supersededByRenameId
+					? "coalesced"
+					: "unresolved",
+			};
+		}
+		const separator = event.mutationId.lastIndexOf(":");
+		const eventDevice =
+			separator > 0 ? event.mutationId.slice(0, separator) : null;
+		if (
+			applied &&
+			eventDevice &&
+			source?.lastModifiedBy === eventDevice &&
+			(source.mutationSeq ?? -1) > event.mutationSeq
+		) {
+			return {
+				...fallback,
+				reason: "stale-same-device",
+				epoch: canonical.epoch,
+				canonicalRevision: canonical.revision,
+			};
+		}
+		if (
+			applied &&
+			source &&
+			!source.deleted &&
+			eventDevice &&
+			source.lastModifiedBy !== eventDevice
+		) {
+			return {
+				...fallback,
+				reason: "foreign-conflict",
+				epoch: canonical.epoch,
+				canonicalRevision: canonical.revision,
 			};
 		}
 		return {
 			...fallback,
+			reason: "unresolved",
 			epoch: canonical.epoch,
 			canonicalRevision: canonical.revision,
 		};
@@ -2755,10 +2844,26 @@ export class SyncEngine {
 			source !== undefined &&
 			!source.deleted &&
 			source.sha256 === item.snapshot?.sha256;
+		let reason: UploadCausalReceipt["reason"] = "unresolved";
+		if (accepted) {
+			reason = "accepted-put";
+		} else if (
+			source?.lastModifiedBy === this.settings.deviceId &&
+			(source.mutationSeq ?? -1) > item.mutation.seq
+		) {
+			reason = "stale-same-device";
+		} else if (
+			source &&
+			!source.deleted &&
+			source.lastModifiedBy !== this.settings.deviceId
+		) {
+			reason = "foreign-conflict";
+		}
 		return {
 			eventId: item.id,
 			path: item.path,
 			status: accepted ? "accepted-put" : "rejected-put",
+			reason,
 			epoch: canonical.epoch,
 			canonicalRevision: canonical.revision,
 			mutationId: item.mutation.id,
@@ -2776,6 +2881,63 @@ export class SyncEngine {
 		if (separator <= 0) return false;
 		const deviceId = event.mutationId.slice(0, separator);
 		return (appliedMutationSeq[deviceId] ?? 0) >= event.mutationSeq;
+	}
+
+	/** Recover terminal upload work from the current canonical watermark. */
+	private classifyAppliedUploadEvent(
+		event: RealtimeFileEvent,
+	): UploadCausalReceipt | null {
+		if (
+			!event.mutationId ||
+			event.mutationSeq === undefined ||
+			!event.snapshotSha256
+		) {
+			return null;
+		}
+		const canonical = this.indexManager.getRemoteIndex();
+		if (
+			canonical.epoch !== event.epoch ||
+			!this.isUploadEventApplied(event, canonical.appliedMutationSeq)
+		) {
+			return null;
+		}
+		const separator = event.mutationId.lastIndexOf(":");
+		if (separator <= 0) return null;
+		const deviceId = event.mutationId.slice(0, separator);
+		const source = canonical.files[event.path];
+		let status: UploadCausalReceipt["status"] = "rejected-put";
+		let reason: UploadCausalReceipt["reason"] = "unresolved";
+		if (
+			source &&
+			!source.deleted &&
+			source.sha256 === event.snapshotSha256
+		) {
+			status = "accepted-put";
+			reason = "idempotent";
+			this.indexManager.updateLocalFile(event.path, source);
+		} else if (
+			source?.lastModifiedBy === deviceId &&
+			(source.mutationSeq ?? -1) > event.mutationSeq
+		) {
+			reason = "stale-same-device";
+		} else if (
+			source &&
+			!source.deleted &&
+			source.lastModifiedBy !== deviceId
+		) {
+			reason = "foreign-conflict";
+		}
+		return {
+			eventId: event.id,
+			path: event.path,
+			status,
+			reason,
+			epoch: canonical.epoch,
+			canonicalRevision: canonical.revision,
+			mutationId: event.mutationId,
+			mutationSeq: event.mutationSeq,
+			sha256: event.snapshotSha256,
+		};
 	}
 
 	/**

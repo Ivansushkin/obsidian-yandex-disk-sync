@@ -1398,6 +1398,14 @@ export class FileWatcher {
 	 * the predecessor event is acknowledged.
 	 */
 	private applyUploadCausalReceipts(result: RealtimeBatchResult): void {
+		const eventsById = new Map(
+			this.deferredEvents
+				.filter(
+					(event): event is RealtimeFileEvent =>
+						event.action === "upload" || event.action === "delete",
+				)
+				.map((event) => [event.id, event]),
+		);
 		const receipts = new Map(
 			(result.uploadReceipts ?? []).map((receipt) => [
 				receipt.eventId,
@@ -1420,6 +1428,39 @@ export class FileWatcher {
 			candidate.predecessorUploadId = undefined;
 			this.logUploadHandoff(candidate, receipt);
 		}
+		for (const receipt of receipts.values()) {
+			if (
+				receipt.status !== "accepted-put" ||
+				receipt.canonicalRevision === null
+			) {
+				continue;
+			}
+			const predecessor = eventsById.get(receipt.eventId);
+			if (!predecessor) continue;
+			for (const candidate of this.deferredEvents) {
+				if (
+					candidate.action !== "upload" ||
+					candidate.id === receipt.eventId ||
+					candidate.path !== receipt.path ||
+					candidate.createdAt <= predecessor.createdAt ||
+					settledIds.has(candidate.id) ||
+					(candidate.epoch !== null &&
+						candidate.epoch !== receipt.epoch)
+				) {
+					continue;
+				}
+				candidate.baseRevision = receipt.canonicalRevision;
+				candidate.epoch = receipt.epoch;
+				logger.info("Watcher upload receipt advanced successor", {
+					eventId: candidate.id,
+					predecessorUploadId: receipt.eventId,
+					path: candidate.path,
+					canonicalRevision: receipt.canonicalRevision,
+					mutationSeq: candidate.mutationSeq ?? null,
+					reason: receipt.reason,
+				});
+			}
+		}
 	}
 
 	private logUploadHandoff(
@@ -1432,6 +1473,7 @@ export class FileWatcher {
 			oldPath: rename.path,
 			targetPath: rename.targetPath,
 			state: receipt?.status ?? "not-committed",
+			reason: receipt?.reason ?? "unresolved",
 			canonicalRevision: receipt?.canonicalRevision ?? null,
 			mutationId: receipt?.mutationId ?? null,
 			mutationSeq: receipt?.mutationSeq ?? null,

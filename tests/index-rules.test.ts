@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { FileMetadata, FolderTombstone } from "../src/types";
 import {
+	classifyFileMutation,
 	classifyIndexVersion,
 	canApplyDestructiveFolderMutation,
 	collectFolderDeleteTargets,
@@ -369,6 +370,188 @@ test("accepted merge stamps base and changed revisions", () => {
 	assert.equal(merged?.changedRevision, 5);
 	assert.equal(merged?.lastModifiedBy, "device-a");
 	assert.equal(merged?.mutationSeq, 9);
+});
+
+test("continuous same-device edit ignores an older base revision", () => {
+	const current = file("note.md", {
+		sha256: "previous",
+		changedRevision: 36,
+		lastModifiedBy: "device-a",
+		mutationSeq: 7,
+	});
+	const incoming = file("note.md", {
+		sha256: "latest",
+		lastModifiedBy: "device-a",
+		mutationSeq: 8,
+	});
+	assert.equal(
+		classifyFileMutation(current, incoming, 35, {
+			currentWatermark: 7,
+			desiredWatermark: 8,
+		}),
+		"apply",
+	);
+	assert.equal(
+		mergeFileMutation(current, incoming, 35, 37, "device-a", {
+			currentWatermark: 7,
+			desiredWatermark: 8,
+		})?.sha256,
+		"latest",
+	);
+});
+
+test("same-device replay is idempotent or stale but never a conflict", () => {
+	const current = file("note.md", {
+		sha256: "latest",
+		changedRevision: 37,
+		lastModifiedBy: "device-a",
+		mutationSeq: 8,
+	});
+	assert.equal(
+		classifyFileMutation(
+			current,
+			{ ...current },
+			35,
+			{ currentWatermark: 8, desiredWatermark: 8 },
+		),
+		"idempotent",
+	);
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				sha256: "old",
+				lastModifiedBy: "device-a",
+				mutationSeq: 7,
+			}),
+			35,
+			{ currentWatermark: 8, desiredWatermark: 8 },
+		),
+		"stale-same-device",
+	);
+});
+
+test("same-device stale delete cannot remove a newer put", () => {
+	const current = file("note.md", {
+		sha256: "latest",
+		changedRevision: 37,
+		lastModifiedBy: "device-a",
+		mutationSeq: 8,
+	});
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				deleted: true,
+				lastModifiedBy: "device-a",
+				mutationSeq: 7,
+			}),
+			35,
+			{ currentWatermark: 8, desiredWatermark: 8 },
+		),
+		"stale-same-device",
+	);
+});
+
+test("same-device put after its own exact delete restores the path", () => {
+	const current = file("note.md", {
+		deleted: true,
+		changedRevision: 36,
+		lastModifiedBy: "device-a",
+		mutationSeq: 7,
+	});
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				sha256: "restored",
+				lastModifiedBy: "device-a",
+				mutationSeq: 8,
+			}),
+			35,
+			{ currentWatermark: 7, desiredWatermark: 8 },
+		),
+		"apply",
+	);
+});
+
+test("equal divergent sequence and FIFO gap fail closed", () => {
+	const current = file("note.md", {
+		sha256: "canonical",
+		changedRevision: 37,
+		lastModifiedBy: "device-a",
+		mutationSeq: 8,
+	});
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				sha256: "different",
+				lastModifiedBy: "device-a",
+				mutationSeq: 8,
+			}),
+			35,
+			{ currentWatermark: 8, desiredWatermark: 8 },
+		),
+		"invalid-sequence",
+	);
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				sha256: "future",
+				lastModifiedBy: "device-a",
+				mutationSeq: 10,
+			}),
+			35,
+			{ currentWatermark: 8, desiredWatermark: 8 },
+		),
+		"fifo-gap",
+	);
+});
+
+test("foreign edit keeps base-revision conflict rules", () => {
+	const current = file("note.md", {
+		sha256: "device-b",
+		changedRevision: 36,
+		lastModifiedBy: "device-b",
+		mutationSeq: 3,
+	});
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				sha256: "device-a",
+				lastModifiedBy: "device-a",
+				mutationSeq: 8,
+			}),
+			35,
+			{ currentWatermark: 7, desiredWatermark: 8 },
+		),
+		"concurrent-foreign",
+	);
+});
+
+test("force snapshot is followed by sequence one in the same epoch", () => {
+	const current = file("note.md", {
+		sha256: "snapshot",
+		changedRevision: 1,
+		lastModifiedBy: "device-a",
+		mutationSeq: 0,
+	});
+	assert.equal(
+		classifyFileMutation(
+			current,
+			file("note.md", {
+				sha256: "edited",
+				lastModifiedBy: "device-a",
+				mutationSeq: 1,
+			}),
+			1,
+			{ currentWatermark: 0, desiredWatermark: 1 },
+		),
+		"apply",
+	);
 });
 
 test("deletion always replaces a concurrent present state", () => {
