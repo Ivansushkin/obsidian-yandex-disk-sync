@@ -4,12 +4,16 @@ import {
 	classifyPostFullRename,
 	isMissingUploadSuperseded,
 	reduceQueuedFileRename,
+	reduceQueuedFolderRename,
+	reduceFolderChildRename,
+	selectFolderRenameParent,
 	selectFileRenamePlan,
 	shouldRetainQueuedFileEvent,
 	wasPendingPutAccepted,
 	wasRenameSourceCausallyLive,
 	type RealtimeFileEvent,
 	type DurableFileRenameEvent,
+	type DurableFolderRenameEvent,
 } from "../src/sync/realtime-rules";
 import type {
 	FileMetadata,
@@ -29,6 +33,23 @@ function metadata(
 		syncedAt: 1,
 		deleted: options?.deleted,
 		changedRevision: options?.changedRevision,
+	};
+}
+
+function folderRenameEvent(
+	id: string,
+	path: string,
+	targetPath: string,
+): DurableFolderRenameEvent {
+	return {
+		id,
+		action: "rename",
+		path,
+		targetPath,
+		kind: "folder",
+		epoch: "epoch-a",
+		baseRevision: 12,
+		createdAt: 1,
 	};
 }
 
@@ -307,4 +328,56 @@ test("running rename keeps its successor as separate causal work", () => {
 
 	assert.equal(reduction.disposition, "running");
 	assert.deepEqual(reduction.events, [first, second]);
+});
+
+test("queued folder rename chains reduce to one final target", () => {
+	const first = folderRenameEvent("folder-a-b", "A", "B");
+	const second = folderRenameEvent("folder-b-c", "B", "C");
+	const result = reduceQueuedFolderRename([first], second, new Set());
+	assert.equal(result.disposition, "rebased");
+	assert.equal(result.events.length, 1);
+	assert.equal(result.events[0]?.path, "A");
+	assert.equal(result.events[0]?.targetPath, "C");
+});
+
+test("mechanical child rename is absorbed by its parent folder move", () => {
+	const parent = folderRenameEvent("folder-a-b", "A", "B");
+	const mechanical = renameEvent("child", "A/note.md", "B/note.md");
+	assert.equal(
+		reduceFolderChildRename(parent, mechanical).disposition,
+		"absorbed",
+	);
+});
+
+test("user child rename is rebased relative to the folder target", () => {
+	const parent = folderRenameEvent("folder-a-b", "A", "B");
+	const changed = renameEvent("child", "A/note.md", "B/renamed.md");
+	const result = reduceFolderChildRename(parent, changed);
+	assert.equal(result.disposition, "successor");
+	assert.equal(result.event?.path, "B/note.md");
+	assert.equal(result.event?.targetPath, "B/renamed.md");
+	assert.equal(result.event?.predecessorFolderEventId, parent.id);
+});
+
+test("child rename selects the deepest matching folder parent", () => {
+	const unrelated = folderRenameEvent("unrelated", "X", "Y");
+	const outer = folderRenameEvent("outer", "A", "B");
+	const inner = folderRenameEvent("inner", "A/deep", "B/deep");
+	const selection = selectFolderRenameParent(
+		[inner, unrelated, outer],
+		"A/deep/note.md",
+	);
+	assert.equal(selection.parent?.id, "inner");
+	assert.equal(selection.ambiguous, false);
+});
+
+test("equally specific unordered folder parents are ambiguous", () => {
+	const first = folderRenameEvent("first", "A", "B");
+	const second = folderRenameEvent("second", "A", "C");
+	second.createdAt = first.createdAt;
+	const selection = selectFolderRenameParent(
+		[first, second],
+		"A/note.md",
+	);
+	assert.equal(selection.ambiguous, true);
 });

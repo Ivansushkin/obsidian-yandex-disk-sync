@@ -45,12 +45,14 @@ test("confirmed baseline retains canonical causal metadata", () => {
 		changedRevision: 8,
 		baseRevision: 7,
 		lastModifiedBy: "device-b",
+		mutationSeq: 11,
 	};
 	const baseline = createConfirmedBaseline(local, remote, canonical);
 
 	assert.equal(baseline.changedRevision, 8);
 	assert.equal(baseline.baseRevision, 7);
 	assert.equal(baseline.lastModifiedBy, "device-b");
+	assert.equal(baseline.mutationSeq, 11);
 });
 
 test("encryption rewrite changes fingerprints without changing causal revision", () => {

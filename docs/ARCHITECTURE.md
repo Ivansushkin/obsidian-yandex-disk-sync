@@ -115,7 +115,7 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 
 ```typescript
 interface SyncIndex {
-	version: 3;
+	version: 4;
 	epoch: string; // Generation, replaced only by explicit Force sync
 	revision: number; // Общая причинная ревизия
 	lastSyncTime: number; // Время последней синхронизации
@@ -145,6 +145,8 @@ interface FileMetadata {
 	deletedAt?: number; // Время удаления
 	changedRevision?: number;
 	baseRevision?: number;
+	lastModifiedBy?: string;
+	mutationSeq?: number;
 }
 ```
 
@@ -197,8 +199,24 @@ Manifest и canonical читаются единым stable raw-примитив�
 с ограниченной параллельностью папок. Перед записью manifest проверяется по
 session token; для строгого no-op финальный запрос не выполняется.
 
-Индекс v1/v2 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.1.1 и явно выполнить Force sync.
+Индекс v1-v3 не мигрируется обычной синхронизацией: пользователь должен
+обновить все устройства до 2.0.0-beta.2 и один раз выполнить Force sync на
+авторитетном устройстве. Index v4 хранит `mutationSeq` в file metadata,
+folder tombstones и moves. Folder move фиксирует logical intent одной revision,
+а физически выполняется как ограниченная пачка guarded file moves; folder-level
+move API не используется.
+Перед использованием current v4 проходит строгую runtime-валидацию всех
+records, путей, числовых полей, mutation watermarks, moves, tombstones и
+maintenance. Семантически неверный v4 не запускает codec fallback и блокирует
+normal sync без удалённых записей.
+
+Full reconciliation классифицирует каждую операцию как новую локальную
+mutation, применение canonical state либо physical repair. Новый logical
+delete всегда резервирует FIFO sequence до canonical commit. Уже принятый
+tombstone применяется физически без изменения `lastModifiedBy` и
+`mutationSeq`. Для совместимости с предрелизным v4 запись без sequence может
+участвовать в destructive folder operation только при точном совпадении с
+подтверждённым baseline устройства.
 Force создаёт новый `epoch` только на авторитетном устройстве. Остальные
 обновлённые устройства принимают этот epoch обычной full sync: до успеха они
 сохраняют прежний baseline, сравнивают с ним текущий filesystem и новый

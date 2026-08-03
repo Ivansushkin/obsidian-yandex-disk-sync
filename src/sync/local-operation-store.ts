@@ -17,6 +17,7 @@ interface MutationOptions {
 
 interface PhysicalActionOptions {
 	targetPath?: string;
+	parentMutationId?: string;
 	canonicalRevision?: number;
 	expectedFingerprint?: string;
 	expectedChangedRevision?: number;
@@ -365,8 +366,10 @@ export class LocalOperationStore {
 			existing.expectedTargetFingerprint =
 				options?.expectedTargetFingerprint ??
 				existing.expectedTargetFingerprint;
-			existing.baselineSha256 =
+			 existing.baselineSha256 =
 				options?.baselineSha256 ?? existing.baselineSha256;
+			existing.parentMutationId =
+				options?.parentMutationId ?? existing.parentMutationId;
 			logger.debug("Physical action refreshed", {
 				actionId: existing.id,
 				actionType: existing.type,
@@ -380,6 +383,7 @@ export class LocalOperationStore {
 				),
 				path: existing.path,
 				targetPath: existing.targetPath,
+				parentMutationId: existing.parentMutationId,
 			});
 			return existing;
 		}
@@ -392,6 +396,7 @@ export class LocalOperationStore {
 			origin: options?.origin ?? "exact-delete",
 			path,
 			targetPath: options?.targetPath,
+			parentMutationId: options?.parentMutationId,
 			canonicalRevision:
 				options?.canonicalRevision ?? defaultCanonicalRevision,
 			expectedFingerprint: options?.expectedFingerprint,
@@ -413,6 +418,7 @@ export class LocalOperationStore {
 			),
 			path: action.path,
 			targetPath: action.targetPath,
+			parentMutationId: action.parentMutationId,
 		});
 		return action;
 	}

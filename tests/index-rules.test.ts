@@ -3,6 +3,7 @@ import test from "node:test";
 import type { FileMetadata, FolderTombstone } from "../src/types";
 import {
 	classifyIndexVersion,
+	canApplyDestructiveFolderMutation,
 	collectFolderDeleteTargets,
 	findFolderTombstone,
 	isPathInsideFolder,
@@ -20,6 +21,8 @@ function file(
 		deleted?: boolean;
 		changedRevision?: number;
 		deletedByFolder?: string;
+		lastModifiedBy?: string;
+		mutationSeq?: number;
 	},
 ): FileMetadata {
 	return {
@@ -31,6 +34,8 @@ function file(
 		deleted: options?.deleted,
 		changedRevision: options?.changedRevision,
 		deletedByFolder: options?.deletedByFolder,
+		lastModifiedBy: options?.lastModifiedBy,
+		mutationSeq: options?.mutationSeq,
 	};
 }
 
@@ -112,11 +117,23 @@ test("folder delete targets deep descendants without matching siblings", () => {
 	assert.equal(targets.historicalTombstonesSkipped, 1);
 });
 
-test("v1 and v2 are legacy while v3 is current", () => {
+test("folder delete target planning handles ten thousand descendants", () => {
+	const files: Record<string, FileMetadata> = {};
+	for (let index = 0; index < 10_000; index++) {
+		files[`folder/deep/${index}.md`] = file(`folder/deep/${index}.md`);
+		files[`sibling/${index}.md`] = file(`sibling/${index}.md`);
+	}
+	const targets = collectFolderDeleteTargets(files, "folder");
+	assert.equal(targets.livePaths.length, 10_000);
+	assert.equal(targets.knownDescendants, 10_000);
+});
+
+test("v1 through v3 are legacy while v4 is current", () => {
 	assert.equal(classifyIndexVersion(1), "legacy");
 	assert.equal(classifyIndexVersion(2), "legacy");
-	assert.equal(classifyIndexVersion(3), "current");
-	assert.equal(classifyIndexVersion(4), "unsupported");
+	assert.equal(classifyIndexVersion(3), "legacy");
+	assert.equal(classifyIndexVersion(4), "current");
+	assert.equal(classifyIndexVersion(5), "unsupported");
 });
 
 test("newest containing folder tombstone is selected", () => {
@@ -259,17 +276,99 @@ test("child created after folder baseline is preserved", () => {
 	);
 });
 
+test("same-device predecessor is deleted despite a newer canonical revision", () => {
+	const current = file("folder/note.md", {
+		changedRevision: 20,
+		lastModifiedBy: "device-a",
+		mutationSeq: 3,
+	});
+	const incoming = file("folder/note.md", {
+		deleted: true,
+		deletedByFolder: "folder",
+		lastModifiedBy: "device-a",
+		mutationSeq: 4,
+	});
+	assert.equal(shouldApplyFileMutation(current, incoming, 12), true);
+	assert.equal(
+		shouldPreserveConcurrentFolderChild(current, 12, "device-a", 4),
+		false,
+	);
+});
+
+test("foreign newer and unsequenced children are never destructively inferred", () => {
+	const foreign = file("folder/foreign.md", {
+		changedRevision: 20,
+		lastModifiedBy: "device-b",
+		mutationSeq: 1,
+	});
+	const unknown = file("folder/unknown.md", {
+		changedRevision: 20,
+		lastModifiedBy: "device-a",
+	});
+	assert.equal(
+		shouldPreserveConcurrentFolderChild(foreign, 12, "device-a", 4),
+		true,
+	);
+	assert.equal(
+		shouldPreserveConcurrentFolderChild(unknown, 12, "device-a", 4),
+		true,
+	);
+});
+
+test("unsequenced prerelease v4 child requires an exact observed baseline", () => {
+	const current = file("folder/note.md", {
+		changedRevision: 7,
+		lastModifiedBy: "device-a",
+	});
+	assert.equal(
+		canApplyDestructiveFolderMutation(
+			current,
+			{ ...current },
+			7,
+			"device-a",
+			4,
+		),
+		true,
+	);
+	assert.equal(
+		canApplyDestructiveFolderMutation(
+			current,
+			{ ...current, sha256: "different" },
+			7,
+			"device-a",
+			4,
+		),
+		false,
+	);
+	assert.equal(
+		canApplyDestructiveFolderMutation(
+			current,
+			undefined,
+			7,
+			"device-a",
+			4,
+		),
+		false,
+	);
+});
+
 test("accepted merge stamps base and changed revisions", () => {
 	const merged = mergeFileMutation(
 		file("note.md", { changedRevision: 4 }),
-		{ ...file("note.md"), sha256: "new" },
+		{
+			...file("note.md"),
+			sha256: "new",
+			lastModifiedBy: "device-a",
+			mutationSeq: 9,
+		},
 		4,
 		5,
 		"device-b",
 	);
 	assert.equal(merged?.baseRevision, 4);
 	assert.equal(merged?.changedRevision, 5);
-	assert.equal(merged?.lastModifiedBy, "device-b");
+	assert.equal(merged?.lastModifiedBy, "device-a");
+	assert.equal(merged?.mutationSeq, 9);
 });
 
 test("deletion always replaces a concurrent present state", () => {

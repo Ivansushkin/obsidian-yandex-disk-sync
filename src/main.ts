@@ -758,6 +758,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			[
 				"legacy-index",
 				"unreadable-index",
+				"invalid-index",
 				"ambiguous-index-lock",
 				"remote-maintenance",
 				"encryption-blocked",
@@ -772,6 +773,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const noticeKey = {
 			"legacy-index": "notice.legacy_index_blocked",
 			"unreadable-index": "notice.unreadable_index_blocked",
+			"invalid-index": "notice.invalid_index_blocked",
 			"ambiguous-index-lock": "notice.ambiguous_index_blocked",
 			"remote-maintenance": "notice.encryption_remote_busy",
 			"encryption-blocked": null,

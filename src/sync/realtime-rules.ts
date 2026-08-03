@@ -3,6 +3,8 @@ import type { FileMetadata, IndexMove, PendingMutation } from "../types";
 export interface WatcherCausalContext {
 	epoch: string | null;
 	baseRevision: number | null;
+	mutationId?: string;
+	mutationSeq?: number;
 }
 
 export interface RealtimeFileEvent extends WatcherCausalContext {
@@ -73,6 +75,169 @@ export interface DurableFileRenameEvent extends WatcherCausalContext {
 	createdAt: number;
 	/** Submitted upload whose accepted state must be observed before this rename. */
 	predecessorUploadId?: string;
+	/** Folder move that rebased this user-authored child rename. */
+	predecessorFolderEventId?: string;
+	/** Multiple equally specific folder events could not be ordered causally. */
+	folderParentAmbiguous?: boolean;
+}
+
+interface DurableFolderEventBase extends WatcherCausalContext {
+	id: string;
+	path: string;
+	createdAt: number;
+	mutationId?: string;
+	mutationSeq?: number;
+	predecessorFolderEventId?: string;
+}
+
+export interface DurableFolderDeleteEvent extends DurableFolderEventBase {
+	action: "delete-folder";
+}
+
+export interface DurableFolderRenameEvent extends DurableFolderEventBase {
+	action: "rename";
+	targetPath: string;
+	kind: "folder";
+}
+
+export type DurableFolderEvent =
+	| DurableFolderDeleteEvent
+	| DurableFolderRenameEvent;
+
+export interface FolderMutationOutcome {
+	status: "completed" | "superseded" | "retry";
+	canonicalRevision: number | null;
+	epoch: string | null;
+	mutationId?: string;
+	mutationSeq?: number;
+	reason?: string;
+	conflicts?: number;
+	survivors?: number;
+	unresolved?: number;
+	requiresUserAction?: boolean;
+}
+
+export interface FolderRenameReduction {
+	events: DurableFolderRenameEvent[];
+	disposition: "queued" | "rebased" | "running";
+	predecessorId?: string;
+}
+
+/**
+ * Map a descendant path through a folder rename while preserving its suffix.
+ */
+export function mapPathThroughFolderRename(
+	path: string,
+	fromFolder: string,
+	toFolder: string,
+): string | null {
+	const from = fromFolder.replace(/\/+$/, "");
+	const to = toFolder.replace(/\/+$/, "");
+	if (!path.startsWith(`${from}/`)) return null;
+	return `${to}/${path.slice(from.length + 1)}`;
+}
+
+/**
+ * Coalesce queued folder rename chains without rewriting a running parent.
+ */
+export function reduceQueuedFolderRename(
+	existing: DurableFolderRenameEvent[],
+	incoming: DurableFolderRenameEvent,
+	runningIds: ReadonlySet<string>,
+): FolderRenameReduction {
+	const predecessorIndex = existing.findIndex(
+		(event) =>
+			event.action === "rename" &&
+			event.targetPath === incoming.path,
+	);
+	if (predecessorIndex < 0) {
+		return { events: [...existing, incoming], disposition: "queued" };
+	}
+	const predecessor = existing[predecessorIndex]!;
+	if (runningIds.has(predecessor.id)) {
+		return {
+			events: [...existing, incoming],
+			disposition: "running",
+			predecessorId: predecessor.id,
+		};
+	}
+	const reduced = [...existing];
+	reduced[predecessorIndex] = {
+		...predecessor,
+		targetPath: incoming.targetPath,
+	};
+	return {
+		events: reduced,
+		disposition: "rebased",
+		predecessorId: predecessor.id,
+	};
+}
+
+/**
+ * Classify an Obsidian child rename emitted by a queued folder rename.
+ */
+export function reduceFolderChildRename(
+	parent: DurableFolderRenameEvent,
+	child: DurableFileRenameEvent,
+): { disposition: "absorbed" | "successor" | "unrelated"; event?: DurableFileRenameEvent } {
+	const mechanicalTarget = mapPathThroughFolderRename(
+		child.path,
+		parent.path,
+		parent.targetPath,
+	);
+	if (!mechanicalTarget) return { disposition: "unrelated" };
+	if (mechanicalTarget === child.targetPath) {
+		return { disposition: "absorbed" };
+	}
+	return {
+		disposition: "successor",
+		event: {
+			...child,
+			path: mechanicalTarget,
+			predecessorFolderEventId: parent.id,
+		},
+	};
+}
+
+export interface FolderRenameParentSelection {
+	parent?: DurableFolderRenameEvent;
+	ambiguous: boolean;
+}
+
+/**
+ * Select the most specific causal folder rename for a child path. Equal-depth
+ * events are ordered by creation time and must form an explicit chain.
+ */
+export function selectFolderRenameParent(
+	parents: readonly DurableFolderRenameEvent[],
+	childPath: string,
+): FolderRenameParentSelection {
+	const applicable = parents
+		.map((parent, order) => ({
+			parent,
+			order,
+			depth: parent.path.replace(/\/+$/, "").split("/").length,
+		}))
+		.filter(({ parent }) =>
+			childPath.startsWith(`${parent.path.replace(/\/+$/, "")}/`),
+		)
+		.sort(
+			(left, right) =>
+				right.depth - left.depth ||
+				right.parent.createdAt - left.parent.createdAt ||
+				right.order - left.order,
+		);
+	const selected = applicable[0];
+	if (!selected) return { ambiguous: false };
+	const competing = applicable[1];
+	return {
+		parent: selected.parent,
+		ambiguous:
+			competing !== undefined &&
+			competing.depth === selected.depth &&
+			selected.parent.predecessorFolderEventId !== competing.parent.id &&
+			competing.parent.targetPath !== selected.parent.path,
+	};
 }
 
 export interface RenameChainReduction {
@@ -133,11 +298,16 @@ export function wasRenameSourceCausallyLive(
 	localBaseline: FileMetadata | undefined,
 	canonicalSource: FileMetadata | undefined,
 	baseRevision: number | null,
+	deviceId?: string,
 ): boolean {
 	if (!localBaseline || localBaseline.deleted) return false;
 	if (!canonicalSource || canonicalSource.deleted) return false;
 	if (baseRevision === null) return false;
-	return (canonicalSource.changedRevision ?? 0) <= baseRevision;
+	return (
+		(canonicalSource.changedRevision ?? 0) <= baseRevision ||
+		(canonicalSource.lastModifiedBy === deviceId &&
+			typeof canonicalSource.mutationSeq === "number")
+	);
 }
 
 /**

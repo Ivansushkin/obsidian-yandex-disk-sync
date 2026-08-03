@@ -41,7 +41,7 @@
 
 ## Synchronization architecture
 
-- The remote source of truth is one canonical `.obsidian-sync-index.json` v3
+- The remote source of truth is one canonical `.obsidian-sync-index.json` v4
   containing `epoch`, `revision`, file states, folder tombstones, pending moves,
   and `appliedMutationSeq`.
 - Canonical commits use an exclusive move to a unique lock and back. Never
@@ -76,7 +76,7 @@
 
 ## Encryption
 
-- The remote manifest remains v2; the canonical index remains v3.
+- The remote manifest remains v2; the canonical index is v4.
 - Canonical, lock, and manifest names are raw. Canonical content and user paths
   use the active codec; the manifest is always raw.
 - Enable, disable, rotate, and post-commit recovery use the existing
@@ -91,9 +91,9 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of 1.1/1.2 and 2.0 is unsupported. Legacy index v1/v2 blocks
+- Concurrent use of older builds and 2.0.0-beta.2 is unsupported. Legacy index v1-v3 blocks
   normal sync until explicit Force sync with backup.
-- Do not change index v3, manifest v2, epoch/revision, mutation FIFO, or the
+- Do not change index v4, manifest v2, epoch/revision, mutation FIFO, or the
   persisted physical-action schema without a separate migration design,
   scenarios, and tests.
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,

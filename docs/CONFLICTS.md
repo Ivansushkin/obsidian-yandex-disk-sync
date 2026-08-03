@@ -44,6 +44,9 @@ Delete, rename и folder events этого набора завершаются �
 Точечное delete против edit → delete, локальный edit сохранить в backup
 Folder tombstone против нового/изменённого потомка → потомок выживает
 Folder tombstone против неизменённого потомка → потомок удаляется
+Folder move против target с тем же SHA → target считается уже materialized
+Folder move против target с другим SHA → вся операция блокируется до решения
+пользователя; частичный move, tombstone и physical cleanup не выполняются
 Нет локального baseline на первой синхронизации → локальный файл новый;
 разный remote-файл с тем же путём создаёт conflict copy
 ```
@@ -54,6 +57,8 @@ Folder tombstone против неизменённого потомка → по
 - **Индекс до удаления:** tombstone подтверждается до физического DELETE
 - **Mutation ID:** локальная операция удаляется из FIFO только после её
   подтверждения в canonical index
+- **Folder parent:** child rename связывается только с содержащим source-prefix;
+  при вложенности выбирается самый глубокий причинный folder event
 - **Index lock:** один индекс временно переименовывается для атомарной записи
 
 ## Конфигурация

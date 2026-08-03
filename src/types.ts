@@ -287,6 +287,8 @@ export interface FileMetadata {
 	deletedByFolder?: string;
 	/** Device ID that last modified the file */
 	lastModifiedBy?: string;
+	/** Device-local mutation sequence that produced this logical state */
+	mutationSeq?: number;
 	/** Remote index revision that last changed this entry */
 	changedRevision?: number;
 	/** Revision visible to the device when this change was created */
@@ -304,6 +306,8 @@ export interface FolderTombstone {
 	baseRevision: number;
 	/** Device that created the deletion */
 	lastModifiedBy: string;
+	/** Device-local mutation sequence that created the deletion */
+	mutationSeq?: number;
 }
 
 export interface IndexMove {
@@ -323,6 +327,8 @@ export interface IndexMove {
 	pending: boolean;
 	/** Device that created the move */
 	lastModifiedBy: string;
+	/** Device-local mutation sequence shared by all children of this move */
+	mutationSeq?: number;
 }
 
 export type PendingMutationType =
@@ -387,6 +393,8 @@ export interface PendingPhysicalAction {
 	path: string;
 	/** Destination logical path for move operations */
 	targetPath?: string;
+	/** Parent logical mutation for a multi-file folder operation */
+	parentMutationId?: string;
 	/** Canonical revision that authorized this action */
 	canonicalRevision: number;
 	/** Server fingerprint required by guarded cleanup */
@@ -401,7 +409,7 @@ export interface PendingPhysicalAction {
 	createdAt: number;
 }
 
-export const CURRENT_INDEX_VERSION = 3;
+export const CURRENT_INDEX_VERSION = 4;
 
 export function createSyncEpoch(): string {
 	const uuid = globalThis.crypto?.randomUUID?.();
@@ -517,6 +525,11 @@ export type SyncAction =
 	| "conflict"
 	| "none";
 
+export type SyncCausalOrigin =
+	| "new-local-operation"
+	| "apply-canonical"
+	| "physical-repair";
+
 export interface SyncOperation {
 	/** Operation type */
 	action: SyncAction;
@@ -530,6 +543,8 @@ export interface SyncOperation {
 	remoteMeta?: FileMetadata;
 	/** Folder tombstone responsible for a derived deletion */
 	folderTombstonePath?: string;
+	/** Causal source used to decide whether canonical metadata may be changed. */
+	causalOrigin?: SyncCausalOrigin;
 }
 
 export interface SyncResult {

@@ -12,9 +12,14 @@ import type { SyncResult, YandexDiskSyncSettings } from "../types";
 import { logger } from "../utils/logger";
 import {
 	reduceQueuedFileRename,
+	reduceQueuedFolderRename,
+	reduceFolderChildRename,
+	selectFolderRenameParent,
 	shouldRetainQueuedFileEvent,
 	type DurableFileRenameEvent,
 	type FileRenameOutcome,
+	type FolderMutationOutcome,
+	type DurableFolderRenameEvent,
 	type RealtimeBatchResult,
 	type RealtimeFileEvent,
 	type UploadCausalReceipt,
@@ -30,6 +35,9 @@ export type DeferredWatcherEvent =
 		epoch?: string | null;
 		baseRevision?: number | null;
 		createdAt?: number;
+		mutationId?: string;
+		mutationSeq?: number;
+		predecessorFolderEventId?: string;
 	  }
 	| {
 		action: "rename";
@@ -41,6 +49,10 @@ export type DeferredWatcherEvent =
 		baseRevision?: number | null;
 		createdAt?: number;
 		predecessorUploadId?: string;
+		mutationId?: string;
+		mutationSeq?: number;
+		predecessorFolderEventId?: string;
+		folderParentAmbiguous?: boolean;
 	  };
 
 export class FileWatcher {
@@ -313,6 +325,13 @@ export class FileWatcher {
 				event.epoch = context.epoch;
 				event.baseRevision = context.baseRevision;
 				if (event.action === "upload") {
+					event.mutationId = undefined;
+					event.mutationSeq = undefined;
+				}
+				if (
+					event.action === "delete-folder" ||
+					(event.action === "rename" && event.kind === "folder")
+				) {
 					event.mutationId = undefined;
 					event.mutationSeq = undefined;
 				}
@@ -754,7 +773,99 @@ export class FileWatcher {
 	): boolean {
 		event = this.normalizeEvent(event);
 		const before = this.deferredEvents.length;
+		if (event.action === "rename" && event.kind === "folder") {
+			let absorbedChildren = 0;
+			this.deferredEvents = this.deferredEvents.flatMap((candidate) => {
+				if (!this.isDurableFileRename(candidate)) return [candidate];
+				const reduction = reduceFolderChildRename(
+					event as DurableFolderRenameEvent,
+					candidate,
+				);
+				if (reduction.disposition === "absorbed") {
+					absorbedChildren++;
+					return [];
+				}
+				return reduction.event ? [reduction.event] : [candidate];
+			});
+			const queuedFolders = this.deferredEvents.filter(
+				(candidate): candidate is DurableFolderRenameEvent =>
+					this.isDurableFolderRename(candidate),
+			);
+			const reduction = reduceQueuedFolderRename(
+				queuedFolders,
+				event as DurableFolderRenameEvent,
+				this.submittedWatcherEventIds,
+			);
+			if (reduction.disposition === "rebased") {
+				const predecessor = reduction.events.find(
+					(candidate) => candidate.id === reduction.predecessorId,
+				);
+				const index = this.deferredEvents.findIndex(
+					(candidate) => this.getEventId(candidate) === reduction.predecessorId,
+				);
+				if (predecessor && index >= 0) {
+					this.deferredEvents[index] = predecessor;
+					this.persistDeferredEvents();
+					logger.info("Watcher folder rename chain rebased", {
+						eventId: predecessor.id,
+						oldPath: predecessor.path,
+						targetPath: predecessor.targetPath,
+						absorbedChildren,
+					});
+					return true;
+				}
+			} else if (reduction.disposition === "running") {
+				event.predecessorFolderEventId = reduction.predecessorId;
+				logger.info("Folder rename successor queued behind running parent", {
+					eventId: event.id,
+					predecessorId: reduction.predecessorId,
+					oldPath: event.path,
+					targetPath: event.targetPath,
+				});
+			}
+			if (absorbedChildren > 0) {
+				logger.info("Folder move absorbed mechanical child renames", {
+					eventId: event.id,
+					oldPath: event.path,
+					targetPath: event.targetPath,
+					absorbedChildren,
+				});
+			}
+		}
 		if (event.action === "rename" && event.kind === "file") {
+			const selection = selectFolderRenameParent(
+				this.deferredEvents.filter(
+					(candidate): candidate is DurableFolderRenameEvent =>
+						this.isDurableFolderRename(candidate),
+				),
+				event.path,
+			);
+			const parent = selection.parent;
+			if (selection.ambiguous) {
+				event.folderParentAmbiguous = true;
+				logger.warn("Child rename has ambiguous folder parent", {
+					eventId: event.id,
+					oldPath: event.path,
+					targetPath: event.targetPath,
+					parentEventId: parent?.id,
+				});
+			}
+			if (parent) {
+				const childReduction = reduceFolderChildRename(
+					parent,
+					event as DurableFileRenameEvent,
+				);
+				if (childReduction.disposition === "absorbed") {
+					logger.info("Mechanical child rename absorbed by folder move", {
+						eventId: event.id,
+						parentEventId: parent.id,
+						oldPath: event.path,
+						targetPath: event.targetPath,
+					});
+					return false;
+				}
+				if (childReduction.event) event = childReduction.event;
+			}
 			const queuedRenames = this.deferredEvents.filter(
 				(candidate): candidate is DurableFileRenameEvent =>
 					this.isDurableFileRename(candidate),
@@ -842,9 +953,16 @@ export class FileWatcher {
 		}
 		if (event.action === "delete-folder") {
 			const prefix = `${event.path.replace(/\/+$/, "")}/`;
+			const beforeFolderReduction = this.deferredEvents.length;
 			this.deferredEvents = this.deferredEvents.filter(
 				(existing) => !existing.path.startsWith(prefix),
 			);
+			logger.info("Folder delete absorbed earlier descendant events", {
+				eventId: event.id,
+				path: event.path,
+				absorbedDescendantEvents:
+					beforeFolderReduction - this.deferredEvents.length,
+			});
 		}
 		if (event.action === "upload" || event.action === "delete") {
 			const submittedIds = new Set(
@@ -999,18 +1117,35 @@ export class FileWatcher {
 				if (!(await flushFileBatch())) break;
 				if (event.action === "rename") {
 					if (event.kind === "folder") {
-						let settled = false;
-						await this.syncEngine.renameFolder(
-							event.path,
-							event.targetPath,
-							async () => {
-								settled = true;
-								this.acknowledgeLegacyEvent(event);
-								await this.waitForPersistence();
-							},
-						);
-						if (!settled) this.acknowledgeLegacyEvent(event);
+						if (event.id) this.submittedWatcherEventIds.add(event.id);
+						try {
+							const outcome = await this.syncEngine.renameFolder(
+								event.path,
+								event.targetPath,
+								this.getEventContext(event),
+								async (prepared) => {
+									event.mutationId = prepared.mutationId;
+									event.mutationSeq = prepared.mutationSeq;
+									this.persistDeferredEvents();
+									await this.waitForPersistence();
+								},
+							);
+							await this.settleFolderEvent(event, outcome, replayResult);
+						} finally {
+							if (event.id) this.submittedWatcherEventIds.delete(event.id);
+						}
 					} else {
+						if (event.folderParentAmbiguous) {
+							if (event.id && !replayResult.retry.includes(event.id)) {
+								replayResult.retry.push(event.id);
+							}
+							logger.warn("Ambiguous child rename remains durable", {
+								eventId: event.id,
+								oldPath: event.path,
+								targetPath: event.targetPath,
+							});
+							break;
+						}
 						if (event.id) {
 							this.submittedWatcherEventIds.add(event.id);
 						}
@@ -1054,13 +1189,17 @@ export class FileWatcher {
 						}
 					}
 				} else if (event.action === "delete-folder") {
-					let settled = false;
-					await this.syncEngine.deleteFolder(event.path, async () => {
-						settled = true;
-						this.acknowledgeLegacyEvent(event);
-						await this.waitForPersistence();
-					});
-					if (!settled) this.acknowledgeLegacyEvent(event);
+					const outcome = await this.syncEngine.deleteFolder(
+						event.path,
+						this.getEventContext(event),
+						async (prepared) => {
+							event.mutationId = prepared.mutationId;
+							event.mutationSeq = prepared.mutationSeq;
+							this.persistDeferredEvents();
+							await this.waitForPersistence();
+						},
+					);
+					await this.settleFolderEvent(event, outcome, replayResult);
 				}
 			} catch (e) {
 				const eventId = this.getEventId(event);
@@ -1409,6 +1548,61 @@ export class FileWatcher {
 		});
 	}
 
+	/** Persist a folder operation receipt before acknowledging its watcher event. */
+	private async settleFolderEvent(
+		event: DeferredWatcherEvent,
+		outcome: FolderMutationOutcome,
+		replayResult: RealtimeBatchResult,
+	): Promise<void> {
+		const id = this.getEventId(event);
+		if (!id) return;
+		if (outcome.status === "retry") {
+			if (!replayResult.retry.includes(id)) replayResult.retry.push(id);
+			logger.warn("Watcher folder event remains durable", {
+				eventId: id,
+				action: event.action,
+				path: event.path,
+				reason: outcome.reason,
+				unresolved: outcome.unresolved ?? 0,
+				requiresUserAction: outcome.requiresUserAction === true,
+			});
+			return;
+		}
+		const successors = this.deferredEvents.filter(
+			(candidate) =>
+				candidate !== event &&
+				candidate.action === "rename" &&
+				(candidate.predecessorFolderEventId === id ||
+					(candidate.kind === "folder" &&
+						candidate.path ===
+							(event.action === "rename" ? event.targetPath : ""))),
+		);
+		if (outcome.canonicalRevision !== null) {
+			for (const successor of successors) {
+				if (successor.action !== "rename") continue;
+				successor.baseRevision = outcome.canonicalRevision;
+				successor.epoch = outcome.epoch;
+				successor.predecessorFolderEventId = undefined;
+			}
+		}
+		this.acknowledgeEvents([id]);
+		if (outcome.status === "superseded") {
+			replayResult.superseded.push(id);
+		} else {
+			replayResult.completed.push(id);
+		}
+		await this.waitForPersistence();
+		logger.info("Watcher folder event settled", {
+			eventId: id,
+			action: event.action,
+			path: event.path,
+			canonicalRevision: outcome.canonicalRevision,
+			mutationSeq: outcome.mutationSeq,
+			survivors: outcome.survivors ?? 0,
+			conflicts: outcome.conflicts ?? 0,
+		});
+	}
+
 	private acknowledgeEvents(ids: string[]): void {
 		if (ids.length === 0) return;
 		const acknowledged = new Set(ids);
@@ -1421,17 +1615,11 @@ export class FileWatcher {
 		this.persistDeferredEvents();
 	}
 
-	private acknowledgeLegacyEvent(event: DeferredWatcherEvent): void {
-		const index = this.deferredEvents.indexOf(event);
-		if (index >= 0) {
-			this.deferredEvents.splice(index, 1);
-			this.persistDeferredEvents();
-		}
-	}
-
 	private getEventContext(event: {
 		epoch?: string | null;
 		baseRevision?: number | null;
+		mutationId?: string;
+		mutationSeq?: number;
 	}): WatcherCausalContext {
 		const current = this.syncEngine.getWatcherCausalContext();
 		return {
@@ -1440,6 +1628,8 @@ export class FileWatcher {
 				event.baseRevision === undefined
 					? current.baseRevision
 					: event.baseRevision,
+			mutationId: event.mutationId,
+			mutationSeq: event.mutationSeq,
 		};
 	}
 
@@ -1472,6 +1662,15 @@ export class FileWatcher {
 			event.action === "rename" && event.kind === "file"
 				? (event.predecessorUploadId ?? "")
 				: "",
+			event.action === "rename" && event.kind === "file"
+				? String(event.folderParentAmbiguous === true)
+				: "",
+			"mutationSeq" in event
+				? (event.mutationSeq?.toString() ?? "")
+				: "",
+			"predecessorFolderEventId" in event
+				? (event.predecessorFolderEventId ?? "")
+				: "",
 		].join("\u0000");
 	}
 
@@ -1481,6 +1680,19 @@ export class FileWatcher {
 		return (
 			event.action === "rename" &&
 			event.kind === "file" &&
+			typeof event.id === "string" &&
+			typeof event.createdAt === "number" &&
+			"epoch" in event &&
+			"baseRevision" in event
+		);
+	}
+
+	private isDurableFolderRename(
+		event: DeferredWatcherEvent,
+	): event is DurableFolderRenameEvent {
+		return (
+			event.action === "rename" &&
+			event.kind === "folder" &&
 			typeof event.id === "string" &&
 			typeof event.createdAt === "number" &&
 			"epoch" in event &&

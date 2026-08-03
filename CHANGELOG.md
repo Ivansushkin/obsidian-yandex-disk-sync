@@ -1,5 +1,57 @@
 # Changelog
 
+## 2.0.0-beta.2
+
+### Fixed
+
+- Child rename events now bind only to a containing folder move, preferring
+  the deepest causal parent. Ambiguous parents remain durable and block full
+  reconciliation instead of moving the wrong path.
+- Folder moves now preflight every target. A different-content target blocks
+  the whole operation before canonical or physical writes; same-content
+  targets remain safe idempotent completions.
+- Full-sync file deletions now use the same per-device FIFO mutations as
+  realtime deletion. Applying an existing tombstone preserves its original
+  device and mutation sequence.
+- Prerelease v4 entries without a mutation sequence can authorize folder
+  destruction only when an exact confirmed device baseline proves they were
+  observed.
+- Current v4 indexes now receive strict semantic validation. Invalid records,
+  paths, metadata, watermarks, moves, tombstones, or maintenance state block
+  normal sync without codec fallback or remote mutation.
+
+### Performance
+
+- Folder move and delete planning now uses path sets and maps instead of
+  repeated linear searches, preserving bounded concurrency and the two-commit
+  folder-operation limit.
+
+## 2.0.0-beta.1.2
+
+### Breaking change
+
+- Upgraded the canonical synchronization index to v4. Index v3 cannot safely
+  distinguish folder-operation predecessors from concurrent changes. Update
+  every device, restore the intended local tree on one authoritative device,
+  and run one backed-up **Force sync → Local to remote**. Other updated devices
+  adopt that epoch with a normal full sync.
+
+### Fixed
+
+- Added per-device mutation sequences to file metadata, folder tombstones, and
+  pending moves so later folder operations recognize earlier changes from the
+  same device without deleting foreign or newer descendants.
+- Made folder rename one logical mutation backed by guarded per-file moves.
+  Yandex folder moves with an unverifiable fingerprint are no longer used.
+- Coalesced folder rename chains and absorbed Obsidian's mechanical child
+  rename/delete events while preserving user edits and recreated old paths.
+- Folder delete now queues physical work only for canonical tombstones actually
+  accepted by the latest index transaction and remains durable on partial
+  failure.
+- Full sync now fails closed before scanning either tree when a pending folder
+  move or authorized destructive action cannot be resolved, preventing stale
+  paths from being downloaded or uploaded as compensating changes.
+
 ## 2.0.0-beta.1.1
 
 ### Fixed

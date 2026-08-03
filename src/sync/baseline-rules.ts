@@ -65,6 +65,7 @@ export function createConfirmedBaseline(
 		changedRevision: canonical?.changedRevision,
 		baseRevision: canonical?.baseRevision,
 		lastModifiedBy: canonical?.lastModifiedBy,
+		mutationSeq: canonical?.mutationSeq,
 		deleted: false,
 		deletedAt: undefined,
 		deletedByFolder: undefined,

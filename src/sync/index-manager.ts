@@ -49,6 +49,7 @@ import {
 	getStableContentFingerprint,
 } from "../utils/resource-fingerprint";
 import {
+	canApplyDestructiveFolderMutation,
 	classifyIndexVersion,
 	isPathInsideFolder,
 	isStableLockStale,
@@ -107,8 +108,136 @@ export interface LocalCausalSnapshot {
 }
 
 type IndexCodecAttemptResult =
-	| { data: Partial<SyncIndex> }
+	| { data: unknown }
 	| { attempt: IndexDecodeAttempt };
+
+type JsonRecord = Record<string, unknown>;
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function isOptionalNonNegativeInteger(value: unknown): boolean {
+	return value === undefined || isNonNegativeInteger(value);
+}
+
+function isOptionalString(value: unknown): boolean {
+	return value === undefined || typeof value === "string";
+}
+
+function isLogicalPath(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		!value.startsWith("/") &&
+		!value.endsWith("/") &&
+		!value.includes("\u0000") &&
+		value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..")
+	);
+}
+
+function assertIndexSection(
+	condition: boolean,
+	section: string,
+	reason: string,
+): asserts condition {
+	if (!condition) throw new InvalidCurrentIndexError(section, reason);
+}
+
+function validateEncryptionModeDescriptor(value: unknown, section: string): void {
+	assertIndexSection(isJsonRecord(value), section, "must be an object");
+	assertIndexSection(typeof value.enabled === "boolean", section, "enabled must be boolean");
+	assertIndexSection(
+		value.revision === null || isNonNegativeInteger(value.revision),
+		section,
+		"revision must be null or a non-negative integer",
+	);
+	assertIndexSection(
+		value.salt === null || typeof value.salt === "string",
+		section,
+		"salt must be null or string",
+	);
+	assertIndexSection(
+		value.verifier === null || typeof value.verifier === "string",
+		section,
+		"verifier must be null or string",
+	);
+}
+
+function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord & SyncIndex {
+	assertIndexSection(typeof data.epoch === "string" && data.epoch.length > 0, "root", "epoch is required");
+	assertIndexSection(isNonNegativeInteger(data.revision), "root", "revision must be a non-negative integer");
+	assertIndexSection(isNonNegativeInteger(data.lastSyncTime), "root", "lastSyncTime must be a non-negative integer");
+	assertIndexSection(typeof data.deviceId === "string" && data.deviceId.length > 0, "root", "deviceId is required");
+	assertIndexSection(isJsonRecord(data.files), "files", "must be an object");
+	for (const [path, raw] of Object.entries(data.files)) {
+		assertIndexSection(isLogicalPath(path), "files", "contains an invalid path key");
+		assertIndexSection(isJsonRecord(raw), "files", "metadata must be an object");
+		assertIndexSection(raw.path === path, "files", "metadata path must match its key");
+		assertIndexSection(typeof raw.sha256 === "string", "files", "sha256 must be a string");
+		assertIndexSection(isNonNegativeInteger(raw.size), "files", "size must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.mtime), "files", "mtime must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.syncedAt), "files", "syncedAt must be a non-negative integer");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.remoteMtime), "files", "remoteMtime must be a non-negative integer");
+		assertIndexSection(isOptionalString(raw.remoteFingerprint), "files", "remoteFingerprint must be a string");
+		assertIndexSection(raw.deleted === undefined || typeof raw.deleted === "boolean", "files", "deleted must be boolean");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.deletedAt), "files", "deletedAt must be a non-negative integer");
+		assertIndexSection(isOptionalString(raw.deletedByFolder), "files", "deletedByFolder must be a string");
+		assertIndexSection(isOptionalString(raw.lastModifiedBy), "files", "lastModifiedBy must be a string");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.mutationSeq), "files", "mutationSeq must be a non-negative integer");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.changedRevision), "files", "changedRevision must be a non-negative integer");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.baseRevision), "files", "baseRevision must be a non-negative integer");
+	}
+	assertIndexSection(isJsonRecord(data.folderTombstones), "folderTombstones", "must be an object");
+	for (const [path, raw] of Object.entries(data.folderTombstones)) {
+		assertIndexSection(isLogicalPath(path), "folderTombstones", "contains an invalid path key");
+		assertIndexSection(isJsonRecord(raw), "folderTombstones", "entry must be an object");
+		assertIndexSection(raw.path === path, "folderTombstones", "path must match its key");
+		assertIndexSection(isNonNegativeInteger(raw.deletedAt), "folderTombstones", "deletedAt must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.changedRevision), "folderTombstones", "changedRevision must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.baseRevision), "folderTombstones", "baseRevision must be a non-negative integer");
+		assertIndexSection(typeof raw.lastModifiedBy === "string" && raw.lastModifiedBy.length > 0, "folderTombstones", "lastModifiedBy is required");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.mutationSeq), "folderTombstones", "mutationSeq must be a non-negative integer");
+	}
+	assertIndexSection(isJsonRecord(data.moves), "moves", "must be an object");
+	for (const [id, raw] of Object.entries(data.moves)) {
+		assertIndexSection(id.length > 0 && isJsonRecord(raw), "moves", "entry must be an object");
+		assertIndexSection(raw.id === id, "moves", "id must match its key");
+		assertIndexSection(isLogicalPath(raw.fromPath), "moves", "fromPath is invalid");
+		assertIndexSection(isLogicalPath(raw.toPath), "moves", "toPath is invalid");
+		assertIndexSection(raw.kind === "file" || raw.kind === "folder", "moves", "kind is invalid");
+		assertIndexSection(isNonNegativeInteger(raw.baseRevision), "moves", "baseRevision must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.changedRevision), "moves", "changedRevision must be a non-negative integer");
+		assertIndexSection(typeof raw.pending === "boolean", "moves", "pending must be boolean");
+		assertIndexSection(typeof raw.lastModifiedBy === "string" && raw.lastModifiedBy.length > 0, "moves", "lastModifiedBy is required");
+		assertIndexSection(isOptionalNonNegativeInteger(raw.mutationSeq), "moves", "mutationSeq must be a non-negative integer");
+	}
+	assertIndexSection(isJsonRecord(data.appliedMutationSeq), "appliedMutationSeq", "must be an object");
+	for (const [deviceId, sequence] of Object.entries(data.appliedMutationSeq)) {
+		assertIndexSection(deviceId.length > 0 && isNonNegativeInteger(sequence), "appliedMutationSeq", "contains an invalid watermark");
+	}
+	if (data.maintenance === undefined) return;
+	const maintenance = data.maintenance;
+	assertIndexSection(isJsonRecord(maintenance), "maintenance", "must be an object");
+	assertIndexSection(typeof maintenance.id === "string" && maintenance.id.length > 0, "maintenance", "id is required");
+	assertIndexSection(maintenance.kind === "enable" || maintenance.kind === "disable" || maintenance.kind === "rotate", "maintenance", "kind is invalid");
+	assertIndexSection(["prepared", "files-copied", "index-committed", "stable", "cleanup"].includes(String(maintenance.phase)), "maintenance", "phase is invalid");
+	assertIndexSection(typeof maintenance.initiatedBy === "string" && maintenance.initiatedBy.length > 0, "maintenance", "initiatedBy is required");
+	assertIndexSection(isNonNegativeInteger(maintenance.sourceRevision), "maintenance", "sourceRevision must be a non-negative integer");
+	assertIndexSection(maintenance.targetRevision === null || isNonNegativeInteger(maintenance.targetRevision), "maintenance", "targetRevision must be null or a non-negative integer");
+	validateEncryptionModeDescriptor(maintenance.source, "maintenance.source");
+	validateEncryptionModeDescriptor(maintenance.target, "maintenance.target");
+	assertIndexSection(Array.isArray(maintenance.cleanup), "maintenance.cleanup", "must be an array");
+	for (const action of maintenance.cleanup) {
+		assertIndexSection(isJsonRecord(action), "maintenance.cleanup", "entry must be an object");
+		assertIndexSection(typeof action.path === "string" && action.path.length > 0, "maintenance.cleanup", "path is required");
+		assertIndexSection(typeof action.expectedFingerprint === "string" && action.expectedFingerprint.length > 0, "maintenance.cleanup", "expectedFingerprint is required");
+	}
+}
 
 export class IndexManager {
 	private yandexClient: YandexDiskClient;
@@ -264,6 +393,7 @@ export class IndexManager {
 				deletedAt: canonical.deletedAt,
 				deletedByFolder: canonical.deletedByFolder,
 				lastModifiedBy: canonical.lastModifiedBy,
+				mutationSeq: canonical.mutationSeq,
 				changedRevision: canonical.changedRevision,
 				baseRevision: canonical.baseRevision,
 			};
@@ -329,7 +459,7 @@ export class IndexManager {
 
 	/**
 	 * Convert the version 1.1 local index into a content baseline without
-	 * claiming that any v3 epoch has already been observed.
+	 * claiming that any v4 epoch has already been observed.
 	 */
 	loadLegacyLocalIndexFromData(data: {
 		lastSyncTime?: number;
@@ -361,7 +491,7 @@ export class IndexManager {
 	}
 
 	/**
-	 * Allow one force-sync commit to replace a legacy index with v3.
+	 * Allow one force-sync commit to replace a legacy index with v4.
 	 */
 	beginForceBootstrap(replaceRemote = true): void {
 		this.allowLegacyWriteOnce = true;
@@ -443,6 +573,7 @@ export class IndexManager {
 		path: string,
 		options?: {
 			targetPath?: string;
+			parentMutationId?: string;
 			canonicalRevision?: number;
 			expectedFingerprint?: string;
 			expectedChangedRevision?: number;
@@ -537,8 +668,17 @@ export class IndexManager {
 		this.confirmAppliedMutations();
 		for (const mutation of this.getPendingMutations()) {
 			if (mutation.type === "delete-file") {
-				this.markLocalFileDeleted(mutation.path);
-				this.markRemoteFileDeleted(mutation.path);
+				this.markLocalFileDeleted(
+					mutation.path,
+					undefined,
+					mutation.seq,
+				);
+				this.markRemoteFileDeleted(
+					mutation.path,
+					undefined,
+					mutation.baseRevision ?? 0,
+					mutation.seq,
+				);
 				continue;
 			}
 			if (mutation.type === "delete-folder") {
@@ -546,6 +686,7 @@ export class IndexManager {
 					mutation.path,
 					mutation.createdAt,
 					mutation.baseRevision,
+					mutation.seq,
 				);
 				const prefix = `${mutation.path.replace(/\/+$/, "")}/`;
 				const paths = new Set([
@@ -554,11 +695,29 @@ export class IndexManager {
 				]);
 				for (const path of paths) {
 					if (!path.startsWith(prefix)) continue;
-					this.markLocalFileDeleted(path, mutation.path);
+					const current = this.remoteIndex.files[path];
+					if (
+						current &&
+						!canApplyDestructiveFolderMutation(
+							current,
+							this.localState.files[path],
+							mutation.baseRevision ?? 0,
+							this.settings.deviceId,
+							mutation.seq,
+						)
+					) {
+						continue;
+					}
+					this.markLocalFileDeleted(
+						path,
+						mutation.path,
+						mutation.seq,
+					);
 					this.markRemoteFileDeleted(
 						path,
 						mutation.path,
 						mutation.baseRevision ?? 0,
+						mutation.seq,
 					);
 				}
 				continue;
@@ -724,6 +883,17 @@ export class IndexManager {
 			);
 		}
 		return await this.downloadIndex(path, false);
+	}
+
+	/**
+	 * Refresh the reducer baseline from the current canonical file before a new
+	 * realtime mutation is staged. Call only while the sync coordinator is held.
+	 */
+	async refreshCanonicalForMutation(): Promise<SyncIndex> {
+		const canonical = await this.readCanonicalIndex();
+		this.remoteIndex = this.cloneIndex(canonical);
+		this.loadedRemoteIndex = this.cloneIndex(canonical);
+		return canonical;
 	}
 
 	/** Verify that Force did not replace the adopted generation mid-session. */
@@ -1149,14 +1319,19 @@ export class IndexManager {
 			...metadata,
 			baseRevision:
 				metadata.baseRevision ?? this.localState.observedRevision,
-			lastModifiedBy: this.settings.deviceId,
+			lastModifiedBy:
+				metadata.lastModifiedBy ?? this.settings.deviceId,
 		};
 	}
 
 	/**
 	 * Mark file as deleted in local index
 	 */
-	markLocalFileDeleted(path: string, deletedByFolder?: string): void {
+	markLocalFileDeleted(
+		path: string,
+		deletedByFolder?: string,
+		mutationSeq?: number,
+	): void {
 		const meta = this.localState.files[path];
 		if (!meta) return;
 		if (!meta.deleted) {
@@ -1167,6 +1342,7 @@ export class IndexManager {
 			meta.deletedByFolder = deletedByFolder;
 		}
 		meta.lastModifiedBy = this.settings.deviceId;
+		if (mutationSeq !== undefined) meta.mutationSeq = mutationSeq;
 	}
 
 	/**
@@ -1184,7 +1360,8 @@ export class IndexManager {
 			...metadata,
 			baseRevision:
 				metadata.baseRevision ?? this.loadedRemoteIndex.revision,
-			lastModifiedBy: this.settings.deviceId,
+			lastModifiedBy:
+				metadata.lastModifiedBy ?? this.settings.deviceId,
 		};
 	}
 
@@ -1230,6 +1407,7 @@ export class IndexManager {
 		path: string,
 		deletedByFolder?: string,
 		baseRevision = this.loadedRemoteIndex.revision,
+		mutationSeq?: number,
 	): void {
 		const meta =
 			this.remoteIndex.files[path] ||
@@ -1242,11 +1420,39 @@ export class IndexManager {
 			};
 		this.remoteIndex.files[path] = meta;
 		if (meta.deleted) return;
+		if (mutationSeq === undefined) {
+			throw new Error(
+				`A live canonical entry cannot be deleted without a mutation sequence: ${path}`,
+			);
+		}
 		meta.deleted = true;
 		meta.deletedAt = Date.now();
 		meta.deletedByFolder = deletedByFolder;
 		meta.baseRevision = baseRevision;
 		meta.lastModifiedBy = this.settings.deviceId;
+		meta.mutationSeq = mutationSeq;
+	}
+
+	/** Apply an existing canonical folder tombstone without changing its author. */
+	markRemoteFileDeletedByCanonicalFolder(
+		path: string,
+		folderPath: string,
+	): void {
+		const tombstone = this.remoteIndex.folderTombstones[folderPath];
+		if (!tombstone) {
+			throw new Error(`Canonical folder tombstone is missing: ${folderPath}`);
+		}
+		const meta = this.remoteIndex.files[path] ?? this.localState.files[path];
+		if (!meta || meta.deleted) return;
+		this.remoteIndex.files[path] = {
+			...meta,
+			deleted: true,
+			deletedAt: tombstone.deletedAt,
+			deletedByFolder: folderPath,
+			baseRevision: tombstone.baseRevision,
+			lastModifiedBy: tombstone.lastModifiedBy,
+			mutationSeq: tombstone.mutationSeq,
+		};
 	}
 
 	/**
@@ -1256,6 +1462,7 @@ export class IndexManager {
 		path: string,
 		deletedAt = Date.now(),
 		baseRevision: number | null = this.loadedRemoteIndex.revision,
+		mutationSeq?: number,
 	): void {
 		const normalized = path.replace(/\/+$/, "");
 		const tombstone: FolderTombstone = {
@@ -1264,6 +1471,7 @@ export class IndexManager {
 			changedRevision: this.remoteIndex.revision,
 			baseRevision: baseRevision ?? 0,
 			lastModifiedBy: this.settings.deviceId,
+			mutationSeq,
 		};
 		this.remoteIndex.folderTombstones[normalized] = tombstone;
 		this.localState.folderTombstones[normalized] = { ...tombstone };
@@ -1279,6 +1487,7 @@ export class IndexManager {
 		toPath: string,
 		kind: "file" | "folder",
 		baseRevision = this.loadedRemoteIndex.revision,
+		mutationSeq?: number,
 	): void {
 		this.remoteIndex.moves[id] = {
 			id,
@@ -1289,6 +1498,7 @@ export class IndexManager {
 			changedRevision: this.remoteIndex.revision,
 			pending: true,
 			lastModifiedBy: this.settings.deviceId,
+			mutationSeq,
 		};
 	}
 
@@ -1658,16 +1868,19 @@ export class IndexManager {
 		}
 	}
 
-	private parseIndexJson(content: ArrayBuffer): Partial<SyncIndex> {
+	private parseIndexJson(content: ArrayBuffer): unknown {
 		return JSON.parse(
 			new TextDecoder().decode(content),
-		) as Partial<SyncIndex>;
+		) as unknown;
 	}
 
 	private normalizeParsedIndex(
-		data: Partial<SyncIndex>,
+		data: unknown,
 		allowLegacy: boolean,
 	): SyncIndex {
+		if (!isJsonRecord(data)) {
+			throw new InvalidCurrentIndexError("root", "must be an object");
+		}
 		const versionKind = classifyIndexVersion(data.version);
 		if (versionKind !== "current") {
 			if (allowLegacy && versionKind === "legacy") {
@@ -1678,27 +1891,12 @@ export class IndexManager {
 					`Remote sync index version ${String(data.version)} is not supported by this plugin version.`,
 				);
 			}
-			throw new LegacyIndexVersionError(data.version);
+			throw new LegacyIndexVersionError(
+				typeof data.version === "number" ? data.version : undefined,
+			);
 		}
-		if (typeof data.epoch !== "string" || !data.epoch) {
-			throw new LegacyIndexVersionError(data.version);
-		}
-
-		const normalized: SyncIndex = {
-			version: CURRENT_INDEX_VERSION,
-			epoch: data.epoch,
-			revision: data.revision || 0,
-			lastSyncTime: data.lastSyncTime || 0,
-			deviceId: data.deviceId || "",
-			files: data.files || {},
-			folderTombstones: data.folderTombstones || {},
-			moves: data.moves || {},
-			appliedMutationSeq: data.appliedMutationSeq || {},
-		};
-		if (data.maintenance !== undefined) {
-			normalized.maintenance = data.maintenance;
-		}
-		return normalized;
+		validateCurrentIndexShape(data);
+		return this.cloneIndex(data);
 	}
 
 	private async createUnreadableIndexError(
@@ -1726,10 +1924,16 @@ export class IndexManager {
 		return error instanceof Error ? error.name : typeof error;
 	}
 
-	private normalizeLegacyIndex(data: Partial<SyncIndex>): SyncIndex {
-		const normalized = createEmptyIndex(data.deviceId || "");
-		normalized.lastSyncTime = data.lastSyncTime || 0;
-		normalized.files = data.files || {};
+	private normalizeLegacyIndex(data: JsonRecord): SyncIndex {
+		const normalized = createEmptyIndex(
+			typeof data.deviceId === "string" ? data.deviceId : "legacy",
+		);
+		normalized.lastSyncTime = isNonNegativeInteger(data.lastSyncTime)
+			? data.lastSyncTime
+			: 0;
+		normalized.files = isJsonRecord(data.files)
+			? (data.files as Record<string, FileMetadata>)
+			: {};
 		for (const meta of Object.values(normalized.files)) {
 			meta.changedRevision = 0;
 			meta.baseRevision = 0;
@@ -1755,16 +1959,22 @@ export class IndexManager {
 			for (const meta of Object.values(replacement.files)) {
 				meta.changedRevision = nextRevision;
 				meta.baseRevision = latest.revision;
+				meta.lastModifiedBy = this.settings.deviceId;
+				meta.mutationSeq = 0;
 			}
 			for (const tombstone of Object.values(
 				replacement.folderTombstones,
 			)) {
 				tombstone.changedRevision = nextRevision;
 				tombstone.baseRevision = latest.revision;
+				tombstone.lastModifiedBy = this.settings.deviceId;
+				tombstone.mutationSeq = 0;
 			}
 			for (const move of Object.values(replacement.moves)) {
 				move.changedRevision = nextRevision;
 				move.baseRevision = latest.revision;
+				move.lastModifiedBy = this.settings.deviceId;
+				move.mutationSeq = 0;
 			}
 			return replacement;
 		}
@@ -1808,6 +2018,17 @@ export class IndexManager {
 				merged.files[path] = physical;
 				changed = true;
 				continue;
+			}
+			const logicalChange =
+				baseline === undefined ||
+				desired.sha256 !== baseline.sha256 ||
+				desired.deleted !== baseline.deleted ||
+				desired.deletedByFolder !== baseline.deletedByFolder;
+			if (logicalChange && desired.mutationSeq === undefined) {
+				throw new InvalidCurrentIndexError(
+					"files",
+					"new logical state is missing mutationSeq",
+				);
 			}
 			const mutationBase = desired.baseRevision ?? baseRevision;
 			const next = mergeFileMutation(
@@ -1861,11 +2082,18 @@ export class IndexManager {
 			) {
 				continue;
 			}
+			if (tombstone.mutationSeq === undefined) {
+				throw new InvalidCurrentIndexError(
+					"folderTombstones",
+					"new logical state is missing mutationSeq",
+				);
+			}
 			merged.folderTombstones[path] = {
 				...tombstone,
 				baseRevision: tombstone.baseRevision ?? baseRevision,
 				changedRevision: nextRevision,
 				lastModifiedBy: this.settings.deviceId,
+				mutationSeq: tombstone.mutationSeq,
 			};
 			const mutationBase =
 				tombstone.baseRevision ?? baseRevision;
@@ -1877,6 +2105,8 @@ export class IndexManager {
 					!shouldPreserveConcurrentFolderChild(
 						current,
 						mutationBase,
+						tombstone.lastModifiedBy,
+						tombstone.mutationSeq,
 					)
 				) {
 					continue;
@@ -1893,10 +2123,17 @@ export class IndexManager {
 			if (this.sameValue(move, this.loadedRemoteIndex.moves[id])) {
 				continue;
 			}
+			if (move.mutationSeq === undefined) {
+				throw new InvalidCurrentIndexError(
+					"moves",
+					"new logical state is missing mutationSeq",
+				);
+			}
 			merged.moves[id] = {
 				...move,
 				changedRevision: nextRevision,
 				lastModifiedBy: this.settings.deviceId,
+				mutationSeq: move.mutationSeq,
 			};
 			changed = true;
 		}
@@ -2920,10 +3157,20 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.1.1. Run an explicit force sync to create index v3.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.2. Update every device and run one explicit force sync to create index v4.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;
+	}
+}
+
+export class InvalidCurrentIndexError extends Error {
+	constructor(
+		readonly section: string,
+		reason: string,
+	) {
+		super(`Remote sync index v4 is invalid in ${section}: ${reason}.`);
+		this.name = "InvalidCurrentIndexError";
 	}
 }
 

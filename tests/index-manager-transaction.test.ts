@@ -5,13 +5,16 @@ import {
 	LegacyIndexVersionError,
 	RemoteIndexRolledBackError,
 	IndexEpochMismatchError,
+	InvalidCurrentIndexError,
 	UnreadableRemoteIndexError,
 } from "../src/sync/index-manager";
 import {
 	CURRENT_INDEX_VERSION,
+	createEmptyIndex,
 	DEFAULT_SETTINGS,
 	type YandexDiskSyncSettings,
 	type YandexResource,
+	type FileMetadata,
 } from "../src/types";
 import type { EncryptionService } from "../src/crypto/encryption";
 import type { YandexDiskClient } from "../src/api/yandex-client";
@@ -300,10 +303,16 @@ async function runLegacyForceCommit(
 	const plain = encryption ? await encryption.decrypt(raw) : raw;
 	const canonical = JSON.parse(
 		new TextDecoder().decode(plain),
-	) as { version: number; epoch: string; revision: number };
+	) as {
+		version: number;
+		epoch: string;
+		revision: number;
+		files: Record<string, FileMetadata>;
+	};
 	assert.equal(canonical.version, CURRENT_INDEX_VERSION);
 	assert.equal(canonical.revision, 1);
 	assert.ok(canonical.epoch);
+	assert.equal(canonical.files["note.md"]?.mutationSeq, 0);
 	assert.equal(manager.getObservedEpoch(), canonical.epoch);
 	assert.equal(manager.getObservedRevision(), canonical.revision);
 	assert.equal(client.moveCount, 2);
@@ -314,11 +323,11 @@ async function runLegacyForceCommit(
 	return { client, manager, canonicalPath, originalRaw };
 }
 
-test("plaintext legacy Force commits and verifies canonical v3", async () => {
+test("plaintext legacy Force commits and verifies canonical v4", async () => {
 	await runLegacyForceCommit(null);
 });
 
-test("encrypted legacy Force commits and verifies canonical v3", async () => {
+test("encrypted legacy Force commits and verifies canonical v4", async () => {
 	await runLegacyForceCommit(
 		new XorEncryptionService(0xa5) as unknown as EncryptionService,
 	);
@@ -386,7 +395,7 @@ test("absent manifest token detects a newly created manifest", async () => {
 });
 
 async function createIndexManagerWithContent(
-	content: Record<string, unknown> | string,
+	content: object | string,
 	activeEncryption: EncryptionService | null,
 	storageEncryption: EncryptionService | null = activeEncryption,
 ): Promise<{
@@ -470,10 +479,9 @@ test("encrypted current index loads without plaintext fallback", async () => {
 		new XorEncryptionService(0xa5) as unknown as EncryptionService;
 	const { manager } = await createIndexManagerWithContent(
 		{
-			version: CURRENT_INDEX_VERSION,
+			...createEmptyIndex("device-current", "epoch-current"),
 			epoch: "epoch-current",
 			revision: 4,
-			files: {},
 		},
 		encryption,
 	);
@@ -485,10 +493,9 @@ test("encrypted current index loads without plaintext fallback", async () => {
 test("only full discovery may load a replacement current epoch", async () => {
 	const { manager } = await createIndexManagerWithContent(
 		{
-			version: CURRENT_INDEX_VERSION,
+			...createEmptyIndex("device-current", "epoch-b"),
 			epoch: "epoch-b",
 			revision: 4,
-			files: {},
 		},
 		null,
 	);
@@ -507,6 +514,18 @@ test("only full discovery may load a replacement current epoch", async () => {
 	assert.equal(manager.getObservedEpoch(), "epoch-a");
 });
 
+test("malformed current v4 is rejected as a semantic index error", async () => {
+	const malformed = createEmptyIndex("device-current", "epoch-current");
+	(malformed as unknown as { files: unknown }).files = [];
+	const { manager } = await createIndexManagerWithContent(malformed, null);
+	await assert.rejects(
+		manager.loadRemoteIndex(),
+		(error: unknown) =>
+			error instanceof InvalidCurrentIndexError &&
+			error.section === "files",
+	);
+});
+
 test("wrong encrypted index key is classified as unreadable", async () => {
 	const currentEncryption =
 		new RejectingEncryptionService() as unknown as EncryptionService;
@@ -514,10 +533,9 @@ test("wrong encrypted index key is classified as unreadable", async () => {
 		new XorEncryptionService(0x5a) as unknown as EncryptionService;
 	const { manager } = await createIndexManagerWithContent(
 		{
-			version: CURRENT_INDEX_VERSION,
+			...createEmptyIndex("device-current", "epoch-current"),
 			epoch: "epoch-current",
 			revision: 4,
-			files: {},
 		},
 		currentEncryption,
 		storageEncryption,
@@ -570,10 +588,9 @@ test("explicit transition codec does not fall back to plaintext", async () => {
 	const { manager, client, canonicalPath } =
 		await createIndexManagerWithContent(
 			{
-				version: CURRENT_INDEX_VERSION,
+				...createEmptyIndex("device-current", "epoch-current"),
 				epoch: "epoch-current",
 				revision: 1,
-				files: {},
 			},
 			encryption,
 			null,

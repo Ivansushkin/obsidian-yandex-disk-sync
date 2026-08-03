@@ -136,7 +136,9 @@ export class ConflictResolver {
 			}
 			if (operation.action !== "none") operations.push(operation);
 		}
-		return operations;
+		return operations.map((operation) =>
+			this.withCausalOrigin(operation, canonicalFiles[operation.path]),
+		);
 	}
 
 	private resolveConcurrentEpochChange(
@@ -632,6 +634,30 @@ export class ConflictResolver {
 			}
 		}
 
-		return operations;
+		return operations.map((operation) =>
+			this.withCausalOrigin(operation, remoteIndex[operation.path]),
+		);
+	}
+
+	/** Classify whether reconciliation creates logic or only applies known state. */
+	private withCausalOrigin(
+		operation: SyncOperation,
+		canonical: FileMetadata | undefined,
+	): SyncOperation {
+		if (
+			operation.reason.startsWith("Repairing") ||
+			operation.reason.startsWith("Resuming") ||
+			operation.reason.startsWith("Removing a physical")
+		) {
+			return { ...operation, causalOrigin: "physical-repair" };
+		}
+		if (
+			operation.folderTombstonePath !== undefined ||
+			canonical?.deleted === true ||
+			operation.action === "download"
+		) {
+			return { ...operation, causalOrigin: "apply-canonical" };
+		}
+		return { ...operation, causalOrigin: "new-local-operation" };
 	}
 }

@@ -76,9 +76,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.1.1 detected an index from an older plugin version. Update every device, create a backup, then run Force sync from local or remote.",
+			"Plugin 2.0.0-beta.2 detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
+		"notice.invalid_index_blocked":
+			"The remote sync index has an invalid v4 structure. Normal sync is blocked without changing remote data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.epoch_adopted":
 			"The new remote snapshot was accepted and local changes were merged.",
 		"notice.epoch_adopted_conflicts":
@@ -381,9 +383,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.1.1 обнаружил индекс более старой версии плагина. Обновите все устройства, создайте резервную копию и выполните принудительную синхронизацию из локального или удалённого хранилища.",
+			"Плагин 2.0.0-beta.2 обнаружил старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
+		"notice.invalid_index_blocked":
+			"Удалённый индекс синхронизации имеет недопустимую структуру v4. Обычная синхронизация заблокирована без изменения удалённых данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.epoch_adopted":
 			"Новое удалённое состояние принято, локальные изменения объединены.",
 		"notice.epoch_adopted_conflicts":

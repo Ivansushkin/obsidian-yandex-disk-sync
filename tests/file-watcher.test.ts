@@ -138,6 +138,48 @@ test("quick file rename chain coalesces to the final target", () => {
 	);
 });
 
+test("child rename ignores a newer unrelated folder event", () => {
+	const watcher = createWatcher();
+	watcher.loadDeferredEvents([]);
+	const access = watcher as unknown as FileWatcherTestAccess;
+	access.deferEvent({
+		id: "parent-a",
+		action: "rename",
+		path: "A",
+		targetPath: "B",
+		kind: "folder",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 1,
+	});
+	access.deferEvent({
+		id: "unrelated",
+		action: "rename",
+		path: "X",
+		targetPath: "Y",
+		kind: "folder",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 2,
+	});
+	const retained = access.deferEvent({
+		id: "child",
+		action: "rename",
+		path: "A/note.md",
+		targetPath: "B/note.md",
+		kind: "file",
+		epoch: "epoch-a",
+		baseRevision: 7,
+		createdAt: 3,
+	});
+
+	assert.equal(retained, false);
+	assert.deepEqual(
+		watcher.getDeferredEvents().map((event) => event.id),
+		["parent-a", "unrelated"],
+	);
+});
+
 test("new file at the old path survives a queued rename", () => {
 	const watcher = createWatcher();
 	watcher.loadDeferredEvents([]);
