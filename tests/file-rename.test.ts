@@ -121,6 +121,7 @@ class RenameIndexFake {
 	readonly local = createEmptyLocalState("device-a");
 	readonly store = new LocalOperationStore("device-a");
 	beforeSave?: () => void;
+	beforeRepairAuthorization?: () => void;
 	remoteFileScans = 0;
 
 	constructor(private readonly yandex: RenameYandexFake) {
@@ -140,6 +141,13 @@ class RenameIndexFake {
 
 	async readCanonicalIndex() {
 		return structuredClone(this.index);
+	}
+
+	async readCanonicalIndexForRepair() {
+		const index = structuredClone(this.index);
+		this.beforeRepairAuthorization?.();
+		this.beforeRepairAuthorization = undefined;
+		return index;
 	}
 
 	getPendingMutations() {
@@ -288,6 +296,12 @@ class RenameIndexFake {
 	async saveRemoteIndex() {
 		this.beforeSave?.();
 		this.index.revision++;
+		return {
+			epoch: this.index.epoch,
+			revision: this.index.revision,
+			index: structuredClone(this.index),
+			contentFingerprint: "md5:test",
+		};
 	}
 
 	beginPhysicalRewriteCommit() {}
@@ -312,6 +326,130 @@ class RenameIndexFake {
 		return result;
 	}
 }
+
+test("foreign delete after commit cancels proof-based physical repair", async () => {
+	const yandex = new RenameYandexFake();
+	const vault = new RenameVaultFake();
+	const fileContent = content("accepted");
+	const sha256 = await computeSha256(fileContent);
+	vault.files.set("note.md", fileContent);
+	const index = new RenameIndexFake(yandex);
+	index.index.files["note.md"] = {
+		path: "note.md",
+		sha256,
+		size: fileContent.byteLength,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 8,
+		lastModifiedBy: "device-a",
+		mutationSeq: 1,
+	};
+	index.index.revision = 8;
+	const proof = {
+		epoch: index.index.epoch,
+		revision: index.index.revision,
+		index: structuredClone(index.index),
+		contentFingerprint: "md5:accepted",
+	};
+	index.beforeRepairAuthorization = () => {
+		index.index.revision = 9;
+		index.index.files["note.md"] = {
+			...index.index.files["note.md"]!,
+			deleted: true,
+			changedRevision: 9,
+			lastModifiedBy: "device-b",
+			mutationSeq: 1,
+		};
+	};
+	const engine = new SyncEngine(
+		yandex as unknown as YandexDiskClient,
+		vault as unknown as VaultAdapter,
+		index as unknown as IndexManager,
+		{
+			...DEFAULT_SETTINGS,
+			deviceId: "device-a",
+			remotePath: "remote",
+		},
+	);
+
+	await (
+		engine as unknown as {
+			repairMissingAcceptedUploads(
+				items: Array<{
+					path: string;
+					snapshot: { content: ArrayBuffer; sha256: string };
+				}>,
+				commitProof: typeof proof,
+			): Promise<void>;
+		}
+	).repairMissingAcceptedUploads(
+		[{ path: "note.md", snapshot: { content: fileContent, sha256 } }],
+		proof,
+	);
+
+	assert.deepEqual(yandex.uploads, []);
+	assert.equal(yandex.resources.has("remote/note.md"), false);
+});
+
+test("encryption change blocks proof-based physical repair", async () => {
+	const yandex = new RenameYandexFake();
+	const vault = new RenameVaultFake();
+	const fileContent = content("accepted");
+	const sha256 = await computeSha256(fileContent);
+	vault.files.set("note.md", fileContent);
+	const index = new RenameIndexFake(yandex);
+	index.index.files["note.md"] = {
+		path: "note.md",
+		sha256,
+		size: fileContent.byteLength,
+		mtime: 1,
+		syncedAt: 1,
+		changedRevision: 8,
+		lastModifiedBy: "device-a",
+		mutationSeq: 1,
+	};
+	index.index.revision = 8;
+	const proof = {
+		epoch: index.index.epoch,
+		revision: index.index.revision,
+		index: structuredClone(index.index),
+		contentFingerprint: "md5:accepted",
+	};
+	const engine = new SyncEngine(
+		yandex as unknown as YandexDiskClient,
+		vault as unknown as VaultAdapter,
+		index as unknown as IndexManager,
+		{
+			...DEFAULT_SETTINGS,
+			deviceId: "device-a",
+			remotePath: "remote",
+		},
+	);
+	engine.setSyncGuardCallback(async (token) => ({
+		blockReason: token === "old-manifest" ? "manifest changed" : null,
+	}));
+
+	await assert.rejects(
+		(
+			engine as unknown as {
+				repairMissingAcceptedUploads(
+					items: Array<{
+						path: string;
+						snapshot: { content: ArrayBuffer; sha256: string };
+					}>,
+					commitProof: typeof proof,
+					validationToken: string,
+				): Promise<void>;
+			}
+		).repairMissingAcceptedUploads(
+			[{ path: "note.md", snapshot: { content: fileContent, sha256 } }],
+			proof,
+			"old-manifest",
+		),
+		/encryption state changed/i,
+	);
+	assert.deepEqual(yandex.uploads, []);
+});
 
 function content(value: string): ArrayBuffer {
 	return new TextEncoder().encode(value).buffer;

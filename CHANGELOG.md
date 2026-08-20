@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.0-beta.4
+
+### Changed
+
+- Canonical commits use SHA-256/MD5 metadata and a same-session commit proof to
+  avoid redundant index downloads. Hashless resources retain semantic
+  read-back verification.
+- Confirmed remote directories are reused across uploads. Delete, move,
+  credential, remote-path, and encryption-codec changes invalidate the cache;
+  a stale cached parent is recreated once after 404.
+- Corrective uploads re-read canonical state and revalidate encryption before
+  writing. Newer foreign state, maintenance, or a manifest change blocks them.
+- Unknown folder conflicts and exclusive upload conflicts no longer trigger
+  unsafe folder recovery.
+
 ## 2.0.0-beta.3
 
 ### Fixed

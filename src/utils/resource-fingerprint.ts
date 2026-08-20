@@ -16,6 +16,32 @@ export function getStableContentFingerprint(
 	return null;
 }
 
+/** Return whether a stable identity is backed by a server content hash. */
+export function isHashStableContentFingerprint(
+	fingerprint: string | null | undefined,
+): fingerprint is string {
+	return (
+		typeof fingerprint === "string" &&
+		(fingerprint.startsWith("sha256:") ||
+			fingerprint.startsWith("md5:"))
+	);
+}
+
+/** Match a persisted stable service identity against current metadata. */
+export function matchesStableContentFingerprint(
+	expected: string | null | undefined,
+	resource: YandexResource | null,
+): boolean {
+	if (!expected || !resource) return false;
+	if (expected.startsWith("sha256:")) {
+		return resource.sha256 === expected.slice("sha256:".length);
+	}
+	if (expected.startsWith("md5:")) {
+		return resource.md5 === expected.slice("md5:".length);
+	}
+	return getStableContentFingerprint(resource) === expected;
+}
+
 /**
  * Match the strongest content identity available in two metadata snapshots.
  */

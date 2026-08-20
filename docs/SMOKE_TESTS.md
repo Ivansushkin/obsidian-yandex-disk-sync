@@ -9,7 +9,7 @@ multi-device, Force-loop и шифрования.
 Перед прогоном:
 
 - `npm test`, lint и build уже зелёные.
-- На обоих устройствах установлена одна и та же `2.0.0-beta.3`.
+- На обоих устройствах установлена одна и та же `2.0.0-beta.4`.
 - Используются два независимых профиля Obsidian с разными device ID.
 - Используется реальный Яндекс Диск.
 - Тестовое remote-хранилище можно безопасно очищать.
@@ -85,6 +85,7 @@ multi-device, Force-loop и шифрования.
 7. Сразу запустить manual full, пока watcher ещё может работать.
 8. После завершения выполнить ещё один full.
 9. На Device 2 выполнить full.
+10. Сохранить длительность realtime-сессии и её `apiReads` из summary.
 
 Ожидание:
 
@@ -102,9 +103,16 @@ multi-device, Force-loop и шифрования.
 - Manual full не начинает скачивать старые причинные пути.
 - Device 2 получает только конечную структуру.
 - Повторный full — `0/0/0`.
+- При доступном SHA-256/MD5 лог содержит `commitVerification=hash-fast` и
+  `postCommitCanonical=proof`; без server hash допустим
+  `commitVerification=semantic-fallback`.
+- Нет повторяющихся PUT создания уже наблюдённых root/parent directories.
+- В evidence записаны длительность и `apiReads`; фиксированного порога для
+  нестабильной реальной сети у smoke-теста нет.
 
 Покрывает: `MOVE-001`, `MOVE-002`, `MOVE-016`, `MOVE-017`, `MOVE-025`,
-`SYNC-014`, `SYNC-018`, `UI-002`, `DIAG-013`, `DIAG-015`, `DIAG-016`.
+`SYNC-014`, `SYNC-018`, `PERF-009`, `UI-002`, `DIAG-013`, `DIAG-015`,
+`DIAG-016`, `DIAG-018`.
 
 ## TC-03. Непрерывный ввод без ложного конфликта
 
@@ -285,6 +293,7 @@ conflict/backup-файлы, если они мешают проверке.
 1. На Device 1 выполнить rotate encryption key.
 2. На Device 2 попробовать старый пароль — sync должна блокироваться.
 3. Ввести новый пароль и выполнить full.
+4. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
 
 ### Disable
 
@@ -297,6 +306,8 @@ conflict/backup-файлы, если они мешают проверке.
 - Неверный/старый пароль не позволяет upload, delete или cleanup.
 - Правильный пароль открывает canonical и файлы.
 - После enable/rotate/disable все logical paths и содержимое сохранены.
+- После смены codec upload использует target physical directories и не
+  полагается на folder observations предыдущего режима.
 - Старый ciphertext не скачивается как пользовательский файл.
 - Rename/move/delete в encrypted-режиме дают тот же результат, что plaintext.
 - Каждый transition использует один Notice и не сообщает ложный успех.
@@ -333,7 +344,7 @@ release-прогоном.
 Для каждого TC достаточно записывать:
 
 ```text
-Версия: 2.0.0-beta.3
+Версия: 2.0.0-beta.4
 Дата:
 Устройства:
 Режим: plaintext/encrypted

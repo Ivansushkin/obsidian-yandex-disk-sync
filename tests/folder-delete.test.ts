@@ -224,6 +224,12 @@ class FolderDeleteIndexFake {
 		for (const move of Object.values(this.index.moves)) {
 			move.changedRevision = this.index.revision;
 		}
+		return {
+			epoch: this.index.epoch,
+			revision: this.index.revision,
+			index: structuredClone(this.index),
+			contentFingerprint: "md5:test",
+		};
 	}
 
 	consumeRejectedPuts() {

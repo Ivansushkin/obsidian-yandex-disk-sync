@@ -47,6 +47,8 @@ import type { EncryptionService } from "../crypto/encryption";
 import {
 	getPhysicalResourceFingerprint,
 	getStableContentFingerprint,
+	isHashStableContentFingerprint,
+	matchesStableContentFingerprint,
 } from "../utils/resource-fingerprint";
 import {
 	canApplyDestructiveFolderMutation,
@@ -69,6 +71,7 @@ import {
 	classifyIndexMoveRecovery,
 	rollbackRawIndexSnapshot,
 	shouldRetryIndexTransaction,
+	type CanonicalCommitProof,
 	type IndexCodec,
 	type IndexFileSnapshot,
 	type IndexTransactionOutcome,
@@ -919,6 +922,52 @@ export class IndexManager {
 	}
 
 	/**
+	 * Read canonical state for post-commit repair, reusing a same-session proof
+	 * only when a stable root listing still exposes the same content hash.
+	 */
+	async readCanonicalIndexForRepair(
+		proof?: CanonicalCommitProof,
+	): Promise<SyncIndex> {
+		const discovery = await this.waitForCanonicalIndexFromStableRoot();
+		if (!discovery.path || !discovery.resource) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Canonical index is missing during physical repair",
+			);
+		}
+		const proofMatches =
+			proof !== undefined &&
+			discovery.locks.length === 0 &&
+			isHashStableContentFingerprint(proof.contentFingerprint) &&
+			matchesStableContentFingerprint(
+				proof.contentFingerprint,
+				discovery.resource,
+			);
+		if (proofMatches) {
+			logger.debug("Post-commit canonical proof reused", {
+				postCommitCanonical: "proof",
+				canonicalRevision: proof.revision,
+				canonicalFingerprint: shortenDiagnosticValue(
+					proof.contentFingerprint,
+				),
+			});
+			return this.cloneIndex(proof.index);
+		}
+		const snapshot = await this.downloadIndexSnapshot(
+			discovery.path,
+			false,
+			undefined,
+			undefined,
+			discovery.resource,
+		);
+		logger.debug("Post-commit canonical proof refreshed", {
+			postCommitCanonical: "refreshed",
+			canonicalRevision: snapshot.index.revision,
+			canonicalFingerprint: shortenDiagnosticValue(snapshot.fingerprint),
+		});
+		return snapshot.index;
+	}
+
+	/**
 	 * Refresh the reducer baseline from the current canonical file before a new
 	 * realtime mutation is staged. Call only while the sync coordinator is held.
 	 */
@@ -955,20 +1004,22 @@ export class IndexManager {
 	/**
 	 * Save remote index to Yandex Disk
 	 */
-	async saveRemoteIndex(): Promise<void> {
+	async saveRemoteIndex(): Promise<CanonicalCommitProof> {
 		const save = this.saveChain.then(() =>
 			this.saveRemoteIndexWithRetry(),
 		);
-		this.saveChain = save.catch(() => undefined);
+		this.saveChain = save.then(
+			() => undefined,
+			() => undefined,
+		);
 		return await save;
 	}
 
-	private async saveRemoteIndexWithRetry(): Promise<void> {
+	private async saveRemoteIndexWithRetry(): Promise<CanonicalCommitProof> {
 		let lastError: Error | null = null;
 		for (let attempt = 0; attempt < 4; attempt++) {
 			try {
-				await this.saveRemoteIndexLocked();
-				return;
+				return await this.saveRemoteIndexLocked();
 			} catch (e) {
 				if (
 					!(
@@ -1001,7 +1052,7 @@ export class IndexManager {
 		);
 	}
 
-	private async saveRemoteIndexLocked(): Promise<IndexTransactionOutcome> {
+	private async saveRemoteIndexLocked(): Promise<CanonicalCommitProof> {
 		const canonicalPath = this.getRemoteIndexPath();
 		const transactionId = this.createTransactionId();
 		const lockPath = joinPath(
@@ -1235,7 +1286,7 @@ export class IndexManager {
 					);
 				}
 			}
-			const canonicalSnapshot = await this.verifyCanonicalCommit(
+			const canonicalProof = await this.verifyCanonicalCommit(
 				lockPath,
 				canonicalPath,
 				merged,
@@ -1246,7 +1297,7 @@ export class IndexManager {
 				...transactionContext,
 				committedRevision: merged.revision,
 				canonicalFingerprint: shortenDiagnosticValue(
-					canonicalSnapshot.fingerprint,
+					canonicalProof.contentFingerprint,
 				),
 			});
 			await this.finalizeCommittedTransaction(merged);
@@ -1256,10 +1307,10 @@ export class IndexManager {
 				stage,
 				committedRevision: merged.revision,
 				canonicalFingerprint: shortenDiagnosticValue(
-					canonicalSnapshot.fingerprint,
+					canonicalProof.contentFingerprint,
 				),
 			});
-			return "committed";
+			return canonicalProof;
 		} catch (e) {
 			if (
 				stage === "move-attempted" &&
@@ -1272,6 +1323,12 @@ export class IndexManager {
 				))
 			) {
 				stage = "committed";
+				const canonicalProof = await this.verifyCanonicalCommit(
+					lockPath,
+					canonicalPath,
+					merged,
+					writtenFingerprint,
+				);
 				await this.finalizeCommittedTransaction(merged);
 				logger.warn(
 					"Canonical index commit was confirmed after an ambiguous response",
@@ -1283,7 +1340,7 @@ export class IndexManager {
 						error: e,
 					},
 				);
-				return "committed";
+				return canonicalProof;
 			}
 
 			const rollbackOutcome = originalSnapshot
@@ -1686,6 +1743,7 @@ export class IndexManager {
 		path: string | null;
 		resource?: YandexResource;
 		rootExists: boolean;
+		locks: YandexResource[];
 	}> {
 		const canonicalPath = this.getRemoteIndexPath();
 		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
@@ -1701,10 +1759,15 @@ export class IndexManager {
 				if (!this.replaceRemoteOnNextSave) {
 					await this.cleanupStaleOrphanLocks(locks);
 				}
-				return { path: canonicalPath, resource: canonical, rootExists };
+				return {
+					path: canonicalPath,
+					resource: canonical,
+					rootExists,
+					locks,
+				};
 			}
 			if (locks.length === 0 || this.replaceRemoteOnNextSave) {
-				return { path: null, rootExists };
+				return { path: null, rootExists, locks };
 			}
 			if (locks.length > 1) {
 				throw new AmbiguousRemoteIndexLockError(
@@ -2478,18 +2541,16 @@ export class IndexManager {
 		expected: SyncIndex,
 		serviceOverride?: EncryptionService | null,
 		codecLabel?: IndexCodec,
+		expectedResource?: YandexResource,
 	): Promise<{
 		exists: boolean;
 		readable: boolean;
 		matches: boolean;
 		snapshot: IndexFileSnapshot | null;
 	}> {
-		const resource = await this.yandexClient.getResource(
-			path,
-			1,
-			0,
-			true,
-		);
+		const resource =
+			expectedResource ??
+			(await this.yandexClient.getResource(path, 1, 0, true));
 		if (!resource) {
 			return {
 				exists: false,
@@ -2504,6 +2565,7 @@ export class IndexManager {
 				this.allowLegacyWriteOnce,
 				serviceOverride,
 				codecLabel,
+				resource,
 			);
 			return {
 				exists: true,
@@ -2551,7 +2613,7 @@ export class IndexManager {
 		});
 		if (
 			decision === "committed" &&
-			expectedFingerprint &&
+			isHashStableContentFingerprint(expectedFingerprint) &&
 			canonical.snapshot?.fingerprint !== expectedFingerprint
 		) {
 			decision = "ambiguous";
@@ -2591,26 +2653,67 @@ export class IndexManager {
 		canonicalPath: string,
 		expected: SyncIndex,
 		expectedFingerprint: string | null,
-	): Promise<IndexFileSnapshot> {
-		const [canonical, lock] = await Promise.all([
-			this.inspectExpectedIndex(
-				canonicalPath,
-				expected,
-				this.transitionIndexWriteService,
-				"target",
-			),
+	): Promise<CanonicalCommitProof> {
+		const [canonicalResource, lock] = await Promise.all([
+			this.yandexClient.getResource(canonicalPath, 1, 0, true),
 			this.yandexClient.getResource(lockPath, 1, 0, true),
 		]);
+		if (
+			canonicalResource &&
+			!lock &&
+			isHashStableContentFingerprint(expectedFingerprint) &&
+			matchesStableContentFingerprint(
+				expectedFingerprint,
+				canonicalResource,
+			)
+		) {
+			logger.debug("Canonical commit verified from content hash", {
+				commitVerification: "hash-fast",
+				canonicalRevision: expected.revision,
+				canonicalFingerprint: shortenDiagnosticValue(
+					expectedFingerprint,
+				),
+			});
+			return this.createCanonicalCommitProof(
+				expected,
+				expectedFingerprint,
+			);
+		}
+
+		const canonical = canonicalResource
+			? await this.inspectExpectedIndex(
+					canonicalPath,
+					expected,
+					this.transitionIndexWriteService,
+					"target",
+					canonicalResource,
+				)
+			: {
+					exists: false,
+					readable: false,
+					matches: false,
+					snapshot: null,
+				};
 		if (
 			canonical.exists &&
 			canonical.readable &&
 			canonical.matches &&
 			!lock &&
-			(!expectedFingerprint ||
+			(!isHashStableContentFingerprint(expectedFingerprint) ||
 				canonical.snapshot?.fingerprint === expectedFingerprint) &&
-			canonical.snapshot
+			canonical.snapshot?.fingerprint
 		) {
-			return canonical.snapshot;
+			logger.debug("Canonical commit verified semantically", {
+				commitVerification: "semantic-fallback",
+				canonicalRevision: expected.revision,
+				canonicalFingerprint: shortenDiagnosticValue(
+					canonical.snapshot.fingerprint,
+				),
+			});
+			return this.createCanonicalCommitProof(
+				expected,
+				canonical.snapshot.fingerprint,
+			);
 		}
 		if (
 			canonical.exists &&
@@ -2628,6 +2731,18 @@ export class IndexManager {
 			"Canonical index commit could not be verified",
 			"move-attempted",
 		);
+	}
+
+	private createCanonicalCommitProof(
+		index: SyncIndex,
+		contentFingerprint: string,
+	): CanonicalCommitProof {
+		return {
+			epoch: index.epoch,
+			revision: index.revision,
+			index: this.cloneIndex(index),
+			contentFingerprint,
+		};
 	}
 
 	private async isExpectedCanonicalCommitted(
@@ -3257,7 +3372,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.3. Update every device and run one explicit force sync to create index v4.`,
+			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.4. Update every device and run one explicit force sync to create index v4.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

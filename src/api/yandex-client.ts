@@ -59,6 +59,7 @@ export class YandexDiskClient {
 	 * Update token
 	 */
 	setToken(token: string): void {
+		if (this.token !== token) this.clearFolderCache();
 		this.token = token;
 	}
 
@@ -67,6 +68,7 @@ export class YandexDiskClient {
 	 * Pass null to disable encryption.
 	 */
 	setEncryptionService(service: EncryptionService | null): void {
+		if (this.encryptionService !== service) this.clearFolderCache();
 		this.encryptionService = service;
 	}
 
@@ -85,7 +87,9 @@ export class YandexDiskClient {
 	 * the entry point for traversal), only segments below it are.
 	 */
 	setRemotePath(remotePath: string): void {
-		this.remotePath = normalizePath(remotePath);
+		const normalized = normalizePath(remotePath);
+		if (this.remotePath !== normalized) this.clearFolderCache();
+		this.remotePath = normalized;
 	}
 
 	/**
@@ -93,6 +97,37 @@ export class YandexDiskClient {
 	 */
 	clearFolderCache(): void {
 		this.folderCache.clear();
+	}
+
+	/** Remember one observed folder and its already-existing ancestors. */
+	private rememberFolder(path: string): void {
+		const parts = this.normalizeFolderObservation(path)
+			.split("/")
+			.filter(Boolean);
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			this.folderCache.add(current);
+		}
+	}
+
+	/** Invalidate a folder observation and every cached descendant. */
+	private invalidateFolder(path: string): void {
+		const normalized = this.normalizeFolderObservation(path);
+		if (!normalized) return;
+		for (const cached of [...this.folderCache]) {
+			if (cached === normalized || cached.startsWith(`${normalized}/`)) {
+				this.folderCache.delete(cached);
+			}
+		}
+	}
+
+	private hasObservedFolder(path: string): boolean {
+		return this.folderCache.has(this.normalizeFolderObservation(path));
+	}
+
+	private normalizeFolderObservation(path: string): string {
+		return normalizePath(path.replace(/^disk:\//, ""));
 	}
 
 	/** Return a copy of cumulative API GET counters for session diagnostics. */
@@ -280,12 +315,14 @@ export class YandexDiskClient {
 				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`
 			);
 			const resource = response.json as YandexResource;
+			if (resource.type === "dir") this.rememberFolder(path);
 			if (raw) {
 				return resource;
 			}
 			return await this.decryptResource(resource);
 		} catch (e: unknown) {
 			if (this.isNotFoundError(e)) {
+				this.invalidateFolder(path);
 				return null;
 			}
 			throw e;
@@ -366,6 +403,9 @@ export class YandexDiskClient {
 			if (!embedded) break;
 			for (const item of embedded.items) {
 				if (item.type === "dir") {
+					this.rememberFolder(
+						item.path.replace(/^disk:\//, ""),
+					);
 					if (!isProtectedPath(item.path)) directories.push(item.path);
 				} else {
 					files.push(raw ? item : await this.decryptResource(item));
@@ -382,19 +422,27 @@ export class YandexDiskClient {
 	 */
 	async createFolder(path: string): Promise<void> {
 		// Check cache first
-		if (this.folderCache.has(path)) {
+		if (this.hasObservedFolder(path)) {
 			return;
 		}
 
 		const encodedPath = encodePathForUrl(path);
 		try {
 			await this.request("PUT", `/resources?path=${encodedPath}`);
-			this.folderCache.add(path);
+			this.rememberFolder(path);
 			logger.debug(`Created folder: ${path}`);
 		} catch (e: unknown) {
 			// Ignore error if folder already exists
-			if (this.isConflictError(e)) {
-				this.folderCache.add(path);
+			if (
+				this.isConflictError(e) &&
+				e instanceof YandexApiError &&
+				e.code === "DiskPathPointsToExistentDirectoryError"
+			) {
+				this.rememberFolder(path);
+			} else if (this.isConflictError(e)) {
+				const existing = await this.getResource(path, 1, 0, true);
+				if (existing?.type !== "dir") throw e;
+				this.rememberFolder(path);
 			} else {
 				throw e;
 			}
@@ -433,7 +481,7 @@ export class YandexDiskClient {
 
 			for (const part of parts) {
 				currentPath = currentPath ? `${currentPath}/${part}` : part;
-				if (!this.folderCache.has(currentPath)) {
+				if (!this.hasObservedFolder(currentPath)) {
 					allFolders.add(currentPath);
 				}
 			}
@@ -509,8 +557,8 @@ export class YandexDiskClient {
 	 * already exists (preflight ensured it). If the upload then fails anyway —
 	 * most commonly because another concurrent sync pruned that folder in the
 	 * meantime — we recreate the parent folder and retry the upload once,
-	 * instead of failing the operation until the next full sync. Only 404/409
-	 * errors trigger the retry; other failures (auth, quota, network, 5xx) are
+	 * instead of failing the operation until the next full sync. Only a 404
+	 * triggers the retry; other failures (auth, quota, conflict, network, 5xx) are
 	 * re-thrown immediately so the real cause isn't masked as a missing folder.
 	 */
 	async uploadFile(
@@ -531,15 +579,25 @@ export class YandexDiskClient {
 			logger.debug(`Uploaded file: ${remotePath}`);
 			return;
 		} catch (e) {
+			if (
+				!skipFolderCheck &&
+				e instanceof YandexApiError &&
+				e.status === 404
+			) {
+				await this.recreateUploadParent(remotePath, raw);
+				await this.putFile(remotePath, content, raw, overwrite);
+				logger.debug(`Uploaded file after folder recovery: ${remotePath}`);
+				return;
+			}
 			if (!skipFolderCheck) throw e;
 			// Only retry when the failure is consistent with a missing/vanished
-			// parent folder (404 not found or 409 conflict). Other errors
+			// parent folder (404 not found). Other errors
 			// (auth, quota, network, 5xx) are not caused by a missing folder
 			// and would just waste an extra upload attempt while masking the
 			// real cause.
 			if (
 				!(e instanceof YandexApiError) ||
-				(e.status !== 404 && e.status !== 409)
+				e.status !== 404
 			) {
 				throw e;
 			}
@@ -547,11 +605,11 @@ export class YandexDiskClient {
 			// and this upload (e.g. another device's fullSync removed the last
 			// file in that folder and pruned the empty folder). Recreate the
 			// parent and retry once.
-			logger.warn(
-				`Upload failed for ${remotePath} (skipFolderCheck); recreating parent and retrying once:`,
-				{ error: e }
-			);
-			await this.ensureUploadParent(remotePath, raw);
+			logger.info("Upload parent missing; recreating before one retry", {
+				status: e.status,
+				skipFolderCheck: true,
+			});
+			await this.recreateUploadParent(remotePath, raw);
 			await this.putFile(remotePath, content, raw, overwrite);
 			logger.debug(`Uploaded file after folder retry: ${remotePath}`);
 		}
@@ -583,16 +641,31 @@ export class YandexDiskClient {
 	 * parent from the (optionally encrypted) target path.
 	 */
 	private async ensureUploadParent(remotePath: string, raw: boolean): Promise<void> {
-		const encryptedPath = raw
-			? remotePath
-			: await this.encryptFilePath(remotePath);
-		const parentPath = encryptedPath.substring(
-			0,
-			encryptedPath.lastIndexOf("/")
-		);
+		const parentPath = await this.getUploadParent(remotePath, raw);
 		if (parentPath) {
 			await this.createFolderRecursive(parentPath);
 		}
+	}
+
+	/** Revalidate a cached upload parent after the server reports it missing. */
+	private async recreateUploadParent(
+		remotePath: string,
+		raw: boolean,
+	): Promise<void> {
+		const parentPath = await this.getUploadParent(remotePath, raw);
+		if (!parentPath) return;
+		this.invalidateFolder(parentPath);
+		await this.createFolderRecursive(parentPath);
+	}
+
+	private async getUploadParent(
+		remotePath: string,
+		raw: boolean,
+	): Promise<string> {
+		const targetPath = raw
+			? remotePath
+			: await this.encryptFilePath(remotePath);
+		return targetPath.substring(0, targetPath.lastIndexOf("/"));
 	}
 
 	/**
@@ -749,12 +822,12 @@ export class YandexDiskClient {
 				`/resources?path=${encodedPath}&permanently=${permanently}`
 			);
 			await this.waitForAsyncOperation(response);
+			this.invalidateFolder(targetPath);
 			logger.debug(`Deleted resource: ${path}`);
 		} catch (e: unknown) {
 			// Ignore error if resource doesn't exist
-			if (!this.isNotFoundError(e)) {
-				throw e;
-			}
+			if (!this.isNotFoundError(e)) throw e;
+			this.invalidateFolder(targetPath);
 		}
 	}
 
@@ -782,6 +855,7 @@ export class YandexDiskClient {
 			`/resources/move?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`
 		);
 		await this.waitForAsyncOperation(response);
+		this.invalidateFolder(encryptedFrom);
 		logger.debug(`Moved resource: ${fromPath} -> ${toPath}`);
 	}
 

@@ -139,6 +139,12 @@ class FullSyncIndexFake {
 	async saveRemoteIndex() {
 		this.remoteSaveCount++;
 		this.index.revision++;
+		return {
+			epoch: this.index.epoch,
+			revision: this.index.revision,
+			index: structuredClone(this.index),
+			contentFingerprint: "md5:test",
+		};
 	}
 
 	consumeRejectedPuts() {

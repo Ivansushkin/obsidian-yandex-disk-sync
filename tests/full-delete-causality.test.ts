@@ -112,6 +112,12 @@ class FullDeleteIndexFake {
 
 	async saveRemoteIndex() {
 		this.index.revision++;
+		return {
+			epoch: this.index.epoch,
+			revision: this.index.revision,
+			index: structuredClone(this.index),
+			contentFingerprint: "md5:test",
+		};
 	}
 }
 
@@ -152,10 +158,10 @@ test("full-discovered logical delete receives and confirms a FIFO sequence", asy
 		commitDeletionIntents(
 			operations: SyncOperation[],
 			result: SyncResult,
-		): Promise<boolean>;
+		): Promise<object | null>;
 	};
 
-	assert.equal(await access.commitDeletionIntents([operation], createResult()), true);
+	assert.ok(await access.commitDeletionIntents([operation], createResult()));
 	assert.equal(index.index.files["note.md"]?.deleted, true);
 	assert.equal(index.index.files["note.md"]?.mutationSeq, 2);
 	assert.equal(index.index.appliedMutationSeq["device-a"], 2);
@@ -180,10 +186,10 @@ test("applying a canonical tombstone preserves foreign causal attribution", asyn
 		commitDeletionIntents(
 			operations: SyncOperation[],
 			result: SyncResult,
-		): Promise<boolean>;
+		): Promise<object | null>;
 	};
 
-	assert.equal(await access.commitDeletionIntents([operation], createResult()), true);
+	assert.ok(await access.commitDeletionIntents([operation], createResult()));
 	assert.equal(index.index.files["note.md"]?.lastModifiedBy, "device-b");
 	assert.equal(index.index.files["note.md"]?.mutationSeq, 9);
 	assert.deepEqual(index.store.getMutations(), []);

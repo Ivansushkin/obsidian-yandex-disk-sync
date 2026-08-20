@@ -46,6 +46,9 @@
   and `appliedMutationSeq`.
 - Canonical commits use an exclusive move to a unique lock and back. Never
   bypass `IndexManager` transaction/recovery rules with direct writes.
+- A `CanonicalCommitProof` is ephemeral and may skip an index download only
+  after a stable hash-matching root listing. It never authorizes a physical
+  write; re-read canonical and revalidate encryption before corrective upload.
 - Device-local baseline and durable queues live in plugin `data.json`:
   `LocalSyncState`, pending mutations, physical actions, and watcher events.
   Persist them as one coherent snapshot through the existing persistence flow.
@@ -73,6 +76,9 @@
   `path-utils`. Do not add local variants of path filtering.
 - Use the shared `path-utils` helper for ancestor directories and deepest-first
   cleanup.
+- Treat the remote-folder cache as an observation only. Invalidate it after
+  delete/move and token, remote-path, or encryption-codec changes; recover a
+  missing cached parent only from 404, never from an exclusive 409.
 
 ## Encryption
 
@@ -91,7 +97,7 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of older builds and 2.0.0-beta.3 is unsupported. Legacy index v1-v3 blocks
+- Concurrent use of older builds and 2.0.0-beta.4 is unsupported. Legacy index v1-v3 blocks
   normal sync until explicit Force sync with backup.
 - Do not change index v4, manifest v2, epoch/revision, mutation FIFO, or the
   persisted physical-action schema without a separate migration design,

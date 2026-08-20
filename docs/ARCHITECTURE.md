@@ -87,6 +87,11 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
   конфликт 409 обрабатывается причинно в lock/upload/move workflows
 - Пагинация для больших директорий
 - Обработка rate limiting
+- Stable raw read подтверждает service-файлы по `sha256 → md5 →
+  modified+size`; `resource_id` не считается content identity
+- Cache подтверждённых remote directories очищается после delete/move и смены
+  token, remote path или encryption codec. После 404 parent создаётся заново;
+  exclusive 409 не запускает `mkdir`
 
 ### VaultAdapter (api/vault-adapter.ts)
 
@@ -172,6 +177,10 @@ baseline/base revision; одинаковый sequence с разным logical st
 или lock с той же ревизией, но другим содержимым, блокируют обычную
 синхронизацию до явного Force sync. Список lock читается с полной пагинацией;
 транзакция требует два последовательных одинаковых снимка root listing.
+Успешный commit возвращает временный `CanonicalCommitProof`. Он позволяет
+пропустить повторный index download только при совпавшем SHA-256/MD5 и
+отсутствующих locks. Proof не сохраняется и не разрешает physical write:
+corrective upload заново проверяет canonical и encryption manifest.
 
 `SyncCoordinator` последовательно выполняет full, Force, realtime batch и
 encryption maintenance. Повторные full-запросы объединяются в один запуск.
@@ -206,7 +215,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1-v3 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.3 и один раз выполнить Force sync на
+обновить все устройства до 2.0.0-beta.4 и один раз выполнить Force sync на
 авторитетном устройстве. Index v4 хранит `mutationSeq` в file metadata,
 folder tombstones и moves. Folder move фиксирует logical intent одной revision,
 а физически выполняется как ограниченная пачка guarded file moves; folder-level

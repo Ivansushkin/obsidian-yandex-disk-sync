@@ -206,6 +206,7 @@
 | ENC-007 | P0  | Wrong-key canonical                   | Ошибка расшифровки не интерпретируется как пустой remote         | auto: fault            |
 | ENC-008 | P0  | Source/target codec во время transition | Явный codec не использует plaintext fallback                     | auto: `explicit transition codec does not fall back to plaintext` |
 | ENC-009 | P0  | Сбой enable/disable/rotate после установки transition codec | Общий executor всегда очищает source/target codec и запускает causal recovery | auto: `transition services are cleared after a failed re-encode`; fault matrix |
+| ENC-010 | P1  | Codec/manifest меняется после canonical commit либо при enable/disable/rotate | Corrective upload старым codec блокируется; folder observations старого physical namespace очищаются, следующий upload подтверждает/создаёт target directories | auto: `encryption change blocks proof-based physical repair`; `encryption codec change invalidates folder observations`; manual: `docs/SMOKE_TESTS.md` TC-08 |
 
 ## Переходы шифрования
 
@@ -278,6 +279,8 @@
 | NET-012 | P1  | Fingerprint отсутствует                | Destructive action блокируется или использует подтверждённую альтернативу | auto: fake-yandex       |
 | NET-013 | P0  | Сбой после перезаписи захваченного lock | Исходные raw bytes восстанавливаются и проверяются до возврата canonical; неоднозначность не ретраится | auto: index-transaction + fake-yandex |
 | NET-014 | P0  | Persisted action содержит SHA-256, MD5, resource ID или modified | Совпадение принимается по любой поддерживаемой server identity, но новый destructive action использует единый strongest fingerprint | auto: `physical fingerprints accept every persisted server identity` |
+| NET-015 | P0  | После принятого put другой device удаляет или изменяет canonical до physical repair | Proof не разрешает запись: перед corrective upload читается свежий canonical, более новое состояние сохраняется | auto: `foreign delete after commit cancels proof-based physical repair` |
+| NET-016 | P1  | Другой device удалил ранее наблюдавшийся upload parent либо upload получил exclusive 409 | 404 очищает cache, parent создаётся и upload повторяется один раз; 409 не запускает `mkdir` и не перезаписывает target | auto: `missing cached upload parent is recreated before retry`; `exclusive upload conflict never retries through folder creation` |
 
 ## Масштаб, платформы и пути
 
@@ -291,6 +294,7 @@
 | PERF-006 | P2  | Mobile с ограниченной памятью       | Нет одновременного хранения нескольких полных file-content snapshots | manual-required     |
 | PERF-007 | P2  | Encrypted no-op startup, 9 local/9 remote | Не более 13 GET, `0/0/0`, без index write и post-full realtime | manual-required; integration |
 | PERF-008 | P2  | Remote tree содержит независимые папки и `.backup` | Папки читаются с bounded concurrency, `.backup` не обходится | auto: `remote tree uses bounded folder concurrency and skips backup` |
+| PERF-009 | P2  | Realtime put/rename при доступном SHA-256/MD5 canonical | Stable root listing подтверждает same-session proof без повторного index download; hashless metadata использует semantic fallback | auto: `plaintext legacy Force commits and verifies canonical v4`; `hashless canonical metadata falls back to semantic verification`; manual: `docs/SMOKE_TESTS.md` TC-02 |
 | PATH-001 | P1  | Unicode и emoji в имени             | Logical/physical mapping обратим                                     | auto: parameterized |
 | PATH-002 | P1  | Пробелы, `%`, `#`, `?`, `+`         | API path кодируется один раз                                         | auto: parameterized |
 | PATH-003 | P1  | Имена, различающиеся регистром      | Поведение соответствует платформе и не объединяет entries молча      | manual-required     |
@@ -330,6 +334,7 @@
 | DIAG-013 | P1 | Rename superseded/rebased ожидаемым локальным событием | Лог содержит event ID, исходный session ID и `rebased`/`already-applied` без повторных error stack | auto: file-watcher; manual-required |
 | DIAG-014 | P1 | Startup завершён без canonical maintenance/cleanup | После full не создаётся пустая maintenance/realtime-сессия; summary содержит post-full rename settlement и число новых replay events | auto: full-sync-barrier; manual-required |
 | DIAG-015 | P1 | Submitted upload причинно передан rename              | Лог содержит predecessor event ID, mutation sequence, handoff state и accepted revision; rename не маскируется как независимый `put-target` | auto: file-watcher + file-rename; manual-required |
+| DIAG-018 | P2 | Canonical commit и repair выбирают fast path либо fallback | Лог содержит decision, revision и короткий fingerprint, но не index, path или ciphertext | manual: `docs/SMOKE_TESTS.md` TC-02 |
 
 ## UI синхронизации
 
@@ -356,14 +361,14 @@
 | FDEL-016  | P0 | Folder delete после собственных revisions при старом observedRevision | Потомки с меньшим same-device sequence удаляются; foreign/newer сохраняются | manual-required |
 | MULTI-016 | P0 | Другой device меняет child во время folder move/delete | Foreign child и отличающийся target не удаляются и не перезаписываются | manual-required |
 | SYNC-029  | P0 | Full запускается при unresolved parent move/action | Full останавливается до local/remote scan, не создаёт compensating operations | manual-required |
-| MIG-004   | P0 | Переход beta.1.1 index v3 на beta.3 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | manual-required |
+| MIG-004   | P0 | Переход beta.1.1 index v3 на beta.4 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | manual-required |
 | DIAG-016  | P1 | Folder reducer и recovery | Лог содержит parent event/mutation, sequence, absorbed/rebased, survivor/conflict/unresolved counts без expected coalescing ERROR | manual-required |
 | MOVE-029  | P0 | Одновременно ожидают unrelated и nested folder moves, затем приходит child rename | Выбирается только содержащий child source и самый глубокий causal parent; unrelated move не влияет | auto: `child rename selects the deepest matching folder parent` |
 | MOVE-030  | P0 | Folder move встречает существующий target с другим SHA | Ноль canonical/physical writes; source и local target сохраняются; event остаётся durable с `folder-target-conflict` | auto: `folder target conflict performs no canonical or physical writes` |
 | FDEL-017  | P0 | Предрелизная v4 file entry не содержит `mutationSeq` | Destructive folder operation разрешена только при exact baseline и достаточной base revision | auto: `unsequenced prerelease v4 child requires an exact observed baseline` |
 | SYNC-030  | P0 | Full обнаруживает новое локальное удаление файла | До tombstone сохраняется FIFO mutation; canonical получает sequence и watermark; existing foreign tombstone сохраняет attribution | auto: `full-discovered logical delete receives and confirms a FIFO sequence`; `applying a canonical tombstone preserves foreign causal attribution` |
 | INDEX-001 | P0 | JSON декодирован, но current v4 имеет неверную структуру | Возвращается semantic invalid-index; codec fallback и remote mutation не выполняются; Force остаётся доступным после backup | auto: `malformed current v4 is rejected as a semantic index error` |
-| PERF-008  | P1 | Folder move/delete на 10 000 descendants | Планирование использует Set/Map, targeted API calls линейны, concurrency ≤ 4, index commits ≤ 2 | auto: `folder delete target planning handles ten thousand descendants`; move/API/commit manual-required |
+| PERF-010  | P1 | Folder move/delete на 10 000 descendants | Планирование использует Set/Map, targeted API calls линейны, concurrency ≤ 4, index commits ≤ 2 | auto: `folder delete target planning handles ten thousand descendants`; move/API/commit manual-required |
 
 ## Последовательное редактирование и causal FIFO
 

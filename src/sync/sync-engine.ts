@@ -79,6 +79,7 @@ import {
 	type UploadCausalReceipt,
 	type WatcherCausalContext,
 } from "./realtime-rules";
+import type { CanonicalCommitProof } from "./index-transaction";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -826,13 +827,15 @@ export class SyncEngine {
 						"applying",
 						t("status.op.deleting_files"),
 					);
-					if (
-						!(await this.commitDeletionIntents(deletes, result))
-					) {
+					const deletionCommitProof =
+						await this.commitDeletionIntents(deletes, result);
+					if (!deletionCommitProof) {
 						return;
 					}
 					await this.repairMissingAcceptedUploads(
 						uploads.map((operation) => operation.path),
+						deletionCommitProof,
+						validationToken,
 					);
 					indexCommittedBeforeDeletes = true;
 					deletes = this.filterCommittedDeletions(deletes);
@@ -986,11 +989,14 @@ export class SyncEngine {
 				}
 
 				this.indexManager.updateSyncTime();
-				if (!(await this.saveRemoteIndexOrAbort(result))) {
+				const commitProof = await this.saveRemoteIndexOrAbort(result);
+				if (!commitProof) {
 					return;
 				}
 				await this.repairMissingAcceptedUploads(
 					uploads.map((operation) => operation.path),
+					commitProof,
+					validationToken,
 				);
 				if (this.hasPendingPhysicalWork()) {
 					this.setSyncPhase("cleanup");
@@ -1270,7 +1276,7 @@ export class SyncEngine {
 		let bootstrapStarted = false;
 		const run = async () => await this.runSyncSession(
 			options,
-			async (result) => {
+			async (result, _startTime, validationToken) => {
 				bootstrapStarted = true;
 				const inheritedCleanup = await this.prepareForceBootstrap();
 
@@ -1363,11 +1369,15 @@ export class SyncEngine {
 					}
 					if (this.indexSaveCallback) await this.indexSaveCallback();
 					this.indexManager.updateSyncTime();
-					if (!(await this.saveRemoteIndexOrAbort(result, false))) {
+					const deletionCommitProof =
+						await this.saveRemoteIndexOrAbort(result, false);
+					if (!deletionCommitProof) {
 						return;
 					}
 					await this.repairMissingAcceptedUploads(
 						uploads.map((operation) => operation.path),
+						deletionCommitProof,
+						validationToken,
 					);
 					indexCommittedBeforeDeletes = true;
 					deletes = deletes.filter(
@@ -1410,11 +1420,17 @@ export class SyncEngine {
 				this.indexManager.cleanupDeletedFiles();
 				if (indexCommittedBeforeDeletes) return;
 				this.indexManager.updateSyncTime();
-				if (!(await this.saveRemoteIndexOrAbort(result, false))) {
+				const commitProof = await this.saveRemoteIndexOrAbort(
+					result,
+					false,
+				);
+				if (!commitProof) {
 					return;
 				}
 				await this.repairMissingAcceptedUploads(
 					uploads.map((operation) => operation.path),
+					commitProof,
+					validationToken,
 				);
 			},
 			(result) =>
@@ -2587,7 +2603,8 @@ export class SyncEngine {
 			}
 			if (accepted.length === 0) return batchResult;
 			this.setSyncPhase("saving-index");
-			if (!(await this.saveRemoteIndexBestEffort())) {
+			const commitProof = await this.saveRemoteIndexBestEffort();
+			if (!commitProof) {
 				batchResult.retry.push(
 					...accepted
 						.map((event) => event.id)
@@ -2602,6 +2619,7 @@ export class SyncEngine {
 						path: item.path,
 						snapshot: item.snapshot,
 					})),
+				commitProof,
 			);
 			for (const item of accepted.filter(
 				(event) => event.action === "upload",
@@ -3586,10 +3604,11 @@ export class SyncEngine {
 		const uploaded = this.indexManager.getRemoteIndex().files[newPath];
 		if (uploaded) uploaded.mutationSeq = mutation.seq;
 		this.indexManager.stageMutation(mutation);
-		if (!(await this.saveRemoteIndexBestEffort())) {
+		const commitProof = await this.saveRemoteIndexBestEffort();
+		if (!commitProof) {
 			return false;
 		}
-		await this.repairMissingAcceptedUploads([newPath]);
+		await this.repairMissingAcceptedUploads([newPath], commitProof);
 		const local = this.indexManager.getLocalIndex().files[newPath];
 		const canonical = this.indexManager.getRemoteIndex().files[newPath];
 		if (
@@ -4683,18 +4702,18 @@ export class SyncEngine {
 	 * Save the remote index with optimistic concurrency control. If another
 	 * device wrote a newer index during this sync, do NOT overwrite it: our
 	 * physical file transfers already landed and will be reconciled on the next
-	 * sync once we reload the newer index. Returns false (and records an error
+	 * sync once we reload the newer index. Returns null (and records an error
 	 * on `result`) when the save was skipped due to a concurrent modification.
 	 */
 	private async saveRemoteIndexOrAbort(
 		result: SyncResult,
 		includePendingMutations = true,
-	): Promise<boolean> {
+	): Promise<CanonicalCommitProof | null> {
 		try {
 			if (includePendingMutations) {
 				this.indexManager.stagePendingMutations();
 			}
-			await this.indexManager.saveRemoteIndex();
+			const proof = await this.indexManager.saveRemoteIndex();
 			await this.cleanupRejectedUploads();
 			if (includePendingMutations) {
 				this.indexManager.confirmAppliedMutations();
@@ -4702,7 +4721,7 @@ export class SyncEngine {
 			if (this.indexSaveCallback) {
 				await this.indexSaveCallback();
 			}
-			return true;
+			return proof;
 		} catch (e) {
 			if (!(e instanceof RemoteIndexTransactionError)) {
 				throw e;
@@ -4720,7 +4739,7 @@ export class SyncEngine {
 				message: `Index transaction ${e.outcome} at ${e.stage}: ${e.message}`,
 			});
 			result.success = false;
-			return false;
+			return null;
 		}
 	}
 
@@ -4731,7 +4750,7 @@ export class SyncEngine {
 	 * reload the newer remote index and reconcile. We only log a warning so
 	 * real-time editing stays non-disruptive.
 	 */
-	private async saveRemoteIndexBestEffort(): Promise<boolean> {
+	private async saveRemoteIndexBestEffort(): Promise<CanonicalCommitProof | null> {
 		try {
 			if (this.realtimeGuardValidationToken !== undefined) {
 				const guard = await this.getSyncGuardResult(
@@ -4743,12 +4762,12 @@ export class SyncEngine {
 					logger.warn(
 						"Realtime canonical commit blocked by changed encryption state",
 					);
-					return false;
+					return null;
 				}
 			}
-			await this.indexManager.saveRemoteIndex();
+			const proof = await this.indexManager.saveRemoteIndex();
 			await this.cleanupRejectedUploads();
-			return true;
+			return proof;
 		} catch (e) {
 			if (e instanceof RemoteIndexTransactionError) {
 				if (
@@ -4767,7 +4786,7 @@ export class SyncEngine {
 						error: e,
 					},
 				);
-				return false;
+				return null;
 			}
 			throw e;
 		}
@@ -4786,7 +4805,7 @@ export class SyncEngine {
 	private async saveMoveCompletionBestEffort(): Promise<boolean> {
 		this.indexManager.beginPhysicalRewriteCommit();
 		try {
-			return await this.saveRemoteIndexBestEffort();
+			return Boolean(await this.saveRemoteIndexBestEffort());
 		} finally {
 			this.indexManager.cancelPhysicalRewriteCommit();
 		}
@@ -4804,9 +4823,12 @@ export class SyncEngine {
 					snapshot?: { content: ArrayBuffer; sha256: string };
 			  }
 		>,
+		commitProof?: CanonicalCommitProof,
+		validationToken = this.realtimeGuardValidationToken,
 	): Promise<void> {
 		if (items.length === 0) return;
-		const canonical = await this.indexManager.readCanonicalIndex();
+		const canonical =
+			await this.indexManager.readCanonicalIndexForRepair(commitProof);
 		let repaired = false;
 		const snapshots = new Map<string, { content: ArrayBuffer; sha256: string }>();
 		for (const item of items) {
@@ -4818,7 +4840,7 @@ export class SyncEngine {
 			items.map((item) => (typeof item === "string" ? item : item.path)),
 		);
 		for (const path of paths) {
-			const accepted = canonical.files[path];
+			let accepted = canonical.files[path];
 			if (!accepted || accepted.deleted) {
 				continue;
 			}
@@ -4840,6 +4862,39 @@ export class SyncEngine {
 			if (physicalMatches) {
 				continue;
 			}
+			const freshCanonical = await this.indexManager.readCanonicalIndex();
+			const currentlyAuthorized = freshCanonical.files[path];
+			if (freshCanonical.maintenance !== undefined) {
+				throw new Error(
+					"Encryption maintenance started before physical upload repair",
+				);
+			}
+			if (
+				freshCanonical.epoch !== canonical.epoch ||
+				!currentlyAuthorized ||
+				currentlyAuthorized.deleted ||
+				currentlyAuthorized.sha256 !== accepted.sha256
+			) {
+				logger.info("Post-commit upload repair cancelled by newer canonical state", {
+					committedEpoch: shortenDiagnosticValue(canonical.epoch),
+					currentEpoch: shortenDiagnosticValue(freshCanonical.epoch),
+					committedRevision: canonical.revision,
+					currentRevision: freshCanonical.revision,
+				});
+				continue;
+			}
+			if (validationToken !== undefined) {
+				const guard = await this.getSyncGuardResult(
+					false,
+					validationToken,
+				);
+				if (guard.blockReason) {
+					throw new Error(
+						"Encryption state changed before physical upload repair",
+					);
+				}
+			}
+			accepted = currentlyAuthorized;
 			if (physical) {
 				const remoteContent =
 					await this.yandexClient.downloadFile(remotePath);
@@ -5523,7 +5578,9 @@ export class SyncEngine {
 			let committed = false;
 			this.indexManager.beginPhysicalRewriteCommit();
 			try {
-				committed = await this.saveRemoteIndexOrAbort(result, false);
+				committed = Boolean(
+					await this.saveRemoteIndexOrAbort(result, false),
+				);
 			} finally {
 				this.indexManager.cancelPhysicalRewriteCommit();
 			}
@@ -5756,7 +5813,7 @@ export class SyncEngine {
 	private async commitDeletionIntents(
 		operations: SyncOperation[],
 		result: SyncResult,
-	): Promise<boolean> {
+	): Promise<CanonicalCommitProof | null> {
 		const unsafeFolderDeletes = operations.filter((operation) => {
 			if (!operation.folderTombstonePath) return false;
 			const canonical = this.indexManager.getRemoteIndex();
@@ -5786,7 +5843,7 @@ export class SyncEngine {
 						"Folder deletion is missing confirmed causal metadata.",
 				})),
 			);
-			return false;
+			return null;
 		}
 		const mutations = new Map<string, PendingMutation>();
 		const pending = this.indexManager.getPendingMutations();

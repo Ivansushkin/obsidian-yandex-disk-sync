@@ -22,6 +22,14 @@ export interface IndexFileSnapshot {
 	codec: IndexCodec;
 }
 
+/** Ephemeral proof that one canonical index revision was committed. */
+export interface CanonicalCommitProof {
+	epoch: string;
+	revision: number;
+	index: SyncIndex;
+	contentFingerprint: string;
+}
+
 export type IndexMoveRecoveryDecision =
 	| "committed"
 	| "retry-move"

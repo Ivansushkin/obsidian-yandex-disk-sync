@@ -59,6 +59,7 @@ class RejectingEncryptionService {
 class FakeIndexYandex {
 	readonly files = new Map<string, ArrayBuffer>();
 	moveCount = 0;
+	stableReadCount = 0;
 
 	constructor(
 		private readonly remotePath: string,
@@ -66,6 +67,7 @@ class FakeIndexYandex {
 		private readonly faults: {
 			throwAfterFinalMove?: boolean;
 			corruptIndexUpload?: boolean;
+			hashlessMetadata?: boolean;
 		} = {},
 	) {}
 
@@ -95,6 +97,7 @@ class FakeIndexYandex {
 		resource: YandexResource;
 		fingerprint: string;
 	} | null> {
+		this.stableReadCount++;
 		const resource = await this.getResource(path);
 		if (!resource) return null;
 		const raw = await this.downloadFile(path, true);
@@ -222,14 +225,17 @@ class FakeIndexYandex {
 		path: string,
 		content: ArrayBuffer,
 	): YandexResource {
+		const identity = this.fingerprint(content);
 		return {
 			name: path.split("/").pop() ?? path,
 			path,
 			type: "file",
 			created: "2026-01-01T00:00:00Z",
-			modified: "2026-01-01T00:00:00Z",
+			modified: this.faults.hashlessMetadata
+				? `content-${identity}-${path}`
+				: "2026-01-01T00:00:00Z",
 			size: content.byteLength,
-			md5: this.fingerprint(content),
+			md5: this.faults.hashlessMetadata ? undefined : identity,
 		};
 	}
 
@@ -260,6 +266,7 @@ async function runLegacyForceCommit(
 	faults: {
 		throwAfterFinalMove?: boolean;
 		corruptIndexUpload?: boolean;
+		hashlessMetadata?: boolean;
 	} = {},
 ): Promise<{
 	client: FakeIndexYandex;
@@ -297,7 +304,7 @@ async function runLegacyForceCommit(
 		return { client, manager, canonicalPath, originalRaw };
 	}
 
-	await manager.saveRemoteIndex();
+	const proof = await manager.saveRemoteIndex();
 
 	const raw = client.files.get(canonicalPath)!;
 	const plain = encryption ? await encryption.decrypt(raw) : raw;
@@ -316,6 +323,16 @@ async function runLegacyForceCommit(
 	assert.equal(manager.getObservedEpoch(), canonical.epoch);
 	assert.equal(manager.getObservedRevision(), canonical.revision);
 	assert.equal(client.moveCount, 2);
+	assert.equal(proof.epoch, canonical.epoch);
+	assert.equal(proof.revision, canonical.revision);
+	assert.match(
+		proof.contentFingerprint,
+		faults.hashlessMetadata ? /^modified:/ : /^md5:/,
+	);
+	assert.equal(
+		client.stableReadCount,
+		faults.throwAfterFinalMove || faults.hashlessMetadata ? 3 : 2,
+	);
 	assert.deepEqual(
 		[...client.files.keys()].filter((path) => path.includes(".lock.")),
 		[],
@@ -331,6 +348,10 @@ test("encrypted legacy Force commits and verifies canonical v4", async () => {
 	await runLegacyForceCommit(
 		new XorEncryptionService(0xa5) as unknown as EncryptionService,
 	);
+});
+
+test("hashless canonical metadata falls back to semantic verification", async () => {
+	await runLegacyForceCommit(null, undefined, { hashlessMetadata: true });
 });
 
 test("encryption manifest validation token detects unchanged and changed content", async () => {

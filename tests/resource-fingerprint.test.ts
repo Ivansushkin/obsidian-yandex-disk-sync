@@ -4,7 +4,9 @@ import type { YandexResource } from "../src/types";
 import {
 	getPhysicalResourceFingerprint,
 	getStableContentFingerprint,
+	isHashStableContentFingerprint,
 	matchesPhysicalResourceFingerprint,
+	matchesStableContentFingerprint,
 } from "../src/utils/resource-fingerprint";
 
 function createResource(
@@ -51,4 +53,27 @@ test("service fingerprint never accepts resource id as content identity", () => 
 		resource_id: "stable-path-id",
 	});
 	assert.equal(getStableContentFingerprint(resource), null);
+});
+
+test("hash service identities match even when stronger metadata appears", () => {
+	const resource = createResource({
+		sha256: "sha-value",
+		md5: "md5-value",
+	});
+	assert.equal(isHashStableContentFingerprint("sha256:sha-value"), true);
+	assert.equal(isHashStableContentFingerprint("md5:md5-value"), true);
+	assert.equal(
+		isHashStableContentFingerprint(
+			`modified:${resource.modified}:size:${resource.size}`,
+		),
+		false,
+	);
+	assert.equal(
+		matchesStableContentFingerprint("md5:md5-value", resource),
+		true,
+	);
+	assert.equal(
+		matchesStableContentFingerprint("sha256:changed", resource),
+		false,
+	);
 });

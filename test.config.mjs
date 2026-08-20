@@ -42,7 +42,10 @@ const obsidianStubPlugin = {
 			{ filter: /.*/, namespace: "test" },
 			() => ({
 				contents: `
-					export async function requestUrl() {
+					export async function requestUrl(params) {
+						if (globalThis.__obsidianRequestUrl) {
+							return await globalThis.__obsidianRequestUrl(params);
+						}
 						throw new Error("Unexpected Obsidian requestUrl call in unit test");
 					}
 					export function normalizePath(path) {
