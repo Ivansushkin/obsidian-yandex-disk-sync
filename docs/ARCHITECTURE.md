@@ -35,9 +35,9 @@ src/
 │   └── backup-envelope.ts  # Self-contained OYDSBKP2 envelope
 │
 ├── crypto/
-│   ├── encryption.ts       # Legacy-v2 и hardened-v3 codecs
+│   ├── encryption.ts       # Единственный hardened-v3 codec
 │   ├── encryption-manager.ts # Profile, snapshot и manifest wire-shapes
-│   ├── encryption-state-migration.ts # Additive PluginData migration
+│   ├── encryption-state-migration.ts # Strict current/stable-1.0/1.1 loader
 │   └── encryption-transition.ts # Общий transition executor и crash recovery
 │
 ├── ui/
@@ -209,7 +209,8 @@ barrier не поглощает upload, на который ссылается r
 sync для external edit и orphan detection.
 
 Startup является обычной coordinator-сессией `fullSync({ startup: true })`.
-Watcher durable-буфер включается до первого чтения encryption manifest.
+Persisted watcher events загружаются в память, но watcher и scheduler
+запускаются только после успешной строгой проверки encryption manifest.
 Manifest и canonical читаются единым stable raw-примитивом
 `metadata → download → metadata`; неизменность подтверждается по `sha256`,
 затем `md5`, затем паре `server modified + size`. Canonical и lock находятся
@@ -217,12 +218,14 @@ Manifest и canonical читаются единым stable raw-примитив�
 с ограниченной параллельностью папок. Перед записью manifest проверяется по
 session token; для строгого no-op финальный запрос не выполняется.
 
-Индекс v1-v3 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.5 и один раз выполнить Force sync на
-авторитетном устройстве. Index v4 хранит `mutationSeq` в file metadata,
-folder tombstones и moves. Folder move фиксирует logical intent одной revision,
-а физически выполняется как ограниченная пачка guarded file moves; folder-level
-move API не используется.
+Plaintext stable 1.0/1.1 index v1/v2 не мигрируется обычной синхронизацией:
+пользователь один раз выполняет Force sync с обязательным backup на
+авторитетном устройстве. Encrypted index v1/v2 и index v3 являются
+неподдерживаемыми форматами и блокируются даже при Force.
+Force выполняет read-only classification до захвата canonical lock. Index v4
+хранит `mutationSeq` в file metadata, folder tombstones и moves. Folder move
+фиксирует logical intent одной revision, а физически выполняется как
+ограниченная пачка guarded file moves; folder-level move API не используется.
 Перед использованием current v4 проходит строгую runtime-валидацию всех
 records, путей, числовых полей, mutation watermarks, moves, tombstones и
 maintenance. Семантически неверный v4 не запускает codec fallback и блокирует
@@ -232,9 +235,9 @@ Full reconciliation классифицирует каждую операцию �
 mutation, применение canonical state либо physical repair. Новый logical
 delete всегда резервирует FIFO sequence до canonical commit. Уже принятый
 tombstone применяется физически без изменения `lastModifiedBy` и
-`mutationSeq`. Для совместимости с предрелизным v4 запись без sequence может
-участвовать в destructive folder operation только при точном совпадении с
-подтверждённым baseline устройства.
+`mutationSeq`. Current v4 file entry без sequence не даёт causal proof для
+destructive folder operation и не получает baseline fallback; само наличие
+такой записи не включает prerelease recovery.
 Force создаёт новый `epoch` только на авторитетном устройстве. Остальные
 обновлённые устройства принимают этот epoch обычной full sync: до успеха они
 сохраняют прежний baseline, сравнивают с ним текущий filesystem и новый
@@ -475,16 +478,17 @@ interface StorageClient {
 ## Encryption profiles и migration
 
 Новые vault используют hardened-v3: PBKDF2 600k выводит master key, HKDF
-разделяет AES-GCM content key и AES-SIV filename key. Legacy-v2 остаётся только
-для чтения и явного migration. Manifest v3 строго объявляет все алгоритмы;
-unknown version/profile блокирует любые remote mutations.
+разделяет AES-GCM content key и AES-SIV filename key. Других codecs в текущей
+версии нет. Manifest v1/v2, encrypted legacy index и stable/prerelease 1.2
+fail closed без чтения или migration; manifest v3 строго объявляет все
+алгоритмы, а unknown version/profile блокирует любые remote mutations.
 
-Format upgrade выполняется как canonical maintenance kind `rotate`. До commit
-canonical читается source codec, после commit — только target codec. Cleanup
-paths и source fingerprints фиксируются атомарно с target canonical, поэтому
-другое target-capable устройство может завершить post-commit cleanup без
-source password. `IndexManager` разрешает это только matching transition ID и
-post-commit phase. Подробный wire и recovery contract описан в
+Fresh enable, rotate и disable используют один crash-safe transition. До
+commit canonical читается source codec, после commit — только target codec.
+Cleanup paths и source fingerprints фиксируются атомарно с target canonical,
+поэтому другое target-capable устройство может завершить post-commit cleanup
+без source password. `IndexManager` разрешает это только matching transition ID
+и post-commit phase. Подробный wire и recovery contract описан в
 [E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
 
 ## Тестирование

@@ -8,7 +8,6 @@ import { YandexDiskClient, YandexApiError } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import { joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
-import { t } from "../i18n";
 import { computeSha256 } from "../utils/hash-utils";
 import {
 	BackupEnvelopeAuthenticationError,
@@ -16,6 +15,7 @@ import {
 	openBackupEnvelope,
 	sealBackupEnvelope,
 } from "./backup-envelope";
+import { UnsupportedPrereleaseDataError } from "../compatibility-errors";
 
 export interface BackupResult {
 	success: boolean;
@@ -364,9 +364,7 @@ export class BackupManager {
 			const backupFolder = joinPath(this.settings.remotePath, ".backup");
 			logger.info(`Fetching backup list from: ${backupFolder}`);
 
-			// raw=true: .backup is a protected path — filenames are always
-			// plaintext timestamps and never need decryption. Skipping
-			// decryptResource avoids unnecessary crypto attempts per file.
+			// Backup names are raw and must match a recognized release format.
 			const resources = await this.yandexClient.getResourcesRecursive(
 				backupFolder,
 				true,
@@ -374,15 +372,9 @@ export class BackupManager {
 			const backups: BackupInfo[] = [];
 
 			for (const resource of resources) {
-				// Only process files with .zip extension
-				if (
-					resource.type !== "file" ||
-					!resource.name.endsWith(".zip")
-				) {
-					continue;
-				}
-
-				const created = this.parseBackupName(resource.name);
+				if (resource.type !== "file") continue;
+				const logicalName = resource.name;
+				const created = this.parseBackupName(logicalName);
 				if (!created) {
 					logger.warn(
 						`Invalid backup filename format: ${resource.name}`,
@@ -391,7 +383,7 @@ export class BackupManager {
 				}
 
 				backups.push({
-					name: resource.name,
+					name: logicalName,
 					created,
 					size: resource.size || 0,
 					remotePath: resource.path,
@@ -419,7 +411,6 @@ export class BackupManager {
 		backupPath: string,
 		password?: string,
 	): Promise<ArrayBuffer> {
-		const isEncrypted = backupPath.includes(".enc.zip");
 		try {
 			logger.info(`Starting backup download: ${backupPath}`);
 			const raw = await this.yandexClient.downloadFile(backupPath, true);
@@ -428,9 +419,11 @@ export class BackupManager {
 					password ?? this.settings.encryptionPassword ?? undefined;
 				if (!effectivePassword) throw new BackupPasswordRequiredError();
 				try {
-					return (
+					const content = (
 						await openBackupEnvelope(raw, effectivePassword)
 					).content;
+					assertZipContent(content);
+					return content;
 				} catch (error) {
 					if (!(error instanceof BackupEnvelopeAuthenticationError)) {
 						throw error;
@@ -441,34 +434,19 @@ export class BackupManager {
 					throw new BackupPasswordRequiredError();
 				}
 			}
-			if (isEncrypted && !this.yandexClient.hasEncryptionService()) {
-				throw new Error(t("notice.backup_encrypted_no_key"));
+			if (backupPath.endsWith(".enc.zip")) {
+				throw new UnsupportedPrereleaseDataError(
+					"A non-envelope .enc.zip backup is unsupported",
+				);
 			}
-			const content = isEncrypted
-				? await this.yandexClient.decodeServiceFileContent(raw)
-				: raw;
-			logger.info("Backup downloaded successfully");
-			return content;
+			if (isZipContent(raw)) {
+				logger.info("Backup downloaded successfully");
+				return raw;
+			}
+			throw new UnsupportedPrereleaseDataError(
+				"Unknown non-envelope backup bytes are unsupported",
+			);
 		} catch (error) {
-			// If the backup is encrypted and the download attempt was made
-			// (encryption service was active), a decrypt failure likely means
-			// the backup was created with a different key — e.g. before a
-			// password rotation. Surface a clear message.
-			if (
-				isEncrypted &&
-				!(
-					error instanceof Error &&
-					error.message === t("notice.backup_encrypted_no_key")
-				)
-			) {
-				const isCryptoError =
-					error instanceof DOMException ||
-					(error instanceof Error &&
-						/decrypt|crypto|aes|gcm|auth/i.test(error.message));
-				if (isCryptoError) {
-					throw new Error(t("notice.backup_old_key"));
-				}
-			}
 			logger.error("Error downloading backup:", { error });
 			throw error;
 		}
@@ -477,6 +455,22 @@ export class BackupManager {
 	getSuggestedDownloadName(name: string): string {
 		return name.replace(/\.enc\.zip$/, ".zip");
 	}
+}
+
+function assertZipContent(content: ArrayBuffer): void {
+	if (!isZipContent(content)) {
+		throw new Error("Backup payload is not a valid ZIP stream");
+	}
+}
+
+function isZipContent(content: ArrayBuffer): boolean {
+	const bytes = new Uint8Array(content);
+	if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) return false;
+	return (
+		(bytes[2] === 0x03 && bytes[3] === 0x04) ||
+		(bytes[2] === 0x05 && bytes[3] === 0x06) ||
+		(bytes[2] === 0x07 && bytes[3] === 0x08)
+	);
 }
 
 function bytesEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {

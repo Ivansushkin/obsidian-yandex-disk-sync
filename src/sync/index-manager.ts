@@ -39,12 +39,12 @@ import {
 	computeSha256FromString,
 } from "../utils/hash-utils";
 import {
-	PBKDF2_ITERATIONS,
 	HARDENED_PBKDF2_ITERATIONS,
 	AES_KEY_LENGTH,
 	FILENAME_KEY_LENGTH,
 	IV_LENGTH,
 } from "../crypto/encryption";
+import { UnsupportedPrereleaseDataError } from "../compatibility-errors";
 import type { EncryptionCodec } from "../crypto/encryption";
 import {
 	getPhysicalResourceFingerprint,
@@ -194,7 +194,7 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		assertIndexSection(isOptionalNonNegativeInteger(raw.deletedAt), "files", "deletedAt must be a non-negative integer");
 		assertIndexSection(isOptionalString(raw.deletedByFolder), "files", "deletedByFolder must be a string");
 		assertIndexSection(isOptionalString(raw.lastModifiedBy), "files", "lastModifiedBy must be a string");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.mutationSeq), "files", "mutationSeq must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.mutationSeq), "files", "mutationSeq must be a non-negative integer");
 		assertIndexSection(isOptionalNonNegativeInteger(raw.changedRevision), "files", "changedRevision must be a non-negative integer");
 		assertIndexSection(isOptionalNonNegativeInteger(raw.baseRevision), "files", "baseRevision must be a non-negative integer");
 	}
@@ -207,7 +207,7 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		assertIndexSection(isNonNegativeInteger(raw.changedRevision), "folderTombstones", "changedRevision must be a non-negative integer");
 		assertIndexSection(isNonNegativeInteger(raw.baseRevision), "folderTombstones", "baseRevision must be a non-negative integer");
 		assertIndexSection(typeof raw.lastModifiedBy === "string" && raw.lastModifiedBy.length > 0, "folderTombstones", "lastModifiedBy is required");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.mutationSeq), "folderTombstones", "mutationSeq must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.mutationSeq), "folderTombstones", "mutationSeq must be a non-negative integer");
 	}
 	assertIndexSection(isJsonRecord(data.moves), "moves", "must be an object");
 	for (const [id, raw] of Object.entries(data.moves)) {
@@ -220,7 +220,7 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		assertIndexSection(isNonNegativeInteger(raw.changedRevision), "moves", "changedRevision must be a non-negative integer");
 		assertIndexSection(typeof raw.pending === "boolean", "moves", "pending must be boolean");
 		assertIndexSection(typeof raw.lastModifiedBy === "string" && raw.lastModifiedBy.length > 0, "moves", "lastModifiedBy is required");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.mutationSeq), "moves", "mutationSeq must be a non-negative integer");
+		assertIndexSection(isNonNegativeInteger(raw.mutationSeq), "moves", "mutationSeq must be a non-negative integer");
 	}
 	assertIndexSection(isJsonRecord(data.appliedMutationSeq), "appliedMutationSeq", "must be an object");
 	for (const [deviceId, sequence] of Object.entries(data.appliedMutationSeq)) {
@@ -516,39 +516,6 @@ export class IndexManager {
 	}
 
 	/**
-	 * Convert the version 1.1 local index into a content baseline without
-	 * claiming that any v4 epoch has already been observed.
-	 */
-	loadLegacyLocalIndexFromData(data: {
-		lastSyncTime?: number;
-		files?: Record<string, Partial<FileMetadata>>;
-	} | null): void {
-		const files: Record<string, FileMetadata> = {};
-		for (const [path, metadata] of Object.entries(data?.files ?? {})) {
-			if (typeof metadata.sha256 !== "string") continue;
-			files[path] = {
-				path,
-				sha256: metadata.sha256,
-				size: typeof metadata.size === "number" ? metadata.size : 0,
-				mtime: typeof metadata.mtime === "number" ? metadata.mtime : 0,
-				syncedAt:
-					typeof metadata.syncedAt === "number" ? metadata.syncedAt : 0,
-				deleted: metadata.deleted,
-				deletedAt: metadata.deletedAt,
-				lastModifiedBy: metadata.lastModifiedBy,
-			};
-		}
-		this.localState = {
-			...createEmptyLocalState(this.settings.deviceId),
-			lastSyncTime: data?.lastSyncTime ?? 0,
-			files,
-		};
-		logger.info("Migrated legacy device baseline", {
-			baselineFiles: Object.keys(files).length,
-		});
-	}
-
-	/**
 	 * Allow one force-sync commit to replace a legacy index with v4.
 	 */
 	beginForceBootstrap(replaceRemote = true): void {
@@ -758,7 +725,6 @@ export class IndexManager {
 						current &&
 						!canApplyDestructiveFolderMutation(
 							current,
-							this.localState.files[path],
 							mutation.baseRevision ?? 0,
 							this.settings.deviceId,
 							mutation.seq,
@@ -1093,6 +1059,9 @@ export class IndexManager {
 		};
 		logger.info("Canonical index transaction started", transactionContext);
 
+		if (this.replaceRemoteOnNextSave) {
+			await this.assertForceSourceSupported(canonicalPath);
+		}
 		await this.ensureCanonicalIndex();
 
 		let acquired = false;
@@ -1157,20 +1126,9 @@ export class IndexManager {
 					"source",
 				);
 			} catch (sourceReadError) {
-				if (!this.replaceRemoteOnNextSave) throw sourceReadError;
 				originalSnapshot =
 					await this.downloadUnparsedIndexSnapshot(lockPath);
-				logger.warn(
-					"Force transaction captured an unreadable source index as raw bytes",
-					{
-						...transactionContext,
-						sourceReadable: false,
-						sourceFingerprint: shortenDiagnosticValue(
-							originalSnapshot.fingerprint,
-						),
-						error: sourceReadError,
-					},
-				);
+				throw sourceReadError;
 			}
 			const latest = this.replaceRemoteOnNextSave
 				? this.createReplacementBaseline()
@@ -1399,6 +1357,7 @@ export class IndexManager {
 				error: e,
 			});
 			if (rollbackOutcome === "rolled-back") {
+				if (e instanceof UnsupportedPrereleaseDataError) throw e;
 				throw new RemoteIndexRolledBackError(
 					e instanceof Error
 						? e.message
@@ -1420,6 +1379,41 @@ export class IndexManager {
 				stage,
 				e,
 			);
+		}
+	}
+
+	/** Reject detectable prerelease or malformed data before Force takes a lock. */
+	private async assertForceSourceSupported(
+		canonicalPath: string,
+	): Promise<void> {
+		const resource = await this.yandexClient.getResource(
+			canonicalPath,
+			1,
+			0,
+			true,
+		);
+		if (!resource) return;
+		const allowPlaintextLegacy =
+			this.transitionIndexReadService === undefined &&
+			!this.yandexClient.hasEncryptionService();
+		try {
+			await this.downloadIndexSnapshot(
+				canonicalPath,
+				allowPlaintextLegacy,
+				this.transitionIndexReadService,
+				"source",
+				resource,
+			);
+		} catch (error) {
+			if (
+				!allowPlaintextLegacy &&
+				error instanceof LegacyIndexVersionError
+			) {
+				throw new UnsupportedPrereleaseDataError(
+					"Encrypted canonical index v1/v2 is unsupported",
+				);
+			}
+			throw error;
 		}
 	}
 
@@ -1908,7 +1902,11 @@ export class IndexManager {
 			}
 			logger.debug("Decoded remote index snapshot", { codec });
 			return {
-				index: this.normalizeParsedIndex(decoded.data, allowLegacy),
+				index: this.normalizeParsedIndex(
+					decoded.data,
+					allowLegacy,
+					serviceOverride !== null,
+				),
 				codec,
 			};
 		}
@@ -1922,35 +1920,16 @@ export class IndexManager {
 		if ("data" in current) {
 			logger.debug("Decoded remote index snapshot", { codec: "current" });
 			return {
-				index: this.normalizeParsedIndex(current.data, allowLegacy),
+				index: this.normalizeParsedIndex(
+					current.data,
+					allowLegacy,
+					this.yandexClient.hasEncryptionService(),
+				),
 				codec: "current",
 			};
 		}
 		attempts.push(current.attempt);
 
-		if (!this.yandexClient.hasEncryptionService()) {
-			throw await this.createUnreadableIndexError(
-				raw,
-				fingerprint,
-				attempts,
-			);
-		}
-
-		const plaintext = await this.tryDecodeIndexCodec(
-			raw,
-			null,
-			"plaintext",
-		);
-		if ("data" in plaintext) {
-			logger.debug("Decoded remote index snapshot", {
-				codec: "plaintext",
-			});
-			return {
-				index: this.normalizeParsedIndex(plaintext.data, allowLegacy),
-				codec: "plaintext",
-			};
-		}
-		attempts.push(plaintext.attempt);
 		throw await this.createUnreadableIndexError(raw, fingerprint, attempts);
 	}
 
@@ -1995,16 +1974,27 @@ export class IndexManager {
 	private normalizeParsedIndex(
 		data: unknown,
 		allowLegacy: boolean,
+		decodedWithEncryption: boolean,
 	): SyncIndex {
 		if (!isJsonRecord(data)) {
 			throw new InvalidCurrentIndexError("root", "must be an object");
 		}
 		const versionKind = classifyIndexVersion(data.version);
 		if (versionKind !== "current") {
+			if (versionKind === "legacy" && decodedWithEncryption) {
+				throw new UnsupportedPrereleaseDataError(
+					"Encrypted canonical index v1/v2 is unsupported",
+				);
+			}
 			if (allowLegacy && versionKind === "legacy") {
 				return this.normalizeLegacyIndex(data);
 			}
 			if (versionKind === "unsupported") {
+				if (data.version === 3) {
+					throw new UnsupportedPrereleaseDataError(
+						"Canonical index v3 was written by an unsupported prerelease",
+					);
+				}
 				throw new Error(
 					`Remote sync index version ${String(data.version)} is not supported by this plugin version.`,
 				);
@@ -3109,28 +3099,35 @@ export class IndexManager {
 	private parseEncryptionManifest(
 		data: Record<string, unknown>,
 	): RemoteEncryptionManifest {
+		if (data.version === 1 || data.version === 2) {
+			throw new UnsupportedPrereleaseDataError(
+				`Encryption manifest v${String(data.version)} is unsupported`,
+			);
+		}
 		const salt = data.salt;
 		if (typeof salt !== "string" || !salt) {
 			throw new Error("Invalid encryption manifest: missing salt");
 		}
 		this.assertManifestBase64(salt, 16, 16, "salt");
 
-		if (data.version === 1) {
-			return {
-				version: 1,
-				state: "enabled",
-				revision: 1,
-				salt,
-				verifier: null,
-				legacy: true,
-				updatedAt: 0,
-				updatedBy: "",
-			};
-		}
-
-		if (data.version !== 2 && data.version !== 3) {
+		if (data.version !== 3) {
 			throw new Error("Unsupported encryption manifest version");
 		}
+		this.assertManifestKeys(data, [
+			"version",
+			"profileId",
+			"state",
+			"revision",
+			"salt",
+			"verifier",
+			"kdf",
+			"keySchedule",
+			"cipher",
+			"filenameCipher",
+			"updatedAt",
+			"updatedBy",
+			"transition",
+		]);
 
 		const state = data.state;
 		const revision = data.revision;
@@ -3144,62 +3141,35 @@ export class IndexManager {
 		) {
 			throw new Error("Invalid encryption manifest: unsupported state");
 		}
-		if (typeof revision !== "number" || revision < 1) {
+		if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
 			throw new Error("Invalid encryption manifest: invalid revision");
 		}
 		if (typeof verifier !== "string" || !verifier) {
 			throw new Error("Invalid encryption manifest: missing verifier");
 		}
 		this.assertManifestBase64(verifier, 28, 4096, "verifier");
-		if (typeof updatedAt !== "number") {
+		if (!Number.isSafeInteger(updatedAt) || (updatedAt as number) < 0) {
 			throw new Error("Invalid encryption manifest: invalid updatedAt");
 		}
-		if (typeof updatedBy !== "string") {
+		if (typeof updatedBy !== "string" || !updatedBy) {
 			throw new Error("Invalid encryption manifest: invalid updatedBy");
 		}
 
 		const transition = this.parseEncryptionTransition(data.transition);
-		if (data.version === 2) {
-			this.assertLegacyManifestAlgorithms(data.kdf, data.cipher);
-			return {
-				version: 2,
-				state,
-				revision,
-				salt,
-				verifier,
-				kdf: {
-					name: "PBKDF2",
-					hash: "SHA-256",
-					iterations: PBKDF2_ITERATIONS,
-				},
-				cipher: {
-					name: "AES-GCM",
-					keyLength: AES_KEY_LENGTH,
-					ivLength: IV_LENGTH,
-				},
-				updatedAt,
-				updatedBy,
-				transition,
-			};
-		}
-
-		this.assertHardenedManifestAlgorithms(data);
 		if (
-			transition &&
-			(transition.source === undefined ||
-				transition.target === undefined ||
-				transition.sourceProfileId === undefined ||
-				transition.targetProfileId === undefined)
+			(state === "enabled" && transition !== undefined) ||
+			(state !== "enabled" && transition === undefined)
 		) {
 			throw new Error(
-				"Invalid encryption manifest: incomplete v3 transition",
+				"Invalid encryption manifest: transition/state mismatch",
 			);
 		}
+		this.assertHardenedManifestAlgorithms(data);
 		return {
 			version: 3,
 			profileId: "hardened-v3",
 			state,
-			revision,
+			revision: revision as number,
 			salt,
 			verifier,
 			kdf: {
@@ -3222,37 +3192,10 @@ export class IndexManager {
 				encoding: "base64url",
 				aad: "obsidian-yandex-disk-sync:filename:v3",
 			},
-			updatedAt,
+			updatedAt: updatedAt as number,
 			updatedBy,
 			transition,
 		};
-	}
-
-	private assertLegacyManifestAlgorithms(kdf: unknown, cipher: unknown): void {
-		if (kdf !== undefined) {
-			const value = kdf as Record<string, unknown>;
-			if (
-				!kdf ||
-				typeof kdf !== "object" ||
-				value.name !== "PBKDF2" ||
-				value.hash !== "SHA-256" ||
-				value.iterations !== PBKDF2_ITERATIONS
-			) {
-				throw new Error("Invalid encryption manifest: unsupported v2 KDF");
-			}
-		}
-		if (cipher !== undefined) {
-			const value = cipher as Record<string, unknown>;
-			if (
-				!cipher ||
-				typeof cipher !== "object" ||
-				value.name !== "AES-GCM" ||
-				value.keyLength !== AES_KEY_LENGTH ||
-				value.ivLength !== IV_LENGTH
-			) {
-				throw new Error("Invalid encryption manifest: unsupported v2 cipher");
-			}
-		}
 	}
 
 	private assertManifestBase64(
@@ -3278,10 +3221,27 @@ export class IndexManager {
 	private assertHardenedManifestAlgorithms(
 		data: Record<string, unknown>,
 	): void {
-		const kdf = data.kdf as Record<string, unknown> | undefined;
-		const schedule = data.keySchedule as Record<string, unknown> | undefined;
-		const cipher = data.cipher as Record<string, unknown> | undefined;
-		const filename = data.filenameCipher as Record<string, unknown> | undefined;
+		if (
+			!isJsonRecord(data.kdf) ||
+			!isJsonRecord(data.keySchedule) ||
+			!isJsonRecord(data.cipher) ||
+			!isJsonRecord(data.filenameCipher)
+		) {
+			throw new Error("Invalid encryption manifest: unsupported v3 profile");
+		}
+		const kdf = data.kdf;
+		const schedule = data.keySchedule;
+		const cipher = data.cipher;
+		const filename = data.filenameCipher;
+		this.assertManifestKeys(kdf, ["name", "hash", "iterations"]);
+		this.assertManifestKeys(schedule, ["name", "hash"]);
+		this.assertManifestKeys(cipher, ["name", "keyLength", "ivLength"]);
+		this.assertManifestKeys(filename, [
+			"name",
+			"keyLength",
+			"encoding",
+			"aad",
+		]);
 		if (
 			data.profileId !== "hardened-v3" ||
 			kdf?.name !== "PBKDF2" ||
@@ -3309,6 +3269,17 @@ export class IndexManager {
 			throw new Error("Invalid encryption manifest: invalid transition");
 		}
 		const data = value as Record<string, unknown>;
+		this.assertManifestKeys(data, [
+			"id",
+			"phase",
+			"sourceRevision",
+			"targetRevision",
+			"initiatedBy",
+			"source",
+			"target",
+			"sourceProfileId",
+			"targetProfileId",
+		]);
 		const phases = [
 			"prepared",
 			"files-copied",
@@ -3316,20 +3287,40 @@ export class IndexManager {
 			"stable",
 			"cleanup",
 		];
-		const validRevision = (revision: unknown): boolean =>
-			revision === null ||
-			(typeof revision === "number" &&
-				Number.isInteger(revision) &&
-				revision >= 1);
+			const validRevision = (revision: unknown): boolean =>
+				revision === null ||
+				(typeof revision === "number" &&
+					Number.isSafeInteger(revision) &&
+					revision >= 1);
 		if (
 			typeof data.id !== "string" ||
+			!data.id ||
 			typeof data.phase !== "string" ||
 			!phases.includes(data.phase) ||
 			!validRevision(data.sourceRevision) ||
 			!validRevision(data.targetRevision) ||
-			typeof data.initiatedBy !== "string"
+			typeof data.initiatedBy !== "string" ||
+			!data.initiatedBy
 		) {
 			throw new Error("Invalid encryption manifest: invalid transition");
+		}
+		const source = this.parseEncryptionModeDescriptor(data.source);
+		const target = this.parseEncryptionModeDescriptor(data.target);
+		const sourceProfileId = this.parseEncryptionProfileId(
+			data.sourceProfileId,
+		);
+		const targetProfileId = this.parseEncryptionProfileId(
+			data.targetProfileId,
+		);
+		if (
+			(source.enabled && sourceProfileId === null) ||
+			(!source.enabled && sourceProfileId !== null) ||
+			(target.enabled && targetProfileId === null) ||
+			(!target.enabled && targetProfileId !== null) ||
+			source.revision !== data.sourceRevision ||
+			target.revision !== data.targetRevision
+		) {
+			throw new Error("Invalid encryption manifest: profile/mode mismatch");
 		}
 		return {
 			id: data.id,
@@ -3337,40 +3328,41 @@ export class IndexManager {
 			sourceRevision: data.sourceRevision as number | null,
 			targetRevision: data.targetRevision as number | null,
 			initiatedBy: data.initiatedBy,
-			source: this.parseEncryptionModeDescriptor(data.source),
-			target: this.parseEncryptionModeDescriptor(data.target),
-			sourceProfileId: this.parseEncryptionProfileId(
-				data.sourceProfileId,
-			),
-			targetProfileId: this.parseEncryptionProfileId(
-				data.targetProfileId,
-			),
+			source,
+			target,
+			sourceProfileId,
+			targetProfileId,
 		};
 	}
 
 	private parseEncryptionProfileId(
 		value: unknown,
 	): EncryptionTransitionDescriptor["sourceProfileId"] {
-		if (value === undefined || value === null) return value;
-		if (value === "legacy-v2" || value === "hardened-v3") return value;
+		if (value === null) return null;
+		if (value === "hardened-v3") return value;
 		throw new Error("Invalid encryption manifest: invalid profile ID");
 	}
 
 	private parseEncryptionModeDescriptor(
 		value: unknown,
 	): EncryptionTransitionDescriptor["source"] {
-		if (value === undefined) return undefined;
 		if (!value || typeof value !== "object") {
 			throw new Error(
 				"Invalid encryption manifest: invalid mode descriptor",
 			);
 		}
 		const descriptor = value as Record<string, unknown>;
+		this.assertManifestKeys(descriptor, [
+			"enabled",
+			"revision",
+			"salt",
+			"verifier",
+		]);
 		if (
 			typeof descriptor.enabled !== "boolean" ||
 			!(
 				descriptor.revision === null ||
-				typeof descriptor.revision === "number"
+				Number.isSafeInteger(descriptor.revision)
 			) ||
 			!(
 				descriptor.salt === null ||
@@ -3385,12 +3377,55 @@ export class IndexManager {
 				"Invalid encryption manifest: invalid mode descriptor",
 			);
 		}
+		if (descriptor.enabled) {
+			if (
+				!Number.isSafeInteger(descriptor.revision) ||
+				(descriptor.revision as number) < 1 ||
+				typeof descriptor.salt !== "string" ||
+				!descriptor.salt ||
+				typeof descriptor.verifier !== "string" ||
+				!descriptor.verifier
+			) {
+				throw new Error(
+					"Invalid encryption manifest: invalid encrypted mode descriptor",
+				);
+			}
+			this.assertManifestBase64(descriptor.salt, 16, 16, "transition salt");
+			this.assertManifestBase64(
+				descriptor.verifier,
+				28,
+				4096,
+				"transition verifier",
+			);
+		} else if (
+			descriptor.revision !== null ||
+			descriptor.salt !== null ||
+			descriptor.verifier !== null
+		) {
+			throw new Error(
+				"Invalid encryption manifest: invalid plaintext mode descriptor",
+			);
+		}
 		return {
 			enabled: descriptor.enabled,
-			revision: descriptor.revision,
+			revision: descriptor.revision as number | null,
 			salt: descriptor.salt,
 			verifier: descriptor.verifier,
 		};
+	}
+
+	private assertManifestKeys(
+		data: Record<string, unknown>,
+		allowed: readonly string[],
+	): void {
+		const keys = new Set(allowed);
+		for (const key of Object.keys(data)) {
+			if (!keys.has(key)) {
+				throw new Error(
+					`Invalid encryption manifest: unsupported field ${key}`,
+				);
+			}
+		}
 	}
 
 	private isEncryptionManifestState(

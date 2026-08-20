@@ -129,10 +129,10 @@ test("folder delete target planning handles ten thousand descendants", () => {
 	assert.equal(targets.knownDescendants, 10_000);
 });
 
-test("v1 through v3 are legacy while v4 is current", () => {
+test("only v1 and v2 are legacy while v3 is unsupported", () => {
 	assert.equal(classifyIndexVersion(1), "legacy");
 	assert.equal(classifyIndexVersion(2), "legacy");
-	assert.equal(classifyIndexVersion(3), "legacy");
+	assert.equal(classifyIndexVersion(3), "unsupported");
 	assert.equal(classifyIndexVersion(4), "current");
 	assert.equal(classifyIndexVersion(5), "unsupported");
 });
@@ -316,7 +316,7 @@ test("foreign newer and unsequenced children are never destructively inferred", 
 	);
 });
 
-test("unsequenced prerelease v4 child requires an exact observed baseline", () => {
+test("unsequenced v4 child never authorizes a destructive folder mutation", () => {
 	const current = file("folder/note.md", {
 		changedRevision: 7,
 		lastModifiedBy: "device-a",
@@ -324,32 +324,16 @@ test("unsequenced prerelease v4 child requires an exact observed baseline", () =
 	assert.equal(
 		canApplyDestructiveFolderMutation(
 			current,
-			{ ...current },
 			7,
 			"device-a",
 			4,
 		),
+		false,
+	);
+	current.mutationSeq = 4;
+	assert.equal(
+		canApplyDestructiveFolderMutation(current, 7, "device-a", 4),
 		true,
-	);
-	assert.equal(
-		canApplyDestructiveFolderMutation(
-			current,
-			{ ...current, sha256: "different" },
-			7,
-			"device-a",
-			4,
-		),
-		false,
-	);
-	assert.equal(
-		canApplyDestructiveFolderMutation(
-			current,
-			undefined,
-			7,
-			"device-a",
-			4,
-		),
-		false,
 	);
 });
 

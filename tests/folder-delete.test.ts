@@ -18,6 +18,8 @@ function metadata(
 		deleted?: boolean;
 		fingerprint?: string;
 		changedRevision?: number;
+		lastModifiedBy?: string;
+		mutationSeq?: number;
 	},
 ): FileMetadata {
 	return {
@@ -29,6 +31,8 @@ function metadata(
 		deleted: options?.deleted,
 		remoteFingerprint: options?.fingerprint,
 		changedRevision: options?.changedRevision,
+		lastModifiedBy: options?.lastModifiedBy ?? "device-test",
+		mutationSeq: options?.mutationSeq ?? 1,
 	};
 }
 

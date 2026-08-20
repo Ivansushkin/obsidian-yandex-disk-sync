@@ -8,7 +8,7 @@ export function classifyIndexVersion(
 	version: unknown,
 ): "current" | "legacy" | "unsupported" {
 	if (version === CURRENT_INDEX_VERSION) return "current";
-	if (version === 1 || version === 2 || version === 3) return "legacy";
+	if (version === 1 || version === 2) return "legacy";
 	return "unsupported";
 }
 
@@ -103,33 +103,22 @@ export function shouldPreserveConcurrentFolderChild(
 }
 
 /**
- * Authorize a destructive folder mutation using v4 sequence data or, for
- * prerelease v4 entries, an exact baseline that proves the state was observed.
+ * Authorize a destructive folder mutation only from current v4 sequence data.
+ * Missing sequence information never proves causal ownership.
  */
 export function canApplyDestructiveFolderMutation(
 	metadata: FileMetadata,
-	baseline: FileMetadata | undefined,
 	folderBaseRevision: number,
 	incomingDeviceId: string,
 	incomingMutationSeq: number,
 ): boolean {
 	if (metadata.deleted) return false;
-	if (typeof metadata.mutationSeq === "number") {
-		return !shouldPreserveConcurrentFolderChild(
-			metadata,
-			folderBaseRevision,
-			incomingDeviceId,
-			incomingMutationSeq,
-		);
-	}
-	return (
-		baseline !== undefined &&
-		baseline.deleted !== true &&
-		metadata.sha256 === baseline.sha256 &&
-		metadata.changedRevision === baseline.changedRevision &&
-		metadata.lastModifiedBy === baseline.lastModifiedBy &&
-		baseline.mutationSeq === undefined &&
-		folderBaseRevision >= (metadata.changedRevision ?? 0)
+	if (typeof metadata.mutationSeq !== "number") return false;
+	return !shouldPreserveConcurrentFolderChild(
+		metadata,
+		folderBaseRevision,
+		incomingDeviceId,
+		incomingMutationSeq,
 	);
 }
 

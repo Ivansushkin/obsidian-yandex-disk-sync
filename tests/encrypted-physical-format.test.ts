@@ -3,7 +3,6 @@ import test from "node:test";
 import { YandexDiskClient } from "../src/api/yandex-client";
 import {
 	EncryptionService,
-	HardenedEncryptionService,
 	SALT_LENGTH,
 } from "../src/crypto/encryption";
 
@@ -14,14 +13,14 @@ async function createEncryptedClient(): Promise<{
 	const salt = new Uint8Array(SALT_LENGTH);
 	salt.fill(7);
 	const service = new EncryptionService(salt);
-	await service.initializeKey("beta-2-test-password");
+	await service.initializeKey("current-password");
 	const client = new YandexDiskClient({ token: "test-token" });
 	client.setRemotePath("vault");
 	client.setEncryptionService(service);
 	return { client, service };
 }
 
-test("real encryption service transforms physical paths and content", async () => {
+test("current encryption transforms every user path segment and content", async () => {
 	const { client, service } = await createEncryptedClient();
 	const logicalPath = "vault/Папка/deep/Заметка.md";
 	const physicalPath = await client.getPhysicalPath(logicalPath);
@@ -61,7 +60,7 @@ test("invalid encrypted resource name never falls back to a logical path", async
 });
 
 test("hardened folder moves keep descendant physical segments unchanged", async () => {
-	const service = new HardenedEncryptionService(
+	const service = new EncryptionService(
 		new Uint8Array(SALT_LENGTH).fill(9),
 	);
 	await service.initializeKey("password");

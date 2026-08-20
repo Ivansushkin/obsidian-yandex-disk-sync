@@ -73,13 +73,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_no_changes": "Synchronization completed: no changes",
 		"notice.sync_exception": "Synchronization failed: {message}",
 		"notice.force_sync_exception": "Force sync failed: {message}",
+		"notice.unsupported_prerelease_data":
+			"Synchronization is blocked because unsupported historical or prerelease data was detected. Use a clean remote path or reset the old data manually after creating an independent backup.",
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
-		"notice.encryption_upgrade_required":
-			"Encryption must be upgraded before synchronization can continue. Open plugin settings and run the protected format upgrade.",
-		"notice.encryption_upgrading": "Upgrading encryption format...",
-		"notice.encryption_upgrade_completed":
-			"Encryption format upgraded successfully",
 		"notice.legacy_index_blocked":
 			"This plugin version detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
 		"notice.unreadable_index_blocked":
@@ -207,10 +204,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.backup_download_completed": "Backup downloaded: {name}",
 		"notice.backup_download_failed": "Failed to download backup",
 		"notice.backup_list_load_failed": "Failed to load backup list",
-		"notice.backup_encrypted_no_key":
-			"This backup was encrypted. Enable E2E encryption or re-enter the encryption password to download it.",
-		"notice.backup_old_key":
-			"This backup was encrypted with an older password and cannot be downloaded after password rotation.",
 		"notice.logs_cleared": "Logs cleared",
 
 		// Generic strings
@@ -220,14 +213,6 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Enable end-to-end encryption for files on Yandex Disk",
 		"settings.encryption_status_active": "Encryption active",
 		"settings.encryption_change_password": "Change password",
-		"settings.encryption_upgrade_title": "Encryption upgrade required",
-		"settings.encryption_upgrade_desc":
-			"Create a verified independent backup and migrate filenames and keys to the hardened v3 format.",
-		"settings.encryption_upgrade_button": "Upgrade encryption",
-		"modal.encryption_upgrade_title": "Upgrade encryption format",
-		"modal.encryption_upgrade_warning":
-			"A new verified backup will be created first. Existing .enc.zip backups are not modified and may still require the old vault key after migration.",
-		"modal.encryption_upgrade_button": "Back up and upgrade",
 		"modal.encryption_enable_title": "Enable encryption",
 		"modal.encryption_enable_warning":
 			"Enabling encryption will overwrite ALL files on Yandex Disk with encrypted versions. If you lose your password, access to your data will be permanently lost.",
@@ -395,13 +380,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_exception": "Ошибка синхронизации: {message}",
 		"notice.force_sync_exception":
 			"Ошибка принудительной синхронизации: {message}",
+		"notice.unsupported_prerelease_data":
+			"Синхронизация заблокирована: обнаружены неподдерживаемые исторические или prerelease-данные. Выберите чистый удалённый каталог или вручную сбросьте старые данные после создания независимого бекапа.",
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
-		"notice.encryption_upgrade_required":
-			"Перед продолжением синхронизации нужно усилить шифрование. Откройте настройки плагина и запустите защищённую миграцию формата.",
-		"notice.encryption_upgrading": "Обновление формата шифрования...",
-		"notice.encryption_upgrade_completed":
-			"Формат шифрования успешно обновлён",
 		"notice.legacy_index_blocked":
 			"Текущая версия плагина обнаружила старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
 		"notice.unreadable_index_blocked":
@@ -530,10 +512,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.backup_download_completed": "Бекап скачан: {name}",
 		"notice.backup_download_failed": "Ошибка скачивания бекапа",
 		"notice.backup_list_load_failed": "Ошибка загрузки списка бекапов",
-		"notice.backup_encrypted_no_key":
-			"Этот бекап зашифрован. Включите сквозное шифрование или введите пароль заново, чтобы скачать его.",
-		"notice.backup_old_key":
-			"Этот бекап зашифрован старым паролем и не может быть скачан после смены пароля.",
 		"notice.logs_cleared": "Логи очищены",
 
 		// Generic strings
@@ -543,14 +521,6 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Включить сквозное шифрование для файлов на Яндекс.Диске",
 		"settings.encryption_status_active": "Шифрование активно",
 		"settings.encryption_change_password": "Сменить пароль",
-		"settings.encryption_upgrade_title": "Требуется обновление шифрования",
-		"settings.encryption_upgrade_desc":
-			"Создать проверенный независимый backup и перевести имена и ключи на усиленный формат v3.",
-		"settings.encryption_upgrade_button": "Обновить шифрование",
-		"modal.encryption_upgrade_title": "Обновление формата шифрования",
-		"modal.encryption_upgrade_warning":
-			"Сначала будет создан новый проверенный backup. Старые .enc.zip не изменяются и после миграции могут по-прежнему требовать прежний ключ хранилища.",
-		"modal.encryption_upgrade_button": "Создать backup и обновить",
 		"modal.encryption_enable_title": "Включение шифрования",
 		"modal.encryption_enable_warning":
 			"Включение шифрования перезапишет ВСЕ файлы на Яндекс.Диске зашифрованными версиями. Если вы забудете пароль, доступ к данным будет безвозвратно утерян.",

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.0.0-beta.6
+
+### Breaking changes
+
+- Removed migration and recovery compatibility with every 2.0.0 prerelease.
+  Manifest v2, canonical index v3, unversioned beta queues, incomplete beta
+  transitions, and non-envelope `.enc.zip` archives now fail closed.
+- Limited legacy migration to plaintext stable 1.0.0 and 1.1.0 data. Their
+  `localIndex` becomes an unobserved current baseline and plaintext canonical
+  v1/v2 requires explicit backed-up Force. Stable 1.2 data is unsupported.
+- Current v4 entries without `mutationSeq` no longer receive a prerelease
+  baseline fallback and cannot authorize destructive folder operations.
+
+### Security
+
+- Force now classifies an existing canonical index before taking its lock.
+  Detectable prerelease v3 and malformed current data are rejected before any
+  remote mutation.
+- Historical backup downloads validate ZIP magic. Non-envelope `.enc.zip`,
+  unknown `.zip` bytes, encrypted legacy names, and manifest v1/v2 never invoke
+  a compatibility decoder.
+- Strict v3 parsing rejects extra algorithm fields and transition/state
+  mismatches. Startup, manual/Force backup, and transition preflight/recovery
+  revalidate the manifest before enabling remote writes or cleanup.
+- Current plugin data and transition snapshots require schema v2 and explicit
+  encryption profile metadata. Unsupported prerelease data stops plugin
+  startup with manual clean-path/reset guidance.
+
 ## 2.0.0-beta.5
 
 ### Security

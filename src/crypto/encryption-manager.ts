@@ -26,7 +26,7 @@ export class EncryptionManager {
 	getManifestProfileId(
 		manifest: RemoteEncryptionManifest,
 	): EncryptionProfileId {
-		return manifest.version === 3 ? "hardened-v3" : "legacy-v2";
+		return manifest.profileId;
 	}
 
 	async createCodec(
@@ -60,14 +60,15 @@ export class EncryptionManager {
 	}
 
 	captureSnapshot(settings: YandexDiskSyncSettings): LocalEncryptionSnapshot {
+		const profileId = settings.enableEncryption
+			? requireProfileId(settings.encryptionProfileId)
+			: null;
 		return {
 			enabled: settings.enableEncryption,
 			salt: settings.encryptionSalt,
 			password: settings.encryptionPassword,
 			revision: settings.encryptionRevision,
-			profileId: settings.enableEncryption
-				? (settings.encryptionProfileId ?? "legacy-v2")
-				: null,
+			profileId,
 		};
 	}
 
@@ -78,7 +79,7 @@ export class EncryptionManager {
 		const codec =
 			snapshot.enabled && snapshot.salt && snapshot.password
 				? await this.createCodec(
-						snapshot.profileId ?? "legacy-v2",
+						requireProfileId(snapshot.profileId),
 						snapshot.salt,
 						snapshot.password,
 					)
@@ -88,7 +89,7 @@ export class EncryptionManager {
 		settings.encryptionPassword = snapshot.password;
 		settings.encryptionRevision = snapshot.revision;
 		settings.encryptionProfileId = snapshot.enabled
-			? (snapshot.profileId ?? "legacy-v2")
+			? requireProfileId(snapshot.profileId)
 			: null;
 		return codec;
 	}
@@ -105,7 +106,7 @@ export class EncryptionManager {
 			};
 		}
 		const codec = await this.createCodec(
-			snapshot.profileId ?? "legacy-v2",
+			requireProfileId(snapshot.profileId),
 			snapshot.salt,
 			snapshot.password,
 		);
@@ -127,6 +128,13 @@ export class EncryptionManager {
 		maintenance?: IndexMaintenance;
 	}): Promise<EncryptionManifest> {
 		const { service, salt, state, revision, deviceId, transition } = options;
+		if (service.profileId !== "hardened-v3") {
+			throw new Error("Only hardened-v3 manifests can be written");
+		}
+		const maintenance = transition ? options.maintenance : undefined;
+		if (transition && !maintenance) {
+			throw new Error("Transition manifest requires canonical maintenance");
+		}
 		const common = {
 			state,
 			revision,
@@ -146,28 +154,13 @@ export class EncryptionManager {
 						sourceRevision: transition.source.revision,
 						targetRevision: transition.target.revision,
 						initiatedBy: deviceId,
-						source: options.maintenance?.source,
-						target: options.maintenance?.target,
-						sourceProfileId:
-							transition.source.profileId ??
-							(transition.source.enabled ? "legacy-v2" : null),
-						targetProfileId:
-							transition.target.profileId ??
-							(transition.target.enabled ? "legacy-v2" : null),
+						source: maintenance!.source,
+						target: maintenance!.target,
+						sourceProfileId: transition.source.profileId,
+						targetProfileId: transition.target.profileId,
 					}
 				: undefined,
 		};
-		if (service.profileId === "legacy-v2") {
-			return {
-				version: 2,
-				...common,
-				kdf: {
-					name: "PBKDF2",
-					hash: "SHA-256",
-					iterations: 100_000,
-				},
-			};
-		}
 		return {
 			version: 3,
 			profileId: "hardened-v3",
@@ -186,4 +179,11 @@ export class EncryptionManager {
 			},
 		};
 	}
+}
+
+function requireProfileId(
+	profileId: EncryptionProfileId | null,
+): EncryptionProfileId {
+	if (!profileId) throw new Error("Encrypted snapshot requires a profile ID");
+	return profileId;
 }

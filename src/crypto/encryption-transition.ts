@@ -14,7 +14,7 @@ export interface LocalEncryptionSnapshot {
 	salt: string | null;
 	password: string | null;
 	revision: number | null;
-	profileId?: EncryptionProfileId | null;
+	profileId: EncryptionProfileId | null;
 }
 
 export interface EncryptionBackupProof {
@@ -29,7 +29,6 @@ export interface EncryptionBackupProof {
 export interface LocalEncryptionTransition {
 	id: string;
 	kind: "enable" | "disable" | "rotate";
-	reason?: "format-upgrade";
 	phase: EncryptionTransitionPhase;
 	source: LocalEncryptionSnapshot;
 	target: LocalEncryptionSnapshot;

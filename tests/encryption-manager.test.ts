@@ -7,7 +7,7 @@ import type { YandexDiskSyncSettings } from "../src/types";
 const manager = new EncryptionManager();
 const salt = EncryptionService.bytesToBase64(new Uint8Array(16).fill(7));
 
-test("encryption manager preserves legacy snapshot defaults", async () => {
+test("encryption manager requires explicit current profile metadata", () => {
 	const settings = {
 		enableEncryption: true,
 		encryptionSalt: salt,
@@ -15,15 +15,26 @@ test("encryption manager preserves legacy snapshot defaults", async () => {
 		encryptionRevision: 4,
 		encryptionProfileId: null,
 	} as YandexDiskSyncSettings;
-	const snapshot = manager.captureSnapshot(settings);
-	assert.equal(snapshot.profileId, "legacy-v2");
-	const codec = await manager.applySnapshot(settings, snapshot);
-	assert.equal(codec?.profileId, "legacy-v2");
-	assert.equal(settings.encryptionProfileId, "legacy-v2");
+	assert.throws(
+		() => manager.captureSnapshot(settings),
+		/explicit profile ID|requires a profile ID/,
+	);
 });
 
 test("encryption manager emits strict hardened v3 manifest descriptors", async () => {
 	const codec = await manager.createCodec("hardened-v3", salt, "password");
+	const source = {
+		enabled: true,
+		revision: 4,
+		salt,
+		verifier: "source-verifier",
+	};
+	const target = {
+		enabled: true,
+		revision: 5,
+		salt,
+		verifier: "target-verifier",
+	};
 	const manifest = await manager.createManifest({
 		service: codec,
 		salt,
@@ -33,14 +44,13 @@ test("encryption manager emits strict hardened v3 manifest descriptors", async (
 		transition: {
 			id: "transition-a",
 			kind: "rotate",
-			reason: "format-upgrade",
 			phase: "prepared",
 			source: {
 				enabled: true,
 				salt,
 				password: "password",
 				revision: 4,
-				profileId: "legacy-v2",
+				profileId: "hardened-v3",
 			},
 			target: {
 				enabled: true,
@@ -55,10 +65,21 @@ test("encryption manager emits strict hardened v3 manifest descriptors", async (
 			targetFingerprints: {},
 			sourceCanonicalRevision: 11,
 		},
+		maintenance: {
+			id: "transition-a",
+			kind: "rotate",
+			phase: "prepared",
+			initiatedBy: "device-a",
+			sourceRevision: 4,
+			targetRevision: 5,
+			source,
+			target,
+			cleanup: [],
+		},
 	});
 	assert.equal(manifest.version, 3);
 	assert.equal(manifest.kdf.iterations, 600_000);
 	assert.equal(manifest.filenameCipher.name, "AES-SIV");
-	assert.equal(manifest.transition?.sourceProfileId, "legacy-v2");
+	assert.equal(manifest.transition?.sourceProfileId, "hardened-v3");
 	assert.equal(manifest.transition?.targetProfileId, "hardened-v3");
 });

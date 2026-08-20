@@ -18,6 +18,10 @@ const evidence = readJson("docs/release-evidence/2.0.0.json");
 const version = packageJson.version;
 const stable = !version.includes("-");
 
+if (evidence.betaVersion !== "2.0.0-beta.6") {
+	fail("release evidence must target 2.0.0-beta.6");
+}
+
 if (manifest.version !== version) fail("package and manifest versions differ");
 if (manifest.minAppVersion !== "1.0.0") fail("minAppVersion must be 1.0.0");
 if (versions[version] !== manifest.minAppVersion) {
@@ -87,7 +91,7 @@ if (stable) {
 		fail("manual P0/P1 evidence is not complete");
 	}
 	if (!/^[0-9a-f]{40}$/.test(evidence.betaCommit ?? "")) {
-		fail("verified beta.5 commit SHA is missing");
+		fail("verified beta.6 commit SHA is missing");
 	}
 	const priorityLines = catalog
 		.split("\n")
@@ -144,7 +148,7 @@ if (stable) {
 		.filter(Boolean);
 	const forbidden = changed.filter((path) => !allowedStableDiff.has(path));
 	if (forbidden.length > 0) {
-		fail(`stable differs from beta.5 code: ${forbidden.join(", ")}`);
+		fail(`stable differs from beta.6 code: ${forbidden.join(", ")}`);
 	}
 }
 

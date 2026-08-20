@@ -82,7 +82,7 @@
 
 ## Encryption
 
-- The remote manifest remains v2; the canonical index is v4.
+- The remote manifest is strict v3; the canonical index is v4.
 - Canonical, lock, and manifest names are raw. Canonical content and user paths
   use the active codec; the manifest is always raw.
 - Enable, disable, rotate, and post-commit recovery use the existing
@@ -97,9 +97,10 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of older builds and 2.0.0-beta.4 is unsupported. Legacy index v1-v3 blocks
-  normal sync until explicit Force sync with backup.
-- Do not change index v4, manifest v2, epoch/revision, mutation FIFO, or the
+- Concurrent use of older builds and 2.0.0-beta.6 is unsupported. Only
+  plaintext stable 1.0/1.1 local data and index v1/v2 are migratable; encrypted
+  legacy data, index v3, manifest v1/v2, and all prerelease queues fail closed.
+- Do not change index v4, manifest v3, epoch/revision, mutation FIFO, or the
   persisted physical-action schema without a separate migration design,
   scenarios, and tests.
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,

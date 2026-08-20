@@ -12,21 +12,7 @@
 - До canonical commit авторитетен source codec. После commit rollback запрещён,
   авторитетен target codec.
 
-## Codec profiles
-
-### `legacy-v2`
-
-Профиль нужен только для чтения, восстановления незавершённого beta-transition
-и явного format upgrade:
-
-- PBKDF2-HMAC-SHA256, 100 000 итераций, salt 16 bytes;
-- один AES-256-GCM key для content и имён;
-- filename: детерминированный публичный IV и Base64URL.
-
-Обычный sync с manifest v1/v2 блокируется состоянием
-`encryption-upgrade-required`. Старый codec не используется для новых vault.
-
-### `hardened-v3`
+## Codec profile: `hardened-v3`
 
 - PBKDF2-HMAC-SHA256, ровно 600 000 итераций, случайная salt 16 bytes;
 - PBKDF2 выводит 256-bit master key;
@@ -49,10 +35,8 @@ ciphertext или UTF-8 блокирует sync до обращения к Vault
 
 `.obsidian-encrypt.json` всегда читается и записывается raw.
 
-- v1 доступен только для подключения и migration.
-- v2 без исторических `kdf`/`cipher` нормализуется в legacy constants.
-- Объявленные v2-параметры должны точно соответствовать
-  PBKDF2-100k/AES-256-GCM; противоречие блокирует sync.
+- v1/v2 и весь encryption format stable/prerelease 1.2 не поддерживаются и
+  всегда блокируются отдельной ошибкой без попытки compatibility decode.
 - v3 обязан полностью и точно объявлять `profileId`, KDF, HKDF, content cipher
   и filename cipher.
 - Unknown version/profile/algorithm блокирует watcher, scheduler, upload,
@@ -63,34 +47,17 @@ profile IDs. Устройство не выбирает codec по локаль�
 
 ## Локальное состояние
 
-`PluginData.schemaVersion = 2`. Encryption snapshot имеет optional
-`profileId`; отсутствие у существующего encrypted snapshot означает
-`legacy-v2`. Миграция аддитивна и не очищает, не сортирует и не переигрывает:
+`PluginData.schemaVersion = 2`. Current encryption и transition snapshots
+обязаны иметь явный `profileId`. Загрузчик принимает только:
 
-- local baseline;
-- pending mutations;
-- pending physical actions;
-- pending watcher events;
-- beta transition recovery data.
+- полную current schema v2, сохраняя baseline и очереди без перестановки;
+- точную plaintext stable 1.0/1.1 форму
+  `settings + localIndex + lastSyncStats`, преобразуя `localIndex` в unobserved
+  baseline и создавая пустые очереди.
 
-## v1/v2 → v3 format upgrade
-
-1. Восстановить незавершённый legacy beta-transition, если он существует.
-2. Выполнить source full sync внутри единственного `SyncCoordinator`.
-3. Создать logical backup текущего согласованного vault и подтвердить exact
-   raw bytes read-back.
-4. Привязать backup proof к canonical epoch/revision и digest local snapshot.
-   После concurrent canonical commit preflight и backup повторяются.
-5. Создать новый hardened-v3 target с новой salt. Пароль можно оставить тем же.
-6. Захватить exclusive canonical maintenance под source codec.
-7. Опубликовать manifest v3 `rotating` до первых target writes.
-8. Перекодировать physical tree, повторно проверить source fingerprints и
-   записать target fingerprints.
-9. Прочитать canonical source codec и записать target codec. Cleanup plan со
-   source paths/fingerprints входит в тот же canonical commit.
-10. Опубликовать stable manifest v3 и выполнить только fingerprint-matching
-    cleanup.
-11. Выполнить full reconcile и только затем запускать watcher/scheduler.
+Unversioned `localState`, beta queues, transition без profile metadata,
+stable 1.2 settings с encryption-полями и любая другая schema блокируют plugin
+startup до создания компонентов синхронизации.
 
 Если initiator потерян после commit, target-capable устройство проверяет
 matching transition ID, target salt/revision/verifier и post-commit phase,
@@ -108,8 +75,6 @@ proof.
 
 - enable создаёт hardened-v3 и backup под target password;
 - rotate создаёт новый hardened-v3 target и backup под new password;
-- format upgrade имеет canonical kind `rotate`, локальный diagnostic reason
-  `format-upgrade`;
 - disable создаёт backup под source password и target plaintext;
 - `clearIndexTransitionServices()` всегда выполняется через `finally`.
 
@@ -117,6 +82,9 @@ proof.
 `enableEncryption`, `disableEncryption`, `rotateEncryptionPassword`,
 `connectToRemoteEncryption`, `verifyEncryptionPassword`,
 `getRemoteEncryptionManifest`, `createBackup`.
+
+Переход из manifest v1/v2 или другого legacy/prerelease encryption metadata не
+создаётся: эти данные fail closed до любых remote writes.
 
 ## Проверки
 

@@ -13,11 +13,11 @@ import {
 	ConnectEncryptedVaultModal,
 	DisableEncryptionModal,
 	EnableEncryptionModal,
-	EncryptionUpgradeModal,
 	VerifyPasswordModal,
 } from "./ui/encryption-modals";
 import type { BackupInfo, RemoteEncryptionManifest } from "./types";
 import { YandexApiError } from "./api/yandex-client";
+import { UnsupportedPrereleaseDataError } from "./compatibility-errors";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
@@ -77,7 +77,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		try {
 			remoteManifest = await this.plugin.getRemoteEncryptionManifest();
 		} catch (e) {
-			new Notice(e instanceof Error ? e.message : String(e));
+			new Notice(
+				e instanceof UnsupportedPrereleaseDataError
+					? t("notice.unsupported_prerelease_data")
+					: e instanceof Error
+						? e.message
+						: String(e),
+			);
 			return;
 		}
 
@@ -380,65 +386,48 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			});
 
 		if (this.plugin.settings.enableEncryption) {
-			if (this.plugin.settings.encryptionProfileId !== "hardened-v3") {
-				new Setting(containerEl)
-					.setName(t("settings.encryption_upgrade_title"))
-					.setDesc(t("settings.encryption_upgrade_desc"))
-					.addButton((button) =>
-						button
-							.setButtonText(t("settings.encryption_upgrade_button"))
-							.setCta()
-							.onClick(async () => {
-								const confirmed = await new Promise<boolean>(
-									(resolve) =>
-										new EncryptionUpgradeModal(
-											this.app,
-											resolve,
-										).open(),
-								);
-								if (!confirmed) return;
-								try {
-									await this.plugin.upgradeEncryptionFormat();
-								} catch {
-									// The plugin owns the result Notice.
-								}
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-							}),
-					);
-			}
 			new Setting(containerEl)
 				.setDesc(t("settings.encryption_status_active"))
 				.addButton((button) =>
 					button
-						.setButtonText(t("settings.encryption_change_password"))
-						.onClick(async () => {
-							const spinner = encryptionToggle
-								? this.showToggleSpinner(encryptionToggle)
-								: null;
-							try {
-								const currentPassword = await this.promptCurrentEncryptionPassword();
-								if (!currentPassword) return;
+								.setButtonText(t("settings.encryption_change_password"))
+								.onClick(async () => {
+									const spinner = encryptionToggle
+										? this.showToggleSpinner(encryptionToggle)
+										: null;
+									try {
+										const currentPassword =
+											await this.promptCurrentEncryptionPassword();
+										if (!currentPassword) return;
 
-								const newPassword = await new Promise<string | null>((resolve) => {
-									new ChangePasswordModal(this.app, resolve).open();
-								});
-								if (!newPassword) return;
+										const newPassword = await new Promise<string | null>(
+											(resolve) =>
+												new ChangePasswordModal(
+													this.app,
+													resolve,
+												).open(),
+										);
+										if (!newPassword) return;
 
-								try {
-									await this.plugin.rotateEncryptionPassword(newPassword);
-								} catch {
-									// The plugin owns the single progress and result Notice.
-								}
-							} finally {
-								if (spinner && encryptionToggle) {
-									this.hideToggleSpinner(encryptionToggle, spinner);
-								}
-								// eslint-disable-next-line @typescript-eslint/no-deprecated
-								this.display();
-							}
-						})
-			);
+										try {
+											await this.plugin.rotateEncryptionPassword(
+												newPassword,
+											);
+										} catch {
+											// The plugin owns the single progress and result Notice.
+										}
+									} finally {
+										if (spinner && encryptionToggle) {
+											this.hideToggleSpinner(
+												encryptionToggle,
+												spinner,
+											);
+										}
+										// eslint-disable-next-line @typescript-eslint/no-deprecated
+										this.display();
+									}
+								}),
+				);
 		}
 
 		// File filters section

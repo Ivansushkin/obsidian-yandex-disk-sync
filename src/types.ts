@@ -47,7 +47,7 @@ export interface YandexDiskSyncSettings {
 	encryptionPassword: string | null;
 	/** Remote encryption manifest revision applied on this device */
 	encryptionRevision: number | null;
-	/** Encryption wire profile; missing historical values mean legacy-v2. */
+	/** Explicit encryption wire profile for current plugin data. */
 	encryptionProfileId: EncryptionProfileId | null;
 }
 
@@ -119,13 +119,13 @@ export interface EncryptionTransitionDescriptor {
 	/** Device responsible for recovery */
 	initiatedBy: string;
 	/** Source encryption mode used before the canonical commit */
-	source?: EncryptionModeDescriptor;
+	source: EncryptionModeDescriptor;
 	/** Target encryption mode used after the canonical commit */
-	target?: EncryptionModeDescriptor;
-	/** Source codec profile, omitted by historical v2 transitions. */
-	sourceProfileId?: EncryptionProfileId | null;
-	/** Target codec profile, omitted by historical v2 transitions. */
-	targetProfileId?: EncryptionProfileId | null;
+	target: EncryptionModeDescriptor;
+	/** Source codec profile, or null for plaintext. */
+	sourceProfileId: EncryptionProfileId | null;
+	/** Target codec profile, or null for plaintext. */
+	targetProfileId: EncryptionProfileId | null;
 }
 
 export interface EncryptionModeDescriptor {
@@ -137,29 +137,6 @@ export interface EncryptionModeDescriptor {
 	salt: string | null;
 	/** Password verifier, or null for plaintext */
 	verifier: string | null;
-}
-
-export interface EncryptionManifestV2 {
-	/** Manifest format version */
-	version: 2;
-	/** Current remote encryption state */
-	state: EncryptionManifestState;
-	/** Monotonic key revision shared by devices */
-	revision: number;
-	/** Base64-encoded PBKDF2 salt */
-	salt: string;
-	/** Base64-encoded encrypted verifier payload */
-	verifier: string;
-	/** Key derivation parameters */
-	kdf: EncryptionManifestKdfParams;
-	/** Cipher parameters */
-	cipher: EncryptionManifestCipherParams;
-	/** Unix timestamp of the latest manifest update */
-	updatedAt: number;
-	/** Device ID that wrote the manifest */
-	updatedBy: string;
-	/** Recovery metadata present only while encryption is transitioning */
-	transition?: EncryptionTransitionDescriptor;
 }
 
 export interface EncryptionManifestKeyScheduleParams {
@@ -191,30 +168,9 @@ export interface EncryptionManifestV3 {
 	transition?: EncryptionTransitionDescriptor;
 }
 
-export type EncryptionManifest = EncryptionManifestV2 | EncryptionManifestV3;
+export type EncryptionManifest = EncryptionManifestV3;
 
-export interface LegacyEncryptionManifest {
-	/** Legacy salt-only manifest format */
-	version: 1;
-	/** Legacy salt-only manifests are treated as enabled */
-	state: "enabled";
-	/** Synthetic revision for legacy manifests */
-	revision: 1;
-	/** Base64-encoded PBKDF2 salt */
-	salt: string;
-	/** Legacy manifests do not contain password verifier */
-	verifier: null;
-	/** Marks a manifest converted from the legacy format */
-	legacy: true;
-	/** Legacy manifests do not contain update timestamp */
-	updatedAt: number;
-	/** Legacy manifests do not contain writer device ID */
-	updatedBy: string;
-}
-
-export type RemoteEncryptionManifest =
-	| EncryptionManifest
-	| LegacyEncryptionManifest;
+export type RemoteEncryptionManifest = EncryptionManifest;
 
 // ============================================================================
 // Synchronization index

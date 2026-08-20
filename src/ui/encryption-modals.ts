@@ -166,38 +166,6 @@ export class DisableEncryptionModal extends ResolvableModal<boolean> {
 
 }
 
-export class EncryptionUpgradeModal extends ResolvableModal<boolean> {
-	constructor(app: App, resolve: (value: boolean) => void) {
-		super(app, resolve, false);
-	}
-
-	onOpen(): void {
-		this.titleEl.setText(t("modal.encryption_upgrade_title"));
-		this.contentEl.createEl("p", {
-			text: t("modal.encryption_upgrade_warning"),
-		});
-		const setting = new Setting(this.contentEl)
-			.addButton((button) =>
-				button
-					.setButtonText(t("modal.encryption_upgrade_button"))
-					.setCta()
-					.onClick(() => {
-						this.finish(true);
-						this.close();
-					}),
-			)
-			.addButton((button) =>
-				button
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(false);
-						this.close();
-					}),
-			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
-	}
-}
-
 export class VerifyPasswordModal extends PasswordModal {
 	private verifyPassword: (password: string) => Promise<boolean>;
 

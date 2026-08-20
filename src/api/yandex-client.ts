@@ -82,9 +82,8 @@ export class YandexDiskClient {
 	}
 
 	/**
-	 * Set the remote base path. Required for segment-wise path encryption:
-	 * the base path itself is never encrypted (it hosts service files and is
-	 * the entry point for traversal), only segments below it are.
+	 * Set the remote base path. The base path itself stays raw while user path
+	 * segments below it are encrypted independently.
 	 */
 	setRemotePath(remotePath: string): void {
 		const normalized = normalizePath(remotePath);
@@ -216,11 +215,7 @@ export class YandexDiskClient {
 		return this.encryptionService.decrypt(data);
 	}
 
-	/**
-	 * Encrypt a remote path segment by segment. The base path is left intact;
-	 * only the segments below it are encrypted. Protected paths (service files,
-	 * backups) are returned unchanged so traversal entry points stay readable.
-	 */
+	/** Map a logical file path to the current physical layout. */
 	private async encryptFilePath(path: string): Promise<string> {
 		if (!this.encryptionService) return path;
 		if (isProtectedPath(path)) return path;
@@ -231,7 +226,6 @@ export class YandexDiskClient {
 
 		const hasBase = base !== "" && full.startsWith(base + "/");
 		const relative = hasBase ? full.slice(base.length + 1) : full;
-
 		const encrypted = await Promise.all(
 			relative.split("/").map((seg) => this.encryptionService!.encryptFilename(seg))
 		);
@@ -244,12 +238,7 @@ export class YandexDiskClient {
 		return await this.encryptionService.decryptFilename(name);
 	}
 
-	/**
-	 * Decrypt a remote path segment by segment, mirroring encryptFilePath().
-	 * Handles the Yandex "disk:/" prefix and leaves the base path and protected
-	 * paths intact. Invalid ciphertext fails closed so a physical name can never
-	 * become a logical vault path by fallback.
-	 */
+	/** Decode a physical resource path without accepting ciphertext fallback. */
 	private async decryptFilePath(path: string): Promise<string> {
 		if (!this.encryptionService) return path;
 		if (isProtectedPath(path)) return path;
@@ -261,7 +250,6 @@ export class YandexDiskClient {
 
 		const hasBase = base !== "" && clean.startsWith(base + "/");
 		const relative = hasBase ? clean.slice(base.length + 1) : clean;
-
 		const decrypted = await Promise.all(
 			relative.split("/").map((seg) => this.decryptFileName(seg))
 		);
@@ -271,9 +259,13 @@ export class YandexDiskClient {
 
 	private async decryptResource(resource: YandexResource): Promise<YandexResource> {
 		if (!this.encryptionService) return resource;
+		const protectedRawResource = isProtectedPath(resource.path);
 		return {
 			...resource,
-			name: await this.decryptFileName(resource.name),
+			name:
+				protectedRawResource
+					? resource.name
+					: await this.decryptFileName(resource.name),
 			path: await this.decryptFilePath(resource.path),
 			_embedded: resource._embedded
 				? {
@@ -462,8 +454,7 @@ export class YandexDiskClient {
 	 * Ensure multiple folders exist (optimized batch creation)
 	 */
 	async ensureFoldersExist(paths: string[]): Promise<void> {
-		// Encrypt folder paths so intermediate levels are created with their
-		// encrypted names. Each level is an independently-encrypted segment.
+		// Encrypt every folder segment independently under the current profile.
 		const effectivePaths = this.encryptionService
 			? await Promise.all(paths.map((p) => this.encryptFilePath(p)))
 			: paths;
@@ -498,7 +489,7 @@ export class YandexDiskClient {
 
 	/**
 	 * Check whether a remote folder is empty (no child resources of any kind).
-	 * The path is encrypted segment-wise under encryption so the real remote
+	 * The path uses the active encrypted directory layout so the real remote
 	 * folder is inspected. Returns true when the folder does not exist or has
 	 * no children. Used by the sync engine before pruning a folder that the
 	 * in-memory index believes to be empty, to guard against a stale index

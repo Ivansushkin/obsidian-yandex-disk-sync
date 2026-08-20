@@ -9,7 +9,7 @@ multi-device, Force-loop и шифрования.
 Перед прогоном:
 
 - `npm test`, lint и build уже зелёные.
-- На обоих устройствах установлена одна и та же `2.0.0-beta.5`.
+- На обоих устройствах установлена одна и та же `2.0.0-beta.6`.
 - Используются два независимых профиля Obsidian с разными device ID.
 - Используется реальный Яндекс Диск.
 - Тестовое remote-хранилище можно безопасно очищать.
@@ -265,26 +265,35 @@ multi-device, Force-loop и шифрования.
 Покрывает: `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`, `FORCE-017`,
 `MULTI-012`, `MIG-004`, `UI-006`.
 
-## TC-08. Шифрование: v2→v3, fresh v3, rotate, disable и backup restore
+## TC-08. Шифрование: fresh v3 и unsupported historical data
 
 Время: 6 минут на маленьком vault.
 
 Использовать vault из предыдущих тестов, но удалить намеренные
 conflict/backup-файлы, если они мешают проверке.
 
-### Legacy-v2 → hardened-v3
+### Stable 1.0/1.1 plaintext boundary
 
-1. Подготовить legacy encrypted manifest v2 и читаемый vault на Device 1.
-2. Убедиться, что normal sync, watcher и scheduler заблокированы сообщением о
-   required format upgrade.
-3. Подтвердить предупреждение о старых `.enc.zip` и запустить upgrade с текущим
-   паролем.
-4. Во время перехода проверить manifest v3 `rotating`, затем stable v3.
-5. На Device 2 подключить target password и выполнить full reconcile.
-6. Повторить с crash/restart до и после canonical commit; после commit Device 2
-   должен завершить cleanup без source password.
-7. Старый beta-клиент против manifest v3 должен только заблокироваться и не
-   изменить remote.
+1. Подготовить plaintext `data.json` и canonical v2 из stable 1.1 на Device 1.
+2. Обновить плагин и проверить перенос settings, device ID, hashes и
+   `localIndex` в unobserved baseline; все current queues должны быть пустыми.
+3. Убедиться, что normal sync заблокирован инструкцией Force.
+4. Выполнить Force local с обязательным backup и получить canonical v4.
+5. На Device 2 выполнить обычный full и проверить принятие нового epoch.
+
+### Unsupported beta formats
+
+1. По отдельности подготовить stable 1.2-shaped local data, manifest v1/v2,
+   encrypted canonical v1/v2, canonical v3, unversioned local
+   `localState`/queues и transition без profile metadata.
+2. Для каждого формата подтвердить отдельную ошибку unsupported prerelease и
+   инструкцию выбрать чистый remote path либо выполнить ручной reset после
+   самостоятельного backup.
+3. Проверить, что normal sync, watcher, scheduler и оба направления Force не
+   выполняют upload, delete, lock или cleanup.
+4. Скачать non-envelope `.enc.zip`, unknown `.zip` bytes и backup с encrypted
+   legacy name: compatibility decrypt не должен вызываться, локальный
+   повреждённый `.zip` не создаётся.
 
 ### Fresh enable
 
@@ -294,6 +303,8 @@ conflict/backup-файлы, если они мешают проверке.
 4. Сначала ввести неверный пароль.
 5. Убедиться, что sync заблокирована и remote не изменён.
 6. Ввести правильный пароль и выполнить full.
+7. Старый beta-клиент против manifest v3 должен только заблокироваться и не
+   изменить remote.
 
 ### Обычная encrypted sync
 
@@ -304,12 +315,13 @@ conflict/backup-файлы, если они мешают проверке.
 
 ### Backup и rotate
 
-1. Скачать созданный при enable/upgrade backup и восстановить ZIP во временный
+1. Скачать созданный при enable backup и восстановить ZIP во временный
    vault; сравнить paths и SHA-256.
 2. На Device 1 выполнить rotate encryption key.
 2. На Device 2 попробовать старый пароль — sync должна блокироваться.
 3. Ввести новый пароль и выполнить full.
-4. Скачать pre-rotate `.enc.zip` и открыть его исходным backup password.
+4. Скачать pre-rotate `OYDSBKP2` `.enc.zip` и открыть его исходным backup
+   password.
 5. Создать новый backup, скачать и восстановить его.
 6. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
 
@@ -355,7 +367,8 @@ conflict/backup-файлы, если они мешают проверке.
 - параллельные encryption transitions.
 
 Перед stable обязательны: Obsidian 1.0.0 desktop, current desktop и current
-mobile; plaintext, legacy-v2 migration и fresh hardened-v3; два независимых
+mobile; fresh install, stable 1.0/1.1 plaintext migration, fresh hardened-v3 и
+fail-closed stable 1.2/beta formats; два независимых
 профиля; 409/423/429 и ambiguous upload; offline return; 10 000 descendants;
 PERF-006; PBKDF2 p95 не более 3 секунд; финальный full обоих профилей `0/0/0`.
 Результаты записываются в `release-evidence/2.0.0.json` без secret и полных
@@ -366,7 +379,7 @@ remote paths.
 Для каждого TC достаточно записывать:
 
 ```text
-Версия: 2.0.0-beta.5
+Версия: 2.0.0-beta.6
 Дата:
 Устройства:
 Режим: plaintext/encrypted

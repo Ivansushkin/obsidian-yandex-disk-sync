@@ -20,9 +20,9 @@ backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>.zip
 backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>.enc.zip
 ```
 
-Исторические имена с точностью до секунды продолжают распознаваться. Суффикс
-`.enc.zip` означает encrypted archive, но способ открытия определяется magic
-envelope, а не одним именем.
+Исторические имена с точностью до секунды продолжают распознаваться. Новый
+`.enc.zip` обязан начинаться с magic envelope `OYDSBKP2`; non-envelope
+`.enc.zip` является неподдерживаемым prerelease-форматом.
 
 ## Plaintext backup
 
@@ -53,7 +53,7 @@ Exact UTF-8 header bytes являются AES-GCM AAD. Header ограничен
 
 Password policy:
 
-- enable и format upgrade — target password;
+- enable — target password;
 - rotate — new password;
 - disable — current source password;
 - обычный encrypted backup — current password;
@@ -81,10 +81,11 @@ Download всегда начинается raw:
 3. При authentication failure UI запрашивает backup password.
 4. Пользователю сохраняется обычный `.zip`.
 
-Legacy `.enc.zip` без magic пробуется текущим legacy vault codec. Ошибка явно
-сообщает, что нужен старый vault password/salt. Такие архивы не мигрируются
-автоматически; перед v2→v3 upgrade пользователь подтверждает это ограничение,
-а плагин создаёт новый verified self-contained backup.
+Non-envelope `.enc.zip` отклоняется без вызова compatibility decrypt.
+Исторический `.zip` принимается только при наличии plaintext ZIP magic.
+Неизвестные bytes и encrypted legacy names не декодируются, download
+блокируется, повреждённый `.zip` не сохраняется. Старые архивы не удаляются и
+не мигрируются автоматически.
 
 ## Memory
 
@@ -96,5 +97,6 @@ PERF-006 остаётся обязательным release gate.
 
 Автоматические проверки покрывают envelope auth/header bounds, wrong password,
 corrupted tag/header, lost response, 409/collision, exact read-back, unique
-names и legacy fallback. Реальное создание, download и restore до/после
-rotate/disable входят в `SMOKE_TESTS.md` TC-08.
+names, plaintext historical ZIP и fail-closed для non-envelope `.enc.zip`,
+unknown bytes и encrypted legacy names. Реальное создание, download и restore
+до/после rotate/disable входят в `SMOKE_TESTS.md` TC-08.

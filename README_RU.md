@@ -2,15 +2,21 @@
 
 Плагин для синхронизации заметок Obsidian с Яндекс Диском. Позволяет автоматически синхронизировать хранилище между несколькими устройствами через облачное хранилище Яндекса.
 
-## Обновление до 2.0.0-beta.5
+## Обновление до 2.0.0-beta.6
 
-Версия 2.0.0-beta.5 сохраняет canonical index v4 и вводит усиленный encryption
-manifest v3. Она не должна работать одновременно с 1.1, beta 1.2 или ранними
-beta 2.0. Сначала обновите все устройства. Index v1-v3 по-прежнему требует
-одного Force local с обязательным backup на авторитетном устройстве; остальные
-обновлённые устройства принимают новый epoch обычной full sync. Для encrypted
-manifest v1/v2 normal sync блокируется до явного защищённого format upgrade в
-настройках.
+Версия 2.0.0-beta.6 поддерживает миграцию только с plaintext stable 1.0.0 и
+1.1.0. Их local `localIndex` однократно преобразуется в текущий baseline.
+Plaintext canonical v1/v2 требует явного Force с обязательным backup;
+canonical v3 не поддерживается даже для Force.
+
+Migration и recovery из stable 1.2 и специфичных prerelease-форматов 1.2/2.0
+не поддерживаются. Распознаваемые manifest v1/v2, encrypted legacy index v1/v2,
+canonical v3, unversioned beta queues/transitions и неполная metadata текущего
+transition блокируют запуск и любые remote writes. Нужно выбрать чистый remote
+path либо вручную сбросить старые данные только после самостоятельного backup.
+Структурно текущие schema v2, manifest v3 или index v4, созданные beta-клиентом,
+технически неотличимы от тех же форматов beta.6 и могут быть прочитаны, но
+отдельного beta converter/recovery кода больше нет.
 
 Не запускайте старую версию плагина после перехода: она может заменить индекс
 v4 или вернуть удалённые файлы. Если это произошло, отключите синхронизацию
@@ -217,10 +223,10 @@ fingerprint-guarded cleanup из canonical metadata без source password.
 > удаляется только guarded-cleanup при совпадении fingerprint. Полученные
 > зашифрованные данные невозможно прочитать без пароля.
 
-Legacy encrypted manifest v1/v2 доступен только для recovery и migration.
-Настройки требуют явный format upgrade и предупреждают, что исторические
-`.enc.zip` могут требовать старый vault password/salt; эти архивы никогда не
-перезаписываются.
+Manifest v1/v2 и исторические encrypted backup-форматы не поддерживаются.
+Non-envelope `.enc.zip`, encrypted legacy names и historical `.zip` без
+plaintext ZIP magic отклоняются без попытки compatibility decrypt. Старые
+plaintext ZIP по-прежнему можно скачать.
 
 ## Разработка
 

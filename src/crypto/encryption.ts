@@ -1,11 +1,11 @@
 /**
- * Browser-compatible encryption codecs used by remote storage and transition
- * recovery. Legacy v2 remains readable; all new encrypted state uses v3.
+ * Browser-compatible hardened encryption used by remote storage and transition
+ * recovery. Historical prerelease and 1.2 encryption formats are unsupported.
  */
 
 import { aessiv } from "@noble/ciphers/aes.js";
 
-export type EncryptionProfileId = "legacy-v2" | "hardened-v3";
+export type EncryptionProfileId = "hardened-v3";
 
 export interface EncryptionCodec {
 	readonly profileId: EncryptionProfileId;
@@ -18,10 +18,7 @@ export interface EncryptionCodec {
 	decryptFilename(encryptedName: string): Promise<string>;
 }
 
-export const LEGACY_PBKDF2_ITERATIONS = 100_000;
 export const HARDENED_PBKDF2_ITERATIONS = 600_000;
-/** Historical alias retained for v2 manifest compatibility. */
-export const PBKDF2_ITERATIONS = LEGACY_PBKDF2_ITERATIONS;
 export const AES_KEY_LENGTH = 256;
 export const FILENAME_KEY_LENGTH = 512;
 export const IV_LENGTH = 12;
@@ -53,13 +50,11 @@ export function assertValidLogicalPathSegment(segment: string): string {
 	return segment;
 }
 
-/**
- * Legacy beta encryption profile. It is intentionally kept byte-compatible so
- * existing v1/v2 vaults and backups can be recovered before v3 migration.
- */
+/** Hardened v3 profile with separated content and filename keys. */
 export class EncryptionService implements EncryptionCodec {
-	readonly profileId = "legacy-v2" as const;
-	private key: CryptoKey | null = null;
+	readonly profileId = "hardened-v3" as const;
+	private contentKey: CryptoKey | null = null;
+	private filenameKey: Uint8Array | null = null;
 	private readonly salt: Uint8Array;
 	private filenameEncCache = new Map<string, string>();
 	private filenameDecCache = new Map<string, string>();
@@ -67,90 +62,6 @@ export class EncryptionService implements EncryptionCodec {
 	constructor(salt: Uint8Array) {
 		assertSalt(salt);
 		this.salt = salt.slice();
-	}
-
-	async initializeKey(password: string): Promise<void> {
-		const keyMaterial = await importPassword(password);
-		this.key = await crypto.subtle.deriveKey(
-			{
-				name: "PBKDF2",
-				salt: this.salt,
-				iterations: LEGACY_PBKDF2_ITERATIONS,
-				hash: "SHA-256",
-			},
-			keyMaterial,
-			{ name: "AES-GCM", length: AES_KEY_LENGTH },
-			false,
-			["encrypt", "decrypt"],
-		);
-	}
-
-	async encrypt(data: ArrayBuffer): Promise<ArrayBuffer> {
-		return await encryptContent(this.getKey(), data);
-	}
-
-	async decrypt(data: ArrayBuffer): Promise<ArrayBuffer> {
-		return await decryptContent(this.getKey(), data);
-	}
-
-	async createVerifier(): Promise<string> {
-		return await createVerifier(this);
-	}
-
-	async verifyVerifier(verifierBase64: string): Promise<boolean> {
-		return await verifyVerifier(this, verifierBase64);
-	}
-
-	async encryptFilename(originalPath: string): Promise<string> {
-		assertValidLogicalPathSegment(originalPath);
-		const cached = this.filenameEncCache.get(originalPath);
-		if (cached !== undefined) return cached;
-
-		const encoder = new TextEncoder();
-		const ivInput = encoder.encode(
-			`${originalPath}:iv:${EncryptionService.bytesToBase64(this.salt)}`,
-		);
-		const ivHash = await crypto.subtle.digest("SHA-256", ivInput);
-		const iv = new Uint8Array(ivHash).slice(0, IV_LENGTH);
-		const encrypted = await crypto.subtle.encrypt(
-			{ name: "AES-GCM", iv },
-			this.getKey(),
-			encoder.encode(originalPath),
-		);
-		const combined = new Uint8Array(IV_LENGTH + encrypted.byteLength);
-		combined.set(iv, 0);
-		combined.set(new Uint8Array(encrypted), IV_LENGTH);
-		const result = EncryptionService.base64UrlEncode(combined);
-		this.filenameEncCache.set(originalPath, result);
-		return result;
-	}
-
-	async decryptFilename(encryptedName: string): Promise<string> {
-		const cached = this.filenameDecCache.get(encryptedName);
-		if (cached !== undefined) return cached;
-		const data = EncryptionService.base64UrlDecode(encryptedName);
-		if (data.length <= IV_LENGTH + 16) {
-			throw new Error("Encrypted filename is truncated");
-		}
-		const decrypted = await crypto.subtle.decrypt(
-			{ name: "AES-GCM", iv: data.slice(0, IV_LENGTH) },
-			this.getKey(),
-			data.slice(IV_LENGTH),
-		);
-		const result = assertValidLogicalPathSegment(
-			new TextDecoder("utf-8", { fatal: true }).decode(decrypted),
-		);
-		this.filenameDecCache.set(encryptedName, result);
-		return result;
-	}
-
-	private getKey(): CryptoKey {
-		if (!this.key) {
-			throw new Error(
-				"EncryptionService not initialized. Call initializeKey() first.",
-			);
-		}
-		return this.key;
 	}
 
 	static generateSalt(): Uint8Array {
@@ -188,21 +99,6 @@ export class EncryptionService implements EncryptionCodec {
 			throw new Error("Encrypted filename is not canonical Base64URL");
 		}
 		return decoded;
-	}
-}
-
-/** Hardened v3 profile with separated content and filename keys. */
-export class HardenedEncryptionService implements EncryptionCodec {
-	readonly profileId = "hardened-v3" as const;
-	private contentKey: CryptoKey | null = null;
-	private filenameKey: Uint8Array | null = null;
-	private readonly salt: Uint8Array;
-	private filenameEncCache = new Map<string, string>();
-	private filenameDecCache = new Map<string, string>();
-
-	constructor(salt: Uint8Array) {
-		assertSalt(salt);
-		this.salt = salt.slice();
 	}
 
 	async initializeKey(password: string): Promise<void> {
@@ -311,9 +207,10 @@ export function createEncryptionCodec(
 	profileId: EncryptionProfileId,
 	salt: Uint8Array,
 ): EncryptionCodec {
-	return profileId === "hardened-v3"
-		? new HardenedEncryptionService(salt)
-		: new EncryptionService(salt);
+	if (profileId !== "hardened-v3") {
+		throw new Error("Unsupported encryption profile");
+	}
+	return new EncryptionService(salt);
 }
 
 async function importPassword(password: string): Promise<CryptoKey> {

@@ -10,9 +10,12 @@ import {
 	type YandexDiskClient,
 } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import type { YandexDiskSyncSettings } from "../src/types";
+import type {
+	YandexDiskSyncSettings,
+	YandexResource,
+} from "../src/types";
 import { DEFAULT_SETTINGS } from "../src/types";
-import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
+import { UnsupportedPrereleaseDataError } from "../src/compatibility-errors";
 
 class FakeBackupClient {
 	files = new Map<string, ArrayBuffer>();
@@ -21,7 +24,9 @@ class FakeBackupClient {
 	corruptFirstUpload = false;
 	conflictFirstUpload = false;
 	encrypted = true;
+	decodeCalls = 0;
 	decoder: ((content: ArrayBuffer) => Promise<ArrayBuffer>) | null = null;
+	resources: YandexResource[] = [];
 
 	hasEncryptionService(): boolean {
 		return this.encrypted;
@@ -62,8 +67,14 @@ class FakeBackupClient {
 	}
 
 	async decodeServiceFileContent(content: ArrayBuffer): Promise<ArrayBuffer> {
+		this.decodeCalls++;
 		return this.decoder ? await this.decoder(content) : content.slice(0);
 	}
+
+	async getResourcesRecursive(): Promise<YandexResource[]> {
+		return this.resources.map((resource) => ({ ...resource }));
+	}
+
 }
 
 function createManager(client: FakeBackupClient): {
@@ -88,7 +99,7 @@ function createManager(client: FakeBackupClient): {
 			client as unknown as YandexDiskClient,
 			vault,
 			settings,
-			"2.0.0-beta.5",
+			"2.0.0-beta.6",
 		),
 		settings,
 	};
@@ -167,23 +178,68 @@ test("invalid envelope header is reported as corruption, not a password prompt",
 	);
 });
 
-test("legacy encrypted backup remains downloadable with its original codec", async () => {
+test("non-envelope enc.zip is rejected without invoking legacy decrypt", async () => {
 	const client = new FakeBackupClient();
-	const legacy = new EncryptionService(new Uint8Array(SALT_LENGTH).fill(4));
-	await legacy.initializeKey("old-vault-password");
-	client.decoder = async (content) => await legacy.decrypt(content);
-	const zip = new TextEncoder().encode("PK\u0003\u0004 legacy ZIP").buffer;
 	client.files.set(
 		"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
-		await legacy.encrypt(zip),
+		new Uint8Array([1, 2, 3, 4]).buffer,
 	);
+	const { manager } = createManager(client);
+	await assert.rejects(
+		manager.downloadBackup(
+			"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
+		),
+		UnsupportedPrereleaseDataError,
+	);
+	assert.equal(client.decodeCalls, 0);
+});
+
+test("encrypted legacy backup names are ignored without compatibility decoding", async () => {
+	const client = new FakeBackupClient();
+	const physicalName = "unrecognized-encrypted-name";
+	client.resources = [
+		{
+			name: physicalName,
+			path: `disk:/vault/.backup/${physicalName}`,
+			type: "file",
+			created: "2026-08-20T10:00:00Z",
+			modified: "2026-08-20T10:00:00Z",
+			size: 100,
+		},
+	];
+	const { manager } = createManager(client);
+	const backups = await manager.listBackups();
+	assert.deepEqual(backups, []);
+});
+
+test("historical plaintext zip is returned without codec fallback", async () => {
+	const client = new FakeBackupClient();
+	const zip = new TextEncoder().encode("PK\u0003\u0004 plaintext ZIP").buffer;
+	client.files.set("vault/.backup/backup_2026-08-20_10-00-00.zip", zip);
 	const { manager } = createManager(client);
 	assert.deepEqual(
 		new Uint8Array(
 			await manager.downloadBackup(
-				"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
+				"vault/.backup/backup_2026-08-20_10-00-00.zip",
 			),
 		),
 		new Uint8Array(zip),
 	);
+	assert.equal(client.decodeCalls, 0);
+});
+
+test("unknown historical zip bytes fail closed without decryption fallback", async () => {
+	const client = new FakeBackupClient();
+	client.files.set(
+		"vault/.backup/backup_2026-08-20_10-00-00.zip",
+		new Uint8Array([1, 2, 3, 4]).buffer,
+	);
+	const { manager } = createManager(client);
+	await assert.rejects(
+		manager.downloadBackup(
+			"vault/.backup/backup_2026-08-20_10-00-00.zip",
+		),
+		UnsupportedPrereleaseDataError,
+	);
+	assert.equal(client.decodeCalls, 0);
 });

@@ -31,6 +31,7 @@ import {
 	RemoteIndexTransactionError,
 	UnreadableRemoteIndexError,
 } from "./index-manager";
+import { UnsupportedPrereleaseDataError } from "../compatibility-errors";
 import { ConflictResolver } from "./conflict-resolver";
 import {
 	joinPath,
@@ -3830,7 +3831,6 @@ export class SyncEngine {
 				const metadata = canonical.files[filePath]!;
 				const accepted = canApplyDestructiveFolderMutation(
 					metadata,
-					this.indexManager.getLocalIndex().files[filePath],
 					mutation.baseRevision ?? 0,
 					this.settings.deviceId,
 					mutation.seq,
@@ -4130,7 +4130,6 @@ export class SyncEngine {
 				const target = `${newPrefix}${filePath.slice(oldPrefix.length)}`;
 				if (!canApplyDestructiveFolderMutation(
 					meta,
-					localIndex.files[filePath],
 					mutation.baseRevision ?? 0,
 					this.settings.deviceId,
 					mutation.seq,
@@ -4676,6 +4675,14 @@ export class SyncEngine {
 		);
 		if (apiError && (apiError.status === 401 || apiError.status === 403)) {
 			return "authentication";
+		}
+		if (
+			findErrorCause(
+				error,
+				(candidate) => candidate instanceof UnsupportedPrereleaseDataError,
+			)
+		) {
+			return "unsupported-prerelease";
 		}
 		if (findErrorCause(error, (candidate) => candidate instanceof LegacyIndexVersionError)) {
 			return "legacy-index";
@@ -5826,7 +5833,6 @@ export class SyncEngine {
 				typeof tombstone.mutationSeq !== "number" ||
 				!canApplyDestructiveFolderMutation(
 					file,
-					this.indexManager.getLocalIndex().files[operation.path],
 					tombstone.baseRevision,
 					tombstone.lastModifiedBy,
 					tombstone.mutationSeq,

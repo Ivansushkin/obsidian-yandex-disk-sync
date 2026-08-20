@@ -13,7 +13,7 @@ test("backup envelope is self-contained and authenticated", async () => {
 	const envelope = await sealBackupEnvelope(plaintext, "backup-password", {
 		kind: "logical-vault",
 		createdAt: 1_787_155_200_000,
-		pluginVersion: "2.0.0-beta.5",
+		pluginVersion: "2.0.0-beta.6",
 		fileCount: 7,
 	});
 	assert.equal(isBackupEnvelope(envelope), true);
@@ -27,7 +27,7 @@ test("backup envelope rejects wrong password and modified ciphertext", async () 
 	const envelope = await sealBackupEnvelope(plaintext, "right-password", {
 		kind: "remote-raw",
 		createdAt: 1,
-		pluginVersion: "2.0.0-beta.5",
+		pluginVersion: "2.0.0-beta.6",
 		fileCount: 1,
 	});
 	await assert.rejects(
@@ -55,7 +55,7 @@ test("backup envelope rejects unbounded or unsupported headers before KDF", asyn
 		await sealBackupEnvelope(plaintext, "password", {
 			kind: "logical-vault",
 			createdAt: 1,
-			pluginVersion: "2.0.0-beta.5",
+			pluginVersion: "2.0.0-beta.6",
 			fileCount: 1,
 		}),
 	);
@@ -75,7 +75,7 @@ test("backup envelope rejects unknown authenticated header fields", async () => 
 		await sealBackupEnvelope(plaintext, "password", {
 			kind: "logical-vault",
 			createdAt: 1,
-			pluginVersion: "2.0.0-beta.5",
+			pluginVersion: "2.0.0-beta.6",
 			fileCount: 1,
 		}),
 	);

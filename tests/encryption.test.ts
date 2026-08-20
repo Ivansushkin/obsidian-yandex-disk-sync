@@ -3,7 +3,6 @@ import test from "node:test";
 import { aessiv } from "@noble/ciphers/aes.js";
 import {
 	EncryptionService,
-	HardenedEncryptionService,
 	SALT_LENGTH,
 } from "../src/crypto/encryption";
 
@@ -25,30 +24,8 @@ test("AES-SIV matches the RFC 5297 deterministic vector", () => {
 	);
 });
 
-test("legacy v2 filename format remains readable", async () => {
-	const salt = new Uint8Array(SALT_LENGTH).fill(7);
-	const service = new EncryptionService(salt);
-	await service.initializeKey("legacy-password");
-	const filename = "Заметка.md";
-	const encrypted = await service.encryptFilename(filename);
-	assert.equal(await service.decryptFilename(encrypted), filename);
-
-	const publicIv = new Uint8Array(
-		await crypto.subtle.digest(
-			"SHA-256",
-			new TextEncoder().encode(
-				`${filename}:iv:${EncryptionService.bytesToBase64(salt)}`,
-			),
-		),
-	).slice(0, 12);
-	assert.deepEqual(
-		EncryptionService.base64UrlDecode(encrypted).slice(0, 12),
-		publicIv,
-	);
-});
-
 const hardenedServicePromise = (async () => {
-	const service = new HardenedEncryptionService(
+	const service = new EncryptionService(
 		new Uint8Array(SALT_LENGTH).fill(11),
 	);
 	await service.initializeKey("hardened-password");

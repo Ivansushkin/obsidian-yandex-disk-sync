@@ -2,15 +2,21 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-## Upgrading to 2.0.0-beta.5
+## Upgrading to 2.0.0-beta.6
 
-Version 2.0.0-beta.5 keeps canonical index v4 and introduces hardened
-encryption manifest v3. It must not synchronize concurrently with 1.1, 1.2
-beta, or older 2.0 beta builds. Update every device first. Index v1-v3 still
-requires one backed-up **Force sync → Local to remote** on the authoritative
-device; other updated devices then accept the new epoch through normal full
-sync. Existing encrypted manifest v1/v2 requires the explicit protected format
-upgrade in plugin settings before normal sync resumes.
+Version 2.0.0-beta.6 supports migration only from plaintext stable 1.0.0 and
+1.1.0. Their local `localIndex` is converted once into the current baseline.
+Plaintext canonical v1/v2 requires a backed-up explicit **Force sync**;
+canonical v3 is unsupported even for Force.
+
+Migration and recovery from stable 1.2 and prerelease-specific 1.2/2.0 formats
+are unsupported. Detectable manifest v1/v2, encrypted legacy index v1/v2,
+canonical v3, unversioned beta queues/transitions, and incomplete current
+transition metadata block startup and all remote writes. Choose a clean remote
+path or reset the old data manually only after making an independent backup.
+Structurally current schema v2, manifest v3, or index v4 created by a beta cannot
+be distinguished from the same beta.6 format and may be read, but no
+beta-specific converter or recovery code remains.
 
 Do not start an older plugin version after the transition: it can replace the
 v4 index or restore deleted files. If that happens, disable sync everywhere,
@@ -216,10 +222,10 @@ post-commit cleanup from canonical metadata without the source password.
 > deleted only by fingerprint-guarded cleanup. The resulting encrypted data
 > cannot be read without the password.
 
-Legacy encrypted manifest v1/v2 remains readable only for recovery and
-migration. The settings screen requires an explicit format upgrade and warns
-that historical `.enc.zip` archives may still require the old vault
-password/salt; those archives are never rewritten.
+Manifest v1/v2 and historical encrypted backup formats are unsupported.
+Non-envelope `.enc.zip`, encrypted legacy names, and non-plaintext historical
+`.zip` bytes are rejected without a compatibility decryption attempt. Plaintext
+historical ZIP archives remain downloadable.
 
 ## Development
 
