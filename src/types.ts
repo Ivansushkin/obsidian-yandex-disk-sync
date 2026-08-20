@@ -2,6 +2,8 @@
  * Types and interfaces for Yandex Disk synchronization plugin
  */
 
+import type { EncryptionProfileId } from "./crypto/encryption";
+
 // ============================================================================
 // Plugin settings
 // ============================================================================
@@ -45,6 +47,8 @@ export interface YandexDiskSyncSettings {
 	encryptionPassword: string | null;
 	/** Remote encryption manifest revision applied on this device */
 	encryptionRevision: number | null;
+	/** Encryption wire profile; missing historical values mean legacy-v2. */
+	encryptionProfileId: EncryptionProfileId | null;
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
@@ -65,6 +69,7 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	encryptionSalt: null,
 	encryptionPassword: null,
 	encryptionRevision: null,
+	encryptionProfileId: null,
 };
 
 // ============================================================================
@@ -117,6 +122,10 @@ export interface EncryptionTransitionDescriptor {
 	source?: EncryptionModeDescriptor;
 	/** Target encryption mode used after the canonical commit */
 	target?: EncryptionModeDescriptor;
+	/** Source codec profile, omitted by historical v2 transitions. */
+	sourceProfileId?: EncryptionProfileId | null;
+	/** Target codec profile, omitted by historical v2 transitions. */
+	targetProfileId?: EncryptionProfileId | null;
 }
 
 export interface EncryptionModeDescriptor {
@@ -130,7 +139,7 @@ export interface EncryptionModeDescriptor {
 	verifier: string | null;
 }
 
-export interface EncryptionManifest {
+export interface EncryptionManifestV2 {
 	/** Manifest format version */
 	version: 2;
 	/** Current remote encryption state */
@@ -152,6 +161,37 @@ export interface EncryptionManifest {
 	/** Recovery metadata present only while encryption is transitioning */
 	transition?: EncryptionTransitionDescriptor;
 }
+
+export interface EncryptionManifestKeyScheduleParams {
+	name: "HKDF";
+	hash: "SHA-256";
+}
+
+export interface EncryptionManifestFilenameCipherParams {
+	name: "AES-SIV";
+	keyLength: 512;
+	encoding: "base64url";
+	aad: "obsidian-yandex-disk-sync:filename:v3";
+}
+
+/** Strict hardened manifest. Unknown algorithms must block all remote writes. */
+export interface EncryptionManifestV3 {
+	version: 3;
+	profileId: "hardened-v3";
+	state: EncryptionManifestState;
+	revision: number;
+	salt: string;
+	verifier: string;
+	kdf: EncryptionManifestKdfParams;
+	keySchedule: EncryptionManifestKeyScheduleParams;
+	cipher: EncryptionManifestCipherParams;
+	filenameCipher: EncryptionManifestFilenameCipherParams;
+	updatedAt: number;
+	updatedBy: string;
+	transition?: EncryptionTransitionDescriptor;
+}
+
+export type EncryptionManifest = EncryptionManifestV2 | EncryptionManifestV3;
 
 export interface LegacyEncryptionManifest {
 	/** Legacy salt-only manifest format */

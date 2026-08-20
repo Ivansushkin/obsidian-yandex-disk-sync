@@ -254,7 +254,7 @@ await this.plugin.saveSettings();
 **Для сетевых операций (I/O-bound):**
 
 - Автоматически: `settings.maxConcurrency`
-- По умолчанию: 5
+- По умолчанию: 10
 - Максимум: 20
 
 ## Обработка ошибок

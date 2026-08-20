@@ -40,10 +40,12 @@ import {
 } from "../utils/hash-utils";
 import {
 	PBKDF2_ITERATIONS,
+	HARDENED_PBKDF2_ITERATIONS,
 	AES_KEY_LENGTH,
+	FILENAME_KEY_LENGTH,
 	IV_LENGTH,
 } from "../crypto/encryption";
-import type { EncryptionService } from "../crypto/encryption";
+import type { EncryptionCodec } from "../crypto/encryption";
 import {
 	getPhysicalResourceFingerprint,
 	getStableContentFingerprint,
@@ -298,10 +300,11 @@ export class IndexManager {
 		remoteFingerprint: string;
 		baselineSha256?: string;
 	}> = [];
-	private transitionIndexReadService: EncryptionService | null | undefined;
-	private transitionIndexWriteService: EncryptionService | null | undefined;
+	private transitionIndexReadService: EncryptionCodec | null | undefined;
+	private transitionIndexWriteService: EncryptionCodec | null | undefined;
 	private physicalRewriteOnNextSave = false;
 	private epochAdoptionTarget: string | null = null;
+	private targetRecoveryMaintenanceId: string | null = null;
 
 	constructor(
 		yandexClient: YandexDiskClient,
@@ -330,11 +333,30 @@ export class IndexManager {
 	 * changes encryption mode.
 	 */
 	setIndexTransitionServices(
-		source: EncryptionService | null,
-		target: EncryptionService | null,
+		source: EncryptionCodec | null,
+		target: EncryptionCodec | null,
 	): void {
 		this.transitionIndexReadService = source;
 		this.transitionIndexWriteService = target;
+	}
+
+	/**
+	 * Allow one target-codec device to adopt a committed foreign transition.
+	 * The matching maintenance ID and post-commit phase are still validated.
+	 */
+	async runTargetMaintenanceRecovery<T>(
+		maintenanceId: string,
+		action: () => Promise<T>,
+	): Promise<T> {
+		if (this.targetRecoveryMaintenanceId !== null) {
+			throw new Error("Target encryption recovery is already active");
+		}
+		this.targetRecoveryMaintenanceId = maintenanceId;
+		try {
+			return await action();
+		} finally {
+			this.targetRecoveryMaintenanceId = null;
+		}
 	}
 
 	clearIndexTransitionServices(): void {
@@ -1802,7 +1824,7 @@ export class IndexManager {
 	private async downloadIndex(
 		path: string,
 		allowLegacy: boolean,
-		serviceOverride?: EncryptionService | null,
+		serviceOverride?: EncryptionCodec | null,
 	): Promise<SyncIndex> {
 		return (
 			await this.downloadIndexSnapshot(
@@ -1816,7 +1838,7 @@ export class IndexManager {
 	private async downloadIndexSnapshot(
 		path: string,
 		allowLegacy: boolean,
-		serviceOverride?: EncryptionService | null,
+		serviceOverride?: EncryptionCodec | null,
 		codecLabel?: IndexCodec,
 		expectedResource?: YandexResource,
 	): Promise<IndexFileSnapshot> {
@@ -1864,7 +1886,7 @@ export class IndexManager {
 	private async decodeIndexSnapshot(
 		raw: ArrayBuffer,
 		allowLegacy: boolean,
-		serviceOverride?: EncryptionService | null,
+		serviceOverride?: EncryptionCodec | null,
 		codecLabel?: IndexCodec,
 		fingerprint: string | null = null,
 	): Promise<{ index: SyncIndex; codec: IndexCodec }> {
@@ -1935,7 +1957,7 @@ export class IndexManager {
 	/** Decode and parse one codec without catching semantic index errors. */
 	private async tryDecodeIndexCodec(
 		raw: ArrayBuffer,
-		service: EncryptionService | null | undefined,
+		service: EncryptionCodec | null | undefined,
 		codec: IndexCodec,
 	): Promise<IndexCodecAttemptResult> {
 		let content: ArrayBuffer;
@@ -2441,7 +2463,7 @@ export class IndexManager {
 
 	private async assertStaleLockReadable(lockPath: string): Promise<void> {
 		const candidates: Array<{
-			service: EncryptionService | null | undefined;
+			service: EncryptionCodec | null | undefined;
 			codec: IndexCodec;
 		}> = [
 			{
@@ -2539,7 +2561,7 @@ export class IndexManager {
 	private async inspectExpectedIndex(
 		path: string,
 		expected: SyncIndex,
-		serviceOverride?: EncryptionService | null,
+		serviceOverride?: EncryptionCodec | null,
 		codecLabel?: IndexCodec,
 		expectedResource?: YandexResource,
 	): Promise<{
@@ -2924,9 +2946,15 @@ export class IndexManager {
 
 	private assertMaintenanceCompatible(index: SyncIndex): void {
 		const maintenance = index.maintenance;
+		const allowedTargetRecovery =
+			maintenance?.id === this.targetRecoveryMaintenanceId &&
+			(maintenance.phase === "index-committed" ||
+				maintenance.phase === "cleanup" ||
+				maintenance.phase === "stable");
 		if (
 			maintenance &&
 			maintenance.initiatedBy !== this.settings.deviceId &&
+			!allowedTargetRecovery &&
 			maintenance.phase !== "cleanup" &&
 			maintenance.phase !== "stable"
 		) {
@@ -3085,6 +3113,7 @@ export class IndexManager {
 		if (typeof salt !== "string" || !salt) {
 			throw new Error("Invalid encryption manifest: missing salt");
 		}
+		this.assertManifestBase64(salt, 16, 16, "salt");
 
 		if (data.version === 1) {
 			return {
@@ -3099,7 +3128,7 @@ export class IndexManager {
 			};
 		}
 
-		if (data.version !== 2) {
+		if (data.version !== 2 && data.version !== 3) {
 			throw new Error("Unsupported encryption manifest version");
 		}
 
@@ -3121,6 +3150,7 @@ export class IndexManager {
 		if (typeof verifier !== "string" || !verifier) {
 			throw new Error("Invalid encryption manifest: missing verifier");
 		}
+		this.assertManifestBase64(verifier, 28, 4096, "verifier");
 		if (typeof updatedAt !== "number") {
 			throw new Error("Invalid encryption manifest: invalid updatedAt");
 		}
@@ -3128,8 +3158,46 @@ export class IndexManager {
 			throw new Error("Invalid encryption manifest: invalid updatedBy");
 		}
 
+		const transition = this.parseEncryptionTransition(data.transition);
+		if (data.version === 2) {
+			this.assertLegacyManifestAlgorithms(data.kdf, data.cipher);
+			return {
+				version: 2,
+				state,
+				revision,
+				salt,
+				verifier,
+				kdf: {
+					name: "PBKDF2",
+					hash: "SHA-256",
+					iterations: PBKDF2_ITERATIONS,
+				},
+				cipher: {
+					name: "AES-GCM",
+					keyLength: AES_KEY_LENGTH,
+					ivLength: IV_LENGTH,
+				},
+				updatedAt,
+				updatedBy,
+				transition,
+			};
+		}
+
+		this.assertHardenedManifestAlgorithms(data);
+		if (
+			transition &&
+			(transition.source === undefined ||
+				transition.target === undefined ||
+				transition.sourceProfileId === undefined ||
+				transition.targetProfileId === undefined)
+		) {
+			throw new Error(
+				"Invalid encryption manifest: incomplete v3 transition",
+			);
+		}
 		return {
-			version: 2,
+			version: 3,
+			profileId: "hardened-v3",
 			state,
 			revision,
 			salt,
@@ -3137,17 +3205,100 @@ export class IndexManager {
 			kdf: {
 				name: "PBKDF2",
 				hash: "SHA-256",
-				iterations: PBKDF2_ITERATIONS,
+				iterations: HARDENED_PBKDF2_ITERATIONS,
+			},
+			keySchedule: {
+				name: "HKDF",
+				hash: "SHA-256",
 			},
 			cipher: {
 				name: "AES-GCM",
 				keyLength: AES_KEY_LENGTH,
 				ivLength: IV_LENGTH,
 			},
-				updatedAt,
-				updatedBy,
-			transition: this.parseEncryptionTransition(data.transition),
-			};
+			filenameCipher: {
+				name: "AES-SIV",
+				keyLength: FILENAME_KEY_LENGTH,
+				encoding: "base64url",
+				aad: "obsidian-yandex-disk-sync:filename:v3",
+			},
+			updatedAt,
+			updatedBy,
+			transition,
+		};
+	}
+
+	private assertLegacyManifestAlgorithms(kdf: unknown, cipher: unknown): void {
+		if (kdf !== undefined) {
+			const value = kdf as Record<string, unknown>;
+			if (
+				!kdf ||
+				typeof kdf !== "object" ||
+				value.name !== "PBKDF2" ||
+				value.hash !== "SHA-256" ||
+				value.iterations !== PBKDF2_ITERATIONS
+			) {
+				throw new Error("Invalid encryption manifest: unsupported v2 KDF");
+			}
+		}
+		if (cipher !== undefined) {
+			const value = cipher as Record<string, unknown>;
+			if (
+				!cipher ||
+				typeof cipher !== "object" ||
+				value.name !== "AES-GCM" ||
+				value.keyLength !== AES_KEY_LENGTH ||
+				value.ivLength !== IV_LENGTH
+			) {
+				throw new Error("Invalid encryption manifest: unsupported v2 cipher");
+			}
+		}
+	}
+
+	private assertManifestBase64(
+		value: string,
+		minimumBytes: number,
+		maximumBytes: number,
+		field: string,
+	): void {
+		try {
+			const binary = atob(value);
+			if (
+				binary.length < minimumBytes ||
+				binary.length > maximumBytes ||
+				btoa(binary) !== value
+			) {
+				throw new Error();
+			}
+		} catch {
+			throw new Error(`Invalid encryption manifest: invalid ${field}`);
+		}
+	}
+
+	private assertHardenedManifestAlgorithms(
+		data: Record<string, unknown>,
+	): void {
+		const kdf = data.kdf as Record<string, unknown> | undefined;
+		const schedule = data.keySchedule as Record<string, unknown> | undefined;
+		const cipher = data.cipher as Record<string, unknown> | undefined;
+		const filename = data.filenameCipher as Record<string, unknown> | undefined;
+		if (
+			data.profileId !== "hardened-v3" ||
+			kdf?.name !== "PBKDF2" ||
+			kdf.hash !== "SHA-256" ||
+			kdf.iterations !== HARDENED_PBKDF2_ITERATIONS ||
+			schedule?.name !== "HKDF" ||
+			schedule.hash !== "SHA-256" ||
+			cipher?.name !== "AES-GCM" ||
+			cipher.keyLength !== AES_KEY_LENGTH ||
+			cipher.ivLength !== IV_LENGTH ||
+			filename?.name !== "AES-SIV" ||
+			filename.keyLength !== FILENAME_KEY_LENGTH ||
+			filename.encoding !== "base64url" ||
+			filename.aad !== "obsidian-yandex-disk-sync:filename:v3"
+		) {
+			throw new Error("Invalid encryption manifest: unsupported v3 profile");
+		}
 	}
 
 	private parseEncryptionTransition(
@@ -3188,7 +3339,21 @@ export class IndexManager {
 			initiatedBy: data.initiatedBy,
 			source: this.parseEncryptionModeDescriptor(data.source),
 			target: this.parseEncryptionModeDescriptor(data.target),
+			sourceProfileId: this.parseEncryptionProfileId(
+				data.sourceProfileId,
+			),
+			targetProfileId: this.parseEncryptionProfileId(
+				data.targetProfileId,
+			),
 		};
+	}
+
+	private parseEncryptionProfileId(
+		value: unknown,
+	): EncryptionTransitionDescriptor["sourceProfileId"] {
+		if (value === undefined || value === null) return value;
+		if (value === "legacy-v2" || value === "hardened-v3") return value;
+		throw new Error("Invalid encryption manifest: invalid profile ID");
 	}
 
 	private parseEncryptionModeDescriptor(
@@ -3372,7 +3537,7 @@ export class LegacyIndexVersionError extends Error {
 
 	constructor(version: number | undefined) {
 		super(
-			`Remote sync index version ${String(version)} is not supported by plugin 2.0.0-beta.4. Update every device and run one explicit force sync to create index v4.`,
+			`Remote sync index version ${String(version)} is not supported by this plugin build. Update every device and run one explicit force sync to create index v4.`,
 		);
 		this.name = "LegacyIndexVersionError";
 		this.version = version;

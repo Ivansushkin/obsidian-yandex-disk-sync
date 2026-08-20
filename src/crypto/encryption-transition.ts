@@ -1,4 +1,7 @@
-import type { EncryptionService } from "./encryption";
+import type {
+	EncryptionCodec,
+	EncryptionProfileId,
+} from "./encryption";
 import type { IndexManager } from "../sync/index-manager";
 import type { SyncEngine } from "../sync/sync-engine";
 import type {
@@ -11,11 +14,22 @@ export interface LocalEncryptionSnapshot {
 	salt: string | null;
 	password: string | null;
 	revision: number | null;
+	profileId?: EncryptionProfileId | null;
+}
+
+export interface EncryptionBackupProof {
+	path: string;
+	sha256: string;
+	epoch: string;
+	canonicalRevision: number;
+	localSnapshotDigest: string;
+	createdAt: number;
 }
 
 export interface LocalEncryptionTransition {
 	id: string;
 	kind: "enable" | "disable" | "rotate";
+	reason?: "format-upgrade";
 	phase: EncryptionTransitionPhase;
 	source: LocalEncryptionSnapshot;
 	target: LocalEncryptionSnapshot;
@@ -24,11 +38,12 @@ export interface LocalEncryptionTransition {
 	sourceFingerprints: Record<string, string>;
 	targetFingerprints: Record<string, string>;
 	sourceCanonicalRevision: number;
+	backupProof?: EncryptionBackupProof;
 }
 
 interface EncryptionTransitionLifecycle {
 	claim(transition: LocalEncryptionTransition): Promise<void>;
-	applyTarget(snapshot: LocalEncryptionSnapshot): Promise<EncryptionService | null>;
+	applyTarget(snapshot: LocalEncryptionSnapshot): Promise<EncryptionCodec | null>;
 	resolveTargetPaths(transition: LocalEncryptionTransition): Promise<void>;
 	assertSourceUnchanged(transition: LocalEncryptionTransition): Promise<void>;
 	captureTargetFingerprints(transition: LocalEncryptionTransition): Promise<void>;
@@ -36,6 +51,7 @@ interface EncryptionTransitionLifecycle {
 	stageMaintenance(
 		transition: LocalEncryptionTransition,
 		phase: EncryptionTransitionPhase,
+		cleanup?: IndexMaintenance["cleanup"],
 	): Promise<void>;
 	commitMaintenance(
 		transition: LocalEncryptionTransition,
@@ -61,7 +77,7 @@ interface EncryptionTransitionLifecycle {
 
 export interface EncryptionRewriteOptions {
 	transition: LocalEncryptionTransition;
-	sourceService: EncryptionService | null;
+	sourceService: EncryptionCodec | null;
 	beforeApplyTarget?(): Promise<void>;
 	publishPrepared?(): Promise<void>;
 	publishFilesCopied?(): Promise<void>;
@@ -105,9 +121,17 @@ export class EncryptionTransitionController {
 						await this.lifecycle.assertSourceUnchanged(transition);
 						await this.lifecycle.captureTargetFingerprints(transition);
 						await this.lifecycle.setPhase("files-copied");
+						const cleanup = transition.sourceRawPaths.flatMap((path) => {
+							const expectedFingerprint =
+								transition.sourceFingerprints[path];
+							return expectedFingerprint
+								? [{ path, expectedFingerprint }]
+								: [];
+						});
 						await this.lifecycle.stageMaintenance(
 							transition,
 							"index-committed",
+							cleanup,
 						);
 						await options.publishFilesCopied?.();
 					},

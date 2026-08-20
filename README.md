@@ -2,15 +2,15 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-## Upgrading to 2.0.0-beta.4
+## Upgrading to 2.0.0-beta.5
 
-Version 2.0.0-beta.4 uses canonical index v4 and cannot synchronize alongside
-1.1, 1.2 beta, or earlier 2.0 beta builds that use index v1-v3. Stop sync on
-every device and restore the intended local folder structure on the device
-with the most complete data. Update the plugin everywhere, then run one
-backed-up **Force sync → Local to remote** on that authoritative device. Run a
-normal full sync on every other updated device; another Force sync is not
-required.
+Version 2.0.0-beta.5 keeps canonical index v4 and introduces hardened
+encryption manifest v3. It must not synchronize concurrently with 1.1, 1.2
+beta, or older 2.0 beta builds. Update every device first. Index v1-v3 still
+requires one backed-up **Force sync → Local to remote** on the authoritative
+device; other updated devices then accept the new epoch through normal full
+sync. Existing encrypted manifest v1/v2 requires the explicit protected format
+upgrade in plugin settings before normal sync resumes.
 
 Do not start an older plugin version after the transition: it can replace the
 v4 index or restore deleted files. If that happens, disable sync everywhere,
@@ -59,7 +59,7 @@ repeat the backed-up Force local procedure.
 - **Multi-device support** — work under one token on different devices
 - **Backup system** — create ZIP backups of vault stored on Yandex Disk
 - **Force synchronization** — unconditional one-way overwrite (local→remote or remote→local) for recovery or manual resync
-- **End-to-end encryption** — AES-256-GCM encryption for file content and filenames with PBKDF2 key derivation
+- **End-to-end encryption** — AES-256-GCM content encryption and deterministic AES-SIV filenames with separated keys
 
 ## Installation
 
@@ -96,8 +96,9 @@ repeat the backed-up Force local procedure.
 | **OAuth token**              | Token for Yandex Disk API access                               | Obtained in settings    |
 | **Remote path**              | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`) | `obsidian-sync`         |
 | **Real-time sync**           | Automatic synchronization when files are changed               | Enabled                 |
-| **Full sync interval**       | Full synchronization interval in minutes (0 = manual only)     | 60                      |
-| **Sync delay**               | Delay before uploading file after change (debounce)            | 5 seconds               |
+| **Full sync interval**       | Full synchronization interval in minutes (0 = manual only)     | 5 minutes               |
+| **Sync delay**               | Delay before uploading file after change (debounce)            | 1000 ms                 |
+| **Max concurrent operations** | Bounded file-operation concurrency                             | 10                      |
 | **Sync config folder**       | Synchronize Obsidian settings folder                           | Disabled (by default)   |
 | **Include/Exclude patterns** | Glob patterns for file filtering                               | `*.md`, `attachments/*` |
 | **Force Sync**               | Unconditional one-way overwrite (local→remote / remote→local)  | —                       |
@@ -157,8 +158,10 @@ Plugin includes built-in backup system for creating ZIP archives of your vault:
 
 - **Create backups**: Plugin settings → Backup section → "Create backup" button
 - **Backup location**: Backups are stored in `.backup` folder on Yandex Disk
-- **Backup format**: `backup_YYYY-MM-DD_HH-MM-SS.zip`; encrypted backups use
-  `backup_YYYY-MM-DD_HH-MM-SS.enc.zip`
+- **Backup format**:
+  `backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>[.enc].zip`
+- **Encrypted backup**: self-contained authenticated envelope; download saves
+  a regular `.zip` and can request the archive's own password
 - **Content**: All files subject to synchronization according to filters
 - **Availability**: Every device reads the shared backup list directly from
   the protected remote `.backup` folder
@@ -182,15 +185,16 @@ Force sync ignores timestamps, file hashes, and conflict resolver — it creates
 
 ### Encryption
 
-The plugin supports end-to-end encryption of file content and filenames using **AES-256-GCM** with **PBKDF2** key derivation (100k iterations, HMAC-SHA256):
+New encrypted vaults use the hardened-v3 profile: PBKDF2-HMAC-SHA256 with
+600,000 iterations derives a master key, then HKDF-SHA256 derives independent
+AES-256-GCM content and AES-SIV filename keys.
 
 While encryption is being enabled, disabled, or rotated, other devices block
-normal synchronization. If the initiating device is lost, recover only with
-**Force sync → Local to remote** from a verified complete local copy after
-creating a backup.
+normal synchronization. A target-capable device can finish fingerprint-guarded
+post-commit cleanup from canonical metadata without the source password.
 
 - **Content encryption**: each file gets a random 12-byte IV, ensuring unique ciphertext even for identical files
-- **Filename encryption**: deterministic IV derived from the file path via SHA-256, so encrypted paths are stable across devices and sessions
+- **Filename encryption**: RFC 5297 AES-SIV with fixed domain AAD and canonical Base64URL; paths remain stable across devices and folder moves do not re-encode descendants
 - **Key**: derived from your password + random 16-byte salt — the master key never leaves your device
 - **Multi-device**: salt is stored in a shared file `.obsidian-encrypt.json` on Yandex Disk (raw, unencrypted). When encryption is enabled on a new device, it auto-detects encrypted data, prompts for the password, and verifies it before enabling
 
@@ -198,8 +202,8 @@ creating a backup.
 
 1. Go to **Settings → Encryption section**
 2. Click the encryption toggle
-3. Choose whether to create a backup first
-4. Enter and confirm your password
+3. Enter and confirm your password
+4. Wait while the plugin creates and byte-verifies the mandatory backup
 5. Wait for the initial encryption sync (all files are re-uploaded encrypted)
 
 **Password recovery**: The password is NOT recoverable. If you lose the password while encryption is enabled, your data on Yandex Disk becomes permanently inaccessible. Keep the password in a safe place (e.g., password manager).
@@ -212,11 +216,16 @@ creating a backup.
 > deleted only by fingerprint-guarded cleanup. The resulting encrypted data
 > cannot be read without the password.
 
+Legacy encrypted manifest v1/v2 remains readable only for recovery and
+migration. The settings screen requires an explicit format upgrade and warns
+that historical `.enc.zip` archives may still require the old vault
+password/salt; those archives are never rewritten.
+
 ## Development
 
 ### Requirements
 
-- Node.js 18+
+- Node.js 20.19+
 - npm
 
 ### Install Dependencies

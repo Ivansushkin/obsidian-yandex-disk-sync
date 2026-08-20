@@ -4,9 +4,13 @@
 
 import { App, Modal, Notice } from 'obsidian';
 import type { BackupInfo } from '../types';
-import type { BackupManager } from '../backup/backup-manager';
+import {
+	BackupManager,
+	BackupPasswordRequiredError,
+} from '../backup/backup-manager';
 import { t } from '../i18n';
 import { logger } from '../utils/logger';
+import { ConnectEncryptedVaultModal } from './encryption-modals';
 
 export class BackupListModal extends Modal {
 	private backupManager: BackupManager;
@@ -101,7 +105,18 @@ export class BackupListModal extends Modal {
 
 			new Notice(t('notice.backup_download_started'));
 
-			const content = await this.backupManager.downloadBackup(backup.remotePath);
+			let content: ArrayBuffer;
+			try {
+				content = await this.backupManager.downloadBackup(backup.remotePath);
+			} catch (error) {
+				if (!(error instanceof BackupPasswordRequiredError)) throw error;
+				const password = await this.promptBackupPassword();
+				if (!password) return;
+				content = await this.backupManager.downloadBackup(
+					backup.remotePath,
+					password,
+				);
+			}
 
 			// Create blob and download
 			const blob = new Blob([content], { type: 'application/zip' });
@@ -110,14 +125,17 @@ export class BackupListModal extends Modal {
 			// Create download link
 			const a = document.createElement('a');
 			a.href = url;
-			a.download = backup.name;
+			const downloadName = this.backupManager.getSuggestedDownloadName(
+				backup.name,
+			);
+			a.download = downloadName;
 			document.body.appendChild(a);
 			a.click();
 			document.body.removeChild(a);
 
 			URL.revokeObjectURL(url);
 
-			new Notice(t('notice.backup_download_completed', { name: backup.name }));
+			new Notice(t('notice.backup_download_completed', { name: downloadName }));
 		} catch (error) {
 			logger.error('Error downloading backup:', { error });
 			new Notice(t('notice.backup_download_failed'));
@@ -125,6 +143,18 @@ export class BackupListModal extends Modal {
 			button.disabled = false;
 			button.setText(t('backup_list.download'));
 		}
+	}
+
+	private async promptBackupPassword(): Promise<string | null> {
+		return await new Promise<string | null>((resolve) => {
+			new ConnectEncryptedVaultModal(
+				this.app,
+				resolve,
+				t('modal.backup_password_title'),
+				t('modal.backup_password_desc'),
+				t('modal.backup_password_button'),
+			).open();
+		});
 	}
 
 	private formatDate(date: Date): string {

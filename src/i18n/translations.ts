@@ -75,8 +75,13 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_sync_exception": "Force sync failed: {message}",
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
+		"notice.encryption_upgrade_required":
+			"Encryption must be upgraded before synchronization can continue. Open plugin settings and run the protected format upgrade.",
+		"notice.encryption_upgrading": "Upgrading encryption format...",
+		"notice.encryption_upgrade_completed":
+			"Encryption format upgraded successfully",
 		"notice.legacy_index_blocked":
-			"Plugin 2.0.0-beta.4 detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
+			"This plugin version detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.invalid_index_blocked":
@@ -215,6 +220,14 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Enable end-to-end encryption for files on Yandex Disk",
 		"settings.encryption_status_active": "Encryption active",
 		"settings.encryption_change_password": "Change password",
+		"settings.encryption_upgrade_title": "Encryption upgrade required",
+		"settings.encryption_upgrade_desc":
+			"Create a verified independent backup and migrate filenames and keys to the hardened v3 format.",
+		"settings.encryption_upgrade_button": "Upgrade encryption",
+		"modal.encryption_upgrade_title": "Upgrade encryption format",
+		"modal.encryption_upgrade_warning":
+			"A new verified backup will be created first. Existing .enc.zip backups are not modified and may still require the old vault key after migration.",
+		"modal.encryption_upgrade_button": "Back up and upgrade",
 		"modal.encryption_enable_title": "Enable encryption",
 		"modal.encryption_enable_warning":
 			"Enabling encryption will overwrite ALL files on Yandex Disk with encrypted versions. If you lose your password, access to your data will be permanently lost.",
@@ -236,13 +249,17 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_rotated_desc":
 			"The encryption password was changed on another device. Enter the new password to continue synchronization on this device.",
 		"modal.encryption_connect_button": "Connect",
+		"modal.backup_password_title": "Open encrypted backup",
+		"modal.backup_password_desc":
+			"Enter the password used when this backup was created.",
+		"modal.backup_password_button": "Open backup",
 		"modal.encryption_connect_privacy":
 			"The password is stored only on this device and is never sent to Yandex Disk.",
 		"notice.encryption_enabled":
 			"Encryption enabled. All files encrypted and synced.",
 		"settings.encryption_info_title": "About encryption",
 		"settings.encryption_info_how":
-			"Encryption uses AES-256-GCM with PBKDF2 key derivation (100,000 iterations). File contents and filenames are encrypted before upload and decrypted after download.",
+			"Hardened encryption uses PBKDF2 (600,000 iterations), HKDF-separated keys, AES-256-GCM file content, and deterministic AES-SIV filenames.",
 		"settings.encryption_info_warning":
 			"Warning: If you lose your password, encrypted files cannot be decrypted. There is no password recovery mechanism.",
 		"settings.encryption_info_password":
@@ -280,8 +297,6 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Encryption password changed. Other devices will ask for the new password.",
 		"modal.encryption_enable_with_backup":
 			"Create backup and enable encryption",
-		"modal.encryption_enable_without_backup":
-			"Enable encryption without backup",
 
 		"generic.yes": "Yes",
 		"generic.confirm": "Confirm",
@@ -382,8 +397,13 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Ошибка принудительной синхронизации: {message}",
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
+		"notice.encryption_upgrade_required":
+			"Перед продолжением синхронизации нужно усилить шифрование. Откройте настройки плагина и запустите защищённую миграцию формата.",
+		"notice.encryption_upgrading": "Обновление формата шифрования...",
+		"notice.encryption_upgrade_completed":
+			"Формат шифрования успешно обновлён",
 		"notice.legacy_index_blocked":
-			"Плагин 2.0.0-beta.4 обнаружил старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
+			"Текущая версия плагина обнаружила старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.invalid_index_blocked":
@@ -523,6 +543,14 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Включить сквозное шифрование для файлов на Яндекс.Диске",
 		"settings.encryption_status_active": "Шифрование активно",
 		"settings.encryption_change_password": "Сменить пароль",
+		"settings.encryption_upgrade_title": "Требуется обновление шифрования",
+		"settings.encryption_upgrade_desc":
+			"Создать проверенный независимый backup и перевести имена и ключи на усиленный формат v3.",
+		"settings.encryption_upgrade_button": "Обновить шифрование",
+		"modal.encryption_upgrade_title": "Обновление формата шифрования",
+		"modal.encryption_upgrade_warning":
+			"Сначала будет создан новый проверенный backup. Старые .enc.zip не изменяются и после миграции могут по-прежнему требовать прежний ключ хранилища.",
+		"modal.encryption_upgrade_button": "Создать backup и обновить",
 		"modal.encryption_enable_title": "Включение шифрования",
 		"modal.encryption_enable_warning":
 			"Включение шифрования перезапишет ВСЕ файлы на Яндекс.Диске зашифрованными версиями. Если вы забудете пароль, доступ к данным будет безвозвратно утерян.",
@@ -544,13 +572,17 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_rotated_desc":
 			"Пароль шифрования был изменён на другом устройстве. Введите новый пароль, чтобы продолжить синхронизацию на этом устройстве.",
 		"modal.encryption_connect_button": "Подключить",
+		"modal.backup_password_title": "Открыть зашифрованный backup",
+		"modal.backup_password_desc":
+			"Введите пароль, с которым был создан этот backup.",
+		"modal.backup_password_button": "Открыть backup",
 		"modal.encryption_connect_privacy":
 			"Пароль хранится только на этом устройстве и никогда не отправляется на Яндекс.Диск.",
 		"notice.encryption_enabled":
 			"Шифрование включено. Все файлы зашифрованы и синхронизированы.",
 		"settings.encryption_info_title": "О шифровании",
 		"settings.encryption_info_how":
-			"Шифрование использует AES-256-GCM с выводом ключа через PBKDF2 (100 000 итераций). Содержимое файлов и их имена шифруются перед загрузкой и расшифровываются после скачивания.",
+			"Усиленное шифрование использует PBKDF2 (600 000 итераций), разделённые HKDF-ключи, AES-256-GCM для содержимого и детерминированный AES-SIV для имён.",
 		"settings.encryption_info_warning":
 			"Предупреждение: При утере пароля зашифрованные файлы невозможно расшифровать. Механизма восстановления пароля нет.",
 		"settings.encryption_info_password":
@@ -588,8 +620,6 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Пароль шифрования изменён. Другие устройства запросят новый пароль.",
 		"modal.encryption_enable_with_backup":
 			"Сделать бекап и включить шифрование",
-		"modal.encryption_enable_without_backup":
-			"Включить шифрование без бекапа",
 
 		"generic.yes": "Да",
 		"generic.confirm": "Подтвердить",

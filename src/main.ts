@@ -49,14 +49,15 @@ import {
 import { logger, shortenDiagnosticValue } from "./utils/logger";
 import { initI18n, t } from "./i18n";
 import {
+	createEncryptionCodec,
 	EncryptionService,
-	PBKDF2_ITERATIONS,
-	AES_KEY_LENGTH,
-	IV_LENGTH,
+	type EncryptionCodec,
 } from "./crypto/encryption";
+import { EncryptionManager } from "./crypto/encryption-manager";
 import {
 	decideEncryptionRecovery,
 	EncryptionTransitionController,
+	type EncryptionBackupProof,
 	type LocalEncryptionSnapshot,
 	type LocalEncryptionTransition,
 } from "./crypto/encryption-transition";
@@ -64,8 +65,11 @@ import {
 	getPhysicalResourceFingerprint,
 	matchesPhysicalResourceFingerprint,
 } from "./utils/resource-fingerprint";
+import { computeSha256FromString } from "./utils/hash-utils";
+import { migrateEncryptionPluginData } from "./crypto/encryption-state-migration";
 
 interface PluginData {
+	schemaVersion?: number;
 	settings: YandexDiskSyncSettings;
 	localState: Partial<LocalSyncState> | null;
 	localIndex?: {
@@ -117,7 +121,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	};
 
 	private regularSyncStarted = false;
-	private encryptionService: EncryptionService | null = null;
+	private readonly encryptionManager = new EncryptionManager();
+	private encryptionService: EncryptionCodec | null = null;
 	private encryptionTransitionController!: EncryptionTransitionController;
 	private encryptionBlockReason: string | null = null;
 	private encryptionPromptPromise: Promise<boolean> | null = null;
@@ -276,8 +281,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						await this.captureTransitionTargetFingerprints(transition),
 					setPhase: async (phase) =>
 						await this.setEncryptionTransitionPhase(phase),
-					stageMaintenance: async (transition, phase) =>
-						await this.stageCanonicalMaintenance(transition, phase),
+					stageMaintenance: async (transition, phase, cleanup) =>
+						await this.stageCanonicalMaintenance(
+							transition,
+							phase,
+							cleanup,
+						),
 					commitMaintenance: async (transition, phase, cleanup) =>
 						await this.commitCanonicalMaintenance(
 							transition,
@@ -371,6 +380,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.yandexClient,
 			this.vaultAdapter,
 			this.settings,
+			this.manifest.version,
 		);
 	}
 
@@ -477,6 +487,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.syncEngine.runExclusiveMaintenance(async () => {
 				await this.recoverEncryptionTransition();
 			});
+		} else {
+			await this.tryRecoverRemoteTargetTransition();
 		}
 
 		if (
@@ -1011,9 +1023,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Load settings
 	 */
 	async loadSettings(): Promise<void> {
-		const data = (await this.loadData()) as PluginData | null;
+		const data = migrateEncryptionPluginData(
+			(await this.loadData()) as PluginData | null,
+		);
 		this.loadedPluginData = data;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
+		if (
+			this.settings.enableEncryption &&
+			!this.settings.encryptionProfileId
+		) {
+			this.settings.encryptionProfileId = "legacy-v2";
+		}
 		if (data?.lastSyncStats) this.lastSyncStats = data.lastSyncStats;
 		this.encryptionTransition = data?.encryptionTransition ?? null;
 		if (
@@ -1025,6 +1045,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		} else if (this.encryptionTransition) {
 			this.encryptionTransition.sourceFingerprints ??= {};
 			this.encryptionTransition.targetFingerprints ??= {};
+			this.encryptionTransition.source.profileId ??=
+				this.encryptionTransition.source.enabled ? "legacy-v2" : null;
+			this.encryptionTransition.target.profileId ??=
+				this.encryptionTransition.target.enabled ? "legacy-v2" : null;
 		}
 
 		// Migrate legacy field name `encryptedPassword` -> `encryptionPassword`.
@@ -1152,7 +1176,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const salt = EncryptionService.base64ToBytes(
 				this.settings.encryptionSalt,
 			);
-			const service = new EncryptionService(salt);
+			const service = createEncryptionCodec(
+				this.settings.encryptionProfileId ?? "legacy-v2",
+				salt,
+			);
 			await service.initializeKey(this.settings.encryptionPassword);
 			this.encryptionService = service;
 			this.yandexClient.setEncryptionService(service);
@@ -1191,6 +1218,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		await this.runEncryptionPreflight();
+		const backupProof =
+			await this.createMandatoryEncryptionBackup(password);
 		const sourceFiles =
 			await this.indexManager.getRemoteRawFileSnapshots();
 		const oldRawPaths = sourceFiles.map((file) => file.path);
@@ -1198,13 +1227,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const saltBytes = EncryptionService.generateSalt();
 		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
 		const revision = 1;
-		const service = new EncryptionService(saltBytes);
+		const service = createEncryptionCodec("hardened-v3", saltBytes);
 		await service.initializeKey(password);
 		const target: LocalEncryptionSnapshot = {
 			enabled: true,
 			salt: saltBase64,
 			password,
 			revision,
+			profileId: "hardened-v3",
 		};
 		const transition = await this.beginEncryptionTransition(
 			"enable",
@@ -1214,6 +1244,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			Object.fromEntries(
 				sourceFiles.map((file) => [file.path, file.fingerprint]),
 			),
+			backupProof,
 		);
 		const publishEnablingManifest =
 			this.createEncryptionManifestPublisher(
@@ -1228,7 +1259,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.encryptionTransitionController.execute({
 			transition,
 			sourceService: null,
-			publishPrepared: publishEnablingManifest,
+			beforeApplyTarget: publishEnablingManifest,
 			publishFilesCopied: publishEnablingManifest,
 			publishIndexCommitted: publishEnablingManifest,
 		});
@@ -1272,6 +1303,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		if (options?.reuploadPlaintext) {
 			await this.runEncryptionPreflight();
+			const backupPassword = this.settings.encryptionPassword;
+			if (!backupPassword) {
+				throw new Error(t("notice.encryption_password_required"));
+			}
+			const backupProof =
+				await this.createMandatoryEncryptionBackup(backupPassword);
 			const source = this.captureEncryptionSnapshot();
 			const sourceService = this.encryptionService;
 			// Capture encrypted paths while service is still active
@@ -1283,6 +1320,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				salt: null,
 				password: null,
 				revision: null,
+				profileId: null,
 			};
 			const transition = await this.beginEncryptionTransition(
 				"disable",
@@ -1295,6 +1333,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						file.fingerprint,
 					]),
 				),
+				backupProof,
 			);
 
 			try {
@@ -1336,6 +1375,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.settings.encryptionSalt = null;
 		this.settings.encryptionPassword = null;
 		this.settings.encryptionRevision = null;
+		this.settings.encryptionProfileId = null;
 		await this.saveSettings();
 
 		try {
@@ -1365,6 +1405,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.settings.encryptionSalt = null;
 		this.settings.encryptionPassword = null;
 		this.settings.encryptionRevision = null;
+		this.settings.encryptionProfileId = null;
 		await this.saveSettings();
 		this.setEncryptionBlock(null);
 	}
@@ -1388,8 +1429,27 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 	}
 
+	async upgradeEncryptionFormat(): Promise<void> {
+		if (this.settings.encryptionProfileId === "hardened-v3") return;
+		const password = this.settings.encryptionPassword;
+		if (!password) {
+			throw new Error(t("notice.encryption_password_required"));
+		}
+		this.beginSyncNotice(t("notice.encryption_upgrading"));
+		try {
+			await this.syncEngine.runExclusiveMaintenance(async () => {
+				await this.rotateEncryptionPasswordNow(password, "format-upgrade");
+			});
+			this.finishSyncNotice(t("notice.encryption_upgrade_completed"), 5000);
+		} catch (error) {
+			this.finishEncryptionError(error);
+			throw error;
+		}
+	}
+
 	private async rotateEncryptionPasswordNow(
 		newPassword: string,
+		reason?: "format-upgrade",
 	): Promise<void> {
 		const currentManifest =
 			await this.indexManager.downloadEncryptionManifest();
@@ -1401,6 +1461,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		await this.runEncryptionPreflight();
+		const backupProof =
+			await this.createMandatoryEncryptionBackup(newPassword);
 		const source = this.captureEncryptionSnapshot();
 		const sourceService = this.encryptionService;
 		const sourceFiles =
@@ -1413,13 +1475,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				currentManifest?.revision ?? 1,
 				this.settings.encryptionRevision ?? 1,
 			) + 1;
-		const service = new EncryptionService(saltBytes);
+		const service = createEncryptionCodec("hardened-v3", saltBytes);
 		await service.initializeKey(newPassword);
 		const target: LocalEncryptionSnapshot = {
 			enabled: true,
 			salt: saltBase64,
 			password: newPassword,
 			revision,
+			profileId: "hardened-v3",
 		};
 		const transition = await this.beginEncryptionTransition(
 			"rotate",
@@ -1429,7 +1492,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			Object.fromEntries(
 				sourceFiles.map((file) => [file.path, file.fingerprint]),
 			),
+			backupProof,
 		);
+		transition.reason = reason;
+		await this.saveSettings();
 
 		const publishRotatingManifest =
 			this.createEncryptionManifestPublisher(
@@ -1445,7 +1511,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.encryptionTransitionController.execute({
 			transition,
 			sourceService,
-			publishPrepared: publishRotatingManifest,
+			beforeApplyTarget: publishRotatingManifest,
 			publishFilesCopied: publishRotatingManifest,
 			publishIndexCommitted: publishRotatingManifest,
 		});
@@ -1471,13 +1537,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (!remoteManifest) {
 			throw new Error(t("notice.encryption_remote_missing"));
 		}
-		if (remoteManifest.state !== "enabled") {
+		const recoveringTarget =
+			this.isRecoverableRemoteTargetManifest(remoteManifest);
+		if (remoteManifest.state !== "enabled" && !recoveringTarget) {
 			throw new Error(t("notice.encryption_remote_busy"));
 		}
 
-		const saltBytes = EncryptionService.base64ToBytes(remoteManifest.salt);
-		const service = new EncryptionService(saltBytes);
-		await service.initializeKey(password);
+		const profileId =
+			this.encryptionManager.getManifestProfileId(remoteManifest);
+		const service = await this.encryptionManager.createCodec(
+			profileId,
+			remoteManifest.salt,
+			password,
+		);
 		await this.verifyRemoteEncryptionPassword(service, remoteManifest);
 
 		this.encryptionService = service;
@@ -1486,10 +1558,112 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.settings.encryptionSalt = remoteManifest.salt;
 		this.settings.encryptionPassword = password;
 		this.settings.encryptionRevision = remoteManifest.revision;
+		this.settings.encryptionProfileId = profileId;
 
 		await this.saveSettings();
-		this.setEncryptionBlock(null);
+		if (recoveringTarget) {
+			await this.recoverRemoteTargetTransition(remoteManifest, service);
+		}
+		this.setEncryptionBlock(
+			remoteManifest.version === 3 &&
+				remoteManifest.state === "enabled"
+				? null
+				: remoteManifest.version === 3
+					? null
+					: t("notice.encryption_upgrade_required"),
+		);
 		logger.info("Encryption configured from remote manifest");
+	}
+
+	private isRecoverableRemoteTargetManifest(
+		manifest: RemoteEncryptionManifest,
+	): manifest is Extract<RemoteEncryptionManifest, { version: 3 }> & {
+		transition: NonNullable<
+			Extract<RemoteEncryptionManifest, { version: 3 }>["transition"]
+		>;
+	} {
+		return (
+			manifest.version === 3 &&
+			manifest.state === "rotating" &&
+			manifest.transition?.targetProfileId === "hardened-v3"
+		);
+	}
+
+	/** Resume post-commit v3 cleanup using only the target password. */
+	private async recoverRemoteTargetTransition(
+		manifest: Extract<RemoteEncryptionManifest, { version: 3 }> & {
+			transition: NonNullable<
+				Extract<RemoteEncryptionManifest, { version: 3 }>["transition"]
+			>;
+		},
+		service: EncryptionCodec,
+	): Promise<void> {
+		await this.indexManager.runTargetMaintenanceRecovery(
+			manifest.transition.id,
+			async () => {
+				await this.indexManager.loadRemoteIndex();
+				const maintenance = this.indexManager.getMaintenance();
+				if (
+					!maintenance ||
+					maintenance.id !== manifest.transition.id ||
+					(maintenance.phase !== "index-committed" &&
+						maintenance.phase !== "cleanup" &&
+						maintenance.phase !== "stable") ||
+					!maintenance.target.enabled ||
+					maintenance.target.salt !== manifest.salt ||
+					maintenance.target.revision !== manifest.revision ||
+					!maintenance.target.verifier ||
+					!(await service.verifyVerifier(
+						maintenance.target.verifier,
+					))
+				) {
+					throw new Error(t("notice.encryption_remote_busy"));
+				}
+				if (maintenance.phase === "index-committed") {
+					this.indexManager.setMaintenance({
+						...maintenance,
+						phase: "cleanup",
+					});
+					await this.indexManager.saveRemoteIndex();
+				}
+				await this.indexManager.uploadEncryptionManifest(
+					await this.createEncryptionManifest(
+						service,
+						manifest.salt,
+						"enabled",
+						manifest.revision,
+					),
+				);
+				await this.resumeCanonicalMaintenanceCleanup();
+			},
+		);
+		this.setEncryptionBlock(null);
+	}
+
+	private async tryRecoverRemoteTargetTransition(): Promise<void> {
+		const password = this.settings.encryptionPassword;
+		if (!password || !this.settings.enableEncryption) return;
+		try {
+			const manifest =
+				await this.indexManager.downloadEncryptionManifest();
+			if (
+				!manifest ||
+				!this.isRecoverableRemoteTargetManifest(manifest) ||
+				this.settings.encryptionSalt !== manifest.salt ||
+				(this.settings.encryptionProfileId ?? "legacy-v2") !==
+					"hardened-v3"
+			) {
+				return;
+			}
+			await this.syncEngine.runExclusiveMaintenance(async () => {
+				await this.connectToRemoteEncryption(password, manifest);
+			});
+		} catch (error) {
+			logger.warn("Target encryption transition recovery is blocked", {
+				error,
+			});
+			this.setEncryptionBlock(t("notice.encryption_remote_busy"));
+		}
 	}
 
 	/**
@@ -1532,6 +1706,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const matchesRemote =
 				hasLocalEncryption &&
 				this.settings.encryptionSalt === manifest.salt &&
+				(this.settings.encryptionProfileId ?? "legacy-v2") ===
+					this.encryptionManager.getManifestProfileId(manifest) &&
 				(manifest.version === 1 || localRevision === manifest.revision);
 
 			if (!matchesRemote) {
@@ -1548,7 +1724,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				);
 			}
 
-			if (manifest.version === 2 && this.encryptionService) {
+			if (manifest.version !== 1 && this.encryptionService) {
 				try {
 					if (
 						!(await this.encryptionService.verifyVerifier(
@@ -1572,6 +1748,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 
 			this.setEncryptionBlock(null);
+			if (manifest.version !== 3) {
+				this.setEncryptionBlock(t("notice.encryption_upgrade_required"));
+				return false;
+			}
 			return true;
 		} catch (e) {
 			const message = e instanceof Error ? e.message : String(e);
@@ -1645,10 +1825,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private async verifyRemoteEncryptionPassword(
-		service: EncryptionService,
+		service: EncryptionCodec,
 		manifest: RemoteEncryptionManifest,
 	): Promise<void> {
-		if (manifest.version === 2) {
+		if (manifest.version !== 1) {
 			try {
 				if (await service.verifyVerifier(manifest.verifier)) {
 					return;
@@ -1698,7 +1878,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			const salt = EncryptionService.base64ToBytes(
 				this.settings.encryptionSalt,
 			);
-			const candidate = new EncryptionService(salt);
+			const candidate = createEncryptionCodec(
+				this.settings.encryptionProfileId ?? "legacy-v2",
+				salt,
+			);
 			await candidate.initializeKey(password);
 			const verifier = await this.encryptionService.createVerifier();
 			return await candidate.verifyVerifier(verifier);
@@ -1708,49 +1891,26 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private async createEncryptionManifest(
-		service: EncryptionService,
+		service: EncryptionCodec,
 		salt: string,
 		state: EncryptionManifest["state"],
 		revision: number,
 		transition?: LocalEncryptionTransition,
 	): Promise<EncryptionManifest> {
-		return {
-			version: 2,
+		return await this.encryptionManager.createManifest({
+			service,
+			salt,
 			state,
 			revision,
-			salt,
-			verifier: await service.createVerifier(),
-			kdf: {
-				name: "PBKDF2",
-				hash: "SHA-256",
-				iterations: PBKDF2_ITERATIONS,
-			},
-			cipher: {
-				name: "AES-GCM",
-				keyLength: AES_KEY_LENGTH,
-				ivLength: IV_LENGTH,
-			},
-			updatedAt: Date.now(),
-			updatedBy: this.settings.deviceId,
-			transition: transition
-				? {
-						id: transition.id,
-						phase: transition.phase,
-						sourceRevision: transition.source.revision,
-						targetRevision: transition.target.revision,
-						initiatedBy: this.settings.deviceId,
-						source:
-							this.indexManager.getMaintenance()?.source,
-						target:
-							this.indexManager.getMaintenance()?.target,
-					}
-				: undefined,
-		};
+			deviceId: this.settings.deviceId,
+			transition,
+			maintenance: this.indexManager.getMaintenance(),
+		});
 	}
 
 	/** Build a reusable publisher for one transition manifest state. */
 	private createEncryptionManifestPublisher(
-		service: EncryptionService,
+		service: EncryptionCodec,
 		salt: string,
 		state: EncryptionManifest["state"],
 		revision: number,
@@ -1769,30 +1929,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private captureEncryptionSnapshot(): LocalEncryptionSnapshot {
-		return {
-			enabled: this.settings.enableEncryption,
-			salt: this.settings.encryptionSalt,
-			password: this.settings.encryptionPassword,
-			revision: this.settings.encryptionRevision,
-		};
+		return this.encryptionManager.captureSnapshot(this.settings);
 	}
 
 	private async applyEncryptionSnapshot(
 		snapshot: LocalEncryptionSnapshot,
-	): Promise<EncryptionService | null> {
-		let service: EncryptionService | null = null;
-		if (snapshot.enabled && snapshot.salt && snapshot.password) {
-			service = new EncryptionService(
-				EncryptionService.base64ToBytes(snapshot.salt),
-			);
-			await service.initializeKey(snapshot.password);
-		}
+	): Promise<EncryptionCodec | null> {
+		const service = await this.encryptionManager.applySnapshot(
+			this.settings,
+			snapshot,
+		);
 		this.encryptionService = service;
 		this.yandexClient.setEncryptionService(service);
-		this.settings.enableEncryption = snapshot.enabled;
-		this.settings.encryptionSalt = snapshot.salt;
-		this.settings.encryptionPassword = snapshot.password;
-		this.settings.encryptionRevision = snapshot.revision;
 		await this.saveSettings();
 		return service;
 	}
@@ -1803,6 +1951,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		target: LocalEncryptionSnapshot,
 		sourceRawPaths: string[],
 		sourceFingerprints: Record<string, string>,
+		backupProof: EncryptionBackupProof,
 	): Promise<LocalEncryptionTransition> {
 		const transition: LocalEncryptionTransition = {
 			id: `${this.settings.deviceId}:${kind}:${Date.now().toString(36)}`,
@@ -1816,6 +1965,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			targetFingerprints: {},
 			sourceCanonicalRevision:
 				this.indexManager.getRemoteIndex().revision,
+			backupProof,
 		};
 		this.encryptionTransition = transition;
 		await this.saveSettings();
@@ -1851,28 +2001,56 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private async createEncryptionModeDescriptor(
 		snapshot: LocalEncryptionSnapshot,
 	): Promise<EncryptionModeDescriptor> {
-		if (!snapshot.enabled || !snapshot.salt || !snapshot.password) {
+		return await this.encryptionManager.createModeDescriptor(snapshot);
+	}
+
+	/** Create and byte-verify a backup of one stable logical vault snapshot. */
+	private async createMandatoryEncryptionBackup(
+		password: string,
+	): Promise<EncryptionBackupProof> {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const before = await this.getLogicalVaultSnapshotDigest();
+			const result = await this.backupManager.createBackup(password);
+			if (!result.success || !result.backupName || !result.sha256) {
+				throw new Error(
+					result.error ?? "Mandatory encryption backup failed",
+				);
+			}
+			const after = await this.getLogicalVaultSnapshotDigest();
+			if (before !== after) {
+				logger.warn("Vault changed while creating encryption backup", {
+					attempt: attempt + 1,
+				});
+				continue;
+			}
+			const canonical = this.indexManager.getRemoteIndex();
 			return {
-				enabled: false,
-				revision: null,
-				salt: null,
-				verifier: null,
+				path: joinPath(
+					this.settings.remotePath,
+					".backup",
+					result.backupName,
+				),
+				sha256: result.sha256,
+				epoch: canonical.epoch,
+				canonicalRevision: canonical.revision,
+				localSnapshotDigest: after,
+				createdAt: Date.now(),
 			};
 		}
-		const service = new EncryptionService(
-			EncryptionService.base64ToBytes(snapshot.salt),
-		);
-		await service.initializeKey(snapshot.password);
-		return {
-			enabled: true,
-			revision: snapshot.revision,
-			salt: snapshot.salt,
-			verifier: await service.createVerifier(),
-		};
+		throw new Error("Vault changed during mandatory encryption backup");
+	}
+
+	private async getLogicalVaultSnapshotDigest(): Promise<string> {
+		const metadata = await this.vaultAdapter.getAllFileMetadata();
+		const stableEntries = [...metadata.values()]
+			.map((file) => [file.path, file.sha256, file.size] as const)
+			.sort(([left], [right]) => left.localeCompare(right));
+		return await computeSha256FromString(JSON.stringify(stableEntries));
 	}
 
 	private async runEncryptionPreflight(): Promise<void> {
 		const result = await this.syncEngine.fullSync({
+			skipEncryptionGuard: true,
 			skipMaintenanceGuard: true,
 		});
 		if (!result.success) {
@@ -1893,8 +2071,24 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
 		for (let attempt = 0; attempt < 3; attempt++) {
-			transition.sourceCanonicalRevision =
-				this.indexManager.getRemoteIndex().revision;
+			const canonical = this.indexManager.getRemoteIndex();
+			transition.sourceCanonicalRevision = canonical.revision;
+			const currentDigest = await this.getLogicalVaultSnapshotDigest();
+			if (
+				!transition.backupProof ||
+				transition.backupProof.epoch !== canonical.epoch ||
+				transition.backupProof.canonicalRevision !== canonical.revision ||
+				transition.backupProof.localSnapshotDigest !== currentDigest
+			) {
+				const backupPassword = transition.target.enabled
+					? transition.target.password
+					: transition.source.password;
+				if (!backupPassword) {
+					throw new Error("Encryption backup password is unavailable");
+				}
+				transition.backupProof =
+					await this.createMandatoryEncryptionBackup(backupPassword);
+			}
 			logger.info("Claiming encryption maintenance ownership", {
 				...this.getEncryptionTransitionLogContext(transition),
 				attempt: attempt + 1,
@@ -1928,6 +2122,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					},
 				);
 				await this.runEncryptionPreflight();
+				const backupPassword = transition.target.enabled
+					? transition.target.password
+					: transition.source.password;
+				if (!backupPassword) {
+					throw new Error("Encryption backup password is unavailable");
+				}
+				transition.backupProof =
+					await this.createMandatoryEncryptionBackup(backupPassword);
 				const sourceFiles =
 					await this.indexManager.getRemoteRawFileSnapshots();
 				transition.sourceRawPaths = sourceFiles.map(
@@ -2483,6 +2685,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private buildPluginData(): PluginData {
 		const data: PluginData = {
+			schemaVersion: 2,
 			settings: this.settings,
 			localState:
 				this.indexManager?.getLocalIndexData() ??

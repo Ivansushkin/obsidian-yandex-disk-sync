@@ -69,6 +69,7 @@ Edits разных installation ID → использовать baseline/base re
 
 Настройки в `Settings → Automatic sync`:
 
+- **Full sync interval:** 5 минут по умолчанию; `0` означает только manual
 - **Debounce delay:** 1000ms по умолчанию — задержка перед real-time sync
 - **Max concurrent operations:** 10 по умолчанию — параллельные операции
 - **Enable realtime sync:** Включает/выключает FileWatcher

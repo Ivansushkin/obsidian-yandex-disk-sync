@@ -361,8 +361,8 @@ test("encryption manifest validation token detects unchanged and changed content
 		version: 2,
 		state: "enabled",
 		revision: 1,
-		salt: "c2FsdA==",
-		verifier: "dmVyaWZpZXI=",
+		salt: "AAAAAAAAAAAAAAAAAAAAAA==",
+		verifier: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
 		updatedAt: 1,
 		updatedBy: "device-a",
 	};
@@ -413,6 +413,133 @@ test("absent manifest token detects a newly created manifest", async () => {
 		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
 		false,
 	);
+});
+
+async function readEncryptionManifest(manifest: object) {
+	const client = new FakeIndexYandex("vault", null);
+	client.files.set(
+		"vault/.obsidian-encrypt.json",
+		new TextEncoder().encode(JSON.stringify(manifest)).buffer,
+	);
+	const manager = new IndexManager(
+		client as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("device-a"),
+	);
+	return await manager.downloadEncryptionManifest();
+}
+
+const manifestCommon = {
+	state: "enabled",
+	revision: 1,
+	salt: "AAAAAAAAAAAAAAAAAAAAAA==",
+	verifier: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+	updatedAt: 1,
+	updatedBy: "device-a",
+};
+
+test("historical v2 manifest without algorithm fields normalizes to legacy", async () => {
+	const manifest = await readEncryptionManifest({
+		version: 2,
+		...manifestCommon,
+	});
+	assert.equal(manifest?.version, 2);
+	if (manifest?.version !== 2) assert.fail("expected v2 manifest");
+	assert.equal(manifest.kdf.iterations, 100_000);
+});
+
+test("v2 manifest rejects conflicting declared algorithms", async () => {
+	await assert.rejects(
+		readEncryptionManifest({
+			version: 2,
+			...manifestCommon,
+			kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 1 },
+			cipher: { name: "AES-GCM", keyLength: 256, ivLength: 12 },
+		}),
+		/unsupported v2 KDF/,
+	);
+});
+
+test("strict v3 manifest accepts only the hardened profile", async () => {
+	const hardened = {
+		version: 3,
+		profileId: "hardened-v3",
+		...manifestCommon,
+		kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600_000 },
+		keySchedule: { name: "HKDF", hash: "SHA-256" },
+		cipher: { name: "AES-GCM", keyLength: 256, ivLength: 12 },
+		filenameCipher: {
+			name: "AES-SIV",
+			keyLength: 512,
+			encoding: "base64url",
+			aad: "obsidian-yandex-disk-sync:filename:v3",
+		},
+	};
+	assert.equal((await readEncryptionManifest(hardened))?.version, 3);
+	await assert.rejects(
+		readEncryptionManifest({
+			...hardened,
+			filenameCipher: { ...hardened.filenameCipher, name: "AES-GCM" },
+		}),
+		/unsupported v3 profile/,
+	);
+	await assert.rejects(
+		readEncryptionManifest({
+			...hardened,
+			state: "rotating",
+			transition: {
+				id: "transition-a",
+				phase: "prepared",
+				sourceRevision: 1,
+				targetRevision: 2,
+				initiatedBy: "device-a",
+			},
+		}),
+		/incomplete v3 transition/,
+	);
+});
+
+test("foreign post-commit maintenance is scoped to matching target recovery", async () => {
+	const manager = new IndexManager(
+		{} as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("target-device"),
+	);
+	const index = createEmptyIndex("source-device");
+	index.maintenance = {
+		id: "transition-a",
+		kind: "rotate",
+		phase: "index-committed",
+		initiatedBy: "source-device",
+		sourceRevision: 1,
+		targetRevision: 2,
+		source: {
+			enabled: true,
+			revision: 1,
+			salt: "source-salt",
+			verifier: "source-verifier",
+		},
+		target: {
+			enabled: true,
+			revision: 2,
+			salt: "target-salt",
+			verifier: "target-verifier",
+		},
+		cleanup: [
+			{ path: "old-raw", expectedFingerprint: "sha256:old" },
+		],
+	};
+	const access = manager as unknown as {
+		assertMaintenanceCompatible(value: typeof index): void;
+	};
+	assert.throws(() => access.assertMaintenanceCompatible(index));
+	await manager.runTargetMaintenanceRecovery("transition-a", async () => {
+		assert.doesNotThrow(() => access.assertMaintenanceCompatible(index));
+		index.maintenance!.phase = "files-copied";
+		assert.throws(() => access.assertMaintenanceCompatible(index));
+		index.maintenance!.phase = "index-committed";
+	});
+	assert.throws(() => access.assertMaintenanceCompatible(index));
 });
 
 async function createIndexManagerWithContent(

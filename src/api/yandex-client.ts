@@ -9,7 +9,7 @@ import type {
 	YandexDownloadLink,
 	YandexError,
 } from "../types";
-import type { EncryptionService } from "../crypto/encryption";
+import type { EncryptionCodec } from "../crypto/encryption";
 import { logger } from "../utils/logger";
 import { encodePathForUrl, isProtectedPath, normalizePath } from "../utils/path-utils";
 import { runWithConcurrency } from "../utils/semaphore";
@@ -39,7 +39,7 @@ export class YandexDiskClient {
 	private maxRetries: number;
 	private retryDelay: number;
 	private folderCache: Set<string> = new Set();
-	private encryptionService: EncryptionService | null = null;
+	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
 	private apiReadMetrics: Record<ApiReadCategory, number> = {
 		manifest: 0,
@@ -67,7 +67,7 @@ export class YandexDiskClient {
 	 * Set encryption service for transparent encryption/decryption.
 	 * Pass null to disable encryption.
 	 */
-	setEncryptionService(service: EncryptionService | null): void {
+	setEncryptionService(service: EncryptionCodec | null): void {
 		if (this.encryptionService !== service) this.clearFolderCache();
 		this.encryptionService = service;
 	}
@@ -241,18 +241,14 @@ export class YandexDiskClient {
 
 	private async decryptFileName(name: string): Promise<string> {
 		if (!this.encryptionService) return name;
-		try {
-			return await this.encryptionService.decryptFilename(name);
-		} catch {
-			return name;
-		}
+		return await this.encryptionService.decryptFilename(name);
 	}
 
 	/**
 	 * Decrypt a remote path segment by segment, mirroring encryptFilePath().
 	 * Handles the Yandex "disk:/" prefix and leaves the base path and protected
-	 * paths intact. Individual segments fall back to their raw value if they are
-	 * not valid ciphertext (handled inside decryptFileName).
+	 * paths intact. Invalid ciphertext fails closed so a physical name can never
+	 * become a logical vault path by fallback.
 	 */
 	private async decryptFilePath(path: string): Promise<string> {
 		if (!this.encryptionService) return path;
@@ -776,7 +772,7 @@ export class YandexDiskClient {
 	 */
 	async decodeServiceFileContent(
 		raw: ArrayBuffer,
-		service?: EncryptionService | null,
+		service?: EncryptionCodec | null,
 	): Promise<ArrayBuffer> {
 		if (service === undefined) {
 			return await this.decryptContent(raw);
@@ -791,7 +787,7 @@ export class YandexDiskClient {
 	async uploadFileWithEncryptionService(
 		remotePath: string,
 		content: string,
-		service: EncryptionService | null,
+		service: EncryptionCodec | null,
 		overwrite = true,
 	): Promise<void> {
 		const plain = new TextEncoder().encode(content).buffer;

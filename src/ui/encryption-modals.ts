@@ -102,15 +102,8 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 }
 
 export class EnableEncryptionModal extends PasswordModal {
-	private createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>;
-
-	constructor(
-		app: App,
-		resolve: (value: string | null) => void,
-		createBackup: () => Promise<{ success: boolean; backupName?: string; error?: string }>
-	) {
+	constructor(app: App, resolve: (value: string | null) => void) {
 		super(app, resolve);
-		this.createBackup = createBackup;
 	}
 
 	onOpen(): void {
@@ -128,35 +121,10 @@ export class EnableEncryptionModal extends PasswordModal {
 
 		this.renderPasswordFields(true);
 
-		const setting = new Setting(contentEl)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.encryption_enable_with_backup"))
-					.setCta()
-					.onClick(async () => {
-						const pw = this.getPassword();
-						if (!pw) return;
-						await this.createBackup();
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.encryption_enable_without_backup"))
-					.onClick(() => {
-						const pw = this.getPassword();
-						if (!pw) return;
-						this.finish(pw);
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => this.cancel())
-			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
+		this.addSubmitButtons(
+			t("modal.encryption_enable_with_backup"),
+			() => true,
+		);
 	}
 
 }
@@ -196,6 +164,38 @@ export class DisableEncryptionModal extends ResolvableModal<boolean> {
 		setting.settingEl.addClass("force-sync-modal-buttons");
 	}
 
+}
+
+export class EncryptionUpgradeModal extends ResolvableModal<boolean> {
+	constructor(app: App, resolve: (value: boolean) => void) {
+		super(app, resolve, false);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(t("modal.encryption_upgrade_title"));
+		this.contentEl.createEl("p", {
+			text: t("modal.encryption_upgrade_warning"),
+		});
+		const setting = new Setting(this.contentEl)
+			.addButton((button) =>
+				button
+					.setButtonText(t("modal.encryption_upgrade_button"))
+					.setCta()
+					.onClick(() => {
+						this.finish(true);
+						this.close();
+					}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText(t("modal.cancel_button"))
+					.onClick(() => {
+						this.finish(false);
+						this.close();
+					}),
+			);
+		setting.settingEl.addClass("force-sync-modal-buttons");
+	}
 }
 
 export class VerifyPasswordModal extends PasswordModal {

@@ -9,7 +9,13 @@ import { VaultAdapter } from "../api/vault-adapter";
 import { joinPath, toLocalPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { t } from "../i18n";
-import { getPhysicalResourceFingerprint } from "../utils/resource-fingerprint";
+import { computeSha256 } from "../utils/hash-utils";
+import {
+	BackupEnvelopeAuthenticationError,
+	isBackupEnvelope,
+	openBackupEnvelope,
+	sealBackupEnvelope,
+} from "./backup-envelope";
 
 export interface BackupResult {
 	success: boolean;
@@ -17,7 +23,15 @@ export interface BackupResult {
 	fileCount: number;
 	totalSize: number;
 	remoteFingerprint?: string;
+	sha256?: string;
 	error?: string;
+}
+
+export class BackupPasswordRequiredError extends Error {
+	constructor() {
+		super("A password is required to open this backup");
+		this.name = "BackupPasswordRequiredError";
+	}
 }
 
 /**
@@ -27,21 +41,24 @@ export class BackupManager {
 	private yandexClient: YandexDiskClient;
 	private vaultAdapter: VaultAdapter;
 	private settings: YandexDiskSyncSettings;
+	private readonly pluginVersion: string;
 
 	constructor(
 		yandexClient: YandexDiskClient,
 		vaultAdapter: VaultAdapter,
 		settings: YandexDiskSyncSettings,
+		pluginVersion = "unknown",
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
 		this.settings = settings;
+		this.pluginVersion = pluginVersion;
 	}
 
 	/**
 	 * Create backup of all synchronized files
 	 */
-	async createBackup(): Promise<BackupResult> {
+	async createBackup(passwordOverride?: string): Promise<BackupResult> {
 		try {
 			logger.info("Starting backup creation...");
 
@@ -74,36 +91,41 @@ export class BackupManager {
 				compressionOptions: { level: 6 },
 			});
 
-			// Generate backup filename. Include `.enc` in the name when
-			// encryption is active so downloadBackup can choose the correct
-			// raw mode without decrypting plaintext or skipping encrypted
-			// content.
-			const backupName = this.formatBackupName(
-				this.yandexClient.hasEncryptionService(),
+			const password =
+				passwordOverride ??
+				(this.yandexClient.hasEncryptionService()
+					? (this.settings.encryptionPassword ?? undefined)
+					: undefined);
+			const createdAt = Date.now();
+			const uploadContent = password
+				? await sealBackupEnvelope(zipContent, password, {
+						kind: "logical-vault",
+						createdAt,
+						pluginVersion: this.pluginVersion,
+						fileCount: files.length,
+					})
+				: zipContent;
+			const uploaded = await this.uploadVerifiedBackup(
+				uploadContent,
+				Boolean(password),
+				createdAt,
 			);
-
-			// Upload to Yandex Disk
-			const backupPath = joinPath(
-				this.settings.remotePath,
-				".backup",
-				backupName,
-			);
-			await this.yandexClient.uploadFile(backupPath, zipContent);
-			const fingerprint = await this.verifyBackupUpload(backupPath);
 
 			logger.info("Backup upload verified", {
-				backupName,
+				backupName: uploaded.backupName,
 				fileCount: files.length,
 				totalSize,
-				remoteFingerprint: fingerprint,
+				remoteFingerprint: uploaded.remoteFingerprint,
+				sha256: uploaded.sha256,
 			});
 
 			return {
 				success: true,
-				backupName,
+				backupName: uploaded.backupName,
 				fileCount: files.length,
 				totalSize,
-				remoteFingerprint: fingerprint,
+				remoteFingerprint: uploaded.remoteFingerprint,
+				sha256: uploaded.sha256,
 			};
 		} catch (error) {
 			const errorMessage =
@@ -124,7 +146,9 @@ export class BackupManager {
 	 * Raw ciphertext and service metadata make this independent from a
 	 * potentially ambiguous canonical index.
 	 */
-	async createRemoteSnapshotBackup(): Promise<BackupResult> {
+	async createRemoteSnapshotBackup(
+		passwordOverride?: string,
+	): Promise<BackupResult> {
 		try {
 			const resources =
 				await this.yandexClient.getResourcesRecursive(
@@ -161,28 +185,39 @@ export class BackupManager {
 				compression: "DEFLATE",
 				compressionOptions: { level: 6 },
 			});
-			const backupName = this.formatBackupName(
-				this.yandexClient.hasEncryptionService(),
+			const password =
+				passwordOverride ??
+				(this.yandexClient.hasEncryptionService()
+					? (this.settings.encryptionPassword ?? undefined)
+					: undefined);
+			const createdAt = Date.now();
+			const uploadContent = password
+				? await sealBackupEnvelope(zipContent, password, {
+						kind: "remote-raw",
+						createdAt,
+						pluginVersion: this.pluginVersion,
+						fileCount: files.length,
+					})
+				: zipContent;
+			const uploaded = await this.uploadVerifiedBackup(
+				uploadContent,
+				Boolean(password),
+				createdAt,
 			);
-			const backupPath = joinPath(
-				this.settings.remotePath,
-				".backup",
-				backupName,
-			);
-			await this.yandexClient.uploadFile(backupPath, zipContent);
-			const fingerprint = await this.verifyBackupUpload(backupPath);
 			logger.info("Remote snapshot backup upload verified", {
-				backupName,
+				backupName: uploaded.backupName,
 				rawObjectCount: files.length,
 				totalSize,
-				remoteFingerprint: fingerprint,
+				remoteFingerprint: uploaded.remoteFingerprint,
+				sha256: uploaded.sha256,
 			});
 			return {
 				success: true,
-				backupName,
+				backupName: uploaded.backupName,
 				fileCount: files.length,
 				totalSize,
-				remoteFingerprint: fingerprint,
+				remoteFingerprint: uploaded.remoteFingerprint,
+				sha256: uploaded.sha256,
 			};
 		} catch (error) {
 			const message =
@@ -197,36 +232,89 @@ export class BackupManager {
 		}
 	}
 
-	private async verifyBackupUpload(backupPath: string): Promise<string> {
-		const resource = await this.yandexClient.getResource(
-			backupPath,
-			1,
-			0,
-			true,
-		);
-		const fingerprint = getPhysicalResourceFingerprint(resource);
-		if (!resource || resource.type !== "file" || !fingerprint) {
-			throw new Error(
-				"Backup upload could not be confirmed on Yandex Disk",
+	private async uploadVerifiedBackup(
+		content: ArrayBuffer,
+		encrypted: boolean,
+		createdAt: number,
+	): Promise<{
+		backupName: string;
+		remoteFingerprint: string;
+		sha256: string;
+	}> {
+		const expectedSha256 = await computeSha256(content);
+		let lastError: Error | null = null;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			let uploadError: unknown;
+			let readbackError: unknown;
+			const backupName = this.formatBackupName(
+				new Date(createdAt),
+				encrypted,
 			);
+			const backupPath = joinPath(
+				this.settings.remotePath,
+				".backup",
+				backupName,
+			);
+			try {
+				await this.yandexClient.uploadFileExclusive(
+					backupPath,
+					content,
+					false,
+					true,
+				);
+			} catch (error) {
+				uploadError = error;
+			}
+
+			try {
+				const readback =
+					await this.yandexClient.downloadStableRawFile(backupPath);
+				if (readback) {
+					const actualSha256 = await computeSha256(readback.raw);
+					if (
+						actualSha256 === expectedSha256 &&
+						bytesEqual(readback.raw, content)
+					) {
+						return {
+							backupName,
+							remoteFingerprint: readback.fingerprint,
+							sha256: expectedSha256,
+						};
+					}
+				}
+			} catch (error) {
+				readbackError = error;
+			}
+			if (readbackError) throw normalizeError(readbackError);
+
+			if (
+				uploadError instanceof YandexApiError &&
+				![408, 409, 423, 429, 500, 502, 503, 504].includes(
+					uploadError.status,
+				)
+			) {
+				throw normalizeError(uploadError);
+			}
+			lastError = new Error("Backup name collision or byte mismatch");
 		}
-		return fingerprint;
+		throw lastError ?? new Error("Backup upload could not be verified");
 	}
 
 	/**
 	 * Format backup filename with current timestamp
 	 */
-	private formatBackupName(encrypted: boolean): string {
-		const now = new Date();
+	private formatBackupName(now: Date, encrypted: boolean): string {
 		const year = now.getFullYear();
 		const month = String(now.getMonth() + 1).padStart(2, "0");
 		const day = String(now.getDate()).padStart(2, "0");
 		const hours = String(now.getHours()).padStart(2, "0");
 		const minutes = String(now.getMinutes()).padStart(2, "0");
 		const seconds = String(now.getSeconds()).padStart(2, "0");
+		const milliseconds = String(now.getMilliseconds()).padStart(3, "0");
+		const random = randomBase64Url(12);
 		const suffix = encrypted ? ".enc" : "";
 
-		return `backup_${year}-${month}-${day}_${hours}-${minutes}-${seconds}${suffix}.zip`;
+		return `backup_${year}-${month}-${day}_${hours}-${minutes}-${seconds}-${milliseconds}_${random}${suffix}.zip`;
 	}
 
 	/**
@@ -240,10 +328,9 @@ export class BackupManager {
 	 * Parse backup filename to extract creation date
 	 */
 	private parseBackupName(name: string): Date | null {
-		// Matches both `backup_YYYY-MM-DD_HH-MM-SS.zip` (plaintext)
-		// and `backup_YYYY-MM-DD_HH-MM-SS.enc.zip` (encrypted).
+		// Accept historical second-resolution names and v2 random-suffix names.
 		const match = name.match(
-			/^backup_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:\.enc)?\.zip$/,
+			/^backup_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:-(\d{3})_[A-Za-z0-9_-]{16})?(?:\.enc)?\.zip$/,
 		);
 		if (!match || match.length < 7) {
 			return null;
@@ -263,6 +350,7 @@ export class BackupManager {
 			parseInt(hours, 10),
 			parseInt(minutes, 10),
 			parseInt(seconds, 10),
+			match[7] ? parseInt(match[7], 10) : 0,
 		);
 
 		return isNaN(date.getTime()) ? null : date;
@@ -327,21 +415,38 @@ export class BackupManager {
 	/**
 	 * Download backup file to local device
 	 */
-	async downloadBackup(backupPath: string): Promise<ArrayBuffer> {
-		// Determine the download mode from the filename: `.enc.zip` was
-		// encrypted at creation time and needs decryption (raw=false);
-		// plain `.zip` was stored as plaintext and must be downloaded
-		// raw to avoid a futile decrypt attempt on non-encrypted bytes.
+	async downloadBackup(
+		backupPath: string,
+		password?: string,
+	): Promise<ArrayBuffer> {
 		const isEncrypted = backupPath.includes(".enc.zip");
 		try {
 			logger.info(`Starting backup download: ${backupPath}`);
+			const raw = await this.yandexClient.downloadFile(backupPath, true);
+			if (isBackupEnvelope(raw)) {
+				const effectivePassword =
+					password ?? this.settings.encryptionPassword ?? undefined;
+				if (!effectivePassword) throw new BackupPasswordRequiredError();
+				try {
+					return (
+						await openBackupEnvelope(raw, effectivePassword)
+					).content;
+				} catch (error) {
+					if (!(error instanceof BackupEnvelopeAuthenticationError)) {
+						throw error;
+					}
+					logger.warn("Backup envelope password verification failed", {
+						error,
+					});
+					throw new BackupPasswordRequiredError();
+				}
+			}
 			if (isEncrypted && !this.yandexClient.hasEncryptionService()) {
 				throw new Error(t("notice.backup_encrypted_no_key"));
 			}
-			const content = await this.yandexClient.downloadFile(
-				backupPath,
-				!isEncrypted,
-			);
+			const content = isEncrypted
+				? await this.yandexClient.decodeServiceFileContent(raw)
+				: raw;
 			logger.info("Backup downloaded successfully");
 			return content;
 		} catch (error) {
@@ -368,4 +473,29 @@ export class BackupManager {
 			throw error;
 		}
 	}
+
+	getSuggestedDownloadName(name: string): string {
+		return name.replace(/\.enc\.zip$/, ".zip");
+	}
+}
+
+function bytesEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	const a = new Uint8Array(left);
+	const b = new Uint8Array(right);
+	return a.every((byte, index) => byte === b[index]);
+}
+
+function randomBase64Url(byteLength: number): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary)
+		.replace(/\+/g, "-")
+		.replace(/\//g, "_")
+		.replace(/=+$/, "");
+}
+
+function normalizeError(value: unknown): Error {
+	return value instanceof Error ? value : new Error(String(value));
 }

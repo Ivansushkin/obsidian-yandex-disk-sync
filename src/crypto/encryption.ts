@@ -1,233 +1,175 @@
 /**
- * Encryption service for E2E encryption of file content and filenames.
- *
- * Uses Web Crypto API exclusively for cross-platform compatibility (desktop + mobile).
- * - Content: AES-256-GCM with random 12-byte IV
- * - Filenames: AES-256-GCM with deterministic IV derived from SHA-256(path + salt)
- *
- * Format of encrypted content:
- *   [12-byte random IV][AES-GCM ciphertext + 16-byte auth tag]
- *
- * Format of encrypted filenames (Base64URL):
- *   Base64URL([12-byte deterministic IV][AES-GCM ciphertext + 16-byte tag])
- *   IV is stored prepended so decryption works without knowing the original path.
+ * Browser-compatible encryption codecs used by remote storage and transition
+ * recovery. Legacy v2 remains readable; all new encrypted state uses v3.
  */
 
-export const PBKDF2_ITERATIONS = 100_000;
+import { aessiv } from "@noble/ciphers/aes.js";
+
+export type EncryptionProfileId = "legacy-v2" | "hardened-v3";
+
+export interface EncryptionCodec {
+	readonly profileId: EncryptionProfileId;
+	initializeKey(password: string): Promise<void>;
+	encrypt(data: ArrayBuffer): Promise<ArrayBuffer>;
+	decrypt(data: ArrayBuffer): Promise<ArrayBuffer>;
+	createVerifier(): Promise<string>;
+	verifyVerifier(verifierBase64: string): Promise<boolean>;
+	encryptFilename(originalPath: string): Promise<string>;
+	decryptFilename(encryptedName: string): Promise<string>;
+}
+
+export const LEGACY_PBKDF2_ITERATIONS = 100_000;
+export const HARDENED_PBKDF2_ITERATIONS = 600_000;
+/** Historical alias retained for v2 manifest compatibility. */
+export const PBKDF2_ITERATIONS = LEGACY_PBKDF2_ITERATIONS;
 export const AES_KEY_LENGTH = 256;
+export const FILENAME_KEY_LENGTH = 512;
 export const IV_LENGTH = 12;
 export const SALT_LENGTH = 16;
-const VERIFIER_PAYLOAD = "obsidian-yandex-disk-sync:encryption-verifier:v1";
 
-export class EncryptionService {
+const VERIFIER_PAYLOAD = "obsidian-yandex-disk-sync:encryption-verifier:v1";
+const CONTENT_KEY_INFO = new TextEncoder().encode(
+	"obsidian-yandex-disk-sync:content:v3",
+);
+const FILENAME_KEY_INFO = new TextEncoder().encode(
+	"obsidian-yandex-disk-sync:filename-key:v3",
+);
+const FILENAME_AAD = new TextEncoder().encode(
+	"obsidian-yandex-disk-sync:filename:v3",
+);
+
+/** Reject decrypted path segments before they can reach the vault adapter. */
+export function assertValidLogicalPathSegment(segment: string): string {
+	if (
+		segment.length === 0 ||
+		segment === "." ||
+		segment === ".." ||
+		segment.includes("/") ||
+		segment.includes("\\") ||
+		segment.includes("\0")
+	) {
+		throw new Error("Encrypted filename contains an invalid path segment");
+	}
+	return segment;
+}
+
+/**
+ * Legacy beta encryption profile. It is intentionally kept byte-compatible so
+ * existing v1/v2 vaults and backups can be recovered before v3 migration.
+ */
+export class EncryptionService implements EncryptionCodec {
+	readonly profileId = "legacy-v2" as const;
 	private key: CryptoKey | null = null;
 	private readonly salt: Uint8Array;
-
-	/**
-	 * Per-instance caches for deterministic filename encryption/decryption.
-	 * Since each password/salt change creates a new EncryptionService instance,
-	 * these caches are automatically scoped to the current key and never need
-	 * manual invalidation. They eliminate redundant crypto work when the same
-	 * path segment (e.g. a folder name) is processed many times during sync.
-	 */
 	private filenameEncCache = new Map<string, string>();
 	private filenameDecCache = new Map<string, string>();
 
 	constructor(salt: Uint8Array) {
-		if (salt.length !== SALT_LENGTH) {
-			throw new Error(`Salt must be ${SALT_LENGTH} bytes`);
-		}
-		this.salt = salt;
+		assertSalt(salt);
+		this.salt = salt.slice();
 	}
 
-	/**
-	 * Derive AES-256-GCM key from password using PBKDF2 (100k iterations, HMAC-SHA256).
-	 */
 	async initializeKey(password: string): Promise<void> {
-		const encoder = new TextEncoder();
-		const keyMaterial = await crypto.subtle.importKey(
-			"raw",
-			encoder.encode(password),
-			"PBKDF2",
-			false,
-			["deriveKey"]
-		);
-
+		const keyMaterial = await importPassword(password);
 		this.key = await crypto.subtle.deriveKey(
 			{
 				name: "PBKDF2",
 				salt: this.salt,
-				iterations: PBKDF2_ITERATIONS,
+				iterations: LEGACY_PBKDF2_ITERATIONS,
 				hash: "SHA-256",
 			},
 			keyMaterial,
-			{
-				name: "AES-GCM",
-				length: 256,
-			},
+			{ name: "AES-GCM", length: AES_KEY_LENGTH },
 			false,
-			["encrypt", "decrypt"]
+			["encrypt", "decrypt"],
 		);
 	}
 
-	/**
-	 * Encrypt data with AES-256-GCM using a random IV.
-	 * Returns: [12-byte IV][ciphertext + 16-byte auth tag]
-	 */
 	async encrypt(data: ArrayBuffer): Promise<ArrayBuffer> {
-		const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-		const encrypted = await crypto.subtle.encrypt(
-			{ name: "AES-GCM", iv },
-			this.getKey(),
-			data
-		);
-
-		const result = new Uint8Array(IV_LENGTH + encrypted.byteLength);
-		result.set(iv, 0);
-		result.set(new Uint8Array(encrypted), IV_LENGTH);
-		return result.buffer;
+		return await encryptContent(this.getKey(), data);
 	}
 
-	/**
-	 * Decrypt data encrypted with `encrypt()`.
-	 * Expects: [12-byte IV][AES-GCM ciphertext + 16-byte auth tag]
-	 */
 	async decrypt(data: ArrayBuffer): Promise<ArrayBuffer> {
-		const bytes = new Uint8Array(data);
-		const iv = bytes.slice(0, IV_LENGTH);
-		const ciphertext = bytes.slice(IV_LENGTH);
-
-		return await crypto.subtle.decrypt(
-			{ name: "AES-GCM", iv },
-			this.getKey(),
-			ciphertext
-		);
+		return await decryptContent(this.getKey(), data);
 	}
 
-	/**
-	 * Create an encrypted verifier payload for remote password checks.
-	 */
 	async createVerifier(): Promise<string> {
-		const encoded = new TextEncoder().encode(VERIFIER_PAYLOAD);
-		const encrypted = await this.encrypt(encoded.buffer);
-		return EncryptionService.bytesToBase64(new Uint8Array(encrypted));
+		return await createVerifier(this);
 	}
 
-	/**
-	 * Verify that the current key can decrypt the remote verifier payload.
-	 */
 	async verifyVerifier(verifierBase64: string): Promise<boolean> {
-		const encrypted = EncryptionService.base64ToBytes(verifierBase64);
-		const decrypted = await this.decrypt(encrypted.buffer);
-		return new TextDecoder().decode(decrypted) === VERIFIER_PAYLOAD;
+		return await verifyVerifier(this, verifierBase64);
 	}
 
-	/**
-	 * Deterministically encrypt a filename.
-	 * IV = SHA-256(originalPath + ":iv:" + base64(salt)).slice(0, 12)
-	 *
-	 * Same input always produces the same output — required for
-	 * finding remote files by plaintext path during sync.
-	 *
-	 * Returns Base64URL-encoded string (no padding, URL-safe).
-	 */
 	async encryptFilename(originalPath: string): Promise<string> {
+		assertValidLogicalPathSegment(originalPath);
 		const cached = this.filenameEncCache.get(originalPath);
 		if (cached !== undefined) return cached;
 
 		const encoder = new TextEncoder();
 		const ivInput = encoder.encode(
-			originalPath + ":iv:" + EncryptionService.bytesToBase64(this.salt)
+			`${originalPath}:iv:${EncryptionService.bytesToBase64(this.salt)}`,
 		);
 		const ivHash = await crypto.subtle.digest("SHA-256", ivInput);
 		const iv = new Uint8Array(ivHash).slice(0, IV_LENGTH);
-
 		const encrypted = await crypto.subtle.encrypt(
 			{ name: "AES-GCM", iv },
 			this.getKey(),
-			encoder.encode(originalPath)
+			encoder.encode(originalPath),
 		);
-
 		const combined = new Uint8Array(IV_LENGTH + encrypted.byteLength);
 		combined.set(iv, 0);
 		combined.set(new Uint8Array(encrypted), IV_LENGTH);
-
 		const result = EncryptionService.base64UrlEncode(combined);
 		this.filenameEncCache.set(originalPath, result);
 		return result;
 	}
 
-	/**
-	 * Decrypt a filename encrypted with `encryptFilename()`.
-	 * Extracts the IV from the first 12 bytes of the decoded data.
-	 */
 	async decryptFilename(encryptedName: string): Promise<string> {
 		const cached = this.filenameDecCache.get(encryptedName);
 		if (cached !== undefined) return cached;
-
 		const data = EncryptionService.base64UrlDecode(encryptedName);
-		const iv = data.slice(0, IV_LENGTH);
-		const ciphertext = data.slice(IV_LENGTH);
-
+		if (data.length <= IV_LENGTH + 16) {
+			throw new Error("Encrypted filename is truncated");
+		}
 		const decrypted = await crypto.subtle.decrypt(
-			{ name: "AES-GCM", iv },
+			{ name: "AES-GCM", iv: data.slice(0, IV_LENGTH) },
 			this.getKey(),
-			ciphertext
+			data.slice(IV_LENGTH),
 		);
-
-		const result = new TextDecoder().decode(decrypted);
+		const result = assertValidLogicalPathSegment(
+			new TextDecoder("utf-8", { fatal: true }).decode(decrypted),
+		);
 		this.filenameDecCache.set(encryptedName, result);
 		return result;
 	}
 
-	/**
-	 * Generate cryptographically random salt for PBKDF2.
-	 */
-	static generateSalt(): Uint8Array {
-		return crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
-	}
-
-	// ============================================================================
-	// Private helpers
-	// ============================================================================
-
 	private getKey(): CryptoKey {
 		if (!this.key) {
-			throw new Error("EncryptionService not initialized. Call initializeKey() first.");
+			throw new Error(
+				"EncryptionService not initialized. Call initializeKey() first.",
+			);
 		}
 		return this.key;
 	}
 
-	// ============================================================================
-	// Static encoding utilities
-	// ============================================================================
+	static generateSalt(): Uint8Array {
+		return crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+	}
 
-	/**
-	 * Encode bytes to Base64 string.
-	 */
 	static bytesToBase64(bytes: Uint8Array): string {
 		let binary = "";
-		for (let i = 0; i < bytes.length; i++) {
-			binary += String.fromCharCode(bytes[i]!);
-		}
+		for (const byte of bytes) binary += String.fromCharCode(byte);
 		return btoa(binary);
 	}
 
-	/**
-	 * Decode Base64 string to bytes.
-	 */
 	static base64ToBytes(base64: string): Uint8Array {
 		const binary = atob(base64);
 		const bytes = new Uint8Array(binary.length);
-		for (let i = 0; i < binary.length; i++) {
-			bytes[i] = binary.charCodeAt(i);
-		}
+		for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 		return bytes;
 	}
 
-	/**
-	 * Encode bytes to Base64URL (no padding, URL-safe).
-	 */
 	static base64UrlEncode(bytes: Uint8Array): string {
 		return EncryptionService.bytesToBase64(bytes)
 			.replace(/\+/g, "-")
@@ -235,16 +177,219 @@ export class EncryptionService {
 			.replace(/=+$/, "");
 	}
 
-	/**
-	 * Decode Base64URL string to bytes.
-	 */
 	static base64UrlDecode(base64url: string): Uint8Array {
-		let base64 = base64url
-			.replace(/-/g, "+")
-			.replace(/_/g, "/");
-		while (base64.length % 4 !== 0) {
-			base64 += "=";
+		if (!/^[A-Za-z0-9_-]+$/.test(base64url)) {
+			throw new Error("Encrypted filename is not canonical Base64URL");
 		}
-		return EncryptionService.base64ToBytes(base64);
+		let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
+		while (base64.length % 4 !== 0) base64 += "=";
+		const decoded = EncryptionService.base64ToBytes(base64);
+		if (EncryptionService.base64UrlEncode(decoded) !== base64url) {
+			throw new Error("Encrypted filename is not canonical Base64URL");
+		}
+		return decoded;
+	}
+}
+
+/** Hardened v3 profile with separated content and filename keys. */
+export class HardenedEncryptionService implements EncryptionCodec {
+	readonly profileId = "hardened-v3" as const;
+	private contentKey: CryptoKey | null = null;
+	private filenameKey: Uint8Array | null = null;
+	private readonly salt: Uint8Array;
+	private filenameEncCache = new Map<string, string>();
+	private filenameDecCache = new Map<string, string>();
+
+	constructor(salt: Uint8Array) {
+		assertSalt(salt);
+		this.salt = salt.slice();
+	}
+
+	async initializeKey(password: string): Promise<void> {
+		const passwordKey = await importPassword(password);
+		const masterBytes = await crypto.subtle.deriveBits(
+			{
+				name: "PBKDF2",
+				salt: this.salt,
+				iterations: HARDENED_PBKDF2_ITERATIONS,
+				hash: "SHA-256",
+			},
+			passwordKey,
+			AES_KEY_LENGTH,
+		);
+		const masterKey = await crypto.subtle.importKey(
+			"raw",
+			masterBytes,
+			"HKDF",
+			false,
+			["deriveBits"],
+		);
+		const contentBytes = await deriveSubkey(
+			masterKey,
+			this.salt,
+			CONTENT_KEY_INFO,
+			AES_KEY_LENGTH,
+		);
+		const filenameBytes = await deriveSubkey(
+			masterKey,
+			this.salt,
+			FILENAME_KEY_INFO,
+			FILENAME_KEY_LENGTH,
+		);
+		this.contentKey = await crypto.subtle.importKey(
+			"raw",
+			contentBytes,
+			{ name: "AES-GCM" },
+			false,
+			["encrypt", "decrypt"],
+		);
+		this.filenameKey = new Uint8Array(filenameBytes);
+	}
+
+	async encrypt(data: ArrayBuffer): Promise<ArrayBuffer> {
+		return await encryptContent(this.getContentKey(), data);
+	}
+
+	async decrypt(data: ArrayBuffer): Promise<ArrayBuffer> {
+		return await decryptContent(this.getContentKey(), data);
+	}
+
+	async createVerifier(): Promise<string> {
+		return await createVerifier(this);
+	}
+
+	async verifyVerifier(verifierBase64: string): Promise<boolean> {
+		return await verifyVerifier(this, verifierBase64);
+	}
+
+	async encryptFilename(originalPath: string): Promise<string> {
+		assertValidLogicalPathSegment(originalPath);
+		const cached = this.filenameEncCache.get(originalPath);
+		if (cached !== undefined) return cached;
+		const encrypted = aessiv(this.getFilenameKey(), FILENAME_AAD).encrypt(
+			new TextEncoder().encode(originalPath),
+		);
+		const result = EncryptionService.base64UrlEncode(encrypted);
+		this.filenameEncCache.set(originalPath, result);
+		return result;
+	}
+
+	async decryptFilename(encryptedName: string): Promise<string> {
+		const cached = this.filenameDecCache.get(encryptedName);
+		if (cached !== undefined) return cached;
+		const ciphertext = EncryptionService.base64UrlDecode(encryptedName);
+		if (ciphertext.length <= 16) {
+			throw new Error("Encrypted filename is truncated");
+		}
+		const decrypted = aessiv(
+			this.getFilenameKey(),
+			FILENAME_AAD,
+		).decrypt(ciphertext);
+		const result = assertValidLogicalPathSegment(
+			new TextDecoder("utf-8", { fatal: true }).decode(decrypted),
+		);
+		this.filenameDecCache.set(encryptedName, result);
+		return result;
+	}
+
+	private getContentKey(): CryptoKey {
+		if (!this.contentKey) {
+			throw new Error("Hardened encryption is not initialized");
+		}
+		return this.contentKey;
+	}
+
+	private getFilenameKey(): Uint8Array {
+		if (!this.filenameKey) {
+			throw new Error("Hardened encryption is not initialized");
+		}
+		return this.filenameKey;
+	}
+}
+
+export function createEncryptionCodec(
+	profileId: EncryptionProfileId,
+	salt: Uint8Array,
+): EncryptionCodec {
+	return profileId === "hardened-v3"
+		? new HardenedEncryptionService(salt)
+		: new EncryptionService(salt);
+}
+
+async function importPassword(password: string): Promise<CryptoKey> {
+	return await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(password),
+		"PBKDF2",
+		false,
+		["deriveBits", "deriveKey"],
+	);
+}
+
+async function deriveSubkey(
+	masterKey: CryptoKey,
+	salt: Uint8Array,
+	info: Uint8Array,
+	length: number,
+): Promise<ArrayBuffer> {
+	return await crypto.subtle.deriveBits(
+		{ name: "HKDF", hash: "SHA-256", salt, info },
+		masterKey,
+		length,
+	);
+}
+
+async function encryptContent(
+	key: CryptoKey,
+	data: ArrayBuffer,
+): Promise<ArrayBuffer> {
+	const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+	const encrypted = await crypto.subtle.encrypt(
+		{ name: "AES-GCM", iv },
+		key,
+		data,
+	);
+	const result = new Uint8Array(IV_LENGTH + encrypted.byteLength);
+	result.set(iv, 0);
+	result.set(new Uint8Array(encrypted), IV_LENGTH);
+	return result.buffer;
+}
+
+async function decryptContent(
+	key: CryptoKey,
+	data: ArrayBuffer,
+): Promise<ArrayBuffer> {
+	if (data.byteLength < IV_LENGTH + 16) {
+		throw new Error("Encrypted content is truncated");
+	}
+	const bytes = new Uint8Array(data);
+	return await crypto.subtle.decrypt(
+		{ name: "AES-GCM", iv: bytes.slice(0, IV_LENGTH) },
+		key,
+		bytes.slice(IV_LENGTH),
+	);
+}
+
+async function createVerifier(codec: EncryptionCodec): Promise<string> {
+	const payload = new TextEncoder().encode(VERIFIER_PAYLOAD);
+	const encrypted = await codec.encrypt(payload.buffer);
+	return EncryptionService.bytesToBase64(new Uint8Array(encrypted));
+}
+
+async function verifyVerifier(
+	codec: EncryptionCodec,
+	verifierBase64: string,
+): Promise<boolean> {
+	const encrypted = EncryptionService.base64ToBytes(verifierBase64);
+	const decrypted = await codec.decrypt(encrypted.buffer);
+	return (
+		new TextDecoder("utf-8", { fatal: true }).decode(decrypted) ===
+		VERIFIER_PAYLOAD
+	);
+}
+
+function assertSalt(salt: Uint8Array): void {
+	if (salt.length !== SALT_LENGTH) {
+		throw new Error(`Salt must be ${SALT_LENGTH} bytes`);
 	}
 }

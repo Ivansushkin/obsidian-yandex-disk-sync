@@ -1,0 +1,40 @@
+name: Verify published release assets
+
+on:
+    release:
+        types: [published]
+
+permissions:
+    contents: read
+
+jobs:
+    verify:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.release.tag_name }}
+                  fetch-depth: 0
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20.x
+                  cache: npm
+                  registry-url: https://registry.npmjs.org
+            - run: npm ci --registry=https://registry.npmjs.org
+            - run: npm test
+            - run: npm run lint
+            - run: npm run build
+            - run: npm run check:bundle
+            - run: npm audit --omit=dev --registry=https://registry.npmjs.org
+            - run: npm audit --registry=https://registry.npmjs.org
+            - run: npm run validate:release
+              env:
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+            - name: Download and compare published assets
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RELEASE_TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  mkdir published-assets
+                  gh release download "$RELEASE_TAG" --dir published-assets
+                  node scripts/verify-published-assets.mjs published-assets build

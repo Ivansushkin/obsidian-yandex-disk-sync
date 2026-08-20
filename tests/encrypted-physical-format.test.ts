@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { YandexDiskClient } from "../src/api/yandex-client";
-import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
+import {
+	EncryptionService,
+	HardenedEncryptionService,
+	SALT_LENGTH,
+} from "../src/crypto/encryption";
 
 async function createEncryptedClient(): Promise<{
 	client: YandexDiskClient;
@@ -40,4 +44,43 @@ test("canonical service path stays raw while its content may be encrypted", asyn
 	const { client } = await createEncryptedClient();
 	const canonical = "vault/.obsidian-sync-index.json";
 	assert.equal(await client.getPhysicalPath(canonical), canonical);
+});
+
+test("invalid encrypted resource name never falls back to a logical path", async () => {
+	const { client } = await createEncryptedClient();
+	await assert.rejects(
+		client.toLogicalResource({
+			name: "not+ciphertext",
+			path: "disk:/vault/not+ciphertext",
+			type: "file",
+			created: "2026-01-01T00:00:00Z",
+			modified: "2026-01-01T00:00:00Z",
+		}),
+		/Base64URL/,
+	);
+});
+
+test("hardened folder moves keep descendant physical segments unchanged", async () => {
+	const service = new HardenedEncryptionService(
+		new Uint8Array(SALT_LENGTH).fill(9),
+	);
+	await service.initializeKey("password");
+	const client = new YandexDiskClient({ token: "test-token" });
+	client.setRemotePath("vault");
+	client.setEncryptionService(service);
+	const oldPath = await client.getPhysicalPath(
+		"vault/old-parent/deep/emoji-🧪.md",
+	);
+	const newPath = await client.getPhysicalPath(
+		"vault/new-parent/deep/emoji-🧪.md",
+	);
+	assert.notEqual(oldPath.split("/")[1], newPath.split("/")[1]);
+	assert.deepEqual(oldPath.split("/").slice(2), newPath.split("/").slice(2));
+
+	const deepLogical = `vault/${Array.from(
+		{ length: 20 },
+		(_, index) => `папка-${index}`,
+	).join("/")}/${"x".repeat(180)}.md`;
+	const deepPhysical = await client.getPhysicalPath(deepLogical);
+	assert.equal(deepPhysical.split("/").length, deepLogical.split("/").length);
 });

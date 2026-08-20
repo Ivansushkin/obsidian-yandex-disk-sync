@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.0.0-beta.5
+
+### Security
+
+- Added the hardened-v3 encryption profile: PBKDF2-HMAC-SHA256 with 600,000
+  iterations, HKDF-separated content and filename keys, AES-256-GCM content,
+  and RFC 5297 AES-SIV filenames.
+- Added strict manifest v3 parsing and fail-closed filename decoding. Legacy
+  manifest v1/v2 remains available only for explicit migration and recovery.
+- Added a crash-safe v2-to-v3 format upgrade with mandatory byte-verified
+  backup, source/target authority around canonical commit, and durable
+  fingerprint-guarded cleanup recoverable by a target-capable device.
+
+### Backup
+
+- Added self-contained `OYDSBKP2` encrypted backup envelopes with bounded,
+  authenticated headers and archive-specific PBKDF2/AES-GCM parameters.
+- Backup uploads now use unique 96-bit-random names, `overwrite=false`, and
+  exact SHA-256 plus byte read-back after success, timeout, or collision.
+- Legacy encrypted archives remain readable with their original vault codec
+  and are never silently rewritten during encryption migration.
+
+### Changed
+
+- Added additive plugin-data schema v2 profile metadata without changing
+  canonical index v4, mutation FIFO, maintenance, or physical-action schemas.
+- Moved encryption profile/snapshot/manifest ownership out of `main.ts` into a
+  focused manager while preserving the public plugin API.
+- Pinned browser runtime dependencies, moved Obsidian to dev dependencies, and
+  regenerated the lockfile through the public npm registry with zero runtime
+  and full audit findings.
+- CI now runs tests on Node 20 and 22. Release validation checks exact assets,
+  version consistency, audits, evidence, and downloaded release SHA-256.
+
 ## 2.0.0-beta.4
 
 ### Changed

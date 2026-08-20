@@ -11,9 +11,8 @@
   ручного восстановления.
 - `P2` — проблема производительности, диагностики или удобства.
 - `auto` — сценарий должен выполняться автоматически.
-- `auto: <suite>` задаёт обязательную suite/категорию, а не подтверждает, что
-  тест уже реализован. До появления исполняемого теста с этим ID сценарий
-  считается непокрытым и блокирует release согласно приоритету.
+- Для P0/P1 `auto: \`точное имя теста\`` должно совпадать с реально прошедшим
+  исполняемым тестом. Generic suite labels не являются release evidence.
 - `manual-required` — требуется проверка на реальном Яндекс Диске и Obsidian.
 - Под `canonical` понимается `.obsidian-sync-index.json`.
 - `Physical` — фактические пользовательские файлы на Яндекс Диске.
@@ -207,6 +206,9 @@
 | ENC-008 | P0  | Source/target codec во время transition | Явный codec не использует plaintext fallback                     | auto: `explicit transition codec does not fall back to plaintext` |
 | ENC-009 | P0  | Сбой enable/disable/rotate после установки transition codec | Общий executor всегда очищает source/target codec и запускает causal recovery | auto: `transition services are cleared after a failed re-encode`; fault matrix |
 | ENC-010 | P1  | Codec/manifest меняется после canonical commit либо при enable/disable/rotate | Corrective upload старым codec блокируется; folder observations старого physical namespace очищаются, следующий upload подтверждает/создаёт target directories | auto: `encryption change blocks proof-based physical repair`; `encryption codec change invalidates folder observations`; manual: `docs/SMOKE_TESTS.md` TC-08 |
+| ENC-011 | P0  | Fresh encrypted vault использует hardened-v3 | PBKDF2 600k, HKDF-separated content/filename keys и AES-SIV соответствуют строгому manifest v3 | auto: `encryption manager emits strict hardened v3 manifest descriptors`; `AES-SIV matches the RFC 5297 deterministic vector` |
+| ENC-012 | P0  | Ciphertext имени повреждён, имеет invalid UTF-8 или декодируется в опасный segment | Sync блокируется до Vault API; raw ciphertext не становится logical path | auto: `hardened filename decryption rejects authenticated invalid UTF-8`; `invalid encrypted resource name never falls back to a logical path` |
+| ENC-013 | P1  | Глубокая папка перемещается в hardened-v3 | Меняется physical segment корня, ciphertext всех потомков остаётся прежним | auto: `hardened folder moves keep descendant physical segments unchanged` |
 
 ## Переходы шифрования
 
@@ -234,6 +236,11 @@
 | TRANS-020 | P1  | Старый пароль после rotate                                       | Он не открывает target canonical; новый пароль открывает                                                       | auto + manual-required                    |
 | TRANS-021 | P0  | Source и target raw paths сравниваются при nested remote root    | Оба набора представлены путями относительно одного remote root; target не попадает в cleanup                   | manual-required |
 | TRANS-022 | P0  | Force local восстанавливает abandoned transition, cleanup падает | Canonical сохраняет cleanup paths/fingerprints; старый tree фильтруется и может быть очищен другим устройством | manual-required |
+| TRANS-023 | P0  | Локальный beta-transition без profile metadata найден при старте | Source и target восстанавливаются как legacy-v2 без очистки baseline или очередей | auto: `plugin data migration preserves every causal queue and baseline` |
+| TRANS-024 | P0  | v2→v3 migration захватила maintenance | Manifest v3 rotating публикуется до инициализации target writes | auto: `target manifest is published after claim and before target writes` |
+| TRANS-025 | P0  | Crash сразу после target canonical commit | Cleanup paths и source fingerprints уже записаны в том же canonical commit | auto: `cleanup proof is committed atomically with target canonical state` |
+| TRANS-026 | P0  | Initiator потерян после commit | Только matching target transition может продолжить foreign post-commit maintenance; pre-commit state остаётся заблокирован | auto: `foreign post-commit maintenance is scoped to matching target recovery` |
+| TRANS-027 | P0  | Fault до claim, после manifest, во время copy, до/после commit или в cleanup | Общий executor вызывает recovery ровно один раз и не оставляет transition codec scope | auto: `transition fault matrix always invokes deterministic recovery` |
 
 
 ## Force sync
@@ -314,6 +321,9 @@
 | SAFE-007 | P0  | `.obsidian` отсутствует в Vault cache | Backup создаётся через DataAdapter в физической plugin-папке | auto: `hidden plugin backup uses DataAdapter and preserves exact bytes` |
 | SAFE-008 | P1  | Два backup одного пути подряд        | Создаются два независимых файла с уникальными именами | auto: `hidden plugin backup uses DataAdapter and preserves exact bytes` |
 | SAFE-009 | P0  | Write или verification backup упали  | Overwrite/delete/rename блокируются, исходный файл сохраняется | auto: `failed mandatory backup prevents a local overwrite` |
+| SAFE-010 | P0  | Создан новый encrypted backup | Raw envelope самодостаточен, header аутентифицирован и ZIP открывается собственным паролем после rotate | auto: `backup envelope is self-contained and authenticated`; `self-contained backup opens with its own password after vault state changes` |
+| SAFE-011 | P0  | Backup upload вернул success, timeout или 409 | Успех подтверждается только exact SHA-256 и byte read-back; collision получает новое имя без overwrite | auto: `verified backup accepts an upload whose response was lost`; `exclusive 409 collision is read back and retried under a new name` |
+| SAFE-012 | P1  | Backup header/tag повреждён или требуется старый пароль | Header fail-closed до KDF, auth failure запрашивает пароль, legacy archive использует исходный codec | auto: `backup envelope rejects unbounded or unsupported headers before KDF`; `legacy encrypted backup remains downloadable with its original codec` |
 
 ## Диагностика
 
@@ -361,7 +371,7 @@
 | FDEL-016  | P0 | Folder delete после собственных revisions при старом observedRevision | Потомки с меньшим same-device sequence удаляются; foreign/newer сохраняются | manual-required |
 | MULTI-016 | P0 | Другой device меняет child во время folder move/delete | Foreign child и отличающийся target не удаляются и не перезаписываются | manual-required |
 | SYNC-029  | P0 | Full запускается при unresolved parent move/action | Full останавливается до local/remote scan, не создаёт compensating operations | manual-required |
-| MIG-004   | P0 | Переход beta.1.1 index v3 на beta.4 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | manual-required |
+| MIG-004   | P0 | Переход beta.1.1 index v3 на beta.5 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | manual-required |
 | DIAG-016  | P1 | Folder reducer и recovery | Лог содержит parent event/mutation, sequence, absorbed/rebased, survivor/conflict/unresolved counts без expected coalescing ERROR | manual-required |
 | MOVE-029  | P0 | Одновременно ожидают unrelated и nested folder moves, затем приходит child rename | Выбирается только содержащий child source и самый глубокий causal parent; unrelated move не влияет | auto: `child rename selects the deepest matching folder parent` |
 | MOVE-030  | P0 | Folder move встречает существующий target с другим SHA | Ноль canonical/physical writes; source и local target сохраняются; event остаётся durable с `folder-target-conflict` | auto: `folder target conflict performs no canonical or physical writes` |

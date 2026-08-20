@@ -13,6 +13,7 @@ import {
 	ConnectEncryptedVaultModal,
 	DisableEncryptionModal,
 	EnableEncryptionModal,
+	EncryptionUpgradeModal,
 	VerifyPasswordModal,
 } from "./ui/encryption-modals";
 import type { BackupInfo, RemoteEncryptionManifest } from "./types";
@@ -126,11 +127,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 	private async promptNewEncryptionPassword(): Promise<string | null> {
 		return await new Promise<string | null>((resolve) => {
-			new EnableEncryptionModal(
-				this.app,
-				resolve,
-				() => this.plugin.createBackup()
-			).open();
+			new EnableEncryptionModal(this.app, resolve).open();
 		});
 	}
 
@@ -383,6 +380,33 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			});
 
 		if (this.plugin.settings.enableEncryption) {
+			if (this.plugin.settings.encryptionProfileId !== "hardened-v3") {
+				new Setting(containerEl)
+					.setName(t("settings.encryption_upgrade_title"))
+					.setDesc(t("settings.encryption_upgrade_desc"))
+					.addButton((button) =>
+						button
+							.setButtonText(t("settings.encryption_upgrade_button"))
+							.setCta()
+							.onClick(async () => {
+								const confirmed = await new Promise<boolean>(
+									(resolve) =>
+										new EncryptionUpgradeModal(
+											this.app,
+											resolve,
+										).open(),
+								);
+								if (!confirmed) return;
+								try {
+									await this.plugin.upgradeEncryptionFormat();
+								} catch {
+									// The plugin owns the result Notice.
+								}
+								// eslint-disable-next-line @typescript-eslint/no-deprecated
+								this.display();
+							}),
+					);
+			}
 			new Setting(containerEl)
 				.setDesc(t("settings.encryption_status_active"))
 				.addButton((button) =>

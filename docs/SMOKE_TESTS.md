@@ -9,7 +9,7 @@ multi-device, Force-loop и шифрования.
 Перед прогоном:
 
 - `npm test`, lint и build уже зелёные.
-- На обоих устройствах установлена одна и та же `2.0.0-beta.4`.
+- На обоих устройствах установлена одна и та же `2.0.0-beta.5`.
 - Используются два независимых профиля Obsidian с разными device ID.
 - Используется реальный Яндекс Диск.
 - Тестовое remote-хранилище можно безопасно очищать.
@@ -265,14 +265,28 @@ multi-device, Force-loop и шифрования.
 Покрывает: `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`, `FORCE-017`,
 `MULTI-012`, `MIG-004`, `UI-006`.
 
-## TC-08. Шифрование: enable, обычная работа, rotate, disable
+## TC-08. Шифрование: v2→v3, fresh v3, rotate, disable и backup restore
 
 Время: 6 минут на маленьком vault.
 
 Использовать vault из предыдущих тестов, но удалить намеренные
 conflict/backup-файлы, если они мешают проверке.
 
-### Enable
+### Legacy-v2 → hardened-v3
+
+1. Подготовить legacy encrypted manifest v2 и читаемый vault на Device 1.
+2. Убедиться, что normal sync, watcher и scheduler заблокированы сообщением о
+   required format upgrade.
+3. Подтвердить предупреждение о старых `.enc.zip` и запустить upgrade с текущим
+   паролем.
+4. Во время перехода проверить manifest v3 `rotating`, затем stable v3.
+5. На Device 2 подключить target password и выполнить full reconcile.
+6. Повторить с crash/restart до и после canonical commit; после commit Device 2
+   должен завершить cleanup без source password.
+7. Старый beta-клиент против manifest v3 должен только заблокироваться и не
+   изменить remote.
+
+### Fresh enable
 
 1. На Device 1 включить шифрование.
 2. Проверить единый progress Notice.
@@ -288,18 +302,24 @@ conflict/backup-файлы, если они мешают проверке.
 3. Удалить на Device 2 вложенную папку с файлом.
 4. На Device 1 выполнить full.
 
-### Rotate
+### Backup и rotate
 
-1. На Device 1 выполнить rotate encryption key.
+1. Скачать созданный при enable/upgrade backup и восстановить ZIP во временный
+   vault; сравнить paths и SHA-256.
+2. На Device 1 выполнить rotate encryption key.
 2. На Device 2 попробовать старый пароль — sync должна блокироваться.
 3. Ввести новый пароль и выполнить full.
-4. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
+4. Скачать pre-rotate `.enc.zip` и открыть его исходным backup password.
+5. Создать новый backup, скачать и восстановить его.
+6. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
 
 ### Disable
 
 1. На Device 1 отключить шифрование.
 2. На Device 2 выполнить full.
 3. Повторить full на обоих устройствах.
+4. Скачать backup, созданный перед disable, открыть source password и сравнить
+   восстановленный ZIP.
 
 Ожидание:
 
@@ -318,10 +338,9 @@ conflict/backup-файлы, если они мешают проверке.
 `TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`, `SAFE-004`, `UI-007`,
 `UI-008`.
 
-## Что сознательно не входит в эти 30 минут
+## Расширенные обязательные release gates
 
-При допущении, что автоматические проверки зелёные, короткий smoke не повторяет
-вручную:
+Короткий smoke не заменяет отдельный release-прогон:
 
 - crash на каждом `await`;
 - timeout до и после успешного commit;
@@ -335,16 +354,19 @@ conflict/backup-файлы, если они мешают проверке.
 - rename между excluded/config paths;
 - параллельные encryption transitions.
 
-Это не означает, что сценарии неважны. Они не помещаются в получасовую ручную
-приёмку и должны оставаться покрыты автоматикой или отдельным расширенным
-release-прогоном.
+Перед stable обязательны: Obsidian 1.0.0 desktop, current desktop и current
+mobile; plaintext, legacy-v2 migration и fresh hardened-v3; два независимых
+профиля; 409/423/429 и ambiguous upload; offline return; 10 000 descendants;
+PERF-006; PBKDF2 p95 не более 3 секунд; финальный full обоих профилей `0/0/0`.
+Результаты записываются в `release-evidence/2.0.0.json` без secret и полных
+remote paths.
 
 ## Итоговая карточка прогона
 
 Для каждого TC достаточно записывать:
 
 ```text
-Версия: 2.0.0-beta.4
+Версия: 2.0.0-beta.5
 Дата:
 Устройства:
 Режим: plaintext/encrypted

@@ -31,10 +31,13 @@ src/
 │   └── sync-scheduler.ts   # Планировщик периодической синхронизации
 │
 ├── backup/
-│   └── backup-manager.ts   # Управление резервным копированием
+│   ├── backup-manager.ts   # ZIP, raw upload и exact read-back
+│   └── backup-envelope.ts  # Self-contained OYDSBKP2 envelope
 │
 ├── crypto/
-│   ├── encryption.ts       # E2E encryption service (Web Crypto API)
+│   ├── encryption.ts       # Legacy-v2 и hardened-v3 codecs
+│   ├── encryption-manager.ts # Profile, snapshot и manifest wire-shapes
+│   ├── encryption-state-migration.ts # Additive PluginData migration
 │   └── encryption-transition.ts # Общий transition executor и crash recovery
 │
 ├── ui/
@@ -215,7 +218,7 @@ Manifest и canonical читаются единым stable raw-примитив�
 session token; для строгого no-op финальный запрос не выполняется.
 
 Индекс v1-v3 не мигрируется обычной синхронизацией: пользователь должен
-обновить все устройства до 2.0.0-beta.4 и один раз выполнить Force sync на
+обновить все устройства до 2.0.0-beta.5 и один раз выполнить Force sync на
 авторитетном устройстве. Index v4 хранит `mutationSeq` в file metadata,
 folder tombstones и moves. Folder move фиксирует logical intent одной revision,
 а физически выполняется как ограниченная пачка guarded file moves; folder-level
@@ -469,6 +472,21 @@ interface StorageClient {
 }
 ```
 
+## Encryption profiles и migration
+
+Новые vault используют hardened-v3: PBKDF2 600k выводит master key, HKDF
+разделяет AES-GCM content key и AES-SIV filename key. Legacy-v2 остаётся только
+для чтения и явного migration. Manifest v3 строго объявляет все алгоритмы;
+unknown version/profile блокирует любые remote mutations.
+
+Format upgrade выполняется как canonical maintenance kind `rotate`. До commit
+canonical читается source codec, после commit — только target codec. Cleanup
+paths и source fingerprints фиксируются атомарно с target canonical, поэтому
+другое target-capable устройство может завершить post-commit cleanup без
+source password. `IndexManager` разрешает это только matching transition ID и
+post-commit phase. Подробный wire и recovery contract описан в
+[E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
+
 ## Тестирование
 
 ### Ручное тестирование
@@ -494,6 +512,11 @@ interface StorageClient {
 observed/canonical revision, mutation/action ID, ожидаемые fingerprint и фазы
 перехода шифрования. Токены, пароли и ключи очищаются централизованно перед
 выводом.
+
+`main.ts` остаётся composition root: lifecycle, UI/Notice и публичные методы
+делегируют profile selection, codec construction, snapshot и manifest
+wire-shapes в `EncryptionManager`. Единственный transition executor —
+`EncryptionTransitionController`; отдельный coordinator не создаётся.
 
 ## Параллелизация операций
 
@@ -632,7 +655,7 @@ backup/
 
 - Создание ZIP-архивов всех синхронизируемых файлов
 - Загрузку бекапов на Яндекс.Диск в защищенную папку `.backup`
-- Проверку созданного remote-файла по physical fingerprint
+- Проверку raw remote-файла по exact SHA-256 и bytes read-back
 - Создание raw remote snapshot перед Force local
 
 ### Интеграция с синхронизацией
@@ -644,8 +667,10 @@ backup/
 ### Формат бекапов
 
 - **Расширение**: `.zip`
-- **Именование**: `backup_YYYY-MM-DD_HH-MM-SS.zip` для plaintext и
-  `backup_YYYY-MM-DD_HH-MM-SS.enc.zip` при активном encryption codec
+- **Именование**:
+  `backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>[.enc].zip`
+- **Encryption**: self-contained `OYDSBKP2` envelope, независимый от active
+  vault codec
 - **Содержимое**: Все файлы, подлежащие синхронизации
 - **Расположение**: `{remotePath}/.backup/`
 
@@ -654,6 +679,8 @@ backup/
 - Папка `.backup` защищена от случайного удаления
 - Фильтрация на уровне `path-utils` и `IndexManager`
 - Бекапы не участвуют в конфликтах синхронизации
+- Upload использует `overwrite=false`; success/timeout/409 принимаются только
+  после exact raw read-back
 
 Подробнее см. [BACKUP.md](./BACKUP.md)
 
