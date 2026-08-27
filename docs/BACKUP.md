@@ -21,8 +21,8 @@ backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>.enc.zip
 ```
 
 Исторические имена с точностью до секунды продолжают распознаваться. Новый
-`.enc.zip` обязан начинаться с magic envelope `OYDSBKP2`; non-envelope
-`.enc.zip` является неподдерживаемым prerelease-форматом.
+`.enc.zip` обязан начинаться с magic envelope `OYDSBKP!`; любой другой
+`.enc.zip` является неподдерживаемым историческим форматом.
 
 ## Plaintext backup
 
@@ -33,15 +33,14 @@ Force remote создаёт logical local backup.
 ## Self-contained encrypted envelope
 
 ```text
-[8 bytes "OYDSBKP2"]
+[8 bytes "OYDSBKP!"]
 [4 bytes big-endian header length]
 [UTF-8 JSON header]
 [AES-256-GCM encrypted ZIP + tag]
 ```
 
-Header v2 содержит только:
+Header содержит только:
 
-- `version: 2`;
 - `kind: "logical-vault" | "remote-raw"`;
 - `createdAt`, plugin version, file count;
 - PBKDF2-HMAC-SHA256, 600 000 iterations, random salt 16 bytes;
@@ -76,7 +75,7 @@ epoch/revision и digest local snapshot; concurrent commit инвалидиру�
 
 Download всегда начинается raw:
 
-1. `OYDSBKP2` открывается по bounded параметрам собственного header.
+1. `OYDSBKP!` открывается по bounded параметрам собственного header.
 2. Сначала пробуется явно переданный или текущий пароль.
 3. При authentication failure UI запрашивает backup password.
 4. Пользователю сохраняется обычный `.zip`.

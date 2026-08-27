@@ -6,19 +6,19 @@
 
 Версия 2.0.0 поддерживает миграцию только с plaintext stable 1.0.0 и 1.1.0.
 Их local `localIndex` однократно преобразуется в текущий baseline.
-Plaintext canonical v1/v2 требует явного Force с обязательным backup;
-canonical v3 не поддерживается даже для Force.
+Plaintext canonical с точной stable-структурой `version: 1` или `version: 2`
+требует явного Force с обязательным backup.
 
-Encrypted legacy и исторические prerelease-форматы не поддерживаются.
-Распознаваемые manifest v1/v2, encrypted legacy index v1/v2, canonical v3,
-unversioned queues/transitions и неполная metadata текущего transition блокируют
-запуск и любые remote writes. Нужно выбрать чистый remote path либо вручную
-сбросить старые данные только после самостоятельного backup. Структурно
-валидные текущие schema v2, manifest v3 и index v4 принимаются как текущий
-формат; converter/recovery для несовместимых исторических форматов нет.
+Encrypted legacy и все остальные исторические форматы не поддерживаются.
+Numeric manifest/canonical, unmarked queues/transitions и неполная current
+transition metadata блокируют запуск и любые remote writes. Нужно выбрать
+чистый remote path либо вручную сбросить старые данные только после
+самостоятельного backup. Текущие данные принимаются только с
+semantic-маркерами `sync-index`, `encryption-manifest` и `plugin-data`;
+converter/recovery для несовместимых исторических форматов нет.
 
-Не запускайте старую версию плагина после перехода: она может заменить индекс
-v4 или вернуть удалённые файлы. Если это произошло, отключите синхронизацию
+Не запускайте старую версию плагина после перехода: она может заменить
+canonical или вернуть удалённые файлы. Если это произошло, отключите синхронизацию
 везде, выберите наиболее полную локальную копию, проверьте
 backup/conflict-копии и повторите Force local с обязательным бэкапом.
 
@@ -76,7 +76,7 @@ backup/conflict-копии и повторите Force local с обязател
 4. Перезапустите Obsidian
 5. Включите плагин в **Настройки → Сторонние плагины**
 
-### Через BRAT (для бета-тестирования)
+### Через BRAT (для тестирования предварительных сборок)
 
 1. Установите плагин [BRAT](https://github.com/TfTHacker/obsidian42-brat)
 2. Добавьте репозиторий через BRAT
@@ -191,7 +191,7 @@ conflict-копию. Последовательные изменения одн�
 
 ### Шифрование
 
-Новые encrypted vault используют профиль hardened-v3: PBKDF2-HMAC-SHA256 с
+Новые encrypted vault используют профиль `hardened`: PBKDF2-HMAC-SHA256 с
 600 000 итераций выводит master key, после чего HKDF-SHA256 создаёт независимые
 ключи AES-256-GCM для содержимого и AES-SIV для имён.
 
@@ -222,8 +222,8 @@ fingerprint-guarded cleanup из canonical metadata без source password.
 > удаляется только guarded-cleanup при совпадении fingerprint. Полученные
 > зашифрованные данные невозможно прочитать без пароля.
 
-Manifest v1/v2 и исторические encrypted backup-форматы не поддерживаются.
-Non-envelope `.enc.zip`, encrypted legacy names и historical `.zip` без
+Numeric historical manifest и исторические encrypted backup-форматы не
+поддерживаются. Non-envelope `.enc.zip`, encrypted legacy names и historical `.zip` без
 plaintext ZIP magic отклоняются без попытки compatibility decrypt. Старые
 plaintext ZIP по-прежнему можно скачать.
 
@@ -305,14 +305,17 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 - [Obsidian](https://obsidian.md) за отличный продукт и API
 - [Яндекс Диск](https://disk.yandex.ru) за облачное хранилище
-- [BRAT](https://github.com/TfTHacker/obsidian42-brat) за инструмент бета-тестирования
+- [BRAT](https://github.com/TfTHacker/obsidian42-brat) за инструмент тестирования обновлений
 - Сообществу Obsidian за поддержку и вдохновение
 
 ---
 
-**Последнее обновление**: 17 июня 2026  
-**Версия**: 1.0.0  
-**Поддерживаемые платформы**: Windows, macOS, Linux, iOS, Android  
+**Последнее обновление**: 27 августа 2026
+
+**Версия**: 2.0.0
+
+**Поддерживаемые платформы**: Windows, macOS, Linux, iOS, Android
+
 **Требуемая версия Obsidian**: 1.0.0+
 
 > **ℹ️ Примечание разработчика**

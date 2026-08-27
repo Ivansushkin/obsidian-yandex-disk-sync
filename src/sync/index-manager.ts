@@ -20,7 +20,8 @@ import type {
 	IndexMaintenance,
 } from "../types";
 import {
-	CURRENT_INDEX_VERSION,
+	CURRENT_INDEX_FORMAT,
+	ENCRYPTION_MANIFEST_FORMAT,
 	createEmptyIndex,
 	createEmptyLocalState,
 } from "../types";
@@ -44,7 +45,8 @@ import {
 	FILENAME_KEY_LENGTH,
 	IV_LENGTH,
 } from "../crypto/encryption";
-import { UnsupportedPrereleaseDataError } from "../compatibility-errors";
+import { UnsupportedHistoricalDataError } from "../compatibility-errors";
+import { parseStable1xIndex } from "../compatibility/stable-1x";
 import type { EncryptionCodec } from "../crypto/encryption";
 import {
 	getPhysicalResourceFingerprint,
@@ -55,7 +57,7 @@ import {
 import {
 	canApplyDestructiveFolderMutation,
 	classifyFileMutation,
-	classifyIndexVersion,
+	classifyIndexFormat,
 	isPathInsideFolder,
 	isStableLockStale,
 	mergeFileMutation,
@@ -175,6 +177,29 @@ function validateEncryptionModeDescriptor(value: unknown, section: string): void
 }
 
 function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord & SyncIndex {
+	const requiredRootKeys = [
+		"format",
+		"epoch",
+		"revision",
+		"lastSyncTime",
+		"deviceId",
+		"files",
+		"folderTombstones",
+		"moves",
+		"appliedMutationSeq",
+	];
+	const allowedRootKeys = new Set([...requiredRootKeys, "maintenance"]);
+	assertIndexSection(
+		Object.keys(data).every((key) => allowedRootKeys.has(key)) &&
+			requiredRootKeys.every((key) => key in data),
+		"root",
+		"fields do not match the current canonical format",
+	);
+	assertIndexSection(
+		data.format === CURRENT_INDEX_FORMAT,
+		"root",
+		"format marker is invalid",
+	);
 	assertIndexSection(typeof data.epoch === "string" && data.epoch.length > 0, "root", "epoch is required");
 	assertIndexSection(isNonNegativeInteger(data.revision), "root", "revision must be a non-negative integer");
 	assertIndexSection(isNonNegativeInteger(data.lastSyncTime), "root", "lastSyncTime must be a non-negative integer");
@@ -494,11 +519,9 @@ export class IndexManager {
 	 */
 	loadLocalIndexFromData(data: Partial<LocalSyncState> | null): void {
 		if (
-			data?.version === 1 &&
-			typeof data.observedRevision === "number"
+			data && typeof data.observedRevision === "number"
 		) {
 			this.localState = {
-				version: 1,
 				deviceId: this.settings.deviceId,
 				observedEpoch:
 					typeof data.observedEpoch === "string"
@@ -516,7 +539,7 @@ export class IndexManager {
 	}
 
 	/**
-	 * Allow one force-sync commit to replace a legacy index with v4.
+	 * Allow one force-sync commit to replace a stable 1.x index.
 	 */
 	beginForceBootstrap(replaceRemote = true): void {
 		this.allowLegacyWriteOnce = true;
@@ -1169,7 +1192,7 @@ export class IndexManager {
 				merged.revision = latest.revision + 1;
 			}
 			if (merged.revision !== latest.revision) {
-				merged.version = CURRENT_INDEX_VERSION;
+				merged.format = CURRENT_INDEX_FORMAT;
 				merged.deviceId = this.settings.deviceId;
 				merged.lastSyncTime = Date.now();
 				let uploadError: unknown;
@@ -1357,7 +1380,7 @@ export class IndexManager {
 				error: e,
 			});
 			if (rollbackOutcome === "rolled-back") {
-				if (e instanceof UnsupportedPrereleaseDataError) throw e;
+				if (e instanceof UnsupportedHistoricalDataError) throw e;
 				throw new RemoteIndexRolledBackError(
 					e instanceof Error
 						? e.message
@@ -1382,7 +1405,7 @@ export class IndexManager {
 		}
 	}
 
-	/** Reject detectable prerelease or malformed data before Force takes a lock. */
+	/** Reject unsupported historical or malformed data before Force takes a lock. */
 	private async assertForceSourceSupported(
 		canonicalPath: string,
 	): Promise<void> {
@@ -1407,10 +1430,10 @@ export class IndexManager {
 		} catch (error) {
 			if (
 				!allowPlaintextLegacy &&
-				error instanceof LegacyIndexVersionError
+				error instanceof LegacyIndexFormatError
 			) {
-				throw new UnsupportedPrereleaseDataError(
-					"Encrypted canonical index v1/v2 is unsupported",
+				throw new UnsupportedHistoricalDataError(
+					"Encrypted legacy canonical data is unsupported",
 				);
 			}
 			throw error;
@@ -1979,29 +2002,22 @@ export class IndexManager {
 		if (!isJsonRecord(data)) {
 			throw new InvalidCurrentIndexError("root", "must be an object");
 		}
-		const versionKind = classifyIndexVersion(data.version);
-		if (versionKind !== "current") {
-			if (versionKind === "legacy" && decodedWithEncryption) {
-				throw new UnsupportedPrereleaseDataError(
-					"Encrypted canonical index v1/v2 is unsupported",
+		const formatKind = classifyIndexFormat(data);
+		if (formatKind !== "current") {
+			if (formatKind === "legacy" && decodedWithEncryption) {
+				throw new UnsupportedHistoricalDataError(
+					"Encrypted legacy canonical data is unsupported",
 				);
 			}
-			if (allowLegacy && versionKind === "legacy") {
+			if (allowLegacy && formatKind === "legacy") {
 				return this.normalizeLegacyIndex(data);
 			}
-			if (versionKind === "unsupported") {
-				if (data.version === 3) {
-					throw new UnsupportedPrereleaseDataError(
-						"Canonical index v3 was written by an unsupported prerelease",
-					);
-				}
-				throw new Error(
-					`Remote sync index version ${String(data.version)} is not supported by this plugin version.`,
+			if (formatKind === "unsupported") {
+				throw new UnsupportedHistoricalDataError(
+					"Remote canonical data uses an unsupported historical format",
 				);
 			}
-			throw new LegacyIndexVersionError(
-				typeof data.version === "number" ? data.version : undefined,
-			);
+			throw new LegacyIndexFormatError();
 		}
 		validateCurrentIndexShape(data);
 		validateCurrentIndexCausality(data);
@@ -2033,19 +2049,32 @@ export class IndexManager {
 		return error instanceof Error ? error.name : typeof error;
 	}
 
+	/** Convert only the exact plaintext canonical shape written by stable 1.0/1.1. */
 	private normalizeLegacyIndex(data: JsonRecord): SyncIndex {
+		const stable = parseStable1xIndex(data);
+		if (!stable) {
+			throw new UnsupportedHistoricalDataError(
+				"Legacy canonical data is not an exact stable 1.0/1.1 index",
+			);
+		}
 		const normalized = createEmptyIndex(
-			typeof data.deviceId === "string" ? data.deviceId : "legacy",
+			stable.deviceId,
 		);
-		normalized.lastSyncTime = isNonNegativeInteger(data.lastSyncTime)
-			? data.lastSyncTime
-			: 0;
-		normalized.files = isJsonRecord(data.files)
-			? (data.files as Record<string, FileMetadata>)
-			: {};
-		for (const meta of Object.values(normalized.files)) {
-			meta.changedRevision = 0;
-			meta.baseRevision = 0;
+		normalized.lastSyncTime = stable.lastSyncTime;
+		for (const [path, metadata] of Object.entries(stable.files)) {
+			normalized.files[path] = {
+				path,
+				sha256: metadata.sha256,
+				size: metadata.size,
+				mtime: metadata.mtime,
+				syncedAt: metadata.syncedAt,
+				deleted: metadata.deleted,
+				deletedAt: metadata.deletedAt,
+				lastModifiedBy: metadata.lastModifiedBy,
+				mutationSeq: 0,
+				changedRevision: 0,
+				baseRevision: 0,
+			};
 		}
 		return normalized;
 	}
@@ -3099,9 +3128,9 @@ export class IndexManager {
 	private parseEncryptionManifest(
 		data: Record<string, unknown>,
 	): RemoteEncryptionManifest {
-		if (data.version === 1 || data.version === 2) {
-			throw new UnsupportedPrereleaseDataError(
-				`Encryption manifest v${String(data.version)} is unsupported`,
+		if (data.format !== ENCRYPTION_MANIFEST_FORMAT) {
+			throw new UnsupportedHistoricalDataError(
+				"Encryption manifest uses an unsupported historical format",
 			);
 		}
 		const salt = data.salt;
@@ -3110,11 +3139,8 @@ export class IndexManager {
 		}
 		this.assertManifestBase64(salt, 16, 16, "salt");
 
-		if (data.version !== 3) {
-			throw new Error("Unsupported encryption manifest version");
-		}
 		this.assertManifestKeys(data, [
-			"version",
+			"format",
 			"profileId",
 			"state",
 			"revision",
@@ -3166,8 +3192,8 @@ export class IndexManager {
 		}
 		this.assertHardenedManifestAlgorithms(data);
 		return {
-			version: 3,
-			profileId: "hardened-v3",
+			format: ENCRYPTION_MANIFEST_FORMAT,
+			profileId: "hardened",
 			state,
 			revision: revision as number,
 			salt,
@@ -3190,7 +3216,7 @@ export class IndexManager {
 				name: "AES-SIV",
 				keyLength: FILENAME_KEY_LENGTH,
 				encoding: "base64url",
-				aad: "obsidian-yandex-disk-sync:filename:v3",
+				aad: "obsidian-yandex-disk-sync:filename",
 			},
 			updatedAt: updatedAt as number,
 			updatedBy,
@@ -3227,7 +3253,7 @@ export class IndexManager {
 			!isJsonRecord(data.cipher) ||
 			!isJsonRecord(data.filenameCipher)
 		) {
-			throw new Error("Invalid encryption manifest: unsupported v3 profile");
+			throw new Error("Invalid encryption manifest: unsupported profile");
 		}
 		const kdf = data.kdf;
 		const schedule = data.keySchedule;
@@ -3243,7 +3269,7 @@ export class IndexManager {
 			"aad",
 		]);
 		if (
-			data.profileId !== "hardened-v3" ||
+			data.profileId !== "hardened" ||
 			kdf?.name !== "PBKDF2" ||
 			kdf.hash !== "SHA-256" ||
 			kdf.iterations !== HARDENED_PBKDF2_ITERATIONS ||
@@ -3255,9 +3281,9 @@ export class IndexManager {
 			filename?.name !== "AES-SIV" ||
 			filename.keyLength !== FILENAME_KEY_LENGTH ||
 			filename.encoding !== "base64url" ||
-			filename.aad !== "obsidian-yandex-disk-sync:filename:v3"
+			filename.aad !== "obsidian-yandex-disk-sync:filename"
 		) {
-			throw new Error("Invalid encryption manifest: unsupported v3 profile");
+			throw new Error("Invalid encryption manifest: unsupported profile");
 		}
 	}
 
@@ -3339,7 +3365,7 @@ export class IndexManager {
 		value: unknown,
 	): EncryptionTransitionDescriptor["sourceProfileId"] {
 		if (value === null) return null;
-		if (value === "hardened-v3") return value;
+		if (value === "hardened") return value;
 		throw new Error("Invalid encryption manifest: invalid profile ID");
 	}
 
@@ -3567,15 +3593,12 @@ export class RemoteIndexLockedError extends Error {
 	}
 }
 
-export class LegacyIndexVersionError extends Error {
-	readonly version: number | undefined;
-
-	constructor(version: number | undefined) {
+export class LegacyIndexFormatError extends Error {
+	constructor() {
 		super(
-			`Remote sync index version ${String(version)} is not supported by this plugin build. Update every device and run one explicit force sync to create index v4.`,
+			"A stable 1.x synchronization index requires one explicit Force sync with a verified backup.",
 		);
-		this.name = "LegacyIndexVersionError";
-		this.version = version;
+		this.name = "LegacyIndexFormatError";
 	}
 }
 
@@ -3584,7 +3607,7 @@ export class InvalidCurrentIndexError extends Error {
 		readonly section: string,
 		reason: string,
 	) {
-		super(`Remote sync index v4 is invalid in ${section}: ${reason}.`);
+		super(`Current remote sync index is invalid in ${section}: ${reason}.`);
 		this.name = "InvalidCurrentIndexError";
 	}
 }

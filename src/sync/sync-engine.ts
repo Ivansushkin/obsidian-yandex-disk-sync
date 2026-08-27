@@ -26,12 +26,12 @@ import {
 	AmbiguousRemoteIndexLockError,
 	IndexEpochMismatchError,
 	InvalidCurrentIndexError,
-	LegacyIndexVersionError,
+	LegacyIndexFormatError,
 	RemoteMaintenanceActiveError,
 	RemoteIndexTransactionError,
 	UnreadableRemoteIndexError,
 } from "./index-manager";
-import { UnsupportedPrereleaseDataError } from "../compatibility-errors";
+import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { ConflictResolver } from "./conflict-resolver";
 import {
 	joinPath,
@@ -1414,7 +1414,7 @@ export class SyncEngine {
 					}
 				}
 
-				// 7. Commit the v4 index. Failed physical deletions deliberately
+				// 7. Commit the canonical index. Failed physical deletions deliberately
 				// remain tombstoned so the next sync retries them. Failed uploads
 				// never updated the desired index and are likewise retried.
 				this.setSyncPhase("saving-index");
@@ -4679,12 +4679,12 @@ export class SyncEngine {
 		if (
 			findErrorCause(
 				error,
-				(candidate) => candidate instanceof UnsupportedPrereleaseDataError,
+				(candidate) => candidate instanceof UnsupportedHistoricalDataError,
 			)
 		) {
-			return "unsupported-prerelease";
+			return "unsupported-historical";
 		}
-		if (findErrorCause(error, (candidate) => candidate instanceof LegacyIndexVersionError)) {
+		if (findErrorCause(error, (candidate) => candidate instanceof LegacyIndexFormatError)) {
 			return "legacy-index";
 		}
 		if (findErrorCause(error, (candidate) => candidate instanceof UnreadableRemoteIndexError)) {

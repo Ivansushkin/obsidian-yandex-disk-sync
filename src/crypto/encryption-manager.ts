@@ -6,6 +6,7 @@ import type {
 	RemoteEncryptionManifest,
 	YandexDiskSyncSettings,
 } from "../types";
+import { ENCRYPTION_MANIFEST_FORMAT } from "../types";
 import {
 	AES_KEY_LENGTH,
 	createEncryptionCodec,
@@ -54,7 +55,7 @@ export class EncryptionManager {
 				salt: EncryptionService.bytesToBase64(saltBytes),
 				password,
 				revision,
-				profileId: "hardened-v3",
+				profileId: "hardened",
 			},
 		};
 	}
@@ -128,8 +129,8 @@ export class EncryptionManager {
 		maintenance?: IndexMaintenance;
 	}): Promise<EncryptionManifest> {
 		const { service, salt, state, revision, deviceId, transition } = options;
-		if (service.profileId !== "hardened-v3") {
-			throw new Error("Only hardened-v3 manifests can be written");
+		if (service.profileId !== "hardened") {
+			throw new Error("Only hardened manifests can be written");
 		}
 		const maintenance = transition ? options.maintenance : undefined;
 		if (transition && !maintenance) {
@@ -162,8 +163,8 @@ export class EncryptionManager {
 				: undefined,
 		};
 		return {
-			version: 3,
-			profileId: "hardened-v3",
+			format: ENCRYPTION_MANIFEST_FORMAT,
+			profileId: "hardened",
 			...common,
 			kdf: {
 				name: "PBKDF2",
@@ -175,7 +176,7 @@ export class EncryptionManager {
 				name: "AES-SIV",
 				keyLength: FILENAME_KEY_LENGTH,
 				encoding: "base64url",
-				aad: "obsidian-yandex-disk-sync:filename:v3",
+				aad: "obsidian-yandex-disk-sync:filename",
 			},
 		};
 	}

@@ -17,7 +17,7 @@ import {
 } from "./ui/encryption-modals";
 import type { BackupInfo, RemoteEncryptionManifest } from "./types";
 import { YandexApiError } from "./api/yandex-client";
-import { UnsupportedPrereleaseDataError } from "./compatibility-errors";
+import { UnsupportedHistoricalDataError } from "./compatibility-errors";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
@@ -78,8 +78,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			remoteManifest = await this.plugin.getRemoteEncryptionManifest();
 		} catch (e) {
 			new Notice(
-				e instanceof UnsupportedPrereleaseDataError
-					? t("notice.unsupported_prerelease_data")
+				e instanceof UnsupportedHistoricalDataError
+					? t("notice.unsupported_historical_data")
 					: e instanceof Error
 						? e.message
 						: String(e),

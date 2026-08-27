@@ -1,11 +1,11 @@
 /**
  * Browser-compatible hardened encryption used by remote storage and transition
- * recovery. Historical prerelease encryption formats are unsupported.
+ * recovery. Historical encryption formats are unsupported.
  */
 
 import { aessiv } from "@noble/ciphers/aes.js";
 
-export type EncryptionProfileId = "hardened-v3";
+export type EncryptionProfileId = "hardened";
 
 export interface EncryptionCodec {
 	readonly profileId: EncryptionProfileId;
@@ -24,15 +24,15 @@ export const FILENAME_KEY_LENGTH = 512;
 export const IV_LENGTH = 12;
 export const SALT_LENGTH = 16;
 
-const VERIFIER_PAYLOAD = "obsidian-yandex-disk-sync:encryption-verifier:v1";
+const VERIFIER_PAYLOAD = "obsidian-yandex-disk-sync:encryption-verifier";
 const CONTENT_KEY_INFO = new TextEncoder().encode(
-	"obsidian-yandex-disk-sync:content:v3",
+	"obsidian-yandex-disk-sync:content-key",
 );
 const FILENAME_KEY_INFO = new TextEncoder().encode(
-	"obsidian-yandex-disk-sync:filename-key:v3",
+	"obsidian-yandex-disk-sync:filename-key",
 );
 const FILENAME_AAD = new TextEncoder().encode(
-	"obsidian-yandex-disk-sync:filename:v3",
+	"obsidian-yandex-disk-sync:filename",
 );
 
 /** Reject decrypted path segments before they can reach the vault adapter. */
@@ -50,9 +50,9 @@ export function assertValidLogicalPathSegment(segment: string): string {
 	return segment;
 }
 
-/** Hardened v3 profile with separated content and filename keys. */
+/** Hardened profile with separated content and filename keys. */
 export class EncryptionService implements EncryptionCodec {
-	readonly profileId = "hardened-v3" as const;
+	readonly profileId = "hardened" as const;
 	private contentKey: CryptoKey | null = null;
 	private filenameKey: Uint8Array | null = null;
 	private readonly salt: Uint8Array;
@@ -207,7 +207,7 @@ export function createEncryptionCodec(
 	profileId: EncryptionProfileId,
 	salt: Uint8Array,
 ): EncryptionCodec {
-	if (profileId !== "hardened-v3") {
+	if (profileId !== "hardened") {
 		throw new Error("Unsupported encryption profile");
 	}
 	return new EncryptionService(salt);

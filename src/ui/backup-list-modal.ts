@@ -11,7 +11,7 @@ import {
 import { t } from '../i18n';
 import { logger } from '../utils/logger';
 import { ConnectEncryptedVaultModal } from './encryption-modals';
-import { UnsupportedPrereleaseDataError } from '../compatibility-errors';
+import { UnsupportedHistoricalDataError } from '../compatibility-errors';
 
 export class BackupListModal extends Modal {
 	private backupManager: BackupManager;
@@ -140,8 +140,8 @@ export class BackupListModal extends Modal {
 		} catch (error) {
 			logger.error('Error downloading backup:', { error });
 			const message =
-				error instanceof UnsupportedPrereleaseDataError
-					? t('notice.unsupported_prerelease_data')
+				error instanceof UnsupportedHistoricalDataError
+					? t('notice.unsupported_historical_data')
 					: t('notice.backup_download_failed');
 			new Notice(message);
 		} finally {

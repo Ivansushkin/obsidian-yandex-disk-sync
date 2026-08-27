@@ -14,6 +14,10 @@ src/
 ├── main.ts                 # Точка входа, жизненный цикл плагина
 ├── settings.ts             # UI настроек
 ├── types.ts                # TypeScript интерфейсы и типы
+├── compatibility-errors.ts # Generic fail-closed historical error
+├── plugin-data-loader.ts    # Strict current/stable-1.0/1.1 local loader
+├── compatibility/
+│   └── stable-1x.ts        # Exact plaintext stable 1.0/1.1 parser
 │
 ├── api/
 │   ├── yandex-client.ts    # HTTP клиент для Yandex Disk API
@@ -32,12 +36,11 @@ src/
 │
 ├── backup/
 │   ├── backup-manager.ts   # ZIP, raw upload и exact read-back
-│   └── backup-envelope.ts  # Self-contained OYDSBKP2 envelope
+│   └── backup-envelope.ts  # Self-contained OYDSBKP! envelope
 │
 ├── crypto/
-│   ├── encryption.ts       # Единственный hardened-v3 codec
+│   ├── encryption.ts       # Единственный hardened codec
 │   ├── encryption-manager.ts # Profile, snapshot и manifest wire-shapes
-│   ├── encryption-state-migration.ts # Strict current/stable-1.0/1.1 loader
 │   └── encryption-transition.ts # Общий transition executor и crash recovery
 │
 ├── ui/
@@ -123,7 +126,7 @@ HTTP клиент для взаимодействия с Yandex Disk REST API.
 
 ```typescript
 interface SyncIndex {
-	version: 4;
+	format: "sync-index";
 	epoch: string; // Generation, replaced only by explicit Force sync
 	revision: number; // Общая причинная ревизия
 	lastSyncTime: number; // Время последней синхронизации
@@ -136,7 +139,6 @@ interface SyncIndex {
 }
 
 interface LocalSyncState {
-	version: 1;
 	observedEpoch: string | null;
 	observedRevision: number;
 	files: Record<string, FileMetadata>; // Last applied baseline
@@ -218,26 +220,26 @@ Manifest и canonical читаются единым stable raw-примитив�
 с ограниченной параллельностью папок. Перед записью manifest проверяется по
 session token; для строгого no-op финальный запрос не выполняется.
 
-Plaintext stable 1.0/1.1 index v1/v2 не мигрируется обычной синхронизацией:
-пользователь один раз выполняет Force sync с обязательным backup на
-авторитетном устройстве. Encrypted index v1/v2 и index v3 являются
-неподдерживаемыми форматами и блокируются даже при Force.
-Force выполняет read-only classification до захвата canonical lock. Index v4
-хранит `mutationSeq` в file metadata, folder tombstones и moves. Folder move
+Plaintext stable 1.0/1.1 canonical с точной формой `version: 1` или
+`version: 2` не мигрируется обычной синхронизацией: пользователь один раз
+выполняет Force sync с обязательным backup на авторитетном устройстве.
+Encrypted legacy и все остальные historical formats блокируются даже при
+Force. Force выполняет read-only classification до захвата canonical lock.
+Current canonical хранит `mutationSeq` в file metadata, folder tombstones и moves. Folder move
 фиксирует logical intent одной revision, а физически выполняется как
 ограниченная пачка guarded file moves; folder-level move API не используется.
-Перед использованием current v4 проходит строгую runtime-валидацию всех
+Перед использованием current canonical проходит строгую runtime-валидацию всех
 records, путей, числовых полей, mutation watermarks, moves, tombstones и
-maintenance. Семантически неверный v4 не запускает codec fallback и блокирует
+maintenance. Семантически неверный canonical не запускает codec fallback и блокирует
 normal sync без удалённых записей.
 
 Full reconciliation классифицирует каждую операцию как новую локальную
 mutation, применение canonical state либо physical repair. Новый logical
 delete всегда резервирует FIFO sequence до canonical commit. Уже принятый
 tombstone применяется физически без изменения `lastModifiedBy` и
-`mutationSeq`. Current v4 file entry без sequence не даёт causal proof для
+`mutationSeq`. Current file entry без sequence не даёт causal proof для
 destructive folder operation и не получает baseline fallback; само наличие
-такой записи не включает prerelease recovery.
+такой записи не включает historical recovery.
 Force создаёт новый `epoch` только на авторитетном устройстве. Остальные
 обновлённые устройства принимают этот epoch обычной full sync: до успеха они
 сохраняют прежний baseline, сравнивают с ним текущий filesystem и новый
@@ -477,11 +479,12 @@ interface StorageClient {
 
 ## Encryption profiles и migration
 
-Новые vault используют hardened-v3: PBKDF2 600k выводит master key, HKDF
+Новые vault используют `hardened`: PBKDF2 600k выводит master key, HKDF
 разделяет AES-GCM content key и AES-SIV filename key. Других codecs в текущей
-версии нет. Manifest v1/v2, encrypted legacy index и historical prerelease
-fail closed без чтения или migration; manifest v3 строго объявляет все
-алгоритмы, а unknown version/profile блокирует любые remote mutations.
+версии нет. Numeric manifest, encrypted legacy index и другие historical
+formats fail closed без чтения или migration; current manifest имеет marker
+`encryption-manifest`, строго объявляет все алгоритмы, а unknown
+format/profile блокирует любые remote mutations.
 
 Fresh enable, rotate и disable используют один crash-safe transition. До
 commit canonical читается source codec, после commit — только target codec.
@@ -673,7 +676,7 @@ backup/
 - **Расширение**: `.zip`
 - **Именование**:
   `backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>[.enc].zip`
-- **Encryption**: self-contained `OYDSBKP2` envelope, независимый от active
+- **Encryption**: self-contained `OYDSBKP!` envelope, независимый от active
   vault codec
 - **Содержимое**: Все файлы, подлежащие синхронизации
 - **Расположение**: `{remotePath}/.backup/`

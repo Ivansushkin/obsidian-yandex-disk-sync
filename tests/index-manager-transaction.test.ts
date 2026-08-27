@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	IndexManager,
-	LegacyIndexVersionError,
+	LegacyIndexFormatError,
 	RemoteIndexRolledBackError,
 	IndexEpochMismatchError,
 	InvalidCurrentIndexError,
 	UnreadableRemoteIndexError,
 } from "../src/sync/index-manager";
 import {
-	CURRENT_INDEX_VERSION,
+	CURRENT_INDEX_FORMAT,
 	createEmptyIndex,
 	DEFAULT_SETTINGS,
 	type YandexDiskSyncSettings,
@@ -20,7 +20,7 @@ import type { EncryptionCodec } from "../src/crypto/encryption";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { logger } from "../src/utils/logger";
-import { UnsupportedPrereleaseDataError } from "../src/compatibility-errors";
+import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
@@ -256,14 +256,18 @@ function createSettings(deviceId: string): YandexDiskSyncSettings {
 	};
 }
 
+function stable1xIndex(version: 1 | 2 = 2): Record<string, unknown> {
+	return {
+		version,
+		lastSyncTime: 1,
+		deviceId: "stable-device",
+		files: {},
+	};
+}
+
 async function runLegacyForceCommit(
 	encryption: EncryptionCodec | null,
-	sourceIndex: Record<string, unknown> = {
-		version: 2,
-		lastSyncTime: 1,
-		deviceId: "old-device",
-		files: {},
-	},
+	sourceIndex: Record<string, unknown> = stable1xIndex(),
 	faults: {
 		throwAfterFinalMove?: boolean;
 		corruptIndexUpload?: boolean;
@@ -312,12 +316,13 @@ async function runLegacyForceCommit(
 	const canonical = JSON.parse(
 		new TextDecoder().decode(plain),
 	) as {
-		version: number;
+		format: string;
 		epoch: string;
 		revision: number;
 		files: Record<string, FileMetadata>;
 	};
-	assert.equal(canonical.version, CURRENT_INDEX_VERSION);
+	assert.equal(canonical.format, CURRENT_INDEX_FORMAT);
+	assert.equal("version" in canonical, false);
 	assert.equal(canonical.revision, 1);
 	assert.ok(canonical.epoch);
 	assert.equal(canonical.files["note.md"]?.mutationSeq, 0);
@@ -341,21 +346,47 @@ async function runLegacyForceCommit(
 	return { client, manager, canonicalPath, originalRaw };
 }
 
-test("plaintext legacy Force commits and verifies canonical v4", async () => {
-	await runLegacyForceCommit(null);
+test("plaintext stable 1.0/1.1 Force commits and verifies current canonical", async () => {
+	for (const version of [1, 2] as const) {
+		await runLegacyForceCommit(null, {
+			version,
+			lastSyncTime: 1,
+			deviceId: "stable-device",
+			files: {},
+		});
+	}
+});
+
+test("versioned data outside the exact stable 1.x shape is rejected before Force locks", async () => {
+	const { manager, client } = await createIndexManagerWithContent(
+		{
+			version: 2,
+			lastSyncTime: 1,
+			deviceId: "historical-device",
+			files: {},
+			pendingMutations: [],
+		},
+		null,
+	);
+	manager.beginForceBootstrap(true);
+	await assert.rejects(
+		manager.saveRemoteIndex(),
+		UnsupportedHistoricalDataError,
+	);
+	assert.equal(client.moveCount, 0);
 });
 
 test("encrypted legacy index is rejected before Force acquires a lock", async () => {
 	const encryption =
 		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
 	const { manager, client } = await createIndexManagerWithContent(
-		{ version: 2, files: {} },
+		stable1xIndex(),
 		encryption,
 	);
 	manager.beginForceBootstrap(true);
 	await assert.rejects(
 		manager.saveRemoteIndex(),
-		UnsupportedPrereleaseDataError,
+		UnsupportedHistoricalDataError,
 	);
 	assert.equal(client.moveCount, 0);
 });
@@ -368,8 +399,8 @@ test("encryption manifest validation token detects unchanged and changed content
 	const client = new FakeIndexYandex("vault", null);
 	const manifestPath = "vault/.obsidian-encrypt.json";
 	const manifest = {
-		version: 3,
-		profileId: "hardened-v3",
+		format: "encryption-manifest",
+		profileId: "hardened",
 		state: "enabled",
 		revision: 1,
 		salt: "AAAAAAAAAAAAAAAAAAAAAA==",
@@ -381,7 +412,7 @@ test("encryption manifest validation token detects unchanged and changed content
 			name: "AES-SIV",
 			keyLength: 512,
 			encoding: "base64url",
-			aad: "obsidian-yandex-disk-sync:filename:v3",
+			aad: "obsidian-yandex-disk-sync:filename",
 		},
 		updatedAt: 1,
 		updatedBy: "device-a",
@@ -458,19 +489,19 @@ const manifestCommon = {
 	updatedBy: "device-a",
 };
 
-test("manifest v1 and v2 are rejected as unsupported data", async () => {
-	for (const version of [1, 2]) {
+test("numeric historical manifests are rejected as unsupported data", async () => {
+	for (const version of [1, 2, 3]) {
 		await assert.rejects(
 			readEncryptionManifest({ version, ...manifestCommon }),
-			UnsupportedPrereleaseDataError,
+			UnsupportedHistoricalDataError,
 		);
 	}
 });
 
-test("strict v3 manifest accepts only the hardened profile", async () => {
+test("strict semantic manifest accepts only the hardened profile", async () => {
 	const hardened = {
-		version: 3,
-		profileId: "hardened-v3",
+		format: "encryption-manifest",
+		profileId: "hardened",
 		...manifestCommon,
 		kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600_000 },
 		keySchedule: { name: "HKDF", hash: "SHA-256" },
@@ -479,16 +510,22 @@ test("strict v3 manifest accepts only the hardened profile", async () => {
 			name: "AES-SIV",
 			keyLength: 512,
 			encoding: "base64url",
-			aad: "obsidian-yandex-disk-sync:filename:v3",
+			aad: "obsidian-yandex-disk-sync:filename",
 		},
 	};
-	assert.equal((await readEncryptionManifest(hardened))?.version, 3);
+	const parsed = await readEncryptionManifest(hardened);
+	assert.equal(parsed?.format, "encryption-manifest");
+	assert.equal(parsed ? "version" in parsed : true, false);
+	await assert.rejects(
+		readEncryptionManifest({ ...hardened, version: 3 }),
+		/unsupported field version/,
+	);
 	await assert.rejects(
 		readEncryptionManifest({
 			...hardened,
 			filenameCipher: { ...hardened.filenameCipher, name: "AES-GCM" },
 		}),
-		/unsupported v3 profile/,
+		/unsupported profile/,
 	);
 	await assert.rejects(
 		readEncryptionManifest({
@@ -519,8 +556,8 @@ test("strict v3 manifest accepts only the hardened profile", async () => {
 				salt: manifestCommon.salt,
 				verifier: manifestCommon.verifier,
 			},
-			sourceProfileId: "hardened-v3",
-			targetProfileId: "hardened-v3",
+			sourceProfileId: "hardened",
+			targetProfileId: "hardened",
 		},
 	};
 	assert.equal((await readEncryptionManifest(rotating))?.state, "rotating");
@@ -622,16 +659,14 @@ async function createIndexManagerWithContent(
 	};
 }
 
-test("plaintext legacy startup preserves LegacyIndexVersionError", async () => {
+test("plaintext stable 1.x startup preserves LegacyIndexFormatError", async () => {
 	const { manager } = await createIndexManagerWithContent(
-		{ version: 2, files: {} },
+		stable1xIndex(),
 		null,
 	);
 	await assert.rejects(
 		manager.loadRemoteIndex(),
-		(error: unknown) =>
-			error instanceof LegacyIndexVersionError &&
-			error.version === 2,
+		LegacyIndexFormatError,
 	);
 });
 
@@ -640,13 +675,13 @@ test("encrypted legacy startup is rejected as unsupported data", async () => {
 		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
 	const { manager, client, canonicalPath } =
 		await createIndexManagerWithContent(
-			{ version: 2, files: {} },
+			stable1xIndex(),
 			encryption,
 		);
 	const originalRaw = client.files.get(canonicalPath)!.slice(0);
 	await assert.rejects(
 		manager.loadRemoteIndex(),
-		UnsupportedPrereleaseDataError,
+		UnsupportedHistoricalDataError,
 	);
 	assert.deepEqual(
 		new Uint8Array(client.files.get(canonicalPath)!),
@@ -659,7 +694,7 @@ test("plaintext legacy index never falls back from an active encryption codec", 
 	const encryption =
 		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
 	const { manager } = await createIndexManagerWithContent(
-		{ version: 2, files: {} },
+		stable1xIndex(),
 		encryption,
 		null,
 	);
@@ -685,7 +720,7 @@ test("encrypted current index loads without plaintext fallback", async () => {
 	assert.equal(index.revision, 4);
 });
 
-test("current v4 file without mutationSeq is rejected", async () => {
+test("current canonical file without mutationSeq is rejected", async () => {
 	const index = createEmptyIndex("device-current", "epoch-current");
 	index.revision = 4;
 	index.files["note.md"] = {
@@ -713,7 +748,6 @@ test("only full discovery may load a replacement current epoch", async () => {
 		null,
 	);
 	manager.loadLocalIndexFromData({
-		version: 1,
 		deviceId: "new-device",
 		observedEpoch: "epoch-a",
 		observedRevision: 3,
@@ -727,7 +761,7 @@ test("only full discovery may load a replacement current epoch", async () => {
 	assert.equal(manager.getObservedEpoch(), "epoch-a");
 });
 
-test("malformed current v4 is rejected as a semantic index error", async () => {
+test("malformed current canonical is rejected as a semantic index error", async () => {
 	const malformed = createEmptyIndex("device-current", "epoch-current");
 	(malformed as unknown as { files: unknown }).files = [];
 	const { manager } = await createIndexManagerWithContent(malformed, null);
@@ -737,6 +771,16 @@ test("malformed current v4 is rejected as a semantic index error", async () => {
 			error instanceof InvalidCurrentIndexError &&
 			error.section === "files",
 	);
+});
+
+test("current canonical rejects an extra numeric format marker", async () => {
+	const current = {
+		...createEmptyIndex("device-current", "epoch-current"),
+		version: 4,
+	};
+	const { manager, client } = await createIndexManagerWithContent(current, null);
+	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+	assert.equal(client.moveCount, 0);
 });
 
 test("file mutation sequence cannot exceed its device watermark", async () => {
@@ -786,7 +830,6 @@ test("canonical transaction accepts a continuous same-device edit", async () => 
 			"device-a",
 		);
 	manager.loadLocalIndexFromData({
-		version: 1,
 		deviceId: "device-a",
 		observedEpoch: "epoch-a",
 		observedRevision: 35,
@@ -843,7 +886,6 @@ test("canonical transaction still rejects a concurrent foreign edit", async () =
 		"device-a",
 	);
 	manager.loadLocalIndexFromData({
-		version: 1,
 		deviceId: "device-a",
 		observedEpoch: "epoch-a",
 		observedRevision: 35,
@@ -915,7 +957,7 @@ test("invalid plaintext index is classified as unreadable", async () => {
 	);
 });
 
-test("semantic index version errors are not masked by codec fallback", async () => {
+test("historical format errors are not masked by codec fallback", async () => {
 	const encryption =
 		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
 	const { manager } = await createIndexManagerWithContent(
@@ -924,20 +966,22 @@ test("semantic index version errors are not masked by codec fallback", async () 
 	);
 	await assert.rejects(
 		manager.loadRemoteIndex(),
-		/Remote sync index version 999 is not supported/,
+		UnsupportedHistoricalDataError,
 	);
 });
 
-test("prerelease index v3 is rejected during normal load", async () => {
-	const { manager, client } = await createIndexManagerWithContent(
-		{ version: 3, revision: 1, files: {} },
-		null,
-	);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		UnsupportedPrereleaseDataError,
-	);
-	assert.equal(client.moveCount, 0);
+test("numeric historical canonical formats are rejected during normal load", async () => {
+	for (const version of [3, 4]) {
+		const { manager, client } = await createIndexManagerWithContent(
+			{ version, revision: 1, files: {} },
+			null,
+		);
+		await assert.rejects(
+			manager.loadRemoteIndex(),
+			UnsupportedHistoricalDataError,
+		);
+		assert.equal(client.moveCount, 0);
+	}
 });
 
 test("explicit transition codec does not fall back to plaintext", async () => {
@@ -976,11 +1020,11 @@ test("explicit transition codec does not fall back to plaintext", async () => {
 	);
 });
 
-test("Force rejects prerelease index v3 before any remote move", async () => {
+test("Force rejects numeric historical canonical before any remote move", async () => {
 	const client = new FakeIndexYandex("vault", null);
 	const canonicalPath = "vault/.obsidian-sync-index.json";
 	const source = new TextEncoder().encode(JSON.stringify({
-		version: 3,
+		version: 4,
 		revision: 1,
 		files: {},
 	})).buffer;
@@ -1000,7 +1044,7 @@ test("Force rejects prerelease index v3 before any remote move", async () => {
 	});
 	await assert.rejects(
 		manager.saveRemoteIndex(),
-		UnsupportedPrereleaseDataError,
+		UnsupportedHistoricalDataError,
 	);
 	assert.equal(client.moveCount, 0);
 	assert.deepEqual(

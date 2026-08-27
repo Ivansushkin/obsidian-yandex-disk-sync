@@ -6,29 +6,31 @@ Changes since stable `1.1.0`.
 
 ### Breaking changes
 
-- Replaced the legacy synchronization format with canonical index v4. It uses
-  epochs, revisions, per-device mutation sequences, file and folder
-  tombstones, pending moves, and durable physical-action queues.
+- Replaced the legacy synchronization format with one canonical index marked
+  by `format: "sync-index"`. It uses epochs, revisions, per-device mutation
+  sequences, file and folder tombstones, pending moves, and durable
+  physical-action queues.
 - Limited automatic migration to plaintext stable 1.0.0 and 1.1.0 local data.
   Their `localIndex` is converted once into the current baseline. Plaintext
-  canonical index v1/v2 requires an explicit Force sync with a verified backup.
-- Encrypted legacy data, manifest v1/v2, canonical index v3, unversioned
-  transition/queue data, and incomplete current metadata are unsupported and
-  fail closed before remote writes. All devices must be updated before using
-  the new format.
-- Current v4 entries without `mutationSeq` cannot authorize destructive folder
+  canonical indexes carrying stable `version: 1` or `version: 2` require an
+  explicit Force sync with a verified backup.
+- Encrypted legacy data, numeric historical manifests and canonical indexes,
+  unmarked transition/queue data, and incomplete current metadata are
+  unsupported and fail closed before remote writes. All devices must be
+  updated before using the new format.
+- Current entries without `mutationSeq` cannot authorize destructive folder
   operations.
 
 ### Added
 
 - Added optional end-to-end encryption with PBKDF2-HMAC-SHA256 at 600,000
   iterations, HKDF-separated content and filename keys, AES-256-GCM file
-  content, deterministic RFC 5297 AES-SIV path segments, and strict manifest
-  v3 validation.
+  content, deterministic RFC 5297 AES-SIV path segments, and a strict manifest
+  marked by `format: "encryption-manifest"`.
 - Added coordinated, crash-safe encryption enable, password rotation, disable,
   and post-commit recovery. Cleanup is repeatable and guarded by canonical
   state and physical fingerprints.
-- Added self-contained `OYDSBKP2` encrypted backup envelopes with bounded,
+- Added self-contained `OYDSBKP!` encrypted backup envelopes with bounded,
   authenticated headers and archive-specific PBKDF2/AES-GCM parameters.
 - Added collision-resistant backup names, non-overwriting upload, and exact
   SHA-256 plus byte read-back after success, timeout, or an ambiguous response.

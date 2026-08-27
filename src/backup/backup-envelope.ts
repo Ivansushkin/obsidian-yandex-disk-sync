@@ -1,6 +1,6 @@
 import { HARDENED_PBKDF2_ITERATIONS } from "../crypto/encryption";
 
-const MAGIC = new TextEncoder().encode("OYDSBKP2");
+const MAGIC = new TextEncoder().encode("OYDSBKP!");
 const HEADER_LENGTH_BYTES = 4;
 const MAX_HEADER_LENGTH = 16 * 1024;
 const SALT_LENGTH = 16;
@@ -10,7 +10,6 @@ const TAG_LENGTH = 16;
 export type BackupKind = "logical-vault" | "remote-raw";
 
 export interface BackupEnvelopeHeader {
-	version: 2;
 	kind: BackupKind;
 	createdAt: number;
 	pluginVersion: string;
@@ -57,7 +56,6 @@ export async function sealBackupEnvelope(
 	const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
 	const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
 	const header: BackupEnvelopeHeader = {
-		version: 2,
 		kind: metadata.kind,
 		createdAt: metadata.createdAt,
 		pluginVersion: metadata.pluginVersion,
@@ -97,7 +95,7 @@ export async function sealBackupEnvelope(
 	return result.buffer;
 }
 
-/** Open a v2 envelope after strict, bounded header validation. */
+/** Open an envelope after strict, bounded header validation. */
 export async function openBackupEnvelope(
 	data: ArrayBuffer,
 	password: string,
@@ -159,7 +157,6 @@ function parseHeader(value: unknown): BackupEnvelopeHeader {
 	const cipher = header.cipher as Record<string, unknown> | undefined;
 	if (
 		!hasExactKeys(header, [
-			"version",
 			"kind",
 			"createdAt",
 			"pluginVersion",
@@ -171,7 +168,6 @@ function parseHeader(value: unknown): BackupEnvelopeHeader {
 		!hasExactKeys(kdf, ["name", "hash", "iterations", "salt"]) ||
 		!cipher ||
 		!hasExactKeys(cipher, ["name", "keyLength", "iv"]) ||
-		header.version !== 2 ||
 		(header.kind !== "logical-vault" && header.kind !== "remote-raw") ||
 		typeof header.createdAt !== "number" ||
 		!Number.isSafeInteger(header.createdAt) ||

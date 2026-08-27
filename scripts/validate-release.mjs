@@ -93,7 +93,8 @@ for (const id of [
 ]) {
 	const line = catalog.split("\n").find((candidate) => candidate.startsWith(`| ${id}`));
 	if (!line || !/auto: `[^`]+`/.test(line)) fail(`${id} lacks exact automated evidence`);
-	for (const name of [...line.matchAll(/`([^`]+)`/g)].map((match) => match[1])) {
+	const evidenceCell = line.split("|").map((cell) => cell.trim()).at(-2) ?? "";
+	for (const name of [...evidenceCell.matchAll(/`([^`]+)`/g)].map((match) => match[1])) {
 		if (!testSources.includes(`test("${name}"`)) {
 			fail(`${id} references a missing test: ${name}`);
 		}

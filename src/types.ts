@@ -82,6 +82,8 @@ export type EncryptionManifestState =
 	| "rotating"
 	| "disabling";
 
+export const ENCRYPTION_MANIFEST_FORMAT = "encryption-manifest" as const;
+
 export interface EncryptionManifestKdfParams {
 	/** Key derivation algorithm */
 	name: "PBKDF2";
@@ -148,13 +150,13 @@ export interface EncryptionManifestFilenameCipherParams {
 	name: "AES-SIV";
 	keyLength: 512;
 	encoding: "base64url";
-	aad: "obsidian-yandex-disk-sync:filename:v3";
+	aad: "obsidian-yandex-disk-sync:filename";
 }
 
 /** Strict hardened manifest. Unknown algorithms must block all remote writes. */
-export interface EncryptionManifestV3 {
-	version: 3;
-	profileId: "hardened-v3";
+export interface EncryptionManifest {
+	format: typeof ENCRYPTION_MANIFEST_FORMAT;
+	profileId: "hardened";
 	state: EncryptionManifestState;
 	revision: number;
 	salt: string;
@@ -168,17 +170,17 @@ export interface EncryptionManifestV3 {
 	transition?: EncryptionTransitionDescriptor;
 }
 
-export type EncryptionManifest = EncryptionManifestV3;
-
 export type RemoteEncryptionManifest = EncryptionManifest;
 
 // ============================================================================
 // Synchronization index
 // ============================================================================
 
+export const CURRENT_INDEX_FORMAT = "sync-index" as const;
+
 export interface SyncIndex {
-	/** Index format version */
-	version: number;
+	/** Stable artifact marker; causal revisions are stored separately. */
+	format: typeof CURRENT_INDEX_FORMAT;
 	/** Causal history generation replaced only by an explicit Force sync */
 	epoch: string;
 	/** Monotonic revision of the authoritative remote index */
@@ -233,8 +235,6 @@ export interface IndexMaintenance {
  * fully observed and applied.
  */
 export interface LocalSyncState {
-	/** Local state format version */
-	version: 1;
 	/** Installation identifier that owns pending FIFO sequences */
 	deviceId: string;
 	/** Canonical epoch last fully applied on this installation */
@@ -405,8 +405,6 @@ export interface PendingPhysicalAction {
 	createdAt: number;
 }
 
-export const CURRENT_INDEX_VERSION = 4;
-
 export function createSyncEpoch(): string {
 	const uuid = globalThis.crypto?.randomUUID?.();
 	if (uuid) return uuid;
@@ -418,7 +416,7 @@ export function createEmptyIndex(
 	epoch = createSyncEpoch(),
 ): SyncIndex {
 	return {
-		version: CURRENT_INDEX_VERSION,
+		format: CURRENT_INDEX_FORMAT,
 		epoch,
 		revision: 0,
 		lastSyncTime: 0,
@@ -432,7 +430,6 @@ export function createEmptyIndex(
 
 export function createEmptyLocalState(deviceId: string): LocalSyncState {
 	return {
-		version: 1,
 		deviceId,
 		observedEpoch: null,
 		observedRevision: 0,

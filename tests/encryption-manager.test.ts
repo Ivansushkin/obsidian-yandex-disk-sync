@@ -21,8 +21,8 @@ test("encryption manager requires explicit current profile metadata", () => {
 	);
 });
 
-test("encryption manager emits strict hardened v3 manifest descriptors", async () => {
-	const codec = await manager.createCodec("hardened-v3", salt, "password");
+test("encryption manager emits strict semantic hardened manifest descriptors", async () => {
+	const codec = await manager.createCodec("hardened", salt, "password");
 	const source = {
 		enabled: true,
 		revision: 4,
@@ -50,14 +50,14 @@ test("encryption manager emits strict hardened v3 manifest descriptors", async (
 				salt,
 				password: "password",
 				revision: 4,
-				profileId: "hardened-v3",
+				profileId: "hardened",
 			},
 			target: {
 				enabled: true,
 				salt,
 				password: "password",
 				revision: 5,
-				profileId: "hardened-v3",
+				profileId: "hardened",
 			},
 			sourceRawPaths: [],
 			targetRawPaths: [],
@@ -77,9 +77,11 @@ test("encryption manager emits strict hardened v3 manifest descriptors", async (
 			cleanup: [],
 		},
 	});
-	assert.equal(manifest.version, 3);
+	assert.equal(manifest.format, "encryption-manifest");
+	assert.equal("version" in manifest, false);
+	assert.equal(manifest.profileId, "hardened");
 	assert.equal(manifest.kdf.iterations, 600_000);
 	assert.equal(manifest.filenameCipher.name, "AES-SIV");
-	assert.equal(manifest.transition?.sourceProfileId, "hardened-v3");
-	assert.equal(manifest.transition?.targetProfileId, "hardened-v3");
+	assert.equal(manifest.transition?.sourceProfileId, "hardened");
+	assert.equal(manifest.transition?.targetProfileId, "hardened");
 });

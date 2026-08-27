@@ -57,22 +57,22 @@
 | INIT-008 | P1  | Canonical отсутствует, существует один активный lock   | Sync ждёт владельца; до stale-time lock не забирается             | auto: fault             |
 | INIT-009 | P1  | Canonical отсутствует, один неизменный stale lock      | Lock восстанавливается после двух стабильных наблюдений           | auto: fault             |
 | INIT-010 | P0  | Несколько locks                                        | Normal sync блокируется; ни один lock не удаляется                | manual-required |
-| INIT-011 | P1  | Canonical v1/v2                                        | Normal sync блокируется с инструкцией Force                       | manual-required |
-| INIT-012 | P1  | Предрелизный canonical v3                              | Normal sync блокируется как unsupported prerelease; Force также запрещён | auto: `prerelease index v3 is rejected during normal load`; `Force rejects prerelease index v3 before any remote move` |
+| INIT-011 | P1  | Exact stable 1.0/1.1 canonical с `version: 1/2`          | Normal sync блокируется с инструкцией Force                       | auto: `plaintext stable 1.x startup preserves LegacyIndexFormatError`; manual-required |
+| INIT-012 | P1  | Numeric historical canonical вне stable shape             | Normal sync и Force блокируются как unsupported historical до remote writes | auto: `numeric historical canonical formats are rejected during normal load`; `Force rejects numeric historical canonical before any remote move`; `versioned data outside the exact stable 1.x shape is rejected before Force locks` |
 | INIT-013 | P1  | Новый девайс, canonical current epoch                  | Выполняется initial merge; epoch принимается после reconciliation | manual-required |
 | INIT-014 | P0  | Старый девайс с другим непустым epoch                  | Full принимает новый epoch и выполняет трёхсторонний merge без Force | auto: `a full sync accepts a replacement epoch without Force ping-pong`; two-device |
 | INIT-015 | P1  | Первый запуск прерван после remote scan                | Следующий запуск повторяет merge без потери состояния             | auto: fault             |
 | INIT-016 | P2  | В remote только пустые папки                           | Папки не скачиваются и не попадают в canonical                    | auto: integration       |
 | INIT-017 | P1  | Token отсутствует или недействителен                   | Ни watcher, ни scheduler не изменяют remote                       | manual-required |
 | INIT-018 | P1  | Сеть недоступна при определении initial state          | Initial sync не подменяет remote пустым состоянием                | auto: fault             |
-| INIT-019 | P0  | Encrypted canonical v1/v2                             | Формат блокируется как unsupported; normal и Force не выполняют remote writes | auto: `encrypted legacy startup is rejected as unsupported data`; `encrypted legacy index is rejected before Force acquires a lock` |
+| INIT-019 | P0  | Encrypted stable numeric canonical                    | Формат блокируется как unsupported; normal и Force не выполняют remote writes | auto: `encrypted legacy startup is rejected as unsupported data`; `encrypted legacy index is rejected before Force acquires a lock` |
 | INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable` |
 | INIT-021 | P0  | Watcher-событие возникает до/во время startup encryption guard | Событие durable-буферизуется; blocked/failed startup его не теряет | auto: `strict no-op validates encryption only once`; integration |
 | INIT-022 | P0  | Plaintext stable 1.0/1.1 обновляется до 2.0.0          | `localIndex` преобразуется в unobserved baseline до первого save; очереди создаются пустыми | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; integration |
-| INIT-023 | P0  | Remote содержит encryption manifest v1/v2             | Manifest блокируется как unsupported до upload/delete/cleanup | auto: `manifest v1 and v2 are rejected as unsupported data` |
-| INIT-024 | P0  | Unversioned local data содержит `localState` или historical queues | Plugin startup блокируется до создания watcher/scheduler и remote writes | auto: `unversioned historical queues are rejected` |
-| INIT-025 | P1  | Current schema v2 transition не содержит profile metadata | Snapshot не получает legacy default; startup блокируется | auto: `current transition without profile metadata is rejected` |
-| INIT-026 | P0  | Unversioned local data содержит encrypted legacy-поля | Эти данные не принимаются за stable 1.0/1.1; startup блокируется до remote writes | auto: `unversioned encrypted legacy data is deliberately unsupported` |
+| INIT-023 | P0  | Remote содержит numeric encryption manifest           | Manifest блокируется как unsupported до upload/delete/cleanup | auto: `numeric historical manifests are rejected as unsupported data` |
+| INIT-024 | P0  | Unmarked local data содержит `localState` или historical queues | Plugin startup блокируется до создания watcher/scheduler и remote writes | auto: `unmarked historical queues are rejected` |
+| INIT-025 | P1  | Current `plugin-data` transition не содержит profile metadata | Snapshot не получает fallback; startup блокируется | auto: `current transition without profile metadata is rejected` |
+| INIT-026 | P0  | Unmarked local data содержит encrypted legacy-поля | Эти данные не принимаются за stable 1.0/1.1; startup блокируется до remote writes | auto: `unmarked encrypted legacy data is deliberately unsupported` |
 
 ## Обычный full и realtime
 
@@ -210,9 +210,9 @@
 | ENC-008 | P0  | Source/target codec во время transition | Явный codec не использует plaintext fallback                     | auto: `explicit transition codec does not fall back to plaintext` |
 | ENC-009 | P0  | Сбой enable/disable/rotate после установки transition codec | Общий executor всегда очищает source/target codec и запускает causal recovery | auto: `transition services are cleared after a failed re-encode`; fault matrix |
 | ENC-010 | P1  | Codec/manifest меняется после canonical commit либо при enable/disable/rotate | Corrective upload старым codec блокируется; folder observations старого physical namespace очищаются, следующий upload подтверждает/создаёт target directories | auto: `encryption change blocks proof-based physical repair`; `encryption codec change invalidates folder observations`; manual: `docs/SMOKE_TESTS.md` TC-08 |
-| ENC-011 | P0  | Fresh encrypted vault использует hardened-v3 | PBKDF2 600k, HKDF-separated content/filename keys и AES-SIV соответствуют строгому manifest v3 | auto: `encryption manager emits strict hardened v3 manifest descriptors`; `AES-SIV matches the RFC 5297 deterministic vector` |
+| ENC-011 | P0  | Fresh encrypted vault использует `hardened` | PBKDF2 600k, HKDF-separated content/filename keys, verifier domains и AES-SIV соответствуют strict semantic manifest | auto: `encryption manager emits strict semantic hardened manifest descriptors`; `hardened verifier uses the unnumbered verifier and content-key domains`; `AES-SIV matches the RFC 5297 deterministic vector` |
 | ENC-012 | P0  | Ciphertext имени повреждён, имеет invalid UTF-8 или декодируется в опасный segment | Sync блокируется до Vault API; raw ciphertext не становится logical path | auto: `hardened filename decryption rejects authenticated invalid UTF-8`; `invalid encrypted resource name never falls back to a logical path` |
-| ENC-013 | P1  | Глубокая папка перемещается в hardened-v3 | Меняется physical segment корня, ciphertext всех потомков остаётся прежним | auto: `hardened folder moves keep descendant physical segments unchanged` |
+| ENC-013 | P1  | Глубокая папка перемещается в `hardened` | Меняется physical segment корня, ciphertext всех потомков остаётся прежним | auto: `hardened folder moves keep descendant physical segments unchanged` |
 
 ## Переходы шифрования
 
@@ -240,8 +240,8 @@
 | TRANS-020 | P1  | Старый пароль после rotate                                       | Он не открывает target canonical; новый пароль открывает                                                       | auto + manual-required                    |
 | TRANS-021 | P0  | Source и target raw paths сравниваются при nested remote root    | Оба набора представлены путями относительно одного remote root; target не попадает в cleanup                   | manual-required |
 | TRANS-022 | P0  | Current transition с полной schema перезапущен, cleanup падает | Canonical сохраняет cleanup paths/fingerprints; target-capable устройство повторяет cleanup | manual-required |
-| TRANS-023 | P0  | Локальный transition без обязательной current profile metadata | Данные блокируются как unsupported prerelease без очистки baseline/очередей и без remote writes | auto: `current transition without profile metadata is rejected` |
-| TRANS-024 | P0  | Fresh enable захватил canonical maintenance | Manifest v3 enabling публикуется до инициализации target writes | auto: `target manifest is published after claim and before target writes` |
+| TRANS-023 | P0  | Локальный transition без обязательной current profile metadata | Данные блокируются как unsupported historical без очистки baseline/очередей и без remote writes | auto: `current transition without profile metadata is rejected` |
+| TRANS-024 | P0  | Fresh enable захватил canonical maintenance | Current manifest в состоянии enabling публикуется до инициализации target writes | auto: `target manifest is published after claim and before target writes` |
 | TRANS-025 | P0  | Crash сразу после target canonical commit | Cleanup paths и source fingerprints уже записаны в том же canonical commit | auto: `cleanup proof is committed atomically with target canonical state` |
 | TRANS-026 | P0  | Initiator потерян после commit | Только matching target transition может продолжить foreign post-commit maintenance; pre-commit state остаётся заблокирован | auto: `foreign post-commit maintenance is scoped to matching target recovery` |
 | TRANS-027 | P0  | Fault до claim, после manifest, во время copy, до/после commit или в cleanup | Общий executor вызывает recovery ровно один раз и не оставляет transition codec scope | auto: `transition fault matrix always invokes deterministic recovery` |
@@ -254,7 +254,7 @@
 | FORCE-001 | P0  | Force local, backup успешен            | Remote становится точной local-копией, создаётся новый epoch            | manual-required |
 | FORCE-002 | P0  | Force remote, backup успешен           | Local становится точной remote-копией, создаётся новый epoch            | manual-required |
 | FORCE-003 | P0  | Backup не создан                       | Force не начинается                                                     | manual-required |
-| FORCE-004 | P1  | Stable canonical v1/v2                 | Оба направления строят новый v4 с epoch                                 | manual-required |
+| FORCE-004 | P1  | Exact stable 1.0/1.1 numeric canonical  | Оба направления строят current canonical с новым epoch                  | auto: `plaintext stable 1.0/1.1 Force commits and verifies current canonical`; manual-required |
 | FORCE-005 | P1  | Несколько locks                        | Оба направления Force работоспособны; cleanup после commit              | manual-required |
 | FORCE-006 | P1  | Canonical отсутствует                  | Force создаёт новый canonical                                           | manual-required |
 | FORCE-007 | P0  | Старые pending mutations инициатора    | Они не переходят в новый epoch                                          | auto: operation-store |
@@ -265,13 +265,13 @@
 | FORCE-012 | P1  | Crash до replacement commit            | Старый canonical остаётся авторитетным либо locks блокируют normal sync | auto: fault           |
 | FORCE-013 | P1  | Crash после replacement commit         | Новый epoch авторитетен, cleanup повторяем                              | auto: fault           |
 | FORCE-014 | P0  | Optional-поля index проходят JSON roundtrip | Отсутствующее поле и `undefined` семантически равны; реальные различия сохраняются | auto: `semantic index comparison uses JSON undefined semantics` |
-| FORCE-015 | P0  | Перезапуск после частично завершённого Force | Существующий v4 проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
+| FORCE-015 | P0  | Перезапуск после частично завершённого Force | Существующий current canonical проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
 | FORCE-016 | P0  | Device 1 выполняет Force local, device 2 остаётся на старом epoch | Device 2 выполняет обычный full, принимает remote и больше не требует Force | manual-required |
 | FORCE-017 | P0  | После этого device 2 явно выполняет Force remote | Device 1 принимает следующее поколение обычным full; ping-pong требований Force отсутствует | manual-required |
 | FORCE-018 | P0  | Local и remote одновременно изменились между epoch | Создаётся одна conflict copy, remote остаётся на исходном пути | auto: `epoch adoption restores a remote deletion and conflicts on two live edits`; two-device |
 | FORCE-019 | P0  | Remote delete и local edit между epoch | Локальный edit восстанавливает путь новым put | auto: `epoch adoption restores a remote deletion and conflicts on two live edits` |
 | FORCE-020 | P0  | Старый folder delete не знает нового remote-потомка | Неизвестный потомок скачивается и не удаляется | auto: `unknown remote child survives an old device folder deletion` |
-| FORCE-021 | P0  | Force запущен против canonical v3 | Read-only preflight отклоняет prerelease до lock и любых remote writes | auto: `Force rejects prerelease index v3 before any remote move` |
+| FORCE-021 | P0  | Force запущен против numeric historical canonical | Read-only preflight отклоняет format до lock и любых remote writes | auto: `Force rejects numeric historical canonical before any remote move` |
 
 ## Сеть и Яндекс Диск API
 
@@ -306,7 +306,7 @@
 | PERF-006 | P2  | Mobile с ограниченной памятью       | Нет одновременного хранения нескольких полных file-content snapshots | manual-required     |
 | PERF-007 | P2  | Encrypted no-op startup, 9 local/9 remote | Не более 13 GET, `0/0/0`, без index write и post-full realtime | manual-required; integration |
 | PERF-008 | P2  | Remote tree содержит независимые папки и `.backup` | Папки читаются с bounded concurrency, `.backup` не обходится | auto: `remote tree uses bounded folder concurrency and skips backup` |
-| PERF-009 | P2  | Realtime put/rename при доступном SHA-256/MD5 canonical | Stable root listing подтверждает same-session proof без повторного index download; hashless metadata использует semantic fallback | auto: `plaintext legacy Force commits and verifies canonical v4`; `hashless canonical metadata falls back to semantic verification`; manual: `docs/SMOKE_TESTS.md` TC-02 |
+| PERF-009 | P2  | Realtime put/rename при доступном SHA-256/MD5 canonical | Stable root listing подтверждает same-session proof без повторного index download; hashless metadata использует semantic fallback | auto: `plaintext stable 1.0/1.1 Force commits and verifies current canonical`; `hashless canonical metadata falls back to semantic verification`; manual: `docs/SMOKE_TESTS.md` TC-02 |
 | PATH-001 | P1  | Unicode и emoji в имени             | Logical/physical mapping обратим                                     | auto: parameterized |
 | PATH-002 | P1  | Пробелы, `%`, `#`, `?`, `+`         | API path кодируется один раз                                         | auto: parameterized |
 | PATH-003 | P1  | Имена, различающиеся регистром      | Поведение соответствует платформе и не объединяет entries молча      | manual-required     |
@@ -328,7 +328,7 @@
 | SAFE-009 | P0  | Write или verification backup упали  | Overwrite/delete/rename блокируются, исходный файл сохраняется | auto: `failed mandatory backup prevents a local overwrite` |
 | SAFE-010 | P0  | Создан новый encrypted backup | Raw envelope самодостаточен, header аутентифицирован и ZIP открывается собственным паролем после rotate | auto: `backup envelope is self-contained and authenticated`; `self-contained backup opens with its own password after vault state changes` |
 | SAFE-011 | P0  | Backup upload вернул success, timeout или 409 | Успех подтверждается только exact SHA-256 и byte read-back; collision получает новое имя без overwrite | auto: `verified backup accepts an upload whose response was lost`; `exclusive 409 collision is read back and retried under a new name` |
-| SAFE-012 | P1  | Backup header/tag повреждён либо найден historical archive | Header fail-closed до KDF; принимается только plaintext ZIP или OYDSBKP2; encrypted legacy name/bytes не декодируются | auto: `backup envelope rejects unbounded or unsupported headers before KDF`; `non-envelope enc.zip is rejected without invoking legacy decrypt`; `encrypted legacy backup names are ignored without compatibility decoding`; `unknown historical zip bytes fail closed without decryption fallback` |
+| SAFE-012 | P1  | Backup header/tag повреждён либо найден historical archive | Header fail-closed до KDF; принимается только plaintext ZIP или `OYDSBKP!`; historical encrypted name/bytes не декодируются | auto: `backup envelope rejects unbounded or unsupported headers before KDF`; `numbered historical envelope is rejected without invoking decryption`; `encrypted legacy backup names are ignored without compatibility decoding`; `unknown historical zip bytes fail closed without decryption fallback` |
 
 ## Диагностика
 
@@ -365,7 +365,7 @@
 | UI-008 | P0 | Auth, legacy, wrong password или ambiguous lock блокируют sync | Нет ложного success; пользователь получает один дедуплицированный persistent Notice, watcher/scheduler остановлены | manual-required |
 | UI-009 | P1 | Экран настроек открыт без токена либо с 401/403 | Backup API не вызывается при пустом токене; показывается «Статус резервных копий недоступен» без ERROR-spam | unit; manual-required |
 
-## Причинные операции над папками и migration v4
+## Причинные операции над папками и migration stable 1.x
 
 | ID        | P  | Сценарий | Ожидаемый результат | Проверка |
 | --------- | -- | -------- | -------------------- | -------- |
@@ -376,13 +376,13 @@
 | FDEL-016  | P0 | Folder delete после собственных revisions при старом observedRevision | Потомки с меньшим same-device sequence удаляются; foreign/newer сохраняются | manual-required |
 | MULTI-016 | P0 | Другой device меняет child во время folder move/delete | Foreign child и отличающийся target не удаляются и не перезаписываются | manual-required |
 | SYNC-029  | P0 | Full запускается при unresolved parent move/action | Full останавливается до local/remote scan, не создаёт compensating operations | manual-required |
-| MIG-004   | P0 | Переход plaintext stable 1.0/1.1 index v1/v2 на 2.0.0 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; `plaintext legacy Force commits and verifies canonical v4`; manual-required |
+| MIG-004   | P0 | Переход plaintext stable 1.0/1.1 numeric canonical на current canonical | Один Force local с backup создаёт `sync-index`; остальные devices принимают epoch обычной full | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; `plaintext stable 1.0/1.1 Force commits and verifies current canonical`; manual-required |
 | DIAG-016  | P1 | Folder reducer и recovery | Лог содержит parent event/mutation, sequence, absorbed/rebased, survivor/conflict/unresolved counts без expected coalescing ERROR | manual-required |
 | MOVE-029  | P0 | Одновременно ожидают unrelated и nested folder moves, затем приходит child rename | Выбирается только содержащий child source и самый глубокий causal parent; unrelated move не влияет | auto: `child rename selects the deepest matching folder parent` |
 | MOVE-030  | P0 | Folder move встречает существующий target с другим SHA | Ноль canonical/physical writes; source и local target сохраняются; event остаётся durable с `folder-target-conflict` | auto: `folder target conflict performs no canonical or physical writes` |
-| FDEL-017  | P0 | V4 file entry не содержит `mutationSeq` | Entry не разрешает destructive folder operation ни при каком baseline | auto: `unsequenced v4 child never authorizes a destructive folder mutation` |
+| FDEL-017  | P0 | Current file entry не содержит `mutationSeq` | Entry не разрешает destructive folder operation ни при каком baseline | auto: `unsequenced current child never authorizes a destructive folder mutation` |
 | SYNC-030  | P0 | Full обнаруживает новое локальное удаление файла | До tombstone сохраняется FIFO mutation; canonical получает sequence и watermark; existing foreign tombstone сохраняет attribution | auto: `full-discovered logical delete receives and confirms a FIFO sequence`; `applying a canonical tombstone preserves foreign causal attribution` |
-| INDEX-001 | P0 | JSON декодирован, но current v4 имеет неверную структуру | Возвращается semantic invalid-index; codec fallback, Force и remote mutation не выполняются | auto: `malformed current v4 is rejected as a semantic index error`; `current v4 file without mutationSeq is rejected` |
+| INDEX-001 | P0 | JSON декодирован, но current canonical имеет неверную структуру | Возвращается semantic invalid-index; codec fallback, Force и remote mutation не выполняются | auto: `malformed current canonical is rejected as a semantic index error`; `current canonical file without mutationSeq is rejected` |
 | PERF-010  | P1 | Folder move/delete на 10 000 descendants | Планирование использует Set/Map, targeted API calls линейны, concurrency ≤ 4, index commits ≤ 2 | auto: `folder delete target planning handles ten thousand descendants`; move/API/commit manual-required |
 
 ## Последовательное редактирование и causal FIFO

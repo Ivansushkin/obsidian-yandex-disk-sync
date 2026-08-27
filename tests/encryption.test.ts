@@ -32,7 +32,7 @@ const hardenedServicePromise = (async () => {
 	return service;
 })();
 
-test("hardened v3 encrypts content and deterministic Unicode filenames", async () => {
+test("hardened encryption round-trips content and deterministic Unicode filenames", async () => {
 	const service = await hardenedServicePromise;
 	const plaintext = new TextEncoder().encode("content").buffer;
 	const ciphertext = await service.encrypt(plaintext);
@@ -71,6 +71,65 @@ test("hardened filename ciphertext does not expose the legacy public IV", async 
 		),
 	).slice(0, 12);
 	assert.notDeepEqual(encrypted.slice(0, 12), legacyPublicIv);
+});
+
+test("hardened verifier uses the unnumbered verifier and content-key domains", async () => {
+	const salt = new Uint8Array(SALT_LENGTH).fill(11);
+	const passwordKey = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode("hardened-password"),
+		"PBKDF2",
+		false,
+		["deriveBits"],
+	);
+	const masterBytes = await crypto.subtle.deriveBits(
+		{
+			name: "PBKDF2",
+			hash: "SHA-256",
+			iterations: 600_000,
+			salt,
+		},
+		passwordKey,
+		256,
+	);
+	const masterKey = await crypto.subtle.importKey(
+		"raw",
+		masterBytes,
+		"HKDF",
+		false,
+		["deriveBits"],
+	);
+	const contentBytes = await crypto.subtle.deriveBits(
+		{
+			name: "HKDF",
+			hash: "SHA-256",
+			salt,
+			info: new TextEncoder().encode(
+				"obsidian-yandex-disk-sync:content-key",
+			),
+		},
+		masterKey,
+		256,
+	);
+	const contentKey = await crypto.subtle.importKey(
+		"raw",
+		contentBytes,
+		"AES-GCM",
+		false,
+		["decrypt"],
+	);
+	const verifier = EncryptionService.base64ToBytes(
+		await (await hardenedServicePromise).createVerifier(),
+	);
+	const payload = await crypto.subtle.decrypt(
+		{ name: "AES-GCM", iv: verifier.slice(0, 12) },
+		contentKey,
+		verifier.slice(12),
+	);
+	assert.equal(
+		new TextDecoder().decode(payload),
+		"obsidian-yandex-disk-sync:encryption-verifier",
+	);
 });
 
 test("encrypted filenames fail closed on invalid paths and ciphertext", async () => {
@@ -121,7 +180,7 @@ test("hardened filename decryption rejects authenticated invalid UTF-8", async (
 				hash: "SHA-256",
 				salt,
 				info: new TextEncoder().encode(
-					"obsidian-yandex-disk-sync:filename-key:v3",
+					"obsidian-yandex-disk-sync:filename-key",
 				),
 			},
 			masterKey,
@@ -130,12 +189,96 @@ test("hardened filename decryption rejects authenticated invalid UTF-8", async (
 	);
 	const invalidUtf8 = aessiv(
 		filenameKey,
-		new TextEncoder().encode("obsidian-yandex-disk-sync:filename:v3"),
+		new TextEncoder().encode("obsidian-yandex-disk-sync:filename"),
 	).encrypt(new Uint8Array([0xff]));
 	await assert.rejects(
 		(await hardenedServicePromise).decryptFilename(
 			EncryptionService.base64UrlEncode(invalidUtf8),
 		),
 		/encoded data|encoding/i,
+	);
+});
+
+test("hardened codec rejects content and filename ciphertext from numbered historical domains", async () => {
+	const salt = new Uint8Array(SALT_LENGTH).fill(11);
+	const passwordKey = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode("hardened-password"),
+		"PBKDF2",
+		false,
+		["deriveBits"],
+	);
+	const masterBytes = await crypto.subtle.deriveBits(
+		{
+			name: "PBKDF2",
+			hash: "SHA-256",
+			iterations: 600_000,
+			salt,
+		},
+		passwordKey,
+		256,
+	);
+	const masterKey = await crypto.subtle.importKey(
+		"raw",
+		masterBytes,
+		"HKDF",
+		false,
+		["deriveBits"],
+	);
+	const historicalFilenameKey = new Uint8Array(
+		await crypto.subtle.deriveBits(
+			{
+				name: "HKDF",
+				hash: "SHA-256",
+				salt,
+				info: new TextEncoder().encode(
+					"obsidian-yandex-disk-sync:filename-key:v3",
+				),
+			},
+			masterKey,
+			512,
+		),
+	);
+	const historicalCiphertext = aessiv(
+		historicalFilenameKey,
+		new TextEncoder().encode("obsidian-yandex-disk-sync:filename:v3"),
+	).encrypt(new TextEncoder().encode("note.md"));
+
+	await assert.rejects(
+		(await hardenedServicePromise).decryptFilename(
+			EncryptionService.base64UrlEncode(historicalCiphertext),
+		),
+	);
+
+	const historicalContentBytes = await crypto.subtle.deriveBits(
+		{
+			name: "HKDF",
+			hash: "SHA-256",
+			salt,
+			info: new TextEncoder().encode(
+				"obsidian-yandex-disk-sync:content:v3",
+			),
+		},
+		masterKey,
+		256,
+	);
+	const historicalContentKey = await crypto.subtle.importKey(
+		"raw",
+		historicalContentBytes,
+		"AES-GCM",
+		false,
+		["encrypt"],
+	);
+	const iv = new Uint8Array(12).fill(4);
+	const encryptedContent = await crypto.subtle.encrypt(
+		{ name: "AES-GCM", iv },
+		historicalContentKey,
+		new TextEncoder().encode("historical content"),
+	);
+	const historicalContent = new Uint8Array(iv.length + encryptedContent.byteLength);
+	historicalContent.set(iv);
+	historicalContent.set(new Uint8Array(encryptedContent), iv.length);
+	await assert.rejects(
+		(await hardenedServicePromise).decrypt(historicalContent.buffer),
 	);
 });

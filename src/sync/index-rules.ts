@@ -1,14 +1,19 @@
 import type { FileMetadata, FolderTombstone } from "../types";
-import { CURRENT_INDEX_VERSION } from "../types";
+import { CURRENT_INDEX_FORMAT } from "../types";
+import { parseStable1xIndex } from "../compatibility/stable-1x";
 
 /**
- * Classify an index version for startup and force-sync migration.
+ * Classify current canonical data and the stable 1.x migration input.
  */
-export function classifyIndexVersion(
-	version: unknown,
+export function classifyIndexFormat(
+	value: unknown,
 ): "current" | "legacy" | "unsupported" {
-	if (version === CURRENT_INDEX_VERSION) return "current";
-	if (version === 1 || version === 2) return "legacy";
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return "unsupported";
+	}
+	const data = value as Record<string, unknown>;
+	if (data.format === CURRENT_INDEX_FORMAT) return "current";
+	if (parseStable1xIndex(data)) return "legacy";
 	return "unsupported";
 }
 
@@ -103,7 +108,7 @@ export function shouldPreserveConcurrentFolderChild(
 }
 
 /**
- * Authorize a destructive folder mutation only from current v4 sequence data.
+ * Authorize a destructive folder mutation only from current causal data.
  * Missing sequence information never proves causal ownership.
  */
 export function canApplyDestructiveFolderMutation(

@@ -15,7 +15,7 @@ import {
 	openBackupEnvelope,
 	sealBackupEnvelope,
 } from "./backup-envelope";
-import { UnsupportedPrereleaseDataError } from "../compatibility-errors";
+import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 
 export interface BackupResult {
 	success: boolean;
@@ -328,7 +328,7 @@ export class BackupManager {
 	 * Parse backup filename to extract creation date
 	 */
 	private parseBackupName(name: string): Date | null {
-		// Accept historical second-resolution names and v2 random-suffix names.
+		// Accept historical second-resolution names and current random-suffix names.
 		const match = name.match(
 			/^backup_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:-(\d{3})_[A-Za-z0-9_-]{16})?(?:\.enc)?\.zip$/,
 		);
@@ -435,7 +435,7 @@ export class BackupManager {
 				}
 			}
 			if (backupPath.endsWith(".enc.zip")) {
-				throw new UnsupportedPrereleaseDataError(
+				throw new UnsupportedHistoricalDataError(
 					"A non-envelope .enc.zip backup is unsupported",
 				);
 			}
@@ -443,7 +443,7 @@ export class BackupManager {
 				logger.info("Backup downloaded successfully");
 				return raw;
 			}
-			throw new UnsupportedPrereleaseDataError(
+			throw new UnsupportedHistoricalDataError(
 				"Unknown non-envelope backup bytes are unsupported",
 			);
 		} catch (error) {

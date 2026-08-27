@@ -42,7 +42,6 @@ function metadata(
 class FolderDeleteIndexFake {
 	readonly index = createEmptyIndex("device-test", "epoch-test");
 	readonly local = {
-		version: 1 as const,
 		observedEpoch: "epoch-test",
 		observedRevision: 7,
 		files: {} as Record<string, FileMetadata>,

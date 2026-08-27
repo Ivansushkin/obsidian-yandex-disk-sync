@@ -63,7 +63,7 @@ multi-device, Force-loop и шифрования.
 - Нет искусственного `0%`.
 - `Старт.md` появляется на Device 2 с правильным содержимым.
 - Повторные full дают `0/0/0`.
-- На remote существует один canonical v4.
+- На remote существует один canonical с `format: "sync-index"`.
 
 Покрывает: `INIT-001`, `INIT-002`, `INIT-003`, `INIT-013`, `SYNC-002`,
 `SYNC-003`, `UI-001`, `UI-003`, `UI-005`.
@@ -265,7 +265,7 @@ multi-device, Force-loop и шифрования.
 Покрывает: `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`, `FORCE-017`,
 `MULTI-012`, `MIG-004`, `UI-006`.
 
-## TC-08. Шифрование: fresh v3 и unsupported historical data
+## TC-08. Шифрование: fresh hardened и unsupported historical data
 
 Время: 6 минут на маленьком vault.
 
@@ -274,19 +274,21 @@ conflict/backup-файлы, если они мешают проверке.
 
 ### Stable 1.0/1.1 plaintext boundary
 
-1. Подготовить plaintext `data.json` и canonical v2 из stable 1.1 на Device 1.
+1. Подготовить plaintext `data.json` и canonical с `version: 2` из stable 1.1
+   на Device 1.
 2. Обновить плагин и проверить перенос settings, device ID, hashes и
    `localIndex` в unobserved baseline; все current queues должны быть пустыми.
 3. Убедиться, что normal sync заблокирован инструкцией Force.
-4. Выполнить Force local с обязательным backup и получить canonical v4.
+4. Выполнить Force local с обязательным backup и получить canonical с
+   `format: "sync-index"`.
 5. На Device 2 выполнить обычный full и проверить принятие нового epoch.
 
 ### Unsupported historical formats
 
-1. По отдельности подготовить unversioned encrypted legacy local data,
-   manifest v1/v2, encrypted canonical v1/v2, canonical v3, unversioned local
-   `localState`/queues и transition без profile metadata.
-2. Для каждого формата подтвердить отдельную ошибку unsupported prerelease и
+1. По отдельности подготовить unmarked encrypted legacy local data, numeric
+   manifest, encrypted stable canonical, другие numeric canonical formats,
+   unmarked local `localState`/queues и transition без profile metadata.
+2. Для каждого формата подтвердить отдельную ошибку unsupported historical и
    инструкцию выбрать чистый remote path либо выполнить ручной reset после
    самостоятельного backup.
 3. Проверить, что normal sync, watcher, scheduler и оба направления Force не
@@ -303,8 +305,8 @@ conflict/backup-файлы, если они мешают проверке.
 4. Сначала ввести неверный пароль.
 5. Убедиться, что sync заблокирована и remote не изменён.
 6. Ввести правильный пароль и выполнить full.
-7. Несовместимый старый клиент против manifest v3 должен только заблокироваться и не
-   изменить remote.
+7. Несовместимый старый клиент против current manifest должен только
+   заблокироваться и не изменить remote.
 
 ### Обычная encrypted sync
 
@@ -320,7 +322,7 @@ conflict/backup-файлы, если они мешают проверке.
 2. На Device 1 выполнить rotate encryption key.
 2. На Device 2 попробовать старый пароль — sync должна блокироваться.
 3. Ввести новый пароль и выполнить full.
-4. Скачать pre-rotate `OYDSBKP2` `.enc.zip` и открыть его исходным backup
+4. Скачать pre-rotate `OYDSBKP!` `.enc.zip` и открыть его исходным backup
    password.
 5. Создать новый backup, скачать и восстановить его.
 6. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
@@ -367,7 +369,7 @@ conflict/backup-файлы, если они мешают проверке.
 - параллельные encryption transitions.
 
 Перед stable обязательны: Obsidian 1.0.0 desktop, current desktop и current
-mobile; fresh install, stable 1.0/1.1 plaintext migration, fresh hardened-v3 и
+mobile; fresh install, stable 1.0/1.1 plaintext migration, fresh `hardened` и
 fail-closed historical formats; два независимых
 профиля; 409/423/429 и ambiguous upload; offline return; 10 000 descendants;
 PERF-006; PBKDF2 p95 не более 3 секунд; финальный full обоих профилей `0/0/0`.

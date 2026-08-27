@@ -3,7 +3,7 @@ import test from "node:test";
 import type { FileMetadata, FolderTombstone } from "../src/types";
 import {
 	classifyFileMutation,
-	classifyIndexVersion,
+	classifyIndexFormat,
 	canApplyDestructiveFolderMutation,
 	collectFolderDeleteTargets,
 	findFolderTombstone,
@@ -129,12 +129,23 @@ test("folder delete target planning handles ten thousand descendants", () => {
 	assert.equal(targets.knownDescendants, 10_000);
 });
 
-test("only v1 and v2 are legacy while v3 is unsupported", () => {
-	assert.equal(classifyIndexVersion(1), "legacy");
-	assert.equal(classifyIndexVersion(2), "legacy");
-	assert.equal(classifyIndexVersion(3), "unsupported");
-	assert.equal(classifyIndexVersion(4), "current");
-	assert.equal(classifyIndexVersion(5), "unsupported");
+test("only stable 1.x numeric indexes are legacy", () => {
+	for (const version of [1, 2]) {
+		assert.equal(
+			classifyIndexFormat({
+				version,
+				lastSyncTime: 0,
+				deviceId: "stable-device",
+				files: {},
+			}),
+			"legacy",
+		);
+	}
+	assert.equal(classifyIndexFormat({ version: 2, files: {} }), "unsupported");
+	assert.equal(classifyIndexFormat({ format: "sync-index" }), "current");
+	assert.equal(classifyIndexFormat({ version: 3 }), "unsupported");
+	assert.equal(classifyIndexFormat({ version: 4 }), "unsupported");
+	assert.equal(classifyIndexFormat({ format: "unknown" }), "unsupported");
 });
 
 test("newest containing folder tombstone is selected", () => {
@@ -316,7 +327,7 @@ test("foreign newer and unsequenced children are never destructively inferred", 
 	);
 });
 
-test("unsequenced v4 child never authorizes a destructive folder mutation", () => {
+test("unsequenced current child never authorizes a destructive folder mutation", () => {
 	const current = file("folder/note.md", {
 		changedRevision: 7,
 		lastModifiedBy: "device-a",

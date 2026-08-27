@@ -21,6 +21,7 @@ test("backup envelope is self-contained and authenticated", async () => {
 	assert.deepEqual(new Uint8Array(opened.content), new Uint8Array(plaintext));
 	assert.equal(opened.header.kind, "logical-vault");
 	assert.equal(opened.header.fileCount, 7);
+	assert.equal("version" in opened.header, false);
 });
 
 test("backup envelope rejects wrong password and modified ciphertext", async () => {
@@ -44,7 +45,7 @@ test("backup envelope rejects wrong password and modified ciphertext", async () 
 
 test("backup envelope rejects unbounded or unsupported headers before KDF", async () => {
 	const oversized = new Uint8Array(12);
-	oversized.set(new TextEncoder().encode("OYDSBKP2"));
+	oversized.set(new TextEncoder().encode("OYDSBKP!"));
 	new DataView(oversized.buffer).setUint32(8, 16 * 1024 + 1, false);
 	await assert.rejects(
 		openBackupEnvelope(oversized.buffer, "unused"),
@@ -70,7 +71,12 @@ test("backup envelope rejects unbounded or unsupported headers before KDF", asyn
 	await assert.rejects(openBackupEnvelope(envelope.buffer, "password"), /header/);
 });
 
-test("backup envelope rejects unknown authenticated header fields", async () => {
+test("numbered historical backup magic is not accepted as a current envelope", () => {
+	const historical = new TextEncoder().encode("OYDSBKP2").buffer;
+	assert.equal(isBackupEnvelope(historical), false);
+});
+
+test("backup envelope rejects a numbered authenticated header field", async () => {
 	const envelope = new Uint8Array(
 		await sealBackupEnvelope(plaintext, "password", {
 			kind: "logical-vault",
@@ -83,7 +89,7 @@ test("backup envelope rejects unknown authenticated header fields", async () => 
 	const header = JSON.parse(
 		new TextDecoder().decode(envelope.slice(12, 12 + headerLength)),
 	) as Record<string, unknown>;
-	header.path = "must-not-be-accepted";
+	header.version = 2;
 	const encoded = new TextEncoder().encode(JSON.stringify(header));
 	const resized = new Uint8Array(
 		12 + encoded.length + envelope.length - 12 - headerLength,

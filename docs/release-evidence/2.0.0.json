@@ -4,6 +4,7 @@
 	"testedCommit": null,
 	"scenarios": [],
 	"blockers": [
+		"The clean-cut 2.0.0 commit has not been recorded or tested",
 		"Real two-profile Yandex Disk run is not recorded",
 		"2.0.0 fresh install, plaintext stable 1.0/1.1 migration, and historical-format fail-closed evidence is not recorded",
 		"Current desktop, Obsidian 1.0.0 desktop, and current mobile evidence is not recorded",

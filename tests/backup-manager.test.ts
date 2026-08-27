@@ -15,7 +15,7 @@ import type {
 	YandexResource,
 } from "../src/types";
 import { DEFAULT_SETTINGS } from "../src/types";
-import { UnsupportedPrereleaseDataError } from "../src/compatibility-errors";
+import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
 
 class FakeBackupClient {
 	files = new Map<string, ArrayBuffer>();
@@ -88,7 +88,7 @@ function createManager(client: FakeBackupClient): {
 		encryptionPassword: "backup-password",
 		encryptionSalt: "unused",
 		encryptionRevision: 1,
-		encryptionProfileId: "hardened-v3",
+		encryptionProfileId: "hardened",
 	};
 	const vault = {
 		getAllSyncableFiles: () => [{ path: "note.md" }],
@@ -166,7 +166,7 @@ test("invalid envelope header is reported as corruption, not a password prompt",
 	const client = new FakeBackupClient();
 	const { manager } = createManager(client);
 	const invalid = new Uint8Array(12);
-	invalid.set(new TextEncoder().encode("OYDSBKP2"));
+	invalid.set(new TextEncoder().encode("OYDSBKP!"));
 	new DataView(invalid.buffer).setUint32(8, 16 * 1024 + 1, false);
 	client.files.set("vault/.backup/corrupt.enc.zip", invalid.buffer);
 	await assert.rejects(
@@ -178,18 +178,18 @@ test("invalid envelope header is reported as corruption, not a password prompt",
 	);
 });
 
-test("non-envelope enc.zip is rejected without invoking legacy decrypt", async () => {
+test("numbered historical envelope is rejected without invoking decryption", async () => {
 	const client = new FakeBackupClient();
 	client.files.set(
 		"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
-		new Uint8Array([1, 2, 3, 4]).buffer,
+		new TextEncoder().encode("OYDSBKP2historical-envelope").buffer,
 	);
 	const { manager } = createManager(client);
 	await assert.rejects(
 		manager.downloadBackup(
 			"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
 		),
-		UnsupportedPrereleaseDataError,
+		UnsupportedHistoricalDataError,
 	);
 	assert.equal(client.decodeCalls, 0);
 });
@@ -239,7 +239,7 @@ test("unknown historical zip bytes fail closed without decryption fallback", asy
 		manager.downloadBackup(
 			"vault/.backup/backup_2026-08-20_10-00-00.zip",
 		),
-		UnsupportedPrereleaseDataError,
+		UnsupportedHistoricalDataError,
 	);
 	assert.equal(client.decodeCalls, 0);
 });

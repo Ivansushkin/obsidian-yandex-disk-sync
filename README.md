@@ -6,19 +6,19 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 
 Version 2.0.0 supports migration only from plaintext stable 1.0.0 and 1.1.0.
 Their local `localIndex` is converted once into the current baseline.
-Plaintext canonical v1/v2 requires a backed-up explicit **Force sync**;
-canonical v3 is unsupported even for Force.
+Plaintext canonical indexes carrying the exact stable `version: 1` or
+`version: 2` shape require a backed-up explicit **Force sync**.
 
-Encrypted legacy and historical prerelease formats are unsupported. Detectable
-manifest v1/v2, encrypted legacy index v1/v2, canonical v3, unversioned
-queues/transitions, and incomplete current transition metadata block startup
-and all remote writes. Choose a clean remote path or reset the old data manually
-only after making an independent backup. Structurally valid current schema v2,
-manifest v3, and index v4 data is accepted as the current format; no converter
-or recovery path exists for incompatible historical formats.
+Encrypted legacy data and every other historical format are unsupported.
+Numeric manifests and canonical formats, unmarked queues/transitions, and
+incomplete current transition metadata block startup and all remote writes.
+Choose a clean remote path or reset the old data manually only after making an
+independent backup. Current data is accepted only with the semantic markers
+`sync-index`, `encryption-manifest`, and `plugin-data`; incompatible historical
+data has no converter or recovery path.
 
 Do not start an older plugin version after the transition: it can replace the
-v4 index or restore deleted files. If that happens, disable sync everywhere,
+canonical index or restore deleted files. If that happens, disable sync everywhere,
 select the most complete local vault, inspect backup/conflict copies, and
 repeat the backed-up Force local procedure.
 
@@ -76,7 +76,7 @@ repeat the backed-up Force local procedure.
 4. Restart Obsidian
 5. Enable plugin in **Settings → Community plugins**
 
-### Via BRAT (for beta testing)
+### Via BRAT (for preview testing)
 
 1. Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin
 2. Add repository through BRAT
@@ -190,7 +190,7 @@ Force sync ignores timestamps, file hashes, and conflict resolver — it creates
 
 ### Encryption
 
-New encrypted vaults use the hardened-v3 profile: PBKDF2-HMAC-SHA256 with
+New encrypted vaults use the `hardened` profile: PBKDF2-HMAC-SHA256 with
 600,000 iterations derives a master key, then HKDF-SHA256 derives independent
 AES-256-GCM content and AES-SIV filename keys.
 
@@ -221,10 +221,10 @@ post-commit cleanup from canonical metadata without the source password.
 > deleted only by fingerprint-guarded cleanup. The resulting encrypted data
 > cannot be read without the password.
 
-Manifest v1/v2 and historical encrypted backup formats are unsupported.
-Non-envelope `.enc.zip`, encrypted legacy names, and non-plaintext historical
-`.zip` bytes are rejected without a compatibility decryption attempt. Plaintext
-historical ZIP archives remain downloadable.
+Numeric historical manifests and historical encrypted backup formats are
+unsupported. Non-envelope `.enc.zip`, encrypted legacy names, and
+non-plaintext historical `.zip` bytes are rejected without a compatibility
+decryption attempt. Plaintext historical ZIP archives remain downloadable.
 
 ## Development
 
@@ -304,14 +304,17 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 - [Obsidian](https://obsidian.md) for excellent product and API
 - [Yandex Disk](https://disk.yandex.ru) for cloud storage
-- [BRAT](https://github.com/TfTHacker/obsidian42-brat) for beta testing tool
+- [BRAT](https://github.com/TfTHacker/obsidian42-brat) for preview update testing
 - Obsidian community for support and inspiration
 
 ---
 
-**Last Updated**: June 17, 2026  
-**Version**: 1.0.0  
-**Supported Platforms**: Windows, macOS, Linux, iOS, Android  
+**Last Updated**: August 27, 2026
+
+**Version**: 2.0.0
+
+**Supported Platforms**: Windows, macOS, Linux, iOS, Android
+
 **Required Obsidian Version**: 1.0.0+
 
 > **ℹ️ Developer Note**  

@@ -66,11 +66,14 @@ import {
 	matchesPhysicalResourceFingerprint,
 } from "./utils/resource-fingerprint";
 import { computeSha256FromString } from "./utils/hash-utils";
-import { migrateEncryptionPluginData } from "./crypto/encryption-state-migration";
-import { UnsupportedPrereleaseDataError } from "./compatibility-errors";
+import {
+	PLUGIN_DATA_FORMAT,
+	loadPluginData,
+} from "./plugin-data-loader";
+import { UnsupportedHistoricalDataError } from "./compatibility-errors";
 
 interface PluginData {
-	schemaVersion: 2;
+	format: typeof PLUGIN_DATA_FORMAT;
 	settings: YandexDiskSyncSettings;
 	localState: Partial<LocalSyncState> | null;
 	pendingMutations: PendingMutation[];
@@ -135,8 +138,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		try {
 			await this.loadSettings();
 		} catch (error) {
-			if (error instanceof UnsupportedPrereleaseDataError) {
-				new Notice(t("notice.unsupported_prerelease_data"), 0);
+			if (error instanceof UnsupportedHistoricalDataError) {
+				new Notice(t("notice.unsupported_historical_data"), 0);
 			}
 			throw error;
 		}
@@ -214,7 +217,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.blockingNotice?.notice.hide();
 		this.blockingNotice = null;
 
-		// Save index (sync version - onunload is not async)
+		// Save the sync snapshot; plugin unload itself is not asynchronous.
 		void this.persistPluginData();
 
 		logger.info("Yandex Disk Sync plugin unloaded");
@@ -485,11 +488,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				await this.tryRecoverRemoteTargetTransition();
 			}
 		} catch (error) {
-			if (!(error instanceof UnsupportedPrereleaseDataError)) throw error;
-			this.setEncryptionBlock(t("notice.unsupported_prerelease_data"));
+			if (!(error instanceof UnsupportedHistoricalDataError)) throw error;
+			this.setEncryptionBlock(t("notice.unsupported_historical_data"));
 			this.showBlockingNotice(
-				"unsupported-prerelease",
-				t("notice.unsupported_prerelease_data"),
+				"unsupported-historical",
+				t("notice.unsupported_historical_data"),
 			);
 			return;
 		}
@@ -771,7 +774,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	): boolean {
 		const blockingError = result.errors.find((error) =>
 			[
-				"unsupported-prerelease",
+				"unsupported-historical",
 				"legacy-index",
 				"unreadable-index",
 				"invalid-index",
@@ -787,7 +790,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.syncScheduler.stop();
 		this.regularSyncStarted = false;
 		const noticeKey = {
-			"unsupported-prerelease": "notice.unsupported_prerelease_data",
+			"unsupported-historical": "notice.unsupported_historical_data",
 			"legacy-index": "notice.legacy_index_blocked",
 			"unreadable-index": "notice.unreadable_index_blocked",
 			"invalid-index": "notice.invalid_index_blocked",
@@ -964,7 +967,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Load settings
 	 */
 	async loadSettings(): Promise<void> {
-		const data = migrateEncryptionPluginData(
+		const data = loadPluginData(
 			(await this.loadData()) as PluginData | null,
 		);
 		this.loadedPluginData = data;
@@ -1002,7 +1005,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		};
 		const vaultScope =
 			adapter.getBasePath?.() || this.app.vault.getName();
-		const key = `yandex-disk-sync:device-id:v2:${vaultScope}`;
+		const key = `yandex-disk-sync:device-id:${vaultScope}`;
 		try {
 			const existing = globalThis.localStorage?.getItem(key);
 			if (existing) return existing;
@@ -1135,14 +1138,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const saltBytes = EncryptionService.generateSalt();
 		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
 		const revision = 1;
-		const service = createEncryptionCodec("hardened-v3", saltBytes);
+		const service = createEncryptionCodec("hardened", saltBytes);
 		await service.initializeKey(password);
 		const target: LocalEncryptionSnapshot = {
 			enabled: true,
 			salt: saltBase64,
 			password,
 			revision,
-			profileId: "hardened-v3",
+			profileId: "hardened",
 		};
 		const transition = await this.beginEncryptionTransition(
 			"enable",
@@ -1210,9 +1213,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		let partialErrors = false;
 
 		if (options?.reuploadPlaintext) {
-			if (this.settings.encryptionProfileId !== "hardened-v3") {
-				throw new UnsupportedPrereleaseDataError(
-					"Only hardened-v3 encryption can be disabled",
+			if (this.settings.encryptionProfileId !== "hardened") {
+				throw new UnsupportedHistoricalDataError(
+					"Only hardened encryption can be disabled",
 				);
 			}
 			await this.runEncryptionPreflight();
@@ -1350,9 +1353,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (currentManifest && currentManifest.state !== "enabled") {
 			throw new Error(t("notice.encryption_remote_busy"));
 		}
-		if (this.settings.encryptionProfileId !== "hardened-v3") {
-			throw new UnsupportedPrereleaseDataError(
-				"Only hardened-v3 encryption can be rotated",
+		if (this.settings.encryptionProfileId !== "hardened") {
+			throw new UnsupportedHistoricalDataError(
+				"Only hardened encryption can be rotated",
 			);
 		}
 		if (!this.settings.enableEncryption || !this.settings.encryptionSalt) {
@@ -1374,14 +1377,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				currentManifest?.revision ?? 1,
 				this.settings.encryptionRevision ?? 1,
 			) + 1;
-		const service = createEncryptionCodec("hardened-v3", saltBytes);
+		const service = createEncryptionCodec("hardened", saltBytes);
 		await service.initializeKey(newPassword);
 		const target: LocalEncryptionSnapshot = {
 			enabled: true,
 			salt: saltBase64,
 			password: newPassword,
 			revision,
-			profileId: "hardened-v3",
+			profileId: "hardened",
 		};
 		const transition = await this.beginEncryptionTransition(
 			"rotate",
@@ -1466,23 +1469,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private isRecoverableRemoteTargetManifest(
 		manifest: RemoteEncryptionManifest,
-	): manifest is Extract<RemoteEncryptionManifest, { version: 3 }> & {
+	): manifest is RemoteEncryptionManifest & {
 		transition: NonNullable<
-			Extract<RemoteEncryptionManifest, { version: 3 }>["transition"]
+			RemoteEncryptionManifest["transition"]
 		>;
 	} {
 		return (
-			manifest.version === 3 &&
 			manifest.state === "rotating" &&
-			manifest.transition?.targetProfileId === "hardened-v3"
+			manifest.transition?.targetProfileId === "hardened"
 		);
 	}
 
-	/** Resume post-commit v3 cleanup using only the target password. */
+	/** Resume post-commit cleanup using only the target password. */
 	private async recoverRemoteTargetTransition(
-		manifest: Extract<RemoteEncryptionManifest, { version: 3 }> & {
+		manifest: RemoteEncryptionManifest & {
 			transition: NonNullable<
-				Extract<RemoteEncryptionManifest, { version: 3 }>["transition"]
+				RemoteEncryptionManifest["transition"]
 			>;
 		},
 		service: EncryptionCodec,
@@ -1539,7 +1541,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				!manifest ||
 				!this.isRecoverableRemoteTargetManifest(manifest) ||
 				this.settings.encryptionSalt !== manifest.salt ||
-				this.settings.encryptionProfileId !== "hardened-v3"
+				this.settings.encryptionProfileId !== "hardened"
 			) {
 				return;
 			}
@@ -1551,11 +1553,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				error,
 			});
 			this.setEncryptionBlock(
-				error instanceof UnsupportedPrereleaseDataError
-					? t("notice.unsupported_prerelease_data")
+				error instanceof UnsupportedHistoricalDataError
+					? t("notice.unsupported_historical_data")
 					: t("notice.encryption_remote_busy"),
 			);
-			if (error instanceof UnsupportedPrereleaseDataError) throw error;
+			if (error instanceof UnsupportedHistoricalDataError) throw error;
 		}
 	}
 
@@ -1643,8 +1645,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.setEncryptionBlock(null);
 			return true;
 		} catch (e) {
-			if (e instanceof UnsupportedPrereleaseDataError) {
-				this.setEncryptionBlock(t("notice.unsupported_prerelease_data"));
+			if (e instanceof UnsupportedHistoricalDataError) {
+				this.setEncryptionBlock(t("notice.unsupported_historical_data"));
 				return false;
 			}
 			const message = e instanceof Error ? e.message : String(e);
@@ -1760,7 +1762,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private requireEncryptionProfileId(): EncryptionProfileId {
 		const profileId = this.settings.encryptionProfileId;
 		if (!profileId) {
-			throw new UnsupportedPrereleaseDataError(
+			throw new UnsupportedHistoricalDataError(
 				"Encrypted settings have no current profile ID",
 			);
 		}
@@ -2542,7 +2544,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					success: false,
 					error:
 						this.encryptionBlockReason ??
-						t("notice.unsupported_prerelease_data"),
+						t("notice.unsupported_historical_data"),
 				};
 			}
 			new Notice(t("notice.backup_started"));
@@ -2576,7 +2578,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private buildPluginData(): PluginData {
 		const data: PluginData = {
-			schemaVersion: 2,
+			format: PLUGIN_DATA_FORMAT,
 			settings: this.settings,
 			localState:
 				this.indexManager?.getLocalIndexData() ??

@@ -41,9 +41,9 @@
 
 ## Synchronization architecture
 
-- The remote source of truth is one canonical `.obsidian-sync-index.json` v4
-  containing `epoch`, `revision`, file states, folder tombstones, pending moves,
-  and `appliedMutationSeq`.
+- The remote source of truth is one canonical `.obsidian-sync-index.json` with
+  `format: "sync-index"`, `epoch`, `revision`, file states, folder tombstones,
+  pending moves, and `appliedMutationSeq`.
 - Canonical commits use an exclusive move to a unique lock and back. Never
   bypass `IndexManager` transaction/recovery rules with direct writes.
 - A `CanonicalCommitProof` is ephemeral and may skip an index download only
@@ -82,7 +82,9 @@
 
 ## Encryption
 
-- The remote manifest is strict v3; the canonical index is v4.
+- The current remote manifest has `format: "encryption-manifest"`; the current
+  canonical has `format: "sync-index"`. Numeric current format versions are
+  forbidden.
 - Canonical, lock, and manifest names are raw. Canonical content and user paths
   use the active codec; the manifest is always raw.
 - Enable, disable, rotate, and post-commit recovery use the existing
@@ -97,16 +99,17 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of older builds and 2.0.0 is unsupported. Only
-  plaintext stable 1.0/1.1 local data and index v1/v2 are migratable; encrypted
-  legacy data, index v3, manifest v1/v2, and all prerelease queues fail closed.
-- Do not change index v4, manifest v3, epoch/revision, mutation FIFO, or the
-  persisted physical-action schema without a separate migration design,
-  scenarios, and tests.
+- Concurrent use of older builds and 2.0.0 is unsupported. Only plaintext
+  stable 1.0/1.1 local data and their numeric canonical formats are migratable;
+  encrypted legacy data and every other historical format fail closed.
+- Do not change the `sync-index`, `encryption-manifest`, or `plugin-data`
+  markers, profile `hardened`, epoch/revision, mutation FIFO, or the persisted
+  physical-action schema without a separate migration design, scenarios, and
+  tests.
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
   translations, and migration messages.
-- Release metadata exposes one 2.0.0 line; do not add historical prerelease
+- Release metadata exposes one 2.0.0 line; do not add historical development
   entries back to `CHANGELOG.md` or `versions.json`.
 
 ## Documentation and testing

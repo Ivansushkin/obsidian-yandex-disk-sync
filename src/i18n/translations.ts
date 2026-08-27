@@ -73,16 +73,16 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_no_changes": "Synchronization completed: no changes",
 		"notice.sync_exception": "Synchronization failed: {message}",
 		"notice.force_sync_exception": "Force sync failed: {message}",
-		"notice.unsupported_prerelease_data":
-			"Synchronization is blocked because unsupported historical or prerelease data was detected. Use a clean remote path or reset the old data manually after creating an independent backup.",
+		"notice.unsupported_historical_data":
+			"Synchronization is blocked because unsupported historical data was detected. Use a clean remote path or reset the old data manually after creating an independent backup.",
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
 		"notice.legacy_index_blocked":
-			"This plugin version detected an older synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create index v4.",
+			"This plugin version detected a stable 1.x synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create the current canonical index.",
 		"notice.unreadable_index_blocked":
 			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.invalid_index_blocked":
-			"The remote sync index has an invalid v4 structure. Normal sync is blocked without changing remote data. Create a backup, then use Force sync to select the authoritative side.",
+			"The current remote sync index has an invalid structure. Normal sync is blocked without changing remote data. Create a backup, then use Force sync to select the authoritative side.",
 		"notice.epoch_adopted":
 			"The new remote snapshot was accepted and local changes were merged.",
 		"notice.epoch_adopted_conflicts":
@@ -380,16 +380,16 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_exception": "Ошибка синхронизации: {message}",
 		"notice.force_sync_exception":
 			"Ошибка принудительной синхронизации: {message}",
-		"notice.unsupported_prerelease_data":
-			"Синхронизация заблокирована: обнаружены неподдерживаемые исторические или prerelease-данные. Выберите чистый удалённый каталог или вручную сбросьте старые данные после создания независимого бекапа.",
+		"notice.unsupported_historical_data":
+			"Синхронизация заблокирована: обнаружены неподдерживаемые исторические данные. Выберите чистый удалённый каталог или вручную сбросьте старые данные после создания независимого бекапа.",
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
 		"notice.legacy_index_blocked":
-			"Текущая версия плагина обнаружила старый индекс синхронизации. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать индекс v4.",
+			"Текущая версия плагина обнаружила индекс синхронизации stable 1.x. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать текущий canonical index.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.invalid_index_blocked":
-			"Удалённый индекс синхронизации имеет недопустимую структуру v4. Обычная синхронизация заблокирована без изменения удалённых данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
+			"Текущий удалённый индекс синхронизации имеет недопустимую структуру. Обычная синхронизация заблокирована без изменения удалённых данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.epoch_adopted":
 			"Новое удалённое состояние принято, локальные изменения объединены.",
 		"notice.epoch_adopted_conflicts":
