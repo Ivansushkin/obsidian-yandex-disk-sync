@@ -18,16 +18,28 @@ const evidence = readJson("docs/release-evidence/2.0.0.json");
 const version = packageJson.version;
 const stable = !version.includes("-");
 
-if (evidence.betaVersion !== "2.0.0-beta.6") {
-	fail("release evidence must target 2.0.0-beta.6");
-}
-
 if (manifest.version !== version) fail("package and manifest versions differ");
 if (manifest.minAppVersion !== "1.0.0") fail("minAppVersion must be 1.0.0");
 if (versions[version] !== manifest.minAppVersion) {
 	fail(`versions.json does not map ${version} to ${manifest.minAppVersion}`);
 }
 if (versions["1.1.0"] !== "0.15.0") fail("1.1.0 fallback is missing");
+if (
+	JSON.stringify(Object.keys(versions).sort()) !==
+	JSON.stringify(["1.1.0", "2.0.0"])
+) {
+	fail("versions.json must expose only stable 1.1.0 and 2.0.0");
+}
+const changelog = readFileSync("CHANGELOG.md", "utf8");
+const changelogVersions = [...changelog.matchAll(/^## (.+)$/gm)].map(
+	(match) => match[1],
+);
+if (JSON.stringify(changelogVersions) !== JSON.stringify(["2.0.0"])) {
+	fail("changelog must contain one unified 2.0.0 section");
+}
+if (/\b(?:beta|prerelease)\b/i.test(changelog)) {
+	fail("changelog must describe only changes from stable 1.1.0");
+}
 if (process.env.RELEASE_TAG && process.env.RELEASE_TAG !== version) {
 	fail(`tag ${process.env.RELEASE_TAG} does not equal ${version}`);
 }
@@ -90,8 +102,8 @@ if (stable) {
 	if (evidence.status !== "PASS" || evidence.releaseVersion !== version) {
 		fail("manual P0/P1 evidence is not complete");
 	}
-	if (!/^[0-9a-f]{40}$/.test(evidence.betaCommit ?? "")) {
-		fail("verified beta.6 commit SHA is missing");
+	if (!/^[0-9a-f]{40}$/.test(evidence.testedCommit ?? "")) {
+		fail("verified 2.0.0 test commit SHA is missing");
 	}
 	const priorityLines = catalog
 		.split("\n")
@@ -117,7 +129,7 @@ if (stable) {
 			!entry ||
 			entry.status !== "PASS" ||
 			!entry.evidenceName ||
-			entry.betaCommit !== evidence.betaCommit ||
+			entry.testedCommit !== evidence.testedCommit ||
 			!entry.date ||
 			!entry.os ||
 			!entry.obsidianVersion ||
@@ -128,27 +140,18 @@ if (stable) {
 			fail(`${id} lacks complete machine-readable evidence`);
 		}
 	}
-	const allowedStableDiff = new Set([
-		"CHANGELOG.md",
-		"README.md",
-		"README_RU.md",
-		"docs/release-evidence/2.0.0.json",
-		"manifest.json",
-		"package-lock.json",
-		"package.json",
-		"versions.json",
-	]);
+	const allowedReleaseDiff = new Set(["docs/release-evidence/2.0.0.json"]);
 	const changed = execFileSync(
 		"git",
-		["diff", "--name-only", evidence.betaCommit, "HEAD"],
+		["diff", "--name-only", evidence.testedCommit, "HEAD"],
 		{ encoding: "utf8" },
 	)
 		.trim()
 		.split("\n")
 		.filter(Boolean);
-	const forbidden = changed.filter((path) => !allowedStableDiff.has(path));
+	const forbidden = changed.filter((path) => !allowedReleaseDiff.has(path));
 	if (forbidden.length > 0) {
-		fail(`stable differs from beta.6 code: ${forbidden.join(", ")}`);
+		fail(`release differs from the tested 2.0.0 code: ${forbidden.join(", ")}`);
 	}
 }
 

@@ -100,7 +100,7 @@ test("current schema preserves causal data with explicit profiles", () => {
 	assert.strictEqual(migrated, source);
 });
 
-test("unversioned beta queues are rejected", () => {
+test("unversioned historical queues are rejected", () => {
 	assert.throws(
 		() =>
 			migrateEncryptionPluginData({
@@ -123,7 +123,7 @@ test("partial unversioned data is not mistaken for stable 1.0/1.1", () => {
 	);
 });
 
-test("stable 1.2 encryption-shaped data is deliberately unsupported", () => {
+test("unversioned encrypted legacy data is deliberately unsupported", () => {
 	for (const enableEncryption of [false, true]) {
 		assert.throws(
 			() =>

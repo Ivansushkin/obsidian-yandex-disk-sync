@@ -2,21 +2,20 @@
 
 Плагин для синхронизации заметок Obsidian с Яндекс Диском. Позволяет автоматически синхронизировать хранилище между несколькими устройствами через облачное хранилище Яндекса.
 
-## Обновление до 2.0.0-beta.6
+## Обновление с 1.1.0 до 2.0.0
 
-Версия 2.0.0-beta.6 поддерживает миграцию только с plaintext stable 1.0.0 и
-1.1.0. Их local `localIndex` однократно преобразуется в текущий baseline.
+Версия 2.0.0 поддерживает миграцию только с plaintext stable 1.0.0 и 1.1.0.
+Их local `localIndex` однократно преобразуется в текущий baseline.
 Plaintext canonical v1/v2 требует явного Force с обязательным backup;
 canonical v3 не поддерживается даже для Force.
 
-Migration и recovery из stable 1.2 и специфичных prerelease-форматов 1.2/2.0
-не поддерживаются. Распознаваемые manifest v1/v2, encrypted legacy index v1/v2,
-canonical v3, unversioned beta queues/transitions и неполная metadata текущего
-transition блокируют запуск и любые remote writes. Нужно выбрать чистый remote
-path либо вручную сбросить старые данные только после самостоятельного backup.
-Структурно текущие schema v2, manifest v3 или index v4, созданные beta-клиентом,
-технически неотличимы от тех же форматов beta.6 и могут быть прочитаны, но
-отдельного beta converter/recovery кода больше нет.
+Encrypted legacy и исторические prerelease-форматы не поддерживаются.
+Распознаваемые manifest v1/v2, encrypted legacy index v1/v2, canonical v3,
+unversioned queues/transitions и неполная metadata текущего transition блокируют
+запуск и любые remote writes. Нужно выбрать чистый remote path либо вручную
+сбросить старые данные только после самостоятельного backup. Структурно
+валидные текущие schema v2, manifest v3 и index v4 принимаются как текущий
+формат; converter/recovery для несовместимых исторических форматов нет.
 
 Не запускайте старую версию плагина после перехода: она может заменить индекс
 v4 или вернуть удалённые файлы. Если это произошло, отключите синхронизацию

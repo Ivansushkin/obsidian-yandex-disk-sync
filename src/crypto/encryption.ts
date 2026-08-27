@@ -1,6 +1,6 @@
 /**
  * Browser-compatible hardened encryption used by remote storage and transition
- * recovery. Historical prerelease and 1.2 encryption formats are unsupported.
+ * recovery. Historical prerelease encryption formats are unsupported.
  */
 
 import { aessiv } from "@noble/ciphers/aes.js";

@@ -97,7 +97,7 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of older builds and 2.0.0-beta.6 is unsupported. Only
+- Concurrent use of older builds and 2.0.0 is unsupported. Only
   plaintext stable 1.0/1.1 local data and index v1/v2 are migratable; encrypted
   legacy data, index v3, manifest v1/v2, and all prerelease queues fail closed.
 - Do not change index v4, manifest v3, epoch/revision, mutation FIFO, or the
@@ -106,7 +106,8 @@
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
   translations, and migration messages.
-- Never rewrite previous beta history in `CHANGELOG.md` or `versions.json`.
+- Release metadata exposes one 2.0.0 line; do not add historical prerelease
+  entries back to `CHANGELOG.md` or `versions.json`.
 
 ## Documentation and testing
 

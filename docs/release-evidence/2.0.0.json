@@ -1,12 +1,11 @@
 {
 	"releaseVersion": "2.0.0",
 	"status": "PENDING",
-	"betaVersion": "2.0.0-beta.6",
-	"betaCommit": null,
+	"testedCommit": null,
 	"scenarios": [],
 	"blockers": [
 		"Real two-profile Yandex Disk run is not recorded",
-		"Beta.6 fresh install, plaintext stable 1.0/1.1 migration, and stable 1.2/prerelease fail-closed evidence is not recorded",
+		"2.0.0 fresh install, plaintext stable 1.0/1.1 migration, and historical-format fail-closed evidence is not recorded",
 		"Current desktop, Obsidian 1.0.0 desktop, and current mobile evidence is not recorded",
 		"PERF-006 and PBKDF2 mobile p95 evidence is not recorded"
 	]

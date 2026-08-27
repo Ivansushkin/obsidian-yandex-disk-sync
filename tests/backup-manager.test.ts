@@ -99,7 +99,7 @@ function createManager(client: FakeBackupClient): {
 			client as unknown as YandexDiskClient,
 			vault,
 			settings,
-			"2.0.0-beta.6",
+			"2.0.0",
 		),
 		settings,
 	};

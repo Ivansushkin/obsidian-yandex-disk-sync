@@ -35,7 +35,7 @@ ciphertext или UTF-8 блокирует sync до обращения к Vault
 
 `.obsidian-encrypt.json` всегда читается и записывается raw.
 
-- v1/v2 и весь encryption format stable/prerelease 1.2 не поддерживаются и
+- v1/v2 и все historical prerelease encryption formats не поддерживаются и
   всегда блокируются отдельной ошибкой без попытки compatibility decode.
 - v3 обязан полностью и точно объявлять `profileId`, KDF, HKDF, content cipher
   и filename cipher.
@@ -55,8 +55,8 @@ profile IDs. Устройство не выбирает codec по локаль�
   `settings + localIndex + lastSyncStats`, преобразуя `localIndex` в unobserved
   baseline и создавая пустые очереди.
 
-Unversioned `localState`, beta queues, transition без profile metadata,
-stable 1.2 settings с encryption-полями и любая другая schema блокируют plugin
+Unversioned `localState`, historical queues, transition без profile metadata,
+unversioned settings с encryption-полями и любая другая schema блокируют plugin
 startup до создания компонентов синхронизации.
 
 Если initiator потерян после commit, target-capable устройство проверяет

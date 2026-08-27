@@ -55,7 +55,7 @@ export function classifyPhysicalDeleteFingerprint(
 
 /**
  * Classify a destructive guard against current Yandex resource metadata.
- * Legacy beta fingerprints may refer to any server identity field.
+ * Persisted legacy fingerprints may refer to any server identity field.
  */
 export function classifyPhysicalDeleteResource(
 	expectedFingerprint: string | undefined,

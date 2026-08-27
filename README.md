@@ -2,21 +2,20 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-## Upgrading to 2.0.0-beta.6
+## Upgrading from 1.1.0 to 2.0.0
 
-Version 2.0.0-beta.6 supports migration only from plaintext stable 1.0.0 and
-1.1.0. Their local `localIndex` is converted once into the current baseline.
+Version 2.0.0 supports migration only from plaintext stable 1.0.0 and 1.1.0.
+Their local `localIndex` is converted once into the current baseline.
 Plaintext canonical v1/v2 requires a backed-up explicit **Force sync**;
 canonical v3 is unsupported even for Force.
 
-Migration and recovery from stable 1.2 and prerelease-specific 1.2/2.0 formats
-are unsupported. Detectable manifest v1/v2, encrypted legacy index v1/v2,
-canonical v3, unversioned beta queues/transitions, and incomplete current
-transition metadata block startup and all remote writes. Choose a clean remote
-path or reset the old data manually only after making an independent backup.
-Structurally current schema v2, manifest v3, or index v4 created by a beta cannot
-be distinguished from the same beta.6 format and may be read, but no
-beta-specific converter or recovery code remains.
+Encrypted legacy and historical prerelease formats are unsupported. Detectable
+manifest v1/v2, encrypted legacy index v1/v2, canonical v3, unversioned
+queues/transitions, and incomplete current transition metadata block startup
+and all remote writes. Choose a clean remote path or reset the old data manually
+only after making an independent backup. Structurally valid current schema v2,
+manifest v3, and index v4 data is accepted as the current format; no converter
+or recovery path exists for incompatible historical formats.
 
 Do not start an older plugin version after the transition: it can replace the
 v4 index or restore deleted files. If that happens, disable sync everywhere,

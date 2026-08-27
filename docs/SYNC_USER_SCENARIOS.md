@@ -68,11 +68,11 @@
 | INIT-019 | P0  | Encrypted canonical v1/v2                             | Формат блокируется как unsupported; normal и Force не выполняют remote writes | auto: `encrypted legacy startup is rejected as unsupported data`; `encrypted legacy index is rejected before Force acquires a lock` |
 | INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable` |
 | INIT-021 | P0  | Watcher-событие возникает до/во время startup encryption guard | Событие durable-буферизуется; blocked/failed startup его не теряет | auto: `strict no-op validates encryption only once`; integration |
-| INIT-022 | P0  | Plaintext stable 1.0/1.1 обновляется до beta.6         | `localIndex` преобразуется в unobserved baseline до первого save; очереди создаются пустыми | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; integration |
+| INIT-022 | P0  | Plaintext stable 1.0/1.1 обновляется до 2.0.0          | `localIndex` преобразуется в unobserved baseline до первого save; очереди создаются пустыми | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; integration |
 | INIT-023 | P0  | Remote содержит encryption manifest v1/v2             | Manifest блокируется как unsupported до upload/delete/cleanup | auto: `manifest v1 and v2 are rejected as unsupported data` |
-| INIT-024 | P0  | Unversioned local data содержит `localState` или beta queues | Plugin startup блокируется до создания watcher/scheduler и remote writes | auto: `unversioned beta queues are rejected` |
+| INIT-024 | P0  | Unversioned local data содержит `localState` или historical queues | Plugin startup блокируется до создания watcher/scheduler и remote writes | auto: `unversioned historical queues are rejected` |
 | INIT-025 | P1  | Current schema v2 transition не содержит profile metadata | Snapshot не получает legacy default; startup блокируется | auto: `current transition without profile metadata is rejected` |
-| INIT-026 | P0  | Unversioned local data содержит encryption-поля stable 1.2 | Stable 1.2 не принимается за stable 1.0/1.1; startup блокируется до remote writes | auto: `stable 1.2 encryption-shaped data is deliberately unsupported` |
+| INIT-026 | P0  | Unversioned local data содержит encrypted legacy-поля | Эти данные не принимаются за stable 1.0/1.1; startup блокируется до remote writes | auto: `unversioned encrypted legacy data is deliberately unsupported` |
 
 ## Обычный full и realtime
 
@@ -376,7 +376,7 @@
 | FDEL-016  | P0 | Folder delete после собственных revisions при старом observedRevision | Потомки с меньшим same-device sequence удаляются; foreign/newer сохраняются | manual-required |
 | MULTI-016 | P0 | Другой device меняет child во время folder move/delete | Foreign child и отличающийся target не удаляются и не перезаписываются | manual-required |
 | SYNC-029  | P0 | Full запускается при unresolved parent move/action | Full останавливается до local/remote scan, не создаёт compensating operations | manual-required |
-| MIG-004   | P0 | Переход plaintext stable 1.0/1.1 index v1/v2 на beta.6 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; `plaintext legacy Force commits and verifies canonical v4`; manual-required |
+| MIG-004   | P0 | Переход plaintext stable 1.0/1.1 index v1/v2 на 2.0.0 index v4 | Один Force local с backup создаёт v4; остальные devices принимают epoch обычной full | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; `plaintext legacy Force commits and verifies canonical v4`; manual-required |
 | DIAG-016  | P1 | Folder reducer и recovery | Лог содержит parent event/mutation, sequence, absorbed/rebased, survivor/conflict/unresolved counts без expected coalescing ERROR | manual-required |
 | MOVE-029  | P0 | Одновременно ожидают unrelated и nested folder moves, затем приходит child rename | Выбирается только содержащий child source и самый глубокий causal parent; unrelated move не влияет | auto: `child rename selects the deepest matching folder parent` |
 | MOVE-030  | P0 | Folder move встречает существующий target с другим SHA | Ноль canonical/physical writes; source и local target сохраняются; event остаётся durable с `folder-target-conflict` | auto: `folder target conflict performs no canonical or physical writes` |

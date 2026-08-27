@@ -479,7 +479,7 @@ interface StorageClient {
 
 Новые vault используют hardened-v3: PBKDF2 600k выводит master key, HKDF
 разделяет AES-GCM content key и AES-SIV filename key. Других codecs в текущей
-версии нет. Manifest v1/v2, encrypted legacy index и stable/prerelease 1.2
+версии нет. Manifest v1/v2, encrypted legacy index и historical prerelease
 fail closed без чтения или migration; manifest v3 строго объявляет все
 алгоритмы, а unknown version/profile блокирует любые remote mutations.
 

@@ -4,6 +4,35 @@ import test from "node:test";
 
 const catalog = readFileSync("docs/SYNC_USER_SCENARIOS.md", "utf8");
 
+test("release metadata exposes one 2.0.0 line after stable 1.1.0", () => {
+	const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+		version: string;
+	};
+	const manifest = JSON.parse(readFileSync("manifest.json", "utf8")) as {
+		version: string;
+		minAppVersion: string;
+	};
+	const versions = JSON.parse(readFileSync("versions.json", "utf8")) as Record<
+		string,
+		string
+	>;
+	const changelog = readFileSync("CHANGELOG.md", "utf8");
+
+	assert.equal(packageJson.version, "2.0.0");
+	assert.equal(manifest.version, "2.0.0");
+	assert.equal(manifest.minAppVersion, "1.0.0");
+	assert.deepEqual(versions, {
+		"1.1.0": "0.15.0",
+		"2.0.0": "1.0.0",
+	});
+	assert.deepEqual(
+		[...changelog.matchAll(/^## (.+)$/gm)].map((match) => match[1]),
+		["2.0.0"],
+	);
+	assert.match(changelog, /Changes since stable `1\.1\.0`\./);
+	assert.doesNotMatch(changelog, /\b(?:beta|prerelease)\b/i);
+});
+
 test("P0 and P1 scenario evidence does not use generic test labels", () => {
 	const invalid = catalog.split("\n").flatMap((line) => {
 		if (!/^\|\s*[^|]+\s*\|\s*P[01]\s*\|/.test(line)) return [];
@@ -21,7 +50,7 @@ test("P0 and P1 scenario evidence does not use generic test labels", () => {
 	);
 });
 
-test("beta.3 causal blockers have exact automated evidence", () => {
+test("causal blockers have exact automated evidence", () => {
 	for (const id of [
 		"MOVE-029",
 		"MOVE-030",

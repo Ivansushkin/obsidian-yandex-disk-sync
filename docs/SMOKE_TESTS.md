@@ -9,7 +9,7 @@ multi-device, Force-loop и шифрования.
 Перед прогоном:
 
 - `npm test`, lint и build уже зелёные.
-- На обоих устройствах установлена одна и та же `2.0.0-beta.6`.
+- На обоих устройствах установлена одна и та же `2.0.0`.
 - Используются два независимых профиля Obsidian с разными device ID.
 - Используется реальный Яндекс Диск.
 - Тестовое remote-хранилище можно безопасно очищать.
@@ -281,10 +281,10 @@ conflict/backup-файлы, если они мешают проверке.
 4. Выполнить Force local с обязательным backup и получить canonical v4.
 5. На Device 2 выполнить обычный full и проверить принятие нового epoch.
 
-### Unsupported beta formats
+### Unsupported historical formats
 
-1. По отдельности подготовить stable 1.2-shaped local data, manifest v1/v2,
-   encrypted canonical v1/v2, canonical v3, unversioned local
+1. По отдельности подготовить unversioned encrypted legacy local data,
+   manifest v1/v2, encrypted canonical v1/v2, canonical v3, unversioned local
    `localState`/queues и transition без profile metadata.
 2. Для каждого формата подтвердить отдельную ошибку unsupported prerelease и
    инструкцию выбрать чистый remote path либо выполнить ручной reset после
@@ -303,7 +303,7 @@ conflict/backup-файлы, если они мешают проверке.
 4. Сначала ввести неверный пароль.
 5. Убедиться, что sync заблокирована и remote не изменён.
 6. Ввести правильный пароль и выполнить full.
-7. Старый beta-клиент против manifest v3 должен только заблокироваться и не
+7. Несовместимый старый клиент против manifest v3 должен только заблокироваться и не
    изменить remote.
 
 ### Обычная encrypted sync
@@ -368,18 +368,21 @@ conflict/backup-файлы, если они мешают проверке.
 
 Перед stable обязательны: Obsidian 1.0.0 desktop, current desktop и current
 mobile; fresh install, stable 1.0/1.1 plaintext migration, fresh hardened-v3 и
-fail-closed stable 1.2/beta formats; два независимых
+fail-closed historical formats; два независимых
 профиля; 409/423/429 и ambiguous upload; offline return; 10 000 descendants;
 PERF-006; PBKDF2 p95 не более 3 секунд; финальный full обоих профилей `0/0/0`.
 Результаты записываются в `release-evidence/2.0.0.json` без secret и полных
-remote paths.
+remote paths. Верхнеуровневый `testedCommit` и одноимённое поле каждой записи
+сценария должны указывать на один и тот же 40-символьный SHA проверенного
+коммита `2.0.0`. После этого коммита до release-tag разрешено менять только
+сам evidence-файл.
 
 ## Итоговая карточка прогона
 
 Для каждого TC достаточно записывать:
 
 ```text
-Версия: 2.0.0-beta.6
+Версия: 2.0.0
 Дата:
 Устройства:
 Режим: plaintext/encrypted
