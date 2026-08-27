@@ -4,7 +4,7 @@ import test from "node:test";
 
 const catalog = readFileSync("docs/SYNC_USER_SCENARIOS.md", "utf8");
 
-test("release metadata exposes one 2.0.0 line after stable 1.1.0", () => {
+test("changelog exposes stable 2.0.0 and historical 1.1.0", () => {
 	const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
 		version: string;
 	};
@@ -27,9 +27,10 @@ test("release metadata exposes one 2.0.0 line after stable 1.1.0", () => {
 	});
 	assert.deepEqual(
 		[...changelog.matchAll(/^## (.+)$/gm)].map((match) => match[1]),
-		["2.0.0"],
+		["2.0.0", "1.1.0"],
 	);
 	assert.match(changelog, /Changes since stable `1\.1\.0`\./);
+	assert.match(changelog, /## 1\.1\.0[\s\S]+#### Force Sync/);
 	assert.doesNotMatch(changelog, /\b(?:beta|prerelease)\b/i);
 });
 

@@ -34,8 +34,11 @@ const changelog = readFileSync("CHANGELOG.md", "utf8");
 const changelogVersions = [...changelog.matchAll(/^## (.+)$/gm)].map(
 	(match) => match[1],
 );
-if (JSON.stringify(changelogVersions) !== JSON.stringify(["2.0.0"])) {
-	fail("changelog must contain one unified 2.0.0 section");
+if (
+	JSON.stringify(changelogVersions) !==
+	JSON.stringify(["2.0.0", "1.1.0"])
+) {
+	fail("changelog must contain stable 2.0.0 and historical 1.1.0 sections");
 }
 if (/\b(?:beta|prerelease)\b/i.test(changelog)) {
 	fail("changelog must describe only changes from stable 1.1.0");

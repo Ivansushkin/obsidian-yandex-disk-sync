@@ -88,3 +88,65 @@ Changes since stable `1.1.0`.
   complete remote-tree traversal.
 - Folder planning uses path sets and maps, while remote traversal and file
   operations retain bounded concurrency.
+
+## 1.1.0
+
+### Added
+
+#### Force Sync
+
+Added forced one-way synchronization that ignores modification dates, file
+hashes, and the previous index state. The selected source becomes the exact
+authoritative copy in the chosen direction.
+
+#### ForceSyncModal (`src/ui/force-sync-modal.ts`)
+
+Added a confirmation modal before Force Sync with:
+
+- an explanation specific to the selected direction;
+- a warning that the operation is destructive;
+- a button to create a backup before continuing;
+- a button to continue without a backup;
+- a cancel button.
+
+#### Force Sync from local
+
+Overwrites all files on Yandex Disk with local versions and removes remote
+files that do not exist locally.
+
+```text
+1. Build the local index by scanning the vault.
+2. Get the remote file list.
+3. Upload every local file unconditionally.
+4. Delete every remote-only file.
+5. Replace the remote index with the local index.
+```
+
+#### Force Sync from remote
+
+Overwrites all local files with versions from Yandex Disk and removes local
+files that do not exist remotely.
+
+```text
+1. Build the local index to identify local-only files.
+2. Load the remote index.
+3. Get the remote file list.
+4. Download every remote file unconditionally.
+5. Delete every local-only file.
+6. Replace the local index with the remote index.
+```
+
+#### Implementation details
+
+- Force Sync generated operations directly without `ConflictResolver`.
+- Overwrites did not compare mtime or SHA-256.
+- `FileWatcher` was suspended through the existing `syncPauseCallbacks`.
+- Progress was reported through the regular `updateState()` mechanism.
+- File operations reused `executeOperationsParallel()`.
+
+#### Settings UI
+
+Added a **Force Sync** section after **Backup** with two actions:
+
+- **From local to remote**;
+- **From remote to local**.
