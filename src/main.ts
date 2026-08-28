@@ -24,7 +24,11 @@ import {
 	IndexManager,
 	RemoteIndexConcurrentModificationError,
 } from "./sync/index-manager";
-import { SyncEngine, type SyncRunOptions } from "./sync/sync-engine";
+import {
+	SyncEngine,
+	type ForceBackupProof,
+	type SyncRunOptions,
+} from "./sync/sync-engine";
 import {
 	DeferredWatcherEvent,
 	FileWatcher,
@@ -37,7 +41,11 @@ import {
 import { SyncStatusModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
-import { BackupManager } from "./backup/backup-manager";
+import {
+	BackupManager,
+	type BackupResult,
+} from "./backup/backup-manager";
+import { captureLogicalVaultSnapshot } from "./backup/backup-snapshot";
 import {
 	generateDeviceId,
 	getAncestorDirectoriesDeepestFirst,
@@ -65,7 +73,6 @@ import {
 	getPhysicalResourceFingerprint,
 	matchesPhysicalResourceFingerprint,
 } from "./utils/resource-fingerprint";
-import { computeSha256FromString } from "./utils/hash-utils";
 import {
 	PLUGIN_DATA_FORMAT,
 	loadPluginData,
@@ -816,8 +823,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private confirmForceSync(
 		direction: "from_local" | "from_remote",
-	): Promise<boolean> {
+	): Promise<BackupResult | null> {
 		return new Promise((resolve) => {
+			let completedBackup: BackupResult | null = null;
 			new ForceSyncModal(
 				this.app,
 				direction,
@@ -825,12 +833,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					if (!(await this.ensureEncryptionReady({ prompt: true }))) {
 						return { success: false };
 					}
-					return direction === "from_local"
+					const result = direction === "from_local"
 						? await this.backupManager.createRemoteSnapshotBackup()
 						: await this.backupManager.createBackup();
+					if (result.success) completedBackup = result;
+					return result;
 				},
 				(action) => {
-					resolve(action === "proceed");
+					resolve(action === "proceed" ? completedBackup : null);
 				},
 			).open();
 		});
@@ -839,9 +849,51 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/** Run the shared confirmed Force UI and persistence lifecycle. */
 	private async runConfirmedForceSync(
 		direction: "from_local" | "from_remote",
-		task: () => Promise<SyncResult>,
+		task: (options: SyncRunOptions) => Promise<SyncResult>,
 	): Promise<void> {
-		if (!(await this.confirmForceSync(direction))) return;
+		let canonical: ForceBackupProof["canonical"];
+		try {
+			canonical = await this.indexManager.captureForceCanonicalProof();
+		} catch (error) {
+			logger.warn("Force preflight rejected the canonical source", {
+				error,
+			});
+			if (error instanceof UnsupportedHistoricalDataError) {
+				this.fileWatcher.stop();
+				this.syncScheduler.stop();
+				this.regularSyncStarted = false;
+				this.showBlockingNotice(
+					"unsupported-historical",
+					t("notice.unsupported_historical_data"),
+				);
+				return;
+			}
+			new Notice(
+				t("notice.force_sync_exception", {
+					message:
+						error instanceof Error ? error.message : String(error),
+				}),
+				10000,
+			);
+			return;
+		}
+		const backup = await this.confirmForceSync(direction);
+		if (!backup) return;
+		if (
+			!backup.backupName ||
+			!backup.sha256 ||
+			!backup.snapshotDigest
+		) {
+			new Notice(t("notice.force_backup_stale"), 10000);
+			return;
+		}
+		const forceBackupProof: ForceBackupProof = {
+			direction,
+			canonical,
+			snapshotDigest: backup.snapshotDigest,
+			backupName: backup.backupName,
+			backupSha256: backup.sha256,
+		};
 		this.beginSyncNotice(
 			t(
 				direction === "from_local"
@@ -850,10 +902,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			),
 		);
 		try {
-			const result = await task();
+			const result = await task({ forceBackupProof });
 			this.updateLastSyncStats(result);
 			await this.persistPluginData();
 			if (!result.success) {
+				if (
+					result.errors.some(
+						(error) => error.code === "force-backup-stale",
+					)
+				) {
+					this.finishSyncNotice(t("notice.force_backup_stale"), 10000);
+					return;
+				}
 				this.finishSyncNotice(
 					t("notice.sync_error", { errors: result.errors.length }),
 					10000,
@@ -895,7 +955,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		await this.runConfirmedForceSync(
 			"from_local",
-			async () => await this.syncEngine.forceSyncFromLocal(),
+			async (options) =>
+				await this.syncEngine.forceSyncFromLocal(options),
 		);
 	}
 
@@ -913,7 +974,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		await this.runConfirmedForceSync(
 			"from_remote",
-			async () => await this.syncEngine.forceSyncFromRemote(),
+			async (options) =>
+				await this.syncEngine.forceSyncFromRemote(options),
 		);
 	}
 
@@ -1474,8 +1536,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			RemoteEncryptionManifest["transition"]
 		>;
 	} {
+		const kind = this.encryptionManager.getRemoteTargetRecoveryKind(manifest);
 		return (
-			manifest.state === "rotating" &&
+			(kind === "enable" || kind === "rotate") &&
 			manifest.transition?.targetProfileId === "hardened"
 		);
 	}
@@ -1493,16 +1556,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			manifest.transition.id,
 			async () => {
 				await this.indexManager.loadRemoteIndex();
-				const maintenance = this.indexManager.getMaintenance();
+				const maintenance =
+					this.encryptionManager.assertRemoteTargetMaintenance(
+						manifest,
+						this.indexManager.getMaintenance(),
+					);
 				if (
-					!maintenance ||
-					maintenance.id !== manifest.transition.id ||
-					(maintenance.phase !== "index-committed" &&
-						maintenance.phase !== "cleanup" &&
-						maintenance.phase !== "stable") ||
 					!maintenance.target.enabled ||
-					maintenance.target.salt !== manifest.salt ||
-					maintenance.target.revision !== manifest.revision ||
 					!maintenance.target.verifier ||
 					!(await service.verifyVerifier(
 						maintenance.target.verifier,
@@ -1531,15 +1591,83 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.setEncryptionBlock(null);
 	}
 
+	/** Recover a committed disable using the plaintext target canonical. */
+	private async tryRecoverRemotePlaintextTargetTransition(
+		manifest: RemoteEncryptionManifest | null,
+	): Promise<boolean> {
+		const canonical =
+			await this.indexManager.readCanonicalIndexWithCodecIfPresent(null);
+		if (!canonical) return false;
+		const maintenance = canonical.maintenance;
+		if (!maintenance) {
+			if (manifest?.state === "disabling") {
+				throw new Error(t("notice.encryption_remote_busy"));
+			}
+			return false;
+		}
+		this.encryptionManager.assertRemoteTargetMaintenance(manifest, maintenance);
+		if (maintenance.target.enabled) return false;
+
+		await this.syncEngine.runExclusiveMaintenance(async () => {
+			await this.indexManager.runTargetMaintenanceRecovery(
+				maintenance.id,
+				async () => {
+					this.indexManager.setIndexTransitionServices(null, null);
+					try {
+						await this.indexManager.loadRemoteIndexWithTargetCodec(null);
+						const current =
+							this.encryptionManager.assertRemoteTargetMaintenance(
+								manifest,
+								this.indexManager.getMaintenance(),
+							);
+						await this.applyEncryptionSnapshot({
+							enabled: false,
+							salt: null,
+							password: null,
+							revision: null,
+							profileId: null,
+						});
+						if (current.phase === "index-committed") {
+							this.indexManager.setMaintenance({
+								...current,
+								phase: "cleanup",
+							});
+							await this.indexManager.saveRemoteIndex();
+						}
+						if (manifest) {
+							await this.indexManager.deleteEncryptionManifest();
+						}
+						await this.resumeCanonicalMaintenanceCleanup();
+					} finally {
+						this.indexManager.clearIndexTransitionServices();
+					}
+				},
+			);
+		});
+		this.setEncryptionBlock(null);
+		this.encryptionStateChangeCallback?.();
+		return true;
+	}
+
 	private async tryRecoverRemoteTargetTransition(): Promise<void> {
-		const password = this.settings.encryptionPassword;
-		if (!password || !this.settings.enableEncryption) return;
 		try {
 			const manifest =
 				await this.indexManager.downloadEncryptionManifest();
+			const recoveryKind =
+				this.encryptionManager.getRemoteTargetRecoveryKind(manifest);
+			if (recoveryKind === "disable" || !manifest) {
+				if (
+					await this.tryRecoverRemotePlaintextTargetTransition(manifest)
+				) {
+					return;
+				}
+			}
+			const password = this.settings.encryptionPassword;
 			if (
 				!manifest ||
 				!this.isRecoverableRemoteTargetManifest(manifest) ||
+				!password ||
+				!this.settings.enableEncryption ||
 				this.settings.encryptionSalt !== manifest.salt ||
 				this.settings.encryptionProfileId !== "hardened"
 			) {
@@ -1890,13 +2018,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const before = await this.getLogicalVaultSnapshotDigest();
 			const result = await this.backupManager.createBackup(password);
-			if (!result.success || !result.backupName || !result.sha256) {
+			if (
+				!result.success ||
+				!result.backupName ||
+				!result.sha256 ||
+				!result.snapshotDigest
+			) {
 				throw new Error(
 					result.error ?? "Mandatory encryption backup failed",
 				);
 			}
 			const after = await this.getLogicalVaultSnapshotDigest();
-			if (before !== after) {
+			if (
+				before !== result.snapshotDigest ||
+				result.snapshotDigest !== after
+			) {
 				logger.warn("Vault changed while creating encryption backup", {
 					attempt: attempt + 1,
 				});
@@ -1912,7 +2048,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				sha256: result.sha256,
 				epoch: canonical.epoch,
 				canonicalRevision: canonical.revision,
-				localSnapshotDigest: after,
+				localSnapshotDigest: result.snapshotDigest,
 				createdAt: Date.now(),
 			};
 		}
@@ -1920,11 +2056,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private async getLogicalVaultSnapshotDigest(): Promise<string> {
-		const metadata = await this.vaultAdapter.getAllFileMetadata();
-		const stableEntries = [...metadata.values()]
-			.map((file) => [file.path, file.sha256, file.size] as const)
-			.sort(([left], [right]) => left.localeCompare(right));
-		return await computeSha256FromString(JSON.stringify(stableEntries));
+		return (await captureLogicalVaultSnapshot(this.vaultAdapter)).digest;
 	}
 
 	private async runEncryptionPreflight(): Promise<void> {

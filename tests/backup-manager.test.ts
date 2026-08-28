@@ -77,7 +77,11 @@ class FakeBackupClient {
 
 }
 
-function createManager(client: FakeBackupClient): {
+function createManager(
+	client: FakeBackupClient,
+	readFile: () => Promise<ArrayBuffer> = async () =>
+		new TextEncoder().encode("note").buffer,
+): {
 	manager: BackupManager;
 	settings: YandexDiskSyncSettings;
 } {
@@ -92,7 +96,7 @@ function createManager(client: FakeBackupClient): {
 	};
 	const vault = {
 		getAllSyncableFiles: () => [{ path: "note.md" }],
-		readFile: async () => new TextEncoder().encode("note").buffer,
+		readFile,
 	} as unknown as VaultAdapter;
 	return {
 		manager: new BackupManager(
@@ -104,6 +108,38 @@ function createManager(client: FakeBackupClient): {
 		settings,
 	};
 }
+
+test("Force backup proof binds the exact logical and remote snapshots", async () => {
+	const client = new FakeBackupClient();
+	let localContent = "local-a";
+	const { manager } = createManager(
+		client,
+		async () => new TextEncoder().encode(localContent).buffer,
+	);
+	const firstLocal = await manager.createBackup();
+	localContent = "local-b";
+	const secondLocal = await manager.createBackup();
+	assert.ok(firstLocal.snapshotDigest);
+	assert.notEqual(firstLocal.snapshotDigest, secondLocal.snapshotDigest);
+
+	const remotePath = "disk:/vault/remote.md";
+	client.resources = [
+		{
+			name: "remote.md",
+			path: remotePath,
+			type: "file",
+			created: "2026-08-20T10:00:00Z",
+			modified: "2026-08-20T10:00:00Z",
+			size: 8,
+		},
+	];
+	client.files.set(remotePath, new TextEncoder().encode("remote-a").buffer);
+	const firstRemote = await manager.createRemoteSnapshotBackup();
+	client.files.set(remotePath, new TextEncoder().encode("remote-b").buffer);
+	const secondRemote = await manager.createRemoteSnapshotBackup();
+	assert.ok(firstRemote.snapshotDigest);
+	assert.notEqual(firstRemote.snapshotDigest, secondRemote.snapshotDigest);
+});
 
 test("verified backup accepts an upload whose response was lost", async () => {
 	const client = new FakeBackupClient();

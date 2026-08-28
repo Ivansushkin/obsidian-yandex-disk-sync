@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
+import { validateScenarioCatalog } from "../scripts/scenario-catalog.mjs";
 
 const catalog = readFileSync("docs/SYNC_USER_SCENARIOS.md", "utf8");
+const smokeTests = readFileSync("docs/SMOKE_TESTS.md", "utf8");
+const scenarioTestSources = readdirSync("tests")
+	.filter((name) => name.endsWith(".test.ts"))
+	.map((name) => readFileSync(`tests/${name}`, "utf8"));
 
 function collectTextFiles(directory: string): string[] {
 	return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -70,20 +75,10 @@ test("first-party source and docs contain no numbered current format markers", (
 	assert.deepEqual(violations, []);
 });
 
-test("P0 and P1 scenario evidence does not use generic test labels", () => {
-	const invalid = catalog.split("\n").flatMap((line) => {
-		if (!/^\|\s*[^|]+\s*\|\s*P[01]\s*\|/.test(line)) return [];
-		const cells = line.split("|").map((cell) => cell.trim());
-		const id = cells[1] ?? "unknown";
-		const evidence = cells.at(-2) ?? "";
-		const hasGenericLabel =
-			/\b(?:integration|two-device|fault matrix)\b/i.test(evidence);
-		return hasGenericLabel && !evidence.includes("`") ? [id] : [];
-	});
+test("scenario evidence uses strict syntax and exact executable test names", () => {
 	assert.deepEqual(
-		invalid,
+		validateScenarioCatalog(catalog, scenarioTestSources, smokeTests),
 		[],
-		`Replace generic scenario evidence with an exact test name or manual-required: ${invalid.join(", ")}`,
 	);
 });
 
@@ -96,7 +91,6 @@ test("causal blockers have exact automated evidence", () => {
 		"INDEX-001",
 		"SYNC-031",
 		"MULTI-017",
-		"DIAG-017",
 	]) {
 		const line = catalog
 			.split("\n")

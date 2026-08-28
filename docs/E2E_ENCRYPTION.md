@@ -64,9 +64,14 @@ unmarked settings с encryption-полями и любой другой format �
 startup до создания компонентов синхронизации.
 
 Если initiator потерян после commit, target-capable устройство проверяет
-matching transition ID, target salt/revision/verifier и post-commit phase,
-публикует stable manifest и продолжает canonical cleanup без source password.
-Pre-commit foreign maintenance остаётся заблокированным.
+matching transition ID, source/target descriptors, profile combination и
+post-commit phase. Для enable/rotate оно аутентифицирует target verifier,
+явно читает target canonical новым codec, публикует stable manifest и
+продолжает canonical cleanup без source password. Для disable оно явно читает
+plaintext target canonical; transitional manifest проверяется, если ещё
+существует, но его отсутствие допустимо только для committed plaintext target.
+Explicit target read разрешён `IndexManager` только внутри matching recovery
+scope. Pre-commit foreign maintenance остаётся заблокированным.
 
 Офлайн-устройство сначала подключает `hardened` codec, принимает canonical через full
 reconcile и только затем воспроизводит durable logical mutations. Старые

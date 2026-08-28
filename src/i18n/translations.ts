@@ -73,6 +73,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_no_changes": "Synchronization completed: no changes",
 		"notice.sync_exception": "Synchronization failed: {message}",
 		"notice.force_sync_exception": "Force sync failed: {message}",
+		"notice.force_backup_stale":
+			"Force sync stopped because the canonical or protected data changed after backup verification. Create a new backup and try again.",
 		"notice.unsupported_historical_data":
 			"Synchronization is blocked because unsupported historical data was detected. Use a clean remote path or reset the old data manually after creating an independent backup.",
 		"notice.encryption_transition_error":
@@ -380,6 +382,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_exception": "Ошибка синхронизации: {message}",
 		"notice.force_sync_exception":
 			"Ошибка принудительной синхронизации: {message}",
+		"notice.force_backup_stale":
+			"Force sync остановлен: canonical или защищаемые данные изменились после проверки бекапа. Создайте новый бекап и повторите операцию.",
 		"notice.unsupported_historical_data":
 			"Синхронизация заблокирована: обнаружены неподдерживаемые исторические данные. Выберите чистый удалённый каталог или вручную сбросьте старые данные после создания независимого бекапа.",
 		"notice.encryption_transition_error":

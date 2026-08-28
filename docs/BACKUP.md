@@ -68,8 +68,17 @@ Password policy:
   новое random имя; существующий объект не перезаписывается.
 
 Force и encryption transition не переходят к destructive phase без успешно
-подтверждённого backup. Migration proof дополнительно привязан к canonical
-epoch/revision и digest local snapshot; concurrent commit инвалидирует proof.
+подтверждённого backup. Encryption transition proof привязан к canonical
+epoch/revision и digest точных logical bytes, попавших в backup; concurrent
+commit или local change инвалидирует proof.
+
+Force сначала выполняет read-only canonical preflight, затем создаёт backup и
+передаёт proof внутрь сериализованной Force-сессии. Proof содержит SHA-256
+точных remote backup bytes, raw identity canonical и digest защищаемого
+snapshot: `remote-raw` для Force local, `logical-vault` для Force remote. До
+первого `mkdir`, upload/delete либо local overwrite/delete `SyncEngine` заново
+скачивает backup и переснимает canonical/snapshot. Любое отличие блокирует
+Force как stale и требует новый backup.
 
 ## Download
 
@@ -88,9 +97,10 @@ Non-envelope `.enc.zip` отклоняется без вызова compatibility
 
 ## Memory
 
-Migration создаёт один logical backup после source preflight, а не объединяет
-полные local и remote snapshots. Это сохраняет прежний memory peak. Mobile
-PERF-006 остаётся обязательным release gate.
+Encryption transition создаёт один logical backup после source preflight, а не
+объединяет полные local и remote snapshots. Force создаёт только один snapshot
+защищаемой стороны. Это сохраняет прежний memory peak. Mobile PERF-006 остаётся
+обязательным release gate.
 
 ## Проверки
 
@@ -98,4 +108,5 @@ PERF-006 остаётся обязательным release gate.
 corrupted tag/header, lost response, 409/collision, exact read-back, unique
 names, plaintext historical ZIP и fail-closed для non-envelope `.enc.zip`,
 unknown bytes и encrypted legacy names. Реальное создание, download и restore
-до/после rotate/disable входят в `SMOKE_TESTS.md` TC-08.
+до/после rotate/disable входят в `SMOKE_TESTS.md` TC-08. Freshness proof Force
+проверяется в TC-07.

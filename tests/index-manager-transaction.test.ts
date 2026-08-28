@@ -7,6 +7,7 @@ import {
 	IndexEpochMismatchError,
 	InvalidCurrentIndexError,
 	UnreadableRemoteIndexError,
+	ForceBackupStaleError,
 } from "../src/sync/index-manager";
 import {
 	CURRENT_INDEX_FORMAT,
@@ -627,6 +628,54 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 	assert.throws(() => access.assertMaintenanceCompatible(index));
 });
 
+test("plaintext target recovery reads committed disable canonical without source key", async () => {
+	const sourceEncryption =
+		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const index = createEmptyIndex("source-device", "epoch-disable");
+	index.revision = 2;
+	index.maintenance = {
+		id: "transition-disable",
+		kind: "disable",
+		phase: "index-committed",
+		initiatedBy: "source-device",
+		sourceRevision: 1,
+		targetRevision: null,
+		source: {
+			enabled: true,
+			revision: 1,
+			salt: "source-salt",
+			verifier: "source-verifier",
+		},
+		target: {
+			enabled: false,
+			revision: null,
+			salt: null,
+			verifier: null,
+		},
+		cleanup: [],
+	};
+	const { manager } = await createIndexManagerWithContent(
+		index,
+		sourceEncryption,
+		null,
+		"target-device",
+	);
+
+	await assert.rejects(manager.loadRemoteIndex(), UnreadableRemoteIndexError);
+	const discovered = await manager.readCanonicalIndexWithCodecIfPresent(null);
+	assert.equal(discovered?.maintenance?.id, "transition-disable");
+	await assert.rejects(
+		manager.loadRemoteIndexWithTargetCodec(null),
+		/requires recovery ownership/,
+	);
+	const recovered = await manager.runTargetMaintenanceRecovery(
+		"transition-disable",
+		async () => manager.loadRemoteIndexWithTargetCodec(null),
+	);
+	assert.equal(recovered.epoch, "epoch-disable");
+	assert.equal(recovered.maintenance?.phase, "index-committed");
+});
+
 async function createIndexManagerWithContent(
 	content: object | string,
 	activeEncryption: EncryptionCodec | null,
@@ -1051,6 +1100,26 @@ test("Force rejects numeric historical canonical before any remote move", async 
 		new Uint8Array(client.files.get(canonicalPath)!),
 		new Uint8Array(source),
 	);
+});
+
+test("Force canonical proof becomes stale before any replacement write", async () => {
+	const { manager, client, canonicalPath } =
+		await createIndexManagerWithContent(
+			createEmptyIndex("device-a", "epoch-a"),
+			null,
+		);
+	const proof = await manager.captureForceCanonicalProof();
+	const changed = createEmptyIndex("device-b", "epoch-b");
+	changed.revision = 1;
+	client.files.set(
+		canonicalPath,
+		new TextEncoder().encode(JSON.stringify(changed)).buffer,
+	);
+	await assert.rejects(
+		manager.assertForceCanonicalProof(proof),
+		ForceBackupStaleError,
+	);
+	assert.equal(client.moveCount, 0);
 });
 
 test("successful final move with a lost response still commits", async () => {

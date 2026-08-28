@@ -59,6 +59,17 @@ function currentTransition(): LocalEncryptionTransition {
 	};
 }
 
+test("fresh plugin data accepts nullish storage and rejects arbitrary roots", () => {
+	assert.equal(loadPluginData(null), null);
+	assert.equal(loadPluginData(undefined), null);
+	for (const value of [0, "data", [], { arbitrary: true }]) {
+		assert.throws(
+			() => loadPluginData(value as never),
+			UnsupportedHistoricalDataError,
+		);
+	}
+});
+
 test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues", () => {
 	const migrated = loadPluginData({
 		settings: stable1xSettings(),

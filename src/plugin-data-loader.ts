@@ -39,9 +39,14 @@ const CURRENT_PLUGIN_DATA_KEYS = new Set([
  * plaintext stable 1.0/1.1. Other unmarked data is not migrated.
  */
 export function loadPluginData<T extends PersistedPluginData>(
-	data: T | null,
+	data: T | null | undefined,
 ): (T & { format: typeof PLUGIN_DATA_FORMAT }) | null {
-	if (data === null) return null;
+	if (data == null) return null;
+	if (typeof data !== "object" || Array.isArray(data)) {
+		throw new UnsupportedHistoricalDataError(
+			"Plugin data root must be a recognized object",
+		);
+	}
 	if (data.format === PLUGIN_DATA_FORMAT) {
 		assertExactKeys(data, CURRENT_PLUGIN_DATA_KEYS, "current plugin data");
 		assertCurrentEncryptionState(data);

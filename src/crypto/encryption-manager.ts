@@ -22,8 +22,82 @@ import type {
 	LocalEncryptionTransition,
 } from "./encryption-transition";
 
+export type RemoteTargetRecoveryKind = "enable" | "rotate" | "disable";
+
 /** Owns profile selection and wire-shape creation outside the plugin root. */
 export class EncryptionManager {
+	getRemoteTargetRecoveryKind(
+		manifest: RemoteEncryptionManifest | null,
+	): RemoteTargetRecoveryKind | null {
+		if (!manifest || manifest.state === "enabled") return null;
+		if (manifest.state === "enabling") return "enable";
+		if (manifest.state === "rotating") return "rotate";
+		return "disable";
+	}
+
+	/** Validate that transitional metadata describes one committed target. */
+	assertRemoteTargetMaintenance(
+		manifest: RemoteEncryptionManifest | null,
+		maintenance: IndexMaintenance | undefined,
+	): IndexMaintenance {
+		if (
+			!maintenance ||
+			(maintenance.phase !== "index-committed" &&
+				maintenance.phase !== "cleanup" &&
+				maintenance.phase !== "stable")
+		) {
+			throw new Error("Remote target maintenance is not post-commit");
+		}
+		const manifestKind = this.getRemoteTargetRecoveryKind(manifest);
+		const expectedKind = manifestKind ?? "disable";
+		if (maintenance.kind !== expectedKind) {
+			throw new Error("Remote target maintenance kind does not match");
+		}
+		if (!manifest) {
+			if (maintenance.target.enabled) {
+				throw new Error("Missing manifest is valid only for plaintext target");
+			}
+			return maintenance;
+		}
+		const transition = manifest.transition;
+		if (!transition || transition.id !== maintenance.id) {
+			throw new Error("Remote transition ID does not match maintenance");
+		}
+		if (
+			!sameModeDescriptor(transition.source, maintenance.source) ||
+			!sameModeDescriptor(transition.target, maintenance.target)
+		) {
+			throw new Error("Remote transition descriptors do not match maintenance");
+		}
+		const manifestMode = {
+			enabled: true,
+			revision: manifest.revision,
+			salt: manifest.salt,
+			verifier: manifest.verifier,
+		};
+		const declaredMode =
+			expectedKind === "disable"
+				? maintenance.source
+				: maintenance.target;
+		if (!sameModeDescriptor(manifestMode, declaredMode)) {
+			throw new Error("Manifest key does not match committed maintenance");
+		}
+		if (
+			(expectedKind === "enable" &&
+				(transition.sourceProfileId !== null ||
+					transition.targetProfileId !== "hardened")) ||
+			(expectedKind === "rotate" &&
+				(transition.sourceProfileId !== "hardened" ||
+					transition.targetProfileId !== "hardened")) ||
+			(expectedKind === "disable" &&
+				(transition.sourceProfileId !== "hardened" ||
+					transition.targetProfileId !== null))
+		) {
+			throw new Error("Remote transition profiles do not match its kind");
+		}
+		return maintenance;
+	}
+
 	getManifestProfileId(
 		manifest: RemoteEncryptionManifest,
 	): EncryptionProfileId {
@@ -180,6 +254,18 @@ export class EncryptionManager {
 			},
 		};
 	}
+}
+
+function sameModeDescriptor(
+	left: EncryptionModeDescriptor,
+	right: EncryptionModeDescriptor,
+): boolean {
+	return (
+		left.enabled === right.enabled &&
+		left.revision === right.revision &&
+		left.salt === right.salt &&
+		left.verifier === right.verifier
+	);
 }
 
 function requireProfileId(

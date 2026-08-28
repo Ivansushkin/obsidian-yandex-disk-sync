@@ -30,6 +30,8 @@ import {
 	RemoteMaintenanceActiveError,
 	RemoteIndexTransactionError,
 	UnreadableRemoteIndexError,
+	ForceBackupStaleError,
+	type ForceCanonicalProof,
 } from "./index-manager";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { ConflictResolver } from "./conflict-resolver";
@@ -81,6 +83,10 @@ import {
 	type WatcherCausalContext,
 } from "./realtime-rules";
 import type { CanonicalCommitProof } from "./index-transaction";
+import {
+	captureLogicalVaultSnapshot,
+	captureRemoteRawSnapshot,
+} from "../backup/backup-snapshot";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
@@ -119,6 +125,16 @@ export interface SyncRunOptions {
 	beforeIndexCommit?: () => void | Promise<void>;
 	/** Prevent an epoch race from scheduling more than one immediate follow-up. */
 	epochRetry?: boolean;
+	/** Exact verified backup and pre-backup canonical identity for Force only. */
+	forceBackupProof?: ForceBackupProof;
+}
+
+export interface ForceBackupProof {
+	direction: "from_local" | "from_remote";
+	canonical: ForceCanonicalProof;
+	snapshotDigest: string;
+	backupName: string;
+	backupSha256: string;
 }
 
 export interface SyncLifecycleContext {
@@ -1278,6 +1294,10 @@ export class SyncEngine {
 		const run = async () => await this.runSyncSession(
 			options,
 			async (result, _startTime, validationToken) => {
+				await this.assertForceBackupProof(
+					"from_local",
+					options?.forceBackupProof,
+				);
 				bootstrapStarted = true;
 				const inheritedCleanup = await this.prepareForceBootstrap();
 
@@ -1454,6 +1474,10 @@ export class SyncEngine {
 		const run = async () => await this.runSyncSession(
 			options,
 			async (result) => {
+				await this.assertForceBackupProof(
+					"from_remote",
+					options?.forceBackupProof,
+				);
 				bootstrapStarted = true;
 				const inheritedCleanup = await this.prepareForceBootstrap();
 
@@ -1599,6 +1623,51 @@ export class SyncEngine {
 			this.indexManager.cancelForceBootstrap();
 		}
 		return result;
+	}
+
+	/** Revalidate backup coverage before Force creates folders or mutates data. */
+	private async assertForceBackupProof(
+		direction: ForceBackupProof["direction"],
+		proof: ForceBackupProof | undefined,
+	): Promise<void> {
+		if (
+			!proof ||
+			proof.direction !== direction ||
+			!proof.snapshotDigest ||
+			!proof.backupName ||
+			!proof.backupSha256
+		) {
+			throw new ForceBackupStaleError(
+				"Force requires an exact verified backup proof",
+			);
+		}
+		const backupPath = joinPath(
+			this.settings.remotePath,
+			".backup",
+			proof.backupName,
+		);
+		const backup = await this.yandexClient.downloadStableRawFile(backupPath);
+		if (
+			!backup ||
+			(await computeSha256(backup.raw)) !== proof.backupSha256
+		) {
+			throw new ForceBackupStaleError(
+				"Verified Force backup is missing or changed",
+			);
+		}
+		await this.indexManager.assertForceCanonicalProof(proof.canonical);
+		const snapshot =
+			direction === "from_local"
+				? await captureRemoteRawSnapshot(
+						this.yandexClient,
+						this.settings.remotePath,
+					)
+				: await captureLogicalVaultSnapshot(this.vaultAdapter);
+		if (snapshot.digest !== proof.snapshotDigest) {
+			throw new ForceBackupStaleError(
+				"Protected data changed after the Force backup was verified",
+			);
+		}
 	}
 
 	/** Initialize one Force epoch while preserving resumable cleanup metadata. */
@@ -4701,6 +4770,9 @@ export class SyncEngine {
 		}
 		if (findErrorCause(error, (candidate) => candidate instanceof RemoteMaintenanceActiveError)) {
 			return "remote-maintenance";
+		}
+		if (findErrorCause(error, (candidate) => candidate instanceof ForceBackupStaleError)) {
+			return "force-backup-stale";
 		}
 		return undefined;
 	}

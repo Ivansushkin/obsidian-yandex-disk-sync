@@ -6,7 +6,7 @@ import JSZip from "jszip";
 import type { YandexDiskSyncSettings, BackupInfo } from "../types";
 import { YandexDiskClient, YandexApiError } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
-import { joinPath, toLocalPath } from "../utils/path-utils";
+import { joinPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { computeSha256 } from "../utils/hash-utils";
 import {
@@ -16,6 +16,10 @@ import {
 	sealBackupEnvelope,
 } from "./backup-envelope";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
+import {
+	captureLogicalVaultSnapshot,
+	captureRemoteRawSnapshot,
+} from "./backup-snapshot";
 
 export interface BackupResult {
 	success: boolean;
@@ -24,6 +28,7 @@ export interface BackupResult {
 	totalSize: number;
 	remoteFingerprint?: string;
 	sha256?: string;
+	snapshotDigest?: string;
 	error?: string;
 }
 
@@ -62,26 +67,12 @@ export class BackupManager {
 		try {
 			logger.info("Starting backup creation...");
 
-			// Get list of files to backup
-			const files = this.vaultAdapter.getAllSyncableFiles();
-			logger.info(`Found ${files.length} files to backup`);
+			const snapshot = await captureLogicalVaultSnapshot(this.vaultAdapter);
+			logger.info(`Found ${snapshot.files.length} files to backup`);
 
-			// Create ZIP archive
 			const zip = new JSZip();
-			let totalSize = 0;
-
-			for (const file of files) {
-				try {
-					const content = await this.vaultAdapter.readFile(file.path);
-					zip.file(file.path, content);
-					totalSize += content.byteLength;
-				} catch (error) {
-					logger.warn(
-						`Failed to read file for backup: ${file.path}`,
-						{ error },
-					);
-					throw error;
-				}
+			for (const file of snapshot.files) {
+				zip.file(file.path, file.content);
 			}
 
 			// Generate ZIP content
@@ -102,7 +93,7 @@ export class BackupManager {
 						kind: "logical-vault",
 						createdAt,
 						pluginVersion: this.pluginVersion,
-						fileCount: files.length,
+						fileCount: snapshot.files.length,
 					})
 				: zipContent;
 			const uploaded = await this.uploadVerifiedBackup(
@@ -113,8 +104,8 @@ export class BackupManager {
 
 			logger.info("Backup upload verified", {
 				backupName: uploaded.backupName,
-				fileCount: files.length,
-				totalSize,
+				fileCount: snapshot.files.length,
+				totalSize: snapshot.totalSize,
 				remoteFingerprint: uploaded.remoteFingerprint,
 				sha256: uploaded.sha256,
 			});
@@ -122,10 +113,11 @@ export class BackupManager {
 			return {
 				success: true,
 				backupName: uploaded.backupName,
-				fileCount: files.length,
-				totalSize,
+				fileCount: snapshot.files.length,
+				totalSize: snapshot.totalSize,
 				remoteFingerprint: uploaded.remoteFingerprint,
 				sha256: uploaded.sha256,
+				snapshotDigest: snapshot.digest,
 			};
 		} catch (error) {
 			const errorMessage =
@@ -150,35 +142,13 @@ export class BackupManager {
 		passwordOverride?: string,
 	): Promise<BackupResult> {
 		try {
-			const resources =
-				await this.yandexClient.getResourcesRecursive(
-					this.settings.remotePath,
-					true,
-				);
-			const files = resources.filter((resource) => {
-				if (resource.type !== "file") return false;
-				const relative = toLocalPath(
-					resource.path,
-					this.settings.remotePath,
-				);
-				return (
-					relative !== ".backup" &&
-					!relative.startsWith(".backup/")
-				);
-			});
+			const snapshot = await captureRemoteRawSnapshot(
+				this.yandexClient,
+				this.settings.remotePath,
+			);
 			const zip = new JSZip();
-			let totalSize = 0;
-			for (const file of files) {
-				const relative = toLocalPath(
-					file.path,
-					this.settings.remotePath,
-				);
-				const content = await this.yandexClient.downloadFile(
-					file.path,
-					true,
-				);
-				zip.file(`remote-raw/${relative}`, content);
-				totalSize += content.byteLength;
+			for (const file of snapshot.files) {
+				zip.file(`remote-raw/${file.path}`, file.content);
 			}
 			const zipContent = await zip.generateAsync({
 				type: "arraybuffer",
@@ -196,7 +166,7 @@ export class BackupManager {
 						kind: "remote-raw",
 						createdAt,
 						pluginVersion: this.pluginVersion,
-						fileCount: files.length,
+						fileCount: snapshot.files.length,
 					})
 				: zipContent;
 			const uploaded = await this.uploadVerifiedBackup(
@@ -206,18 +176,19 @@ export class BackupManager {
 			);
 			logger.info("Remote snapshot backup upload verified", {
 				backupName: uploaded.backupName,
-				rawObjectCount: files.length,
-				totalSize,
+				rawObjectCount: snapshot.files.length,
+				totalSize: snapshot.totalSize,
 				remoteFingerprint: uploaded.remoteFingerprint,
 				sha256: uploaded.sha256,
 			});
 			return {
 				success: true,
 				backupName: uploaded.backupName,
-				fileCount: files.length,
-				totalSize,
+				fileCount: snapshot.files.length,
+				totalSize: snapshot.totalSize,
 				remoteFingerprint: uploaded.remoteFingerprint,
 				sha256: uploaded.sha256,
+				snapshotDigest: snapshot.digest,
 			};
 		} catch (error) {
 			const message =

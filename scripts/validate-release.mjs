@@ -2,6 +2,11 @@ import { builtinModules } from "node:module";
 import { readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import process from "node:process";
+import {
+	parseScenarioEvidence,
+	parseScenarioRows,
+	validateScenarioCatalog,
+} from "./scenario-catalog.mjs";
 
 function readJson(path) {
 	return JSON.parse(readFileSync(path, "utf8"));
@@ -74,10 +79,20 @@ for (const name of forbiddenImports) {
 }
 
 const catalog = readFileSync("docs/SYNC_USER_SCENARIOS.md", "utf8");
+const smokeTests = readFileSync("docs/SMOKE_TESTS.md", "utf8");
 const testSources = readdirSync("tests")
 	.filter((name) => name.endsWith(".test.ts"))
-	.map((name) => readFileSync(`tests/${name}`, "utf8"))
-	.join("\n");
+	.map((name) => readFileSync(`tests/${name}`, "utf8"));
+const scenarioRows = parseScenarioRows(catalog);
+const scenarioErrors = validateScenarioCatalog(
+	catalog,
+	testSources,
+	smokeTests,
+);
+if (scenarioErrors.length > 0) {
+	fail(`scenario catalogue is invalid: ${scenarioErrors.join("; ")}`);
+}
+const scenariosById = new Map(scenarioRows.map((row) => [row.id, row]));
 for (const id of [
 	"ENC-011",
 	"ENC-012",
@@ -91,13 +106,9 @@ for (const id of [
 	"SAFE-011",
 	"SAFE-012",
 ]) {
-	const line = catalog.split("\n").find((candidate) => candidate.startsWith(`| ${id}`));
-	if (!line || !/auto: `[^`]+`/.test(line)) fail(`${id} lacks exact automated evidence`);
-	const evidenceCell = line.split("|").map((cell) => cell.trim()).at(-2) ?? "";
-	for (const name of [...evidenceCell.matchAll(/`([^`]+)`/g)].map((match) => match[1])) {
-		if (!testSources.includes(`test("${name}"`)) {
-			fail(`${id} references a missing test: ${name}`);
-		}
+	const row = scenariosById.get(id);
+	if (!row || parseScenarioEvidence(row.evidence).autoNames.length === 0) {
+		fail(`${id} lacks exact automated evidence`);
 	}
 }
 
@@ -109,25 +120,14 @@ if (stable) {
 	if (!/^[0-9a-f]{40}$/.test(evidence.testedCommit ?? "")) {
 		fail("verified 2.0.0 test commit SHA is missing");
 	}
-	const priorityLines = catalog
-		.split("\n")
-		.filter((line) => /^\|\s*[^|]+\s*\|\s*P[01]\s*\|/.test(line));
+	const priorityRows = scenarioRows.filter(
+		(row) => row.priority === "P0" || row.priority === "P1",
+	);
 	const entries = new Map(
 		(evidence.scenarios ?? []).map((entry) => [entry.scenarioId, entry]),
 	);
-	for (const line of priorityLines) {
-		const cells = line.split("|").map((cell) => cell.trim());
-		const id = cells[1];
-		const check = cells.at(-2) ?? "";
-		if (check.includes("auto:")) {
-			const names = [...check.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
-			if (names.length === 0) fail(`${id} uses generic automated evidence`);
-			for (const name of names) {
-				if (!testSources.includes(`test("${name}"`)) {
-					fail(`${id} references a missing test: ${name}`);
-				}
-			}
-		}
+	for (const row of priorityRows) {
+		const id = row.id;
 		const entry = entries.get(id);
 		if (
 			!entry ||

@@ -10,10 +10,12 @@
 - `P1` — синхронизация может остановиться, повторять операцию или потребовать
   ручного восстановления.
 - `P2` — проблема производительности, диагностики или удобства.
-- `auto` — сценарий должен выполняться автоматически.
-- Для P0/P1 `auto: \`точное имя теста\`` должно совпадать с реально прошедшим
-  исполняемым тестом. Generic suite labels не являются release evidence.
-- `manual-required` — требуется проверка на реальном Яндекс Диске и Obsidian.
+- `auto: \`точное имя теста\`` — сценарий проверяется указанным исполняемым
+  тестом; все перечисленные тесты должны пройти в release workflow.
+- Generic suite labels (`fault`, `integration`, `fake-yandex` и подобные) не
+  являются release evidence.
+- `manual-required` — требуется отдельная проверка на реальном Яндекс Диске и
+  Obsidian; `manual: \`TC-xx\`` ссылается на конкретный smoke case.
 - Под `canonical` понимается `.obsidian-sync-index.json`.
 - `Physical` — фактические пользовательские файлы на Яндекс Диске.
 - Локальный файл без baseline существует до первой успешной синхронизации
@@ -52,59 +54,60 @@
 | INIT-003 | P1  | Только remote-файлы                                    | Все файлы скачаны, baseline содержит server fingerprints          | manual-required |
 | INIT-004 | P1  | Одинаковый файл есть с обеих сторон                    | `none`, без повторной загрузки, baseline сохранён                 | manual-required |
 | INIT-005 | P0  | Разные файлы одного пути без local baseline            | Создаётся conflict copy; ни одна версия не теряется               | manual-required |
-| INIT-006 | P0  | Новый local-файл находится под старым folder tombstone | Local-файл считается новым и восстанавливает путь                 | auto: conflict-resolver |
+| INIT-006 | P0  | Новый local-файл находится под старым folder tombstone | Local-файл считается новым и восстанавливает путь                 | auto: `first-sync local descendant survives a folder tombstone` |
 | INIT-007 | P1  | Remote physical существует, canonical отсутствует      | Canonical строится из фактического remote/local merge             | manual-required |
-| INIT-008 | P1  | Canonical отсутствует, существует один активный lock   | Sync ждёт владельца; до stale-time lock не забирается             | auto: fault             |
-| INIT-009 | P1  | Canonical отсутствует, один неизменный stale lock      | Lock восстанавливается после двух стабильных наблюдений           | auto: fault             |
+| INIT-008 | P1  | Canonical отсутствует, существует один активный lock   | Sync ждёт владельца; до stale-time lock не забирается             | manual-required |
+| INIT-009 | P1  | Canonical отсутствует, один неизменный stale lock      | Lock восстанавливается после двух стабильных наблюдений           | manual-required |
 | INIT-010 | P0  | Несколько locks                                        | Normal sync блокируется; ни один lock не удаляется                | manual-required |
 | INIT-011 | P1  | Exact stable 1.0/1.1 canonical с `version: 1/2`          | Normal sync блокируется с инструкцией Force                       | auto: `plaintext stable 1.x startup preserves LegacyIndexFormatError`; manual-required |
-| INIT-012 | P1  | Numeric historical canonical вне stable shape             | Normal sync и Force блокируются как unsupported historical до remote writes | auto: `numeric historical canonical formats are rejected during normal load`; `Force rejects numeric historical canonical before any remote move`; `versioned data outside the exact stable 1.x shape is rejected before Force locks` |
+| INIT-012 | P1  | Numeric historical canonical вне stable shape             | Normal sync и Force блокируются как unsupported historical до remote writes | auto: `numeric historical canonical formats are rejected during normal load`; `Force rejects numeric historical canonical before any remote move`; `versioned data outside the exact stable 1.x shape is rejected before Force locks`; manual-required |
 | INIT-013 | P1  | Новый девайс, canonical current epoch                  | Выполняется initial merge; epoch принимается после reconciliation | manual-required |
-| INIT-014 | P0  | Старый девайс с другим непустым epoch                  | Full принимает новый epoch и выполняет трёхсторонний merge без Force | auto: `a full sync accepts a replacement epoch without Force ping-pong`; two-device |
-| INIT-015 | P1  | Первый запуск прерван после remote scan                | Следующий запуск повторяет merge без потери состояния             | auto: fault             |
-| INIT-016 | P2  | В remote только пустые папки                           | Папки не скачиваются и не попадают в canonical                    | auto: integration       |
+| INIT-014 | P0  | Старый девайс с другим непустым epoch                  | Full принимает новый epoch и выполняет трёхсторонний merge без Force | auto: `a full sync accepts a replacement epoch without Force ping-pong` |
+| INIT-015 | P1  | Первый запуск прерван после remote scan                | Следующий запуск повторяет merge без потери состояния             | manual-required |
+| INIT-016 | P2  | В remote только пустые папки                           | Папки не скачиваются и не попадают в canonical                    | manual-required |
 | INIT-017 | P1  | Token отсутствует или недействителен                   | Ни watcher, ни scheduler не изменяют remote                       | manual-required |
-| INIT-018 | P1  | Сеть недоступна при определении initial state          | Initial sync не подменяет remote пустым состоянием                | auto: fault             |
-| INIT-019 | P0  | Encrypted stable numeric canonical                    | Формат блокируется как unsupported; normal и Force не выполняют remote writes | auto: `encrypted legacy startup is rejected as unsupported data`; `encrypted legacy index is rejected before Force acquires a lock` |
-| INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable` |
-| INIT-021 | P0  | Watcher-событие возникает до/во время startup encryption guard | Событие durable-буферизуется; blocked/failed startup его не теряет | auto: `strict no-op validates encryption only once`; integration |
-| INIT-022 | P0  | Plaintext stable 1.0/1.1 обновляется до 2.0.0          | `localIndex` преобразуется в unobserved baseline до первого save; очереди создаются пустыми | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; integration |
-| INIT-023 | P0  | Remote содержит numeric encryption manifest           | Manifest блокируется как unsupported до upload/delete/cleanup | auto: `numeric historical manifests are rejected as unsupported data` |
-| INIT-024 | P0  | Unmarked local data содержит `localState` или historical queues | Plugin startup блокируется до создания watcher/scheduler и remote writes | auto: `unmarked historical queues are rejected` |
-| INIT-025 | P1  | Current `plugin-data` transition не содержит profile metadata | Snapshot не получает fallback; startup блокируется | auto: `current transition without profile metadata is rejected` |
-| INIT-026 | P0  | Unmarked local data содержит encrypted legacy-поля | Эти данные не принимаются за stable 1.0/1.1; startup блокируется до remote writes | auto: `unmarked encrypted legacy data is deliberately unsupported` |
+| INIT-018 | P1  | Сеть недоступна при определении initial state          | Initial sync не подменяет remote пустым состоянием                | manual-required |
+| INIT-019 | P0  | Encrypted historical numeric canonical                | Формат блокируется как unsupported; normal и Force не выполняют remote writes | auto: `encrypted legacy startup is rejected as unsupported data`; `encrypted legacy index is rejected before Force acquires a lock`; manual-required |
+| INIT-020 | P0  | Canonical не читается разрешёнными codec               | Startup блокируется без watcher, scheduler и remote mutation      | auto: `wrong encrypted index key is classified as unreadable`; manual-required |
+| INIT-021 | P0  | Watcher-событие возникает до/во время startup encryption guard | Событие durable-буферизуется; blocked/failed startup его не теряет | manual-required |
+| INIT-022 | P0  | Plaintext stable 1.0/1.1 обновляется до 2.0.0          | Settings, hashes и `localIndex` переходят в unobserved baseline; active mutation ID заменяется installation-scoped ID; current queues пусты | auto: `plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues`; manual-required |
+| INIT-023 | P0  | Remote содержит numeric encryption manifest           | Manifest блокируется как unsupported до upload/delete/cleanup | auto: `numeric historical manifests are rejected as unsupported data`; manual-required |
+| INIT-024 | P0  | Unmarked local data содержит `localState` или historical queues | Plugin startup блокируется до создания watcher/scheduler и remote writes | auto: `unmarked historical queues are rejected`; manual-required |
+| INIT-025 | P1  | Current `plugin-data` transition не содержит profile metadata | Snapshot не получает fallback; startup блокируется | auto: `current transition without profile metadata is rejected`; manual-required |
+| INIT-026 | P0  | Unmarked local data содержит encrypted legacy-поля | Эти данные не принимаются за stable 1.0/1.1; startup блокируется до remote writes | auto: `unmarked encrypted legacy data is deliberately unsupported`; manual-required |
+| INIT-027 | P1  | Fresh install возвращает `null` или `undefined` из `Plugin.loadData()` | Оба значения создают чистый current `plugin-data`; произвольные scalar/array/object значения fail closed | auto: `fresh plugin data accepts nullish storage and rejects arbitrary roots`; manual: `TC-01` |
 
 ## Обычный full и realtime
 
 | ID       | P   | Действие                                         | Ожидаемый результат                                             | Проверка                |
 | -------- | --- | ------------------------------------------------ | --------------------------------------------------------------- | ----------------------- |
-| SYNC-001 | P2  | Full без изменений                               | Нет physical операций и лишнего canonical commit                | auto: integration       |
+| SYNC-001 | P2  | Full без изменений                               | Нет physical операций и лишнего canonical commit                | manual-required |
 | SYNC-002 | P1  | Новый local-файл                                 | Один upload и один batch index commit                           | manual-required |
 | SYNC-003 | P1  | Новый remote-файл                                | Один download и сохранение baseline                             | manual-required |
 | SYNC-004 | P1  | Local edit                                       | SHA отличается от baseline, выполняется upload                  | manual-required |
 | SYNC-005 | P1  | Remote edit                                      | Fingerprint/mtime отличается от baseline, выполняется download  | manual-required |
 | SYNC-006 | P0  | Local и remote изменены независимо               | Создаётся conflict copy, сохраняются обе версии                 | manual-required |
-| SYNC-007 | P1  | Remote fingerprint изменился при том же mtime    | Изменение считается remote edit                                 | auto: conflict-resolver |
-| SYNC-008 | P1  | Fingerprint отсутствует, server mtime изменился  | Изменение считается remote edit без tolerance window            | auto: conflict-resolver |
+| SYNC-007 | P1  | Remote fingerprint изменился при том же mtime    | Изменение считается remote edit                                 | auto: `fingerprint detects a remote edit inside the old mtime tolerance` |
+| SYNC-008 | P1  | Fingerprint отсутствует, server mtime изменился  | Изменение считается remote edit без tolerance window            | manual-required |
 | SYNC-009 | P0  | Разные клиентские часы                           | Результат совпадает с вариантом без clock skew                  | manual-required |
 | SYNC-010 | P1  | Physical отсутствует при live canonical          | Файл восстанавливается с authoritative live-копии               | manual-required |
 | SYNC-011 | P1  | Physical существует без canonical entry          | Объект проходит безопасный initial/orphan merge                 | manual-required |
-| SYNC-012 | P1  | Obsidian закрыт до realtime debounce             | Следующий startup full обнаруживает изменение                   | auto: fault             |
-| SYNC-013 | P1  | Obsidian закрыт после durable mutation до upload | Mutation или filesystem state воспроизводится идемпотентно      | auto: fault             |
+| SYNC-012 | P1  | Obsidian закрыт до realtime debounce             | Следующий startup full обнаруживает изменение                   | manual-required |
+| SYNC-013 | P1  | Obsidian закрыт после durable mutation до upload | Mutation или filesystem state воспроизводится идемпотентно      | manual-required |
 | SYNC-014 | P1  | Edit во время full sync                          | Событие сохраняется и воспроизводится после сессии              | manual-required |
-| SYNC-015 | P1  | Create→modify в одном debounce                   | Загружается последний snapshot                                  | auto: file-watcher      |
-| SYNC-016 | P1  | Create→delete до flush                           | Не создаётся потерянный live entry                              | auto: file-watcher      |
-| SYNC-017 | P1  | Delete→create до flush                           | Итоговое состояние live                                         | auto: file-watcher      |
+| SYNC-015 | P1  | Create→modify в одном debounce                   | Загружается последний snapshot                                  | auto: `queued modify replaces an older event but not submitted work` |
+| SYNC-016 | P1  | Create→delete до flush                           | Не создаётся потерянный live entry                              | auto: `delete supersedes an uncommitted put without a FIFO gap` |
+| SYNC-017 | P1  | Delete→create до flush                           | Итоговое состояние live                                         | auto: `put after observing deletion restores the file` |
 | SYNC-018 | P1  | Engine записывает/удаляет локальный файл         | Watcher не создаёт обратную пользовательскую операцию           | manual-required |
-| SYNC-019 | P1  | Engine event приходит с большой задержкой        | Он подавляется по durable expectation, не по TTL                | auto: fault             |
-| SYNC-020 | P2  | Несколько scheduler/manual full одновременно     | Выполняется один coalesced full run                             | auto: coordinator       |
-| SYNC-021 | P2  | Realtime batch из нескольких файлов              | Контент читается и хешируется по одному разу, index commit один | auto: integration       |
-| SYNC-022 | P1  | Durable upload остался после закрытия до debounce, а файла при restart уже нет | Успешная full sync подтверждает captured ID без realtime replay и remote write | auto: `plaintext/encrypted no-op full consumes a stale watcher upload without remote write` |
+| SYNC-019 | P1  | Engine event приходит с большой задержкой        | Он подавляется по durable expectation, не по TTL                | manual-required |
+| SYNC-020 | P2  | Несколько scheduler/manual full одновременно     | Выполняется один coalesced full run                             | auto: `concurrent full requests share one execution` |
+| SYNC-021 | P2  | Realtime batch из нескольких файлов              | Контент читается и хешируется по одному разу, index commit один | manual-required |
+| SYNC-022 | P1  | Durable upload остался после закрытия до debounce, а файла при restart уже нет | Успешная full sync подтверждает captured ID без realtime replay и remote write | auto: `plaintext no-op full consumes a stale watcher upload without remote write`; `encrypted no-op full consumes a stale watcher upload without remote write` |
 | SYNC-023 | P0  | Upload создан во время full sync                  | Новый ID не поглощается barrier и воспроизводится после full    | auto: `successful full barrier acknowledges only pre-full uploads` |
 | SYNC-024 | P0  | Full sync завершилась с ошибками при pre-full upload | Captured upload остаётся durable и повторяется позже            | auto: `failed full barrier retains every captured upload`; `failed full sync postpones watcher replay` |
-| SYNC-025 | P0  | Успешный realtime `put-target`, затем full sync       | Confirmed baseline сохраняет fingerprint/mtime/revision; full выполняет `0/0/0` без index commit | auto: `plaintext/encrypted unsynced rename retargets the pending put`; integration |
+| SYNC-025 | P0  | Успешный realtime put, затем full sync                 | Confirmed baseline сохраняет fingerprint/mtime/revision; full выполняет `0/0/0` без index commit | auto: `confirmed baseline retains canonical causal metadata`; `full sync settles accepted and superseded puts through one watermark`; manual-required |
 | SYNC-026 | P0  | Retry существовал до full/maintenance                 | Старый retry не запускается повторно сразу после сессии; автоматически replay-ятся только новые/изменённые за время паузы события | auto: `successful session replays only watcher events created while paused`; `failed session does not replay watcher events created while paused` |
-| SYNC-027 | P0  | Manual/startup full запрошен во время upload → rename chain | Связанные upload и rename завершаются до reconciliation; неоднозначная цепочка блокирует full и старый путь не скачивается | auto: `startup blocks before reconciliation when an upload rename chain is unresolved`; integration |
+| SYNC-027 | P0  | Manual/startup full запрошен во время upload → rename chain | Связанные upload и rename завершаются до reconciliation; неоднозначная цепочка блокирует full и старый путь не скачивается | auto: `startup blocks before reconciliation when an upload rename chain is unresolved` |
 | SYNC-028 | P0  | Realtime commit обнаруживает новый epoch | Транзакция откатывается без четырёх retry, событие остаётся durable и ставится один coalesced full; повторная замена завершает full с `epoch-replaced-during-sync` | manual-required |
 
 
@@ -114,39 +117,39 @@
 | ------- | --- | ---------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------- |
 | DEL-001 | P0  | Local exact delete                                         | Tombstone commit предшествует physical delete                                 | manual-required |
 | DEL-002 | P0  | Remote exact delete                                        | Изменённый local-файл сохраняется в backup и удаляется                        | manual-required |
-| DEL-003 | P0  | Backup изменённого файла не создался                       | Tombstone остаётся, physical local delete не выполняется                      | auto: fault                 |
-| DEL-004 | P1  | Crash до tombstone commit                                  | Local deletion остаётся pending и повторяется                                 | auto: fault                 |
-| DEL-005 | P0  | Crash после tombstone до physical delete                   | Следующий запуск продолжает delete, не восстанавливает файл                   | auto: fault                 |
-| DEL-006 | P1  | Crash после physical delete до action confirmation         | Отсутствие файла идемпотентно завершает action                                | auto: fault                 |
+| DEL-003 | P0  | Backup изменённого файла не создался                       | Tombstone остаётся, physical local delete не выполняется                      | manual-required |
+| DEL-004 | P1  | Crash до tombstone commit                                  | Local deletion остаётся pending и повторяется                                 | manual-required |
+| DEL-005 | P0  | Crash после tombstone до physical delete                   | Следующий запуск продолжает delete, не восстанавливает файл                   | manual-required |
+| DEL-006 | P1  | Crash после physical delete до action confirmation         | Отсутствие файла идемпотентно завершает action                                | manual-required |
 | DEL-007 | P0  | Edit конкурентен exact delete и имеет старый base          | Delete побеждает, edit сохраняется в backup                                   | manual-required |
 | DEL-008 | P0  | Put создан после наблюдения exact tombstone                | Put восстанавливает canonical и physical path                                 | manual-required |
-| DEL-009 | P0  | Put commit произошёл между delete commit и physical delete | Delete не уничтожает более новое live-состояние либо put ремонтирует physical | auto: fault                 |
+| DEL-009 | P0  | Put commit произошёл между delete commit и physical delete | Delete не уничтожает более новое live-состояние либо put ремонтирует physical | auto: `a newer live canonical state cancels an old physical delete` |
 | DEL-010 | P1  | Physical уже отсутствует                                   | Delete action подтверждается без ошибки                                       | manual-required |
-| DEL-011 | P0  | Physical fingerprint изменился после staging delete        | Старый action не удаляет новый объект                                         | auto: fault                 |
-| DEL-012 | P1  | DELETE вернул async operation                              | Action завершается только после terminal success и проверки 404               | auto: fake-yandex           |
-| DEL-013 | P1  | DELETE async operation failed                              | Action остаётся pending                                                       | auto: fake-yandex           |
+| DEL-011 | P0  | Physical fingerprint изменился после staging delete        | Старый action не удаляет новый объект                                         | auto: `changed physical fingerprint defers remote deletion` |
+| DEL-012 | P1  | DELETE вернул async operation                              | Action завершается только после terminal success и проверки 404               | manual-required |
+| DEL-013 | P1  | DELETE async operation failed                              | Action остаётся pending                                                       | manual-required |
 | DEL-014 | P1  | Оба устройства удаляют один файл                           | Один tombstone, оба действия идемпотентны                                     | manual-required |
-| DEL-015 | P0  | Local-файл без baseline попал под exact tombstone          | Перед удалением создаётся backup, поскольку равенство baseline не доказано    | auto: physical-action-rules |
+| DEL-015 | P0  | Local-файл без baseline попал под exact tombstone          | Перед удалением создаётся backup, поскольку равенство baseline не доказано    | auto: `unknown or changed local content requires backup before deletion` |
 
 ## Удаление папки
 
 | ID       | P   | Действие и состояние потомка                                   | Ожидаемый результат                                        | Проверка                |
 | -------- | --- | -------------------------------------------------------------- | ---------------------------------------------------------- | ----------------------- |
-| FDEL-001 | P1  | Удалена пустая папка                                           | Нет canonical операции                                     | auto: file-watcher      |
+| FDEL-001 | P1  | Удалена пустая папка                                           | Нет canonical операции                                     | manual-required |
 | FDEL-002 | P0  | Удалена папка с неизменёнными файлами                          | Один prefix tombstone, потомки удалены                     | manual-required |
 | FDEL-003 | P0  | Глубокая папка со многими уровнями                             | Все известные потомки удалены, папки очищены deepest-first | manual-required |
 | FDEL-004 | P0  | Потомок изменён конкурентно                                    | Потомок остаётся live                                      | manual-required |
 | FDEL-005 | P0  | Потомок создан конкурентно                                     | Потомок остаётся live и восстанавливает ветку              | manual-required |
-| FDEL-006 | P0  | Explicit put имеет тот же SHA                                  | Потомок остаётся live                                      | auto: index-rules       |
+| FDEL-006 | P0  | Explicit put имеет тот же SHA                                  | Потомок остаётся live                                      | auto: `an explicit same-content put survives a concurrent folder deletion` |
 | FDEL-007 | P0  | Потомок неизвестен удаляющему устройству                       | Merge latest canonical сохраняет causally-new child        | manual-required |
-| FDEL-008 | P0  | Child put commit после folder tombstone commit                 | Physical delete не уничтожает принятый put                 | auto: fault             |
-| FDEL-009 | P0  | Локальный folder-derived tombstone встречает remote live child | Выполняется download, а не новый exact delete              | auto: conflict-resolver |
+| FDEL-008 | P0  | Child put commit после folder tombstone commit                 | Physical delete не уничтожает принятый put                 | auto: `a newer live canonical state cancels an old physical delete`; manual-required |
+| FDEL-009 | P0  | Локальный folder-derived tombstone встречает remote live child | Выполняется download, а не новый exact delete              | auto: `new remote descendant survives a folder tombstone` |
 | FDEL-010 | P1  | Один из массовых DELETE упал                                   | Остальные завершаются, failed action остаётся pending      | manual-required |
-| FDEL-011 | P1  | Crash после batch tombstone commit                             | Все незавершённые child actions воспроизводятся            | auto: fault             |
-| FDEL-012 | P2  | Папка содержит тысячи файлов                                   | Concurrency ограничена, canonical commit один              | auto: performance       |
-| FDEL-013 | P0  | Два устройства удаляют/редактируют одну ветку                  | Результат не зависит от порядка lock acquisition           | auto: permutation       |
-| FDEL-014 | P1  | В папке появился physical orphan                               | Папка не удаляется рекурсивно без live-empty проверки      | auto: fake-yandex       |
-| FDEL-015 | P1  | Файл перенесён в папку, переименован, затем папка удалена       | Historical source tombstone не получает physical action; удаляются только текущий live-путь и пустая папка | auto: `plaintext/encrypted rename tombstone is skipped by folder delete` |
+| FDEL-011 | P1  | Crash после batch tombstone commit                             | Все незавершённые child actions воспроизводятся            | manual-required |
+| FDEL-012 | P2  | Папка содержит тысячи файлов                                   | Concurrency ограничена, canonical commit один              | auto: `folder delete target planning handles ten thousand descendants`; manual-required |
+| FDEL-013 | P0  | Два устройства удаляют/редактируют одну ветку                  | Результат не зависит от порядка lock acquisition           | manual-required |
+| FDEL-014 | P1  | В папке появился physical orphan                               | Папка не удаляется рекурсивно без live-empty проверки      | manual-required |
+| FDEL-015 | P1  | Файл перенесён в папку, переименован, затем папка удалена       | Historical source tombstone не получает physical action; удаляются только текущий live-путь и пустая папка | auto: `plaintext rename tombstone is skipped by folder delete`; `encrypted rename tombstone is skipped by folder delete` |
 
 ## Rename и move
 
@@ -157,25 +160,25 @@
 | MOVE-003 | P0  | Target уже существует                                  | Target не перезаписывается; создаётся conflict/blocked result      | auto: `different physical target is not overwritten by rename` |
 | MOVE-004 | P0  | Concurrent edit old path                               | Правило конфликта применяется до physical move                     | manual-required |
 | MOVE-005 | P0  | Concurrent edit new path                               | Target не теряется                                                 | manual-required |
-| MOVE-006 | P1  | Crash после logical commit до move                     | Любое устройство завершает move идемпотентно                       | auto: fault       |
-| MOVE-007 | P1  | Crash после move до completion commit                  | Source absent + target present завершает action                    | auto: fault       |
-| MOVE-008 | P0  | Новый child появился в old subtree после folder rename | Child не перемещается/удаляется как устаревший без causal проверки | auto: fault       |
+| MOVE-006 | P1  | Crash после logical commit до move                     | Любое устройство завершает move идемпотентно                       | auto: `missing move target is materialized and completed` |
+| MOVE-007 | P1  | Crash после move до completion commit                  | Source absent + target present завершает action                    | auto: `rename acknowledgement replay detects an already applied target` |
+| MOVE-008 | P0  | Новый child появился в old subtree после folder rename | Child не перемещается/удаляется как устаревший без causal проверки | manual-required |
 | MOVE-009 | P1  | Rename из syncable в excluded                          | Old path удаляется remote, target не загружается                   | manual-required |
 | MOVE-010 | P1  | Rename из excluded в syncable                          | Target загружается как новый                                       | manual-required |
-| MOVE-011 | P1  | Async move failed/timeout                              | Move остаётся pending, оба пути проверяются повторно               | auto: fake-yandex |
-| MOVE-012 | P0  | Create → rename до начала upload                       | Загружается только target; source не получает tombstone, move или physical action | auto: `plaintext/encrypted unsynced rename retargets the pending put` |
-| MOVE-013 | P0  | Modify существующего файла → rename до upload          | Target содержит новый SHA; старый physical удаляется только после fingerprint guard | auto: `plaintext/encrypted modified source rename materializes target before cleanup` |
+| MOVE-011 | P1  | Async move failed/timeout                              | Move остаётся pending, оба пути проверяются повторно               | auto: `lost remote move response is confirmed from final state`; manual-required |
+| MOVE-012 | P0  | Create → rename до начала upload                       | Загружается только target; source не получает tombstone, move или physical action | auto: `plaintext unsynced rename retargets the pending put`; `encrypted unsynced rename retargets the pending put` |
+| MOVE-013 | P0  | Modify существующего файла → rename до upload          | Target содержит новый SHA; старый physical удаляется только после fingerprint guard | auto: `plaintext modified source rename materializes target before cleanup`; `encrypted modified source rename materializes target before cleanup` |
 | MOVE-014 | P0  | После прерванного move canonical target live, а source/target physical отсутствуют | Target materialize из совпадающего local snapshot, move/action завершаются за один full | auto: `missing move target is materialized and completed` |
 | MOVE-015 | P1  | Create A → rename A→B → создать новый A                | Rename и новый put имеют разные ID; canonical сохраняет оба файла | auto: `new file at the old path survives a queued rename`; manual-required |
 | MOVE-016 | P1  | Быстрые move A→B→C                                     | Не начатая цепочка coalesce до A→C; начатые шаги завершаются последовательно и идемпотентно | auto: `quick file rename chain coalesces to the final target`; manual-required |
-| MOVE-017 | P0  | Create → rename → deep move при занятом coordinator   | Queued цепочка становится одним A→C; submitted upload причинно передаёт accepted revision конечному rename | auto: `plaintext/encrypted durable create rename and deep move materializes only final path`; `plaintext/encrypted running upload hands its committed revision to a deep rename`; manual-required |
-| MOVE-018 | P0  | Successor появился до или после snapshot predecessor | До physical/index commit put retarget-ится; после начала commit successor использует подтверждённую revision | auto: `plaintext/encrypted rename after physical upload retargets before canonical commit`; `accepted submitted upload advances its rename before acknowledgement` |
-| MOVE-019 | P0  | Rename → delete target до commit                       | Операция становится delete причинного source либо noop для никогда не принятого put | auto: `queued rename followed by delete reduces to source deletion`; integration |
-| MOVE-020 | P0  | Full запрошен во время watcher drain                   | Cutoff destructive/rename events settle до full; более новые events остаются durable | auto: `settlement completes before the next session starts`; integration |
-| MOVE-021 | P0  | Durable rename, source и target уже отсутствуют после full | Событие становится superseded без remote read/write и удаляется из durable queue | auto: `plaintext/encrypted full supersedes a stale rename after both paths settle` |
+| MOVE-017 | P0  | Create → rename → deep move при занятом coordinator   | Queued цепочка становится одним A→C; submitted upload причинно передаёт accepted revision конечному rename | auto: `plaintext durable create rename and deep move materializes only final path`; `encrypted durable create rename and deep move materializes only final path`; `plaintext running upload hands its committed revision to a deep rename`; `encrypted running upload hands its committed revision to a deep rename`; manual-required |
+| MOVE-018 | P0  | Successor появился до или после snapshot predecessor | До physical/index commit put retarget-ится; после начала commit successor использует подтверждённую revision | auto: `plaintext rename after physical upload retargets before canonical commit`; `encrypted rename after physical upload retargets before canonical commit`; `accepted submitted upload advances its rename before acknowledgement` |
+| MOVE-019 | P0  | Rename → delete target до commit                       | Операция становится delete причинного source либо noop для никогда не принятого put | auto: `queued rename followed by delete reduces to source deletion` |
+| MOVE-020 | P0  | Full запрошен во время watcher drain                   | Cutoff destructive/rename events settle до full; более новые events остаются durable | auto: `settlement completes before the next session starts` |
+| MOVE-021 | P0  | Durable rename, source и target уже отсутствуют после full | Событие становится superseded без remote read/write и удаляется из durable queue | auto: `plaintext full supersedes a stale rename after both paths settle`; `encrypted full supersedes a stale rename after both paths settle` |
 | MOVE-022 | P0  | Durable rename, target уже подтверждён local/canonical | Событие подтверждается как `already-applied` без нового commit/upload/move/delete | auto: `full acknowledges an already applied rename target without remote write` |
 | MOVE-023 | P0  | Source остаётся causal-live, target отсутствует после full | Событие остаётся durable, full получает `watcher-rename-unresolved` и не продвигает observed revision | auto: `full leaves an ambiguous causal rename durable and reports an error` |
-| MOVE-024 | P0  | Rename появляется после начала canonical transaction upload | Upload подтверждается watermark/SHA, successor получает committed revision, old tombstone и final live фиксируются как causal move | auto: `plaintext/encrypted running upload hands its committed revision to a deep rename`; `plaintext/encrypted accepted upload receipt recovers after watcher settlement crash` |
+| MOVE-024 | P0  | Rename появляется после начала canonical transaction upload | Upload подтверждается watermark/SHA, successor получает committed revision, old tombstone и final live фиксируются как causal move | auto: `plaintext running upload hands its committed revision to a deep rename`; `encrypted running upload hands its committed revision to a deep rename`; `plaintext accepted upload receipt recovers after watcher settlement crash`; `encrypted accepted upload receipt recovers after watcher settlement crash` |
 
 ## Несколько устройств
 
@@ -185,33 +188,33 @@
 | MULTI-002 | P1  | Full против realtime                                | Ни одно пользовательское событие не теряется                                  | manual-required |
 | MULTI-003 | P1  | Realtime против realtime разных путей               | Оба изменения присутствуют в следующей revision                               | manual-required |
 | MULTI-004 | P0  | Два edit одного пути                                | Conflict copy, обе версии доступны                                            | manual-required |
-| MULTI-005 | P0  | Upload против exact delete                          | Causal delete/restore rules соблюдены                                         | auto: permutation   |
-| MULTI-006 | P0  | Folder delete против new child                      | New child остаётся live                                                       | auto: permutation   |
-| MULTI-007 | P0  | Rename против delete                                | Не остаётся live canonical без physical и наоборот                            | auto: permutation   |
+| MULTI-005 | P0  | Upload против exact delete                          | Causal delete/restore rules соблюдены                                         | auto: `deletion always replaces a concurrent present state`; `put after observing deletion restores the file` |
+| MULTI-006 | P0  | Folder delete против new child                      | New child остаётся live                                                       | auto: `child created after folder baseline is preserved` |
+| MULTI-007 | P0  | Rename против delete                                | Не остаётся live canonical без physical и наоборот                            | auto: `queued rename followed by delete reduces to source deletion` |
 | MULTI-008 | P0  | Offline device возвращается через много revisions   | Изменения сравниваются с его старым baseline                                  | manual-required |
-| MULTI-009 | P0  | Три устройства доставляют операции в разном порядке | Одинаковый causal graph даёт одинаковый итог                                  | auto: permutation   |
+| MULTI-009 | P0  | Три устройства доставляют операции в разном порядке | Одинаковый causal graph даёт одинаковый итог                                  | manual-required |
 | MULTI-010 | P0  | Vault/profile скопирован на второе устройство       | Устройства получают разные installation device IDs                            | manual-required |
-| MULTI-011 | P0  | `syncDotObsidian=true`                              | `data.json`, пароль и causal state плагина не синхронизируются как user files | auto: vault-adapter |
+| MULTI-011 | P0  | `syncDotObsidian=true`                              | `data.json`, пароль и causal state плагина не синхронизируются как user files | auto: `plugin installation data is never synchronized` |
 | MULTI-012 | P1  | Устройство offline во время Force                   | При возврате принимает последний remote epoch; локальный drift причинно вливается | manual-required |
-| MULTI-013 | P0  | Concurrent source edit/delete и target put во время rename-chain | Более новый source не удаляется, независимый target не перезаписывается, merge читает последнюю revision под lock | auto: `source changed after rename base survives as a concurrent file`; permutation |
-| MULTI-014 | P0  | Source создан или изменён другим устройством после baseRevision stale rename | Более новый source сохраняется, missing-target rename становится superseded без destructive action | auto: `post-full rename preserves newer sources and blocks causal ambiguity`; two-device |
+| MULTI-013 | P0  | Concurrent source edit/delete и target put во время rename-chain | Более новый source не удаляется, независимый target не перезаписывается, merge читает последнюю revision под lock | auto: `source changed after rename base survives as a concurrent file`; manual-required |
+| MULTI-014 | P0  | Source создан или изменён другим устройством после baseRevision stale rename | Более новый source сохраняется, missing-target rename становится superseded без destructive action | auto: `post-full rename preserves newer sources and blocks causal ambiguity` |
 
 ## Стабильное шифрование
 
 | ID      | P   | Сценарий                              | Ожидаемый результат                                              | Проверка               |
 | ------- | --- | ------------------------------------- | ---------------------------------------------------------------- | ---------------------- |
-| ENC-001 | P0  | Новый девайс вводит правильный пароль | Canonical и файлы читаются, baseline plaintext SHA корректен     | auto + manual-required |
+| ENC-001 | P0  | Новый девайс вводит правильный пароль | Canonical и файлы читаются, baseline plaintext SHA корректен     | auto: `hardened encryption round-trips content and deterministic Unicode filenames`; `encrypted current index loads without plaintext fallback`; manual-required |
 | ENC-002 | P0  | Неверный пароль                       | Sync и любые удаления блокируются                                | manual-required |
 | ENC-003 | P1  | Пользователь отменяет пароль          | Watcher/scheduler не запускаются                                 | manual-required |
-| ENC-004 | P0  | Обычные create/edit/delete/rename     | Logical результат совпадает с plaintext-вариантом                | auto: parameterized    |
+| ENC-004 | P0  | Обычные create/edit/delete/rename     | Logical результат совпадает с plaintext-вариантом                | manual-required |
 | ENC-005 | P0  | Remote ciphertext fingerprint изменён | Изменение обнаруживается без сравнения plaintext/ciphertext SHA  | manual-required |
-| ENC-006 | P0  | Index/lock/manifest                   | Имена service-файлов raw, index content зашифрован, manifest raw | auto: `canonical service path stays raw while its content may be encrypted`; `real encryption service transforms physical paths and content` |
-| ENC-007 | P0  | Wrong-key canonical                   | Ошибка расшифровки не интерпретируется как пустой remote         | auto: fault            |
+| ENC-006 | P0  | Index/lock/manifest                   | Имена service-файлов raw, index content зашифрован, manifest raw | auto: `canonical service path stays raw while its content may be encrypted`; `current encryption transforms every user path segment and content`; manual-required |
+| ENC-007 | P0  | Wrong-key canonical                   | Ошибка расшифровки не интерпретируется как пустой remote         | auto: `wrong encrypted index key is classified as unreadable` |
 | ENC-008 | P0  | Source/target codec во время transition | Явный codec не использует plaintext fallback                     | auto: `explicit transition codec does not fall back to plaintext` |
-| ENC-009 | P0  | Сбой enable/disable/rotate после установки transition codec | Общий executor всегда очищает source/target codec и запускает causal recovery | auto: `transition services are cleared after a failed re-encode`; fault matrix |
-| ENC-010 | P1  | Codec/manifest меняется после canonical commit либо при enable/disable/rotate | Corrective upload старым codec блокируется; folder observations старого physical namespace очищаются, следующий upload подтверждает/создаёт target directories | auto: `encryption change blocks proof-based physical repair`; `encryption codec change invalidates folder observations`; manual: `docs/SMOKE_TESTS.md` TC-08 |
+| ENC-009 | P0  | Сбой enable/disable/rotate после установки transition codec | Общий executor всегда очищает source/target codec и запускает causal recovery | auto: `transition services are cleared after a failed re-encode`; `transition fault matrix always invokes deterministic recovery` |
+| ENC-010 | P1  | Codec/manifest меняется после canonical commit либо при enable/disable/rotate | Corrective upload старым codec блокируется; folder observations старого physical namespace очищаются, следующий upload подтверждает/создаёт target directories | auto: `encryption change blocks proof-based physical repair`; `encryption codec change invalidates folder observations`; manual: `TC-08` |
 | ENC-011 | P0  | Fresh encrypted vault использует `hardened` | PBKDF2 600k, HKDF-separated content/filename keys, verifier domains и AES-SIV соответствуют strict semantic manifest | auto: `encryption manager emits strict semantic hardened manifest descriptors`; `hardened verifier uses the unnumbered verifier and content-key domains`; `AES-SIV matches the RFC 5297 deterministic vector` |
-| ENC-012 | P0  | Ciphertext имени повреждён, имеет invalid UTF-8 или декодируется в опасный segment | Sync блокируется до Vault API; raw ciphertext не становится logical path | auto: `hardened filename decryption rejects authenticated invalid UTF-8`; `invalid encrypted resource name never falls back to a logical path` |
+| ENC-012 | P0  | Ciphertext имени повреждён, имеет invalid UTF-8 или декодируется в опасный segment | Sync блокируется до Vault API; raw ciphertext не становится logical path | auto: `encrypted filenames fail closed on invalid paths and ciphertext`; `hardened filename decryption rejects authenticated invalid UTF-8`; `invalid encrypted resource name never falls back to a logical path` |
 | ENC-013 | P1  | Глубокая папка перемещается в `hardened` | Меняется physical segment корня, ciphertext всех потомков остаётся прежним | auto: `hardened folder moves keep descendant physical segments unchanged` |
 
 ## Переходы шифрования
@@ -222,7 +225,7 @@
 | TRANS-002 | P0  | Disable после source full                                        | Все logical files присутствуют plaintext                                                                       | manual-required |
 | TRANS-003 | P0  | Rotate после source full                                         | Все logical files доступны новым ключом                                                                        | manual-required |
 | TRANS-004 | P0  | Remote-only файл перед transition                                | Он сначала скачивается/разрешается и не удаляется cleanup                                                      | manual-required |
-| TRANS-005 | P0  | Source revision изменилась до maintenance claim                  | Preflight повторяется                                                                                          | auto: fault                               |
+| TRANS-005 | P0  | Source revision изменилась до maintenance claim                  | Preflight и обязательный backup повторяются для нового canonical snapshot                                     | manual-required |
 | TRANS-006 | P0  | Два устройства начинают transition                               | Только один получает ownership                                                                                 | manual-required |
 | TRANS-007 | P0  | Обычный sync начался до transition                               | Его index commit блокируется новым maintenance ID                                                              | manual-required |
 | TRANS-008 | P1  | Пользователь редактирует во время transition                     | Event durable и воспроизводится в target-режиме                                                                | manual-required |
@@ -234,17 +237,20 @@
 | TRANS-014 | P0  | Initiator потерян после commit                                   | Второе устройство завершает cleanup из canonical metadata                                                      | manual-required |
 | TRANS-015 | P0  | Source и target trees сосуществуют                               | Source tree не появляется в vault как новые файлы                                                              | manual-required |
 | TRANS-016 | P0  | Disable cleanup ещё не завершён                                  | Старый ciphertext не скачивается как plaintext user file                                                       | manual-required |
-| TRANS-017 | P0  | Fingerprint старого файла изменился                              | Cleanup не удаляет заменённый объект                                                                           | auto: fault                               |
+| TRANS-017 | P0  | Fingerprint старого файла изменился                              | Cleanup не удаляет заменённый объект                                                                           | manual-required |
 | TRANS-018 | P1  | Cleanup resource уже отсутствует                                 | Action завершается идемпотентно                                                                                | manual-required |
-| TRANS-019 | P0  | Manifest и canonical phase расходятся                            | Sync блокируется до deterministic recovery                                                                     | auto: fault                               |
-| TRANS-020 | P1  | Старый пароль после rotate                                       | Он не открывает target canonical; новый пароль открывает                                                       | auto + manual-required                    |
+| TRANS-019 | P0  | Manifest и canonical phase расходятся                            | Sync блокируется до deterministic recovery                                                                     | auto: `foreign post-commit maintenance is scoped to matching target recovery`; manual-required |
+| TRANS-020 | P1  | Старый пароль после rotate                                       | Он не открывает target canonical; новый пароль открывает                                                       | auto: `wrong encrypted index key is classified as unreadable`; `encrypted current index loads without plaintext fallback`; manual-required |
 | TRANS-021 | P0  | Source и target raw paths сравниваются при nested remote root    | Оба набора представлены путями относительно одного remote root; target не попадает в cleanup                   | manual-required |
 | TRANS-022 | P0  | Current transition с полной schema перезапущен, cleanup падает | Canonical сохраняет cleanup paths/fingerprints; target-capable устройство повторяет cleanup | manual-required |
-| TRANS-023 | P0  | Локальный transition без обязательной current profile metadata | Данные блокируются как unsupported historical без очистки baseline/очередей и без remote writes | auto: `current transition without profile metadata is rejected` |
+| TRANS-023 | P0  | Локальный transition без обязательной current profile metadata | Данные блокируются как unsupported historical без очистки baseline/очередей и без remote writes | auto: `current transition without profile metadata is rejected`; manual-required |
 | TRANS-024 | P0  | Fresh enable захватил canonical maintenance | Current manifest в состоянии enabling публикуется до инициализации target writes | auto: `target manifest is published after claim and before target writes` |
 | TRANS-025 | P0  | Crash сразу после target canonical commit | Cleanup paths и source fingerprints уже записаны в том же canonical commit | auto: `cleanup proof is committed atomically with target canonical state` |
 | TRANS-026 | P0  | Initiator потерян после commit | Только matching target transition может продолжить foreign post-commit maintenance; pre-commit state остаётся заблокирован | auto: `foreign post-commit maintenance is scoped to matching target recovery` |
 | TRANS-027 | P0  | Fault до claim, после manifest, во время copy, до/после commit или в cleanup | Общий executor вызывает recovery ровно один раз и не оставляет transition codec scope | auto: `transition fault matrix always invokes deterministic recovery` |
+| TRANS-028 | P0  | Enable committed, initiator потерян, manifest остаётся `enabling` | Устройство с target password проверяет descriptors и завершает target cleanup; pre-commit состояние остаётся заблокированным | auto: `foreign encrypted target recovery requires matching committed descriptors`; manual: `TC-08` |
+| TRANS-029 | P0  | Rotate committed, initiator потерян, manifest остаётся `rotating` | Устройство с новым password завершает target cleanup без source password; mismatched target блокируется | auto: `foreign encrypted target recovery requires matching committed descriptors`; manual: `TC-08` |
+| TRANS-030 | P0  | Disable committed, initiator потерян, manifest остаётся `disabling` либо уже удалён | Canonical читается как plaintext только в matching recovery scope; source ciphertext очищается только по fingerprints и не попадает в Vault | auto: `foreign disable target recovery accepts committed plaintext canonical`; `plaintext target recovery reads committed disable canonical without source key`; manual: `TC-08` |
 
 
 ## Force sync
@@ -257,40 +263,42 @@
 | FORCE-004 | P1  | Exact stable 1.0/1.1 numeric canonical  | Оба направления строят current canonical с новым epoch                  | auto: `plaintext stable 1.0/1.1 Force commits and verifies current canonical`; manual-required |
 | FORCE-005 | P1  | Несколько locks                        | Оба направления Force работоспособны; cleanup после commit              | manual-required |
 | FORCE-006 | P1  | Canonical отсутствует                  | Force создаёт новый canonical                                           | manual-required |
-| FORCE-007 | P0  | Старые pending mutations инициатора    | Они не переходят в новый epoch                                          | auto: operation-store |
-| FORCE-008 | P0  | Старый девайс возвращается после Force | Normal full принимает новый epoch, сохраняет локальные изменения и очищает старые causal queues | auto: `a full sync accepts a replacement epoch without Force ping-pong`; two-device |
+| FORCE-007 | P0  | Старые pending mutations инициатора    | Они не переходят в новый epoch                                          | auto: `force epoch reset clears old FIFO work and preserves new-epoch cleanup` |
+| FORCE-008 | P0  | Старый девайс возвращается после Force | Normal full принимает новый epoch, сохраняет локальные изменения и очищает старые causal queues | auto: `a full sync accepts a replacement epoch without Force ping-pong` |
 | FORCE-009 | P0  | Force local encrypted                  | Logical snapshot и новый epoch записываются текущим ключом              | manual-required |
 | FORCE-010 | P0  | Force remote encrypted                 | Physical ciphertext читается текущим ключом и перестраивает canonical   | manual-required |
 | FORCE-011 | P0  | Force во время active transition       | Разрешён только документированный recovery-flow                         | manual-required |
-| FORCE-012 | P1  | Crash до replacement commit            | Старый canonical остаётся авторитетным либо locks блокируют normal sync | auto: fault           |
-| FORCE-013 | P1  | Crash после replacement commit         | Новый epoch авторитетен, cleanup повторяем                              | auto: fault           |
+| FORCE-012 | P1  | Crash до replacement commit            | Старый canonical остаётся авторитетным либо locks блокируют normal sync | manual-required |
+| FORCE-013 | P1  | Crash после replacement commit         | Новый epoch авторитетен, cleanup повторяем                              | manual-required |
 | FORCE-014 | P0  | Optional-поля index проходят JSON roundtrip | Отсутствующее поле и `undefined` семантически равны; реальные различия сохраняются | auto: `semantic index comparison uses JSON undefined semantics` |
-| FORCE-015 | P0  | Перезапуск после частично завершённого Force | Существующий current canonical проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | auto: fake-yandex + manual-required |
+| FORCE-015 | P0  | Перезапуск после частично завершённого Force | Существующий current canonical проходит initial reconciliation без повторной загрузки одинаковых файлов; одиночный читаемый lock восстанавливается | manual-required |
 | FORCE-016 | P0  | Device 1 выполняет Force local, device 2 остаётся на старом epoch | Device 2 выполняет обычный full, принимает remote и больше не требует Force | manual-required |
 | FORCE-017 | P0  | После этого device 2 явно выполняет Force remote | Device 1 принимает следующее поколение обычным full; ping-pong требований Force отсутствует | manual-required |
-| FORCE-018 | P0  | Local и remote одновременно изменились между epoch | Создаётся одна conflict copy, remote остаётся на исходном пути | auto: `epoch adoption restores a remote deletion and conflicts on two live edits`; two-device |
+| FORCE-018 | P0  | Local и remote одновременно изменились между epoch | Создаётся одна conflict copy, remote остаётся на исходном пути | auto: `epoch adoption restores a remote deletion and conflicts on two live edits` |
 | FORCE-019 | P0  | Remote delete и local edit между epoch | Локальный edit восстанавливает путь новым put | auto: `epoch adoption restores a remote deletion and conflicts on two live edits` |
 | FORCE-020 | P0  | Старый folder delete не знает нового remote-потомка | Неизвестный потомок скачивается и не удаляется | auto: `unknown remote child survives an old device folder deletion` |
-| FORCE-021 | P0  | Force запущен против numeric historical canonical | Read-only preflight отклоняет format до lock и любых remote writes | auto: `Force rejects numeric historical canonical before any remote move` |
+| FORCE-021 | P0  | Canonical replacement transaction запущена против numeric historical canonical | Внутренний preflight отклоняет format до canonical lock/move | auto: `Force rejects numeric historical canonical before any remote move` |
+| FORCE-022 | P0  | Пользователь запускает полный UI → backup → Force flow против unsupported canonical | Read-only preflight отклоняет формат до backup upload; внутренний transaction guard повторно блокирует его до lock/move | auto: `Force rejects numeric historical canonical before any remote move`; `Force backup proof is required before any destructive operation`; manual: `TC-08` |
+| FORCE-023 | P0  | Canonical либо защищаемый local/remote snapshot изменился после подтверждённого backup | Proof точных backup bytes, canonical и защищаемого snapshot проверяется внутри coordinator; matching proof принимается, а любое отличие блокирует Force как stale до первой destructive operation и требует новый backup | auto: `Force backup proof binds the exact logical and remote snapshots`; `Force canonical proof becomes stale before any replacement write`; `Force backup proof is required before any destructive operation`; `Force backup proof accepts only the matching protected snapshot`; manual: `TC-07` |
 
 ## Сеть и Яндекс Диск API
 
 | ID      | P   | Ошибка                                 | Ожидаемый результат                                                       | Проверка                |
 | ------- | --- | -------------------------------------- | ------------------------------------------------------------------------- | ----------------------- |
-| NET-001 | P1  | 401/403                                | Операция останавливается без retry и без изменения causal state           | auto: fake-yandex       |
-| NET-002 | P1  | 404 после неоднозначного move          | Проверяются source, target и canonical                                    | auto: fake-yandex       |
-| NET-003 | P1  | 409/423 lock contention                | Retry с jitter, без overwrite чужого lock                                 | auto: fake-yandex       |
-| NET-004 | P1  | 429/503                                | Ограниченный exponential retry с jitter                                   | auto: fake-yandex       |
-| NET-005 | P1  | Quota exceeded                         | Mutation/action остаётся durable, пользователь видит причину              | auto: fake-yandex       |
-| NET-006 | P1  | Timeout после upload                   | Проверяется physical fingerprint до повтора                               | auto: fake-yandex       |
-| NET-007 | P1  | Timeout после canonical move           | Проверяются lock/canonical и fingerprint                                  | auto: fake-yandex       |
-| NET-008 | P1  | Async operation status `failed`        | Physical action не подтверждается                                         | auto: fake-yandex       |
-| NET-009 | P1  | Async operation timeout                | Состояние проверяется повторным read                                      | auto: fake-yandex       |
-| NET-010 | P0  | Root listing меняется между страницами | Snapshot повторяется либо commit блокируется                              | auto: fake-yandex       |
-| NET-011 | P1  | 1001+ объектов в root                  | Locks после первой страницы обнаруживаются                                | auto: index-transaction |
-| NET-012 | P1  | Fingerprint отсутствует                | Destructive action блокируется или использует подтверждённую альтернативу | auto: fake-yandex       |
-| NET-013 | P0  | Сбой после перезаписи захваченного lock | Исходные raw bytes восстанавливаются и проверяются до возврата canonical; неоднозначность не ретраится | auto: index-transaction + fake-yandex |
-| NET-014 | P0  | Persisted action содержит SHA-256, MD5, resource ID или modified | Совпадение принимается по любой поддерживаемой server identity, но новый destructive action использует единый strongest fingerprint | auto: `physical fingerprints accept every persisted server identity` |
+| NET-001 | P1  | 401/403                                | Операция останавливается без retry и без изменения causal state           | manual-required |
+| NET-002 | P1  | 404 после неоднозначного move          | Проверяются source, target и canonical                                    | manual-required |
+| NET-003 | P1  | 409/423 lock contention                | Retry с jitter, без overwrite чужого lock                                 | manual-required |
+| NET-004 | P1  | 429/503                                | Ограниченный exponential retry с jitter                                   | manual-required |
+| NET-005 | P1  | Quota exceeded                         | Mutation/action остаётся durable, пользователь видит причину              | manual-required |
+| NET-006 | P1  | Timeout после upload                   | Проверяется physical fingerprint до повтора                               | manual-required |
+| NET-007 | P1  | Timeout после canonical move           | Проверяются lock/canonical и fingerprint                                  | auto: `successful but timed out canonical move is classified as committed` |
+| NET-008 | P1  | Async operation status `failed`        | Physical action не подтверждается                                         | manual-required |
+| NET-009 | P1  | Async operation timeout                | Состояние проверяется повторным read                                      | manual-required |
+| NET-010 | P0  | Root listing меняется между страницами | Snapshot повторяется либо commit блокируется                              | auto: `changing pagination fails closed` |
+| NET-011 | P1  | 1001+ объектов в root                  | Locks после первой страницы обнаруживаются                                | auto: `remote root pagination reads objects after the first 1000 entries` |
+| NET-012 | P1  | Fingerprint отсутствует                | Destructive action блокируется или использует подтверждённую альтернативу | auto: `missing expected fingerprint defers remote deletion` |
+| NET-013 | P0  | Сбой после перезаписи захваченного lock | Исходные raw bytes восстанавливаются и проверяются до возврата canonical; неоднозначность не ретраится | auto: `unverified modified lock restores the encrypted source bytes`; `raw rollback comparison is byte exact` |
+| NET-014 | P0  | Persisted action содержит SHA-256, MD5, resource ID или modified | Совпадение принимается по любой поддерживаемой server identity, но новый destructive action использует единый strongest fingerprint | auto: `persisted physical actions accept every current server identity`; `physical fingerprints accept every persisted server identity` |
 | NET-015 | P0  | После принятого put другой device удаляет или изменяет canonical до physical repair | Proof не разрешает запись: перед corrective upload читается свежий canonical, более новое состояние сохраняется | auto: `foreign delete after commit cancels proof-based physical repair` |
 | NET-016 | P1  | Другой device удалил ранее наблюдавшийся upload parent либо upload получил exclusive 409 | 404 очищает cache, parent создаётся и upload повторяется один раз; 409 не запускает `mkdir` и не перезаписывает target | auto: `missing cached upload parent is recreated before retry`; `exclusive upload conflict never retries through folder creation` |
 
@@ -298,37 +306,37 @@
 
 | ID       | P   | Сценарий                            | Ожидаемый результат                                                  | Проверка            |
 | -------- | --- | ----------------------------------- | -------------------------------------------------------------------- | ------------------- |
-| PERF-001 | P2  | 10 000 live files                   | Ограничены память, API calls и время index commit                    | auto: benchmark     |
-| PERF-002 | P2  | 10 000 tombstones                   | Lookup зависит от глубины пути, не от размера history                | auto: benchmark     |
-| PERF-003 | P2  | 100 уровней вложенности             | Нет stack overflow и квадратичного folder traversal                  | auto: benchmark     |
-| PERF-004 | P2  | 5 000 файлов удаляются одной папкой | Один tombstone commit, bounded delete concurrency                    | auto: benchmark     |
-| PERF-005 | P2  | Realtime edit при большом index     | Один index rewrite, без повторного SHA/read файла                    | auto: benchmark     |
+| PERF-001 | P2  | 10 000 live files                   | Ограничены память, API calls и время index commit                    | manual-required |
+| PERF-002 | P2  | 10 000 tombstones                   | Lookup зависит от глубины пути, не от размера history                | auto: `folder tombstone lookup scales with path depth, not history size` |
+| PERF-003 | P2  | 100 уровней вложенности             | Нет stack overflow и квадратичного folder traversal                  | manual-required |
+| PERF-004 | P2  | 5 000 файлов удаляются одной папкой | Один tombstone commit, bounded delete concurrency                    | auto: `folder delete target planning handles ten thousand descendants`; manual-required |
+| PERF-005 | P2  | Realtime edit при большом index     | Один index rewrite, без повторного SHA/read файла                    | manual-required |
 | PERF-006 | P2  | Mobile с ограниченной памятью       | Нет одновременного хранения нескольких полных file-content snapshots | manual-required     |
-| PERF-007 | P2  | Encrypted no-op startup, 9 local/9 remote | Не более 13 GET, `0/0/0`, без index write и post-full realtime | manual-required; integration |
+| PERF-007 | P2  | Encrypted no-op startup, 9 local/9 remote | Не более 13 GET, `0/0/0`, без index write и post-full realtime | manual-required |
 | PERF-008 | P2  | Remote tree содержит независимые папки и `.backup` | Папки читаются с bounded concurrency, `.backup` не обходится | auto: `remote tree uses bounded folder concurrency and skips backup` |
-| PERF-009 | P2  | Realtime put/rename при доступном SHA-256/MD5 canonical | Stable root listing подтверждает same-session proof без повторного index download; hashless metadata использует semantic fallback | auto: `plaintext stable 1.0/1.1 Force commits and verifies current canonical`; `hashless canonical metadata falls back to semantic verification`; manual: `docs/SMOKE_TESTS.md` TC-02 |
-| PATH-001 | P1  | Unicode и emoji в имени             | Logical/physical mapping обратим                                     | auto: parameterized |
-| PATH-002 | P1  | Пробелы, `%`, `#`, `?`, `+`         | API path кодируется один раз                                         | auto: parameterized |
+| PERF-009 | P2  | Canonical commit имеет hash identity либо только hashless metadata | SHA-256/MD5 подтверждает commit fast path; hashless metadata использует semantic fallback | auto: `plaintext stable 1.0/1.1 Force commits and verifies current canonical`; `hashless canonical metadata falls back to semantic verification`; manual: `TC-02` |
+| PATH-001 | P1  | Unicode и emoji в имени             | Logical/physical mapping обратим                                     | auto: `hardened encryption round-trips content and deterministic Unicode filenames`; manual-required |
+| PATH-002 | P1  | Пробелы, `%`, `#`, `?`, `+`         | API path кодируется один раз                                         | manual-required |
 | PATH-003 | P1  | Имена, различающиеся регистром      | Поведение соответствует платформе и не объединяет entries молча      | manual-required     |
-| PATH-004 | P1  | Очень длинный путь                  | Ошибка API не повреждает canonical                                   | auto: fake-yandex   |
-| PATH-005 | P0  | Имя похоже на service lock          | Пользовательский protected path не перезаписывает служебный файл     | auto: vault-adapter |
+| PATH-004 | P1  | Очень длинный путь                  | Ошибка API не повреждает canonical                                   | manual-required |
+| PATH-005 | P0  | Имя похоже на service lock          | Пользовательский protected path не перезаписывает служебный файл     | manual-required |
 
 ## Backup и безопасность
 
 | ID       | P   | Сценарий                             | Ожидаемый результат                                | Проверка            |
 | -------- | --- | ------------------------------------ | -------------------------------------------------- | ------------------- |
 | SAFE-001 | P0  | Exact delete изменённого local-файла | Backup содержит точные исходные bytes              | manual-required |
-| SAFE-002 | P0  | Force local/remote                   | Без успешного backup продолжение невозможно        | auto: UI            |
-| SAFE-003 | P0  | Encryption password/device state     | Не попадают в user sync даже при `syncDotObsidian` | auto: vault-adapter |
+| SAFE-002 | P0  | Force local/remote                   | Без успешного backup продолжение невозможно        | manual-required |
+| SAFE-003 | P0  | Encryption password/device state     | Не попадают в user sync даже при `syncDotObsidian` | auto: `plugin installation data is never synchronized` |
 | SAFE-004 | P0  | Wrong encryption key                 | Не выполняются upload/delete/cleanup               | manual-required |
-| SAFE-005 | P1  | Backup создан старым encryption key  | UI явно сообщает способ восстановления до rotate   | manual-required     |
+| SAFE-005 | P1  | Encrypted backup создан до rotate/disable | После смены vault state сначала пробуется доступный пароль, затем UI запрашивает исходный backup password; сохраняется обычный ZIP | auto: `self-contained backup opens with its own password after vault state changes`; manual-required |
 | SAFE-006 | P1  | Cleanup старых overwritten backups   | Не блокирует sync и не удаляет свежие backup       | manual-required |
 | SAFE-007 | P0  | `.obsidian` отсутствует в Vault cache | Backup создаётся через DataAdapter в физической plugin-папке | auto: `hidden plugin backup uses DataAdapter and preserves exact bytes` |
 | SAFE-008 | P1  | Два backup одного пути подряд        | Создаются два независимых файла с уникальными именами | auto: `hidden plugin backup uses DataAdapter and preserves exact bytes` |
-| SAFE-009 | P0  | Write или verification backup упали  | Overwrite/delete/rename блокируются, исходный файл сохраняется | auto: `failed mandatory backup prevents a local overwrite` |
+| SAFE-009 | P0  | Write, verification или freshness proof backup упали | Overwrite/delete/rename блокируются, исходный файл сохраняется | auto: `backup rejects failed writes and failed verification`; `failed mandatory backup prevents a local overwrite`; `Force backup proof is required before any destructive operation`; manual-required |
 | SAFE-010 | P0  | Создан новый encrypted backup | Raw envelope самодостаточен, header аутентифицирован и ZIP открывается собственным паролем после rotate | auto: `backup envelope is self-contained and authenticated`; `self-contained backup opens with its own password after vault state changes` |
-| SAFE-011 | P0  | Backup upload вернул success, timeout или 409 | Успех подтверждается только exact SHA-256 и byte read-back; collision получает новое имя без overwrite | auto: `verified backup accepts an upload whose response was lost`; `exclusive 409 collision is read back and retried under a new name` |
-| SAFE-012 | P1  | Backup header/tag повреждён либо найден historical archive | Header fail-closed до KDF; принимается только plaintext ZIP или `OYDSBKP!`; historical encrypted name/bytes не декодируются | auto: `backup envelope rejects unbounded or unsupported headers before KDF`; `numbered historical envelope is rejected without invoking decryption`; `encrypted legacy backup names are ignored without compatibility decoding`; `unknown historical zip bytes fail closed without decryption fallback` |
+| SAFE-011 | P0  | Backup upload вернул success, timeout или 409 | Успех подтверждается только exact SHA-256 и byte read-back; collision получает новое имя без overwrite | auto: `verified backup accepts an upload whose response was lost`; `byte mismatch never overwrites and retries with a unique name`; `exclusive 409 collision is read back and retried under a new name` |
+| SAFE-012 | P1  | Backup header/tag повреждён либо найден historical archive | Header fail-closed до KDF; принимается только plaintext ZIP или `OYDSBKP!`; historical encrypted name/bytes не декодируются | auto: `backup envelope rejects unbounded or unsupported headers before KDF`; `numbered historical envelope is rejected without invoking decryption`; `encrypted legacy backup names are ignored without compatibility decoding`; `historical plaintext zip is returned without codec fallback`; `unknown historical zip bytes fail closed without decryption fallback` |
 
 ## Диагностика
 
@@ -336,42 +344,42 @@
 | -------- | -- | --------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------- |
 | DIAG-001 | P1 | Сбой index transaction на любом durable-шаге | По `sessionId` и `indexTransactionId` видны lock, epoch, revisions и результат retry | manual-required |
 | DIAG-002 | P1 | Crash во время encryption transition         | В журнале видны transition ID, kind, последняя сохранённая phase и recovery decision | manual-required |
-| DIAG-003 | P1 | `syncDotObsidian=true` и file logging включён | Текущий и legacy debug log не попадают в watcher и пользовательскую синхронизацию    | auto: path-utils    |
-| DIAG-004 | P2 | Несколько flush происходят одновременно      | Записи сериализованы, не теряются и журнал остаётся ограниченным по размеру           | auto: logger        |
-| DIAG-005 | P0 | Контекст содержит пароль, token или key       | Секреты маскируются до console/file output                                           | auto: logger        |
+| DIAG-003 | P1 | `syncDotObsidian=true` и file logging включён | Текущий и historical debug log не попадают в watcher и пользовательскую синхронизацию | auto: `plugin installation data is never synchronized`; `legacy debug log directory is never synchronized` |
+| DIAG-004 | P2 | Несколько flush происходят одновременно      | Записи сериализованы, не теряются и журнал остаётся ограниченным по размеру           | auto: `logger serializes concurrent flushes without losing entries`; `logger rotates by UTF-8 byte size and keeps newest entries` |
+| DIAG-005 | P0 | Контекст содержит пароль, token или key       | Секреты маскируются до console/file output                                           | auto: `logger writes correlated sanitized diagnostics to plugin data` |
 | DIAG-006 | P1 | Force вернул `success=false`                  | Журнал содержит `completed with errors` и transaction outcome, но не сообщение об успешном завершении | manual-required |
-| DIAG-007 | P1 | Ни один index codec не читается               | Лог содержит стадии codec, размер, fingerprint и короткий SHA без index/ciphertext   | auto: index-manager |
-| DIAG-008 | P2 | Удаление папки поглощает дочерние watcher events | Лог содержит число live targets, пропущенных historical tombstones и оставшихся physical actions | auto: folder-delete |
+| DIAG-007 | P1 | Ни один index codec не читается               | Лог содержит стадии codec, размер, fingerprint и короткий SHA без index/ciphertext   | manual-required |
+| DIAG-008 | P2 | Удаление папки поглощает дочерние watcher events | Лог содержит число live targets, пропущенных historical tombstones и оставшихся physical actions | manual-required |
 | DIAG-009 | P1 | После post-pass остаётся pending move          | Full sync пишет `completed with errors`, сохраняет action и не продвигает observed revision | auto: `unresolved final move recovery records a full-sync error`; manual-required |
-| DIAG-010 | P1 | Realtime batch вернул структурированный `retry` | Пишется warning-summary с `completed/superseded/retry`; событие остаётся durable без общего replay error | auto: `structured watcher retry remains durable without throwing` |
-| DIAG-011 | P2 | Startup/full завершён без изменений             | Summary содержит GET по manifest/index/root/tree, concurrency и длительность без путей/ciphertext | auto: integration; manual-required |
-| DIAG-012 | P1 | Enable, disable и rotate падают на одинаковой фазе | Все три режима проходят один executor, сохраняют одинаковый phase/recovery contract и не оставляют transition codec | auto: `all rewrite modes use the same post-commit cleanup`; fault matrix |
-| DIAG-013 | P1 | Rename superseded/rebased ожидаемым локальным событием | Лог содержит event ID, исходный session ID и `rebased`/`already-applied` без повторных error stack | auto: file-watcher; manual-required |
-| DIAG-014 | P1 | Startup завершён без canonical maintenance/cleanup | После full не создаётся пустая maintenance/realtime-сессия; summary содержит post-full rename settlement и число новых replay events | auto: full-sync-barrier; manual-required |
-| DIAG-015 | P1 | Submitted upload причинно передан rename              | Лог содержит predecessor event ID, mutation sequence, handoff state и accepted revision; rename не маскируется как независимый `put-target` | auto: file-watcher + file-rename; manual-required |
-| DIAG-018 | P2 | Canonical commit и repair выбирают fast path либо fallback | Лог содержит decision, revision и короткий fingerprint, но не index, path или ciphertext | manual: `docs/SMOKE_TESTS.md` TC-02 |
+| DIAG-010 | P1 | Realtime batch вернул структурированный `retry` | Пишется warning-summary с `completed/superseded/retry`; событие остаётся durable без общего replay error | manual-required |
+| DIAG-011 | P2 | Startup/full завершён без изменений             | Summary содержит GET по manifest/index/root/tree, concurrency и длительность без путей/ciphertext | manual-required |
+| DIAG-012 | P1 | Enable, disable и rotate падают на одинаковой фазе | Все три режима проходят один executor, сохраняют одинаковый phase/recovery contract и не оставляют transition codec | auto: `all rewrite modes use the same post-commit cleanup`; `transition fault matrix always invokes deterministic recovery` |
+| DIAG-013 | P1 | Rename superseded/rebased ожидаемым локальным событием | Лог содержит event ID, исходный session ID и `rebased`/`already-applied` без повторных error stack | manual-required |
+| DIAG-014 | P1 | Startup завершён без canonical maintenance/cleanup | После full не создаётся пустая maintenance/realtime-сессия; summary содержит post-full rename settlement и число новых replay events | manual-required |
+| DIAG-015 | P1 | Submitted upload причинно передан rename              | Лог содержит predecessor event ID, mutation sequence, handoff state и accepted revision; rename не маскируется как независимый `put-target` | manual-required |
+| DIAG-018 | P2 | Canonical commit и repair выбирают fast path либо fallback | Лог содержит decision, revision и короткий fingerprint, но не index, path или ciphertext | manual: `TC-02` |
 
 ## UI синхронизации
 
 | ID     | P  | Сценарий | Ожидаемый результат | Проверка |
 | ------ | -- | -------- | -------------------- | -------- |
-| UI-001 | P1 | Пользователь запускает manual full | Один persistent Notice появляется до watcher drain, обновляется тем же экземпляром по фазам и через 5 секунд скрывается после успеха | auto: `full UI activity starts before watcher preparation`; integration; manual-required |
+| UI-001 | P1 | Пользователь запускает manual full | Один persistent Notice появляется до watcher drain, обновляется тем же экземпляром по фазам и через 5 секунд скрывается после успеха | auto: `full UI activity starts before watcher preparation`; manual-required |
 | UI-002 | P0 | Manual full ожидает медленную realtime rename-цепочку | Внешняя full-сессия сохраняет UI ownership: сначала видны подготовка и ожидание; внутренняя realtime-сессия не закрывает и не подменяет Notice | manual-required |
-| UI-003 | P1 | No-op full | Видны подготовка, scan, анализ и завершение без `0%`; итог сообщает об отсутствии изменений, canonical не записывается | auto: full-sync-barrier + sync-ui; manual-required |
+| UI-003 | P1 | No-op full | Видны подготовка, scan, анализ и завершение без `0%`; итог сообщает об отсутствии изменений, canonical не записывается | auto: `changing sync phase clears progress from the previous phase`; `activity formatting omits determinate progress when total is unknown`; manual-required |
 | UI-004 | P1 | Standalone realtime batch | Status bar показывает realtime и монотонный `N/M` по durable events; progress Notice не создаётся | manual-required |
 | UI-005 | P1 | Startup либо scheduler full | Все реальные фазы видны в status bar, progress Notice не создаётся; блокировка создаёт один persistent Notice | manual-required |
 | UI-006 | P0 | Force local/remote с обязательным backup | Один Notice живёт от подтверждённого backup через Force и restart watcher/scheduler до финального успеха либо ошибки | manual-required |
 | UI-007 | P0 | Enable, disable или rotate encryption | Один Notice отражает maintenance/re-encode/commit/cleanup; вложенная операция не вытесняет внешнюю maintenance-сессию | manual-required |
 | UI-008 | P0 | Auth, legacy, wrong password или ambiguous lock блокируют sync | Нет ложного success; пользователь получает один дедуплицированный persistent Notice, watcher/scheduler остановлены | manual-required |
-| UI-009 | P1 | Экран настроек открыт без токена либо с 401/403 | Backup API не вызывается при пустом токене; показывается «Статус резервных копий недоступен» без ERROR-spam | unit; manual-required |
+| UI-009 | P1 | Экран настроек открыт без токена либо с 401/403 | Backup API не вызывается при пустом токене; показывается «Статус резервных копий недоступен» без ERROR-spam | manual-required |
 
 ## Причинные операции над папками и migration stable 1.x
 
 | ID        | P  | Сценарий | Ожидаемый результат | Проверка |
 | --------- | -- | -------- | -------------------- | -------- |
 | MOVE-025  | P0 | Быстрый folder move с механическими child rename | Child events поглощаются parent mutation; только конечные paths live | manual-required |
-| MOVE-026  | P0 | Folder chain `A → B → C` до remote work | Один logical move `A → C`, не создаются intermediate live paths | auto: `queued folder rename chains reduce to one final target`; integration |
-| MOVE-027  | P0 | User child rename отличается от механического target | Событие rebased относительно target folder и выполняется после parent receipt | auto: `user child rename is rebased relative to the folder target`; integration |
+| MOVE-026  | P0 | Folder chain `A → B → C` до remote work | Один logical move `A → C`, не создаются intermediate live paths | auto: `queued folder rename chains reduce to one final target` |
+| MOVE-027  | P0 | User child rename отличается от механического target | Событие rebased относительно target folder и выполняется после parent receipt | auto: `user child rename is rebased relative to the folder target` |
 | MOVE-028  | P0 | Crash после logical folder commit и части file moves | Parent move остаётся durable; restart завершает pairs и один completion commit | manual-required |
 | FDEL-016  | P0 | Folder delete после собственных revisions при старом observedRevision | Потомки с меньшим same-device sequence удаляются; foreign/newer сохраняются | manual-required |
 | MULTI-016 | P0 | Другой device меняет child во время folder move/delete | Foreign child и отличающийся target не удаляются и не перезаписываются | manual-required |
@@ -382,16 +390,16 @@
 | MOVE-030  | P0 | Folder move встречает существующий target с другим SHA | Ноль canonical/physical writes; source и local target сохраняются; event остаётся durable с `folder-target-conflict` | auto: `folder target conflict performs no canonical or physical writes` |
 | FDEL-017  | P0 | Current file entry не содержит `mutationSeq` | Entry не разрешает destructive folder operation ни при каком baseline | auto: `unsequenced current child never authorizes a destructive folder mutation` |
 | SYNC-030  | P0 | Full обнаруживает новое локальное удаление файла | До tombstone сохраняется FIFO mutation; canonical получает sequence и watermark; existing foreign tombstone сохраняет attribution | auto: `full-discovered logical delete receives and confirms a FIFO sequence`; `applying a canonical tombstone preserves foreign causal attribution` |
-| INDEX-001 | P0 | JSON декодирован, но current canonical имеет неверную структуру | Возвращается semantic invalid-index; codec fallback, Force и remote mutation не выполняются | auto: `malformed current canonical is rejected as a semantic index error`; `current canonical file without mutationSeq is rejected` |
-| PERF-010  | P1 | Folder move/delete на 10 000 descendants | Планирование использует Set/Map, targeted API calls линейны, concurrency ≤ 4, index commits ≤ 2 | auto: `folder delete target planning handles ten thousand descendants`; move/API/commit manual-required |
+| INDEX-001 | P0 | JSON декодирован, но current canonical имеет неверную структуру | Возвращается semantic invalid-index; codec fallback, Force и remote mutation не выполняются | auto: `malformed current canonical is rejected as a semantic index error`; `current canonical file without mutationSeq is rejected`; manual-required |
+| PERF-010  | P1 | Folder move/delete на 10 000 descendants | Планирование использует Set/Map, targeted API calls линейны, concurrency ≤ 4, index commits ≤ 2 | auto: `folder delete target planning handles ten thousand descendants`; manual-required |
 
 ## Последовательное редактирование и causal FIFO
 
 | ID        | P  | Сценарий | Ожидаемый результат | Проверка |
 | --------- | -- | -------- | -------------------- | -------- |
-| SYNC-031  | P0 | Один device продолжает редактировать файл, пока предыдущий upload/commit ещё выполняется | Последний snapshot становится canonical; собственная предыдущая revision не создаёт conflict copy; следующий full `0/0/0` | auto: `continuous same-device edit ignores an older base revision`; `canonical transaction accepts a continuous same-device edit`; manual: `docs/SMOKE_TESTS.md` TC-03 |
-| MULTI-017 | P0 | Foreign edit коммитится между двумя mutations первого device | Следующий put первого device не получает same-device приоритет и создаёт ровно одну настоящую conflict copy | auto: `foreign edit keeps base-revision conflict rules`; `canonical transaction still rejects a concurrent foreign edit`; manual: `docs/SMOKE_TESTS.md` TC-04 |
-| DIAG-017  | P1 | Continuous edit, replay и FIFO corruption | Лог различает `accepted-put`, `coalesced`, `idempotent`, `stale-same-device`, `foreign-conflict`, `unresolved`; expected coalescing не пишет error stack | auto: `accepted upload advances a later queued edit of the same path`; `plaintext applied edit replay is acknowledged without a second upload`; `encrypted applied edit replay is acknowledged without a second upload` |
+| SYNC-031  | P0 | Один device продолжает редактировать файл, пока предыдущий upload/commit ещё выполняется | Последний snapshot становится canonical; собственная предыдущая revision не создаёт conflict copy; следующий full `0/0/0` | auto: `continuous same-device edit ignores an older base revision`; `canonical transaction accepts a continuous same-device edit`; manual: `TC-03` |
+| MULTI-017 | P0 | Foreign edit коммитится между двумя mutations первого device | Следующий put первого device не получает same-device приоритет и создаёт ровно одну настоящую conflict copy | auto: `foreign edit keeps base-revision conflict rules`; `canonical transaction still rejects a concurrent foreign edit`; manual: `TC-04` |
+| DIAG-017  | P1 | Continuous edit, replay и FIFO corruption | Лог различает `accepted-put`, `coalesced`, `idempotent`, `stale-same-device`, `foreign-conflict`, `unresolved`; expected coalescing не пишет error stack | manual-required |
 
 ## Матрица вариантов
 

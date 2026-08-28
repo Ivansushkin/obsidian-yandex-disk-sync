@@ -225,6 +225,13 @@ Plaintext stable 1.0/1.1 canonical с точной формой `version: 1` и�
 выполняет Force sync с обязательным backup на авторитетном устройстве.
 Encrypted legacy и все остальные historical formats блокируются даже при
 Force. Force выполняет read-only classification до захвата canonical lock.
+UI запускает эту classification до создания обязательного backup. После
+exact byte read-back backup внутрь `SyncCoordinator` передаётся proof: SHA-256
+самого backup, точная raw identity canonical и digest защищаемого snapshot.
+`SyncEngine` повторно скачивает backup, canonical и защищаемый snapshot до
+`beginForceBootstrap`, создания папок и любых local/remote writes. Любое
+изменение делает proof stale и требует новый backup; index transaction
+дополнительно повторяет format guard непосредственно перед lock.
 Current canonical хранит `mutationSeq` в file metadata, folder tombstones и moves. Folder move
 фиксирует logical intent одной revision, а физически выполняется как
 ограниченная пачка guarded file moves; folder-level move API не используется.
@@ -491,7 +498,11 @@ commit canonical читается source codec, после commit — тольк
 Cleanup paths и source fingerprints фиксируются атомарно с target canonical,
 поэтому другое target-capable устройство может завершить post-commit cleanup
 без source password. `IndexManager` разрешает это только matching transition ID
-и post-commit phase. Подробный wire и recovery contract описан в
+и post-commit phase. Для enable/rotate target canonical читается только после
+проверки transitional manifest, target descriptors и verifier. Для disable
+target canonical явно читается plaintext внутри того же recovery scope;
+удалённый после commit manifest допустим только для matching plaintext target.
+Подробный wire и recovery contract описан в
 [E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
 
 ## Тестирование

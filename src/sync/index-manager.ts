@@ -115,6 +115,10 @@ export interface LocalCausalSnapshot {
 	physicalActions: PendingPhysicalAction[];
 }
 
+export type ForceCanonicalProof =
+	| { state: "absent" }
+	| { state: "present"; rawSha256: string };
+
 type IndexCodecAttemptResult =
 	| { data: unknown }
 	| { attempt: IndexDecodeAttempt };
@@ -381,6 +385,56 @@ export class IndexManager {
 			return await action();
 		} finally {
 			this.targetRecoveryMaintenanceId = null;
+		}
+	}
+
+	/** Classify and fingerprint canonical before a Force backup can be created. */
+	async captureForceCanonicalProof(): Promise<ForceCanonicalProof> {
+		const canonicalPath = this.getRemoteIndexPath();
+		const resource = await this.yandexClient.getResource(
+			canonicalPath,
+			1,
+			0,
+			true,
+		);
+		if (!resource) return { state: "absent" };
+		const allowPlaintextLegacy =
+			this.transitionIndexReadService === undefined &&
+			!this.yandexClient.hasEncryptionService();
+		try {
+			const snapshot = await this.downloadIndexSnapshot(
+				canonicalPath,
+				allowPlaintextLegacy,
+				this.transitionIndexReadService,
+				"source",
+				resource,
+			);
+			return {
+				state: "present",
+				rawSha256: await computeSha256(snapshot.raw),
+			};
+		} catch (error) {
+			if (
+				!allowPlaintextLegacy &&
+				error instanceof LegacyIndexFormatError
+			) {
+				throw new UnsupportedHistoricalDataError(
+					"Encrypted legacy canonical data is unsupported",
+				);
+			}
+			throw error;
+		}
+	}
+
+	/** Revalidate the canonical bytes protected by a completed Force backup. */
+	async assertForceCanonicalProof(
+		expected: ForceCanonicalProof,
+	): Promise<void> {
+		const actual = await this.captureForceCanonicalProof();
+		if (stableSerialize(actual) !== stableSerialize(expected)) {
+			throw new ForceBackupStaleError(
+				"Canonical changed after the Force backup was verified",
+			);
 		}
 	}
 
@@ -932,6 +986,41 @@ export class IndexManager {
 		return await this.downloadIndex(path, false);
 	}
 
+	/** Read canonical with an explicit target codec without changing local state. */
+	async readCanonicalIndexWithCodec(
+		service: EncryptionCodec | null,
+	): Promise<SyncIndex> {
+		const index = await this.readCanonicalIndexWithCodecIfPresent(service);
+		if (index) return index;
+		throw new RemoteIndexConcurrentModificationError(
+			"Canonical index is missing",
+		);
+	}
+
+	/** Read explicitly decoded canonical when one already exists. */
+	async readCanonicalIndexWithCodecIfPresent(
+		service: EncryptionCodec | null,
+	): Promise<SyncIndex | null> {
+		const path = await this.waitForCanonicalIndex();
+		if (!path) return null;
+		return await this.downloadIndex(path, false, service);
+	}
+
+	/** Adopt explicitly decoded canonical only inside matching target recovery. */
+	async loadRemoteIndexWithTargetCodec(
+		service: EncryptionCodec | null,
+	): Promise<SyncIndex> {
+		if (this.targetRecoveryMaintenanceId === null) {
+			throw new Error("Explicit target codec requires recovery ownership");
+		}
+		const index = await this.readCanonicalIndexWithCodec(service);
+		this.assertEpochCompatible(index);
+		this.assertMaintenanceCompatible(index);
+		this.remoteIndex = this.cloneIndex(index);
+		this.loadedRemoteIndex = this.cloneIndex(index);
+		return this.remoteIndex;
+	}
+
 	/**
 	 * Read canonical state for post-commit repair, reusing a same-session proof
 	 * only when a stable root listing still exposes the same content hash.
@@ -1083,7 +1172,7 @@ export class IndexManager {
 		logger.info("Canonical index transaction started", transactionContext);
 
 		if (this.replaceRemoteOnNextSave) {
-			await this.assertForceSourceSupported(canonicalPath);
+			await this.assertForceSourceSupported();
 		}
 		await this.ensureCanonicalIndex();
 
@@ -1406,38 +1495,8 @@ export class IndexManager {
 	}
 
 	/** Reject unsupported historical or malformed data before Force takes a lock. */
-	private async assertForceSourceSupported(
-		canonicalPath: string,
-	): Promise<void> {
-		const resource = await this.yandexClient.getResource(
-			canonicalPath,
-			1,
-			0,
-			true,
-		);
-		if (!resource) return;
-		const allowPlaintextLegacy =
-			this.transitionIndexReadService === undefined &&
-			!this.yandexClient.hasEncryptionService();
-		try {
-			await this.downloadIndexSnapshot(
-				canonicalPath,
-				allowPlaintextLegacy,
-				this.transitionIndexReadService,
-				"source",
-				resource,
-			);
-		} catch (error) {
-			if (
-				!allowPlaintextLegacy &&
-				error instanceof LegacyIndexFormatError
-			) {
-				throw new UnsupportedHistoricalDataError(
-					"Encrypted legacy canonical data is unsupported",
-				);
-			}
-			throw error;
-		}
+	private async assertForceSourceSupported(): Promise<void> {
+		await this.captureForceCanonicalProof();
 	}
 
 	/**
@@ -3536,6 +3595,13 @@ export class RemoteIndexConcurrentModificationError extends RemoteIndexTransacti
 			lockContention,
 			cause,
 		);
+	}
+}
+
+export class ForceBackupStaleError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ForceBackupStaleError";
 	}
 }
 

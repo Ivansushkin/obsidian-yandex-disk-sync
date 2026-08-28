@@ -1,8 +1,9 @@
 # Release smoke tests
 
-Практический 30-минутный release smoke для проверки наиболее опасных
-регрессий: возврата удалённых файлов, быстрых rename/move, folder delete,
-multi-device, Force-loop и шифрования.
+Практический release smoke для проверки наиболее опасных регрессий: возврата
+удалённых файлов, быстрых rename/move, folder delete, multi-device, Force-loop
+и шифрования. Полный последовательный прогон занимает примерно 45–60 минут;
+TC-01–TC-07 без расширенного шифрования — около 25 минут.
 
 ## Допущения
 
@@ -16,8 +17,8 @@ multi-device, Force-loop и шифрования.
 - Сеть стабильна.
 - Crash/fault injection, несколько locks, 10 000 файлов, throttling и mobile
   проверяются отдельно автоматикой или расширенным прогоном.
-- Все тесты выполняются на небольшом vault, чтобы уложиться примерно в 30
-  минут.
+- Все тесты выполняются на небольшом vault. Нагрузочные проверки вынесены в
+  расширенные release gates.
 
 ## Общий критерий успешности
 
@@ -46,6 +47,8 @@ multi-device, Force-loop и шифрования.
 - Plaintext remote пуст.
 - Оба профиля запущены.
 - На Device 1 пустой тестовый vault.
+- Для отдельного fresh-install прогона у Device 1 отсутствует plugin
+  `data.json`.
 
 Шаги:
 
@@ -64,9 +67,11 @@ multi-device, Force-loop и шифрования.
 - `Старт.md` появляется на Device 2 с правильным содержимым.
 - Повторные full дают `0/0/0`.
 - На remote существует один canonical с `format: "sync-index"`.
+- Плагин без `data.json` загружается без ошибки; после первого сохранения
+  создаётся current `plugin-data`.
 
-Покрывает: `INIT-001`, `INIT-002`, `INIT-003`, `INIT-013`, `SYNC-002`,
-`SYNC-003`, `UI-001`, `UI-003`, `UI-005`.
+Покрывает: `INIT-001`, `INIT-002`, `INIT-003`, `INIT-013`, `INIT-027`,
+`SYNC-002`, `SYNC-003`, `UI-001`, `UI-003`, `UI-005`.
 
 ## TC-02. Быстрые create → rename → edit → move → folder move
 
@@ -166,7 +171,8 @@ multi-device, Force-loop и шифрования.
 - Следующие full не создают новые conflict copy.
 - Разница локальных часов не влияет на результат.
 
-Покрывает: `INIT-005`, `SYNC-006`, `SYNC-009`, `MULTI-004`, `MULTI-008`.
+Покрывает: `INIT-005`, `SYNC-006`, `SYNC-009`, `MULTI-004`, `MULTI-008`,
+`MULTI-017`.
 
 ## TC-05. Exact delete, stale edit и последующее восстановление
 
@@ -251,6 +257,15 @@ multi-device, Force-loop и шифрования.
 6. Теперь на Device 2 выполнить Force remote.
 7. На Device 1 выполнить обычный full.
 
+Отдельно с fault injection проверить stale backup gate:
+
+1. Остановить Force после exact read-back backup, но до первой destructive
+   operation.
+2. Изменить защищаемый source snapshot либо canonical.
+3. Продолжить Force.
+4. Убедиться, что операция остановилась как stale до upload/delete/overwrite
+   и потребовала создать новый backup.
+
 Ожидание:
 
 - Backup подтверждён до начала каждого Force.
@@ -263,11 +278,11 @@ multi-device, Force-loop и шифрования.
 - Повторный full обоих устройств — `0/0/0`.
 
 Покрывает: `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`, `FORCE-017`,
-`MULTI-012`, `MIG-004`, `UI-006`.
+`FORCE-023`, `MULTI-012`, `MIG-004`, `UI-006`.
 
 ## TC-08. Шифрование: fresh hardened и unsupported historical data
 
-Время: 6 минут на маленьком vault.
+Время: 20–30 минут на маленьком vault с заранее подготовленными fixtures.
 
 Использовать vault из предыдущих тестов, но удалить намеренные
 conflict/backup-файлы, если они мешают проверке.
@@ -276,12 +291,15 @@ conflict/backup-файлы, если они мешают проверке.
 
 1. Подготовить plaintext `data.json` и canonical с `version: 2` из stable 1.1
    на Device 1.
-2. Обновить плагин и проверить перенос settings, device ID, hashes и
-   `localIndex` в unobserved baseline; все current queues должны быть пустыми.
-3. Убедиться, что normal sync заблокирован инструкцией Force.
-4. Выполнить Force local с обязательным backup и получить canonical с
+2. Обновить плагин и проверить перенос settings, hashes и `localIndex` в
+   unobserved baseline; все current queues должны быть пустыми.
+3. Проверить, что active device ID заменён installation-scoped ID, переживает
+   перезапуск этого профиля и отличается у второго профиля. Старый stable ID
+   не используется для новых mutation.
+4. Убедиться, что normal sync заблокирован инструкцией Force.
+5. Выполнить Force local с обязательным backup и получить canonical с
    `format: "sync-index"`.
-5. На Device 2 выполнить обычный full и проверить принятие нового epoch.
+6. На Device 2 выполнить обычный full и проверить принятие нового epoch.
 
 ### Unsupported historical formats
 
@@ -292,7 +310,9 @@ conflict/backup-файлы, если они мешают проверке.
    инструкцию выбрать чистый remote path либо выполнить ручной reset после
    самостоятельного backup.
 3. Проверить, что normal sync, watcher, scheduler и оба направления Force не
-   выполняют upload, delete, lock или cleanup.
+   создают lock/root directory/backup, не выполняют upload, delete, cleanup и
+   не изменяют Vault. Сообщение о backup не считается доказательством: на
+   remote не должно появиться нового файла.
 4. Скачать non-envelope `.enc.zip`, unknown `.zip` bytes и backup с encrypted
    legacy name: compatibility decrypt не должен вызываться, локальный
    повреждённый `.zip` не создаётся.
@@ -308,6 +328,23 @@ conflict/backup-файлы, если они мешают проверке.
 7. Несовместимый старый клиент против current manifest должен только
    заблокироваться и не изменить remote.
 
+### Post-commit recovery без initiator
+
+Каждый подпункт выполняется отдельным прогоном с fault injection сразу после
+canonical commit, но до публикации stable manifest:
+
+1. Для enable остановить Device 1, оставить manifest в `enabling`, на Device 2
+   ввести target password и продолжить sync.
+2. Для rotate остановить Device 1, оставить manifest в `rotating`, на Device 2
+   ввести новый password и продолжить sync без source password.
+3. Для disable остановить Device 1, оставить manifest в `disabling` либо уже
+   удалённым, затем продолжить plaintext sync на Device 2.
+4. В каждом прогоне проверить совпадение maintenance ID, target descriptors и
+   verifier до cleanup; при несовпадении Device 2 должен остановиться без
+   удаления.
+5. После recovery выполнить full на обоих устройствах и проверить `0/0/0`,
+   отсутствие source ciphertext в Vault и только fingerprint-matching cleanup.
+
 ### Обычная encrypted sync
 
 1. На Device 1 быстро создать, переименовать и переместить заметку.
@@ -320,12 +357,12 @@ conflict/backup-файлы, если они мешают проверке.
 1. Скачать созданный при enable backup и восстановить ZIP во временный
    vault; сравнить paths и SHA-256.
 2. На Device 1 выполнить rotate encryption key.
-2. На Device 2 попробовать старый пароль — sync должна блокироваться.
-3. Ввести новый пароль и выполнить full.
-4. Скачать pre-rotate `OYDSBKP!` `.enc.zip` и открыть его исходным backup
+3. На Device 2 попробовать старый пароль — sync должна блокироваться.
+4. Ввести новый пароль и выполнить full.
+5. Скачать pre-rotate `OYDSBKP!` `.enc.zip` и открыть его исходным backup
    password.
-5. Создать новый backup, скачать и восстановить его.
-6. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
+6. Создать новый backup, скачать и восстановить его.
+7. Создать файл в уже существующей вложенной папке и дождаться realtime sync.
 
 ### Disable
 
@@ -348,8 +385,9 @@ conflict/backup-файлы, если они мешают проверке.
 - После disable файлы доступны plaintext.
 - Финальные full — `0/0/0`.
 
-Покрывает: `ENC-001`, `ENC-002`, `ENC-005`, `TRANS-001`, `TRANS-002`,
-`TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`, `SAFE-004`, `UI-007`,
+Покрывает: `ENC-001`, `ENC-002`, `ENC-005`, `ENC-010`, `TRANS-001`,
+`TRANS-002`, `TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`,
+`TRANS-028`, `TRANS-029`, `TRANS-030`, `FORCE-022`, `SAFE-004`, `UI-007`,
 `UI-008`.
 
 ## Расширенные обязательные release gates
