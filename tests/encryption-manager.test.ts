@@ -3,13 +3,72 @@ import test from "node:test";
 import { EncryptionManager } from "../src/crypto/encryption-manager";
 import { EncryptionService } from "../src/crypto/encryption";
 import type {
-	IndexMaintenance,
-	RemoteEncryptionManifest,
 	YandexDiskSyncSettings,
 } from "../src/types";
 
 const manager = new EncryptionManager();
 const salt = EncryptionService.bytesToBase64(new Uint8Array(16).fill(7));
+
+test("candidate encryption credentials persist only after authentication and coherence", async () => {
+	const calls: string[] = [];
+	const accepted = await manager.acceptCandidate({
+		service: { verifyVerifier: async () => true } as never,
+		verifier: "verifier",
+		validateAuthority: async () => {
+			calls.push("authority");
+			return "canonical";
+		},
+		persist: async (authority) => {
+			calls.push(`persist:${authority}`);
+		},
+	});
+	assert.equal(accepted, "canonical");
+	assert.deepEqual(calls, ["authority", "persist:canonical"]);
+
+	calls.length = 0;
+	assert.equal(
+		await manager.acceptCandidate({
+			service: { verifyVerifier: async () => false } as never,
+			verifier: "verifier",
+			validateAuthority: async () => {
+				calls.push("authority");
+				return "canonical";
+			},
+			persist: async () => {
+				calls.push("persist");
+			},
+		}),
+		null,
+	);
+	assert.equal(calls.length, 0);
+
+	await assert.rejects(
+		manager.acceptCandidate({
+			service: { verifyVerifier: async () => true } as never,
+			verifier: "verifier",
+			validateAuthority: async () => {
+				throw new Error("incoherent authority");
+			},
+			persist: async () => {
+				calls.push("persist");
+			},
+		}),
+		/incoherent authority/,
+	);
+	assert.equal(calls.length, 0);
+	assert.equal(
+		await manager.acceptCandidate({
+			service: null,
+			verifier: "verifier",
+			validateAuthority: async () => "canonical",
+			persist: async () => {
+				calls.push("persist");
+			},
+		}),
+		null,
+	);
+	assert.equal(calls.length, 0);
+});
 
 test("encryption manager requires explicit current profile metadata", () => {
 	const settings = {
@@ -27,17 +86,18 @@ test("encryption manager requires explicit current profile metadata", () => {
 
 test("encryption manager emits strict semantic hardened manifest descriptors", async () => {
 	const codec = await manager.createCodec("hardened", salt, "password");
+	const targetVerifier = await codec.createVerifier();
 	const source = {
 		enabled: true,
 		revision: 4,
-		salt,
+		salt: EncryptionService.bytesToBase64(new Uint8Array(16).fill(6)),
 		verifier: "source-verifier",
 	};
 	const target = {
 		enabled: true,
 		revision: 5,
 		salt,
-		verifier: "target-verifier",
+		verifier: targetVerifier,
 	};
 	const manifest = await manager.createManifest({
 		service: codec,
@@ -51,8 +111,8 @@ test("encryption manager emits strict semantic hardened manifest descriptors", a
 			phase: "prepared",
 			source: {
 				enabled: true,
-				salt,
-				password: "password",
+				salt: source.salt,
+				password: "source-password",
 				revision: 4,
 				profileId: "hardened",
 			},
@@ -64,18 +124,26 @@ test("encryption manager emits strict semantic hardened manifest descriptors", a
 				profileId: "hardened",
 			},
 			sourceRawPaths: [],
-			targetRawPaths: [],
+			targetRawByLogicalPath: {},
 			sourceFingerprints: {},
 			targetFingerprints: {},
 			sourceCanonicalRevision: 11,
+			backupProof: {
+				path: ".backup/transition.enc.zip",
+				sha256: "backup-sha",
+				epoch: "epoch-a",
+				canonicalRevision: 11,
+				localSnapshotDigest: "snapshot-sha",
+				createdAt: 1,
+			},
 		},
 		maintenance: {
 			id: "transition-a",
 			kind: "rotate",
 			phase: "prepared",
 			initiatedBy: "device-a",
-			sourceRevision: 4,
-			targetRevision: 5,
+			sourceRevision: 11,
+			targetRevision: null,
 			source,
 			target,
 			cleanup: [],
@@ -86,122 +154,104 @@ test("encryption manager emits strict semantic hardened manifest descriptors", a
 	assert.equal(manifest.profileId, "hardened");
 	assert.equal(manifest.kdf.iterations, 600_000);
 	assert.equal(manifest.filenameCipher.name, "AES-SIV");
+	assert.equal(manifest.verifier, targetVerifier);
 	assert.equal(manifest.transition?.sourceProfileId, "hardened");
 	assert.equal(manifest.transition?.targetProfileId, "hardened");
 });
 
-test("foreign encrypted target recovery requires matching committed descriptors", () => {
-	for (const kind of ["enable", "rotate"] as const) {
-		const source =
-			kind === "enable"
-				? { enabled: false, revision: null, salt: null, verifier: null }
-				: {
-						enabled: true,
-						revision: 1,
-						salt: "source-salt",
-						verifier: "source-verifier",
-					};
-		const target = {
+test("transition manifest reuses the verifier for its declared key", async () => {
+	const targetCodec = await manager.createCodec(
+		"hardened",
+		salt,
+		"target-password",
+	);
+	const wrongCodec = await manager.createCodec(
+		"hardened",
+		salt,
+		"wrong-password",
+	);
+	const targetVerifier = await targetCodec.createVerifier();
+	const target = {
+		enabled: true,
+		revision: 1,
+		salt,
+		verifier: targetVerifier,
+	};
+	const transition = {
+		id: "enable-transition",
+		kind: "enable" as const,
+		phase: "prepared" as const,
+		source: {
+			enabled: false,
+			salt: null,
+			password: null,
+			revision: null,
+			profileId: null,
+		},
+		target: {
 			enabled: true,
-			revision: 2,
-			salt: "target-salt",
-			verifier: "target-verifier",
-		};
-		const maintenance: IndexMaintenance = {
-			id: `${kind}-transition`,
-			kind,
-			phase: "index-committed",
-			initiatedBy: "device-a",
-			sourceRevision: 4,
-			targetRevision: 5,
-			source,
-			target,
-			cleanup: [],
-		};
-		const manifest = createTransitionManifest(
-			kind === "enable" ? "enabling" : "rotating",
-			maintenance,
-		);
-		assert.doesNotThrow(() =>
-			manager.assertRemoteTargetMaintenance(manifest, maintenance),
-		);
-		assert.throws(() =>
-			manager.assertRemoteTargetMaintenance(manifest, {
-				...maintenance,
-				target: { ...target, verifier: "different" },
-			}),
-		);
-	}
-});
-
-test("foreign disable target recovery accepts committed plaintext canonical", () => {
-	const maintenance: IndexMaintenance = {
-		id: "disable-transition",
-		kind: "disable",
-		phase: "cleanup",
+			salt,
+			password: "target-password",
+			revision: 1,
+			profileId: "hardened" as const,
+		},
+		sourceRawPaths: [],
+		targetRawByLogicalPath: {},
+		sourceFingerprints: {},
+		targetFingerprints: {},
+		sourceCanonicalRevision: 4,
+		backupProof: {
+			path: ".backup/transition.enc.zip",
+			sha256: "backup-sha",
+			epoch: "epoch-a",
+			canonicalRevision: 4,
+			localSnapshotDigest: "snapshot-sha",
+			createdAt: 1,
+		},
+	};
+	const maintenance = {
+		id: transition.id,
+		kind: transition.kind,
+		phase: transition.phase,
 		initiatedBy: "device-a",
 		sourceRevision: 4,
-		targetRevision: 5,
+		targetRevision: null,
 		source: {
-			enabled: true,
-			revision: 2,
-			salt: "source-salt",
-			verifier: "source-verifier",
+			enabled: false,
+			revision: null,
+			salt: null,
+			verifier: null,
 		},
-		target: { enabled: false, revision: null, salt: null, verifier: null },
+		target,
 		cleanup: [],
 	};
-	assert.doesNotThrow(() =>
-		manager.assertRemoteTargetMaintenance(null, maintenance),
-	);
-	assert.doesNotThrow(() =>
-		manager.assertRemoteTargetMaintenance(
-			createTransitionManifest("disabling", maintenance),
-			maintenance,
-		),
-	);
-	assert.throws(() =>
-		manager.assertRemoteTargetMaintenance(null, {
+	const options = {
+		service: targetCodec,
+		salt,
+		state: "enabling" as const,
+		revision: 1,
+		deviceId: "device-a",
+		transition,
+		maintenance,
+	};
+	const manifest = await manager.createManifest(options);
+	assert.equal(manifest.verifier, targetVerifier);
+	const staged = await manager.createManifest({
+		...options,
+		transition: { ...transition, phase: "files-copied" },
+		maintenance: {
 			...maintenance,
-			phase: "files-copied",
-		}),
+			phase: "index-committed",
+			targetRevision: 5,
+		},
+	});
+	assert.equal(staged.transition?.phase, "index-committed");
+	await assert.rejects(
+		manager.createManifest({ ...options, service: wrongCodec }),
+		/does not match its declared mode/,
+	);
+	await assert.rejects(
+		manager.createManifest({ ...options, state: "rotating" }),
+		/metadata is incoherent/,
 	);
 });
-
-function createTransitionManifest(
-	state: "enabling" | "rotating" | "disabling",
-	maintenance: IndexMaintenance,
-): RemoteEncryptionManifest {
-	const manifestMode =
-		state === "disabling" ? maintenance.source : maintenance.target;
-	return {
-		format: "encryption-manifest",
-		profileId: "hardened",
-		state,
-		revision: manifestMode.revision!,
-		salt: manifestMode.salt!,
-		verifier: manifestMode.verifier!,
-		kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600_000 },
-		keySchedule: { name: "HKDF", hash: "SHA-256" },
-		cipher: { name: "AES-GCM", keyLength: 256, ivLength: 12 },
-		filenameCipher: {
-			name: "AES-SIV",
-			keyLength: 512,
-			encoding: "base64url",
-			aad: "obsidian-yandex-disk-sync:filename",
-		},
-		updatedAt: 1,
-		updatedBy: "device-a",
-		transition: {
-			id: maintenance.id,
-			phase: "files-copied",
-			sourceRevision: maintenance.source.revision,
-			targetRevision: maintenance.target.revision,
-			initiatedBy: maintenance.initiatedBy,
-			source: maintenance.source,
-			target: maintenance.target,
-			sourceProfileId: maintenance.source.enabled ? "hardened" : null,
-			targetProfileId: maintenance.target.enabled ? "hardened" : null,
-		},
-	};
-}

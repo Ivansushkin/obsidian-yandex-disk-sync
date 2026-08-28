@@ -332,6 +332,25 @@ export class YandexDiskClient {
 		return await this.encryptFilePath(path);
 	}
 
+	/** Decode one root-relative user path with an explicit transition codec. */
+	async decodePhysicalUserPath(
+		path: string,
+		service: EncryptionCodec | null,
+	): Promise<string> {
+		const normalized = normalizePath(path);
+		if (!normalized || normalized !== path || isProtectedPath(normalized)) {
+			throw new Error("Transition target contains an invalid physical path");
+		}
+		if (!service) return normalized;
+		return (
+			await Promise.all(
+				normalized
+					.split("/")
+					.map((segment) => service.decryptFilename(segment)),
+			)
+		).join("/");
+	}
+
 	/**
 	 * Recursively get all files in folder
 	 */

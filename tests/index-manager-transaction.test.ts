@@ -266,6 +266,29 @@ function stable1xIndex(version: 1 | 2 = 2): Record<string, unknown> {
 	};
 }
 
+test("encryption source snapshot rejects an unprovable raw user object", async () => {
+	const manager = new IndexManager(
+		{
+			getResourcesRecursive: async () => [
+				{
+					name: "note.md",
+					path: "vault/note.md",
+					type: "file",
+					created: "",
+					modified: "",
+				},
+			],
+		} as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("device-a"),
+	);
+
+	await assert.rejects(
+		manager.getRemoteRawFileSnapshots(),
+		/no stable fingerprint/,
+	);
+});
+
 async function runLegacyForceCommit(
 	encryption: EncryptionCodec | null,
 	sourceIndex: Record<string, unknown> = stable1xIndex(),
@@ -539,6 +562,8 @@ test("strict semantic manifest accepts only the hardened profile", async () => {
 		...hardened,
 		state: "rotating",
 		revision: 2,
+		salt: "AQEBAQEBAQEBAQEBAQEBAQ==",
+		verifier: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==",
 		transition: {
 			id: "transition-a",
 			phase: "prepared",
@@ -554,14 +579,21 @@ test("strict semantic manifest accepts only the hardened profile", async () => {
 			target: {
 				enabled: true,
 				revision: 2,
-				salt: manifestCommon.salt,
-				verifier: manifestCommon.verifier,
+				salt: "AQEBAQEBAQEBAQEBAQEBAQ==",
+				verifier: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==",
 			},
 			sourceProfileId: "hardened",
 			targetProfileId: "hardened",
 		},
 	};
 	assert.equal((await readEncryptionManifest(rotating))?.state, "rotating");
+	await assert.rejects(
+		readEncryptionManifest({
+			...rotating,
+			updatedBy: "different-device",
+		}),
+		/incoherent transition/,
+	);
 	await assert.rejects(
 		readEncryptionManifest({
 			...hardened,
@@ -574,7 +606,7 @@ test("strict semantic manifest accepts only the hardened profile", async () => {
 				initiatedBy: "device-a",
 			},
 		}),
-		/invalid mode descriptor/,
+		/missing field source/,
 	);
 	await assert.rejects(
 		readEncryptionManifest({
@@ -618,14 +650,17 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 	const access = manager as unknown as {
 		assertMaintenanceCompatible(value: typeof index): void;
 	};
-	assert.throws(() => access.assertMaintenanceCompatible(index));
-	await manager.runTargetMaintenanceRecovery("transition-a", async () => {
-		assert.doesNotThrow(() => access.assertMaintenanceCompatible(index));
-		index.maintenance!.phase = "files-copied";
+	for (const phase of ["index-committed", "cleanup", "stable"] as const) {
+		index.maintenance.phase = phase;
 		assert.throws(() => access.assertMaintenanceCompatible(index));
-		index.maintenance!.phase = "index-committed";
-	});
-	assert.throws(() => access.assertMaintenanceCompatible(index));
+		await manager.runTargetMaintenanceRecovery("transition-a", async () => {
+			assert.doesNotThrow(() => access.assertMaintenanceCompatible(index));
+			index.maintenance!.phase = "files-copied";
+			assert.throws(() => access.assertMaintenanceCompatible(index));
+			index.maintenance!.phase = phase;
+		});
+		assert.throws(() => access.assertMaintenanceCompatible(index));
+	}
 });
 
 test("plaintext target recovery reads committed disable canonical without source key", async () => {
@@ -639,7 +674,7 @@ test("plaintext target recovery reads committed disable canonical without source
 		phase: "index-committed",
 		initiatedBy: "source-device",
 		sourceRevision: 1,
-		targetRevision: null,
+		targetRevision: 2,
 		source: {
 			enabled: true,
 			revision: 1,
@@ -820,6 +855,84 @@ test("malformed current canonical is rejected as a semantic index error", async 
 			error instanceof InvalidCurrentIndexError &&
 			error.section === "files",
 	);
+});
+
+test("malformed maintenance is rejected before any remote write", async () => {
+	const source = {
+		enabled: true,
+		revision: 1,
+		salt: "source-salt",
+		verifier: "source-verifier",
+	};
+	const target = {
+		enabled: true,
+		revision: 2,
+		salt: "target-salt",
+		verifier: "target-verifier",
+	};
+	const valid = {
+		id: "transition-a",
+		kind: "rotate" as const,
+		phase: "index-committed" as const,
+		initiatedBy: "device-a",
+		sourceRevision: 4,
+		targetRevision: 6,
+		source,
+		target,
+		cleanup: [{ path: "old-raw", expectedFingerprint: "sha256:old" }],
+	};
+	const variants: unknown[] = [
+		{ ...valid, extra: true },
+		{ ...valid, phase: "prepared", targetRevision: 6 },
+		{ ...valid, phase: "prepared", targetRevision: null },
+		{ ...valid, targetRevision: null },
+		{ ...valid, kind: "enable" },
+		{
+			...valid,
+			cleanup: [
+				{ path: ".backup/object", expectedFingerprint: "sha256:old" },
+			],
+		},
+		{
+			...valid,
+			cleanup: [
+				{ path: "old-raw", expectedFingerprint: "sha256:old" },
+				{ path: "old-raw", expectedFingerprint: "sha256:old" },
+			],
+		},
+	];
+	for (const maintenance of variants) {
+		const index = createEmptyIndex("device-current", "epoch-current");
+		index.maintenance = maintenance as typeof index.maintenance;
+		const { manager, client } = await createIndexManagerWithContent(index, null);
+		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		assert.equal(client.moveCount, 0);
+	}
+	for (const targetRevision of [5, 7]) {
+		const index = createEmptyIndex("device-current", "epoch-current");
+		index.revision = 6;
+		index.maintenance = { ...valid, targetRevision };
+		const { manager, client } = await createIndexManagerWithContent(index, null);
+		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		assert.equal(client.moveCount, 0);
+	}
+	for (const [phase, revision] of [
+		["cleanup", 8],
+		["stable", 6],
+	] as const) {
+		const index = createEmptyIndex("device-current", "epoch-current");
+		index.revision = revision;
+		index.maintenance = { ...valid, phase };
+		const { manager, client } = await createIndexManagerWithContent(index, null);
+		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		assert.equal(client.moveCount, 0);
+	}
+	const staleSource = createEmptyIndex("device-current", "epoch-current");
+	staleSource.revision = 6;
+	staleSource.maintenance = { ...valid, sourceRevision: 6 };
+	const { manager, client } = await createIndexManagerWithContent(staleSource, null);
+	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+	assert.equal(client.moveCount, 0);
 });
 
 test("current canonical rejects an extra numeric format marker", async () => {

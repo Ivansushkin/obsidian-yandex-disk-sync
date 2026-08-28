@@ -1,4 +1,5 @@
 import { build } from "esbuild";
+import { readFileSync } from "node:fs";
 import process from "node:process";
 
 async function bundledSize(contents) {
@@ -26,5 +27,8 @@ const withNoble = await bundledSize(`
 const increase = withNoble - baseline;
 if (increase > 12 * 1024) {
 	throw new Error(`@noble/ciphers adds ${increase} bytes; limit is 12288`);
+}
+if (readFileSync("build/main.js", "utf8").includes("dotenv")) {
+	throw new Error("Runtime bundle must not contain the dev-only dotenv package");
 }
 console.log(`@noble/ciphers minified contribution: ${increase} bytes`);

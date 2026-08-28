@@ -323,9 +323,11 @@ conflict/backup-файлы, если они мешают проверке.
 2. Проверить единый progress Notice.
 3. На Device 2 выполнить full.
 4. Сначала ввести неверный пароль.
-5. Убедиться, что sync заблокирована и remote не изменён.
-6. Ввести правильный пароль и выполнить full.
-7. Несовместимый старый клиент против current manifest должен только
+5. Отменить следующий prompt и перезапустить plugin.
+6. Убедиться, что неверный/отменённый candidate password не заменил прежние
+   local credentials, sync заблокирована и remote не изменён.
+7. Ввести правильный пароль и выполнить full.
+8. Несовместимый старый клиент против current manifest должен только
    заблокироваться и не изменить remote.
 
 ### Post-commit recovery без initiator
@@ -344,6 +346,28 @@ canonical commit, но до публикации stable manifest:
    удаления.
 5. После recovery выполнить full на обоих устройствах и проверить `0/0/0`,
    отсутствие source ciphertext в Vault и только fingerprint-matching cleanup.
+6. Повторить enable/rotate/disable с fault injection после отдельного target
+   upload, но до persistence его fingerprint. Recovery обязан повторно скачать
+   raw object, сверить decoded logical path и plaintext SHA-256.
+7. Подменить target bytes и удалить expected fingerprint. Recovery должен
+   остаться заблокированным, не удалить объект и не показать success.
+8. Подготовить collision двух logical paths в один target raw path, protected
+   target и пересечение source/target. Ни один target upload не должен начаться.
+9. Внести extra field, mismatched phase/ID/descriptors и cleanup без fingerprint
+   по очереди в manifest/canonical/local transition. До lock/upload/delete не
+   должно быть remote writes.
+
+### Offline device после encryption transition
+
+1. Отключить Device 2 до enable, затем повторить отдельно для rotate и disable.
+2. На Device 1 полностью завершить transition и создать local edit на Device 2
+   в offline-режиме.
+3. Вернуть Device 2 online, пройти password prompt там, где он нужен.
+4. Убедиться, что Device 2 сначала принимает manifest/canonical и выполняет
+   full reconcile, затем причинно воспроизводит durable logical mutations.
+5. Старые physical actions без matching epoch/canonical/fingerprint proof не
+   должны удалять source или target objects.
+6. Финальный full на обоих устройствах: `0/0/0`.
 
 ### Обычная encrypted sync
 
@@ -387,7 +411,8 @@ canonical commit, но до публикации stable manifest:
 
 Покрывает: `ENC-001`, `ENC-002`, `ENC-005`, `ENC-010`, `TRANS-001`,
 `TRANS-002`, `TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`,
-`TRANS-028`, `TRANS-029`, `TRANS-030`, `FORCE-022`, `SAFE-004`, `UI-007`,
+`TRANS-028`, `TRANS-029`, `TRANS-030`, `TRANS-031`, `TRANS-032`,
+`TRANS-033`, `MULTI-015`, `FORCE-022`, `SAFE-004`, `SAFE-013`, `UI-007`,
 `UI-008`.
 
 ## Расширенные обязательные release gates

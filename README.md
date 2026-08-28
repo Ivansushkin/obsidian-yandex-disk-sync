@@ -197,6 +197,12 @@ AES-256-GCM content and AES-SIV filename keys.
 While encryption is being enabled, disabled, or rotated, other devices block
 normal synchronization. A target-capable device can finish fingerprint-guarded
 post-commit cleanup from canonical metadata without the source password.
+Passwords entered on another device remain candidate credentials until the
+manifest verifier, transition/canonical coherence, and canonical decryption all
+succeed. A wrong or cancelled password does not replace the active settings.
+Every rewritten object is downloaded back and checked against its decoded
+logical path and plaintext SHA-256 before its fingerprint can authorize commit
+or cleanup.
 
 - **Content encryption**: each file gets a random 12-byte IV, ensuring unique ciphertext even for identical files
 - **Filename encryption**: RFC 5297 AES-SIV with fixed domain AAD and canonical Base64URL; paths remain stable across devices and folder moves do not re-encode descendants
@@ -241,6 +247,18 @@ npm install
 
 ### Development Mode
 
+Create a local environment file once and set the absolute test-vault plugin
+directory. The file is ignored by Git and its value takes precedence over any
+shell variable with the same name:
+
+```bash
+cp .env.example .env
+```
+
+```dotenv
+YANDEX_PLUGIN_PATH=/absolute/path/to/test-vault/.obsidian/plugins/obsidian-yandex-disk-sync
+```
+
 ```bash
 npm run dev
 ```
@@ -251,8 +269,10 @@ npm run dev
 npm run build
 ```
 
-Built files are written to `build/`. When `YANDEX_PLUGIN_PATH` is set, the
-build also copies release artifacts to that test-vault plugin directory.
+Built files are written to `build/`. When `.env` contains
+`YANDEX_PLUGIN_PATH`, the build also copies release artifacts to that
+test-vault plugin directory. A clean checkout without `.env` only creates the
+release artifacts.
 
 ### Linting
 

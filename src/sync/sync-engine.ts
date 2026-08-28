@@ -108,6 +108,11 @@ export type SyncGuardCallback = (
 	validationToken?: string,
 ) => SyncGuardResult | Promise<SyncGuardResult>;
 
+export interface PhysicalRewriteUploadProof {
+	remoteFingerprint: string;
+	remoteMtime?: number;
+}
+
 export interface SyncRunOptions {
 	/** Use the startup discovery path inside the regular full-sync session. */
 	startup?: boolean;
@@ -115,6 +120,10 @@ export interface SyncRunOptions {
 	skipEncryptionGuard?: boolean;
 	/** Allow a sync nested inside the active encryption maintenance flow. */
 	skipMaintenanceGuard?: boolean;
+	/** Reject canonical maintenance before filesystem work during preflight. */
+	requireStableCanonical?: boolean;
+	/** Re-run the remote encryption guard through this transition's local block. */
+	validateThroughExternalEncryptionBlock?: boolean;
 	/**
 	 * Skip generation of delete_remote operations. Used by encryption transition
 	 * flows where remote cleanup of stale paths is handled separately as a bulk
@@ -123,6 +132,11 @@ export interface SyncRunOptions {
 	skipRemoteDeletes?: boolean;
 	/** Run after all target files are uploaded and before the canonical commit. */
 	beforeIndexCommit?: () => void | Promise<void>;
+	/** Prove one rewritten target object before it can enter canonical state. */
+	verifyPhysicalRewriteUpload?: (
+		logicalPath: string,
+		sha256: string,
+	) => Promise<PhysicalRewriteUploadProof>;
 	/** Prevent an epoch race from scheduling more than one immediate follow-up. */
 	epochRetry?: boolean;
 	/** Exact verified backup and pre-backup canonical identity for Force only. */
@@ -677,6 +691,14 @@ export class SyncEngine {
 					options?.startup,
 					true,
 				);
+				if (
+					options?.requireStableCanonical &&
+					this.indexManager.getMaintenance()
+				) {
+					throw new Error(
+						"Encryption preflight requires a stable canonical index",
+					);
+				}
 				const localStateBeforeAdoption = this.indexManager.getLocalIndex();
 				const canonicalEpoch = this.indexManager.getRemoteIndex().epoch;
 				const replacesObservedEpoch =
@@ -956,12 +978,13 @@ export class SyncEngine {
 					tombstonesRemoved ||
 					baselinesChanged ||
 					mutationSettlement.pendingWatermarks > 0;
-				const strictNoOp = !indexDirty && !hadPendingCausalWork;
-				if (!strictNoOp) {
-					const guard = await this.getSyncGuardResult(
-						options?.skipEncryptionGuard,
-						validationToken,
-					);
+					const strictNoOp = !indexDirty && !hadPendingCausalWork;
+					if (!strictNoOp) {
+						const guard = await this.getSyncGuardResult(
+							options?.skipEncryptionGuard,
+							validationToken,
+							options?.validateThroughExternalEncryptionBlock,
+						);
 					if (guard.blockReason) {
 						result.errors.push({
 							path: "",
@@ -1184,6 +1207,9 @@ export class SyncEngine {
 	async reencodeRemoteFiles(
 		options?: SyncRunOptions,
 	): Promise<SyncResult> {
+		if (!options?.verifyPhysicalRewriteUpload) {
+			throw new Error("Encryption rewrite requires exact target upload proof");
+		}
 		const run = async () =>
 			await this.runSyncSession(
 				options,
@@ -1222,12 +1248,15 @@ export class SyncEngine {
 										`File changed during encryption transition: ${path}`,
 									);
 								}
-								await this.yandexClient.uploadFile(
+								const stamp = await this.uploadPhysicalRewriteTarget(
 									joinPath(this.settings.remotePath, path),
 									content,
-									true,
+									async () =>
+										await options.verifyPhysicalRewriteUpload!(
+											path,
+											sha256,
+										),
 								);
-								const stamp = await this.fetchRemoteStamp(path);
 								canonical.files[path] = {
 									...logicalMetadata,
 									size: content.byteLength,
@@ -1282,6 +1311,27 @@ export class SyncEngine {
 					`Encryption rewrite completed: uploaded ${result.uploaded}, errors ${result.errors.length}`,
 			);
 		return await this.runCoordinatedSession("maintenance", options, run);
+	}
+
+	/** Treat every upload response as untrusted until exact read-back succeeds. */
+	private async uploadPhysicalRewriteTarget(
+		remotePath: string,
+		content: ArrayBuffer,
+		verify: () => Promise<PhysicalRewriteUploadProof>,
+	): Promise<PhysicalRewriteUploadProof> {
+		try {
+			await this.yandexClient.uploadFileExclusive(
+				remotePath,
+				content,
+				true,
+			);
+		} catch (error) {
+			logger.warn("Encryption target upload response was not conclusive", {
+				status: error instanceof YandexApiError ? error.status : undefined,
+				error,
+			});
+		}
+		return await verify();
 	}
 
 	/**
@@ -4580,11 +4630,13 @@ export class SyncEngine {
 		await this.notifySyncPauseCallbacks(lifecycleContext);
 		logger.info("Sync reconciliation started", this.getDiagnosticSnapshot());
 
-		try {
-			this.setSyncPhase("validating");
-			const guard = await this.getSyncGuardResult(
-				options?.skipEncryptionGuard,
-			);
+			try {
+				this.setSyncPhase("validating");
+				const guard = await this.getSyncGuardResult(
+					options?.skipEncryptionGuard,
+					undefined,
+					options?.validateThroughExternalEncryptionBlock,
+				);
 			if (guard.blockReason) {
 				result.errors.push({
 					path: "",
@@ -6223,11 +6275,12 @@ export class SyncEngine {
 	private async getSyncGuardResult(
 		skipGuard?: boolean,
 		validationToken?: string,
+		validateThroughExternalBlock = false,
 	): Promise<SyncGuardResult> {
 		if (skipGuard) {
 			return { blockReason: null };
 		}
-		if (this.externalBlockReason) {
+		if (this.externalBlockReason && !validateThroughExternalBlock) {
 			return { blockReason: this.externalBlockReason };
 		}
 		if (!this.syncGuardCallback) {

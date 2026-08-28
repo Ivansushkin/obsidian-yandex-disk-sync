@@ -88,11 +88,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 
 		if (remoteManifest) {
-			if (remoteManifest.state !== "enabled") {
-				new Notice(t("notice.encryption_remote_busy"));
-				return;
-			}
-
 			const password = await this.promptConnectEncryptionPassword();
 			if (!password) return;
 

@@ -16,6 +16,7 @@ import type {
 	EncryptionManifest,
 	EncryptionManifestState,
 	EncryptionTransitionDescriptor,
+	EncryptionModeDescriptor,
 	RemoteEncryptionManifest,
 	IndexMaintenance,
 } from "../types";
@@ -147,6 +148,7 @@ function isLogicalPath(value: unknown): value is string {
 		value.length > 0 &&
 		!value.startsWith("/") &&
 		!value.endsWith("/") &&
+		!value.includes("\\") &&
 		!value.includes("\u0000") &&
 		value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..")
 	);
@@ -160,8 +162,19 @@ function assertIndexSection(
 	if (!condition) throw new InvalidCurrentIndexError(section, reason);
 }
 
-function validateEncryptionModeDescriptor(value: unknown, section: string): void {
+function validateEncryptionModeDescriptor(
+	value: unknown,
+	section: string,
+): asserts value is EncryptionModeDescriptor {
 	assertIndexSection(isJsonRecord(value), section, "must be an object");
+	assertIndexSection(
+		Object.keys(value).length === 4 &&
+			["enabled", "revision", "salt", "verifier"].every(
+				(key) => key in value,
+			),
+		section,
+		"fields do not match the current mode descriptor",
+	);
 	assertIndexSection(typeof value.enabled === "boolean", section, "enabled must be boolean");
 	assertIndexSection(
 		value.revision === null || isNonNegativeInteger(value.revision),
@@ -178,6 +191,24 @@ function validateEncryptionModeDescriptor(value: unknown, section: string): void
 		section,
 		"verifier must be null or string",
 	);
+	if (value.enabled) {
+		assertIndexSection(
+			isNonNegativeInteger(value.revision) &&
+				value.revision > 0 &&
+				typeof value.salt === "string" &&
+				value.salt.length > 0 &&
+				typeof value.verifier === "string" &&
+				value.verifier.length > 0,
+			section,
+			"encrypted mode requires revision, salt, and verifier",
+		);
+	} else {
+		assertIndexSection(
+			value.revision === null && value.salt === null && value.verifier === null,
+			section,
+			"plaintext mode requires null encryption fields",
+		);
+	}
 }
 
 function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord & SyncIndex {
@@ -258,18 +289,103 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 	if (data.maintenance === undefined) return;
 	const maintenance = data.maintenance;
 	assertIndexSection(isJsonRecord(maintenance), "maintenance", "must be an object");
+	const maintenanceKeys = [
+		"id",
+		"kind",
+		"phase",
+		"initiatedBy",
+		"sourceRevision",
+		"targetRevision",
+		"source",
+		"target",
+		"cleanup",
+	];
+	assertIndexSection(
+		Object.keys(maintenance).length === maintenanceKeys.length &&
+			maintenanceKeys.every((key) => key in maintenance),
+		"maintenance",
+		"fields do not match the current maintenance format",
+	);
 	assertIndexSection(typeof maintenance.id === "string" && maintenance.id.length > 0, "maintenance", "id is required");
 	assertIndexSection(maintenance.kind === "enable" || maintenance.kind === "disable" || maintenance.kind === "rotate", "maintenance", "kind is invalid");
 	assertIndexSection(["prepared", "files-copied", "index-committed", "stable", "cleanup"].includes(String(maintenance.phase)), "maintenance", "phase is invalid");
 	assertIndexSection(typeof maintenance.initiatedBy === "string" && maintenance.initiatedBy.length > 0, "maintenance", "initiatedBy is required");
 	assertIndexSection(isNonNegativeInteger(maintenance.sourceRevision), "maintenance", "sourceRevision must be a non-negative integer");
 	assertIndexSection(maintenance.targetRevision === null || isNonNegativeInteger(maintenance.targetRevision), "maintenance", "targetRevision must be null or a non-negative integer");
-	validateEncryptionModeDescriptor(maintenance.source, "maintenance.source");
-	validateEncryptionModeDescriptor(maintenance.target, "maintenance.target");
+	assertIndexSection(
+		maintenance.sourceRevision < data.revision,
+		"maintenance.sourceRevision",
+		"must precede the current canonical revision",
+	);
+	const source = maintenance.source;
+	const target = maintenance.target;
+	validateEncryptionModeDescriptor(source, "maintenance.source");
+	validateEncryptionModeDescriptor(target, "maintenance.target");
+	const preCommit = maintenance.phase === "prepared" || maintenance.phase === "files-copied";
+	assertIndexSection(
+		preCommit
+			? maintenance.targetRevision === null
+			: isNonNegativeInteger(maintenance.targetRevision),
+		"maintenance.targetRevision",
+		"must agree with the maintenance phase",
+	);
+	if (!preCommit) {
+		const targetRevision = maintenance.targetRevision;
+		assertIndexSection(
+			targetRevision !== null &&
+				targetRevision > maintenance.sourceRevision &&
+				targetRevision <= data.revision &&
+				(maintenance.phase !== "index-committed" ||
+					targetRevision === data.revision) &&
+				(maintenance.phase !== "cleanup" ||
+					targetRevision + 1 === data.revision) &&
+				(maintenance.phase !== "stable" ||
+					targetRevision < data.revision),
+			"maintenance.targetRevision",
+			"does not match the canonical commit revision",
+		);
+	}
+	const modeMismatch =
+		(maintenance.kind === "enable" && (source.enabled || !target.enabled)) ||
+		(maintenance.kind === "disable" && (!source.enabled || target.enabled)) ||
+		(maintenance.kind === "rotate" &&
+			(!source.enabled ||
+				!target.enabled ||
+				(target.revision ?? 0) <= (source.revision ?? 0) ||
+				target.salt === source.salt ||
+				target.verifier === source.verifier));
+	assertIndexSection(
+		!modeMismatch,
+		"maintenance",
+		"source and target modes do not match its kind",
+	);
 	assertIndexSection(Array.isArray(maintenance.cleanup), "maintenance.cleanup", "must be an array");
+	assertIndexSection(
+		!preCommit || maintenance.cleanup.length === 0,
+		"maintenance.cleanup",
+		"pre-commit maintenance cannot authorize cleanup",
+	);
+	const cleanupPaths = new Set<string>();
 	for (const action of maintenance.cleanup) {
 		assertIndexSection(isJsonRecord(action), "maintenance.cleanup", "entry must be an object");
-		assertIndexSection(typeof action.path === "string" && action.path.length > 0, "maintenance.cleanup", "path is required");
+		assertIndexSection(
+			Object.keys(action).length === 2 &&
+				"path" in action &&
+				"expectedFingerprint" in action,
+			"maintenance.cleanup",
+			"entry fields are invalid",
+		);
+		assertIndexSection(
+			isLogicalPath(action.path) && !isProtectedPath(action.path),
+			"maintenance.cleanup",
+			"path is invalid or protected",
+		);
+		assertIndexSection(
+			!cleanupPaths.has(action.path),
+			"maintenance.cleanup",
+			"path is duplicated",
+		);
+		cleanupPaths.add(action.path);
 		assertIndexSection(typeof action.expectedFingerprint === "string" && action.expectedFingerprint.length > 0, "maintenance.cleanup", "expectedFingerprint is required");
 	}
 }
@@ -3032,9 +3148,7 @@ export class IndexManager {
 		if (
 			maintenance &&
 			maintenance.initiatedBy !== this.settings.deviceId &&
-			!allowedTargetRecovery &&
-			maintenance.phase !== "cleanup" &&
-			maintenance.phase !== "stable"
+			!allowedTargetRecovery
 		) {
 			throw new RemoteMaintenanceActiveError(
 				maintenance.id,
@@ -3177,7 +3291,11 @@ export class IndexManager {
 			}
 
 			const fingerprint = getPhysicalResourceFingerprint(resource);
-			if (!fingerprint) continue;
+			if (!fingerprint) {
+				throw new Error(
+					"Remote user object has no stable fingerprint for encryption cleanup",
+				);
+			}
 			result.push({ path: localPath, fingerprint });
 		}
 
@@ -3198,7 +3316,7 @@ export class IndexManager {
 		}
 		this.assertManifestBase64(salt, 16, 16, "salt");
 
-		this.assertManifestKeys(data, [
+		const manifestKeys = [
 			"format",
 			"profileId",
 			"state",
@@ -3212,7 +3330,12 @@ export class IndexManager {
 			"updatedAt",
 			"updatedBy",
 			"transition",
-		]);
+		] as const;
+		this.assertManifestKeys(
+			data,
+			manifestKeys,
+			manifestKeys.filter((key) => key !== "transition"),
+		);
 
 		const state = data.state;
 		const revision = data.revision;
@@ -3248,6 +3371,34 @@ export class IndexManager {
 			throw new Error(
 				"Invalid encryption manifest: transition/state mismatch",
 			);
+		}
+		if (transition) {
+			const invalidModes =
+				(state === "enabling" &&
+					(transition.source.enabled || !transition.target.enabled)) ||
+				(state === "disabling" &&
+					(!transition.source.enabled || transition.target.enabled)) ||
+				(state === "rotating" &&
+					(!transition.source.enabled ||
+						!transition.target.enabled ||
+						(transition.target.revision ?? 0) <=
+							(transition.source.revision ?? 0) ||
+						transition.target.salt === transition.source.salt ||
+						transition.target.verifier === transition.source.verifier));
+			const declared = state === "disabling"
+				? transition.source
+				: transition.target;
+			if (
+				invalidModes ||
+				updatedBy !== transition.initiatedBy ||
+				declared.revision !== revision ||
+				declared.salt !== salt ||
+				declared.verifier !== verifier
+			) {
+				throw new Error(
+					"Invalid encryption manifest: incoherent transition",
+				);
+			}
 		}
 		this.assertHardenedManifestAlgorithms(data);
 		return {
@@ -3372,11 +3523,11 @@ export class IndexManager {
 			"stable",
 			"cleanup",
 		];
-			const validRevision = (revision: unknown): boolean =>
-				revision === null ||
-				(typeof revision === "number" &&
-					Number.isSafeInteger(revision) &&
-					revision >= 1);
+		const validRevision = (revision: unknown): boolean =>
+			revision === null ||
+			(typeof revision === "number" &&
+				Number.isSafeInteger(revision) &&
+				revision >= 1);
 		if (
 			typeof data.id !== "string" ||
 			!data.id ||
@@ -3502,12 +3653,20 @@ export class IndexManager {
 	private assertManifestKeys(
 		data: Record<string, unknown>,
 		allowed: readonly string[],
+		required: readonly string[] = allowed,
 	): void {
 		const keys = new Set(allowed);
 		for (const key of Object.keys(data)) {
 			if (!keys.has(key)) {
 				throw new Error(
 					`Invalid encryption manifest: unsupported field ${key}`,
+				);
+			}
+		}
+		for (const key of required) {
+			if (!(key in data)) {
+				throw new Error(
+					`Invalid encryption manifest: missing field ${key}`,
 				);
 			}
 		}

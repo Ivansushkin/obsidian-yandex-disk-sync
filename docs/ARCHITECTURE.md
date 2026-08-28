@@ -75,6 +75,21 @@ commit, guarded cleanup и recovery. Mode-specific код определяет �
 source/target режим и способ публикации manifest. Этот же completion path
 используется после Force recovery незавершённого transition.
 
+Пароль удалённого vault сначала создаёт только candidate codec. Локальные
+settings и active codec меняются лишь после verifier, cross-artifact coherence
+и успешного чтения canonical этим candidate. Интерактивный password prompt
+выполняется до входа ручного запуска в `SyncCoordinator`; guard уже активной
+full/realtime-сессии остаётся read-only и никогда не ставит вложенную
+maintenance-сессию в ту же очередь.
+Source preflight допускает только coordinator nesting: encryption guard остаётся
+активным, а любая уже существующая canonical maintenance блокирует процесс до
+filesystem work. При повторе claim собственный local transition block не
+заменяет remote-проверку: preflight проходит сквозь него только для повторного
+чтения manifest/canonical и снова блокируется при любой incoherence.
+Поскольку verifier использует случайный IV, stable manifest и maintenance не
+сравниваются по ciphertext: уже аутентифицированный codec обязан отдельно
+проверить оба verifier до recovery write.
+
 ### YandexDiskClient (api/yandex-client.ts)
 
 HTTP клиент для взаимодействия с Yandex Disk REST API.
@@ -502,6 +517,30 @@ Cleanup paths и source fingerprints фиксируются атомарно с 
 проверки transitional manifest, target descriptors и verifier. Для disable
 target canonical явно читается plaintext внутри того же recovery scope;
 удалённый после commit manifest допустим только для matching plaintext target.
+
+До первого target upload строится полное injective отображение
+`logicalPath -> targetRawPath`, не пересекающее source и protected paths. Каждый
+upload подтверждается stable raw read-back: target path декодируется обратно в
+ожидаемый logical path, а расшифрованные bytes сравниваются по plaintext
+SHA-256. Fingerprint сохраняется сразу после proof. После crash пропущенный
+fingerprint восстанавливается только тем же read-back; без proof canonical
+commit и cleanup запрещены.
+Success, 409, timeout и остальные ответы upload не считаются доказательством
+сами по себе. Raw source object без стабильного server fingerprint блокирует
+transition до claim, потому что его последующее удаление нельзя доказать.
+
+Transition manifest для следующей canonical phase публикуется до canonical
+commit. Поэтому crash до commit даёт только fail-closed рассогласование, а
+сразу после commit remote уже содержит matching authority для foreign
+recovery. После target commit stable manifest (либо его удаление при disable)
+публикуется до перевода canonical maintenance в `cleanup`. Stable manifest с
+matching `index-committed` maintenance является безопасным resume-состоянием.
+Pre-commit rollback не публикует post-commit `cleanup`: он оставляет source
+авторитетным, удаляет только доказанные target-объекты и затем снимает
+maintenance. Неполный guarded cleanup сохраняет local transition и блокировку.
+Local recovery дополнительно связывает local snapshot с canonical и manifest по
+transition ID, kind, initiator, source revision, descriptors и допустимому
+publication window; совпадения одного device ID недостаточно.
 Подробный wire и recovery contract описан в
 [E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
 

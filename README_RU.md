@@ -198,6 +198,11 @@ conflict-копию. Последовательные изменения одн�
 Во время включения, выключения или смены пароля остальные устройства
 блокируют обычную синхронизацию. Target-capable устройство может завершить
 fingerprint-guarded cleanup из canonical metadata без source password.
+Введённый на другом устройстве пароль остаётся candidate credential, пока не
+пройдут verifier, coherence manifest/transition/canonical и чтение canonical.
+Неверный либо отменённый пароль не заменяет активные settings. Каждый
+перекодированный объект скачивается обратно; decoded logical path и plaintext
+SHA-256 проверяются до сохранения fingerprint, commit или cleanup.
 
 - **Шифрование содержимого**: каждый файл получает случайный 12-байтный IV, что гарантирует уникальный шифротекст даже для одинаковых файлов
 - **Шифрование имён**: RFC 5297 AES-SIV с постоянным domain AAD и canonical Base64URL; имена стабильны между устройствами, а move папки не перекодирует потомков
@@ -242,6 +247,18 @@ npm install
 
 ### Режим разработки
 
+Один раз создайте локальный файл окружения и укажите абсолютный путь к папке
+плагина тестового vault. Файл игнорируется Git, а его значение имеет приоритет
+над одноимённой переменной shell:
+
+```bash
+cp .env.example .env
+```
+
+```dotenv
+YANDEX_PLUGIN_PATH=/absolute/path/to/test-vault/.obsidian/plugins/obsidian-yandex-disk-sync
+```
+
 ```bash
 npm run dev
 ```
@@ -252,8 +269,10 @@ npm run dev
 npm run build
 ```
 
-Собранные файлы помещаются в `build/`. Если задан `YANDEX_PLUGIN_PATH`, release
-artifacts также копируются в указанную папку плагина тестового хранилища.
+Собранные файлы помещаются в `build/`. Если `.env` содержит
+`YANDEX_PLUGIN_PATH`, release artifacts также копируются в указанную папку
+плагина тестового хранилища. В чистом checkout без `.env` выполняется только
+сборка release artifacts.
 
 ### Линтинг
 

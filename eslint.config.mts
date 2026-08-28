@@ -25,6 +25,18 @@ export default tseslint.config(
 	},
 	...obsidianmd.configs.recommended,
 	{
+		files: ["package.json"],
+		rules: {
+			"depend/ban-dependencies": [
+				"error",
+				{
+					presets: ["native", "microutilities", "preferred"],
+					allowed: ["dotenv"],
+				},
+			],
+		},
+	},
+	{
 		files: ["eslint.config.mts", "*.mjs"],
 		languageOptions: {
 			globals: {

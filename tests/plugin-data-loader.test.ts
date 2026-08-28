@@ -52,10 +52,38 @@ function currentTransition(): LocalEncryptionTransition {
 			profileId: "hardened",
 		},
 		sourceRawPaths: ["old"],
-		targetRawPaths: ["new"],
+		targetRawByLogicalPath: { "note.md": "new" },
 		sourceFingerprints: { old: "sha256:old" },
 		targetFingerprints: { new: "sha256:new" },
 		sourceCanonicalRevision: 4,
+		backupProof: {
+			path: ".backup/transition.enc.zip",
+			sha256: "backup-sha",
+			epoch: "epoch-a",
+			canonicalRevision: 4,
+			localSnapshotDigest: "snapshot-sha",
+			createdAt: 1,
+		},
+	};
+}
+
+function currentEncryptedSettings() {
+	return {
+		enableEncryption: true,
+		encryptionSalt: "target",
+		encryptionPassword: "target-password",
+		encryptionRevision: 2,
+		encryptionProfileId: "hardened" as const,
+	};
+}
+
+function currentPlaintextSettings() {
+	return {
+		enableEncryption: false,
+		encryptionSalt: null,
+		encryptionPassword: null,
+		encryptionRevision: null,
+		encryptionProfileId: null,
 	};
 }
 
@@ -129,10 +157,7 @@ test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty qu
 test("current semantic format preserves causal data with explicit profiles", () => {
 	const source = {
 		format: PLUGIN_DATA_FORMAT,
-		settings: {
-			enableEncryption: true,
-			encryptionProfileId: "hardened" as const,
-		},
+		settings: currentEncryptedSettings(),
 		localState: {
 			deviceId: "device-a",
 			observedEpoch: "epoch-a",
@@ -203,10 +228,115 @@ test("current transition without profile metadata is rejected", () => {
 		() =>
 			loadPluginData({
 				format: PLUGIN_DATA_FORMAT,
+				settings: currentEncryptedSettings(),
+				localState: null,
+				pendingMutations: [],
+				pendingPhysicalActions: [],
+				pendingWatcherEvents: [],
+				encryptionTransition:
+					transition as unknown as LocalEncryptionTransition,
+				lastSyncStats: {},
+			}),
+		UnsupportedHistoricalDataError,
+	);
+});
+
+test("current transition without mandatory backup proof is rejected", () => {
+	const transition = currentTransition() as unknown as Record<string, unknown>;
+	delete transition.backupProof;
+	assert.throws(
+		() =>
+			loadPluginData({
+				format: PLUGIN_DATA_FORMAT,
+				settings: currentEncryptedSettings(),
+				localState: null,
+				pendingMutations: [],
+				pendingPhysicalActions: [],
+				pendingWatcherEvents: [],
+				encryptionTransition:
+					transition as unknown as LocalEncryptionTransition,
+				lastSyncStats: {},
+			}),
+		UnsupportedHistoricalDataError,
+	);
+});
+
+test("current transition requires an injective disjoint target mapping", () => {
+	for (const targetRawByLogicalPath of [
+		{ "one.md": "same", "two.md": "same" },
+		{ "one.md": "old" },
+		{ "one.md": ".backup/object" },
+	] as Array<Record<string, string>>) {
+		const transition = {
+			...currentTransition(),
+			targetRawByLogicalPath,
+			targetFingerprints: {},
+		};
+		assert.throws(
+			() =>
+				loadPluginData({
+					format: PLUGIN_DATA_FORMAT,
+					settings: currentEncryptedSettings(),
+					localState: null,
+					pendingMutations: [],
+					pendingPhysicalActions: [],
+					pendingWatcherEvents: [],
+					encryptionTransition: transition,
+					lastSyncStats: {},
+				}),
+			UnsupportedHistoricalDataError,
+		);
+	}
+});
+
+test("copied transition requires a fingerprint for every target object", () => {
+	const transition = currentTransition();
+	transition.targetFingerprints = {};
+	assert.throws(
+		() =>
+			loadPluginData({
+				format: PLUGIN_DATA_FORMAT,
+				settings: currentEncryptedSettings(),
+				localState: null,
+				pendingMutations: [],
+				pendingPhysicalActions: [],
+				pendingWatcherEvents: [],
+				encryptionTransition: transition,
+				lastSyncStats: {},
+			}),
+		UnsupportedHistoricalDataError,
+	);
+});
+
+test("current settings must match the source or target transition mode", () => {
+	assert.throws(
+		() =>
+			loadPluginData({
+				format: PLUGIN_DATA_FORMAT,
 				settings: {
-					enableEncryption: true,
-					encryptionProfileId: "hardened",
+					...currentEncryptedSettings(),
+					encryptionSalt: "unrelated",
 				},
+				localState: null,
+				pendingMutations: [],
+				pendingPhysicalActions: [],
+				pendingWatcherEvents: [],
+				encryptionTransition: currentTransition(),
+				lastSyncStats: {},
+			}),
+		UnsupportedHistoricalDataError,
+	);
+});
+
+test("historical transition target path arrays are rejected", () => {
+	const transition = currentTransition() as unknown as Record<string, unknown>;
+	delete transition.targetRawByLogicalPath;
+	transition.targetRawPaths = ["new"];
+	assert.throws(
+		() =>
+			loadPluginData({
+				format: PLUGIN_DATA_FORMAT,
+				settings: currentEncryptedSettings(),
 				localState: null,
 				pendingMutations: [],
 				pendingPhysicalActions: [],
@@ -224,10 +354,7 @@ test("numbered local state marker is rejected from current plugin data", () => {
 		() =>
 			loadPluginData({
 				format: PLUGIN_DATA_FORMAT,
-				settings: {
-					enableEncryption: false,
-					encryptionProfileId: null,
-				},
+				settings: currentPlaintextSettings(),
 				localState: {
 					version: 1,
 					deviceId: "device-a",

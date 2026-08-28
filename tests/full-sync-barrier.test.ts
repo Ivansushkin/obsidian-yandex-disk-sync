@@ -16,6 +16,7 @@ import {
 	createEmptyLocalState,
 	DEFAULT_SETTINGS,
 	type FileMetadata,
+	type IndexMaintenance,
 	type PendingMutation,
 	type SyncPhase,
 	type SyncProgress,
@@ -29,6 +30,7 @@ class FullSyncIndexFake {
 	readonly remoteFiles = new Map<string, FileMetadata>();
 	remoteSaveCount = 0;
 	onBuildLocalIndex: (() => void) | null = null;
+	maintenance: IndexMaintenance | undefined = undefined;
 
 	constructor() {
 		this.index.revision = 7;
@@ -82,7 +84,7 @@ class FullSyncIndexFake {
 	}
 
 	getMaintenance() {
-		return undefined;
+		return this.maintenance;
 	}
 
 	getPendingMutations() {
@@ -300,6 +302,83 @@ for (const encrypted of [false, true]) {
 		assert.deepEqual(watcher.getDeferredEvents(), []);
 	});
 }
+
+test("encryption preflight rejects active canonical maintenance before filesystem work", async () => {
+	const { engine, index } = createHarness(false);
+	let scannedLocal = false;
+	index.onBuildLocalIndex = () => {
+		scannedLocal = true;
+	};
+	index.maintenance = {
+		id: "stale-owned-transition",
+		kind: "enable",
+		phase: "prepared",
+		initiatedBy: "device-a",
+		sourceRevision: 7,
+		targetRevision: null,
+		source: {
+			enabled: false,
+			revision: null,
+			salt: null,
+			verifier: null,
+		},
+		target: {
+			enabled: true,
+			revision: 1,
+			salt: "target-salt",
+			verifier: "target-verifier",
+		},
+		cleanup: [],
+	};
+
+	const result = await engine.fullSync({
+		skipMaintenanceGuard: true,
+		requireStableCanonical: true,
+	});
+
+	assert.equal(result.success, false);
+	assert.equal(scannedLocal, false);
+	assert.equal(index.remoteSaveCount, 0);
+	assert.match(result.errors[0]?.message ?? "", /requires a stable canonical/);
+});
+
+test("owned encryption preflight revalidates remote state through its local block", async () => {
+	const accepted = createHarness(false);
+	let acceptedGuardCalls = 0;
+	accepted.engine.setExternalBlockReason("local transition is active");
+	accepted.engine.setSyncGuardCallback(() => {
+		acceptedGuardCalls++;
+		return { blockReason: null, validationToken: "stable-manifest" };
+	});
+	const acceptedResult = await accepted.engine.fullSync({
+		skipMaintenanceGuard: true,
+		requireStableCanonical: true,
+		validateThroughExternalEncryptionBlock: true,
+	});
+	assert.equal(acceptedResult.success, true);
+	assert.equal(acceptedGuardCalls, 1);
+
+	const rejected = createHarness(false);
+	let scannedLocal = false;
+	rejected.index.onBuildLocalIndex = () => {
+		scannedLocal = true;
+	};
+	rejected.engine.setExternalBlockReason("local transition is active");
+	rejected.engine.setSyncGuardCallback(() => ({
+		blockReason: "remote manifest is incoherent",
+	}));
+	const rejectedResult = await rejected.engine.fullSync({
+		skipMaintenanceGuard: true,
+		requireStableCanonical: true,
+		validateThroughExternalEncryptionBlock: true,
+	});
+	assert.equal(rejectedResult.success, false);
+	assert.equal(scannedLocal, false);
+	assert.match(
+		rejectedResult.errors[0]?.message ?? "",
+		/remote manifest is incoherent/,
+	);
+});
 
 test("a full sync accepts a replacement epoch without Force ping-pong", async () => {
 	const { engine, index } = createHarness(false);

@@ -7,6 +7,7 @@ import {
 	parseScenarioRows,
 	validateScenarioCatalog,
 } from "./scenario-catalog.mjs";
+import { readLocalPluginPath } from "./local-build-env.mjs";
 
 function readJson(path) {
 	return JSON.parse(readFileSync(path, "utf8"));
@@ -60,10 +61,17 @@ if (runtime["@noble/ciphers"] !== "2.2.0" || runtime.jszip !== "3.10.1") {
 if (runtime.obsidian || development.obsidian !== "1.13.1") {
 	fail("obsidian must be a pinned devDependency");
 }
+if (runtime.dotenv || development.dotenv !== "17.4.2") {
+	fail("dotenv must be a pinned devDependency");
+}
 const lock = readFileSync("package-lock.json", "utf8");
 if (/registry\.npmmirror\.com|npm\.yandex-team\.ru/.test(lock)) {
 	fail("lockfile contains a non-public registry");
 }
+if (execFileSync("git", ["ls-files", "--", ".env"], { encoding: "utf8" }).trim()) {
+	fail("local .env must not be tracked");
+}
+readLocalPluginPath();
 
 const assets = readdirSync("build").sort();
 const expectedAssets = ["main.js", "manifest.json", "styles.css"];
@@ -71,6 +79,7 @@ if (JSON.stringify(assets) !== JSON.stringify(expectedAssets)) {
 	fail(`unexpected build assets: ${assets.join(", ")}`);
 }
 const bundle = readFileSync("build/main.js", "utf8");
+if (bundle.includes("dotenv")) fail("browser bundle contains dotenv");
 const forbiddenImports = ["electron", ...builtinModules, ...builtinModules.map((name) => `node:${name}`)];
 for (const name of forbiddenImports) {
 	if (bundle.includes(`require("${name}")`) || bundle.includes(`require('${name}')`)) {

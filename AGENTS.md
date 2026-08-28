@@ -32,8 +32,9 @@
   npm run build
   ```
 
-- `npm run build` writes release artifacts to `build/` and, when
-  `YANDEX_PLUGIN_PATH` is set, copies them to the test vault.
+- `npm run build` writes release artifacts to `build/` and loads the optional
+  test-vault destination from the ignored root `.env`. Do not use a shell
+  `YANDEX_PLUGIN_PATH`; copy `.env.example` to `.env` instead.
 - Never commit `build/`, `main.js`, `node_modules/`, or other generated files.
   Release assets are `main.js`, `manifest.json`, and `styles.css`.
 - After code changes, run `npm test`, `npm run lint`, `npm run build`, and

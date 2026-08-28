@@ -235,6 +235,9 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_rotated_title": "Encryption password changed",
 		"modal.encryption_rotated_desc":
 			"The encryption password was changed on another device. Enter the new password to continue synchronization on this device.",
+		"modal.encryption_recovery_title": "Complete encryption maintenance",
+		"modal.encryption_recovery_desc":
+			"Another device committed an encryption change. Enter the password for the transitional manifest to verify it and finish guarded recovery.",
 		"modal.encryption_connect_button": "Connect",
 		"modal.backup_password_title": "Open encrypted backup",
 		"modal.backup_password_desc":
@@ -545,6 +548,9 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_rotated_title": "Пароль шифрования изменён",
 		"modal.encryption_rotated_desc":
 			"Пароль шифрования был изменён на другом устройстве. Введите новый пароль, чтобы продолжить синхронизацию на этом устройстве.",
+		"modal.encryption_recovery_title": "Завершить изменение шифрования",
+		"modal.encryption_recovery_desc":
+			"Другое устройство зафиксировало изменение шифрования. Введите пароль transition manifest, чтобы проверить его и безопасно завершить восстановление.",
 		"modal.encryption_connect_button": "Подключить",
 		"modal.backup_password_title": "Открыть зашифрованный backup",
 		"modal.backup_password_desc":

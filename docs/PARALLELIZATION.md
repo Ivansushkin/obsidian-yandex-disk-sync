@@ -6,6 +6,15 @@
 
 ## Архитектура
 
+### Межсессионная сериализация
+
+`SyncCoordinator` сериализует full, realtime, Force и encryption maintenance.
+Параллелизм ниже относится только к операциям внутри одной сессии. Password
+prompt и candidate validation выполняются до входа ручного запуска в очередь;
+sync guard уже активной сессии только читает manifest/token и не может ожидать
+вложенную maintenance-сессию. Watcher и scheduler при encryption block
+оставляют durable работу на повтор, не открывая интерактивные modal windows.
+
 ### Компоненты
 
 ```
