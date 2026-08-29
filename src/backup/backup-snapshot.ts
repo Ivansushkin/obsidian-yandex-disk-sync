@@ -1,7 +1,10 @@
 import type { YandexDiskClient } from "../api/yandex-client";
 import type { VaultAdapter } from "../api/vault-adapter";
 import { computeSha256, computeSha256FromString } from "../utils/hash-utils";
-import { toLocalPath } from "../utils/path-utils";
+import {
+	isLegacyPluginDataPath,
+	toLocalPath,
+} from "../utils/path-utils";
 
 export interface BackupSnapshotFile {
 	path: string;
@@ -36,6 +39,15 @@ export async function captureRemoteRawSnapshot(
 	remotePath: string,
 ): Promise<BackupSnapshot> {
 	const resources = await yandexClient.getResourcesRecursive(remotePath, true);
+	if (
+		resources.some((resource) =>
+			isLegacyPluginDataPath(toLocalPath(resource.path, remotePath)),
+		)
+	) {
+		throw new Error(
+			"Remote plugin data must be removed before a snapshot backup",
+		);
+	}
 	const remoteFiles = resources
 		.filter((resource) => {
 			if (resource.type !== "file") return false;

@@ -7,18 +7,21 @@ export class ForceSyncModal extends Modal {
 	private direction: ForceSyncDirection;
 	private onBackup: () => Promise<{ success: boolean }>;
 	private onAction: (action: "proceed" | "cancel") => void;
+	private requireLegacyClientsStopped: boolean;
 	private settled = false;
 
 	constructor(
 		app: App,
 		direction: ForceSyncDirection,
 		onBackup: () => Promise<{ success: boolean }>,
-		onAction: (action: "proceed" | "cancel") => void
+		onAction: (action: "proceed" | "cancel") => void,
+		requireLegacyClientsStopped = false,
 	) {
 		super(app);
 		this.direction = direction;
 		this.onBackup = onBackup;
 		this.onAction = onAction;
+		this.requireLegacyClientsStopped = requireLegacyClientsStopped;
 	}
 
 	onOpen(): void {
@@ -39,13 +42,28 @@ export class ForceSyncModal extends Modal {
 		contentEl.createEl("p", {
 			text: t("modal.force_sync_recommend_backup"),
 		});
+		let legacyClientsStopped = !this.requireLegacyClientsStopped;
+		let continueButton: { setDisabled(disabled: boolean): unknown } | null = null;
+		if (this.requireLegacyClientsStopped) {
+			new Setting(contentEl)
+				.setName(t("modal.force_sync_legacy_devices_title"))
+				.setDesc(t("modal.force_sync_legacy_devices_desc"))
+				.addToggle((toggle) =>
+					toggle.setValue(false).onChange((value) => {
+						legacyClientsStopped = value;
+						continueButton?.setDisabled(!value);
+					}),
+				);
+		}
 
 		const setting = new Setting(contentEl)
 			.addButton((btn) =>
-				btn
+				(continueButton = btn)
+					.setDisabled(this.requireLegacyClientsStopped)
 					.setButtonText(t("modal.force_sync_backup_button"))
 					.setCta()
 					.onClick(async () => {
+						if (!legacyClientsStopped) return;
 						btn.setDisabled(true);
 						btn.setButtonText(t("settings.backup_in_progress"));
 						const result = await this.onBackup();

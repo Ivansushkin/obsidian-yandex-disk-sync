@@ -7,6 +7,7 @@ import {
 	getPhysicalResourceFingerprint,
 	matchesPhysicalResourceFingerprint,
 } from "../utils/resource-fingerprint";
+import { getRecordValue } from "../utils/record-utils";
 
 export type PhysicalDeleteFingerprintDecision =
 	| "match"
@@ -22,13 +23,13 @@ export function isPhysicalDeleteAuthorized(
 	canonical: SyncIndex,
 ): boolean {
 	if (action.epoch !== canonical.epoch) return false;
-	const metadata = canonical.files[action.path];
+	const metadata = getRecordValue(canonical.files, action.path);
 	if (action.origin === "force-reset") {
-		return metadata === undefined;
+		return metadata === undefined || metadata.deleted === true;
 	}
 	if (action.origin === "rejected-upload") {
 		const target = action.targetPath
-			? canonical.files[action.targetPath]
+			? getRecordValue(canonical.files, action.targetPath)
 			: undefined;
 		return (
 			metadata === undefined &&

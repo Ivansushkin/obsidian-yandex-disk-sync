@@ -1,6 +1,7 @@
 import type { FileMetadata, FolderTombstone } from "../types";
 import { CURRENT_INDEX_FORMAT } from "../types";
 import { parseStable1xIndex } from "../compatibility/stable-1x";
+import { getRecordValue, setRecordValue } from "../utils/record-utils";
 
 /**
  * Classify current canonical data and the stable 1.x migration input.
@@ -77,7 +78,10 @@ export function findFolderTombstone(
 	let result: FolderTombstone | null = null;
 	const segments = path.replace(/\/+$/, "").split("/");
 	for (let depth = 1; depth < segments.length; depth++) {
-		const tombstone = tombstones[segments.slice(0, depth).join("/")];
+		const tombstone = getRecordValue(
+			tombstones,
+			segments.slice(0, depth).join("/"),
+		);
 		if (!tombstone) continue;
 		if (
 			!result ||
@@ -291,7 +295,7 @@ export function advanceMutationSequence(
 ): boolean {
 	const current = appliedMutationSeq[deviceId] || 0;
 	if (sequence !== current + 1) return false;
-	appliedMutationSeq[deviceId] = sequence;
+	setRecordValue(appliedMutationSeq, deviceId, sequence);
 	return true;
 }
 

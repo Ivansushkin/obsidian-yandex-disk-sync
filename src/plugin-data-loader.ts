@@ -6,6 +6,7 @@ import type {
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
 import {
 	parseStable1xPluginData,
+	type Stable1xPluginData,
 	type Stable1xIndex,
 } from "./compatibility/stable-1x";
 import {
@@ -13,6 +14,12 @@ import {
 	createTargetRawMapping,
 	type LocalEncryptionTransition,
 } from "./crypto/encryption-transition";
+import {
+	createSafeRecord,
+	getRecordValue,
+	protectRecord,
+	setRecordValue,
+} from "./utils/record-utils";
 
 interface PersistedPluginData {
 	format?: unknown;
@@ -26,6 +33,15 @@ interface PersistedPluginData {
 }
 
 export const PLUGIN_DATA_FORMAT = "plugin-data" as const;
+
+export type PluginDataSource = "empty" | "current" | "stable-1x";
+
+export interface PluginDataLoadResult<T extends PersistedPluginData> {
+	source: PluginDataSource;
+	data: (T & { format: typeof PLUGIN_DATA_FORMAT }) | null;
+	/** Exact rollback-readable stable snapshot, present only before cutover. */
+	stableSnapshot: Stable1xPluginData | null;
+}
 
 const CURRENT_PLUGIN_DATA_KEYS = new Set([
 	"format",
@@ -45,7 +61,16 @@ const CURRENT_PLUGIN_DATA_KEYS = new Set([
 export function loadPluginData<T extends PersistedPluginData>(
 	data: T | null | undefined,
 ): (T & { format: typeof PLUGIN_DATA_FORMAT }) | null {
-	if (data == null) return null;
+	return loadPluginDataWithSource(data).data;
+}
+
+/** Load plugin data while retaining whether a stable snapshot needs cutover. */
+export function loadPluginDataWithSource<T extends PersistedPluginData>(
+	data: T | null | undefined,
+): PluginDataLoadResult<T> {
+	if (data == null) {
+		return { source: "empty", data: null, stableSnapshot: null };
+	}
 	if (typeof data !== "object" || Array.isArray(data)) {
 		throw new UnsupportedHistoricalDataError(
 			"Plugin data root must be a recognized object",
@@ -54,7 +79,11 @@ export function loadPluginData<T extends PersistedPluginData>(
 	if (data.format === PLUGIN_DATA_FORMAT) {
 		assertExactKeys(data, CURRENT_PLUGIN_DATA_KEYS, "current plugin data");
 		assertCurrentEncryptionState(data);
-		return data as T & { format: typeof PLUGIN_DATA_FORMAT };
+		return {
+			source: "current",
+			data: data as T & { format: typeof PLUGIN_DATA_FORMAT },
+			stableSnapshot: null,
+		};
 	}
 	if (data.format !== undefined || "schemaVersion" in data) {
 		throw new UnsupportedHistoricalDataError(
@@ -69,7 +98,7 @@ export function loadPluginData<T extends PersistedPluginData>(
 	}
 	const settings: Partial<YandexDiskSyncSettings> = { ...stable.settings };
 	settings.encryptionProfileId = null;
-	return {
+	const converted = {
 		format: PLUGIN_DATA_FORMAT,
 		settings,
 		localState: convertStable1xBaseline(
@@ -82,15 +111,20 @@ export function loadPluginData<T extends PersistedPluginData>(
 		encryptionTransition: null,
 		lastSyncStats: stable.lastSyncStats,
 	} as T & { format: typeof PLUGIN_DATA_FORMAT };
+	return {
+		source: "stable-1x",
+		data: converted,
+		stableSnapshot: stable,
+	};
 }
 
 function convertStable1xBaseline(
 	value: Stable1xIndex | null,
 	deviceId: string,
 ): LocalSyncState {
-	const files: Record<string, FileMetadata> = {};
+	const files = createSafeRecord<FileMetadata>();
 	for (const [path, metadata] of Object.entries(value?.files ?? {})) {
-		files[path] = {
+		setRecordValue(files, path, {
 			path,
 			sha256: metadata.sha256,
 			size: metadata.size,
@@ -99,7 +133,7 @@ function convertStable1xBaseline(
 			deleted: metadata.deleted,
 			deletedAt: metadata.deletedAt,
 			lastModifiedBy: metadata.lastModifiedBy,
-		};
+		});
 	}
 	return {
 		deviceId,
@@ -171,6 +205,16 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 			]),
 			"current local state",
 		);
+		if (
+			!isRecord(data.localState.files) ||
+			!isRecord(data.localState.folderTombstones)
+		) {
+			throw new UnsupportedHistoricalDataError(
+				"Current local path records must be objects",
+			);
+		}
+		protectRecord(data.localState.files);
+		protectRecord(data.localState.folderTombstones);
 	}
 	if (data.encryptionTransition) {
 		assertCurrentTransition(data.encryptionTransition);
@@ -263,10 +307,12 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 		sourcePaths.add(path);
 	}
 	assertStringRecord(transition.sourceFingerprints, "source fingerprints");
+	protectRecord(transition.sourceFingerprints);
 	if (
 		Object.keys(transition.sourceFingerprints).length !== sourcePaths.size ||
 		[...sourcePaths].some(
-			(path) => !hasOwn(transition.sourceFingerprints, path),
+			(path) =>
+				getRecordValue(transition.sourceFingerprints, path) === undefined,
 		)
 	) {
 		throw new UnsupportedHistoricalDataError(
@@ -277,6 +323,7 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 		transition.targetRawByLogicalPath,
 		"target path mapping",
 	);
+	protectRecord(transition.targetRawByLogicalPath);
 	let targetPaths: Set<string>;
 	try {
 		const normalizedMapping = createTargetRawMapping(
@@ -292,6 +339,7 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 		);
 	}
 	assertStringRecord(transition.targetFingerprints, "target fingerprints");
+	protectRecord(transition.targetFingerprints);
 	if (
 		Object.keys(transition.targetFingerprints).some(
 			(path) => !targetPaths.has(path),
@@ -304,7 +352,8 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 	if (
 		transition.phase !== "prepared" &&
 		[...targetPaths].some(
-			(path) => !hasOwn(transition.targetFingerprints, path),
+			(path) =>
+				getRecordValue(transition.targetFingerprints, path) === undefined,
 		)
 	) {
 		throw new UnsupportedHistoricalDataError(
@@ -424,8 +473,4 @@ function assertExactKeys(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOwn(value: object, key: string): boolean {
-	return Object.prototype.hasOwnProperty.call(value, key);
 }

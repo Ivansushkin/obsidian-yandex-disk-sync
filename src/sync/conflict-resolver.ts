@@ -9,6 +9,7 @@ import type {
 } from "../types";
 import { getFileName, getDirectory, getExtension } from "../utils/path-utils";
 import { logger } from "../utils/logger";
+import { getRecordValue } from "../utils/record-utils";
 import { findFolderTombstone } from "./index-rules";
 import {
 	getRemotePhysicalDrift,
@@ -38,8 +39,8 @@ export class ConflictResolver {
 		for (const path of allPaths) {
 			const local = localFiles.get(path) ?? null;
 			const physical = remoteFiles.get(path) ?? null;
-			const baseline = previousBaseline[path] ?? null;
-			const canonicalEntry = canonicalFiles[path] ?? null;
+			const baseline = getRecordValue(previousBaseline, path) ?? null;
+			const canonicalEntry = getRecordValue(canonicalFiles, path) ?? null;
 			const remoteLive = canonicalEntry && !canonicalEntry.deleted
 				? {
 						...canonicalEntry,
@@ -137,7 +138,10 @@ export class ConflictResolver {
 			if (operation.action !== "none") operations.push(operation);
 		}
 		return operations.map((operation) =>
-			this.withCausalOrigin(operation, canonicalFiles[operation.path]),
+			this.withCausalOrigin(
+				operation,
+				getRecordValue(canonicalFiles, operation.path),
+			),
 		);
 	}
 
@@ -546,8 +550,8 @@ export class ConflictResolver {
 		for (const path of allPaths) {
 			const localMeta = localFiles.get(path) || null;
 			const remoteMeta = remoteFiles.get(path) || null;
-			const localIndexMeta = localIndex[path] || null;
-			const remoteIndexMeta = remoteIndex[path] || null;
+			const localIndexMeta = getRecordValue(localIndex, path) ?? null;
+			const remoteIndexMeta = getRecordValue(remoteIndex, path) ?? null;
 			const folderTombstone = findFolderTombstone(
 				path,
 				folderTombstones,
@@ -635,7 +639,10 @@ export class ConflictResolver {
 		}
 
 		return operations.map((operation) =>
-			this.withCausalOrigin(operation, remoteIndex[operation.path]),
+			this.withCausalOrigin(
+				operation,
+				getRecordValue(remoteIndex, operation.path),
+			),
 		);
 	}
 

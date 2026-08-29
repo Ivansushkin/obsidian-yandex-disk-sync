@@ -80,6 +80,25 @@ snapshot: `remote-raw` для Force local, `logical-vault` для Force remote. 
 скачивает backup и переснимает canonical/snapshot. Любое отличие блокирует
 Force как stale и требует новый backup.
 
+Metadata scan и сам `remote-raw` snapshot fail closed при обнаружении старой
+remote plugin directory: её содержимое не скачивается и не попадает в ZIP.
+После такого обнаружения non-secret local marker требует сначала удалить
+directory, затем заменить OAuth token; обычный restart этот gate не снимает.
+
+При migration stable 1.1 эта повторная проверка является границей local
+`data.json`: до неё на диск пишется только rollback-readable stable shape.
+После успешной проверки Force фиксирует source identity и portable-path gates,
+повторяет metadata safety check, сохраняет current `plugin-data` и только затем
+начинает replacement. Crash после local cutover, но до
+canonical commit, не переиспользует старый proof — пользователь создаёт новый
+backup. Если replacement commit уже подтверждён, повторный Force запрещён:
+оставшийся cleanup возобновляет normal full.
+
+Второй stable-local device после Force первого не переключается автоматически.
+Явный Full создаёт собственный `logical-vault` backup с exact read-back,
+проверяет digest local snapshot до/после и raw SHA canonical до/после; только
+затем записывает current `plugin-data` и принимает replacement epoch.
+
 ## Download
 
 Download всегда начинается raw:

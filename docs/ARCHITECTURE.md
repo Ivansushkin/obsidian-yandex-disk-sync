@@ -225,9 +225,14 @@ barrier не поглощает upload, на который ссылается r
 затронутые physical paths; полный remote-tree scan остаётся обязанностью full
 sync для external edit и orphan detection.
 
-Startup является обычной coordinator-сессией `fullSync({ startup: true })`.
+До remote classification startup загружает local baseline/очереди и один раз
+регистрирует lifecycle callbacks. Это выполняется даже без token и при 401/403.
+Неперсистентные typed-блоки `migration`, `encryption`, `historical` и
+`authentication` останавливают normal full, realtime, watcher и scheduler;
+только `migration` пропускает подтверждённый Force. Resume сначала выполняет
+read-only recheck и не может скрыть активный блок статусом `idle`.
 Persisted watcher events загружаются в память, но watcher и scheduler
-запускаются только после успешной строгой проверки encryption manifest.
+запускаются только после успешной строгой проверки manifest/canonical.
 Manifest и canonical читаются единым stable raw-примитивом
 `metadata → download → metadata`; неизменность подтверждается по `sha256`,
 затем `md5`, затем паре `server modified + size`. Canonical и lock находятся
@@ -238,6 +243,16 @@ session token; для строгого no-op финальный запрос н�
 Plaintext stable 1.0/1.1 canonical с точной формой `version: 1` или
 `version: 2` не мигрируется обычной синхронизацией: пользователь один раз
 выполняет Force sync с обязательным backup на авторитетном устройстве.
+Точный stable `data.json` при загрузке конвертируется только в память. До
+verified backup он сохраняется legacy-сериализатором, поэтому простой запуск,
+смена token/path или unload не уничтожают возможность отката на 1.1. Current
+`plugin-data` записывается внутри сериализованной Force-сессии после повторной
+проверки backup/canonical/source и до первой filesystem/remote mutation. Crash
+после этого boundary продолжает migration из current state и требует новый
+backup proof, если replacement commit ещё не состоялся. Второй stable-local
+device, обнаруживший уже current canonical, не делает автоматический cutover:
+startup/Resume остаются read-only, а явный Full сначала создаёт и проверяет
+собственный logical backup, повторно сверяет local snapshot и canonical.
 Encrypted legacy и все остальные historical formats блокируются даже при
 Force. Force выполняет read-only classification до захвата canonical lock.
 UI запускает эту classification до создания обязательного backup. После
@@ -247,6 +262,16 @@ exact byte read-back backup внутрь `SyncCoordinator` передаётся 
 `beginForceBootstrap`, создания папок и любых local/remote writes. Любое
 изменение делает proof stale и требует новый backup; index transaction
 дополнительно повторяет format guard непосредственно перед lock.
+До backup metadata-only scan проверяет legacy canonical и physical tree. Любая
+копия `plugins/yandex-disk-sync`/`plugins/obsidian-yandex-disk-sync` блокирует
+migration без content download и требует удалить remote directory и заменить
+OAuth token. Обнаружение сохраняет только non-secret local remediation marker:
+даже после удаления remote directory Force остаётся заблокированным до смены
+token в настройках. Remote-raw snapshot также проверяет metadata до первого
+download и не архивирует plugin data. User paths, конфликтующие с current
+service names или меняющиеся при current normalization, требуют ручного
+переименования. Path records нейтрализуют prototype accessor, поэтому корневой
+`__proto__` остаётся обычным пользовательским ключом.
 Current canonical хранит `mutationSeq` в file metadata, folder tombstones и moves. Folder move
 фиксирует logical intent одной revision, а физически выполняется как
 ограниченная пачка guarded file moves; folder-level move API не используется.
@@ -269,6 +294,15 @@ canonical, затем атомарно продвигают `observedEpoch`. С�
 physical actions не воспроизводятся; локальные изменения оформляются как новые
 операции нового epoch. Смена epoch во время realtime не повторяет index
 transaction, а оставляет событие durable и ставит один coalesced full.
+Replacement canonical содержит live entries выбранной стороны и tombstones с
+`mutationSeq: 0` для отсутствующих canonical/physical paths. Transfer принимает
+только bytes исходного source snapshot: Force local проверяет SHA каждого
+upload и повторный local scan, Force remote использует
+`metadata → download → metadata` и повторный remote-tree scan. До первого
+local write Force remote блокирует exact/NFC/case-fold collisions. До commit
+source mode остаётся авторитетным; после подтверждённого commit rollback
+запрещён, migration block снимается, а fingerprint-guarded cleanup продолжает
+обычный full даже после потери инициатора.
 
 ### SyncEngine (sync/sync-engine.ts)
 
@@ -568,7 +602,8 @@ publication window; совпадения одного device ID недостат
 получает `indexTransactionId`. На durable-границах журнал содержит epoch,
 observed/canonical revision, mutation/action ID, ожидаемые fingerprint и фазы
 перехода шифрования. Токены, пароли и ключи очищаются централизованно перед
-выводом.
+выводом. API diagnostics выводят только endpoint name без query values, поэтому
+metadata-only migration scan не раскрывает полный remote plugin-data path.
 
 `main.ts` остаётся composition root: lifecycle, UI/Notice и публичные методы
 делегируют profile selection, codec construction, snapshot и manifest
@@ -754,6 +789,7 @@ Force Sync — функция принудительной синхрониза�
 - Пояснение операции в зависимости от направления
 - Предупреждение о деструктивности операции
 - Единственная кнопка продолжения сначала создаёт обязательный бекап
+- Обязательное подтверждение, что stable 1.1 остановлена на остальных devices
 - Кнопка отмены
 
 ### Force Sync From Local
@@ -763,12 +799,14 @@ Force Sync — функция принудительной синхрониза�
 **Алгоритм:**
 
 ```
-1. Построить локальный индекс (сканирование vault)
-2. Получить список файлов с Яндекс.Диска
-3. Все локальные файлы → upload (принудительно)
-4. Создать новый `epoch` и canonical snapshot только из локального vault
-5. Удалить remote-only объекты guarded-действиями по fingerprint
-6. Очистить старые locks только после подтверждённого replacement commit
+1. Проверить exact backup proof и выполнить local plugin-data cutover
+2. Зафиксировать sorted local path/SHA/size snapshot
+3. Получить physical remote tree
+4. Загружать только bytes с ожидаемым SHA; перед commit повторить local scan
+5. Создать новый `epoch`: live local entries плюс tombstones отсутствующих paths
+6. Commit replacement canonical
+7. Удалить remote-only объекты guarded-действиями по fingerprint
+8. Очистить старые locks только после подтверждённого replacement commit
 ```
 
 ### Force Sync From Remote
@@ -778,13 +816,15 @@ Force Sync — функция принудительной синхрониза�
 **Алгоритм:**
 
 ```
-1. Построить локальный индекс (для определения удаляемых файлов)
-2. Получить фактический список файлов с Яндекс.Диска, не используя
+1. Проверить exact backup proof и выполнить local plugin-data cutover
+2. Построить local snapshot (для определения удаляемых файлов)
+3. Получить фактический список файлов с Яндекс.Диска, не используя
    legacy/ambiguous index как источник истины
-4. Все удалённые файлы → download (принудительно)
-5. Все локальные файлы, которых нет на диске → delete_local
-6. Создать новый `epoch`, canonical и local baseline из применённого remote
-   snapshot
+4. Проверить combined local/remote portable-path collisions
+5. Каждый remote файл прочитать stable metadata/download/metadata
+6. Повторить remote-tree scan перед commit
+7. Commit нового epoch с live remote entries и local-only tombstones/actions
+8. Только после commit удалить local-only files
 ```
 
 ### Особенности реализации
@@ -793,6 +833,9 @@ Force Sync — функция принудительной синхрониза�
 - **Не использует сравнение mtime/sha256** — безусловная перезапись
 - **Всегда требует backup** — Force local сохраняет raw remote snapshot,
   Force remote сохраняет локальный vault
+- **Не допускает source drift** — любое отличие до replacement commit требует
+  нового backup
+- **После commit не откатывается** — unfinished cleanup возобновляется normal full
 - **FileWatcher приостанавливается** через существующие `syncPauseCallbacks`
 - **Прогресс отображается** через единый `SyncState`: название фазы всегда,
   `N/M` только для известного набора операций

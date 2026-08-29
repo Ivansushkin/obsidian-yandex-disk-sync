@@ -31,6 +31,8 @@ import {
 	RemoteIndexTransactionError,
 	UnreadableRemoteIndexError,
 	ForceBackupStaleError,
+	ForceSourceChangedError,
+	PortablePathCollisionError,
 	type ForceCanonicalProof,
 } from "./index-manager";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
@@ -41,6 +43,7 @@ import {
 	getExtension,
 	getFileName,
 	getAncestorDirectoriesDeepestFirst,
+	hasPortablePathCollision,
 } from "../utils/path-utils";
 import { computeSha256 } from "../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
@@ -87,11 +90,14 @@ import {
 	captureLogicalVaultSnapshot,
 	captureRemoteRawSnapshot,
 } from "../backup/backup-snapshot";
+import { createSafeRecord, setRecordValue } from "../utils/record-utils";
 
 export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
 interface SyncGuardResult {
 	blockReason: string | null;
+	blockCode?: string;
+	blockStatus?: "error" | "migration-required" | "encryption-required";
 	validationToken?: string;
 }
 
@@ -107,6 +113,19 @@ interface PreparedRealtimeItem {
 export type SyncGuardCallback = (
 	validationToken?: string,
 ) => SyncGuardResult | Promise<SyncGuardResult>;
+
+export type ExternalSyncBlockKind =
+	| "migration"
+	| "encryption"
+	| "historical"
+	| "authentication";
+
+interface ExternalSyncBlock {
+	kind: ExternalSyncBlockKind;
+	reason: string;
+	code: string;
+	status: "error" | "migration-required" | "encryption-required";
+}
 
 export interface PhysicalRewriteUploadProof {
 	remoteFingerprint: string;
@@ -141,6 +160,8 @@ export interface SyncRunOptions {
 	epochRetry?: boolean;
 	/** Exact verified backup and pre-backup canonical identity for Force only. */
 	forceBackupProof?: ForceBackupProof;
+	/** Persist current local data only after Force proof was revalidated. */
+	beforeForceMutation?: () => void | Promise<void>;
 }
 
 export interface ForceBackupProof {
@@ -173,7 +194,7 @@ export class SyncEngine {
 	private eventListeners: SyncEventCallback[] = [];
 	private indexSaveCallback: IndexSaveCallback | null = null;
 	private syncGuardCallback: SyncGuardCallback | null = null;
-	private externalBlockReason: string | null = null;
+	private externalBlocks = new Map<ExternalSyncBlockKind, ExternalSyncBlock>();
 	private isSyncing = false;
 	private isPaused = false;
 	private coordinator: SyncCoordinator;
@@ -242,14 +263,26 @@ export class SyncEngine {
 		this.syncGuardCallback = callback;
 	}
 
-	/**
-	 * Set externally managed sync block reason.
-	 */
-	setExternalBlockReason(reason: string | null): void {
-		this.externalBlockReason = reason;
+	/** Set or clear one non-persisted startup/runtime safety block. */
+	setExternalBlock(kind: ExternalSyncBlockKind, reason: string | null): void {
 		if (reason) {
-			this.setBlockedState(reason);
-		} else if (this.state.status === "encryption-required") {
+			this.externalBlocks.set(kind, {
+				kind,
+				reason,
+				code: this.getExternalBlockCode(kind),
+				status: this.getExternalBlockStatus(kind),
+			});
+		} else {
+			this.externalBlocks.delete(kind);
+		}
+		const active = this.getHighestPriorityExternalBlock();
+		if (active) {
+			this.setBlockedState(active.reason, active.status);
+		} else if (
+			this.state.status === "encryption-required" ||
+			this.state.status === "migration-required" ||
+			this.state.status === "error"
+		) {
 			this.updateState({
 				status: "idle",
 				errorMessage: undefined,
@@ -258,6 +291,11 @@ export class SyncEngine {
 				phase: undefined,
 			});
 		}
+	}
+
+	/** Compatibility wrapper for encryption-transition callers and tests. */
+	setExternalBlockReason(reason: string | null): void {
+		this.setExternalBlock("encryption", reason);
 	}
 
 	/**
@@ -557,15 +595,18 @@ export class SyncEngine {
 	): void {
 		if (this.uiOwnerSessionId !== session.id) return;
 		this.uiOwnerSessionId = null;
-		const failed = !success || this.state.status === "error";
-		const blocked = this.state.status === "encryption-required";
+		const activeBlock = this.getHighestPriorityExternalBlock();
+		const failed =
+			!success || (this.state.status === "error" && !activeBlock);
 		this.updateState({
-			status: blocked ? "encryption-required" : failed ? "error" : "idle",
+			status: activeBlock?.status ?? (failed ? "error" : "idle"),
 			lastSyncTime:
-				!failed && !blocked ? Date.now() : this.state.lastSyncTime,
+				!failed && !activeBlock ? Date.now() : this.state.lastSyncTime,
 			errorMessage:
 				error instanceof Error
 					? error.message
+					: activeBlock
+						? activeBlock.reason
 					: failed
 						? this.state.errorMessage
 						: undefined,
@@ -600,9 +641,10 @@ export class SyncEngine {
 	 */
 	resume(): void {
 		this.isPaused = false;
+		const activeBlock = this.getHighestPriorityExternalBlock();
 		this.updateState({
-			status: "idle",
-			errorMessage: undefined,
+			status: activeBlock?.status ?? "idle",
+			errorMessage: activeBlock?.reason,
 		});
 		logger.info("Synchronization resumed");
 	}
@@ -1257,17 +1299,18 @@ export class SyncEngine {
 											sha256,
 										),
 								);
-								canonical.files[path] = {
-									...logicalMetadata,
+									const rewritten: FileMetadata = {
+										...logicalMetadata,
 									size: content.byteLength,
 									sha256,
 									remoteMtime: stamp.remoteMtime,
 									remoteFingerprint:
 										stamp.remoteFingerprint,
-								};
-								this.indexManager.updateLocalFile(path, {
-									...canonical.files[path],
-								});
+									};
+									setRecordValue(canonical.files, path, rewritten);
+									this.indexManager.updateLocalFile(path, {
+										...rewritten,
+									});
 							},
 					);
 					this.setSyncPhase(
@@ -1348,19 +1391,15 @@ export class SyncEngine {
 					"from_local",
 					options?.forceBackupProof,
 				);
-				bootstrapStarted = true;
-				const inheritedCleanup = await this.prepareForceBootstrap();
 
 				// 2. Build local index
 				this.setSyncPhase("scanning-local");
 				const localFiles = await this.indexManager.buildLocalIndex();
+				const sourceIdentity = this.getForceLocalSourceIdentity(localFiles);
 
 				// 3. Get remote files list
 				this.setSyncPhase("scanning-remote");
 				const remoteFiles = await this.indexManager.getRemoteFiles();
-				if (inheritedCleanup) {
-					this.indexManager.clearMaintenance(inheritedCleanup.id);
-				}
 
 				// 4. Generate operations manually: all local → upload, remote-only → delete_remote
 				this.setSyncPhase("analyzing");
@@ -1387,13 +1426,19 @@ export class SyncEngine {
 						}
 					}
 				}
+				await options?.beforeForceMutation?.();
+				bootstrapStarted = true;
+				const inheritedCleanup = await this.prepareForceBootstrap();
+				if (inheritedCleanup) {
+					this.indexManager.clearMaintenance(inheritedCleanup.id);
+				}
 
 				logger.info(
 					`Force sync from local: ${operations.length} synchronization operations`,
 				);
 
-					// 5. Preflight: Create all necessary folders
-					await this.prepareOperationFolders(operations);
+				// 5. Preflight: Create all necessary folders
+				await this.prepareOperationFolders(operations);
 
 				// 6. Execute operations in parallel by type
 				const totalOps = operations.length;
@@ -1402,60 +1447,74 @@ export class SyncEngine {
 				const uploads = operations.filter(
 					(op) => op.action === "upload",
 				);
-				let deletes = operations.filter(
+				const deletes = operations.filter(
 					(op) => op.action === "delete_remote",
 				);
-				let indexCommittedBeforeDeletes = false;
 
-				await this.executeBulkUploads(
+				await this.executeForceLocalUploads(
 					uploads,
 					result,
 					(completed) => {
 						processedOps = completed;
 						this.reportProgress(processedOps, totalOps);
 					},
-					"Batch server metadata re-read after force uploads failed",
 				);
 				if (result.errors.length > 0) return;
 
 				await options?.beforeIndexCommit?.();
+				const finalLocalFiles = await this.indexManager.buildLocalIndex();
+				this.assertForceLocalSourceUnchanged(
+					sourceIdentity,
+					finalLocalFiles,
+				);
+
+				for (const operation of deletes) {
+					if (!operation.remoteMeta) continue;
+					this.indexManager.updateRemoteFile(
+						operation.path,
+						operation.remoteMeta,
+					);
+					this.indexManager.markRemoteFileDeleted(
+						operation.path,
+						undefined,
+						0,
+						0,
+					);
+					this.indexManager.enqueuePhysicalAction(
+						"delete-remote",
+						operation.path,
+						{
+							canonicalRevision:
+								this.indexManager.getRemoteIndex().revision + 1,
+							expectedFingerprint:
+								operation.remoteMeta.remoteFingerprint,
+							origin: "force-reset",
+						},
+					);
+				}
+				if (this.indexSaveCallback) await this.indexSaveCallback();
+
+				// 7. Commit all live entries and replacement tombstones before delete.
+				this.setSyncPhase("saving-index");
+				this.indexManager.updateSyncTime();
+				const commitProof = await this.saveRemoteIndexOrAbort(
+					result,
+					false,
+				);
+				if (!commitProof) {
+					return;
+				}
+				result.replacementCommitted = true;
+				await this.repairMissingAcceptedUploads(
+					uploads.map((operation) => operation.path),
+					commitProof,
+					validationToken,
+				);
 
 				if (deletes.length > 0) {
 					this.setSyncPhase(
 						"applying",
 						t("status.op.deleting_remote_files"),
-					);
-					for (const operation of deletes) {
-						this.indexManager.enqueuePhysicalAction(
-							"delete-remote",
-							operation.path,
-							{
-								canonicalRevision:
-									this.indexManager.getRemoteIndex().revision + 1,
-								expectedFingerprint:
-									operation.remoteMeta?.remoteFingerprint,
-								origin: "force-reset",
-							},
-						);
-					}
-					if (this.indexSaveCallback) await this.indexSaveCallback();
-					this.indexManager.updateSyncTime();
-					const deletionCommitProof =
-						await this.saveRemoteIndexOrAbort(result, false);
-					if (!deletionCommitProof) {
-						return;
-					}
-					await this.repairMissingAcceptedUploads(
-						uploads.map((operation) => operation.path),
-						deletionCommitProof,
-						validationToken,
-					);
-					indexCommittedBeforeDeletes = true;
-					deletes = deletes.filter(
-						(operation) =>
-							!this.indexManager.getRemoteIndex().files[
-								operation.path
-							],
 					);
 					const deleteResults = await this.executeOperationsParallel(
 						deletes,
@@ -1466,49 +1525,21 @@ export class SyncEngine {
 					);
 					result.deleted = deleteResults.succeeded;
 					result.errors.push(...deleteResults.errors);
-					if (this.indexSaveCallback) {
-						await this.indexSaveCallback();
-					}
-
-					// Prune remote folders emptied by the delete group (centralized,
-					// once, after all parallel deletes have settled).
+					if (this.indexSaveCallback) await this.indexSaveCallback();
 					try {
-						await this.pruneRemoteFolders(
-							deletes.map((op) => op.path),
-						);
-					} catch (e) {
-						logger.warn(
-							"Failed to prune remote folders after force deletes:",
-							{ error: e },
-						);
+						await this.pruneRemoteFolders(deletes.map((op) => op.path));
+					} catch (error) {
+						logger.warn("Failed to prune remote folders after Force", {
+							error,
+						});
 					}
 				}
-
-				// 7. Commit the canonical index. Failed physical deletions deliberately
-				// remain tombstoned so the next sync retries them. Failed uploads
-				// never updated the desired index and are likewise retried.
-				this.setSyncPhase("saving-index");
-				this.indexManager.cleanupDeletedFiles();
-				if (indexCommittedBeforeDeletes) return;
-				this.indexManager.updateSyncTime();
-				const commitProof = await this.saveRemoteIndexOrAbort(
-					result,
-					false,
-				);
-				if (!commitProof) {
-					return;
-				}
-				await this.repairMissingAcceptedUploads(
-					uploads.map((operation) => operation.path),
-					commitProof,
-					validationToken,
-				);
 			},
 			(result) =>
 				`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
 		const result = await this.runCoordinatedSession("force", options, run);
-		if (bootstrapStarted && !result.success) {
+		if (bootstrapStarted && !result.replacementCommitted) {
 			this.indexManager.cancelForceBootstrap();
 		}
 		return result;
@@ -1528,8 +1559,6 @@ export class SyncEngine {
 					"from_remote",
 					options?.forceBackupProof,
 				);
-				bootstrapStarted = true;
-				const inheritedCleanup = await this.prepareForceBootstrap();
 
 				// 2. Build local index (to know what to delete)
 				this.setSyncPhase("scanning-local");
@@ -1540,9 +1569,15 @@ export class SyncEngine {
 				// canonical index.
 				this.setSyncPhase("scanning-remote");
 				const remoteFiles = await this.indexManager.getRemoteFiles();
-				if (inheritedCleanup) {
-					this.indexManager.clearMaintenance(inheritedCleanup.id);
+				if (
+					hasPortablePathCollision([
+						...remoteFiles.keys(),
+						...localFiles.keys(),
+					])
+				) {
+					throw new PortablePathCollisionError();
 				}
+				const sourceIdentity = this.getForceRemoteSourceIdentity(remoteFiles);
 
 				// 4. Generate operations manually: all remote → download,
 				// local-only → delete locally.
@@ -1567,6 +1602,12 @@ export class SyncEngine {
 							localMeta: meta,
 						});
 					}
+				}
+				await options?.beforeForceMutation?.();
+				bootstrapStarted = true;
+				const inheritedCleanup = await this.prepareForceBootstrap();
+				if (inheritedCleanup) {
+					this.indexManager.clearMaintenance(inheritedCleanup.id);
 				}
 
 				logger.info(
@@ -1593,7 +1634,7 @@ export class SyncEngine {
 						t("status.op.downloading_files"),
 					);
 					const downloadResults =
-						await this.executeOperationsParallel(
+						await this.executeForceRemoteDownloads(
 							downloads,
 							(completed) => {
 								processedOps = completed;
@@ -1605,71 +1646,82 @@ export class SyncEngine {
 					if (downloadResults.errors.length > 0) return;
 				}
 
-				if (deletes.length > 0) {
-					this.setSyncPhase(
-						"applying",
-						t("status.op.deleting_local_files"),
+				await options?.beforeIndexCommit?.();
+				const finalRemoteFiles = await this.indexManager.getRemoteFiles();
+				this.assertForceRemoteSourceUnchanged(
+					sourceIdentity,
+					finalRemoteFiles,
+				);
+
+				for (const operation of deletes) {
+					if (!operation.localMeta) continue;
+					this.indexManager.updateRemoteFile(
+						operation.path,
+						operation.localMeta,
 					);
-					const deleteResults = await runWithConcurrencySettled(
-						deletes.map((operation) => async () => {
-							await this.deleteLocalFileForForce(operation.path);
-						}),
-						Math.max(1, this.settings.maxConcurrency || 5),
-						(completed) => {
-							processedOps = downloads.length + completed;
-							this.reportProgress(processedOps, totalOps);
+					this.indexManager.markRemoteFileDeleted(
+						operation.path,
+						undefined,
+						0,
+						0,
+					);
+					this.indexManager.enqueuePhysicalAction(
+						"delete-local",
+						operation.path,
+						{
+							canonicalRevision:
+								this.indexManager.getRemoteIndex().revision + 1,
+							baselineSha256: operation.localMeta.sha256,
+							origin: "force-reset",
 						},
 					);
-					for (let index = 0; index < deleteResults.length; index++) {
-						const deletion = deleteResults[index];
-						const operation = deletes[index];
-						if (!deletion || !operation) continue;
-						if (deletion.status === "fulfilled") {
-							result.deleted++;
-							continue;
-						}
-						result.errors.push({
-							path: operation.path,
-							operation: "delete_local",
-							message:
-								deletion.reason instanceof Error
-									? deletion.reason.message
-									: String(deletion.reason),
-						});
-					}
-					if (this.indexSaveCallback) {
-						await this.indexSaveCallback();
-					}
-					if (result.errors.length > 0) return;
 				}
+				if (this.indexSaveCallback) await this.indexSaveCallback();
 
 				// 7. Sync indexes: local becomes a copy of remote (only for
 				// downloads that actually succeeded). Entries whose download failed
 				// are left out of the local index so the next sync retries them and
 				// the local state does not falsely claim a file is present.
 				this.setSyncPhase("saving-index");
-				this.indexManager.cleanupDeletedFiles();
 				const localIndex = this.indexManager.getLocalIndex();
 				const remoteIndex = this.indexManager.getRemoteIndex();
 				const failedPaths = new Set(
 					result.errors.map((e) => e.path).filter(Boolean),
 				);
-				const newLocalFiles: Record<string, FileMetadata> = {};
+				const newLocalFiles = createSafeRecord<FileMetadata>();
 				for (const [p, meta] of Object.entries(remoteIndex.files)) {
 					if (failedPaths.has(p)) continue;
-					newLocalFiles[p] = meta;
+					setRecordValue(newLocalFiles, p, meta);
 				}
 				localIndex.files = newLocalFiles;
 				this.indexManager.updateSyncTime();
 				if (!(await this.saveRemoteIndexOrAbort(result, false))) {
 					return;
 				}
+				result.replacementCommitted = true;
+
+				if (deletes.length > 0) {
+					this.setSyncPhase(
+						"applying",
+						t("status.op.deleting_local_files"),
+					);
+					const deleteResults = await this.executeOperationsParallel(
+						deletes,
+						(completed) => {
+							processedOps = downloads.length + completed;
+							this.reportProgress(processedOps, totalOps);
+						},
+					);
+					result.deleted = deleteResults.succeeded;
+					result.errors.push(...deleteResults.errors);
+					if (this.indexSaveCallback) await this.indexSaveCallback();
+				}
 			},
 			(result) =>
 				`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 		);
 		const result = await this.runCoordinatedSession("force", options, run);
-		if (bootstrapStarted && !result.success) {
+		if (bootstrapStarted && !result.replacementCommitted) {
 			this.indexManager.cancelForceBootstrap();
 		}
 		return result;
@@ -1759,6 +1811,150 @@ export class SyncEngine {
 				error,
 			});
 			return false;
+		}
+	}
+
+	/** Upload only bytes that still match the local Force source snapshot. */
+	private async executeForceLocalUploads(
+		uploads: SyncOperation[],
+		result: SyncResult,
+		onProgress: (completed: number) => void,
+	): Promise<void> {
+		if (uploads.length === 0) return;
+		this.setSyncPhase("applying", t("status.op.uploading_files"));
+		const outcomes = await runWithConcurrencySettled(
+			uploads.map((operation) => async () => {
+				const expected = operation.localMeta;
+				if (!expected) throw new ForceSourceChangedError();
+				const content = await this.vaultAdapter.readFile(operation.path);
+				const sha256 = await computeSha256(content);
+				if (sha256 !== expected.sha256) throw new ForceSourceChangedError();
+				await this.uploadFile(operation.path, true, false, {
+					content,
+					sha256,
+				});
+			}),
+			Math.max(1, this.settings.maxConcurrency || 5),
+			onProgress,
+		);
+		this.collectForceOperationOutcomes(uploads, outcomes, result);
+		if (result.errors.length > 0) return;
+		try {
+			const liveRemote = await this.indexManager.getRemoteFiles();
+			this.indexManager.applyServerMtimes(liveRemote);
+		} catch (error) {
+			logger.warn(
+				"Batch server metadata re-read after Force uploads failed",
+				{ error },
+			);
+		}
+	}
+
+	/** Download each Force source file only after a stable metadata proof. */
+	private async executeForceRemoteDownloads(
+		downloads: SyncOperation[],
+		onProgress: (completed: number) => void,
+	): Promise<{ succeeded: number; errors: SyncError[] }> {
+		const outcomes = await runWithConcurrencySettled(
+			downloads.map((operation) => async () => {
+				if (!operation.remoteMeta) throw new ForceSourceChangedError();
+				await this.downloadStableForceRemoteFile(
+					operation.path,
+					operation.remoteMeta,
+				);
+			}),
+			Math.max(1, this.settings.maxConcurrency || 5),
+			onProgress,
+		);
+		const result = { succeeded: 0, errors: [] as SyncError[] };
+		for (let index = 0; index < outcomes.length; index++) {
+			const outcome = outcomes[index];
+			const operation = downloads[index];
+			if (!outcome || !operation) continue;
+			if (outcome.status === "fulfilled") {
+				result.succeeded++;
+			} else {
+				result.errors.push({
+					path: operation.path,
+					operation: operation.action,
+					message:
+						outcome.reason instanceof Error
+							? outcome.reason.message
+							: String(outcome.reason),
+				});
+			}
+		}
+		return result;
+	}
+
+	private collectForceOperationOutcomes(
+		operations: SyncOperation[],
+		outcomes: Awaited<ReturnType<typeof runWithConcurrencySettled<void>>>,
+		result: SyncResult,
+	): void {
+		for (let index = 0; index < outcomes.length; index++) {
+			const outcome = outcomes[index];
+			const operation = operations[index];
+			if (!outcome || !operation) continue;
+			if (outcome.status === "fulfilled") {
+				result.uploaded++;
+				continue;
+			}
+			result.errors.push({
+				path: operation.path,
+				operation: operation.action,
+				message:
+					outcome.reason instanceof Error
+						? outcome.reason.message
+						: String(outcome.reason),
+			});
+		}
+	}
+
+	private getForceLocalSourceIdentity(
+		files: Map<string, FileMetadata>,
+	): string {
+		return JSON.stringify(
+			[...files.entries()]
+				.map(([path, metadata]) => [
+					path,
+					metadata.sha256,
+					metadata.size,
+				] as const)
+				.sort(([left], [right]) => left.localeCompare(right)),
+		);
+	}
+
+	private getForceRemoteSourceIdentity(
+		files: Map<string, FileMetadata>,
+	): string {
+		return JSON.stringify(
+			[...files.entries()]
+				.map(([path, metadata]) => [
+					path,
+					metadata.remoteFingerprint ?? null,
+					metadata.remoteMtime ?? null,
+					metadata.size,
+				] as const)
+				.sort(([left], [right]) => left.localeCompare(right)),
+		);
+	}
+
+	private assertForceLocalSourceUnchanged(
+		expectedIdentity: string,
+		current: Map<string, FileMetadata>,
+	): void {
+		if (this.getForceLocalSourceIdentity(current) !== expectedIdentity) {
+			throw new ForceSourceChangedError();
+		}
+	}
+
+	private assertForceRemoteSourceUnchanged(
+		expectedIdentity: string,
+		current: Map<string, FileMetadata>,
+	): void {
+		if (this.getForceRemoteSourceIdentity(current) !== expectedIdentity) {
+			throw new ForceSourceChangedError();
 		}
 	}
 
@@ -1971,6 +2167,43 @@ export class SyncEngine {
 
 		const remotePath = joinPath(this.settings.remotePath, path);
 		const content = await this.yandexClient.downloadFile(remotePath);
+		await this.applyDownloadedContent(path, content, { serverMtime });
+	}
+
+	/** Read a stable Force source before performing the first local write. */
+	private async downloadStableForceRemoteFile(
+		path: string,
+		expected: FileMetadata,
+	): Promise<void> {
+		const remotePath = joinPath(this.settings.remotePath, path);
+		const snapshot =
+			await this.yandexClient.downloadStableLogicalFile(remotePath);
+		if (
+			!snapshot ||
+			!matchesPhysicalResourceFingerprint(
+				expected.remoteFingerprint,
+				snapshot.resource,
+			)
+		) {
+			throw new ForceSourceChangedError();
+		}
+		const serverMtime = new Date(snapshot.resource.modified).getTime();
+		await this.applyDownloadedContent(path, snapshot.content, {
+			serverMtime: Number.isFinite(serverMtime) ? serverMtime : undefined,
+			remoteFingerprint:
+				getPhysicalResourceFingerprint(snapshot.resource) ?? undefined,
+		});
+	}
+
+	/** Apply already verified remote bytes and update both local/canonical views. */
+	private async applyDownloadedContent(
+		path: string,
+		content: ArrayBuffer,
+		verified?: {
+			serverMtime?: number;
+			remoteFingerprint?: string;
+		},
+	): Promise<void> {
 
 		// If a local file already exists and its content has diverged from the
 		// last synced state (per the local index), it means the local copy
@@ -2004,8 +2237,13 @@ export class SyncEngine {
 		// Update indexes
 		const sha256 = await computeSha256(content);
 		const mtime = this.vaultAdapter.getFileMtime(path) || Date.now();
-		const remoteStamp = await this.fetchRemoteStamp(path);
-		const remoteMtime = serverMtime ?? remoteStamp.remoteMtime;
+		const remoteStamp = verified?.remoteFingerprint
+			? {
+					remoteMtime: verified.serverMtime,
+					remoteFingerprint: verified.remoteFingerprint,
+				}
+			: await this.fetchRemoteStamp(path);
+		const remoteMtime = verified?.serverMtime ?? remoteStamp.remoteMtime;
 
 		const metadata: FileMetadata = {
 			path,
@@ -2324,21 +2562,6 @@ export class SyncEngine {
 				error: e,
 			});
 		}
-	}
-
-	/**
-	 * Apply a Force-remote snapshot locally. The mandatory vault backup is the
-	 * recovery boundary, so no tombstone is added to the new canonical epoch.
-	 */
-	private async deleteLocalFileForForce(path: string): Promise<void> {
-		if (!this.vaultAdapter.fileExists(path)) {
-			this.indexManager.removeFromLocalIndex(path);
-			return;
-		}
-		this.expectWatcherEvent(path, "delete");
-		await this.vaultAdapter.deleteFile(path);
-		this.indexManager.removeFromLocalIndex(path);
-		await this.vaultAdapter.pruneEmptyLocalAncestors(path);
 	}
 
 	/**
@@ -3321,9 +3544,9 @@ export class SyncEngine {
 						(await computeSha256(remoteContent)) === sha256;
 				}
 				if (physical && physicalMatches) {
-					this.indexManager.getRemoteIndex().files[newPath] = {
+					setRecordValue(this.indexManager.getRemoteIndex().files, newPath, {
 						...canonicalTarget,
-					};
+					});
 					this.stampMovedTarget(newPath, physical, {
 						content,
 						sha256,
@@ -3351,15 +3574,15 @@ export class SyncEngine {
 				}
 			}
 			if (existingMove) {
-				this.indexManager.getRemoteIndex().moves[existingMove.id] = {
+				setRecordValue(this.indexManager.getRemoteIndex().moves, existingMove.id, {
 					...existingMove,
-				};
+				});
 				for (const path of [oldPath, newPath]) {
 					const metadata = canonical.files[path];
 					if (metadata) {
-						this.indexManager.getRemoteIndex().files[path] = {
+						setRecordValue(this.indexManager.getRemoteIndex().files, path, {
 							...metadata,
-						};
+						});
 					}
 				}
 				const physicalMove =
@@ -4641,10 +4864,13 @@ export class SyncEngine {
 				result.errors.push({
 					path: "",
 					operation: "none",
-					code: "encryption-blocked",
+					code: guard.blockCode ?? "encryption-blocked",
 					message: guard.blockReason,
 				});
-				this.setBlockedState(guard.blockReason);
+				this.setBlockedState(
+					guard.blockReason,
+					guard.blockStatus ?? "encryption-required",
+				);
 			} else {
 				await body(result, startTime, guard.validationToken);
 			}
@@ -4825,6 +5051,12 @@ export class SyncEngine {
 		}
 		if (findErrorCause(error, (candidate) => candidate instanceof ForceBackupStaleError)) {
 			return "force-backup-stale";
+		}
+		if (findErrorCause(error, (candidate) => candidate instanceof ForceSourceChangedError)) {
+			return "force-source-changed";
+		}
+		if (findErrorCause(error, (candidate) => candidate instanceof PortablePathCollisionError)) {
+			return "portable-path-collision";
 		}
 		return undefined;
 	}
@@ -5049,20 +5281,20 @@ export class SyncEngine {
 					const remoteFingerprint =
 						getPhysicalResourceFingerprint(physical) ?? undefined;
 					const remoteMtime = new Date(physical.modified).getTime();
-					this.indexManager.getRemoteIndex().files[path] = {
+					setRecordValue(this.indexManager.getRemoteIndex().files, path, {
 						...accepted,
 						remoteMtime: Number.isFinite(remoteMtime)
 							? remoteMtime
 							: accepted.remoteMtime,
 						remoteFingerprint,
-					};
+					});
 					repaired = true;
 					continue;
 				}
 			}
-			this.indexManager.getRemoteIndex().files[path] = {
+			setRecordValue(this.indexManager.getRemoteIndex().files, path, {
 				...accepted,
-			};
+			});
 			await this.uploadFile(path, false, true, snapshot);
 			repaired = true;
 		}
@@ -6277,11 +6509,30 @@ export class SyncEngine {
 		validationToken?: string,
 		validateThroughExternalBlock = false,
 	): Promise<SyncGuardResult> {
+		const external = this.getHighestPriorityExternalBlock((block) => {
+			if (
+				block.kind === "migration" &&
+				this.coordinator.getActiveKind() === "force"
+			) {
+				return false;
+			}
+			if (
+				block.kind === "encryption" &&
+				(skipGuard || validateThroughExternalBlock)
+			) {
+				return false;
+			}
+			return true;
+		});
+		if (external) {
+			return {
+				blockReason: external.reason,
+				blockCode: external.code,
+				blockStatus: external.status,
+			};
+		}
 		if (skipGuard) {
 			return { blockReason: null };
-		}
-		if (this.externalBlockReason && !validateThroughExternalBlock) {
-			return { blockReason: this.externalBlockReason };
 		}
 		if (!this.syncGuardCallback) {
 			return { blockReason: null };
@@ -6289,9 +6540,49 @@ export class SyncEngine {
 		return await this.syncGuardCallback(validationToken);
 	}
 
-	private setBlockedState(reason: string): void {
+	private getExternalBlockCode(kind: ExternalSyncBlockKind): string {
+		switch (kind) {
+			case "migration":
+				return "migration-required";
+			case "historical":
+				return "unsupported-historical";
+			case "authentication":
+				return "authentication";
+			case "encryption":
+				return "encryption-blocked";
+		}
+	}
+
+	private getExternalBlockStatus(
+		kind: ExternalSyncBlockKind,
+	): ExternalSyncBlock["status"] {
+		if (kind === "migration") return "migration-required";
+		if (kind === "encryption") return "encryption-required";
+		return "error";
+	}
+
+	private getHighestPriorityExternalBlock(
+		include: (block: ExternalSyncBlock) => boolean = () => true,
+	): ExternalSyncBlock | null {
+		for (const kind of [
+			"historical",
+			"authentication",
+			"encryption",
+			"migration",
+		] as const) {
+			const block = this.externalBlocks.get(kind);
+			if (block && include(block)) return block;
+		}
+		return null;
+	}
+
+	private setBlockedState(
+		reason: string,
+		status: "error" | "migration-required" | "encryption-required" =
+			"encryption-required",
+	): void {
 		this.updateState({
-			status: "encryption-required",
+			status,
 			errorMessage: reason,
 			currentOperation: undefined,
 			phase: undefined,

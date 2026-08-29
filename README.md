@@ -5,9 +5,25 @@ A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic syn
 ## Upgrading from 1.1.0 to 2.0.0
 
 Version 2.0.0 supports migration only from plaintext stable 1.0.0 and 1.1.0.
-Their local `localIndex` is converted once into the current baseline.
+Their local `localIndex` is converted into the current baseline in memory, but
+the original stable `data.json` shape remains rollback-readable until a
+verified backup and explicit Force migration reach the local cutover boundary.
 Plaintext canonical indexes carrying the exact stable `version: 1` or
 `version: 2` shape require a backed-up explicit **Force sync**.
+
+Before Force, update every device and stop stable 1.1 everywhere. A second
+updated device that observes the replacement canonical must run Full manually;
+it creates and verifies its own local backup before adopting the new epoch.
+Missing/invalid tokens and migration state never start the watcher or scheduler.
+
+If stable 1.1 synchronized the configuration directory and remote metadata
+contains this plugin's directory, migration stops without downloading its
+contents or adding it to a remote snapshot backup. Delete that remote plugin
+directory and replace the OAuth token; a non-secret local remediation marker
+keeps Force blocked across restart until the token changes. Rename any user
+path that conflicts with a current service filename or current path rules.
+Force remote also stops before local writes on NFC/case-insensitive path
+collisions.
 
 Encrypted legacy data and every other historical format are unsupported.
 Numeric manifests and canonical formats, unmarked queues/transitions, and
@@ -184,7 +200,10 @@ Force sync ignores timestamps, file hashes, and conflict resolver — it creates
 
 > **⚠️ Warning**
 > Force sync is destructive. The overwritten side is fully replaced. The
-> plugin requires a successful backup before it enables the operation.
+> plugin requires a successful backup before it enables the operation. The
+> source is checked again before replacement commit. After that commit,
+> interrupted fingerprint-guarded cleanup is resumed by normal Full sync and
+> Force must not be repeated.
 >
 > **Location**: Settings → Force Sync section.
 

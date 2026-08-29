@@ -25,6 +25,7 @@ class FakeBackupClient {
 	conflictFirstUpload = false;
 	encrypted = true;
 	decodeCalls = 0;
+	downloadedPaths: string[] = [];
 	decoder: ((content: ArrayBuffer) => Promise<ArrayBuffer>) | null = null;
 	resources: YandexResource[] = [];
 
@@ -61,6 +62,7 @@ class FakeBackupClient {
 	}
 
 	async downloadFile(path: string): Promise<ArrayBuffer> {
+		this.downloadedPaths.push(path);
 		const value = this.files.get(path);
 		if (!value) throw new Error("missing backup");
 		return value.slice(0);
@@ -139,6 +141,29 @@ test("Force backup proof binds the exact logical and remote snapshots", async ()
 	const secondRemote = await manager.createRemoteSnapshotBackup();
 	assert.ok(firstRemote.snapshotDigest);
 	assert.notEqual(firstRemote.snapshotDigest, secondRemote.snapshotDigest);
+});
+
+test("remote snapshot backup rejects legacy plugin data before download", async () => {
+	const client = new FakeBackupClient();
+	const exposedPath =
+		"disk:/vault/vault-config/plugins/yandex-disk-sync/data.json";
+	client.resources = [
+		{
+			name: "data.json",
+			path: exposedPath,
+			type: "file",
+			created: "2026-08-20T10:00:00Z",
+			modified: "2026-08-20T10:00:00Z",
+			size: 8,
+		},
+	];
+	client.files.set(exposedPath, new TextEncoder().encode("do-not-read").buffer);
+	const { manager } = createManager(client);
+
+	const result = await manager.createRemoteSnapshotBackup();
+	assert.equal(result.success, false);
+	assert.deepEqual(client.downloadedPaths, []);
+	assert.deepEqual(client.uploadedPaths, []);
 });
 
 test("verified backup accepts an upload whose response was lost", async () => {

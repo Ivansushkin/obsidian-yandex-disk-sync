@@ -18,6 +18,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.offline": "Offline",
 		"status.initializing": "Initializing...",
 		"status.encryption_required": "YD: Encryption password required",
+		"status.migration_required": "YD: Migration required",
 		"status.last_sync": "YD: {time}",
 		"status.ready_full": "YD: Ready",
 
@@ -35,6 +36,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.tooltip.initializing": "Status: Initializing...",
 		"status.tooltip.encryption_required":
 			"Status: Synchronization is blocked until encryption password is entered",
+		"status.tooltip.migration_required":
+			"Status: Stable 1.1 data requires a verified Force migration",
 		"status.tooltip.last_sync": "Last synchronization: {datetime}",
 		"status.session.full": "Full sync",
 		"status.session.force": "Force sync",
@@ -75,6 +78,26 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_sync_exception": "Force sync failed: {message}",
 		"notice.force_backup_stale":
 			"Force sync stopped because the canonical or protected data changed after backup verification. Create a new backup and try again.",
+		"notice.force_source_changed":
+			"Force sync stopped because the selected source changed during the operation. Create a new backup and try again.",
+		"notice.force_cleanup_pending":
+			"The replacement snapshot is committed. Cleanup is incomplete and will resume during normal synchronization; do not repeat Force sync.",
+		"notice.remote_recheck_required":
+			"Token or remote path changed. Remote state must be checked again before synchronization.",
+		"notice.remote_state_check_failed":
+			"Remote state could not be checked. Synchronization remains blocked without remote changes.",
+		"notice.stable_adoption_required":
+			"Another updated device completed the stable 1.1 migration. Run Full sync manually to create a verified local backup and adopt the new remote snapshot.",
+		"notice.stable_adoption_backup_failed":
+			"The mandatory local backup failed, so migration remains blocked: {message}",
+		"settings.migration_features_locked":
+			"Encryption and current-only settings stay locked until the stable 1.1 migration has completed.",
+		"notice.legacy_plugin_data_exposure":
+			"Stable 1.1 may have copied this plugin's local settings to Yandex Disk. Remove the remote plugin directory and replace the OAuth token before migration.",
+		"notice.legacy_token_rotation_required":
+			"The exposed remote plugin directory is no longer present, but migration remains blocked until the OAuth token is replaced in settings.",
+		"notice.legacy_service_collision":
+			"A stable 1.1 user path conflicts with a current service name or path rule. Rename it before migration.",
 		"notice.unsupported_historical_data":
 			"Synchronization is blocked because unsupported historical data was detected. Use a clean remote path or reset the old data manually after creating an independent backup.",
 		"notice.encryption_transition_error":
@@ -107,6 +130,10 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		// Modal descriptions
 		"modal.cancel_button": "Cancel",
+		"modal.force_sync_legacy_devices_title":
+			"All stable 1.1 clients are stopped",
+		"modal.force_sync_legacy_devices_desc":
+			"Confirm that Obsidian with plugin 1.1 is disabled on every other device before Force migration.",
 		"modal.close_button": "Close",
 		"modal.status_no_sync": "Synchronization has not been performed yet",
 		"modal.status_uploaded": "Uploaded: {count}",
@@ -328,6 +355,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.offline": "Офлайн",
 		"status.initializing": "Инициализация...",
 		"status.encryption_required": "YD: Требуется пароль шифрования",
+		"status.migration_required": "YD: Требуется миграция",
 		"status.last_sync": "YD: {time}",
 		"status.ready_full": "YD: Готов",
 
@@ -345,6 +373,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.tooltip.initializing": "Статус: Инициализация...",
 		"status.tooltip.encryption_required":
 			"Статус: Синхронизация заблокирована до ввода пароля шифрования",
+		"status.tooltip.migration_required":
+			"Статус: Данные stable 1.1 требуют подтверждённой Force-миграции",
 		"status.tooltip.last_sync": "Последняя синхронизация: {datetime}",
 		"status.session.full": "Полная синхронизация",
 		"status.session.force": "Принудительная синхронизация",
@@ -387,6 +417,26 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Ошибка принудительной синхронизации: {message}",
 		"notice.force_backup_stale":
 			"Force sync остановлен: canonical или защищаемые данные изменились после проверки бекапа. Создайте новый бекап и повторите операцию.",
+		"notice.force_source_changed":
+			"Force sync остановлен: выбранный источник изменился во время операции. Создайте новый бекап и повторите операцию.",
+		"notice.force_cleanup_pending":
+			"Новое состояние уже зафиксировано. Очистка не завершена и продолжится обычной синхронизацией; не повторяйте Force sync.",
+		"notice.remote_recheck_required":
+			"Токен или удалённый путь изменился. Перед синхронизацией нужно заново проверить удалённое состояние.",
+		"notice.remote_state_check_failed":
+			"Удалённое состояние не удалось проверить. Синхронизация остаётся заблокированной без изменений на диске.",
+		"notice.stable_adoption_required":
+			"Другое обновлённое устройство завершило миграцию stable 1.1. Запустите Full sync вручную: плагин создаст проверенный локальный бекап и примет новое удалённое состояние.",
+		"notice.stable_adoption_backup_failed":
+			"Обязательный локальный бекап не создан, поэтому миграция остаётся заблокированной: {message}",
+		"settings.migration_features_locked":
+			"Шифрование и настройки только для текущего формата заблокированы до завершения миграции stable 1.1.",
+		"notice.legacy_plugin_data_exposure":
+			"Stable 1.1 могла скопировать локальные настройки плагина на Яндекс Диск. Удалите удалённую директорию плагина и замените OAuth-токен до миграции.",
+		"notice.legacy_token_rotation_required":
+			"Удалённой директории плагина больше нет, но миграция остаётся заблокированной, пока OAuth-токен не будет заменён в настройках.",
+		"notice.legacy_service_collision":
+			"Пользовательский путь stable 1.1 конфликтует с текущим служебным именем или правилом пути. Переименуйте его до миграции.",
 		"notice.unsupported_historical_data":
 			"Синхронизация заблокирована: обнаружены неподдерживаемые исторические данные. Выберите чистый удалённый каталог или вручную сбросьте старые данные после создания независимого бекапа.",
 		"notice.encryption_transition_error":
@@ -419,6 +469,10 @@ export const translations: Record<Language, Record<string, string>> = {
 
 		// Modal descriptions
 		"modal.cancel_button": "Отмена",
+		"modal.force_sync_legacy_devices_title":
+			"Все клиенты stable 1.1 остановлены",
+		"modal.force_sync_legacy_devices_desc":
+			"Подтвердите, что Obsidian с плагином 1.1 отключён на всех остальных устройствах до Force-миграции.",
 		"modal.close_button": "Закрыть",
 		"modal.status_no_sync": "Синхронизация ещё не выполнялась",
 		"modal.status_uploaded": "Загружено: {count}",

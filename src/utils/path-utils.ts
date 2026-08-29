@@ -10,7 +10,10 @@ const PROTECTED_PATHS = [
 ];
 
 const PROTECTED_PATH_PREFIXES = [".obsidian-sync-index.lock."];
-const PLUGIN_DATA_DIRECTORY = "plugins/yandex-disk-sync";
+const PLUGIN_DIRECTORY_NAMES = new Set([
+	"yandex-disk-sync",
+	"obsidian-yandex-disk-sync",
+]);
 const LEGACY_LOG_DIRECTORY = "yandex-disk-sync";
 
 /**
@@ -117,6 +120,41 @@ export function isProtectedPath(path: string): boolean {
 	);
 }
 
+/** Detect plugin data that stable 1.1 could expose when syncing `.obsidian`. */
+export function isLegacyPluginDataPath(path: string): boolean {
+	const parts = normalizePath(path).split("/");
+	for (let index = 0; index < parts.length - 1; index++) {
+		if (
+			parts[index] === "plugins" &&
+			PLUGIN_DIRECTORY_NAMES.has(parts[index + 1] ?? "")
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Return true when a stable user path collides with a current service name.
+ * Such paths must be renamed manually instead of disappearing from migration.
+ */
+export function isLegacyServicePathCollision(path: string): boolean {
+	return isProtectedPath(path);
+}
+
+/** Find exact, Unicode-NFC, or case-fold collisions before writing locally. */
+export function hasPortablePathCollision(paths: Iterable<string>): boolean {
+	const observed = new Map<string, string>();
+	for (const path of paths) {
+		const normalized = normalizePath(path);
+		const portableKey = normalized.normalize("NFC").toLocaleLowerCase("en-US");
+		const previous = observed.get(portableKey);
+		if (previous !== undefined && previous !== normalized) return true;
+		observed.set(portableKey, normalized);
+	}
+	return false;
+}
+
 /**
  * Simple pattern matching (supports * and **)
  */
@@ -160,11 +198,14 @@ export function shouldSyncFile(
 	}
 
 	if (configDir) {
-		const pluginDataPath = joinPath(configDir, PLUGIN_DATA_DIRECTORY);
+		const pluginDataPaths = [...PLUGIN_DIRECTORY_NAMES].map((name) =>
+			joinPath(configDir, "plugins", name),
+		);
 		const legacyLogPath = joinPath(configDir, LEGACY_LOG_DIRECTORY);
 		if (
-			normalized === pluginDataPath ||
-			normalized.startsWith(`${pluginDataPath}/`) ||
+			pluginDataPaths.some(
+				(path) => normalized === path || normalized.startsWith(`${path}/`),
+			) ||
 			normalized === legacyLogPath ||
 			normalized.startsWith(`${legacyLogPath}/`)
 		) {

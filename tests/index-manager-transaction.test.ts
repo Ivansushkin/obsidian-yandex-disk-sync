@@ -8,6 +8,9 @@ import {
 	InvalidCurrentIndexError,
 	UnreadableRemoteIndexError,
 	ForceBackupStaleError,
+	PortablePathCollisionError,
+	LegacyPluginDataExposureError,
+	LegacyServicePathCollisionError,
 } from "../src/sync/index-manager";
 import {
 	CURRENT_INDEX_FORMAT,
@@ -22,6 +25,7 @@ import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { logger } from "../src/utils/logger";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
+import stableCanonicalFixture from "./fixtures/stable-1.1/canonical-v2.json";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
@@ -62,6 +66,7 @@ class FakeIndexYandex {
 	readonly files = new Map<string, ArrayBuffer>();
 	moveCount = 0;
 	stableReadCount = 0;
+	readonly downloadedPaths: string[] = [];
 
 	constructor(
 		private readonly remotePath: string,
@@ -86,6 +91,7 @@ class FakeIndexYandex {
 	}
 
 	async downloadFile(path: string, raw = false): Promise<ArrayBuffer> {
+		this.downloadedPaths.push(path);
 		const value = this.files.get(path);
 		if (!value) throw new Error(`Missing file: ${path}`);
 		const copy = value.slice(0);
@@ -223,6 +229,12 @@ class FakeIndexYandex {
 		return content ? this.createResource(path, content) : null;
 	}
 
+	async getResourcesRecursive(): Promise<YandexResource[]> {
+		return [...this.files.entries()].map(([path, content]) =>
+			this.createResource(path, content),
+		);
+	}
+
 	private createResource(
 		path: string,
 		content: ArrayBuffer,
@@ -286,6 +298,29 @@ test("encryption source snapshot rejects an unprovable raw user object", async (
 	await assert.rejects(
 		manager.getRemoteRawFileSnapshots(),
 		/no stable fingerprint/,
+	);
+});
+
+test("remote paths rewritten by current normalization fail before indexing", async () => {
+	const manager = new IndexManager(
+		{
+			getResourcesRecursive: async () => [
+				{
+					name: "notes\\name.md",
+					path: "vault/notes\\name.md",
+					type: "file",
+					created: "",
+					modified: "",
+				},
+			],
+		} as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		createSettings("device-a"),
+	);
+
+	await assert.rejects(
+		manager.getRemoteFiles(),
+		PortablePathCollisionError,
 	);
 });
 
@@ -379,6 +414,56 @@ test("plaintext stable 1.0/1.1 Force commits and verifies current canonical", as
 			files: {},
 		});
 	}
+	const fixtureResult = await runLegacyForceCommit(
+		null,
+		stableCanonicalFixture,
+	);
+	const historicalDelete =
+		fixtureResult.manager.getRemoteIndex().files["deleted.md"];
+	assert.equal(historicalDelete?.deleted, true);
+	assert.equal(historicalDelete?.mutationSeq, 0);
+});
+
+test("Force replacement tombstones survive initiator loss", async () => {
+	const source = stable1xIndex();
+	const files = source.files as Record<string, unknown>;
+	files["removed.md"] = {
+		path: "removed.md",
+		sha256: "removed-sha",
+		size: 7,
+		mtime: 8,
+		syncedAt: 9,
+	};
+	const { manager } = await runLegacyForceCommit(null, source);
+	const tombstone = manager.getRemoteIndex().files["removed.md"];
+	assert.equal(tombstone?.deleted, true);
+	assert.equal(tombstone?.mutationSeq, 0);
+	assert.equal(tombstone?.lastModifiedBy, "new-device");
+});
+
+test("legacy root __proto__ path survives conversion and Force", async () => {
+	const source = stable1xIndex();
+	const files = source.files as Record<string, unknown>;
+	Object.defineProperty(files, "__proto__", {
+		value: {
+			path: "__proto__",
+			sha256: "proto-sha",
+			size: 5,
+			mtime: 6,
+			syncedAt: 7,
+		},
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+	const { manager } = await runLegacyForceCommit(null, source);
+	const replacement = manager.getRemoteIndex().files;
+	assert.equal(
+		Object.prototype.hasOwnProperty.call(replacement, "__proto__"),
+		true,
+	);
+	assert.equal(replacement["__proto__"]?.deleted, true);
+	assert.equal(replacement["__proto__"]?.mutationSeq, 0);
 });
 
 test("versioned data outside the exact stable 1.x shape is rejected before Force locks", async () => {
@@ -751,6 +836,90 @@ test("plaintext stable 1.x startup preserves LegacyIndexFormatError", async () =
 	await assert.rejects(
 		manager.loadRemoteIndex(),
 		LegacyIndexFormatError,
+	);
+});
+
+test("legacy protected plugin data blocks migration without content download", async () => {
+	const source = stable1xIndex();
+	const { manager, client, canonicalPath } =
+		await createIndexManagerWithContent(source, null);
+	client.files.set(
+		"vault/vault-config/plugins/yandex-disk-sync/data.json",
+		new TextEncoder().encode("must-not-be-read").buffer,
+	);
+	await assert.rejects(
+		manager.assertLegacyMigrationPathsSafe(),
+		LegacyPluginDataExposureError,
+	);
+	assert.equal(
+		client.downloadedPaths.every((path) => path === canonicalPath),
+		true,
+	);
+});
+
+test("missing legacy canonical cannot hide exposed plugin data", async () => {
+	const { manager, client, canonicalPath } =
+		await createIndexManagerWithContent(stable1xIndex(), null);
+	client.files.delete(canonicalPath);
+	client.files.set(
+		"vault/vault-config/plugins/yandex-disk-sync/data.json",
+		new TextEncoder().encode("must-not-be-read").buffer,
+	);
+	await assert.rejects(
+		manager.assertLegacyMigrationPathsSafe(),
+		LegacyPluginDataExposureError,
+	);
+	assert.deepEqual(client.downloadedPaths, []);
+});
+
+test("legacy service-name collision blocks migration before remote writes", async () => {
+	const source = stable1xIndex();
+	const files = source.files as Record<string, unknown>;
+	files["notes/.obsidian-encrypt.json"] = {
+		path: "notes/.obsidian-encrypt.json",
+		sha256: "collision",
+		size: 3,
+		mtime: 1,
+		syncedAt: 2,
+	};
+	const { manager, client } = await createIndexManagerWithContent(source, null);
+	await assert.rejects(
+		manager.assertLegacyMigrationPathsSafe(),
+		LegacyServicePathCollisionError,
+	);
+	assert.equal(client.moveCount, 0);
+});
+
+test("legacy paths that current normalization would rewrite block migration", async () => {
+	const source = stable1xIndex();
+	const files = source.files as Record<string, unknown>;
+	files["notes\\name.md"] = {
+		path: "notes\\name.md",
+		sha256: "legacy-path",
+		size: 3,
+		mtime: 1,
+		syncedAt: 2,
+	};
+	const { manager, client } = await createIndexManagerWithContent(source, null);
+	await assert.rejects(
+		manager.assertLegacyMigrationPathsSafe(),
+		LegacyServicePathCollisionError,
+	);
+	assert.equal(client.moveCount, 0);
+});
+
+test("legacy physical-only service collision is not silently filtered", async () => {
+	const { manager, client } = await createIndexManagerWithContent(
+		stable1xIndex(),
+		null,
+	);
+	client.files.set(
+		"vault/notes/.obsidian-encrypt.json",
+		new TextEncoder().encode("user-content").buffer,
+	);
+	await assert.rejects(
+		manager.assertLegacyMigrationPathsSafe(),
+		LegacyServicePathCollisionError,
 	);
 });
 

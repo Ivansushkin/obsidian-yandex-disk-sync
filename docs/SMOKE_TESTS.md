@@ -250,12 +250,15 @@ TC-01–TC-07 без расширенного шифрования — окол�
 Шаги:
 
 1. Убедиться, что Device 1 содержит желаемое authoritative-состояние.
-2. На Device 1 выполнить Force local с backup.
-3. Не выполнять Force на Device 2.
-4. На Device 2 выполнить обычный full.
-5. Проверить, что Device 2 принял новый epoch.
-6. Теперь на Device 2 выполнить Force remote.
-7. На Device 1 выполнить обычный full.
+2. Подтвердить в UI, что stable 1.1 остановлена на остальных devices.
+3. На Device 1 выполнить Force local с backup.
+4. Не выполнять Force на Device 2 и убедиться, что его Resume не запускает
+   watcher/scheduler при stale migration block.
+5. На Device 2 выполнить обычный Full. Проверить создание и exact read-back
+   собственного logical backup до изменения его `data.json`.
+6. Проверить, что Device 2 принял новый epoch.
+7. Теперь на Device 2 выполнить Force remote.
+8. На Device 1 выполнить обычный full.
 
 Отдельно с fault injection проверить stale backup gate:
 
@@ -266,6 +269,18 @@ TC-01–TC-07 без расширенного шифрования — окол�
 4. Убедиться, что операция остановилась как stale до upload/delete/overwrite
    и потребовала создать новый backup.
 
+Отдельными fault-прогонами:
+
+1. Изменить local source во время Force local и remote source во время Force
+   remote. Replacement commit не должен состояться.
+2. Прервать Force сразу после replacement commit, затем потерять initiator.
+   Другой current device обязан продолжить tombstone/fingerprint cleanup
+   обычным Full без повторного Force.
+3. Вернуть offline Device 2: unchanged-файл должен удалиться по replacement
+   tombstone, а offline edit — восстановиться причинным put.
+4. Подготовить remote/local имена, совпадающие после NFC или case-fold. Force
+   remote должен остановиться до первого local write/delete.
+
 Ожидание:
 
 - Backup подтверждён до начала каждого Force.
@@ -275,10 +290,13 @@ TC-01–TC-07 без расширенного шифрования — окол�
 - Нет ping-pong требований Force.
 - Локальные изменения не теряются молча.
 - Watcher и scheduler после Force работают без перезапуска Obsidian.
+- Ошибка после replacement commit сообщает pending cleanup, а не требует
+  повторной migration.
 - Повторный full обоих устройств — `0/0/0`.
 
-Покрывает: `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`, `FORCE-017`,
-`FORCE-023`, `MULTI-012`, `MIG-004`, `UI-006`.
+Покрывает: `INIT-028`, `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`,
+`FORCE-017`, `FORCE-023`, `FORCE-024`, `FORCE-025`, `FORCE-026`,
+`MULTI-012`, `MIG-004`, `UI-006`.
 
 ## TC-08. Шифрование: fresh hardened и unsupported historical data
 
@@ -291,15 +309,42 @@ conflict/backup-файлы, если они мешают проверке.
 
 1. Подготовить plaintext `data.json` и canonical с `version: 2` из stable 1.1
    на Device 1.
-2. Обновить плагин и проверить перенос settings, hashes и `localIndex` в
-   unobserved baseline; все current queues должны быть пустыми.
-3. Проверить, что active device ID заменён installation-scoped ID, переживает
-   перезапуск этого профиля и отличается у второго профиля. Старый stable ID
-   не используется для новых mutation.
-4. Убедиться, что normal sync заблокирован инструкцией Force.
-5. Выполнить Force local с обязательным backup и получить canonical с
+2. Сохранить byte/JSON-снимок исходного `data.json`, обновить плагин и открыть
+   настройки без Force. Проверить, что на диске осталась stable-структура без
+   `format`, current queues и 2.0-only fields; 1.1 всё ещё может её прочитать.
+3. Проверить перенос settings, hashes и `localIndex` в in-memory unobserved
+   baseline; current queues должны быть пустыми.
+4. Проверить, что installation-scoped ID используется в памяти/local storage,
+   переживает перезапуск и отличается у второго профиля, но до cutover не
+   заменяет stable device ID внутри `data.json`.
+5. Запустить без token, с неверным token и после исправления. Baseline/lifecycle
+   должны загружаться всегда, но watcher/scheduler — только после успешной
+   read-only classification.
+6. Проверить, что Resume не снимает `migration-required` и normal sync
+   заблокирован инструкцией Force.
+7. Выполнить Force local с обязательным backup и получить canonical с
    `format: "sync-index"`.
-6. На Device 2 выполнить обычный full и проверить принятие нового epoch.
+8. Проверить, что current `plugin-data` появился только после повторной
+   проверки backup/canonical/source. Crash сразу после local cutover требует
+   новый backup, но продолжает migration из current local state.
+9. На Device 2 выполнить обычный Full, проверить его отдельный verified local
+   backup и принятие нового epoch.
+10. Повторить Force remote на отдельной копии stable vault.
+
+### Stable config-directory exposure и paths
+
+1. При `syncDotObsidian=true` поместить на remote fixture metadata для
+   `*/plugins/yandex-disk-sync/**`, не раскрывая содержимое.
+2. Убедиться, что migration блокируется без download этого object, полный path
+	не показывается и remote-raw backup не создаётся. Удалить remote plugin
+	directory, перезапустить plugin и убедиться, что non-secret remediation marker
+	по-прежнему блокирует Force со старым token; затем заменить OAuth token в
+	настройках и повторить read-only preflight.
+3. Отдельно проверить user path с current service name: требуется ручное
+	переименование, silent skip запрещён. Повторить для legacy имени с `\`, которое
+	current normalization преобразовало бы в другой logical path.
+4. Проверить корневой файл `__proto__`: он сохраняется при conversion/Force.
+5. Для Force remote проверить exact/NFC/case-fold collisions до local writes.
 
 ### Unsupported historical formats
 
@@ -412,8 +457,8 @@ canonical commit, но до публикации stable manifest:
 Покрывает: `ENC-001`, `ENC-002`, `ENC-005`, `ENC-010`, `TRANS-001`,
 `TRANS-002`, `TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`,
 `TRANS-028`, `TRANS-029`, `TRANS-030`, `TRANS-031`, `TRANS-032`,
-`TRANS-033`, `MULTI-015`, `FORCE-022`, `SAFE-004`, `SAFE-013`, `UI-007`,
-`UI-008`.
+`TRANS-033`, `MULTI-015`, `INIT-029`, `MIG-004`, `FORCE-022`, `SAFE-004`,
+`SAFE-013`, `UI-007`, `UI-008`.
 
 ## Расширенные обязательные release gates
 

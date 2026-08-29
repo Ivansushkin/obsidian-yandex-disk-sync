@@ -103,6 +103,14 @@
 - Concurrent use of older builds and 2.0.0 is unsupported. Only plaintext
   stable 1.0/1.1 local data and their numeric canonical formats are migratable;
   encrypted legacy data and every other historical format fail closed.
+- Preserve an exact stable 1.0/1.1 `data.json` shape until a verified backup
+  and protected snapshot recheck reach the explicit local cutover. Startup,
+  settings saves, installation ID setup, Resume, and unload must not perform
+  that cutover. A foreign replacement epoch requires its own verified local
+  backup before adoption.
+- Startup blocks are non-persisted and typed. Only `migration` may permit a
+  confirmed Force; encryption, historical, and authentication blocks may not.
+  Load local state and register lifecycle callbacks before token/remote checks.
 - Do not change the `sync-index`, `encryption-manifest`, or `plugin-data`
   markers, profile `hardened`, epoch/revision, mutation FIFO, or the persisted
   physical-action schema without a separate migration design, scenarios, and

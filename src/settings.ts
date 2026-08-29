@@ -165,6 +165,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 	private async renderDisplay(): Promise<void> {
 		const { containerEl } = this;
+		const migrationPending = this.plugin.isStableMigrationPending();
 
 		// Connection section
 		new Setting(containerEl).setName(t("settings.connection_section")).setHeading();
@@ -355,6 +356,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		infoSetting.descEl.createEl("p", {
 			text: t("settings.encryption_info_password"),
 		});
+		if (migrationPending) {
+			infoSetting.descEl.createEl("p", {
+				text: t("settings.migration_features_locked"),
+				cls: "encryption-info-warning",
+			});
+		}
 
 		let encryptionToggle: ToggleComponent | null = null;
 
@@ -364,6 +371,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				encryptionToggle = toggle;
 				return toggle
 					.setValue(this.plugin.settings.enableEncryption)
+					.setDisabled(migrationPending)
 					.onChange(async (value) => {
 						const spinner = this.showToggleSpinner(toggle);
 						try {
@@ -489,6 +497,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.enableDebugLogging)
+					.setDisabled(migrationPending)
 					.onChange(async (value) => {
 						this.plugin.settings.enableDebugLogging = value;
 						await this.plugin.saveSettings();
@@ -502,6 +511,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.logToFile)
+					.setDisabled(migrationPending)
 					.onChange(async (value) => {
 						this.plugin.settings.logToFile = value;
 						await this.plugin.saveSettings();

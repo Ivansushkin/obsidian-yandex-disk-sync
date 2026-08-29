@@ -335,3 +335,29 @@ test("epoch adoption still detects external physical remote edits", () => {
 	);
 	assert.equal(operations[0]?.action, "download");
 });
+
+test("offline device does not resurrect a Force-removed file", () => {
+	const resolver = new ConflictResolver();
+	const baseline = file("removed.md", "base");
+	const tombstone = {
+		...baseline,
+		deleted: true,
+		mutationSeq: 0,
+		changedRevision: 1,
+	};
+	const unchanged = resolver.determineEpochAdoptionOperations(
+		new Map([[baseline.path, baseline]]),
+		new Map([[baseline.path, baseline]]),
+		{ [baseline.path]: baseline },
+		{ [baseline.path]: tombstone },
+	);
+	assert.equal(unchanged[0]?.action, "delete_local");
+
+	const changed = resolver.determineEpochAdoptionOperations(
+		new Map([[baseline.path, file(baseline.path, "offline-edit")]]),
+		new Map([[baseline.path, baseline]]),
+		{ [baseline.path]: baseline },
+		{ [baseline.path]: tombstone },
+	);
+	assert.equal(changed[0]?.action, "upload");
+});

@@ -14,6 +14,15 @@ prompt и candidate validation выполняются до входа ручно
 sync guard уже активной сессии только читает manifest/token и не может ожидать
 вложенную maintenance-сессию. Watcher и scheduler при encryption block
 оставляют durable работу на повтор, не открывая интерактивные modal windows.
+Migration/authentication/historical blocks действуют так же; lifecycle
+callbacks регистрируются до token check, но automation не запускается до
+read-only classification.
+
+В Force parallel transfer не ослабляет source proof: local upload читает и
+проверяет ожидаемый SHA внутри task, remote download выполняет стабильную пару
+metadata вокруг bytes. После settlement всей пачки source tree переснимается
+перед единственным replacement commit. Physical deletes запускаются только
+после commit; ошибка одного cleanup task остаётся durable и не отменяет epoch.
 
 ### Компоненты
 

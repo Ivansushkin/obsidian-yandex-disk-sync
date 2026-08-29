@@ -5,11 +5,50 @@ import type { VaultAdapter } from "../src/api/vault-adapter";
 import { SyncEngine } from "../src/sync/sync-engine";
 import {
 	ForceBackupStaleError,
+	ForceSourceChangedError,
 	type IndexManager,
 } from "../src/sync/index-manager";
 import { DEFAULT_SETTINGS } from "../src/types";
 import { captureLogicalVaultSnapshot } from "../src/backup/backup-snapshot";
 import { computeSha256 } from "../src/utils/hash-utils";
+import type { FileMetadata } from "../src/types";
+
+function metadata(
+	path: string,
+	sha256: string,
+	remoteFingerprint = "fingerprint",
+): FileMetadata {
+	return {
+		path,
+		sha256,
+		remoteFingerprint,
+		remoteMtime: 10,
+		size: 4,
+		mtime: 10,
+		syncedAt: 10,
+	};
+}
+
+function createSourceProofAccess() {
+	const engine = new SyncEngine(
+		{} as YandexDiskClient,
+		{} as VaultAdapter,
+		{} as IndexManager,
+		DEFAULT_SETTINGS,
+	);
+	return engine as unknown as {
+		getForceLocalSourceIdentity(files: Map<string, FileMetadata>): string;
+		getForceRemoteSourceIdentity(files: Map<string, FileMetadata>): string;
+		assertForceLocalSourceUnchanged(
+			expected: string,
+			files: Map<string, FileMetadata>,
+		): void;
+		assertForceRemoteSourceUnchanged(
+			expected: string,
+			files: Map<string, FileMetadata>,
+		): void;
+	};
+}
 
 test("Force backup proof is required before any destructive operation", async () => {
 	const engine = new SyncEngine(
@@ -84,5 +123,33 @@ test("Force backup proof accepts only the matching protected snapshot", async ()
 	await assert.rejects(
 		access.assertForceBackupProof("from_remote", proof),
 		ForceBackupStaleError,
+	);
+});
+
+test("Force local source drift aborts before replacement commit", () => {
+	const access = createSourceProofAccess();
+	const source = new Map([["note.md", metadata("note.md", "before")]]);
+	const identity = access.getForceLocalSourceIdentity(source);
+	access.assertForceLocalSourceUnchanged(identity, source);
+	const changed = new Map([["note.md", metadata("note.md", "after")]]);
+	assert.throws(
+		() => access.assertForceLocalSourceUnchanged(identity, changed),
+		ForceSourceChangedError,
+	);
+});
+
+test("Force remote source drift aborts before replacement commit", () => {
+	const access = createSourceProofAccess();
+	const source = new Map([
+		["note.md", metadata("note.md", "logical", "remote-before")],
+	]);
+	const identity = access.getForceRemoteSourceIdentity(source);
+	access.assertForceRemoteSourceUnchanged(identity, source);
+	const changed = new Map([
+		["note.md", metadata("note.md", "logical", "remote-after")],
+	]);
+	assert.throws(
+		() => access.assertForceRemoteSourceUnchanged(identity, changed),
+		ForceSourceChangedError,
 	);
 });

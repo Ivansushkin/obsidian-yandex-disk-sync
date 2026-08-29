@@ -23,6 +23,35 @@ const obsidianStubPlugin = {
 			{ filter: /.*/, namespace: "test" },
 			() => ({
 				contents: `
+					export class App {}
+					export class Vault {}
+					export class Plugin {}
+					export class Modal {
+						constructor(app) { this.app = app; this.contentEl = {}; }
+						open() {}
+						close() {}
+					}
+					export class PluginSettingTab {}
+					export class Setting {
+						constructor() { this.settingEl = { addClass() {} }; }
+						setName() { return this; }
+						setDesc() { return this; }
+						addButton() { return this; }
+						addToggle() { return this; }
+						addText() { return this; }
+						addTextArea() { return this; }
+						addSlider() { return this; }
+						addDropdown() { return this; }
+					}
+					export class Notice {
+						constructor(message) { this.message = message; }
+						setMessage(message) { this.message = message; }
+						hide() {}
+					}
+					export class ButtonComponent {}
+					export class TextAreaComponent {}
+					export class TextComponent {}
+					export class ToggleComponent {}
 					export async function requestUrl(params) {
 						if (globalThis.__obsidianRequestUrl) {
 							return await globalThis.__obsidianRequestUrl(params);

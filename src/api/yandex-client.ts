@@ -32,6 +32,12 @@ interface StableRawFileSnapshot {
 	fingerprint: string;
 }
 
+export interface StableLogicalFileSnapshot {
+	content: ArrayBuffer;
+	resource: YandexResource;
+	fingerprint: string;
+}
+
 type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
 
 export class YandexDiskClient {
@@ -169,6 +175,33 @@ export class YandexDiskClient {
 			rawSize: raw.byteLength,
 		});
 		return { raw, resource: after, fingerprint: afterFingerprint };
+	}
+
+	/**
+	 * Read a logical user file between two matching physical metadata
+	 * observations. The returned bytes are decrypted by the active codec.
+	 */
+	async downloadStableLogicalFile(
+		path: string,
+		expectedResource?: YandexResource,
+	): Promise<StableLogicalFileSnapshot | null> {
+		const before =
+			expectedResource ?? (await this.getLogicalResource(path));
+		if (!before || !this.getContentFingerprint(before)) return null;
+		const content = await this.downloadFile(path);
+		const after = await this.getLogicalResource(path);
+		if (!after) {
+			throw new Error("Remote user file disappeared while being read");
+		}
+		const matchingFingerprint = this.getMatchingContentFingerprint(
+			before,
+			after,
+		);
+		const afterFingerprint = this.getContentFingerprint(after);
+		if (!matchingFingerprint || !afterFingerprint) {
+			throw new Error("Remote user file changed while being read");
+		}
+		return { content, resource: after, fingerprint: afterFingerprint };
 	}
 
 	/**
@@ -884,6 +917,7 @@ export class YandexDiskClient {
 		body?: unknown
 	): Promise<RequestUrlResponse> {
 		const url = `${API_BASE_URL}${endpoint}`;
+		const endpointName = endpoint.split("?", 1)[0] ?? endpoint;
 
 		const params: RequestUrlParam = {
 			url,
@@ -906,7 +940,7 @@ export class YandexDiskClient {
 				if (method === "GET") {
 					this.recordApiRead(endpoint);
 				}
-				logger.debug(`API request: ${method} ${endpoint}`, {
+				logger.debug(`API request: ${method} ${endpointName}`, {
 					attempt: attempt + 1,
 					maxRetries: this.maxRetries,
 				});
@@ -915,7 +949,9 @@ export class YandexDiskClient {
 
 				// Successful statuses
 				if (response.status >= 200 && response.status < 300) {
-					logger.debug(`API response: ${method} ${endpoint} -> ${response.status}`);
+					logger.debug(
+						`API response: ${method} ${endpointName} -> ${response.status}`,
+					);
 					return response;
 				}
 
@@ -933,7 +969,7 @@ export class YandexDiskClient {
 						errorData?.error
 					);
 
-					logger.warn(`API rate/service error: ${method} ${endpoint} -> ${response.status}`, {
+					logger.warn(`API rate/service error: ${method} ${endpointName} -> ${response.status}`, {
 						code: errorData?.error,
 						description: errorData?.description,
 						attempt: attempt + 1,
@@ -950,7 +986,7 @@ export class YandexDiskClient {
 				}
 
 			// Other errors - don't retry
-			logger.debug(`API error: ${method} ${endpoint} -> ${response.status}`, {
+			logger.debug(`API error: ${method} ${endpointName} -> ${response.status}`, {
 				code: errorData?.error,
 				description: errorData?.description,
 				message: errorData?.message,
@@ -967,7 +1003,7 @@ export class YandexDiskClient {
 				}
 				lastError = e as Error;
 
-				logger.error(`API request failed: ${method} ${endpoint}`, {
+				logger.error(`API request failed: ${method} ${endpointName}`, {
 					attempt: attempt + 1,
 					error: (e as Error).message,
 				});

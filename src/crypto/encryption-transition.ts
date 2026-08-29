@@ -13,6 +13,7 @@ import type {
 } from "../types";
 import type { PhysicalRewriteUploadProof } from "../sync/sync-engine";
 import { isProtectedPath, normalizePath } from "../utils/path-utils";
+import { protectRecord } from "../utils/record-utils";
 
 export interface LocalEncryptionSnapshot {
 	enabled: boolean;
@@ -439,7 +440,7 @@ export function createTargetRawMapping(
 		}
 		rawByLogical.set(logicalPath, rawPath);
 	}
-	return Object.fromEntries(rawByLogical);
+	return protectRecord(Object.fromEntries(rawByLogical));
 }
 
 function collectPathAncestors(paths: Iterable<string>): Set<string> {

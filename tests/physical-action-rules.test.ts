@@ -106,8 +106,23 @@ test("persisted physical actions accept every current server identity", () => {
 	}
 });
 
-test("force cleanup is authorized only by absence in the replacement epoch", () => {
+test("Force replacement cleanup remains authorized after initiator loss", () => {
 	const canonical = createEmptyIndex("device", "new-epoch");
+	assert.equal(
+		isPhysicalDeleteAuthorized(
+			action("new-epoch", "force-reset"),
+			canonical,
+		),
+		true,
+	);
+	canonical.files["note.md"] = {
+		path: "note.md",
+		sha256: "old",
+		size: 3,
+		mtime: 1,
+		syncedAt: 1,
+		deleted: true,
+	};
 	assert.equal(
 		isPhysicalDeleteAuthorized(
 			action("new-epoch", "force-reset"),

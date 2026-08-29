@@ -53,6 +53,8 @@ Edits разных installation ID → использовать baseline/base re
 после общего baseline создают одну conflict copy
 Нет локального baseline на первой синхронизации → локальный файл новый;
 разный remote-файл с тем же путём создаёт conflict copy
+Replacement epoch: unchanged local против tombstone → delete_local;
+offline local edit против tombstone → новый причинный put, а не silent delete
 ```
 
 ### 3. Предотвращение race conditions
@@ -64,6 +66,8 @@ Edits разных installation ID → использовать baseline/base re
 - **Folder parent:** child rename связывается только с содержащим source-prefix;
   при вложенности выбирается самый глубокий причинный folder event
 - **Index lock:** один индекс временно переименовывается для атомарной записи
+- **Force boundary:** live/tombstone replacement commit предшествует physical
+  cleanup; после commit rollback запрещён, cleanup повторяет normal full
 
 ## Конфигурация
 

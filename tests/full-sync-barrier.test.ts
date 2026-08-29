@@ -380,6 +380,39 @@ test("owned encryption preflight revalidates remote state through its local bloc
 	);
 });
 
+test("stable 1.1 startup exposes Force without enabling normal sync", async () => {
+	const { engine, index } = createHarness(false);
+	engine.setExternalBlock("migration", "migration required");
+
+	const normal = await engine.fullSync();
+	assert.equal(normal.success, false);
+	assert.equal(normal.errors[0]?.code, "migration-required");
+	assert.equal(engine.getState().status, "migration-required");
+	assert.equal(index.remoteSaveCount, 0);
+	engine.pause();
+	engine.resume();
+	assert.equal(engine.getState().status, "migration-required");
+
+	const force = await engine.forceSyncFromLocal();
+	assert.equal(force.success, false);
+	assert.equal(force.errors[0]?.code, "force-backup-stale");
+	assert.notEqual(force.errors[0]?.code, "migration-required");
+});
+
+test("historical and authentication blocks reject Force before backup work", async () => {
+	for (const [kind, code] of [
+		["historical", "unsupported-historical"],
+		["authentication", "authentication"],
+	] as const) {
+		const { engine, index } = createHarness(false);
+		engine.setExternalBlock(kind, `${kind} blocked`);
+		const result = await engine.forceSyncFromLocal();
+		assert.equal(result.success, false);
+		assert.equal(result.errors[0]?.code, code);
+		assert.equal(index.remoteSaveCount, 0);
+	}
+});
+
 test("a full sync accepts a replacement epoch without Force ping-pong", async () => {
 	const { engine, index } = createHarness(false);
 	const baseline = {

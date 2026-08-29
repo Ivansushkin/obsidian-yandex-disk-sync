@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "yandexTokenSecret": "",
+    "clientId": "stable-client-id",
+    "remotePath": "obsidian-sync/Test Vault",
+    "syncInterval": 0,
+    "enableRealtimeSync": true,
+    "syncPatterns": ["**"],
+    "excludePatterns": ["workspace.json", "cache"],
+    "syncDotObsidian": true,
+    "deviceId": "stable-device-empty",
+    "debounceDelay": 1000,
+    "maxConcurrency": 10
+  },
+  "localIndex": null,
+  "lastSyncStats": {
+    "uploaded": 0,
+    "downloaded": 0,
+    "deleted": 0,
+    "errors": 0
+  }
+}

@@ -30,10 +30,18 @@ import { YandexApiError, YandexDiskClient } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
 import {
 	isProtectedPath,
+	isLegacyPluginDataPath,
+	isLegacyServicePathCollision,
 	joinPath,
 	normalizePath,
 	toLocalPath,
 } from "../utils/path-utils";
+import {
+	createSafeRecord,
+	getRecordValue,
+	protectRecord,
+	setRecordValue,
+} from "../utils/record-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
 import { findErrorCause } from "../utils/error-utils";
 import {
@@ -119,6 +127,8 @@ export interface LocalCausalSnapshot {
 export type ForceCanonicalProof =
 	| { state: "absent" }
 	| { state: "present"; rawSha256: string };
+
+export type RemoteCanonicalFormat = "absent" | "legacy" | "current";
 
 type IndexCodecAttemptResult =
 	| { data: unknown }
@@ -542,6 +552,86 @@ export class IndexManager {
 		}
 	}
 
+	/** Read-only canonical classification used to refresh startup migration state. */
+	async inspectRemoteCanonicalFormat(): Promise<RemoteCanonicalFormat> {
+		const canonicalPath = this.getRemoteIndexPath();
+		const resource = await this.yandexClient.getResource(
+			canonicalPath,
+			1,
+			0,
+			true,
+		);
+		if (!resource) return "absent";
+		try {
+			await this.downloadIndexSnapshot(
+				canonicalPath,
+				false,
+				null,
+				"plaintext",
+				resource,
+			);
+			return "current";
+		} catch (error) {
+			if (!(error instanceof LegacyIndexFormatError)) throw error;
+			await this.downloadIndexSnapshot(
+				canonicalPath,
+				true,
+				null,
+				"plaintext",
+			);
+			return "legacy";
+		}
+	}
+
+	/**
+	 * Reject stable 1.1 paths that would expose plugin state or be silently
+	 * hidden by current service-path filtering. No user object is downloaded.
+	 */
+	async assertLegacyMigrationPathsSafe(): Promise<void> {
+		const format = await this.inspectRemoteCanonicalFormat();
+		if (format === "current") return;
+		if (format === "legacy") {
+			const canonical = await this.downloadIndexSnapshot(
+				this.getRemoteIndexPath(),
+				true,
+				null,
+				"plaintext",
+			);
+			for (const path of Object.keys(canonical.index.files)) {
+				if (isLegacyPluginDataPath(path)) {
+					throw new LegacyPluginDataExposureError();
+				}
+				if (
+					path.includes("\\") ||
+					isLegacyServicePathCollision(path)
+				) {
+					throw new LegacyServicePathCollisionError();
+				}
+			}
+		}
+		const resources = await this.yandexClient.getResourcesRecursive(
+			this.settings.remotePath,
+			true,
+			Math.min(this.settings.maxConcurrency, 4),
+		);
+		for (const resource of resources) {
+			if (resource.path.includes("\\")) {
+				throw new LegacyServicePathCollisionError();
+			}
+			const path = toLocalPath(resource.path, this.settings.remotePath);
+			if (isLegacyPluginDataPath(path)) {
+				throw new LegacyPluginDataExposureError();
+			}
+			const knownStableService =
+				path === REMOTE_INDEX_FILENAME ||
+				path === ".backup" ||
+				path.startsWith(".backup/");
+			if (!knownStableService && isLegacyServicePathCollision(path)) {
+				throw new LegacyServicePathCollisionError();
+			}
+		}
+	}
+
 	/** Revalidate the canonical bytes protected by a completed Force backup. */
 	async assertForceCanonicalProof(
 		expected: ForceCanonicalProof,
@@ -583,6 +673,10 @@ export class IndexManager {
 	/** Restore the previous device baseline after an unsuccessful adoption. */
 	restoreLocalCausalState(snapshot: LocalCausalSnapshot): void {
 		this.localState = this.cloneValue(snapshot.state);
+		this.localState.files = protectRecord(this.localState.files);
+		this.localState.folderTombstones = protectRecord(
+			this.localState.folderTombstones,
+		);
 		this.operationStore.loadMutations(
 			snapshot.mutations,
 			snapshot.state.nextMutationSeq,
@@ -617,25 +711,25 @@ export class IndexManager {
 	 */
 	markRemoteObserved(): void {
 		if (this.epochAdoptionTarget === this.remoteIndex.epoch) {
-			const adoptedFiles: Record<string, FileMetadata> = {};
+			const adoptedFiles = createSafeRecord<FileMetadata>();
 			for (const [path, canonical] of Object.entries(
 				this.remoteIndex.files,
 			)) {
 				const local = this.localState.files[path];
-				adoptedFiles[path] = {
+				setRecordValue(adoptedFiles, path, {
 					...canonical,
 					mtime:
 						local && local.sha256 === canonical.sha256
 							? local.mtime
 							: canonical.mtime,
-				};
+				});
 			}
 			this.localState.files = adoptedFiles;
 		}
 		for (const [path, baseline] of Object.entries(this.localState.files)) {
 			const canonical = this.remoteIndex.files[path];
 			if (!canonical) continue;
-			this.localState.files[path] = {
+			setRecordValue(this.localState.files, path, {
 				...baseline,
 				sha256: canonical.sha256,
 				size: canonical.size,
@@ -649,12 +743,12 @@ export class IndexManager {
 				mutationSeq: canonical.mutationSeq,
 				changedRevision: canonical.changedRevision,
 				baseRevision: canonical.baseRevision,
-			};
+			});
 		}
 		this.localState.observedEpoch = this.remoteIndex.epoch;
 		this.localState.observedRevision = this.remoteIndex.revision;
-		this.localState.folderTombstones = this.cloneValue(
-			this.remoteIndex.folderTombstones,
+		this.localState.folderTombstones = protectRecord(
+			this.cloneValue(this.remoteIndex.folderTombstones),
 		);
 		this.localState.nextMutationSeq =
 			this.operationStore.getNextMutationSeq();
@@ -678,8 +772,8 @@ export class IndexManager {
 		this.operationStore.resetForEpoch(index.epoch);
 		this.localState.observedEpoch = index.epoch;
 		this.localState.observedRevision = index.revision;
-		this.localState.files = this.cloneValue(index.files);
-		this.localState.folderTombstones = {};
+		this.localState.files = protectRecord(this.cloneValue(index.files));
+		this.localState.folderTombstones = createSafeRecord();
 		this.localState.nextMutationSeq = 1;
 		this.localState.lastSyncTime = Date.now();
 	}
@@ -699,8 +793,8 @@ export class IndexManager {
 						: null,
 				observedRevision: data.observedRevision,
 				lastSyncTime: data.lastSyncTime || 0,
-				files: data.files || {},
-				folderTombstones: data.folderTombstones || {},
+				files: protectRecord(data.files || {}),
+				folderTombstones: protectRecord(data.folderTombstones || {}),
 				nextMutationSeq: Math.max(1, data.nextMutationSeq || 1),
 			};
 		} else {
@@ -1359,7 +1453,7 @@ export class IndexManager {
 				throw sourceReadError;
 			}
 			const latest = this.replaceRemoteOnNextSave
-				? this.createReplacementBaseline()
+				? this.createReplacementBaseline(originalSnapshot.index)
 				: originalSnapshot.index;
 			logger.debug("Latest canonical state loaded from lock", {
 				...transactionContext,
@@ -1619,13 +1713,13 @@ export class IndexManager {
 	 * Update file metadata in local index
 	 */
 	updateLocalFile(path: string, metadata: FileMetadata): void {
-		this.localState.files[path] = {
+		setRecordValue(this.localState.files, path, {
 			...metadata,
 			baseRevision:
 				metadata.baseRevision ?? this.localState.observedRevision,
 			lastModifiedBy:
 				metadata.lastModifiedBy ?? this.settings.deviceId,
-		};
+		});
 	}
 
 	/**
@@ -1660,13 +1754,13 @@ export class IndexManager {
 	 * Update file metadata in remote index
 	 */
 	updateRemoteFile(path: string, metadata: FileMetadata): void {
-		this.remoteIndex.files[path] = {
+		setRecordValue(this.remoteIndex.files, path, {
 			...metadata,
 			baseRevision:
 				metadata.baseRevision ?? this.loadedRemoteIndex.revision,
 			lastModifiedBy:
 				metadata.lastModifiedBy ?? this.settings.deviceId,
-		};
+		});
 	}
 
 	/**
@@ -1689,11 +1783,11 @@ export class IndexManager {
 			const live = remoteFiles.get(path);
 			if (!live) continue;
 			if (typeof live.remoteMtime !== "number") continue;
-			this.remoteIndex.files[path] = {
+			setRecordValue(this.remoteIndex.files, path, {
 				...meta,
 				remoteMtime: live.remoteMtime,
 				remoteFingerprint: live.remoteFingerprint,
-			};
+			});
 			stamped++;
 		}
 		if (stamped > 0) {
@@ -1722,7 +1816,7 @@ export class IndexManager {
 				mtime: 0,
 				syncedAt: 0,
 			};
-		this.remoteIndex.files[path] = meta;
+		setRecordValue(this.remoteIndex.files, path, meta);
 		if (meta.deleted) return;
 		if (mutationSeq === undefined) {
 			throw new Error(
@@ -1748,7 +1842,7 @@ export class IndexManager {
 		}
 		const meta = this.remoteIndex.files[path] ?? this.localState.files[path];
 		if (!meta || meta.deleted) return;
-		this.remoteIndex.files[path] = {
+		setRecordValue(this.remoteIndex.files, path, {
 			...meta,
 			deleted: true,
 			deletedAt: tombstone.deletedAt,
@@ -1756,7 +1850,7 @@ export class IndexManager {
 			baseRevision: tombstone.baseRevision,
 			lastModifiedBy: tombstone.lastModifiedBy,
 			mutationSeq: tombstone.mutationSeq,
-		};
+		});
 	}
 
 	/**
@@ -1777,8 +1871,10 @@ export class IndexManager {
 			lastModifiedBy: this.settings.deviceId,
 			mutationSeq,
 		};
-		this.remoteIndex.folderTombstones[normalized] = tombstone;
-		this.localState.folderTombstones[normalized] = { ...tombstone };
+		setRecordValue(this.remoteIndex.folderTombstones, normalized, tombstone);
+		setRecordValue(this.localState.folderTombstones, normalized, {
+			...tombstone,
+		});
 	}
 
 	/**
@@ -1793,7 +1889,7 @@ export class IndexManager {
 		baseRevision = this.loadedRemoteIndex.revision,
 		mutationSeq?: number,
 	): void {
-		this.remoteIndex.moves[id] = {
+		setRecordValue(this.remoteIndex.moves, id, {
 			id,
 			fromPath,
 			toPath,
@@ -1803,7 +1899,7 @@ export class IndexManager {
 			pending: true,
 			lastModifiedBy: this.settings.deviceId,
 			mutationSeq,
-		};
+		});
 	}
 
 	completeMove(id: string): void {
@@ -1835,6 +1931,9 @@ export class IndexManager {
 			// Skip directories
 			if (rawResource.type !== "file") {
 				continue;
+			}
+			if (rawResource.path.includes("\\")) {
+				throw new PortablePathCollisionError();
 			}
 			const rawLocalPath = toLocalPath(
 				rawResource.path,
@@ -2237,7 +2336,7 @@ export class IndexManager {
 		);
 		normalized.lastSyncTime = stable.lastSyncTime;
 		for (const [path, metadata] of Object.entries(stable.files)) {
-			normalized.files[path] = {
+			setRecordValue(normalized.files, path, {
 				path,
 				sha256: metadata.sha256,
 				size: metadata.size,
@@ -2249,17 +2348,18 @@ export class IndexManager {
 				mutationSeq: 0,
 				changedRevision: 0,
 				baseRevision: 0,
-			};
+			});
 		}
 		return normalized;
 	}
 
-	private createReplacementBaseline(): SyncIndex {
+	private createReplacementBaseline(previous: SyncIndex): SyncIndex {
 		const baseline = createEmptyIndex("", this.remoteIndex.epoch);
 		baseline.revision = Math.max(
 			this.localState.observedRevision,
 			this.remoteIndex.revision,
 		);
+		baseline.files = protectRecord(this.cloneValue(previous.files));
 		return baseline;
 	}
 
@@ -2269,6 +2369,17 @@ export class IndexManager {
 		if (this.replaceRemoteOnNextSave) {
 			const replacement = this.cloneIndex(this.remoteIndex);
 			replacement.revision = nextRevision;
+			for (const [path, previous] of Object.entries(latest.files)) {
+				if (getRecordValue(replacement.files, path) !== undefined) {
+					continue;
+				}
+				setRecordValue(replacement.files, path, {
+					...previous,
+					deleted: true,
+					deletedAt: previous.deletedAt ?? Date.now(),
+					deletedByFolder: undefined,
+				});
+			}
 			for (const meta of Object.values(replacement.files)) {
 				meta.changedRevision = nextRevision;
 				meta.baseRevision = latest.revision;
@@ -2328,7 +2439,7 @@ export class IndexManager {
 						`Logical state changed during physical rewrite: ${path}`,
 					);
 				}
-				merged.files[path] = physical;
+				setRecordValue(merged.files, path, physical);
 				changed = true;
 				continue;
 			}
@@ -2386,10 +2497,10 @@ export class IndexManager {
 					current &&
 					!current.deleted
 				) {
-					merged.files[path] = {
+					setRecordValue(merged.files, path, {
 						...current,
 						changedRevision: nextRevision,
-					};
+					});
 					changed = true;
 					continue;
 				}
@@ -2424,7 +2535,7 @@ export class IndexManager {
 				continue;
 			}
 
-			merged.files[path] = next;
+			setRecordValue(merged.files, path, next);
 			changed = true;
 		}
 
@@ -2458,13 +2569,13 @@ export class IndexManager {
 					"mutationSeq exceeds its staged device watermark",
 				);
 			}
-			merged.folderTombstones[path] = {
+			setRecordValue(merged.folderTombstones, path, {
 				...tombstone,
 				baseRevision: tombstone.baseRevision ?? baseRevision,
 				changedRevision: nextRevision,
 				lastModifiedBy: this.settings.deviceId,
 				mutationSeq: tombstone.mutationSeq,
-			};
+			});
 			const mutationBase =
 				tombstone.baseRevision ?? baseRevision;
 			for (const [filePath, current] of Object.entries(
@@ -2481,10 +2592,10 @@ export class IndexManager {
 				) {
 					continue;
 				}
-				merged.files[filePath] = {
+				setRecordValue(merged.files, filePath, {
 					...current,
 					changedRevision: nextRevision,
-				};
+				});
 			}
 			changed = true;
 		}
@@ -2508,12 +2619,12 @@ export class IndexManager {
 					"mutationSeq exceeds its staged device watermark",
 				);
 			}
-			merged.moves[id] = {
+			setRecordValue(merged.moves, id, {
 				...move,
 				changedRevision: nextRevision,
 				lastModifiedBy: this.settings.deviceId,
 				mutationSeq: move.mutationSeq,
-			};
+			});
 			changed = true;
 		}
 		for (const id of this.completedMoveIds) {
@@ -2527,7 +2638,7 @@ export class IndexManager {
 		)) {
 			const current = merged.appliedMutationSeq[deviceId] || 0;
 			if (sequence <= current) continue;
-			merged.appliedMutationSeq[deviceId] = sequence;
+			setRecordValue(merged.appliedMutationSeq, deviceId, sequence);
 			changed = true;
 		}
 
@@ -3103,7 +3214,12 @@ export class IndexManager {
 	}
 
 	private cloneIndex(index: SyncIndex): SyncIndex {
-		return this.cloneValue(index);
+		const clone = this.cloneValue(index);
+		clone.files = protectRecord(clone.files);
+		clone.folderTombstones = protectRecord(clone.folderTombstones);
+		clone.moves = protectRecord(clone.moves);
+		clone.appliedMutationSeq = protectRecord(clone.appliedMutationSeq);
+		return clone;
 	}
 
 	private cloneValue<T>(value: T): T {
@@ -3761,6 +3877,38 @@ export class ForceBackupStaleError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "ForceBackupStaleError";
+	}
+}
+
+export class ForceSourceChangedError extends Error {
+	constructor() {
+		super("Force source changed after verification; create a new backup and retry");
+		this.name = "ForceSourceChangedError";
+	}
+}
+
+export class PortablePathCollisionError extends Error {
+	constructor() {
+		super("Remote paths collide under Unicode normalization or case folding");
+		this.name = "PortablePathCollisionError";
+	}
+}
+
+export class LegacyPluginDataExposureError extends Error {
+	constructor() {
+		super(
+			"Stable 1.1 remote data may contain this plugin's local settings. Remove the remote plugin directory and replace the OAuth token before migration",
+		);
+		this.name = "LegacyPluginDataExposureError";
+	}
+}
+
+export class LegacyServicePathCollisionError extends Error {
+	constructor() {
+		super(
+			"A stable 1.1 user path conflicts with a current service name or path rule and must be renamed before migration",
+		);
+		this.name = "LegacyServicePathCollisionError";
 	}
 }
 

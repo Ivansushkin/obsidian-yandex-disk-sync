@@ -61,6 +61,7 @@ export class SyncStatusBar {
 			"sync-paused",
 			"sync-offline",
 			"sync-initializing",
+			"sync-migration-required",
 			"sync-encryption-required"
 		);
 		this.statusBarEl.addClass(`sync-${state.status}`);
@@ -88,6 +89,8 @@ export class SyncStatusBar {
 				return "loader-circle";
 			case "encryption-required":
 				return "lock-keyhole";
+			case "migration-required":
+				return "replace";
 			default:
 				return "cloud";
 		}
@@ -121,6 +124,9 @@ export class SyncStatusBar {
 
 			case "encryption-required":
 				return t("status.encryption_required");
+
+			case "migration-required":
+				return t("status.migration_required");
 
 			default:
 				return "YD";
@@ -185,6 +191,10 @@ export class SyncStatusBar {
 				if (state.errorMessage) {
 					lines.push(state.errorMessage);
 				}
+				break;
+			case "migration-required":
+				lines.push(t("status.tooltip.migration_required"));
+				if (state.errorMessage) lines.push(state.errorMessage);
 				break;
 		}
 

@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "lastSyncTime": 1700000000000,
+  "deviceId": "stable-device-filled",
+  "files": {
+    "note.md": {
+      "path": "note.md",
+      "sha256": "live-sha",
+      "size": 4,
+      "mtime": 1699999999000,
+      "syncedAt": 1700000000000,
+      "lastModifiedBy": "stable-device-filled"
+    },
+    "deleted.md": {
+      "path": "deleted.md",
+      "sha256": "deleted-sha",
+      "size": 7,
+      "mtime": 1699999998000,
+      "syncedAt": 1700000000000,
+      "deleted": true,
+      "deletedAt": 1700000000100,
+      "lastModifiedBy": "stable-device-filled"
+    }
+  }
+}

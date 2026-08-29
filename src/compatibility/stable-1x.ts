@@ -1,4 +1,5 @@
 import type { FileMetadata, YandexDiskSyncSettings } from "../types";
+import { createSafeRecord, setRecordValue } from "../utils/record-utils";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -68,7 +69,7 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 	) {
 		return null;
 	}
-	const files: Record<string, FileMetadata> = {};
+	const files = createSafeRecord<FileMetadata>();
 	for (const [path, raw] of Object.entries(value.files)) {
 		if (!isStablePath(path) || !isRecord(raw) || !hasAllowedKeys(raw, FILE_KEYS)) {
 			return null;
@@ -87,7 +88,7 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 		) {
 			return null;
 		}
-		files[path] = {
+		setRecordValue(files, path, {
 			path,
 			sha256: raw.sha256,
 			size: raw.size,
@@ -96,7 +97,7 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 			deleted: raw.deleted,
 			deletedAt: raw.deletedAt,
 			lastModifiedBy: raw.lastModifiedBy,
-		};
+		});
 	}
 	return {
 		version: value.version,
@@ -121,6 +122,48 @@ export function parseStable1xPluginData(
 		settings: { ...value.settings },
 		localIndex,
 		lastSyncStats: { ...value.lastSyncStats },
+	};
+}
+
+/**
+ * Preserve the exact stable 1.0/1.1 storage shape until migration cutover.
+ * The stable device ID is deliberately retained; the current installation ID
+ * remains memory/local-storage only before cutover.
+ */
+export function serializeStable1xPluginData(
+	snapshot: Stable1xPluginData,
+	settings: YandexDiskSyncSettings,
+): Stable1xPluginData {
+	return {
+		settings: {
+			yandexTokenSecret: settings.yandexTokenSecret,
+			clientId: settings.clientId,
+			remotePath: settings.remotePath,
+			syncInterval: settings.syncInterval,
+			enableRealtimeSync: settings.enableRealtimeSync,
+			syncPatterns: [...settings.syncPatterns],
+			excludePatterns: [...settings.excludePatterns],
+			syncDotObsidian: settings.syncDotObsidian,
+			deviceId: snapshot.settings.deviceId,
+			debounceDelay: settings.debounceDelay,
+			maxConcurrency: settings.maxConcurrency,
+		},
+		localIndex: cloneStableIndex(snapshot.localIndex),
+		lastSyncStats: { ...snapshot.lastSyncStats },
+	};
+}
+
+function cloneStableIndex(value: Stable1xIndex | null): Stable1xIndex | null {
+	if (!value) return null;
+	const files = createSafeRecord<FileMetadata>();
+	for (const [path, metadata] of Object.entries(value.files)) {
+		setRecordValue(files, path, { ...metadata });
+	}
+	return {
+		version: value.version,
+		lastSyncTime: value.lastSyncTime,
+		deviceId: value.deviceId,
+		files,
 	};
 }
 

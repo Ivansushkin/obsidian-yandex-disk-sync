@@ -1,0 +1,46 @@
+{
+  "settings": {
+    "yandexTokenSecret": "fixture-token-placeholder",
+    "clientId": "stable-client-id",
+    "remotePath": "custom/stable-vault",
+    "syncInterval": 5,
+    "enableRealtimeSync": false,
+    "syncPatterns": ["**/*.md", "assets/**"],
+    "excludePatterns": ["private/**"],
+    "syncDotObsidian": true,
+    "deviceId": "stable-device-filled",
+    "debounceDelay": 1500,
+    "maxConcurrency": 7
+  },
+  "localIndex": {
+    "version": 2,
+    "lastSyncTime": 1700000000000,
+    "deviceId": "stable-device-filled",
+    "files": {
+      "note.md": {
+        "path": "note.md",
+        "sha256": "live-sha",
+        "size": 4,
+        "mtime": 1699999999000,
+        "syncedAt": 1700000000000,
+        "lastModifiedBy": "stable-device-filled"
+      },
+      "deleted.md": {
+        "path": "deleted.md",
+        "sha256": "deleted-sha",
+        "size": 7,
+        "mtime": 1699999998000,
+        "syncedAt": 1700000000000,
+        "deleted": true,
+        "deletedAt": 1700000000100,
+        "lastModifiedBy": "stable-device-filled"
+      }
+    }
+  },
+  "lastSyncStats": {
+    "uploaded": 2,
+    "downloaded": 3,
+    "deleted": 1,
+    "errors": 0
+  }
+}

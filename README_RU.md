@@ -5,9 +5,26 @@
 ## Обновление с 1.1.0 до 2.0.0
 
 Версия 2.0.0 поддерживает миграцию только с plaintext stable 1.0.0 и 1.1.0.
-Их local `localIndex` однократно преобразуется в текущий baseline.
+Их local `localIndex` преобразуется в текущий baseline в памяти, но исходная
+stable-структура `data.json` остаётся читаемой для отката до verified backup и
+явной границы local cutover внутри Force migration.
 Plaintext canonical с точной stable-структурой `version: 1` или `version: 2`
 требует явного Force с обязательным backup.
+
+До Force обновите все устройства и везде остановите stable 1.1. Второй
+обновлённый device, увидев replacement canonical, должен вручную запустить
+Full: перед epoch adoption плагин создаст и проверит его собственный локальный
+бекап. Отсутствующий/неверный token и migration state не запускают watcher или
+scheduler.
+
+Если stable 1.1 синхронизировала конфигурационную директорию и remote metadata
+содержит директорию этого плагина, migration блокируется без скачивания её
+содержимого и без добавления в remote snapshot backup. Удалите remote plugin
+directory и замените OAuth token: non-secret local marker сохраняет блокировку
+Force после restart, пока token не изменится. Пользовательский путь,
+конфликтующий с current service name или current path rules, надо переименовать.
+Force remote также блокируется до local writes при NFC/case-insensitive
+коллизиях путей.
 
 Encrypted legacy и все остальные исторические форматы не поддерживаются.
 Numeric manifest/canonical, unmarked queues/transitions и неполная current
@@ -185,7 +202,9 @@ conflict-копию. Последовательные изменения одн�
 > **⚠️ Предупреждение**
 > Принудительная синхронизация деструктивна. Перезаписываемая сторона полностью
 > заменяется. Плагин разрешает продолжить только после успешного создания
-> бекапа.
+> бекапа. Source повторно проверяется перед replacement commit; после commit
+> прерванный fingerprint-guarded cleanup продолжает обычный Full, повторять
+> Force нельзя.
 >
 > **Где найти**: Настройки → Секция "Принудительная синхронизация".
 

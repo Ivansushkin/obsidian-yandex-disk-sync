@@ -3,6 +3,7 @@
  */
 
 import type { EncryptionProfileId } from "./crypto/encryption";
+import { createSafeRecord } from "./utils/record-utils";
 
 // ============================================================================
 // Plugin settings
@@ -421,10 +422,10 @@ export function createEmptyIndex(
 		revision: 0,
 		lastSyncTime: 0,
 		deviceId,
-		files: {},
-		folderTombstones: {},
-		moves: {},
-		appliedMutationSeq: {},
+		files: createSafeRecord(),
+		folderTombstones: createSafeRecord(),
+		moves: createSafeRecord(),
+		appliedMutationSeq: createSafeRecord(),
 	};
 }
 
@@ -434,8 +435,8 @@ export function createEmptyLocalState(deviceId: string): LocalSyncState {
 		observedEpoch: null,
 		observedRevision: 0,
 		lastSyncTime: 0,
-		files: {},
-		folderTombstones: {},
+		files: createSafeRecord(),
+		folderTombstones: createSafeRecord(),
 		nextMutationSeq: 1,
 	};
 }
@@ -451,6 +452,7 @@ export type SyncStatus =
 	| "paused"
 	| "offline"
 	| "initializing"
+	| "migration-required"
 	| "encryption-required";
 
 export type SyncSessionKind =
@@ -559,6 +561,8 @@ export interface SyncResult {
 	endTime: number;
 	/** Whether this full run accepted a replacement canonical epoch */
 	epochAdopted?: boolean;
+	/** A Force replacement became authoritative; rollback is no longer valid. */
+	replacementCommitted?: boolean;
 }
 
 export interface SyncError {
