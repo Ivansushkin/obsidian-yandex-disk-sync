@@ -14,12 +14,8 @@ import {
 	type RealtimeFileEvent,
 	type DurableFileRenameEvent,
 	type DurableFolderRenameEvent,
-} from "../src/sync/realtime-rules";
-import type {
-	FileMetadata,
-	IndexMove,
-	PendingMutation,
-} from "../src/types";
+} from "../src/sync/realtime/rules";
+import type { FileMetadata, IndexMove, PendingMutation } from "../src/types";
 
 function metadata(
 	path: string,
@@ -272,7 +268,11 @@ test("missing old upload is superseded only by durable causal evidence", () => {
 		true,
 	);
 	assert.equal(
-		isMissingUploadSuperseded({ ...upload, superseded: true }, undefined, {}),
+		isMissingUploadSuperseded(
+			{ ...upload, superseded: true },
+			undefined,
+			{},
+		),
 		true,
 	);
 });
@@ -286,11 +286,7 @@ test("queued modify replaces an older event but not submitted work", () => {
 		false,
 	);
 	assert.equal(
-		shouldRetainQueuedFileEvent(
-			existing,
-			incoming,
-			new Set(["event-a"]),
-		),
+		shouldRetainQueuedFileEvent(existing, incoming, new Set(["event-a"])),
 		true,
 	);
 	assert.equal(
@@ -312,9 +308,7 @@ test("queued rename chain reduces to its final target", () => {
 	);
 
 	assert.equal(reduction.disposition, "rebased");
-	assert.deepEqual(reduction.events, [
-		{ ...first, targetPath: "deep/C.md" },
-	]);
+	assert.deepEqual(reduction.events, [{ ...first, targetPath: "deep/C.md" }]);
 });
 
 test("running rename keeps its successor as separate causal work", () => {
@@ -375,9 +369,6 @@ test("equally specific unordered folder parents are ambiguous", () => {
 	const first = folderRenameEvent("first", "A", "B");
 	const second = folderRenameEvent("second", "A", "C");
 	second.createdAt = first.createdAt;
-	const selection = selectFolderRenameParent(
-		[first, second],
-		"A/note.md",
-	);
+	const selection = selectFolderRenameParent([first, second], "A/note.md");
 	assert.equal(selection.ambiguous, true);
 });

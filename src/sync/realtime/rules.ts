@@ -1,4 +1,4 @@
-import type { FileMetadata, IndexMove, PendingMutation } from "../types";
+import type { FileMetadata, IndexMove, PendingMutation } from "../../types";
 
 export interface WatcherCausalContext {
 	epoch: string | null;
@@ -53,14 +53,10 @@ export interface RealtimeBatchResult {
 }
 
 export type FileRenamePlan =
-	| "put-target"
-	| "remote-move"
-	| "materialize-target";
+	"put-target" | "remote-move" | "materialize-target";
 
 export type FileRenameOutcomePlan =
-	| FileRenamePlan
-	| "delete-source"
-	| "already-applied";
+	FileRenamePlan | "delete-source" | "already-applied";
 
 export interface FileRenameOutcome {
 	status: "completed" | "superseded" | "retry";
@@ -108,8 +104,7 @@ export interface DurableFolderRenameEvent extends DurableFolderEventBase {
 }
 
 export type DurableFolderEvent =
-	| DurableFolderDeleteEvent
-	| DurableFolderRenameEvent;
+	DurableFolderDeleteEvent | DurableFolderRenameEvent;
 
 export interface FolderMutationOutcome {
 	status: "completed" | "superseded" | "retry";
@@ -140,7 +135,9 @@ export function mapPathThroughFolderRename(
 ): string | null {
 	const from = fromFolder.replace(/\/+$/, "");
 	const to = toFolder.replace(/\/+$/, "");
-	if (!path.startsWith(`${from}/`)) return null;
+	if (!path.startsWith(`${from}/`)) {
+		return null;
+	}
 	return `${to}/${path.slice(from.length + 1)}`;
 }
 
@@ -154,8 +151,7 @@ export function reduceQueuedFolderRename(
 ): FolderRenameReduction {
 	const predecessorIndex = existing.findIndex(
 		(event) =>
-			event.action === "rename" &&
-			event.targetPath === incoming.path,
+			event.action === "rename" && event.targetPath === incoming.path,
 	);
 	if (predecessorIndex < 0) {
 		return { events: [...existing, incoming], disposition: "queued" };
@@ -186,13 +182,18 @@ export function reduceQueuedFolderRename(
 export function reduceFolderChildRename(
 	parent: DurableFolderRenameEvent,
 	child: DurableFileRenameEvent,
-): { disposition: "absorbed" | "successor" | "unrelated"; event?: DurableFileRenameEvent } {
+): {
+	disposition: "absorbed" | "successor" | "unrelated";
+	event?: DurableFileRenameEvent;
+} {
 	const mechanicalTarget = mapPathThroughFolderRename(
 		child.path,
 		parent.path,
 		parent.targetPath,
 	);
-	if (!mechanicalTarget) return { disposition: "unrelated" };
+	if (!mechanicalTarget) {
+		return { disposition: "unrelated" };
+	}
 	if (mechanicalTarget === child.targetPath) {
 		return { disposition: "absorbed" };
 	}
@@ -235,7 +236,9 @@ export function selectFolderRenameParent(
 				right.order - left.order,
 		);
 	const selected = applicable[0];
-	if (!selected) return { ambiguous: false };
+	if (!selected) {
+		return { ambiguous: false };
+	}
 	const competing = applicable[1];
 	return {
 		parent: selected.parent,
@@ -307,9 +310,15 @@ export function wasRenameSourceCausallyLive(
 	baseRevision: number | null,
 	deviceId?: string,
 ): boolean {
-	if (!localBaseline || localBaseline.deleted) return false;
-	if (!canonicalSource || canonicalSource.deleted) return false;
-	if (baseRevision === null) return false;
+	if (!localBaseline || localBaseline.deleted) {
+		return false;
+	}
+	if (!canonicalSource || canonicalSource.deleted) {
+		return false;
+	}
+	if (baseRevision === null) {
+		return false;
+	}
 	return (
 		(canonicalSource.changedRevision ?? 0) <= baseRevision ||
 		(canonicalSource.lastModifiedBy === deviceId &&
@@ -405,7 +414,9 @@ export function selectFileRenamePlan(
 	sourceMetadata: FileMetadata | undefined,
 	targetSha256: string,
 ): FileRenamePlan {
-	if (!sourceCausallyLive) return "put-target";
+	if (!sourceCausallyLive) {
+		return "put-target";
+	}
 	if (!sourceMetadata || sourceMetadata.sha256 !== targetSha256) {
 		return "materialize-target";
 	}
@@ -421,7 +432,9 @@ export function wasPendingPutAccepted(
 	appliedMutationSeq: Record<string, number>,
 	canonicalSource: FileMetadata | undefined,
 ): boolean {
-	if (!pendingPut || !canonicalSource || canonicalSource.deleted) return false;
+	if (!pendingPut || !canonicalSource || canonicalSource.deleted) {
+		return false;
+	}
 	return wasMutationApplied(pendingPut, appliedMutationSeq);
 }
 
@@ -433,7 +446,9 @@ export function wasMutationApplied(
 	appliedMutationSeq: Record<string, number>,
 ): boolean {
 	const separator = mutation.id.lastIndexOf(":");
-	if (separator <= 0) return false;
+	if (separator <= 0) {
+		return false;
+	}
 	const deviceId = mutation.id.slice(0, separator);
 	return (appliedMutationSeq[deviceId] ?? 0) >= mutation.seq;
 }
@@ -446,10 +461,10 @@ export function isMissingUploadSuperseded(
 	canonicalSource: FileMetadata | undefined,
 	moves: Record<string, IndexMove>,
 ): boolean {
-	if (event.superseded || canonicalSource?.deleted) return true;
-	return Object.values(moves).some(
-		(move) => move.fromPath === event.path,
-	);
+	if (event.superseded || canonicalSource?.deleted) {
+		return true;
+	}
+	return Object.values(moves).some((move) => move.fromPath === event.path);
 }
 
 /**

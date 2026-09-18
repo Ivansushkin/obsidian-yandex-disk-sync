@@ -6,7 +6,6 @@ import type {
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
 import {
 	parseStable1xPluginData,
-	type Stable1xPluginData,
 	type Stable1xIndex,
 } from "./compatibility/stable-1x";
 import {
@@ -39,8 +38,6 @@ export type PluginDataSource = "empty" | "current" | "stable-1x";
 export interface PluginDataLoadResult<T extends PersistedPluginData> {
 	source: PluginDataSource;
 	data: (T & { format: typeof PLUGIN_DATA_FORMAT }) | null;
-	/** Exact rollback-readable stable snapshot, present only before cutover. */
-	stableSnapshot: Stable1xPluginData | null;
 }
 
 const CURRENT_PLUGIN_DATA_KEYS = new Set([
@@ -64,12 +61,12 @@ export function loadPluginData<T extends PersistedPluginData>(
 	return loadPluginDataWithSource(data).data;
 }
 
-/** Load plugin data while retaining whether a stable snapshot needs cutover. */
+/** Convert recognized stable data while reporting its source format. */
 export function loadPluginDataWithSource<T extends PersistedPluginData>(
 	data: T | null | undefined,
 ): PluginDataLoadResult<T> {
 	if (data == null) {
-		return { source: "empty", data: null, stableSnapshot: null };
+		return { source: "empty", data: null };
 	}
 	if (typeof data !== "object" || Array.isArray(data)) {
 		throw new UnsupportedHistoricalDataError(
@@ -82,7 +79,6 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		return {
 			source: "current",
 			data: data as T & { format: typeof PLUGIN_DATA_FORMAT },
-			stableSnapshot: null,
 		};
 	}
 	if (data.format !== undefined || "schemaVersion" in data) {
@@ -109,7 +105,6 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 	return {
 		source: "stable-1x",
 		data: converted,
-		stableSnapshot: stable,
 	};
 }
 
@@ -144,7 +139,9 @@ function convertStable1xBaseline(
 function assertCurrentEncryptionState(data: PersistedPluginData): void {
 	const settings = data.settings;
 	if (!settings || typeof settings !== "object") {
-		throw new UnsupportedHistoricalDataError("Current settings are missing");
+		throw new UnsupportedHistoricalDataError(
+			"Current settings are missing",
+		);
 	}
 	const encryptedSettingsInvalid =
 		settings.enableEncryption === true &&
@@ -214,7 +211,10 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 	if (data.encryptionTransition) {
 		assertCurrentTransition(data.encryptionTransition);
 		if (
-			!settingsMatchSnapshot(settings, data.encryptionTransition.source) &&
+			!settingsMatchSnapshot(
+				settings,
+				data.encryptionTransition.source,
+			) &&
 			!settingsMatchSnapshot(settings, data.encryptionTransition.target)
 		) {
 			throw new UnsupportedHistoricalDataError(
@@ -260,9 +260,13 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 	if (
 		!transition.id ||
 		!["enable", "disable", "rotate"].includes(transition.kind) ||
-		!["prepared", "files-copied", "index-committed", "stable", "cleanup"].includes(
-			transition.phase,
-		) ||
+		![
+			"prepared",
+			"files-copied",
+			"index-committed",
+			"stable",
+			"cleanup",
+		].includes(transition.phase) ||
 		!Number.isSafeInteger(transition.sourceCanonicalRevision) ||
 		transition.sourceCanonicalRevision < 0
 	) {
@@ -304,10 +308,12 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 	assertStringRecord(transition.sourceFingerprints, "source fingerprints");
 	protectRecord(transition.sourceFingerprints);
 	if (
-		Object.keys(transition.sourceFingerprints).length !== sourcePaths.size ||
+		Object.keys(transition.sourceFingerprints).length !==
+			sourcePaths.size ||
 		[...sourcePaths].some(
 			(path) =>
-				getRecordValue(transition.sourceFingerprints, path) === undefined,
+				getRecordValue(transition.sourceFingerprints, path) ===
+				undefined,
 		)
 	) {
 		throw new UnsupportedHistoricalDataError(
@@ -348,12 +354,16 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 		transition.phase !== "prepared" &&
 		[...targetPaths].some(
 			(path) =>
-				getRecordValue(transition.targetFingerprints, path) === undefined,
+				getRecordValue(transition.targetFingerprints, path) ===
+				undefined,
 		)
 	) {
 		throw new UnsupportedHistoricalDataError(
 			"Current copied transition target requires exact fingerprints",
 		);
+	}
+	if (transition.backupProof === null) {
+		return;
 	}
 	assertExactKeys(
 		transition.backupProof,
@@ -415,7 +425,10 @@ function assertCurrentSnapshot(
 	}
 }
 
-function assertStringRecord(value: unknown, label: string): asserts value is Record<string, string> {
+function assertStringRecord(
+	value: unknown,
+	label: string,
+): asserts value is Record<string, string> {
 	if (
 		!isRecord(value) ||
 		Object.values(value).some(
@@ -428,7 +441,10 @@ function assertStringRecord(value: unknown, label: string): asserts value is Rec
 	}
 }
 
-function assertCurrentPhysicalPath(value: unknown, label: string): asserts value is string {
+function assertCurrentPhysicalPath(
+	value: unknown,
+	label: string,
+): asserts value is string {
 	if (typeof value !== "string") {
 		throw new UnsupportedHistoricalDataError(
 			`Current transition ${label} path is invalid`,

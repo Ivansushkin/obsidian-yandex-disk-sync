@@ -9,9 +9,31 @@ import {
 
 test("portable path collisions block Force remote before local writes", () => {
 	assert.equal(hasPortablePathCollision(["Notes/A.md", "notes/a.md"]), true);
-	assert.equal(hasPortablePathCollision(["Cafe\u0301.md", "Caf\u00e9.md"]), true);
+	assert.equal(
+		hasPortablePathCollision(["Cafe\u0301.md", "Caf\u00e9.md"]),
+		true,
+	);
 	assert.equal(hasPortablePathCollision(["Remote.md", "remote.md"]), true);
-	assert.equal(hasPortablePathCollision(["one.md", "two.md"]), false);
+	for (const paths of [
+		["Foo/a.md", "foo/b.md"],
+		["folder", "folder/note.md"],
+		["Cafe\u0301/a", "Caf\u00e9/b"],
+	]) {
+		assert.equal(hasPortablePathCollision(paths), true, paths.join(", "));
+	}
+	assert.equal(
+		hasPortablePathCollision(["one.md", "two.md", "one.md"]),
+		false,
+	);
+	assert.equal(hasPortablePathCollision(["folder"], ["folder"]), true);
+	assert.equal(
+		hasPortablePathCollision(["folder/note.md"], ["folder"]),
+		false,
+	);
+	assert.equal(
+		hasPortablePathCollision(["__proto__", "日本語/Заметка.md"]),
+		false,
+	);
 });
 
 test("stable migration recognizes protected plugin and service paths", () => {
@@ -46,7 +68,13 @@ test("path filtering protects plugin storage while allowing other configured plu
 		["plugins/another-plugin/data.json", true],
 	] as const) {
 		assert.equal(
-			shouldSyncFile(`${configDir}/${relativePath}`, ["**"], [], true, configDir),
+			shouldSyncFile(
+				`${configDir}/${relativePath}`,
+				["**"],
+				[],
+				true,
+				configDir,
+			),
 			expected,
 			relativePath,
 		);

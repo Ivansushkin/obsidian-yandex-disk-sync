@@ -20,7 +20,7 @@ export class SyncStatusModal extends Modal {
 			downloaded: number;
 			deleted: number;
 			errors: number;
-		}
+		},
 	) {
 		super(app);
 		this.lastSyncTime = stats.lastSyncTime;
@@ -40,7 +40,9 @@ export class SyncStatusModal extends Modal {
 		if (this.lastSyncTime) {
 			const date = new Date(this.lastSyncTime);
 			statsEl.createEl("p", {
-				text: t("modal.status_last_sync", { time: date.toLocaleString() }),
+				text: t("modal.status_last_sync", {
+					time: date.toLocaleString(),
+				}),
 			});
 		} else {
 			statsEl.createEl("p", {
@@ -48,15 +50,23 @@ export class SyncStatusModal extends Modal {
 			});
 		}
 
-		statsEl.createEl("p", { text: t("modal.status_uploaded", { count: this.uploaded }) });
-		statsEl.createEl("p", { text: t("modal.status_downloaded", { count: this.downloaded }) });
-		statsEl.createEl("p", { text: t("modal.status_deleted", { count: this.deleted }) });
-		statsEl.createEl("p", { text: t("modal.status_errors", { count: this.errors }) });
+		statsEl.createEl("p", {
+			text: t("modal.status_uploaded", { count: this.uploaded }),
+		});
+		statsEl.createEl("p", {
+			text: t("modal.status_downloaded", { count: this.downloaded }),
+		});
+		statsEl.createEl("p", {
+			text: t("modal.status_deleted", { count: this.deleted }),
+		});
+		statsEl.createEl("p", {
+			text: t("modal.status_errors", { count: this.errors }),
+		});
 
 		new Setting(contentEl).addButton((btn) =>
 			btn.setButtonText(t("modal.close_button")).onClick(() => {
 				this.close();
-			})
+			}),
 		);
 	}
 

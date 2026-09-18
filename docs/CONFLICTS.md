@@ -1,144 +1,72 @@
-# Разрешение конфликтов синхронизации
+# Конфликты и сохранность локальных данных
 
-## Обзор
+## Причинные правила
 
-Плагин Yandex Disk Sync использует интеллектуальную систему разрешения конфликтов, которая предотвращает создание нежелательных конфликтных копий файлов при одновременной работе полной синхронизации и real-time синхронизации.
+Локальный drift определяется plaintext SHA-256 относительно baseline. Для remote
+используется physical fingerprint, а при его отсутствии — server mtime относительно
+baseline. Клиентские часы не выбирают победителя.
 
-## Проблема
+| Состояние                                            | Результат                                                                                      |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Разные изменения после общего baseline               | Одна версия сохраняется как conflict copy, canonical winner применяется к исходному пути       |
+| Файл без baseline и отличающийся remote того же пути | Локальный файл считается новым; обе версии сохраняются                                         |
+| Exact delete против stale edit                       | Delete побеждает; неподтверждённые локальные bytes требуют protective copy                     |
+| Causally-later put после delete                      | Путь восстанавливается                                                                         |
+| Folder delete против нового/изменённого descendant   | Descendant сохраняется                                                                         |
+| Folder move против отличающегося target              | Операция блокируется до mutations; частичный overwrite запрещён                                |
+| Последовательные edits одной установки               | Непрерывный mutation watermark предотвращает ложный конфликт                                   |
+| Replacement epoch и offline edit                     | Full сравнивает прежний baseline с filesystem и новым canonical; старые actions не replay-ятся |
 
-Конфликты возникают когда:
+## Conflict copies
 
-- Пользователь редактирует файл сразу после запуска Obsidian
-- Одновременно запускается полная синхронизация (initial sync)
-- Real-time синхронизация (FileWatcher) и полная синхронизация конфликтуют
+Имя содержит исходное имя, timestamp и suffix установки. При коллизии добавляется
+свободный suffix. Имя само по себе не доказывает, что файл можно переиспользовать:
+сравниваются его фактические bytes. Отредактированная существующая копия сохраняется,
+а проигравшая версия получает другой путь. Новая копия создаётся с условием отсутствия;
+конкурентное появление файла не превращает создание в overwrite.
 
-**Результат:** Создаются файлы типа `filename_conflict_2026-01-20T10-06-33_8xpk50.md`
+Rejected-put recovery использует те же правила, что обычный conflict flow. Повторный
+запуск переиспользует совпадающую копию, не создавая дубль. Restore canonical winner
+в исходный путь проходит обычную защищённую процедуру download.
 
-## Решение
+## Download и protective copies
 
-### 1. Приостановка FileWatcher
+До remote I/O фиксируется local absence либо SHA. Проверка повторяется после protective
+backup и после подготовки parent folders в VaultAdapter. Late create/edit останавливает
+устаревшую запись без подтверждения baseline/download/watcher suppression. Следующий
+reconciliation снова применяет причинные правила и сохраняет обе версии.
 
-Во время полной синхронизации FileWatcher автоматически приостанавливается:
+Существующие неподтверждённые bytes, отличающиеся от download, архивируются отдельно,
+включая отсутствие baseline. Ошибка protective copy запрещает overwrite. Для Force
+remote разрешена замена подтверждённого snapshot; последующий drift блокирует её.
+Выбор without-backup отключает только полный архив.
 
-- Пользовательские события создания/изменения/удаления буферизуются
-- События, созданные самим SyncEngine, подавляются по пути и типу
-- После завершения синхронизации буфер воспроизводится в FIFO-порядке
+Local delete подтверждает canonical и SHA после protective backup. Новая правка
+откладывает действие; фактическое удаление использует Obsidian FileManager trash.
+Remote delete и source cleanup проверяют authority/fingerprint на каждом retry и
+подтверждаются отсутствием объекта. Read-before-delete не является атомарной блокировкой
+против внешней записи.
 
-```typescript
-// В SyncEngine
-onSyncPrepare((context) => fileWatcher.prepareForSync(context));
-onSyncPause(() => fileWatcher.pauseForSync());
-onSyncResume(() => fileWatcher.resumeAfterSync());
-```
+## Пути и события
 
-`prepareForSync` фиксирует ID событий на cutoff до постановки full в очередь.
-Delete, rename и folder events этого набора завершаются заранее, upload
-остаётся full-barrier. Результат realtime-сессии подтверждается и сохраняется
-через coordinator `settle` до запуска следующей сессии.
+NFC/case-fold collisions родителей, file/directory/ancestor collisions и несовместимые
+локальные объекты блокируют применение. Exact update, обычный Unicode и `__proto__`
+допустимы. Скрытого переименования или изменения Unicode normalization нет.
 
-### 2. Причинная логика разрешения конфликтов
+Один coordinator и durable watcher queue сохраняют causal order. Internal watcher
+события подавляются только для ожидаемых операций. Пауза не означает, что реальные
+конкурентные изменения перестают создавать конфликты. Порядок prepare/settle/resume
+описан в [PARALLELIZATION.md](PARALLELIZATION.md).
 
-```
-Локальное изменение → сравнить plaintext SHA-256 с baseline
-Удалённое изменение → сначала fingerprint, затем server mtime из baseline
-Точечное delete против edit → delete, локальный edit сохранить в backup
-Folder tombstone против нового/изменённого потомка → потомок выживает
-Folder tombstone против неизменённого потомка → потомок удаляется
-Folder move против target с тем же SHA → target считается уже materialized
-Folder move против target с другим SHA → вся операция блокируется до решения
-пользователя; частичный move, tombstone и physical cleanup не выполняются
-Последовательные edits одного installation ID → сравнить mutation sequence и
-непрерывный watermark текущего epoch; старый base revision не создаёт conflict
-Edits разных installation ID → использовать baseline/base revision; разные SHA
-после общего baseline создают одну conflict copy
-Нет локального baseline на первой синхронизации → локальный файл новый;
-разный remote-файл с тем же путём создаёт conflict copy
-Replacement epoch: unchanged local против tombstone → delete_local;
-offline local edit против tombstone → новый причинный put, а не silent delete
-```
+## Диагностика и проверка
 
-### 3. Предотвращение race conditions
+Проверять содержимое исходного файла, conflict/protective copy, canonical и очереди;
+число вызовов backup само по себе не доказывает сохранность. См. сценарии SYNC, DEL,
+FDEL, MOVE и SAFE в [каталоге](SYNC_USER_SCENARIOS.md), TC-04/05/06/09 в
+[smoke tests](SMOKE_TESTS.md). Реальный двухпрофильный прогон остаётся отдельной проверкой.
 
-- **Один координатор:** full sync, realtime и переходы шифрования сериализованы
-- **Индекс до удаления:** tombstone подтверждается до физического DELETE
-- **Mutation ID:** локальная операция удаляется из FIFO только после её
-  подтверждения в canonical index
-- **Folder parent:** child rename связывается только с содержащим source-prefix;
-  при вложенности выбирается самый глубокий причинный folder event
-- **Index lock:** один индекс временно переименовывается для атомарной записи
-- **Force boundary:** live/tombstone replacement commit предшествует physical
-  cleanup; после commit rollback запрещён, cleanup повторяет normal full
-
-## Конфигурация
-
-Настройки в `Settings → Automatic sync`:
-
-- **Full sync interval:** 5 минут по умолчанию; `0` означает только manual
-- **Debounce delay:** 1000ms по умолчанию — задержка перед real-time sync
-- **Max concurrent operations:** 10 по умолчанию — параллельные операции
-- **Enable realtime sync:** Включает/выключает FileWatcher
-
-## Мониторинг
-
-### Логи
-
-```
-[FileWatcher] Paused for full sync
-[FileWatcher] Buffered file modification during sync pause
-[FileWatcher] Resumed after full sync
-```
-
-### Статус
-
-Status bar показывает:
-
-- текущую фазу full/realtime/maintenance-сессии;
-- `N/M` только при обработке известного набора файлов или событий;
-- время последней успешной синхронизации после завершения.
-
-## Тестирование
-
-**Сценарий для проверки:**
-
-1. Запустить Obsidian
-2. Сразу начать редактировать файл
-3. Наблюдать логи - FileWatcher должен приостановиться
-4. После синхронизации FileWatcher возобновляется
-5. Конфликтные файлы НЕ создаются
-
-## Архитектура
-
-```
-FileWatcher ←─── prepareForSync() → pauseForSync()
-    ↓              settle()          resumeAfterSync()
-SyncEngine ────→ onSyncPrepare() / onSyncPause()
-    ↓              onSyncResume()
-ConflictResolver ──→ compareFiles() с улучшенной логикой
-```
-
-## Производительность
-
-- **Debounce:** Предотвращает частые загрузки при быстром наборе
-- **Пауза:** Избегает конфликтов между синхронизаторами
-- **Толерантность:** Снижает количество ложных конфликтов
-
-## Отладка
-
-При проблемах:
-
-1. Проверить логи на сообщения о паузе/возобновлении
-2. Убедиться что `debounceDelay` не слишком мал
-3. Проверить что конфликты возникают только при реальных расхождениях
-
-## FAQ
-
-**Q: Почему все еще создаются конфликтные файлы?**
-A: Возможно файл действительно конфликтует (разные хеши при одинаковом времени). Проверьте логи.
-
-**Q: FileWatcher не возобновляется после синхронизации?**
-A: Проверьте что callback'и зарегистрированы в `onLayoutReady()`.
-
-**Q: Почему mtime не определяет локального победителя?**
-A: Локальные часы разных устройств ненадёжны. Локальные изменения определяются
-по SHA-256, а server mtime используется только для удалённой стороны и
-оптимизаций.
+Отклонённый rename использует тот же guarded local delete, что rejected upload.
+Спекулятивный local stamp upload не доказывает наличие подтверждённого baseline:
+без исходного baseline нужна protective copy. Изменение файла во время неё оставляет
+действие pending и rename возвращает retry. Cleanup retargeted source требует live
+target; cleanup отклонённого destination требует exact canonical tombstone.

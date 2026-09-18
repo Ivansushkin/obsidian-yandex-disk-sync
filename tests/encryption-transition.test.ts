@@ -1,3 +1,6 @@
+import { DEFAULT_SETTINGS, createEmptyIndex } from "../src/types";
+import type { YandexDiskClient } from "../src/api/yandex-client";
+import type { VaultAdapter } from "../src/api/vault-adapter";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -8,14 +11,18 @@ import {
 	hasPendingEncryptionCleanup,
 	type LocalEncryptionTransition,
 } from "../src/crypto/encryption-transition";
-import type { IndexManager } from "../src/sync/index-manager";
-import type { SyncEngine } from "../src/sync/sync-engine";
+import { IndexManager } from "../src/sync/canonical/manager";
+import type { SyncEngine } from "../src/sync/engine";
 import type { IndexMaintenance, RemoteEncryptionManifest } from "../src/types";
 
-type TransitionLifecycle = ConstructorParameters<typeof EncryptionTransitionController>[2];
+type TransitionLifecycle = ConstructorParameters<
+	typeof EncryptionTransitionController
+>[2];
 
 /** Supply inert boundaries; each scenario overrides the phase it exercises. */
-function createLifecycle(overrides: Partial<TransitionLifecycle> = {}): TransitionLifecycle {
+function createLifecycle(
+	overrides: Partial<TransitionLifecycle> = {},
+): TransitionLifecycle {
 	return {
 		claim: async () => undefined,
 		applyTarget: async () => null,
@@ -49,7 +56,11 @@ test("encryption recovery follows canonical authority across the commit boundary
 		["prepared", false, false, "blocked"],
 	] as const;
 	for (const [phase, targetReadable, sourceReadable, expected] of cases) {
-		assert.equal(decideEncryptionRecovery(phase, targetReadable, sourceReadable), expected, phase);
+		assert.equal(
+			decideEncryptionRecovery(phase, targetReadable, sourceReadable),
+			expected,
+			phase,
+		);
 	}
 });
 
@@ -107,7 +118,10 @@ test("transition target mapping rejects raw collisions before upload", () => {
 		createTargetRawMapping([["one.md", "source-one"]], ["source-one"]),
 	);
 	assert.throws(() =>
-		createTargetRawMapping([["one.md", "source-one/child"]], ["source-one"]),
+		createTargetRawMapping(
+			[["one.md", "source-one/child"]],
+			["source-one"],
+		),
 	);
 	assert.throws(() =>
 		createTargetRawMapping(
@@ -211,7 +225,8 @@ test("target manifest is published after claim and before target writes", async 
 		calls.indexOf("claim") < calls.indexOf("publish-target-manifest"),
 	);
 	assert.ok(
-		calls.indexOf("publish-target-manifest") < calls.indexOf("apply-target"),
+		calls.indexOf("publish-target-manifest") <
+			calls.indexOf("apply-target"),
 	);
 	assert.ok(calls.indexOf("apply-target") < calls.indexOf("copy-target"));
 });
@@ -247,7 +262,9 @@ test("cleanup proof is committed atomically with target canonical state", async 
 			phase: string,
 			cleanup?: typeof stagedCleanup,
 		) => {
-			if (phase === "index-committed") stagedCleanup = cleanup ?? [];
+			if (phase === "index-committed") {
+				stagedCleanup = cleanup ?? [];
+			}
 		},
 	});
 	await new EncryptionTransitionController(
@@ -341,7 +358,8 @@ test("each rewritten target is proven before the canonical commit", async () => 
 		lifecycle,
 	).execute({ transition, sourceService: null });
 	assert.ok(
-		calls.indexOf("stable-readback-proof") < calls.indexOf("canonical-commit"),
+		calls.indexOf("stable-readback-proof") <
+			calls.indexOf("canonical-commit"),
 	);
 });
 
@@ -357,7 +375,9 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 	] as const) {
 		const calls: string[] = [];
 		const failAt = (point: typeof fault): void => {
-			if (point === fault) throw new Error(`fault:${fault}`);
+			if (point === fault) {
+				throw new Error(`fault:${fault}`);
+			}
 		};
 		const indexManager = {
 			setIndexTransitionServices: () => calls.push("set-codecs"),
@@ -412,7 +432,10 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 			`codec scope leaked at ${fault}`,
 		);
 		if (calls.includes("set-codecs")) {
-			assert.ok(calls.indexOf("clear-codecs") < calls.indexOf("recover"), fault);
+			assert.ok(
+				calls.indexOf("clear-codecs") < calls.indexOf("recover"),
+				fault,
+			);
 		}
 	}
 });
@@ -521,14 +544,15 @@ test("incomplete cleanup keeps the transition blocked and local state durable", 
 
 test("foreign encrypted target recovery requires one matching committed authority", () => {
 	for (const kind of ["enable", "rotate"] as const) {
-		const source = kind === "enable"
-			? { enabled: false, revision: null, salt: null, verifier: null }
-			: {
-					enabled: true,
-					revision: 1,
-					salt: "source-salt",
-					verifier: "source-verifier",
-				};
+		const source =
+			kind === "enable"
+				? { enabled: false, revision: null, salt: null, verifier: null }
+				: {
+						enabled: true,
+						revision: 1,
+						salt: "source-salt",
+						verifier: "source-verifier",
+					};
 		const target = {
 			enabled: true,
 			revision: 2,
@@ -553,6 +577,13 @@ test("foreign encrypted target recovery requires one matching committed authorit
 		assert.equal(
 			createRemoteTargetRecoveryPlan(manifest, maintenance).passwordMode,
 			"target",
+		);
+		assert.equal(
+			createRemoteTargetRecoveryPlan(manifest, {
+				...maintenance,
+				phase: "cleanup",
+			}).maintenance.id,
+			maintenance.id,
 		);
 		assert.throws(() =>
 			createRemoteTargetRecoveryPlan(manifest, {
@@ -654,7 +685,8 @@ test("local recovery requires matching manifest canonical and transition authori
 	};
 	const manifest = createTransitionManifest("rotating", maintenance);
 	const sourceService = {
-		verifyVerifier: async (verifier: string) => verifier === "source-verifier",
+		verifyVerifier: async (verifier: string) =>
+			verifier === "source-verifier",
 	} as never;
 	await assert.doesNotReject(
 		controller.assertLocalRecoveryCoherence({
@@ -681,7 +713,10 @@ test("local recovery requires matching manifest canonical and transition authori
 	transition.phase = "files-copied";
 	const aheadManifest = {
 		...manifest,
-		transition: { ...manifest.transition!, phase: "index-committed" as const },
+		transition: {
+			...manifest.transition!,
+			phase: "index-committed" as const,
+		},
 	};
 	await assert.doesNotReject(
 		controller.assertLocalRecoveryCoherence({
@@ -772,11 +807,9 @@ test("stable manifest coherence accepts a fresh authenticated verifier IV", asyn
 		),
 	);
 	await assert.rejects(
-		controller.assertStableManifestTarget(
-			stableManifest,
-			maintenance,
-			{ verifyVerifier: async () => false } as never,
-		),
+		controller.assertStableManifestTarget(stableManifest, maintenance, {
+			verifyVerifier: async () => false,
+		} as never),
 		/does not match maintenance target/,
 	);
 });
@@ -785,9 +818,8 @@ function createTransitionManifest(
 	state: "enabling" | "rotating" | "disabling",
 	maintenance: IndexMaintenance,
 ): RemoteEncryptionManifest {
-	const manifestMode = state === "disabling"
-		? maintenance.source
-		: maintenance.target;
+	const manifestMode =
+		state === "disabling" ? maintenance.source : maintenance.target;
 	return {
 		format: "encryption-manifest",
 		profileId: "hardened",
@@ -819,3 +851,109 @@ function createTransitionManifest(
 		},
 	};
 }
+
+test("cleanup rechecks canonical ownership and retains ambiguous deletion for recovery", async () => {
+	for (const mode of [
+		"revoked",
+		"changed",
+		"missing-proof",
+		"remaining",
+		"lost-response",
+	] as const) {
+		const manager = new IndexManager(
+			{} as YandexDiskClient,
+			{} as VaultAdapter,
+			{ ...DEFAULT_SETTINGS },
+		);
+		const index = manager.getRemoteIndex();
+		index.epoch = "E1";
+		index.maintenance = {
+			id: "enable-A",
+			kind: "enable",
+			phase: "cleanup",
+			initiatedBy: "A",
+			sourceRevision: 1,
+			targetRevision: 2,
+			source: {
+				enabled: false,
+				revision: null,
+				salt: null,
+				verifier: null,
+			},
+			target: {
+				enabled: true,
+				revision: 1,
+				salt: "salt",
+				verifier: "verifier",
+			},
+			cleanup: [{ path: "note.md", expectedFingerprint: "unchanged" }],
+		};
+		let canonical = structuredClone(index);
+		manager.readCanonicalIndex = async () => structuredClone(canonical);
+		let present = true;
+		let deletes = 0;
+		let completed = false;
+		const client = {
+			getPhysicalPath: async (path: string) => path,
+			getResource: async () => {
+				if (mode === "revoked") {
+					canonical = createEmptyIndex("B", "E1");
+					canonical.files["note.md"] = {
+						path: "note.md",
+						sha256: "unchanged",
+						size: 1,
+						mtime: 1,
+						syncedAt: 1,
+					};
+				}
+				return present
+					? { sha256: mode === "changed" ? "new bytes" : "unchanged" }
+					: null;
+			},
+			deleteResource: async (
+				_path: string,
+				_permanent: boolean,
+				_raw: boolean,
+				guard: () => Promise<void>,
+			) => {
+				await guard();
+				deletes++;
+				if (mode === "lost-response") {
+					present = false;
+				}
+				throw new Error("timeout");
+			},
+		} as unknown as YandexDiskClient;
+		const controller = new EncryptionTransitionController(
+			manager,
+			{} as SyncEngine,
+			createLifecycle(),
+			{
+				client,
+				getRemotePath: () => "vault",
+				completeAction: () => {
+					completed = true;
+				},
+				persist: async () => {},
+			},
+		);
+		const run = controller.cleanupRawPaths(
+			["note.md"],
+			mode === "missing-proof" ? {} : { "note.md": "unchanged" },
+		);
+		if (mode === "lost-response") {
+			await run;
+		} else {
+			await assert.rejects(
+				run,
+				/authority changed|timeout|target changed|no longer authorized/,
+			);
+		}
+		assert.equal(completed, mode === "lost-response");
+		assert.equal(present, mode !== "lost-response");
+		assert.equal(
+			deletes,
+			mode === "remaining" || mode === "lost-response" ? 1 : 0,
+		);
+	}
+});

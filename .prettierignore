@@ -1,0 +1,19 @@
+node_modules/
+build/
+dist/
+main.js
+*.map
+package-lock.json
+.git/
+.husky/_/
+.env*
+.npmrc
+.vscode/
+.idea/
+.agents/
+.codex/
+.claude/
+.opencode/
+data.json
+# Historical fixtures must retain their original serialization.
+tests/fixtures/

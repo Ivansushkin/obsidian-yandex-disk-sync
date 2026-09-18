@@ -37,7 +37,13 @@ export interface Stable1xPluginData {
 }
 
 const INDEX_KEYS = ["version", "lastSyncTime", "deviceId", "files"] as const;
-const FILE_REQUIRED_KEYS = ["path", "sha256", "size", "mtime", "syncedAt"] as const;
+const FILE_REQUIRED_KEYS = [
+	"path",
+	"sha256",
+	"size",
+	"mtime",
+	"syncedAt",
+] as const;
 const FILE_KEYS = [
 	...FILE_REQUIRED_KEYS,
 	"deleted",
@@ -62,7 +68,9 @@ const STATS_KEYS = ["uploaded", "downloaded", "deleted", "errors"] as const;
 
 /** Parse the exact canonical/local index shape written by stable 1.0/1.1. */
 export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
-	if (!isRecord(value) || !hasExactKeys(value, INDEX_KEYS)) return null;
+	if (!isRecord(value) || !hasExactKeys(value, INDEX_KEYS)) {
+		return null;
+	}
 	if (
 		(value.version !== 1 && value.version !== 2) ||
 		!isNonNegativeInteger(value.lastSyncTime) ||
@@ -73,7 +81,11 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 	}
 	const files = createSafeRecord<FileMetadata>();
 	for (const [path, raw] of Object.entries(value.files)) {
-		if (!isStablePath(path) || !isRecord(raw) || !hasAllowedKeys(raw, FILE_KEYS)) {
+		if (
+			!isStablePath(path) ||
+			!isRecord(raw) ||
+			!hasAllowedKeys(raw, FILE_KEYS)
+		) {
 			return null;
 		}
 		if (
@@ -84,7 +96,8 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 			!isFileModificationTime(raw.mtime) ||
 			!isNonNegativeInteger(raw.syncedAt) ||
 			(raw.deleted !== undefined && typeof raw.deleted !== "boolean") ||
-			(raw.deletedAt !== undefined && !isNonNegativeInteger(raw.deletedAt)) ||
+			(raw.deletedAt !== undefined &&
+				!isNonNegativeInteger(raw.deletedAt)) ||
 			(raw.lastModifiedBy !== undefined &&
 				typeof raw.lastModifiedBy !== "string")
 		) {
@@ -110,17 +123,21 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 }
 
 /** Parse only the complete plaintext plugin snapshot written by stable 1.0/1.1. */
-export function parseStable1xPluginData(
-	value: unknown,
-): Stable1xPluginData {
+export function parseStable1xPluginData(value: unknown): Stable1xPluginData {
 	if (!isRecord(value) || !hasExactKeys(value, PLUGIN_DATA_KEYS)) {
 		rejectStableSnapshot("root fields");
 	}
-	if (!isStable1xSettings(value.settings)) rejectStableSnapshot("settings");
-	if (!isStable1xStats(value.lastSyncStats)) rejectStableSnapshot("lastSyncStats");
+	if (!isStable1xSettings(value.settings)) {
+		rejectStableSnapshot("settings");
+	}
+	if (!isStable1xStats(value.lastSyncStats)) {
+		rejectStableSnapshot("lastSyncStats");
+	}
 	const localIndex =
 		value.localIndex === null ? null : parseStable1xIndex(value.localIndex);
-	if (value.localIndex !== null && !localIndex) rejectStableSnapshot("localIndex");
+	if (value.localIndex !== null && !localIndex) {
+		rejectStableSnapshot("localIndex");
+	}
 	return {
 		settings: { ...value.settings },
 		localIndex,
@@ -137,52 +154,12 @@ function rejectStableSnapshot(
 	);
 }
 
-/**
- * Preserve the exact stable 1.0/1.1 storage shape until migration cutover.
- * The stable device ID is deliberately retained; the current installation ID
- * remains memory/local-storage only before cutover.
- */
-export function serializeStable1xPluginData(
-	snapshot: Stable1xPluginData,
-	settings: YandexDiskSyncSettings,
-): Stable1xPluginData {
-	return {
-		settings: {
-			yandexTokenSecret: settings.yandexTokenSecret,
-			clientId: settings.clientId,
-			remotePath: settings.remotePath,
-			syncInterval: settings.syncInterval,
-			enableRealtimeSync: settings.enableRealtimeSync,
-			syncPatterns: [...settings.syncPatterns],
-			excludePatterns: [...settings.excludePatterns],
-			syncDotObsidian: settings.syncDotObsidian,
-			deviceId: snapshot.settings.deviceId,
-			debounceDelay: settings.debounceDelay,
-			maxConcurrency: settings.maxConcurrency,
-		},
-		localIndex: cloneStableIndex(snapshot.localIndex),
-		lastSyncStats: { ...snapshot.lastSyncStats },
-	};
-}
-
-function cloneStableIndex(value: Stable1xIndex | null): Stable1xIndex | null {
-	if (!value) return null;
-	const files = createSafeRecord<FileMetadata>();
-	for (const [path, metadata] of Object.entries(value.files)) {
-		setRecordValue(files, path, { ...metadata });
-	}
-	return {
-		version: value.version,
-		lastSyncTime: value.lastSyncTime,
-		deviceId: value.deviceId,
-		files,
-	};
-}
-
 function isStable1xSettings(
 	value: unknown,
 ): value is Stable1xPluginData["settings"] {
-	if (!isRecord(value) || !hasExactKeys(value, SETTINGS_KEYS)) return false;
+	if (!isRecord(value) || !hasExactKeys(value, SETTINGS_KEYS)) {
+		return false;
+	}
 	return (
 		typeof value.yandexTokenSecret === "string" &&
 		typeof value.clientId === "string" &&
@@ -216,25 +193,29 @@ function isStablePath(value: string): boolean {
 		!value.includes("\0") &&
 		value
 			.split("/")
-			.every((segment) => segment !== "" && segment !== "." && segment !== "..")
+			.every(
+				(segment) =>
+					segment !== "" && segment !== "." && segment !== "..",
+			)
 	);
 }
 
 function isStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every((item) => typeof item === "string");
+	return (
+		Array.isArray(value) && value.every((item) => typeof item === "string")
+	);
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
 	return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-function hasExactKeys(
-	value: JsonRecord,
-	expected: readonly string[],
-): boolean {
+function hasExactKeys(value: JsonRecord, expected: readonly string[]): boolean {
 	return (
 		Object.keys(value).length === expected.length &&
-		expected.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+		expected.every((key) =>
+			Object.prototype.hasOwnProperty.call(value, key),
+		)
 	);
 }
 

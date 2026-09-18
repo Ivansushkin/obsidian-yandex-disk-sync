@@ -1,7 +1,7 @@
-import type { FileMetadata, FolderTombstone } from "../types";
-import { CURRENT_INDEX_FORMAT } from "../types";
-import { parseStable1xIndex } from "../compatibility/stable-1x";
-import { getRecordValue, setRecordValue } from "../utils/record-utils";
+import type { FileMetadata, FolderTombstone } from "../../types";
+import { CURRENT_INDEX_FORMAT } from "../../types";
+import { parseStable1xIndex } from "../../compatibility/stable-1x";
+import { getRecordValue, setRecordValue } from "../../utils/record-utils";
 
 /**
  * Classify current canonical data and the stable 1.x migration input.
@@ -13,8 +13,12 @@ export function classifyIndexFormat(
 		return "unsupported";
 	}
 	const data = value as Record<string, unknown>;
-	if (data.format === CURRENT_INDEX_FORMAT) return "current";
-	if (parseStable1xIndex(data)) return "legacy";
+	if (data.format === CURRENT_INDEX_FORMAT) {
+		return "current";
+	}
+	if (parseStable1xIndex(data)) {
+		return "legacy";
+	}
 	return "unsupported";
 }
 
@@ -23,9 +27,7 @@ export function classifyIndexFormat(
  */
 export function isPathInsideFolder(path: string, folderPath: string): boolean {
 	const normalizedFolder = folderPath.replace(/\/+$/, "");
-	return (
-		path === normalizedFolder || path.startsWith(`${normalizedFolder}/`)
-	);
+	return path === normalizedFolder || path.startsWith(`${normalizedFolder}/`);
 }
 
 export interface FolderDeleteTargets {
@@ -82,11 +84,10 @@ export function findFolderTombstone(
 			tombstones,
 			segments.slice(0, depth).join("/"),
 		);
-		if (!tombstone) continue;
-		if (
-			!result ||
-			tombstone.changedRevision > result.changedRevision
-		) {
+		if (!tombstone) {
+			continue;
+		}
+		if (!result || tombstone.changedRevision > result.changedRevision) {
 			result = tombstone;
 		}
 	}
@@ -102,8 +103,12 @@ export function shouldPreserveConcurrentFolderChild(
 	incomingDeviceId?: string,
 	incomingMutationSeq?: number,
 ): boolean {
-	if (metadata.deleted) return false;
-	if ((metadata.changedRevision ?? 0) <= folderBaseRevision) return false;
+	if (metadata.deleted) {
+		return false;
+	}
+	if ((metadata.changedRevision ?? 0) <= folderBaseRevision) {
+		return false;
+	}
 	return !isCausalSameDevicePredecessor(
 		metadata,
 		incomingDeviceId,
@@ -121,8 +126,12 @@ export function canApplyDestructiveFolderMutation(
 	incomingDeviceId: string,
 	incomingMutationSeq: number,
 ): boolean {
-	if (metadata.deleted) return false;
-	if (typeof metadata.mutationSeq !== "number") return false;
+	if (metadata.deleted) {
+		return false;
+	}
+	if (typeof metadata.mutationSeq !== "number") {
+		return false;
+	}
 	return !shouldPreserveConcurrentFolderChild(
 		metadata,
 		folderBaseRevision,
@@ -170,8 +179,7 @@ function hasSameLogicalFileState(
 	return (
 		current.sha256 === incoming.sha256 &&
 		Boolean(current.deleted) === Boolean(incoming.deleted) &&
-		(current.deletedByFolder ?? null) ===
-			(incoming.deletedByFolder ?? null)
+		(current.deletedByFolder ?? null) === (incoming.deletedByFolder ?? null)
 	);
 }
 
@@ -190,8 +198,12 @@ export function classifyFileMutation(
 	const incomingDevice = incoming.lastModifiedBy;
 	const incomingSequence = incoming.mutationSeq;
 	if (causal && incomingSequence !== undefined) {
-		if (incomingSequence === 0) return "invalid-sequence";
-		if (causal.desiredWatermark < incomingSequence) return "fifo-gap";
+		if (incomingSequence === 0) {
+			return "invalid-sequence";
+		}
+		if (causal.desiredWatermark < incomingSequence) {
+			return "fifo-gap";
+		}
 	}
 
 	const sameDevice =
@@ -210,7 +222,9 @@ export function classifyFileMutation(
 		if (incomingSequence < currentSequence) {
 			return "stale-same-device";
 		}
-		if (!causal) return "apply";
+		if (!causal) {
+			return "apply";
+		}
 		if (incomingSequence <= causal.currentWatermark) {
 			return "stale-same-device";
 		}
@@ -236,8 +250,12 @@ export function classifyFileMutation(
 	) {
 		return "concurrent-foreign";
 	}
-	if (!current?.deleted) return "apply";
-	if (current.deletedByFolder) return "apply";
+	if (!current?.deleted) {
+		return "apply";
+	}
+	if (current.deletedByFolder) {
+		return "apply";
+	}
 	return (current.changedRevision ?? 0) <= baseRevision
 		? "apply"
 		: "rejected-by-delete";
@@ -273,7 +291,9 @@ export function mergeFileMutation(
 	const decision =
 		classifiedDecision ??
 		classifyFileMutation(current, incoming, baseRevision, causal);
-	if (decision === "idempotent") return current;
+	if (decision === "idempotent") {
+		return current;
+	}
 	if (decision !== "apply") {
 		return current;
 	}
@@ -294,7 +314,9 @@ export function advanceMutationSequence(
 	sequence: number,
 ): boolean {
 	const current = appliedMutationSeq[deviceId] || 0;
-	if (sequence !== current + 1) return false;
+	if (sequence !== current + 1) {
+		return false;
+	}
 	setRecordValue(appliedMutationSeq, deviceId, sequence);
 	return true;
 }

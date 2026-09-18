@@ -1,4 +1,4 @@
-import type { FileMetadata } from "../types";
+import type { FileMetadata } from "../../types";
 
 /**
  * Compare local plaintext content with the last confirmed device baseline.
@@ -32,7 +32,9 @@ export function getRemotePhysicalDrift(
 	remote: FileMetadata,
 	baseline: FileMetadata | null,
 ): boolean | null {
-	if (!baseline) return true;
+	if (!baseline) {
+		return true;
+	}
 	if (
 		baseline.remoteFingerprint !== undefined &&
 		remote.remoteFingerprint !== undefined

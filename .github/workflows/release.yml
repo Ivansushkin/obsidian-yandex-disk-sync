@@ -1,43 +1,43 @@
 name: Release validation
 
 on:
-    push:
-        tags: ["*"]
+  push:
+    tags: ["*"]
 
 permissions:
-    contents: read
+  contents: read
 
 jobs:
-    validate:
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0
-            - uses: actions/setup-node@v4
-              with:
-                  node-version: 20.x
-                  cache: npm
-                  registry-url: https://registry.npmjs.org
-            - run: npm ci --registry=https://registry.npmjs.org
-            - run: npm test
-            - run: npm run lint
-            - run: npm run build
-            - run: npm run check:bundle
-            - run: git diff --check
-            - run: git diff --exit-code
-            - run: npm audit --omit=dev --registry=https://registry.npmjs.org
-            - run: npm audit --registry=https://registry.npmjs.org
-            - run: npm run validate:release
-              env:
-                  RELEASE_TAG: ${{ github.ref_name }}
-            - name: Prepare exact release assets
-              run: |
-                  mkdir release-assets
-                  cp build/main.js build/manifest.json build/styles.css release-assets/
-                  sha256sum release-assets/main.js release-assets/manifest.json release-assets/styles.css | tee -a "$GITHUB_STEP_SUMMARY"
-            - uses: actions/upload-artifact@v4
-              with:
-                  name: release-${{ github.ref_name }}
-                  path: release-assets/
-                  if-no-files-found: error
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --registry=https://registry.npmjs.org
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run check:bundle
+      - run: git diff --check
+      - run: git diff --exit-code
+      - run: npm audit --omit=dev --registry=https://registry.npmjs.org
+      - run: npm audit --registry=https://registry.npmjs.org
+      - run: npm run validate:release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Prepare exact release assets
+        run: |
+          mkdir release-assets
+          cp build/main.js build/manifest.json build/styles.css release-assets/
+          sha256sum release-assets/main.js release-assets/manifest.json release-assets/styles.css | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: release-assets/
+          if-no-files-found: error

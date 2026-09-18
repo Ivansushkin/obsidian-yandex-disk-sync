@@ -1,10 +1,11 @@
+import * as syncReconciliation from "../src/sync/reconciliation/commits";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import type { IndexManager } from "../src/sync/index-manager";
-import { LocalOperationStore } from "../src/sync/local-operation-store";
-import { SyncEngine } from "../src/sync/sync-engine";
+import type { IndexManager } from "../src/sync/canonical/manager";
+import { LocalOperationStore } from "../src/sync/local/operation-store";
+import { SyncEngine } from "../src/sync/engine";
 import {
 	createEmptyIndex,
 	createEmptyLocalState,
@@ -44,9 +45,15 @@ class FullDeleteIndexFake {
 		this.store.loadMutations(undefined, 2);
 	}
 
-	getRemoteIndex() { return this.index; }
-	getLocalIndex() { return this.local; }
-	getPendingMutations() { return this.store.getMutations(); }
+	getRemoteIndex() {
+		return this.index;
+	}
+	getLocalIndex() {
+		return this.local;
+	}
+	getPendingMutations() {
+		return this.store.getMutations();
+	}
 
 	enqueueMutation(
 		type: "delete-file",
@@ -93,7 +100,11 @@ class FullDeleteIndexFake {
 		throw new Error("not expected");
 	}
 
-	markLocalFileDeleted(path: string, _folder: string | undefined, mutationSeq: number) {
+	markLocalFileDeleted(
+		path: string,
+		_folder: string | undefined,
+		mutationSeq: number,
+	) {
 		this.local.files[path] = {
 			...this.local.files[path]!,
 			deleted: true,
@@ -108,7 +119,9 @@ class FullDeleteIndexFake {
 	}
 
 	updateSyncTime() {}
-	consumeRejectedPuts() { return []; }
+	consumeRejectedPuts() {
+		return [];
+	}
 
 	async saveRemoteIndex() {
 		this.index.revision++;
@@ -154,14 +167,19 @@ test("full-discovered logical delete receives and confirms a FIFO sequence", asy
 		remoteMeta: metadata("note.md"),
 		causalOrigin: "new-local-operation",
 	};
-	const access = createEngine(index) as unknown as {
-		commitDeletionIntents(
-			operations: SyncOperation[],
-			result: SyncResult,
-		): Promise<object | null>;
-	};
+	const deps = (
+		createEngine(index) as unknown as {
+			syncReconciliationDependencies(): syncReconciliation.Dependencies;
+		}
+	).syncReconciliationDependencies();
 
-	assert.ok(await access.commitDeletionIntents([operation], createResult()));
+	assert.ok(
+		await syncReconciliation.commitDeletionIntents(
+			deps,
+			[operation],
+			createResult(),
+		),
+	);
 	assert.equal(index.index.files["note.md"]?.deleted, true);
 	assert.equal(index.index.files["note.md"]?.mutationSeq, 2);
 	assert.equal(index.index.appliedMutationSeq["device-a"], 2);
@@ -182,14 +200,19 @@ test("applying a canonical tombstone preserves foreign causal attribution", asyn
 		reason: "Exact-file remote deletion wins",
 		causalOrigin: "apply-canonical",
 	};
-	const access = createEngine(index) as unknown as {
-		commitDeletionIntents(
-			operations: SyncOperation[],
-			result: SyncResult,
-		): Promise<object | null>;
-	};
+	const deps = (
+		createEngine(index) as unknown as {
+			syncReconciliationDependencies(): syncReconciliation.Dependencies;
+		}
+	).syncReconciliationDependencies();
 
-	assert.ok(await access.commitDeletionIntents([operation], createResult()));
+	assert.ok(
+		await syncReconciliation.commitDeletionIntents(
+			deps,
+			[operation],
+			createResult(),
+		),
+	);
 	assert.equal(index.index.files["note.md"]?.lastModifiedBy, "device-b");
 	assert.equal(index.index.files["note.md"]?.mutationSeq, 9);
 	assert.deepEqual(index.store.getMutations(), []);

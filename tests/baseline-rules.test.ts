@@ -4,12 +4,9 @@ import type { FileMetadata } from "../src/types";
 import {
 	createConfirmedBaseline,
 	mergePhysicalMetadata,
-} from "../src/sync/baseline-rules";
+} from "../src/sync/local/baseline-rules";
 
-function metadata(
-	path: string,
-	sha256: string,
-): FileMetadata {
+function metadata(path: string, sha256: string): FileMetadata {
 	return {
 		path,
 		sha256,
@@ -62,15 +59,11 @@ test("encryption rewrite changes fingerprints without changing causal revision",
 		baseRevision: 7,
 		remoteFingerprint: "old-ciphertext",
 	};
-	const rewritten = mergePhysicalMetadata(
-		{ ...baseline },
-		baseline,
-		{
-			...baseline,
-			remoteFingerprint: "new-ciphertext",
-			remoteMtime: 300,
-		},
-	);
+	const rewritten = mergePhysicalMetadata({ ...baseline }, baseline, {
+		...baseline,
+		remoteFingerprint: "new-ciphertext",
+		remoteMtime: 300,
+	});
 	assert.equal(rewritten?.changedRevision, 8);
 	assert.equal(rewritten?.baseRevision, 7);
 	assert.equal(rewritten?.remoteFingerprint, "new-ciphertext");
@@ -82,11 +75,10 @@ test("encryption rewrite rejects a concurrent logical edit", () => {
 		changedRevision: 8,
 	};
 	assert.equal(
-		mergePhysicalMetadata(
-			{ ...baseline, sha256: "concurrent" },
-			baseline,
-			{ ...baseline, remoteFingerprint: "target" },
-		),
+		mergePhysicalMetadata({ ...baseline, sha256: "concurrent" }, baseline, {
+			...baseline,
+			remoteFingerprint: "target",
+		}),
 		null,
 	);
 });

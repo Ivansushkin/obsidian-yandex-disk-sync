@@ -8,7 +8,7 @@ import {
 	isOrphanIndexAmbiguous,
 	stableSerialize,
 	UnstablePaginationError,
-} from "../src/sync/index-transaction-rules";
+} from "../src/sync/canonical/transaction-rules";
 
 test("remote root pagination reads objects after the first 1000 entries", async () => {
 	const source = Array.from({ length: 1001 }, (_, index) => index);
@@ -151,12 +151,6 @@ test("stable pagination includes the root state in its snapshot identity", async
 });
 
 test("maintenance claim is rejected after a concurrent canonical revision", () => {
-	assert.equal(
-		didCanonicalChangeBeforeMaintenanceClaim(7, 8),
-		true,
-	);
-	assert.equal(
-		didCanonicalChangeBeforeMaintenanceClaim(7, 7),
-		false,
-	);
+	assert.equal(didCanonicalChangeBeforeMaintenanceClaim(7, 8), true);
+	assert.equal(didCanonicalChangeBeforeMaintenanceClaim(7, 7), false);
 });

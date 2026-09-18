@@ -15,9 +15,21 @@ import {
 	normalizePath,
 	shouldSyncFile,
 	getDirectory,
+	hasPortablePathCollision,
 } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { runWithConcurrency } from "../utils/semaphore";
+
+export interface LocalWriteGuard {
+	expectedSha256: string | null;
+	beforeWrite?: () => void;
+}
+
+export class LocalFileChangedError extends Error {
+	constructor() {
+		super("Local file changed; reconciliation required");
+	}
+}
 
 export class VaultAdapter {
 	private app: App;
@@ -71,6 +83,19 @@ export class VaultAdapter {
 
 		logger.debug(`Files for synchronization: ${syncableFiles.length}`);
 		return syncableFiles;
+	}
+
+	/** Include unsynchronized files and empty folders when validating a write. */
+	getLocalPathEntries(): { files: string[]; folders: string[] } {
+		const files: string[] = [];
+		const folders: string[] = [];
+		for (const entry of this.vault.getAllLoadedFiles()) {
+			if (!entry.path || entry.path === "/") {
+				continue;
+			}
+			(entry instanceof TFolder ? folders : files).push(entry.path);
+		}
+		return { files, folders };
 	}
 
 	/**
@@ -144,6 +169,7 @@ export class VaultAdapter {
 	async writeFile(
 		path: string,
 		content: ArrayBuffer | string,
+		guard?: LocalWriteGuard,
 	): Promise<void> {
 		const normalizedPath = normalizePath(path);
 
@@ -153,7 +179,29 @@ export class VaultAdapter {
 			await this.createFolderRecursive(dir);
 		}
 
+		if (guard) {
+			await this.assertLocalIdentity(
+				normalizedPath,
+				guard.expectedSha256,
+			);
+			const entries = this.getLocalPathEntries();
+			if (
+				hasPortablePathCollision(
+					[normalizedPath, ...entries.files],
+					entries.folders,
+				)
+			) {
+				throw new Error("Portable local path collision");
+			}
+		}
 		const existingFile = this.getFile(normalizedPath);
+		if (
+			guard &&
+			(guard.expectedSha256 === null ? existingFile : !existingFile)
+		) {
+			throw new LocalFileChangedError();
+		}
+		guard?.beforeWrite?.();
 
 		if (existingFile) {
 			if (typeof content === "string") {
@@ -162,14 +210,37 @@ export class VaultAdapter {
 				await this.vault.modifyBinary(existingFile, content);
 			}
 		} else {
-			if (typeof content === "string") {
-				await this.vault.create(normalizedPath, content);
-			} else {
-				await this.vault.createBinary(normalizedPath, content);
+			try {
+				if (typeof content === "string") {
+					await this.vault.create(normalizedPath, content);
+				} else {
+					await this.vault.createBinary(normalizedPath, content);
+				}
+			} catch (error) {
+				if (
+					guard?.expectedSha256 === null &&
+					this.fileExists(normalizedPath)
+				) {
+					throw new LocalFileChangedError();
+				}
+				throw error;
 			}
 		}
 
 		logger.debug(`Written file: ${normalizedPath}`);
+	}
+
+	/** Revalidate the local snapshot after asynchronous preparation. */
+	async assertLocalIdentity(
+		path: string,
+		expectedSha256: string | null,
+	): Promise<void> {
+		const actual = this.fileExists(path)
+			? await computeSha256(await this.readFile(path))
+			: null;
+		if (actual !== expectedSha256) {
+			throw new LocalFileChangedError();
+		}
 	}
 
 	/**
@@ -205,17 +276,23 @@ export class VaultAdapter {
 	 * config directory. Only folders that contain nothing are removed, so a
 	 * folder holding local-only or excluded files is never touched. Trashed
 	 * folders are recoverable from the system trash. Mirrors the remote
-	 * {@link SyncEngine.pruneRemoteFolders} behavior so the local and remote
+	 * remote folder pruning behavior so the local and remote
 	 * folder trees stay consistent after deletions.
 	 */
 	async pruneEmptyLocalAncestors(filePath: string): Promise<void> {
 		const configDir = this.app.vault.configDir;
 		let dir = getDirectory(normalizePath(filePath));
 		while (dir) {
-			if (dir === configDir) break;
+			if (dir === configDir) {
+				break;
+			}
 			const folder = this.getFolder(dir);
-			if (!folder) break;
-			if (folder.children.length > 0) break;
+			if (!folder) {
+				break;
+			}
+			if (folder.children.length > 0) {
+				break;
+			}
 			try {
 				await this.app.fileManager.trashFile(folder);
 				logger.debug(`Pruned empty local folder: ${dir}`);
@@ -234,8 +311,7 @@ export class VaultAdapter {
 	 * data folder inside the Obsidian config directory (`.obsidian/plugins`),
 	 * which is excluded from synchronization by default. Used before a download
 	 * overwrites a local file whose content diverged from the last synced state
-	 * (e.g. legacy mixed-clock conflict resolution, or a force-sync from
-	 * remote), so unsaved local edits are never silently lost. The backup is
+	 * (including unknown first-sync content and Force remote), so unsaved local edits are never silently lost. The backup is
 	 * flattened into a single file with a timestamp to avoid nested folder
 	 * creation and to keep it out of the sync scope.
 	 */
@@ -245,12 +321,9 @@ export class VaultAdapter {
 	): Promise<string> {
 		try {
 			const configDir = this.app.vault.configDir;
-			const ts = new Date()
-				.toISOString()
-				.replace(/[:.]/g, "-");
+			const ts = new Date().toISOString().replace(/[:.]/g, "-");
 			const safeName = originalPath.replace(/[\\/]+/g, "__");
-			const backupName =
-				`${safeName}_${ts}_${crypto.randomUUID()}`;
+			const backupName = `${safeName}_${ts}_${crypto.randomUUID()}`;
 			const backupPath = obsidianNormalize(
 				`${configDir}/plugins/yandex-disk-sync/overwritten/${backupName}`,
 			);
@@ -265,9 +338,7 @@ export class VaultAdapter {
 				backupStat.type !== "file" ||
 				backupStat.size !== content.byteLength
 			) {
-				throw new Error(
-					"Written backup could not be verified by size",
-				);
+				throw new Error("Written backup could not be verified by size");
 			}
 			logger.info(`Backed up overwritten local file to: ${backupPath}`);
 			return backupPath;
@@ -290,7 +361,9 @@ export class VaultAdapter {
 		const backupDir = obsidianNormalize(
 			`${configDir}/plugins/yandex-disk-sync/overwritten`,
 		);
-		if (!(await this.vault.adapter.exists(backupDir))) return 0;
+		if (!(await this.vault.adapter.exists(backupDir))) {
+			return 0;
+		}
 
 		const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
 		let removed = 0;
@@ -299,9 +372,7 @@ export class VaultAdapter {
 			try {
 				const stat = await this.vault.adapter.stat(backupPath);
 				if (stat?.type === "file" && stat.mtime < cutoff) {
-					if (
-						await this.vault.adapter.trashSystem(backupPath)
-					) {
+					if (await this.vault.adapter.trashSystem(backupPath)) {
 						removed++;
 					} else {
 						logger.warn(
@@ -310,10 +381,9 @@ export class VaultAdapter {
 					}
 				}
 			} catch (e) {
-				logger.warn(
-					`Failed to remove stale backup ${backupPath}:`,
-					{ error: e },
-				);
+				logger.warn(`Failed to remove stale backup ${backupPath}:`, {
+					error: e,
+				});
 			}
 		}
 		if (removed > 0) {
@@ -332,10 +402,10 @@ export class VaultAdapter {
 		const parts = obsidianNormalize(path).split("/");
 		let currentPath = "";
 		for (const part of parts) {
-			currentPath = currentPath
-				? `${currentPath}/${part}`
-				: part;
-			if (await this.vault.adapter.exists(currentPath)) continue;
+			currentPath = currentPath ? `${currentPath}/${part}` : part;
+			if (await this.vault.adapter.exists(currentPath)) {
+				continue;
+			}
 			try {
 				await this.vault.adapter.mkdir(currentPath);
 			} catch (error) {
@@ -397,5 +467,4 @@ export class VaultAdapter {
 		const file = this.getFile(path);
 		return file ? file.stat.mtime : null;
 	}
-
 }

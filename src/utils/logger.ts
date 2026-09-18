@@ -10,8 +10,7 @@ import type { App } from "obsidian";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LOG_PREFIX = "[YandexSync]";
-export const DEFAULT_LOG_RELATIVE_PATH =
-	"plugins/yandex-disk-sync/debug.log";
+export const DEFAULT_LOG_RELATIVE_PATH = "plugins/yandex-disk-sync/debug.log";
 export const DEFAULT_MAX_LOG_SIZE = 5 * 1024 * 1024;
 const FLUSH_DELAY_MS = 100;
 
@@ -94,8 +93,12 @@ function maskString(value: string): string {
 export function shortenDiagnosticValue(
 	value: string | null | undefined,
 ): string | null {
-	if (!value) return null;
-	if (value.length <= 16) return value;
+	if (!value) {
+		return null;
+	}
+	if (value.length <= 16) {
+		return value;
+	}
 	return `${value.slice(0, 8)}...${value.slice(-4)}`;
 }
 
@@ -116,19 +119,13 @@ function sanitizeString(value: string): string {
 		/(["']?(?:token|authorization|password|secret|access[_-]?token|refresh[_-]?token|encryption[_-]?key)["']?\s*[:=]\s*["']?)(?:Bearer\s+|OAuth\s+)?([^"'\s,;&}]+)/gi;
 	return value
 		.replace(assignment, "$1***")
-		.replace(
-			/\b(Bearer|OAuth)\s+[A-Za-z0-9_.\-/+=]{12,}/gi,
-			"$1 ***",
-		);
+		.replace(/\b(Bearer|OAuth)\s+[A-Za-z0-9_.\-/+=]{12,}/gi, "$1 ***");
 }
 
 /**
  * Recursively sanitize context data to avoid leaking secrets.
  */
-function sanitizeContext(
-	context: unknown,
-	parentKey?: string,
-): unknown {
+function sanitizeContext(context: unknown, parentKey?: string): unknown {
 	if (context === null || context === undefined) {
 		return context;
 	}
@@ -205,8 +202,7 @@ export class Logger {
 	private maxFileSize = DEFAULT_MAX_LOG_SIZE;
 	private baseContext: Record<string, unknown> = {};
 	private contextProvider:
-		| (() => Record<string, unknown> | undefined)
-		| null = null;
+		(() => Record<string, unknown> | undefined) | null = null;
 
 	private buffer: string[] = [];
 	private flushTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -359,7 +355,9 @@ export class Logger {
 	 * diagnostic entries with an older read-modify-write snapshot.
 	 */
 	private async flushBufferedEntries(): Promise<void> {
-		if (!this.app) return;
+		if (!this.app) {
+			return;
+		}
 		const adapter = this.app.vault.adapter;
 		const logPath = this.getResolvedLogPath();
 
@@ -374,19 +372,15 @@ export class Logger {
 					continue;
 				}
 				const stat = await adapter.stat(logPath);
-				const contentSize = new TextEncoder().encode(content).byteLength;
-				if (
-					stat &&
-					stat.size + contentSize <= this.maxFileSize
-				) {
+				const contentSize = new TextEncoder().encode(
+					content,
+				).byteLength;
+				if (stat && stat.size + contentSize <= this.maxFileSize) {
 					await adapter.append(logPath, content);
 					continue;
 				}
 				const existing = await adapter.read(logPath);
-				await adapter.write(
-					logPath,
-					this.trimLog(existing + content),
-				);
+				await adapter.write(logPath, this.trimLog(existing + content));
 			} catch (e) {
 				this.buffer.unshift(...entries);
 				console.error(`${LOG_PREFIX} Failed to write log file:`, e);
@@ -466,7 +460,9 @@ export class Logger {
 			return;
 		}
 		this.flushChain = this.flushChain.then(async () => {
-			if (!this.app) return;
+			if (!this.app) {
+				return;
+			}
 			const adapter = this.app.vault.adapter;
 			const logPath = this.getResolvedLogPath();
 			try {

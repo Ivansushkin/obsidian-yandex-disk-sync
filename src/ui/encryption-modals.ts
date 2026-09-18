@@ -14,7 +14,9 @@ abstract class ResolvableModal<T> extends Modal {
 	}
 
 	protected finish(value: T): void {
-		if (this.resolved) return;
+		if (this.resolved) {
+			return;
+		}
 		this.resolved = true;
 		this.resolveResult(value);
 	}
@@ -41,7 +43,9 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 			placeholder: t("modal.encryption_password_label"),
 		});
 		this.passwordInput.addClass("encryption-password-input");
-		if (!confirm) return;
+		if (!confirm) {
+			return;
+		}
 
 		this.confirmInput = this.contentEl.createEl("input", {
 			type: "password",
@@ -58,8 +62,7 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 		const password = this.passwordInput.value;
 		if (
 			!password ||
-			(this.confirmInput !== null &&
-				password !== this.confirmInput.value)
+			(this.confirmInput !== null && password !== this.confirmInput.value)
 		) {
 			this.errorEl?.addClass("is-visible");
 			return null;
@@ -82,7 +85,9 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 					.setCta()
 					.onClick(async () => {
 						const password = this.getPassword();
-						if (!password || !(await onSubmit(password))) return;
+						if (!password || !(await onSubmit(password))) {
+							return;
+						}
 						this.finish(password);
 						this.close();
 					}),
@@ -126,7 +131,6 @@ export class EnableEncryptionModal extends PasswordModal {
 			() => true,
 		);
 	}
-
 }
 
 export class DisableEncryptionModal extends ResolvableModal<boolean> {
@@ -151,19 +155,16 @@ export class DisableEncryptionModal extends ResolvableModal<boolean> {
 					.onClick(() => {
 						this.finish(true);
 						this.close();
-					})
+					}),
 			)
 			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
-					.onClick(() => {
-						this.finish(false);
-						this.close();
-					})
+				btn.setButtonText(t("modal.cancel_button")).onClick(() => {
+					this.finish(false);
+					this.close();
+				}),
 			);
 		setting.settingEl.addClass("force-sync-modal-buttons");
 	}
-
 }
 
 export class VerifyPasswordModal extends PasswordModal {
@@ -172,7 +173,7 @@ export class VerifyPasswordModal extends PasswordModal {
 	constructor(
 		app: App,
 		resolve: (value: string | null) => void,
-		verifyPassword: (password: string) => Promise<boolean>
+		verifyPassword: (password: string) => Promise<boolean>,
 	) {
 		super(app, resolve);
 		this.verifyPassword = verifyPassword;
@@ -202,12 +203,13 @@ export class VerifyPasswordModal extends PasswordModal {
 		this.renderPasswordFields(false);
 		this.getPasswordInput().oninput = () => this.clearError();
 		this.addSubmitButtons(t("generic.confirm"), async (password) => {
-			if (await this.verifyPassword(password)) return true;
+			if (await this.verifyPassword(password)) {
+				return true;
+			}
 			this.setError();
 			return false;
 		});
 	}
-
 }
 
 export class ChangePasswordModal extends PasswordModal {
@@ -230,7 +232,6 @@ export class ChangePasswordModal extends PasswordModal {
 			() => true,
 		);
 	}
-
 }
 
 export class ConnectEncryptedVaultModal extends PasswordModal {
@@ -243,7 +244,7 @@ export class ConnectEncryptedVaultModal extends PasswordModal {
 		resolve: (value: string | null) => void,
 		title: string,
 		description: string,
-		buttonText: string
+		buttonText: string,
 	) {
 		super(app, resolve);
 		this.title = title;
@@ -264,5 +265,4 @@ export class ConnectEncryptedVaultModal extends PasswordModal {
 		this.renderPasswordFields(false);
 		this.addSubmitButtons(this.buttonText, () => true);
 	}
-
 }

@@ -1,16 +1,20 @@
+import { classifySyncError } from "../src/sync/errors";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { App } from "obsidian";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import { FileWatcher, type DeferredWatcherEvent } from "../src/sync/file-watcher";
+import {
+	FileWatcher,
+	type DeferredWatcherEvent,
+} from "../src/sync/realtime/watcher";
 import {
 	IndexEpochMismatchError,
 	RemoteIndexRolledBackError,
 	type IndexManager,
-} from "../src/sync/index-manager";
-import { LocalOperationStore } from "../src/sync/local-operation-store";
-import { SyncEngine } from "../src/sync/sync-engine";
+} from "../src/sync/canonical/manager";
+import { LocalOperationStore } from "../src/sync/local/operation-store";
+import { SyncEngine } from "../src/sync/engine";
 import {
 	createEmptyIndex,
 	createEmptyLocalState,
@@ -61,9 +65,14 @@ class FullSyncIndexFake {
 
 	endEpochAdoption() {}
 
-	restoreLocalCausalState(snapshot: ReturnType<FullSyncIndexFake["captureLocalCausalState"]>) {
+	restoreLocalCausalState(
+		snapshot: ReturnType<FullSyncIndexFake["captureLocalCausalState"]>,
+	) {
 		Object.assign(this.local, structuredClone(snapshot.state));
-		this.store.loadMutations(snapshot.mutations, snapshot.state.nextMutationSeq);
+		this.store.loadMutations(
+			snapshot.mutations,
+			snapshot.state.nextMutationSeq,
+		);
 		this.store.loadPhysicalActions(snapshot.physicalActions);
 	}
 
@@ -192,19 +201,13 @@ function createHarness(encrypted: boolean) {
 			enableEncryption: encrypted,
 		},
 	);
-	const watcher = new FileWatcher(
-		{} as App,
-		engine,
-		DEFAULT_SETTINGS,
-	);
+	const watcher = new FileWatcher({} as App, engine, DEFAULT_SETTINGS);
 	(watcher as unknown as WatcherAccess).isEnabled = true;
 	watcher.setPersistCallback(async () => {});
 	engine.onSyncPrepare(
 		async (context) => await watcher.prepareForSync(context),
 	);
-	engine.onSyncPause(
-		async (context) => await watcher.pauseForSync(context),
-	);
+	engine.onSyncPause(async (context) => await watcher.pauseForSync(context));
 	engine.onSyncFinalize(
 		async (context, result) =>
 			await watcher.settleAfterReconciliation(context, result),
@@ -249,15 +252,9 @@ for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
 
 	test(`${mode} no-op full consumes a stale watcher upload without remote write`, async () => {
-		const {
-			engine,
-			index,
-			watcher,
-			getFolderCacheClearCount,
-		} = createHarness(encrypted);
-		watcher.loadDeferredEvents([
-			uploadEvent("stale-upload", "missing.md"),
-		]);
+		const { engine, index, watcher, getFolderCacheClearCount } =
+			createHarness(encrypted);
+		watcher.loadDeferredEvents([uploadEvent("stale-upload", "missing.md")]);
 
 		const result = await engine.fullSync();
 
@@ -272,20 +269,14 @@ for (const encrypted of [false, true]) {
 
 	test(`${mode} full settles an uncommitted put with one watermark commit`, async () => {
 		const { engine, index } = createHarness(encrypted);
-		const pending = index.enqueuePut(
-			"missing.md",
-			"obsolete-local-sha",
-		);
+		const pending = index.enqueuePut("missing.md", "obsolete-local-sha");
 
 		const result = await engine.fullSync();
 
 		assert.equal(result.success, true);
 		assert.equal(index.remoteSaveCount, 1);
 		assert.equal(index.index.files["missing.md"], undefined);
-		assert.equal(
-			index.index.appliedMutationSeq["device-a"],
-			pending.seq,
-		);
+		assert.equal(index.index.appliedMutationSeq["device-a"], pending.seq);
 		assert.deepEqual(index.store.getMutations(), []);
 	});
 
@@ -337,7 +328,10 @@ test("encryption preflight rejects active canonical maintenance before filesyste
 	assert.equal(result.success, false);
 	assert.equal(scannedLocal, false);
 	assert.equal(index.remoteSaveCount, 0);
-	assert.match(result.errors[0]?.message ?? "", /requires a stable canonical/);
+	assert.match(
+		result.errors[0]?.message ?? "",
+		/requires a stable canonical/,
+	);
 });
 
 test("owned encryption preflight revalidates remote state through its local block", async () => {
@@ -437,19 +431,12 @@ test("a full sync accepts a replacement epoch without Force ping-pong", async ()
 });
 
 test("recursive transaction cause keeps the epoch replacement classification", () => {
-	const { engine } = createHarness(false);
-	const access = engine as unknown as {
-		classifySyncError(error: Error): string | undefined;
-	};
 	const error = new RemoteIndexRolledBackError(
 		"rolled back",
 		"acquired",
 		new IndexEpochMismatchError("epoch-a", "epoch-b"),
 	);
-	assert.equal(
-		access.classifySyncError(error),
-		"epoch-replaced-during-sync",
-	);
+	assert.equal(classifySyncError(error), "epoch-replaced-during-sync");
 });
 
 test("full leaves an ambiguous causal rename durable and reports an error", async () => {
@@ -529,8 +516,7 @@ test("post-full rename acknowledgement persists before observed revision advance
 	assert.equal(
 		persisted.some(
 			(snapshot) =>
-				snapshot.pendingEvents === 0 &&
-				snapshot.observedRevision === 7,
+				snapshot.pendingEvents === 0 && snapshot.observedRevision === 7,
 		),
 		true,
 	);
@@ -574,4 +560,32 @@ test("dirty full validates the manifest token before commit", async () => {
 
 	assert.equal(result.success, true);
 	assert.deepEqual(calls, [undefined, "manifest-v1"]);
+});
+
+test("full sync rejects an ambiguous remote tree before applying any file", async () => {
+	for (const paths of [
+		["Foo/a.md", "foo/b.md"],
+		["folder", "folder/note.md"],
+	]) {
+		const { engine, index, vaultFiles } = createHarness(false);
+		for (const path of paths) {
+			index.remoteFiles.set(path, {
+				path,
+				sha256: "remote",
+				mtime: 1,
+				size: 1,
+				syncedAt: 1,
+			});
+		}
+		const baseline = structuredClone(index.local);
+		const canonical = structuredClone(index.index);
+		const result = await engine.fullSync();
+		assert.equal(result.success, false);
+		assert.equal(result.errors[0]?.code, "portable-path-collision");
+		assert.equal(result.downloaded, 0);
+		assert.deepEqual(index.local, baseline);
+		assert.deepEqual(index.index, canonical);
+		assert.equal(index.remoteSaveCount, 0);
+		assert.deepEqual([...vaultFiles], []);
+	}
 });

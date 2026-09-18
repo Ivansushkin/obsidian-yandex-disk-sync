@@ -5,7 +5,7 @@ import {
 	rawBuffersEqual,
 	rollbackRawIndexSnapshot,
 	shouldRetryIndexTransaction,
-} from "../src/sync/index-transaction";
+} from "../src/sync/canonical/transaction";
 
 test("successful but timed out canonical move is classified as committed", () => {
 	assert.equal(
@@ -103,23 +103,33 @@ function createRawBackend(
 			},
 			async readRaw(path: string): Promise<ArrayBuffer> {
 				const value = files.get(path);
-				if (!value) throw new Error(`Missing ${path}`);
+				if (!value) {
+					throw new Error(`Missing ${path}`);
+				}
 				return value.slice(0);
 			},
 			async writeRaw(path: string, raw: ArrayBuffer): Promise<void> {
 				files.set(path, raw.slice(0));
-				if (throwAfterWrite) throw new Error("lost upload response");
+				if (throwAfterWrite) {
+					throw new Error("lost upload response");
+				}
 			},
 			async moveExclusive(
 				fromPath: string,
 				toPath: string,
 			): Promise<void> {
-				if (files.has(toPath)) throw new Error("target exists");
+				if (files.has(toPath)) {
+					throw new Error("target exists");
+				}
 				const value = files.get(fromPath);
-				if (!value) throw new Error("source missing");
+				if (!value) {
+					throw new Error("source missing");
+				}
 				files.set(toPath, value);
 				files.delete(fromPath);
-				if (throwAfterMove) throw new Error("lost response");
+				if (throwAfterMove) {
+					throw new Error("lost response");
+				}
 			},
 		},
 	};
@@ -138,10 +148,7 @@ test("modified encrypted lock rolls back byte-for-byte", async () => {
 
 	assert.equal(outcome, "rolled-back");
 	assert.equal(fake.files.has("lock"), false);
-	assert.equal(
-		rawBuffersEqual(fake.files.get("canonical")!, original),
-		true,
-	);
+	assert.equal(rawBuffersEqual(fake.files.get("canonical")!, original), true);
 });
 
 test("rollback recognizes a successful move with a lost response", async () => {
@@ -171,10 +178,7 @@ test("rollback recognizes a successful raw restore with a lost response", async 
 	);
 
 	assert.equal(outcome, "rolled-back");
-	assert.equal(
-		rawBuffersEqual(fake.files.get("canonical")!, original),
-		true,
-	);
+	assert.equal(rawBuffersEqual(fake.files.get("canonical")!, original), true);
 });
 
 test("rollback preserves ambiguous canonical and lock", async () => {

@@ -11,6 +11,8 @@ export interface ActiveSyncSession {
 }
 
 export interface SyncSessionHooks {
+	/** Refresh busy consumers after preparation or settlement changes queue ownership. */
+	onPendingWorkChanged?: () => void;
 	onQueued?: (session: QueuedSyncSession) => void | Promise<void>;
 	onEnter?: (session: ActiveSyncSession) => void | Promise<void>;
 	onExit?: (
@@ -27,8 +29,7 @@ export interface QueuedSyncSession {
 }
 
 export type SyncSessionSettlement<T> =
-	| { status: "fulfilled"; value: T }
-	| { status: "rejected"; reason: unknown };
+	{ status: "fulfilled"; value: T } | { status: "rejected"; reason: unknown };
 
 export interface SyncRunHooks<T> {
 	/** Run local preparation before the session enters the shared queue. */
@@ -50,6 +51,11 @@ export class SyncCoordinator {
 	private activeSession: ActiveSyncSession | null = null;
 	private pendingFull: Promise<unknown> | null = null;
 	private sequence = 0;
+	private pendingWork = 0;
+
+	hasPendingWork(): boolean {
+		return this.pendingWork > 0;
+	}
 
 	constructor(private readonly hooks: SyncSessionHooks = {}) {}
 
@@ -73,7 +79,12 @@ export class SyncCoordinator {
 			await runHooks.prepare?.({ id: sessionId, kind });
 			return await this.enqueueSession(kind, sessionId, task, runHooks);
 		};
-		const run = execute();
+		this.pendingWork++;
+		this.hooks.onPendingWorkChanged?.();
+		const run = execute().finally(() => {
+			this.pendingWork--;
+			this.hooks.onPendingWorkChanged?.();
+		});
 		if (kind === "full") {
 			const shared = run.finally(() => {
 				if (this.pendingFull === shared) {
@@ -156,21 +167,14 @@ export class SyncCoordinator {
 					error,
 				});
 				if (entered && this.activeSession) {
-					await this.hooks.onExit?.(
-						this.activeSession,
-						false,
-						error,
-					);
+					await this.hooks.onExit?.(this.activeSession, false, error);
 					entered = false;
 				}
 				throw error;
 			} finally {
 				try {
 					if (entered && this.activeSession) {
-						await this.hooks.onExit?.(
-							this.activeSession,
-							true,
-						);
+						await this.hooks.onExit?.(this.activeSession, true);
 					}
 				} finally {
 					this.activeKind = null;

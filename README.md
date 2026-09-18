@@ -2,19 +2,24 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
+Connection and sync-scope settings are accepted only after saving a coherent local
+snapshot. Active sync, archive creation, and encryption operations block competing
+changes. Pending recovery prevents moving unfinished work to another remote folder;
+a token can still be repaired while operations are idle. Failed saves keep sync blocked.
+Individual protective copies remain required even when a full archive is declined.
+
 ## Upgrading from 1.1.0 to 2.0.0
 
 Version 2.0.0 supports migration only from plaintext stable 1.0.0 and 1.1.0.
-Their local `localIndex` is converted into the current baseline in memory, but
-the original stable `data.json` shape remains rollback-readable until a
-verified backup and explicit Force migration reach the local cutover boundary.
-Plaintext canonical indexes carrying the exact stable `version: 1` or
-`version: 2` shape require a backed-up explicit **Force sync**.
-
-Before Force, update every device and stop stable 1.1 everywhere. A second
-updated device that observes the replacement canonical must run Full manually;
-it creates and verifies its own local backup before adopting the new epoch.
-Missing/invalid tokens and migration state never start the watcher or scheduler.
+Local settings and baseline are saved immediately as current `plugin-data`
+after installation identity initialization, before automation starts. Downgrading
+the local format to 1.1 is unsupported; a failed save blocks synchronization.
+A plaintext stable canonical with `version: 1`/`version: 2` requires explicit Force.
+Update all devices and stop old builds first. Each Force run offers an archive,
+continuing without an archive, or cancellation. Canonical, snapshot and fingerprint
+guards apply to both choices. Other devices adopt the current epoch through normal
+full sync without an automatic archive; an absent canonical permits initial sync.
+Resume cannot bypass startup blocks.
 
 If stable 1.1 synchronized the configuration directory and remote metadata
 contains this plugin's directory, migration stops without downloading its
@@ -36,7 +41,7 @@ data has no converter or recovery path.
 Do not start an older plugin version after the transition: it can replace the
 canonical index or restore deleted files. If that happens, disable sync everywhere,
 select the most complete local vault, inspect backup/conflict copies, and
-repeat the backed-up Force local procedure.
+repeat Force local with an explicit archive choice.
 
 > **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**
 >
@@ -112,21 +117,21 @@ repeat the backed-up Force local procedure.
 
 ### Plugin Settings
 
-| Parameter                    | Description                                                    | Recommended Value       |
-| ---------------------------- | -------------------------------------------------------------- | ----------------------- |
-| **OAuth token**              | Token for Yandex Disk API access                               | Obtained in settings    |
-| **Remote path**              | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`) | `obsidian-sync`         |
-| **Real-time sync**           | Automatic synchronization when files are changed               | Enabled                 |
-| **Full sync interval**       | Full synchronization interval in minutes (0 = manual only)     | 5 minutes               |
-| **Sync delay**               | Delay before uploading file after change (debounce)            | 1000 ms                 |
+| Parameter                     | Description                                                    | Recommended Value       |
+| ----------------------------- | -------------------------------------------------------------- | ----------------------- |
+| **OAuth token**               | Token for Yandex Disk API access                               | Obtained in settings    |
+| **Remote path**               | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`) | `obsidian-sync`         |
+| **Real-time sync**            | Automatic synchronization when files are changed               | Enabled                 |
+| **Full sync interval**        | Full synchronization interval in minutes (0 = manual only)     | 5 minutes               |
+| **Sync delay**                | Delay before uploading file after change (debounce)            | 1000 ms                 |
 | **Max concurrent operations** | Bounded file-operation concurrency                             | 10                      |
-| **Sync config folder**       | Synchronize Obsidian settings folder                           | Disabled (by default)   |
-| **Include/Exclude patterns** | Glob patterns for file filtering                               | `*.md`, `attachments/*` |
-| **Force Sync**               | Unconditional one-way overwrite (local→remote / remote→local)  | —                       |
-| **Backup**                   | Create ZIP backups of synchronized files                       | Disabled (by default)   |
-| **Encryption**               | Enable end-to-end AES-256-GCM encryption                       | Disabled (by default)   |
-| **Encryption info**          | Information about encryption and password storage              | —                       |
-| **Change password**          | Change encryption password (when encryption is enabled)        | —                       |
+| **Sync config folder**        | Synchronize Obsidian settings folder                           | Disabled (by default)   |
+| **Include/Exclude patterns**  | Glob patterns for file filtering                               | `*.md`, `attachments/*` |
+| **Force Sync**                | Unconditional one-way overwrite (local→remote / remote→local)  | —                       |
+| **Backup**                    | Create ZIP backups of synchronized files                       | Disabled (by default)   |
+| **Encryption**                | Enable end-to-end AES-256-GCM encryption                       | Disabled (by default)   |
+| **Encryption info**           | Information about encryption and password storage              | —                       |
+| **Change password**           | Change encryption password (when encryption is enabled)        | —                       |
 
 ## Commands
 
@@ -196,18 +201,23 @@ The plugin includes a **Force Sync** feature for cases when normal two-way sync 
 - **Sync from local → remote**: overwrites ALL files on Yandex Disk with local versions. Files not present locally are deleted from the remote.
 - **Sync from remote → local**: overwrites ALL local files with versions from Yandex Disk. Files not present on the remote are deleted locally.
 
-Force sync ignores timestamps, file hashes, and conflict resolver — it creates an exact copy in the chosen direction.
+Force sync selects the authoritative side explicitly; snapshot, canonical and fingerprint guards still apply.
 
 > **⚠️ Warning**
 > Force sync is destructive. The overwritten side is fully replaced. The
-> plugin requires a successful backup before it enables the operation. The
-> source is checked again before replacement commit. After that commit,
+> plugin offers an optional full archive. Canonical, protected snapshot and
+> source are checked again before replacement commit. After that commit,
 > interrupted fingerprint-guarded cleanup is resumed by normal Full sync and
 > Force must not be repeated.
 >
 > **Location**: Settings → Force Sync section.
 
-### Encryption
+Full archives before both Force directions and enable/disable/rotate are optional
+per run. A selected archive failure or stale snapshot stops that attempt. Connecting
+to existing encryption and recovery do not create another archive. Individual file
+protection and conflict copies remain active regardless of archive choice.
+
+## Encryption
 
 New encrypted vaults use the `hardened` profile: PBKDF2-HMAC-SHA256 with
 600,000 iterations derives a master key, then HKDF-SHA256 derives independent
@@ -233,7 +243,7 @@ or cleanup.
 1. Go to **Settings → Encryption section**
 2. Click the encryption toggle
 3. Enter and confirm your password
-4. Wait while the plugin creates and byte-verifies the mandatory backup
+4. Choose a full archive, continue without one, or cancel. A selected archive must pass exact byte verification
 5. Wait for the initial encryption sync (all files are re-uploaded encrypted)
 
 **Password recovery**: The password is NOT recoverable. If you lose the password while encryption is enabled, your data on Yandex Disk becomes permanently inaccessible. Keep the password in a safe place (e.g., password manager).
@@ -293,11 +303,21 @@ Built files are written to `build/`. When `.env` contains
 test-vault plugin directory. A clean checkout without `.env` only creates the
 release artifacts.
 
-### Linting
+### Linting and formatting
 
 ```bash
 npm run lint
+npm run format:check
+npm run lint:fix
+npm run format
 ```
+
+ESLint requires braces around every control-flow body, including single-line
+`if`/`else`. Prettier owns formatting; its settings match `.editorconfig`.
+`npm install` also installs the Husky pre-commit hook. On commit, lint-staged
+runs ESLint fixes followed by Prettier on staged code and formats staged
+JSON, CSS, Markdown and YAML. Unstaged hunks are preserved; errors that cannot
+be fixed automatically block the commit. CI checks lint and formatting too.
 
 ### Testing policy
 

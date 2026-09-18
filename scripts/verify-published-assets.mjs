@@ -4,11 +4,15 @@ import { createHash } from "node:crypto";
 import process from "node:process";
 
 const [publishedDir, buildDir] = process.argv.slice(2);
-if (!publishedDir || !buildDir) throw new Error("Two asset directories are required");
+if (!publishedDir || !buildDir) {
+	throw new Error("Two asset directories are required");
+}
 const expected = ["main.js", "manifest.json", "styles.css"];
 const actual = readdirSync(publishedDir).sort();
 if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-	throw new Error(`Published release has unexpected assets: ${actual.join(", ")}`);
+	throw new Error(
+		`Published release has unexpected assets: ${actual.join(", ")}`,
+	);
 }
 for (const name of expected) {
 	const published = readFileSync(join(publishedDir, name));

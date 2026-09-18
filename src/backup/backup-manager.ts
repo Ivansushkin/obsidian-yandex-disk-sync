@@ -1,3 +1,5 @@
+import type { OperationBackupChoice } from "./operation-backup-choice";
+import type { EncryptionBackupProof } from "../crypto/encryption-transition";
 /**
  * Backup manager for creating and managing vault backups
  */
@@ -32,7 +34,8 @@ export interface BackupResult {
 	error?: string;
 }
 
-export type BackupProgress = "creating-backup" | "uploading-backup" | "verifying-backup";
+export type BackupProgress =
+	"creating-backup" | "uploading-backup" | "verifying-backup";
 
 export class BackupPasswordRequiredError extends Error {
 	constructor() {
@@ -49,6 +52,7 @@ export class BackupManager {
 	private vaultAdapter: VaultAdapter;
 	private settings: YandexDiskSyncSettings;
 	private readonly pluginVersion: string;
+	private configurationGeneration = 0;
 
 	constructor(
 		yandexClient: YandexDiskClient,
@@ -62,6 +66,53 @@ export class BackupManager {
 		this.pluginVersion = pluginVersion;
 	}
 
+	/** Archive one explicitly selected source snapshot; drift requires a new user action. */
+	async createTransitionBackup(
+		choice: OperationBackupChoice | undefined,
+		password: string,
+		canonical: { epoch: string; revision: number },
+	): Promise<EncryptionBackupProof | null> {
+		if (choice === "without-backup") {
+			return null;
+		}
+		if (choice !== "with-backup") {
+			throw new Error("An explicit backup choice is required");
+		}
+		const { epoch, revision } = canonical;
+		const remotePath = this.settings.remotePath;
+		const generation = this.configurationGeneration;
+		const before = (await captureLogicalVaultSnapshot(this.vaultAdapter))
+			.digest;
+		this.assertConfigurationGeneration(generation);
+		const result = await this.createBackup(password);
+		if (
+			!result.success ||
+			!result.backupName ||
+			!result.sha256 ||
+			!result.snapshotDigest
+		) {
+			throw new Error(
+				result.error ?? "Selected encryption backup failed",
+			);
+		}
+		const after = (await captureLogicalVaultSnapshot(this.vaultAdapter))
+			.digest;
+		if (
+			before !== result.snapshotDigest ||
+			after !== result.snapshotDigest
+		) {
+			throw new Error("Vault changed during encryption backup");
+		}
+		return {
+			path: joinPath(remotePath, ".backup", result.backupName),
+			sha256: result.sha256,
+			epoch,
+			canonicalRevision: revision,
+			localSnapshotDigest: result.snapshotDigest,
+			createdAt: Date.now(),
+		};
+	}
+
 	/**
 	 * Create backup of all synchronized files
 	 */
@@ -69,11 +120,19 @@ export class BackupManager {
 		passwordOverride?: string,
 		onProgress?: (phase: BackupProgress) => void,
 	): Promise<BackupResult> {
+		const remotePath = this.settings.remotePath;
+		const password =
+			passwordOverride ??
+			(this.yandexClient.hasEncryptionService()
+				? (this.settings.encryptionPassword ?? undefined)
+				: undefined);
 		try {
 			onProgress?.("creating-backup");
 			logger.info("Starting backup creation...");
 
-			const snapshot = await captureLogicalVaultSnapshot(this.vaultAdapter);
+			const snapshot = await captureLogicalVaultSnapshot(
+				this.vaultAdapter,
+			);
 			logger.info(`Found ${snapshot.files.length} files to backup`);
 
 			const zip = new JSZip();
@@ -88,11 +147,6 @@ export class BackupManager {
 				compressionOptions: { level: 6 },
 			});
 
-			const password =
-				passwordOverride ??
-				(this.yandexClient.hasEncryptionService()
-					? (this.settings.encryptionPassword ?? undefined)
-					: undefined);
 			const createdAt = Date.now();
 			const uploadContent = password
 				? await sealBackupEnvelope(zipContent, password, {
@@ -103,6 +157,7 @@ export class BackupManager {
 					})
 				: zipContent;
 			const uploaded = await this.uploadVerifiedBackup(
+				remotePath,
 				uploadContent,
 				Boolean(password),
 				createdAt,
@@ -149,11 +204,17 @@ export class BackupManager {
 		passwordOverride?: string,
 		onProgress?: (phase: BackupProgress) => void,
 	): Promise<BackupResult> {
+		const remotePath = this.settings.remotePath;
+		const password =
+			passwordOverride ??
+			(this.yandexClient.hasEncryptionService()
+				? (this.settings.encryptionPassword ?? undefined)
+				: undefined);
 		try {
 			onProgress?.("creating-backup");
 			const snapshot = await captureRemoteRawSnapshot(
 				this.yandexClient,
-				this.settings.remotePath,
+				remotePath,
 			);
 			const zip = new JSZip();
 			for (const file of snapshot.files) {
@@ -164,11 +225,6 @@ export class BackupManager {
 				compression: "DEFLATE",
 				compressionOptions: { level: 6 },
 			});
-			const password =
-				passwordOverride ??
-				(this.yandexClient.hasEncryptionService()
-					? (this.settings.encryptionPassword ?? undefined)
-					: undefined);
 			const createdAt = Date.now();
 			const uploadContent = password
 				? await sealBackupEnvelope(zipContent, password, {
@@ -179,6 +235,7 @@ export class BackupManager {
 					})
 				: zipContent;
 			const uploaded = await this.uploadVerifiedBackup(
+				remotePath,
 				uploadContent,
 				Boolean(password),
 				createdAt,
@@ -214,6 +271,7 @@ export class BackupManager {
 	}
 
 	private async uploadVerifiedBackup(
+		remotePath: string,
 		content: ArrayBuffer,
 		encrypted: boolean,
 		createdAt: number,
@@ -232,11 +290,7 @@ export class BackupManager {
 				new Date(createdAt),
 				encrypted,
 			);
-			const backupPath = joinPath(
-				this.settings.remotePath,
-				".backup",
-				backupName,
-			);
+			const backupPath = joinPath(remotePath, ".backup", backupName);
 			try {
 				onProgress?.("uploading-backup");
 				await this.yandexClient.uploadFileExclusive(
@@ -269,7 +323,9 @@ export class BackupManager {
 			} catch (error) {
 				readbackError = error;
 			}
-			if (readbackError) throw normalizeError(readbackError);
+			if (readbackError) {
+				throw normalizeError(readbackError);
+			}
 
 			if (
 				uploadError instanceof YandexApiError &&
@@ -305,7 +361,21 @@ export class BackupManager {
 	 * Update settings
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
+		this.configurationGeneration++;
 		this.settings = settings;
+	}
+
+	/** Invalidate UI selections when their remote or encryption context changes. */
+	getConfigurationGeneration(): number {
+		return this.configurationGeneration;
+	}
+
+	assertConfigurationGeneration(generation: number): void {
+		if (generation !== this.configurationGeneration) {
+			throw new Error(
+				"Backup configuration changed; reopen the backup list",
+			);
+		}
 	}
 
 	/**
@@ -344,6 +414,7 @@ export class BackupManager {
 	 * List all available backups from the .backup folder
 	 */
 	async listBackups(): Promise<BackupInfo[]> {
+		const generation = this.configurationGeneration;
 		try {
 			const backupFolder = joinPath(this.settings.remotePath, ".backup");
 			logger.info(`Fetching backup list from: ${backupFolder}`);
@@ -356,7 +427,9 @@ export class BackupManager {
 			const backups: BackupInfo[] = [];
 
 			for (const resource of resources) {
-				if (resource.type !== "file") continue;
+				if (resource.type !== "file") {
+					continue;
+				}
 				const logicalName = resource.name;
 				const created = this.parseBackupName(logicalName);
 				if (!created) {
@@ -378,8 +451,10 @@ export class BackupManager {
 			backups.sort((a, b) => b.created.getTime() - a.created.getTime());
 
 			logger.info(`Found ${backups.length} backups`);
+			this.assertConfigurationGeneration(generation);
 			return backups;
 		} catch (error) {
+			this.assertConfigurationGeneration(generation);
 			if (error instanceof YandexApiError && error.status === 404) {
 				logger.info("Backup folder does not exist yet");
 				return [];
@@ -395,26 +470,34 @@ export class BackupManager {
 		backupPath: string,
 		password?: string,
 	): Promise<ArrayBuffer> {
+		const generation = this.configurationGeneration;
+		const effectivePassword =
+			password ?? this.settings.encryptionPassword ?? undefined;
 		try {
 			logger.info(`Starting backup download: ${backupPath}`);
 			const raw = await this.yandexClient.downloadFile(backupPath, true);
+			this.assertConfigurationGeneration(generation);
 			if (isBackupEnvelope(raw)) {
-				const effectivePassword =
-					password ?? this.settings.encryptionPassword ?? undefined;
-				if (!effectivePassword) throw new BackupPasswordRequiredError();
+				if (!effectivePassword) {
+					throw new BackupPasswordRequiredError();
+				}
 				try {
 					const content = (
 						await openBackupEnvelope(raw, effectivePassword)
 					).content;
+					this.assertConfigurationGeneration(generation);
 					assertZipContent(content);
 					return content;
 				} catch (error) {
 					if (!(error instanceof BackupEnvelopeAuthenticationError)) {
 						throw error;
 					}
-					logger.warn("Backup envelope password verification failed", {
-						error,
-					});
+					logger.warn(
+						"Backup envelope password verification failed",
+						{
+							error,
+						},
+					);
 					throw new BackupPasswordRequiredError();
 				}
 			}
@@ -449,7 +532,9 @@ function assertZipContent(content: ArrayBuffer): void {
 
 function isZipContent(content: ArrayBuffer): boolean {
 	const bytes = new Uint8Array(content);
-	if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) return false;
+	if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
+		return false;
+	}
 	return (
 		(bytes[2] === 0x03 && bytes[3] === 0x04) ||
 		(bytes[2] === 0x05 && bytes[3] === 0x06) ||
@@ -458,7 +543,9 @@ function isZipContent(content: ArrayBuffer): boolean {
 }
 
 function bytesEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
-	if (left.byteLength !== right.byteLength) return false;
+	if (left.byteLength !== right.byteLength) {
+		return false;
+	}
 	const a = new Uint8Array(left);
 	const b = new Uint8Array(right);
 	return a.every((byte, index) => byte === b[index]);
@@ -467,7 +554,9 @@ function bytesEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
 function randomBase64Url(byteLength: number): string {
 	const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
 	let binary = "";
-	for (const byte of bytes) binary += String.fromCharCode(byte);
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte);
+	}
 	return btoa(binary)
 		.replace(/\+/g, "-")
 		.replace(/\//g, "_")

@@ -13,7 +13,7 @@ Changes since stable `1.1.0`.
 - Limited automatic migration to plaintext stable 1.0.0 and 1.1.0 local data.
   Their `localIndex` is converted once into the current baseline. Plaintext
   canonical indexes carrying stable `version: 1` or `version: 2` require an
-  explicit Force sync with a verified backup.
+  explicit Force sync with a per-run choice of a verified archive or no archive.
 - Encrypted legacy data, numeric historical manifests and canonical indexes,
   unmarked transition/queue data, and incomplete current metadata are
   unsupported and fail closed before remote writes. All devices must be
@@ -34,7 +34,7 @@ Changes since stable `1.1.0`.
   authenticated headers and archive-specific PBKDF2/AES-GCM parameters.
 - Added collision-resistant backup names, non-overwriting upload, and exact
   SHA-256 plus byte read-back after success, timeout, or an ambiguous response.
-- Added Force local and Force remote recovery with a mandatory verified backup,
+- Added Force local and Force remote recovery with an optional verified archive,
   a new epoch, canonical read-back verification, and automatic watcher and
   scheduler restart.
 - Added persistent watcher events, per-device mutation FIFO, resumable physical
@@ -93,62 +93,6 @@ Changes since stable `1.1.0`.
 
 ## 1.1.0
 
-### Added
-
-#### Force Sync
-
-Added forced one-way synchronization that ignores modification dates, file
-hashes, and the previous index state. The selected source becomes the exact
-authoritative copy in the chosen direction.
-
-#### ForceSyncModal (`src/ui/force-sync-modal.ts`)
-
-Added a confirmation modal before Force Sync with:
-
-- an explanation specific to the selected direction;
-- a warning that the operation is destructive;
-- a button to create a backup before continuing;
-- a button to continue without a backup;
-- a cancel button.
-
-#### Force Sync from local
-
-Overwrites all files on Yandex Disk with local versions and removes remote
-files that do not exist locally.
-
-```text
-1. Build the local index by scanning the vault.
-2. Get the remote file list.
-3. Upload every local file unconditionally.
-4. Delete every remote-only file.
-5. Replace the remote index with the local index.
-```
-
-#### Force Sync from remote
-
-Overwrites all local files with versions from Yandex Disk and removes local
-files that do not exist remotely.
-
-```text
-1. Build the local index to identify local-only files.
-2. Load the remote index.
-3. Get the remote file list.
-4. Download every remote file unconditionally.
-5. Delete every local-only file.
-6. Replace the local index with the remote index.
-```
-
-#### Implementation details
-
-- Force Sync generated operations directly without `ConflictResolver`.
-- Overwrites did not compare mtime or SHA-256.
-- `FileWatcher` was suspended through the existing `syncPauseCallbacks`.
-- Progress was reported through the regular `updateState()` mechanism.
-- File operations reused `executeOperationsParallel()`.
-
-#### Settings UI
-
-Added a **Force Sync** section after **Backup** with two actions:
-
-- **From local to remote**;
-- **From remote to local**.
+Added explicit local-to-remote and remote-to-local Force synchronization with
+confirmation, optional backup and progress reporting. Added the Force controls
+to settings and reused the existing watcher pause/resume lifecycle.

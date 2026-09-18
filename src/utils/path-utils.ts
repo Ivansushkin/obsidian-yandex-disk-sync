@@ -4,9 +4,9 @@
 
 /** System-protected paths that should never be synchronized */
 const PROTECTED_PATHS = [
-	'.backup',
-	'.obsidian-sync-index.json',
-	'.obsidian-encrypt.json',
+	".backup",
+	".obsidian-sync-index.json",
+	".obsidian-encrypt.json",
 ];
 
 const PROTECTED_PATH_PREFIXES = [".obsidian-sync-index.lock."];
@@ -87,7 +87,7 @@ export function getExtension(path: string): string {
  */
 export function toLocalPath(
 	fullRemotePath: string,
-	remoteBasePath: string
+	remoteBasePath: string,
 ): string {
 	const normalized = normalizePath(fullRemotePath);
 	const base = normalizePath(remoteBasePath);
@@ -142,15 +142,41 @@ export function isLegacyServicePathCollision(path: string): boolean {
 	return isProtectedPath(path);
 }
 
-/** Find exact, Unicode-NFC, or case-fold collisions before writing locally. */
-export function hasPortablePathCollision(paths: Iterable<string>): boolean {
-	const observed = new Map<string, string>();
+/** Reject ambiguous portable trees without renaming logical paths. */
+export function hasPortablePathCollision(
+	paths: Iterable<string>,
+	folders: Iterable<string> = [],
+): boolean {
+	const observed = new Map<string, { spelling: string; file: boolean }>();
+	const add = (path: string, file: boolean): boolean => {
+		const segments = normalizePath(path).split("/");
+		for (let i = 1; i <= segments.length; i++) {
+			const spelling = segments.slice(0, i).join("/");
+			if (!spelling) {
+				continue;
+			}
+			const key = spelling.normalize("NFC").toLocaleLowerCase("en-US");
+			const isFile = file && i === segments.length;
+			const previous = observed.get(key);
+			if (
+				previous &&
+				(previous.spelling !== spelling || previous.file !== isFile)
+			) {
+				return true;
+			}
+			observed.set(key, { spelling, file: isFile });
+		}
+		return false;
+	};
+	for (const path of folders) {
+		if (add(path, false)) {
+			return true;
+		}
+	}
 	for (const path of paths) {
-		const normalized = normalizePath(path);
-		const portableKey = normalized.normalize("NFC").toLocaleLowerCase("en-US");
-		const previous = observed.get(portableKey);
-		if (previous !== undefined && previous !== normalized) return true;
-		observed.set(portableKey, normalized);
+		if (add(path, true)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -188,7 +214,7 @@ export function shouldSyncFile(
 	includePatterns: string[],
 	excludePatterns: string[],
 	syncDotObsidian: boolean,
-	configDir?: string
+	configDir?: string,
 ): boolean {
 	const normalized = normalizePath(path);
 
@@ -204,7 +230,8 @@ export function shouldSyncFile(
 		const legacyLogPath = joinPath(configDir, LEGACY_LOG_DIRECTORY);
 		if (
 			pluginDataPaths.some(
-				(path) => normalized === path || normalized.startsWith(`${path}/`),
+				(path) =>
+					normalized === path || normalized.startsWith(`${path}/`),
 			) ||
 			normalized === legacyLogPath ||
 			normalized.startsWith(`${legacyLogPath}/`)
@@ -248,7 +275,9 @@ export function encodePathForUrl(path: string): string {
  */
 export function generateDeviceId(): string {
 	const uuid = globalThis.crypto?.randomUUID?.();
-	if (uuid) return `device_${uuid}`;
+	if (uuid) {
+		return `device_${uuid}`;
+	}
 	const timestamp = Date.now().toString(36);
 	const random = Math.random().toString(36).substring(2, 10);
 	return `device_${timestamp}_${random}`;

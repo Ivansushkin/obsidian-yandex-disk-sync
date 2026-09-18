@@ -1,3 +1,4 @@
+import * as encryptionRewrite from "../src/sync/workflows/encryption-rewrite";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -5,8 +6,8 @@ import {
 	type YandexDiskClient,
 } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import type { IndexManager } from "../src/sync/index-manager";
-import { SyncEngine } from "../src/sync/sync-engine";
+import type { IndexManager } from "../src/sync/canonical/manager";
+import { SyncEngine } from "../src/sync/engine";
 import { DEFAULT_SETTINGS } from "../src/types";
 
 function createEngine(upload: () => Promise<void>): SyncEngine {
@@ -23,17 +24,12 @@ test("encryption rewrite never overwrites a colliding target path", async () => 
 	const access = createEngine(async () => {
 		attempts++;
 		throw new YandexApiError("already exists", 409);
-	}) as unknown as {
-		uploadPhysicalRewriteTarget(
-			path: string,
-			content: ArrayBuffer,
-			verify: () => Promise<{ remoteFingerprint: string }>,
-		): Promise<{ remoteFingerprint: string }>;
-	};
+	});
 
 	let verified = 0;
 	assert.deepEqual(
-		await access.uploadPhysicalRewriteTarget(
+		await encryptionRewrite.uploadPhysicalRewriteTarget(
+			deps(access),
 			"vault/raw",
 			new ArrayBuffer(1),
 			async () => {
@@ -48,9 +44,10 @@ test("encryption rewrite never overwrites a colliding target path", async () => 
 
 	const failed = createEngine(async () => {
 		throw new YandexApiError("locked", 423);
-	}) as unknown as typeof access;
+	});
 	await assert.rejects(
-		failed.uploadPhysicalRewriteTarget(
+		encryptionRewrite.uploadPhysicalRewriteTarget(
+			deps(failed),
 			"vault/raw",
 			new ArrayBuffer(1),
 			async () => {
@@ -60,3 +57,11 @@ test("encryption rewrite never overwrites a colliding target path", async () => 
 		/read-back proof failed/,
 	);
 });
+
+function deps(engine: SyncEngine): encryptionRewrite.Dependencies {
+	return (
+		engine as unknown as {
+			encryptionRewriteDependencies(): encryptionRewrite.Dependencies;
+		}
+	).encryptionRewriteDependencies();
+}

@@ -1,3 +1,9 @@
+import {
+	prepareSettingsPatch,
+	type UserSettingsPatch,
+} from "./settings-workflow";
+import { OperationBackupModal } from "./ui/operation-backup-modal";
+import type { OperationBackupChoice } from "./backup/operation-backup-choice";
 /**
  * Yandex Disk Sync Plugin for Obsidian
  * File synchronization with Yandex Disk
@@ -26,43 +32,37 @@ import {
 	LegacyPluginDataExposureError,
 	LegacyServicePathCollisionError,
 	RemoteIndexConcurrentModificationError,
-} from "./sync/index-manager";
+} from "./sync/canonical/manager";
 import {
 	SyncEngine,
 	type ForceBackupProof,
 	type PhysicalRewriteUploadProof,
 	type SyncRunOptions,
-} from "./sync/sync-engine";
-import {
-	DeferredWatcherEvent,
-	FileWatcher,
-} from "./sync/file-watcher";
-import { SyncScheduler } from "./sync/sync-scheduler";
-import {
-	formatSyncActivity,
-	SyncStatusBar,
-} from "./ui/status-bar";
+} from "./sync/engine";
+import { DeferredWatcherEvent, FileWatcher } from "./sync/realtime/watcher";
+import { SyncScheduler } from "./sync/scheduler";
+import { formatSyncActivity, SyncStatusBar } from "./ui/status-bar";
 import { SyncStatusModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import {
 	ForceSyncController,
 	type ForceDirection,
 	type ForceFlowState,
-} from "./sync/force-sync-controller";
-import { formatForceActivity, formatForceResult } from "./ui/force-sync-progress";
+} from "./sync/workflows/force-controller";
+import {
+	formatForceActivity,
+	formatForceResult,
+} from "./ui/force-sync-progress";
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
 import { BackupManager } from "./backup/backup-manager";
-import { captureLogicalVaultSnapshot } from "./backup/backup-snapshot";
 import {
-	generateDeviceId,
-	getAncestorDirectoriesDeepestFirst,
-	isProtectedPath,
-	joinPath,
-	toLocalPath,
-} from "./utils/path-utils";
+	captureLogicalVaultSnapshot,
+	captureRemoteRawSnapshot,
+} from "./backup/backup-snapshot";
+import { generateDeviceId, joinPath, toLocalPath } from "./utils/path-utils";
 import { computeSha256 } from "./utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "./utils/logger";
-import { initI18n, t } from "./i18n";
+import { initI18n, t } from "./i18n/index";
 import {
 	createEncryptionCodec,
 	EncryptionService,
@@ -80,18 +80,10 @@ import {
 	type LocalEncryptionTransition,
 } from "./crypto/encryption-transition";
 import {
-	getPhysicalResourceFingerprint,
-	matchesPhysicalResourceFingerprint,
-} from "./utils/resource-fingerprint";
-import {
 	PLUGIN_DATA_FORMAT,
 	loadPluginDataWithSource,
 } from "./plugin-data-loader";
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
-import {
-	serializeStable1xPluginData,
-	type Stable1xPluginData,
-} from "./compatibility/stable-1x";
 
 interface PluginData {
 	format: typeof PLUGIN_DATA_FORMAT;
@@ -116,7 +108,9 @@ interface EncryptionReadyOptions {
 
 class LegacyTokenRotationRequiredError extends Error {
 	constructor() {
-		super("OAuth token rotation is required after legacy plugin-data exposure");
+		super(
+			"OAuth token rotation is required after legacy plugin-data exposure",
+		);
 		this.name = "LegacyTokenRotationRequiredError";
 	}
 }
@@ -145,8 +139,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private loadedPluginData: PluginData | null = null;
 	private pluginDataLoaded = false;
 	private pluginDataLoadGeneration = 0;
-	private stablePluginDataSnapshot: Stable1xPluginData | null = null;
-	private stableCutoverPending = false;
 	private pluginDataPersistenceTail: Promise<void> = Promise.resolve();
 	private localStateRestored = false;
 	private syncLifecycleRegistered = false;
@@ -167,6 +159,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	};
 
 	private regularSyncStarted = false;
+	private activeFullRuns = 0;
 	private readonly encryptionManager = new EncryptionManager();
 	private encryptionService: EncryptionCodec | null = null;
 	private encryptionTransitionController!: EncryptionTransitionController;
@@ -204,13 +197,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 		logger.info("Loading Yandex Disk Sync plugin...");
 
-		// The installation ID lives outside the vault so copying or syncing the
-		// plugin data cannot make two devices share one mutation sequence.
-		const installationDeviceId = this.getInstallationDeviceId();
-		if (this.settings.deviceId !== installationDeviceId) {
-			this.settings.deviceId = installationDeviceId;
-			await this.saveSettings();
-		}
+		const installationDeviceId = this.settings.deviceId;
 		logger.configure({
 			baseContext: {
 				pluginVersion: this.manifest.version,
@@ -241,6 +228,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
+		this.unloaded = true;
 		this.forceSyncController?.dispose();
 		logger.info("Unloading Yandex Disk Sync plugin...");
 
@@ -343,7 +331,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							false,
 						);
 						if (!proof) {
-							throw new Error(`Uploaded target is missing for ${logicalPath}`);
+							throw new Error(
+								`Uploaded target is missing for ${logicalPath}`,
+							);
 						}
 						return proof;
 					},
@@ -361,8 +351,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							phase,
 							cleanup,
 						),
-					publishStable: async (snapshot) =>
-						await this.publishStableEncryptionSnapshot(snapshot),
+					publishStable: async (snapshot) => {
+						const authority = this.indexManager.getMaintenance();
+						if (!authority) {
+							throw new Error(
+								"Transition publication has no canonical authority",
+							);
+						}
+						await this.indexManager.assertMaintenanceAuthority(
+							this.indexManager.getRemoteIndex().epoch,
+							authority,
+						);
+						await this.publishStableEncryptionSnapshot(snapshot);
+					},
 					prepareCleanup: async (paths, fingerprints) =>
 						await this.prepareGuardedCleanup(paths, fingerprints),
 					deletePaths: async (paths, fingerprints) =>
@@ -387,6 +388,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							}),
 						),
 				},
+				{
+					client: this.yandexClient,
+					getRemotePath: () => this.settings.remotePath,
+					completeAction: (path) => this.completeGuardedCleanup(path),
+					persist: () => this.persistPluginData(),
+				},
 			);
 
 		// Set callback for saving local index after auto-sync operations
@@ -394,6 +401,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.persistPluginData();
 		});
 		this.syncEngine.setSyncGuardCallback(async (validationToken) => {
+			if (this.settingsPersistenceFailed || this.unloaded) {
+				return { blockReason: t("notice.remote_recheck_required") };
+			}
 			if (!this.settings.yandexTokenSecret) {
 				return { blockReason: null };
 			}
@@ -419,7 +429,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				blockReason: ready
 					? null
 					: (this.encryptionBlockReason ??
-							t("notice.encryption_password_required")),
+						t("notice.encryption_password_required")),
 				validationToken: manifestRead.validationToken,
 			};
 		});
@@ -517,32 +527,74 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Resume automation only after a fresh startup-state classification. */
 	private async resumeSyncIfReady(): Promise<boolean> {
-		if (this.isForceSyncBusy()) return false;
-		if ((await this.refreshRemoteStartupState(true)) !== "ready") {
+		if (
+			this.isConfigurationBusy() ||
+			this.settingsPersistenceFailed ||
+			this.unloaded
+		) {
 			return false;
 		}
-		this.syncEngine.resume();
-		this.fileWatcher.start();
-		this.syncScheduler.start();
-		new Notice(t("notice.sync_resumed"));
-		return true;
+		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
+		this.notifyManualActivity();
+		try {
+			if ((await this.refreshRemoteStartupState(true)) !== "ready") {
+				return false;
+			}
+			if (this.unloaded) {
+				return false;
+			}
+			this.syncEngine.resume();
+			const result = await this.runFullSync(undefined, false);
+			if (
+				!result?.success ||
+				this.unloaded ||
+				this.syncEngine.isSyncPaused()
+			) {
+				return false;
+			}
+			this.regularSyncStarted = true;
+			this.fileWatcher.start();
+			this.syncScheduler.start();
+			new Notice(t("notice.sync_resumed"));
+			return true;
+		} finally {
+			this.activeFullRuns--;
+			this.notifyManualActivity();
+		}
 	}
 
 	/**
 	 * Callback when layout is ready
 	 */
 	private async onLayoutReady(): Promise<void> {
-		this.restoreLocalStateOnce();
-		this.registerSyncLifecycleOnce();
-		if ((await this.refreshRemoteStartupState(false)) !== "ready") return;
-
-		// Sweep stale overwritten-file backups so the data folder doesn't grow
-		// without bound. Non-critical: log and ignore failures so a backup
-		// cleanup problem never blocks sync startup.
+		if (this.unloaded || this.isConfigurationBusy()) {
+			return;
+		}
+		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
+		this.notifyManualActivity();
 		try {
-			await this.vaultAdapter.cleanupOldBackups();
-		} catch (error) {
-			logger.warn("Overwritten-file backup cleanup failed:", { error });
+			this.restoreLocalStateOnce();
+			this.registerSyncLifecycleOnce();
+			if (
+				(await this.refreshRemoteStartupState(false)) !== "ready" ||
+				this.unloaded
+			) {
+				return;
+			}
+
+			// Sweep stale overwritten-file backups so the data folder doesn't grow
+			// without bound. Non-critical: log and ignore failures so a backup
+			// cleanup problem never blocks sync startup.
+			try {
+				await this.vaultAdapter.cleanupOldBackups();
+			} catch (error) {
+				logger.warn("Overwritten-file backup cleanup failed:", {
+					error,
+				});
+			}
+		} finally {
+			this.activeFullRuns--;
+			this.notifyManualActivity();
 		}
 
 		await this.startSync(true, true);
@@ -550,7 +602,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Restore persisted causal queues before token or remote checks. */
 	private restoreLocalStateOnce(): void {
-		if (this.localStateRestored) return;
+		if (this.localStateRestored) {
+			return;
+		}
 		const data = this.loadedPluginData;
 		if (data?.localState) {
 			this.indexManager.loadLocalIndexFromData(data.localState);
@@ -568,14 +622,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Register watcher lifecycle exactly once, even when startup is blocked. */
 	private registerSyncLifecycleOnce(): void {
-		if (this.syncLifecycleRegistered) return;
+		if (this.syncLifecycleRegistered) {
+			return;
+		}
 		this.syncEngine.onSyncPrepare(
-			async (context) =>
-				await this.fileWatcher.prepareForSync(context),
+			async (context) => await this.fileWatcher.prepareForSync(context),
 		);
 		this.syncEngine.onSyncPause(
-			async (context) =>
-				await this.fileWatcher.pauseForSync(context),
+			async (context) => await this.fileWatcher.pauseForSync(context),
 		);
 		this.syncEngine.onSyncFinalize(
 			async (context, result) =>
@@ -585,8 +639,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				),
 		);
 		this.syncEngine.onSyncResume(
-			async (outcome) =>
-				await this.fileWatcher.resumeAfterSync(outcome),
+			async (outcome) => await this.fileWatcher.resumeAfterSync(outcome),
 		);
 		this.syncLifecycleRegistered = true;
 	}
@@ -598,7 +651,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private async refreshRemoteStartupState(
 		prompt: boolean,
-	): Promise<"ready" | "migration" | "adoption" | "blocked"> {
+		allowRecovery = true,
+	): Promise<"ready" | "migration" | "blocked"> {
 		if (!this.settings.yandexTokenSecret) {
 			this.setAuthenticationBlock(t("notice.token_missing"));
 			logger.info("Token not configured, waiting for settings");
@@ -609,33 +663,37 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				// A different updated device may already have committed replacement.
 				this.remoteStateValidated = false;
 			} else {
-			if (this.historicalBlockReason || this.authenticationBlockReason) {
-				return "blocked";
-			}
-			if (!this.encryptionBlockReason) return "ready";
-			if (!prompt) return "blocked";
+				if (
+					this.historicalBlockReason ||
+					this.authenticationBlockReason
+				) {
+					return "blocked";
+				}
+				if (!this.encryptionBlockReason) {
+					return "ready";
+				}
+				if (!prompt) {
+					return "blocked";
+				}
 			}
 		}
 
 		try {
-			const manifest = await this.indexManager.downloadEncryptionManifest();
-			let stableCurrentAdoption = false;
+			const manifest =
+				await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
 				const canonicalFormat =
 					await this.indexManager.inspectRemoteCanonicalFormat();
 				if (
 					canonicalFormat === "legacy" &&
-					!this.stableCutoverPending &&
-					(this.settings.enableEncryption || this.encryptionTransition)
+					(this.settings.enableEncryption ||
+						this.encryptionTransition)
 				) {
 					throw new UnsupportedHistoricalDataError(
 						"Encrypted current local state cannot migrate a plaintext stable canonical",
 					);
 				}
-				if (
-					canonicalFormat === "legacy" ||
-					(canonicalFormat === "absent" && this.stableCutoverPending)
-				) {
+				if (canonicalFormat === "legacy") {
 					this.setAuthenticationBlock(null);
 					this.setHistoricalBlock(null);
 					this.setEncryptionBlock(null, false);
@@ -643,47 +701,40 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.remoteStateValidated = true;
 					return "migration";
 				}
-				if (canonicalFormat === "current" && this.stableCutoverPending) {
-					this.setMigrationBlock(t("notice.stable_adoption_required"));
-					this.setHistoricalBlock(null);
-					this.setAuthenticationBlock(null);
-					this.setEncryptionBlock(null, false);
-					this.remoteStateValidated = true;
-					return "adoption";
-				}
-			} else if (this.stableCutoverPending && manifest.state !== "enabled") {
-				this.setMigrationBlock(null);
-				this.setHistoricalBlock(null);
-				this.setAuthenticationBlock(null);
-				this.setEncryptionBlock(t("notice.encryption_remote_busy"));
-				this.remoteStateValidated = true;
-				return "blocked";
 			}
 
 			this.setMigrationBlock(null);
 			this.setHistoricalBlock(null);
 			this.setAuthenticationBlock(null);
-			if (this.stableCutoverPending) {
-				stableCurrentAdoption = true;
+			let recovered = false;
+			if (allowRecovery) {
+				if (this.encryptionTransition) {
+					await this.syncEngine.runExclusiveMaintenance(async () => {
+						await this.recoverEncryptionTransition();
+					});
+					recovered = true;
+				} else {
+					recovered = await this.tryRecoverRemoteTargetTransition();
+				}
 			} else if (this.encryptionTransition) {
-				await this.syncEngine.runExclusiveMaintenance(async () => {
-					await this.recoverEncryptionTransition();
-				});
-			} else {
-				await this.tryRecoverRemoteTargetTransition();
+				this.setEncryptionBlock(t("notice.encryption_remote_busy"));
+				return "blocked";
 			}
 			const ready = await this.ensureEncryptionReady(
 				{ prompt },
-				{ manifest },
+				{
+					manifest: recovered
+						? await this.indexManager.downloadEncryptionManifest()
+						: manifest,
+				},
 			);
-			this.remoteStateValidated = ready || Boolean(this.encryptionBlockReason);
-			if (!ready) return "blocked";
-			this.setEncryptionBlock(null, false);
-			if (stableCurrentAdoption) {
-				this.setMigrationBlock(t("notice.stable_adoption_required"));
-				this.remoteStateValidated = true;
-				return "adoption";
+			this.remoteStateValidated =
+				ready || Boolean(this.encryptionBlockReason);
+			if (!ready) {
+				return "blocked";
 			}
+			this.setEncryptionBlock(null, false);
+
 			return "ready";
 		} catch (error) {
 			this.remoteStateValidated = false;
@@ -698,7 +749,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (error instanceof UnsupportedHistoricalDataError) {
 				this.setMigrationBlock(null);
 				this.setEncryptionBlock(null, false);
-				this.setHistoricalBlock(t("notice.unsupported_historical_data"));
+				this.setHistoricalBlock(
+					t("notice.unsupported_historical_data"),
+				);
 				this.remoteStateValidated = true;
 				return "blocked";
 			}
@@ -709,7 +762,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.setAuthenticationBlock(t("notice.token_invalid"));
 				return "blocked";
 			}
-			logger.warn("Remote startup state could not be classified", { error });
+			logger.warn("Remote startup state could not be classified", {
+				error,
+			});
 			this.setAuthenticationBlock(t("notice.remote_state_check_failed"));
 			return "blocked";
 		}
@@ -723,10 +778,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		showProgressNotice = !options?.startup,
 		forceFinalization = false,
 	): Promise<SyncResult | null> {
-		if (this.isForceSyncBusy() && !forceFinalization) return null;
+		if (
+			(this.isForceSyncBusy() ||
+				this.configurationUpdatePending ||
+				this.foregroundOperation ||
+				this.unloaded ||
+				this.settingsPersistenceFailed) &&
+			!forceFinalization
+		) {
+			return null;
+		}
 		if (showProgressNotice && this.activeManualFullPromise) {
 			return await this.activeManualFullPromise;
 		}
+		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
+		this.notifyManualActivity();
 		const run = async (): Promise<SyncResult | null> => {
 			try {
 				if (!this.settings.yandexTokenSecret) {
@@ -737,9 +803,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.registerSyncLifecycleOnce();
 				const startupState =
 					await this.refreshRemoteStartupState(showProgressNotice);
-				if (startupState === "adoption" && showProgressNotice) {
-					if (!(await this.completeStableCurrentAdoption())) return null;
-				} else if (startupState !== "ready") {
+				if (startupState !== "ready" || this.unloaded) {
 					return null;
 				}
 				if (showProgressNotice) {
@@ -763,7 +827,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				if (this.handleBlockingSyncResult(result, showProgressNotice)) {
 					return result;
 				}
-				if (result.success) this.clearBlockingNotice();
+				if (result.success) {
+					this.clearBlockingNotice();
+				}
 				if (result.epochAdopted && !showProgressNotice) {
 					new Notice(
 						result.conflicts > 0
@@ -785,12 +851,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 									})
 								: t("notice.epoch_adopted")
 							: result.success
-							? successful === 0
-								? t("notice.sync_no_changes")
-								: t("notice.sync_completed", { successful })
-							: t("notice.sync_error", {
-									errors: result.errors.length,
-								}),
+								? successful === 0
+									? t("notice.sync_no_changes")
+									: t("notice.sync_completed", { successful })
+								: t("notice.sync_error", {
+										errors: result.errors.length,
+									}),
 						result.success ? 5000 : 10000,
 					);
 				}
@@ -809,8 +875,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 		};
 
-		const promise = run();
-		if (!showProgressNotice) return await promise;
+		const promise = run().finally(() => {
+			this.activeFullRuns--;
+			this.notifyManualActivity();
+		});
+		if (!showProgressNotice) {
+			return await promise;
+		}
 		this.activeManualFullPromise = promise.finally(() => {
 			if (this.activeManualFullPromise === trackedPromise) {
 				this.activeManualFullPromise = null;
@@ -823,7 +894,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private queueEpochRecoveryFull(options?: SyncRunOptions): void {
-		if (this.epochRecoveryTimer !== null) return;
+		if (this.epochRecoveryTimer !== null) {
+			return;
+		}
 		this.epochRecoveryTimer = window.setTimeout(() => {
 			this.epochRecoveryTimer = null;
 			void this.runFullSync(
@@ -834,7 +907,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/** Show one live Notice backed by the same state as the status bar. */
-	private beginSyncNotice(initialMessage: string, subscribeToEngine = true): Notice {
+	private beginSyncNotice(
+		initialMessage: string,
+		subscribeToEngine = true,
+	): Notice {
 		this.syncNoticeGeneration++;
 		if (this.syncNoticeHideTimer !== null) {
 			window.clearTimeout(this.syncNoticeHideTimer);
@@ -843,7 +919,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const reusableBlockingNotice = this.activeSyncNotice
 			? null
 			: (this.blockingNotice?.notice ?? null);
-		if (reusableBlockingNotice) this.blockingNotice = null;
+		if (reusableBlockingNotice) {
+			this.blockingNotice = null;
+		}
 		const notice =
 			this.activeSyncNotice ??
 			reusableBlockingNotice ??
@@ -855,14 +933,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.syncNoticeUnsubscribe = null;
 		}
 		if (subscribeToEngine && !this.syncNoticeUnsubscribe) {
-			this.syncNoticeUnsubscribe = this.syncEngine.onStateChange((state) => {
-				if (state.status !== "syncing" || !this.activeSyncNotice) return;
-				this.activeSyncNotice.setMessage(
-					t("notice.sync_progress", {
-						operation: formatSyncActivity(state),
-					}),
-				);
-			});
+			this.syncNoticeUnsubscribe = this.syncEngine.onStateChange(
+				(state) => {
+					if (state.status !== "syncing" || !this.activeSyncNotice) {
+						return;
+					}
+					this.activeSyncNotice.setMessage(
+						t("notice.sync_progress", {
+							operation: formatSyncActivity(state),
+						}),
+					);
+				},
+			);
 		}
 		return notice;
 	}
@@ -883,10 +965,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.activeSyncNotice = notice;
 		}
 		notice.setMessage(message);
-		if (durationMs <= 0) return;
+		if (durationMs <= 0) {
+			return;
+		}
 		const generation = this.syncNoticeGeneration;
 		this.syncNoticeHideTimer = window.setTimeout(() => {
-			if (generation !== this.syncNoticeGeneration) return;
+			if (generation !== this.syncNoticeGeneration) {
+				return;
+			}
 			notice.hide();
 			if (this.activeSyncNotice === notice) {
 				this.activeSyncNotice = null;
@@ -910,7 +996,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Hide a blocking Notice when its code matches the resolved condition. */
 	private clearBlockingNotice(code?: string): void {
-		if (code && this.blockingNotice?.code !== code) return;
+		if (code && this.blockingNotice?.code !== code) {
+			return;
+		}
 		this.blockingNotice?.notice.hide();
 		this.blockingNotice = null;
 	}
@@ -921,7 +1009,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		message: string,
 		reuseProgressNotice = false,
 	): void {
-		if (this.isForceSyncBusy()) reuseProgressNotice = true;
+		if (this.isForceSyncBusy()) {
+			reuseProgressNotice = true;
+		}
 		if (reuseProgressNotice && this.activeSyncNotice) {
 			this.finishSyncNotice(message, 0);
 			this.blockingNotice?.notice.hide();
@@ -982,7 +1072,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				"authentication",
 			].includes(error.code ?? ""),
 		);
-		if (!blockingError) return false;
+		if (!blockingError) {
+			return false;
+		}
 
 		this.fileWatcher.stop();
 		this.syncScheduler.stop();
@@ -996,7 +1088,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			"ambiguous-index-lock": "notice.ambiguous_index_blocked",
 			"remote-maintenance": "notice.encryption_remote_busy",
 			"encryption-blocked": null,
-			"authentication": "notice.token_invalid",
+			authentication: "notice.token_invalid",
 		}[blockingError.code ?? ""];
 		const message = noticeKey ? t(noticeKey) : blockingError.message;
 		this.showBlockingNotice(
@@ -1016,11 +1108,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private confirmForceSync(
 		direction: ForceDirection,
 		requireLegacyClientsStopped: boolean,
-	): Promise<boolean> {
+	): Promise<OperationBackupChoice> {
 		return new Promise((resolve) => {
 			new ForceSyncModal(
-				this.app, direction,
-				(action) => resolve(action === "proceed"),
+				this.app,
+				direction,
+				resolve,
 				requireLegacyClientsStopped,
 			).open();
 		});
@@ -1028,14 +1121,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Read-only preflight with actionable presentation of migration blocks. */
 	private async prepareForceSync(): Promise<{
-		canonical: ForceBackupProof["canonical"]; migration: boolean;
+		canonical: ForceBackupProof["canonical"];
+		migration: boolean;
 	} | null> {
 		if (!this.settings.yandexTokenSecret) {
 			this.showBlockingNotice("token-missing", t("notice.token_missing"));
 			return null;
 		}
 		const startupState = await this.refreshRemoteStartupState(true);
-		if (startupState === "blocked") return null;
+		if (startupState === "blocked") {
+			return null;
+		}
 		let canonical: ForceBackupProof["canonical"];
 		try {
 			canonical = await this.indexManager.captureForceCanonicalProof();
@@ -1079,7 +1175,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				);
 				return null;
 			}
-			this.showBlockingNotice("force-preflight",
+			this.showBlockingNotice(
+				"force-preflight",
 				t("notice.force_sync_exception", {
 					message:
 						error instanceof Error ? error.message : String(error),
@@ -1090,28 +1187,54 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		return { canonical, migration: startupState !== "ready" };
 	}
 
+	private async captureForceSnapshot(
+		direction: ForceDirection,
+	): Promise<string> {
+		return direction === "from_local"
+			? (
+					await captureRemoteRawSnapshot(
+						this.yandexClient,
+						this.settings.remotePath,
+					)
+				).digest
+			: (await captureLogicalVaultSnapshot(this.vaultAdapter)).digest;
+	}
+
 	/** Compose the shared Force workflow; the controller owns its lifetime. */
 	getForceSyncController(): ForceSyncController {
 		if (!this.forceSyncController) {
 			this.forceSyncController = new ForceSyncController({
 				isSyncBusy: () => this.isForceSyncUnavailable(),
 				preflight: () => this.prepareForceSync(),
-				confirm: (direction, migration) => this.confirmForceSync(direction, migration),
+				confirm: (direction, migration) =>
+					this.confirmForceSync(direction, migration),
+				captureProtectedSnapshot: (direction) =>
+					this.captureForceSnapshot(direction),
 				readyForBackup: async (migration) =>
-					(!migration || await this.recheckLegacyMigrationSafety()) &&
-					await this.ensureEncryptionReady({ prompt: true }),
-				backup: (direction, progress) => direction === "from_local"
-					? this.backupManager.createRemoteSnapshotBackup(undefined, progress)
-					: this.backupManager.createBackup(undefined, progress),
+					(!migration ||
+						(await this.recheckLegacyMigrationSafety())) &&
+					(await this.ensureEncryptionReady({ prompt: true })),
+				backup: (direction, progress) =>
+					direction === "from_local"
+						? this.backupManager.createRemoteSnapshotBackup(
+								undefined,
+								progress,
+							)
+						: this.backupManager.createBackup(undefined, progress),
 				beforeMutation: async (migration) => {
-					if (migration && !(await this.recheckLegacyMigrationSafety())) {
-						throw new Error("Legacy migration safety changed before Force cutover");
+					if (
+						migration &&
+						!(await this.recheckLegacyMigrationSafety())
+					) {
+						throw new Error(
+							"Legacy migration safety changed before Force cutover",
+						);
 					}
-					await this.completeStableLocalCutover();
 				},
-				run: (direction, options) => direction === "from_local"
-					? this.syncEngine.forceSyncFromLocal(options)
-					: this.syncEngine.forceSyncFromRemote(options),
+				run: (direction, options) =>
+					direction === "from_local"
+						? this.syncEngine.forceSyncFromLocal(options)
+						: this.syncEngine.forceSyncFromRemote(options),
 				persist: async (result) => {
 					this.updateLastSyncStats(result);
 					await this.persistPluginData();
@@ -1121,8 +1244,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.remoteStateValidated = false;
 				},
 				reconcile: async (onActivity) => {
-					const result = await this.runFullSync({ onActivity }, false, true);
-					if (result?.success) {
+					const result = await this.runFullSync(
+						{ onActivity },
+						false,
+						true,
+					);
+					if (
+						result?.success &&
+						!this.unloaded &&
+						!this.syncEngine.isSyncPaused()
+					) {
 						this.regularSyncStarted = true;
 						this.fileWatcher.start();
 						this.syncScheduler.start();
@@ -1132,9 +1263,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				hasPendingCleanup: () =>
 					this.indexManager.getPendingPhysicalActions().length > 0 ||
 					this.indexManager.getMaintenance() !== undefined,
-				reportError: (error) => logger.error("Force workflow failed", { error }),
+				reportError: (error) =>
+					logger.error("Force workflow failed", { error }),
 			});
-			this.forceSyncController.subscribe((state) => this.renderForceProgress(state));
+			this.forceSyncController.subscribe((state) =>
+				this.renderForceProgress(state),
+			);
 		}
 		return this.forceSyncController;
 	}
@@ -1144,28 +1278,44 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	isForceSyncUnavailable(): boolean {
-		return this.isForceSyncBusy() || Boolean(this.activeManualFullPromise) || this.syncEngine.isSyncInProgress();
+		return Boolean(
+			this.isConfigurationBusy() ||
+			this.encryptionTransition ||
+			this.settingsPersistenceFailed ||
+			this.unloaded,
+		);
 	}
 
 	/** Subscribe without exposing synchronization internals to settings. */
 	onSyncActivityChange(callback: () => void): () => void {
 		this.manualActivityListeners.add(callback);
 		const unsubscribe = this.syncEngine.onStateChange(callback);
-		return () => { unsubscribe(); this.manualActivityListeners.delete(callback); };
+		return () => {
+			unsubscribe();
+			this.manualActivityListeners.delete(callback);
+		};
 	}
 
 	private notifyManualActivity(): void {
 		for (const callback of this.manualActivityListeners ?? []) {
-			try { callback(); }
-			catch (error) { logger.warn("Manual activity presentation failed", { error }); }
+			try {
+				callback();
+			} catch (error) {
+				logger.warn("Manual activity presentation failed", { error });
+			}
 		}
 	}
 
 	/** Keep one foreground Notice across backup, Force, persistence and full reconciliation. */
 	private renderForceProgress(state: ForceFlowState): void {
 		if (state.active) {
-			if (state.outcome) return;
-			const notice = this.beginSyncNotice(formatForceActivity(state), false);
+			if (state.outcome) {
+				return;
+			}
+			const notice = this.beginSyncNotice(
+				formatForceActivity(state),
+				false,
+			);
 			notice.setMessage(formatForceActivity(state));
 			return;
 		}
@@ -1177,9 +1327,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.disposeSyncNotice();
 			return;
 		}
-		if (state.outcome === "success") this.clearBlockingNotice();
+		if (state.outcome === "success") {
+			this.clearBlockingNotice();
+		}
 		this.beginSyncNotice(formatForceResult(state), false);
-		this.finishSyncNotice(formatForceResult(state), state.outcome === "success" ? 8000 : 0);
+		this.finishSyncNotice(
+			formatForceResult(state),
+			state.outcome === "success" ? 8000 : 0,
+		);
 	}
 
 	private async recheckLegacyMigrationSafety(): Promise<boolean> {
@@ -1206,7 +1361,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				return false;
 			}
 			logger.warn("Legacy migration safety recheck failed", { error });
-			this.showBlockingNotice("force-preflight",
+			this.showBlockingNotice(
+				"force-preflight",
 				t("notice.force_sync_exception", {
 					message:
 						error instanceof Error ? error.message : String(error),
@@ -1229,8 +1385,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Start regular synchronization
 	 */
-	private async startSync(startup = false, remoteReady = false): Promise<void> {
-		if (this.isForceSyncBusy()) return;
+	private async startSync(
+		startup = false,
+		remoteReady = false,
+	): Promise<void> {
+		if (
+			this.isConfigurationBusy() ||
+			this.unloaded ||
+			this.settingsPersistenceFailed ||
+			this.syncEngine.isSyncPaused()
+		) {
+			return;
+		}
 		if (this.regularSyncStarted) {
 			logger.debug("[Main] Regular synchronization already started");
 			return;
@@ -1241,39 +1407,46 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			return;
 		}
-		this.regularSyncStarted = true;
-		logger.info("[Main] Starting regular synchronization");
-
-		// Start file watcher
-		logger.info("[Main] Starting file watcher");
-		this.fileWatcher.start();
-
-		// Start scheduler
-		logger.info("[Main] Starting sync scheduler");
-		this.syncScheduler.start();
-
-		logger.info("[Main] Synchronization started");
-
-		// Run initial sync immediately to check for changes
-		logger.info("[Main] Running initial sync check");
-		// FileWatcher will be automatically paused by sync engine callbacks
+		if (
+			this.unloaded ||
+			this.isConfigurationBusy() ||
+			this.syncEngine.isSyncPaused()
+		) {
+			return;
+		}
+		const result = await this.runFullSync(
+			startup ? { startup: true } : undefined,
+			false,
+		);
+		if (
+			!result?.success ||
+			this.unloaded ||
+			this.syncEngine.isSyncPaused()
+		) {
+			return;
+		}
 		if (startup) {
-			const result = await this.runFullSync({ startup: true });
 			const maintenance = this.indexManager.getMaintenance();
 			const hasGuardedCleanup = this.indexManager
 				.getPendingPhysicalActions()
 				.some((action) => action.type === "guarded-cleanup");
-			if (
-				result?.success &&
-				(maintenance?.phase === "cleanup" || hasGuardedCleanup)
-			) {
+			if (maintenance?.phase === "cleanup" || hasGuardedCleanup) {
 				await this.syncEngine.runExclusiveMaintenance(async () => {
 					await this.requireCanonicalMaintenanceCleanupComplete();
 				});
 			}
+		}
+		if (
+			this.unloaded ||
+			this.isConfigurationBusy() ||
+			this.syncEngine.isSyncPaused()
+		) {
 			return;
 		}
-		await this.runFullSync(undefined, false);
+		this.fileWatcher.start();
+		this.syncScheduler.start();
+		this.regularSyncStarted = true;
+		logger.info("[Main] Synchronization started");
 	}
 
 	/**
@@ -1292,10 +1465,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 		const data = loaded.data;
 		this.loadedPluginData = data;
-		this.stablePluginDataSnapshot = loaded.stableSnapshot;
-		this.stableCutoverPending = loaded.source === "stable-1x";
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
-		if (data?.lastSyncStats) this.lastSyncStats = data.lastSyncStats;
+		if (data?.lastSyncStats) {
+			this.lastSyncStats = data.lastSyncStats;
+		}
 		this.encryptionTransition = data?.encryptionTransition ?? null;
 
 		// Automatically determine path with vault name
@@ -1310,17 +1483,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (
 			loaded.source !== "stable-1x" &&
 			(!saved ||
-			!this.settings.remotePath ||
-			this.settings.remotePath === DEFAULT_SETTINGS.remotePath)
+				!this.settings.remotePath ||
+				this.settings.remotePath === DEFAULT_SETTINGS.remotePath)
 		) {
 			this.settings.remotePath = `${DEFAULT_SETTINGS.remotePath}/${vaultName}`;
-			// Save updated settings
-			try {
-				await this.saveSettings();
-			} catch (error) {
-				this.pluginDataLoaded = false;
-				throw error;
-			}
+		}
+		this.settings.deviceId = this.getInstallationDeviceId();
+		try {
+			await this.persistPluginData();
+		} catch (error) {
+			this.pluginDataLoaded = false;
+			throw error;
 		}
 	}
 
@@ -1333,7 +1506,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const key = `yandex-disk-sync:device-id:${this.getVaultStorageScope()}`;
 		try {
 			const existing = globalThis.localStorage?.getItem(key);
-			if (existing) return existing;
+			if (existing) {
+				return existing;
+			}
 			const created = generateDeviceId();
 			globalThis.localStorage?.setItem(key, created);
 			return created;
@@ -1346,7 +1521,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const adapter = this.app.vault.adapter as unknown as {
 			getBasePath?: () => string;
 		};
-		return adapter.getBasePath?.() || this.app.vault.getName();
+		return adapter?.getBasePath?.() || this.app.vault.getName();
 	}
 
 	private getLegacyExposureStorageKey(): string {
@@ -1404,11 +1579,154 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 	}
 
-	/**
-	 * Save settings
-	 */
+	private configurationUpdatePending = false;
+	private foregroundOperation: "encryption" | "backup" | null = null;
+	private unloaded = false;
+	private settingsPersistenceFailed = false;
+
+	/** Save a validated draft before publishing it to live components. */
+	async applySettingsPatch(patch: UserSettingsPatch): Promise<void> {
+		const draft = prepareSettingsPatch(this.settings, patch);
+		patch = {
+			...patch,
+			...(patch.syncPatterns
+				? { syncPatterns: [...patch.syncPatterns] }
+				: {}),
+			...(patch.excludePatterns
+				? { excludePatterns: [...patch.excludePatterns] }
+				: {}),
+		};
+		const recoveringPersistence = this.settingsPersistenceFailed;
+		const changesScope = draft.changesScope || recoveringPersistence;
+		if (
+			changesScope &&
+			(this.isConfigurationBusy() ||
+				(this.encryptionTransition && draft.changesTransitionScope))
+		) {
+			throw new Error(t("notice.configuration_busy"));
+		}
+		if (draft.changesDestination && this.hasDurableConfigurationWork()) {
+			throw new Error(t("notice.configuration_busy"));
+		}
+		if (changesScope) {
+			this.configurationUpdatePending = true;
+			this.notifyManualActivity();
+			this.stopRegularSync();
+			this.syncEngine?.setExternalBlock(
+				"authentication",
+				t("notice.configuration_busy"),
+			);
+		}
+		try {
+			if (changesScope) {
+				await this.fileWatcher?.waitForPendingPersistence();
+				if (
+					this.syncEngine?.hasPendingWork() ||
+					(draft.changesDestination &&
+						this.hasDurableConfigurationWork())
+				) {
+					throw new Error(t("notice.configuration_busy"));
+				}
+			}
+			await this.persistPluginData(patch);
+			this.settingsPersistenceFailed = false;
+			if (this.unloaded) {
+				return;
+			}
+			if (changesScope) {
+				this.invalidateRemoteStateClassification();
+				const ready = await this.refreshRemoteStartupState(
+					false,
+					false,
+				);
+				if (
+					ready === "ready" &&
+					!this.unloaded &&
+					this.app.workspace.layoutReady &&
+					!this.syncEngine.isSyncPaused()
+				) {
+					if (draft.needsFull || recoveringPersistence) {
+						const result = await this.runFullSync(
+							undefined,
+							false,
+							true,
+						);
+						if (!result?.success) {
+							return;
+						}
+					}
+					if (!this.unloaded && !this.syncEngine.isSyncPaused()) {
+						this.fileWatcher.start();
+						this.syncScheduler.start();
+						this.regularSyncStarted = true;
+					}
+				}
+			}
+		} catch (error) {
+			if (changesScope || this.settingsPersistenceFailed) {
+				this.remoteStateValidated = false;
+				this.setAuthenticationBlock(
+					t("notice.remote_recheck_required"),
+				);
+			}
+			throw error;
+		} finally {
+			if (changesScope) {
+				this.configurationUpdatePending = false;
+				this.notifyManualActivity();
+			}
+		}
+	}
+
+	private hasDurableConfigurationWork(): boolean {
+		return Boolean(
+			this.indexManager?.getPendingMutations().length ||
+			this.indexManager?.getPendingPhysicalActions().length ||
+			this.fileWatcher?.getDeferredEvents().length,
+		);
+	}
+
+	isConfigurationBusy(): boolean {
+		return Boolean(
+			this.configurationUpdatePending ||
+			this.foregroundOperation ||
+			this.isForceSyncBusy() ||
+			this.activeManualFullPromise ||
+			this.activeFullRuns ||
+			this.syncEngine?.hasPendingWork(),
+		);
+	}
+
+	/** Reserve manual preflight through completion without nesting coordinator sessions. */
+	private async withForegroundOperation<T>(
+		kind: "encryption" | "backup",
+		operation: () => Promise<T>,
+	): Promise<T> {
+		this.assertForceIdle();
+		if (
+			this.isConfigurationBusy() ||
+			this.unloaded ||
+			this.settingsPersistenceFailed
+		) {
+			throw new Error(t("notice.configuration_busy"));
+		}
+		this.foregroundOperation = kind;
+		this.notifyManualActivity();
+		try {
+			return await operation();
+		} finally {
+			this.foregroundOperation = null;
+			this.notifyManualActivity();
+		}
+	}
+
 	async saveSettings(): Promise<void> {
 		this.assertPluginDataLoaded();
+		this.publishSettingsToComponents();
+		await this.persistPluginData();
+	}
+
+	private publishSettingsToComponents(): void {
 		const tokenChanged =
 			this.configuredToken !== null &&
 			this.configuredToken !== this.settings.yandexTokenSecret;
@@ -1467,8 +1785,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.configuredToken = this.settings.yandexTokenSecret;
 			this.configuredRemotePath = this.settings.remotePath;
 		}
-
-		await this.persistPluginData();
 	}
 
 	// ============================================================================
@@ -1514,22 +1830,41 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Enable encryption or connect to an already encrypted remote vault.
 	 */
 	async enableEncryption(password: string): Promise<void> {
-		this.assertForceIdle();
-		this.assertStableCutoverComplete();
-		this.beginSyncNotice(t("notice.encryption_syncing"));
-		try {
-			await this.syncEngine.runExclusiveMaintenance(async () => {
-				await this.enableEncryptionNow(password);
-			});
-			this.clearBlockingNotice();
-			this.finishSyncNotice(t("notice.encryption_enabled"), 5000);
-		} catch (error) {
-			this.finishEncryptionError(error);
-			throw error;
-		}
+		return await this.withForegroundOperation("encryption", async () => {
+			this.assertForceIdle();
+			if (this.migrationBlockReason) {
+				throw new LegacyIndexFormatError();
+			}
+			const manifest =
+				await this.indexManager.downloadEncryptionManifest();
+			const choice = manifest
+				? undefined
+				: await this.confirmOperationBackup();
+			if (choice === "cancel") {
+				return;
+			}
+			if (this.unloaded) {
+				throw new Error("Plugin was unloaded");
+			}
+			this.beginSyncNotice(t("notice.encryption_syncing"));
+			try {
+				await this.syncEngine.runExclusiveMaintenance(async () => {
+					await this.enableEncryptionNow(password, choice);
+				});
+				await this.restoreAutomationAfterEncryption();
+				this.clearBlockingNotice();
+				this.finishSyncNotice(t("notice.encryption_enabled"), 5000);
+			} catch (error) {
+				this.finishEncryptionError(error);
+				throw error;
+			}
+		});
 	}
 
-	private async enableEncryptionNow(password: string): Promise<void> {
+	private async enableEncryptionNow(
+		password: string,
+		choice?: OperationBackupChoice,
+	): Promise<void> {
 		const remoteManifest =
 			await this.indexManager.downloadEncryptionManifest();
 		if (remoteManifest) {
@@ -1538,10 +1873,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		await this.runEncryptionPreflight();
-		const backupProof =
-			await this.createMandatoryEncryptionBackup(password);
-		const sourceFiles =
-			await this.indexManager.getRemoteRawFileSnapshots();
+		const backupProof = await this.createSelectedEncryptionBackup(
+			choice,
+			password,
+		);
+		const sourceFiles = await this.indexManager.getRemoteRawFileSnapshots();
 		const oldRawPaths = sourceFiles.map((file) => file.path);
 		const source = this.captureEncryptionSnapshot();
 		const saltBytes = EncryptionService.generateSalt();
@@ -1566,14 +1902,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			),
 			backupProof,
 		);
-		const publishEnablingManifest =
-			this.createEncryptionManifestPublisher(
-				service,
-				saltBase64,
-				"enabling",
-				revision,
-				transition,
-			);
+		const publishEnablingManifest = this.createEncryptionManifestPublisher(
+			service,
+			saltBase64,
+			"enabling",
+			revision,
+			transition,
+		);
 
 		logger.info("Re-uploading all files with encryption...");
 		await this.encryptionTransitionController.execute({
@@ -1598,29 +1933,48 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	async disableEncryption(options?: {
 		reuploadPlaintext?: boolean;
 	}): Promise<{ hadErrors: boolean }> {
-		this.assertForceIdle();
-		this.assertStableCutoverComplete();
-		this.beginSyncNotice(t("notice.encryption_disabling"));
-		try {
-			const result = await this.syncEngine.runExclusiveMaintenance(
-				async () => this.disableEncryptionNow(options),
-			);
-			this.finishSyncNotice(
-				result.hadErrors
-					? t("notice.encryption_disable_partial")
-					: t("notice.encryption_disabled"),
-				result.hadErrors ? 10000 : 5000,
-			);
-			return result;
-		} catch (error) {
-			this.finishEncryptionError(error);
-			throw error;
-		}
+		return await this.withForegroundOperation("encryption", async () => {
+			this.assertForceIdle();
+			if (this.migrationBlockReason) {
+				throw new LegacyIndexFormatError();
+			}
+			const choice = options?.reuploadPlaintext
+				? await this.confirmOperationBackup()
+				: undefined;
+			if (choice === "cancel") {
+				return { hadErrors: false };
+			}
+			if (this.unloaded) {
+				throw new Error("Plugin was unloaded");
+			}
+			this.beginSyncNotice(t("notice.encryption_disabling"));
+			try {
+				const result = await this.syncEngine.runExclusiveMaintenance(
+					async () => this.disableEncryptionNow(options, choice),
+				);
+				if (!result.hadErrors) {
+					await this.restoreAutomationAfterEncryption();
+				}
+				this.finishSyncNotice(
+					result.hadErrors
+						? t("notice.encryption_disable_partial")
+						: t("notice.encryption_disabled"),
+					result.hadErrors ? 10000 : 5000,
+				);
+				return result;
+			} catch (error) {
+				this.finishEncryptionError(error);
+				throw error;
+			}
+		});
 	}
 
-	private async disableEncryptionNow(options?: {
-		reuploadPlaintext?: boolean;
-	}): Promise<{ hadErrors: boolean }> {
+	private async disableEncryptionNow(
+		options?: {
+			reuploadPlaintext?: boolean;
+		},
+		choice?: OperationBackupChoice,
+	): Promise<{ hadErrors: boolean }> {
 		let partialErrors = false;
 
 		if (options?.reuploadPlaintext) {
@@ -1634,8 +1988,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (!backupPassword) {
 				throw new Error(t("notice.encryption_password_required"));
 			}
-			const backupProof =
-				await this.createMandatoryEncryptionBackup(backupPassword);
+			const backupProof = await this.createSelectedEncryptionBackup(
+				choice,
+				backupPassword,
+			);
 			const source = this.captureEncryptionSnapshot();
 			const sourceService = this.encryptionService;
 			// Capture encrypted paths while service is still active
@@ -1655,10 +2011,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				target,
 				oldRawPaths,
 				Object.fromEntries(
-					sourceFiles.map((file) => [
-						file.path,
-						file.fingerprint,
-					]),
+					sourceFiles.map((file) => [file.path, file.fingerprint]),
 				),
 				backupProof,
 			);
@@ -1683,7 +2036,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					publishIndexCommitted: publishDisablingManifest,
 				});
 			} catch (error) {
-				logger.warn("Encryption disable rolled back:", {
+				logger.warn("Encryption disable did not complete:", {
 					error,
 				});
 				partialErrors = true;
@@ -1741,25 +2094,38 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Rotate the encryption password and re-upload all files with a new key.
 	 */
 	async rotateEncryptionPassword(newPassword: string): Promise<void> {
-		this.assertForceIdle();
-		this.assertStableCutoverComplete();
-		this.beginSyncNotice(t("notice.encryption_password_rotating"));
-		try {
-			await this.syncEngine.runExclusiveMaintenance(async () => {
-				await this.rotateEncryptionPasswordNow(newPassword);
-			});
-			this.finishSyncNotice(
-				t("notice.encryption_password_changed"),
-				5000,
-			);
-		} catch (error) {
-			this.finishEncryptionError(error);
-			throw error;
-		}
+		return await this.withForegroundOperation("encryption", async () => {
+			this.assertForceIdle();
+			if (this.migrationBlockReason) {
+				throw new LegacyIndexFormatError();
+			}
+			const choice = await this.confirmOperationBackup();
+			if (choice === "cancel") {
+				return;
+			}
+			if (this.unloaded) {
+				throw new Error("Plugin was unloaded");
+			}
+			this.beginSyncNotice(t("notice.encryption_password_rotating"));
+			try {
+				await this.syncEngine.runExclusiveMaintenance(async () => {
+					await this.rotateEncryptionPasswordNow(newPassword, choice);
+				});
+				await this.restoreAutomationAfterEncryption();
+				this.finishSyncNotice(
+					t("notice.encryption_password_changed"),
+					5000,
+				);
+			} catch (error) {
+				this.finishEncryptionError(error);
+				throw error;
+			}
+		});
 	}
 
 	private async rotateEncryptionPasswordNow(
 		newPassword: string,
+		choice?: OperationBackupChoice,
 	): Promise<void> {
 		const currentManifest =
 			await this.indexManager.downloadEncryptionManifest();
@@ -1776,12 +2142,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		await this.runEncryptionPreflight();
-		const backupProof =
-			await this.createMandatoryEncryptionBackup(newPassword);
+		const backupProof = await this.createSelectedEncryptionBackup(
+			choice,
+			newPassword,
+		);
 		const source = this.captureEncryptionSnapshot();
 		const sourceService = this.encryptionService;
-		const sourceFiles =
-			await this.indexManager.getRemoteRawFileSnapshots();
+		const sourceFiles = await this.indexManager.getRemoteRawFileSnapshots();
 		const oldRawPaths = sourceFiles.map((file) => file.path);
 		const saltBytes = EncryptionService.generateSalt();
 		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
@@ -1809,14 +2176,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			),
 			backupProof,
 		);
-		const publishRotatingManifest =
-			this.createEncryptionManifestPublisher(
-				service,
-				saltBase64,
-				"rotating",
-				revision,
-				transition,
-			);
+		const publishRotatingManifest = this.createEncryptionManifestPublisher(
+			service,
+			saltBase64,
+			"rotating",
+			revision,
+			transition,
+		);
 		logger.info(
 			"Re-uploading all files after encryption password rotation...",
 		);
@@ -1844,8 +2210,34 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		password: string,
 		manifest?: RemoteEncryptionManifest,
 	): Promise<void> {
-		this.assertForceIdle();
-		await this.connectToRemoteEncryptionForSync(password, manifest);
+		await this.withForegroundOperation("encryption", async () => {
+			await this.connectToRemoteEncryptionForSync(password, manifest);
+			await this.restoreAutomationAfterEncryption();
+		});
+	}
+
+	/** Reconcile before restarting automation stopped by an encryption block. */
+	private async restoreAutomationAfterEncryption(): Promise<void> {
+		if (
+			this.regularSyncStarted ||
+			this.unloaded ||
+			this.encryptionTransition ||
+			!this.app.workspace.layoutReady ||
+			this.syncEngine.isSyncPaused()
+		) {
+			return;
+		}
+		const result = await this.runFullSync(undefined, false, true);
+		if (
+			!result?.success ||
+			this.unloaded ||
+			this.syncEngine.isSyncPaused()
+		) {
+			return;
+		}
+		this.fileWatcher.start();
+		this.syncScheduler.start();
+		this.regularSyncStarted = true;
 	}
 
 	/** Authenticate/recover as part of an admitted sync flow using the existing maintenance queue. */
@@ -1853,15 +2245,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		password: string,
 		manifest?: RemoteEncryptionManifest,
 	): Promise<void> {
-		this.assertStableCutoverComplete();
+		if (this.migrationBlockReason) {
+			throw new LegacyIndexFormatError();
+		}
 		await this.syncEngine.runExclusiveMaintenance(async () => {
 			await this.connectToRemoteEncryptionNow(password, manifest);
 		});
 	}
 
-	/** Return whether stable local storage is still rollback-compatible. */
+	/** Return whether the remote still requires explicit migration. */
 	isStableMigrationPending(): boolean {
-		return this.stableCutoverPending;
+		return Boolean(this.migrationBlockReason);
 	}
 
 	private async connectToRemoteEncryptionNow(
@@ -1877,10 +2271,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.encryptionManager.getManifestProfileId(remoteManifest);
 		const activeCodecMatchesCandidate = Boolean(
 			this.encryptionService &&
-				this.settings.enableEncryption &&
-				this.settings.encryptionSalt === remoteManifest.salt &&
-				this.settings.encryptionPassword === password &&
-				this.settings.encryptionProfileId === profileId,
+			this.settings.enableEncryption &&
+			this.settings.encryptionSalt === remoteManifest.salt &&
+			this.settings.encryptionPassword === password &&
+			this.settings.encryptionProfileId === profileId,
 		);
 		const candidate = activeCodecMatchesCandidate
 			? this.encryptionService!
@@ -1911,7 +2305,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				verifier: remoteManifest.verifier,
 				validateAuthority: async () => {
 					const current =
-						await this.indexManager.readCanonicalIndexWithCodec(candidate);
+						await this.indexManager.readCanonicalIndexWithCodec(
+							candidate,
+						);
 					await this.encryptionTransitionController.assertStableManifestTarget(
 						remoteManifest,
 						current.maintenance,
@@ -1980,43 +2376,41 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			manifest.transition.id,
 			async () => {
 				await this.indexManager.loadRemoteIndexWithTargetCodec(service);
-				const maintenance = await this.encryptionManager.acceptCandidate({
-					service,
-					verifier: manifest.verifier,
-					validateAuthority: async () =>
-						this.encryptionTransitionController.createRemoteTargetRecoveryPlan(
-							manifest,
-							this.indexManager.getMaintenance(),
-						).maintenance,
-					persist: async () => {
-						await this.applyEncryptionSnapshot({
-							enabled: true,
-							salt: manifest.salt,
-							password,
-							revision: manifest.revision,
-							profileId: "hardened",
-						});
-					},
-				});
+				const maintenance =
+					await this.encryptionManager.acceptCandidate({
+						service,
+						verifier: manifest.verifier,
+						validateAuthority: async () =>
+							this.encryptionTransitionController.createRemoteTargetRecoveryPlan(
+								manifest,
+								this.indexManager.getMaintenance(),
+							).maintenance,
+						persist: async () => {
+							await this.applyEncryptionSnapshot({
+								enabled: true,
+								salt: manifest.salt,
+								password,
+								revision: manifest.revision,
+								profileId: "hardened",
+							});
+						},
+					});
 				if (!maintenance) {
 					throw new Error(t("notice.encryption_remote_busy"));
 				}
-				if (maintenance.phase === "index-committed") {
-					this.indexManager.setMaintenance({
-						...maintenance,
-						phase: "cleanup",
-					});
-					await this.indexManager.saveRemoteIndex();
-				}
-				await this.indexManager.uploadEncryptionManifest(
-					await this.createEncryptionManifest(
-						service,
-						manifest.salt,
-						"enabled",
-						manifest.revision,
-					),
+				await this.encryptionTransitionController.completeRemoteTarget(
+					maintenance,
+					async () =>
+						this.indexManager.uploadEncryptionManifest(
+							await this.createEncryptionManifest(
+								service,
+								manifest.salt,
+								"enabled",
+								manifest.revision,
+							),
+						),
+					() => this.requireCanonicalMaintenanceCleanupComplete(),
 				);
-				await this.requireCanonicalMaintenanceCleanupComplete();
 			},
 		);
 		this.setEncryptionBlock(null);
@@ -2060,7 +2454,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			async () => {
 				this.indexManager.setIndexTransitionServices(null, null);
 				try {
-					await this.indexManager.loadRemoteIndexWithTargetCodec(null);
+					await this.indexManager.loadRemoteIndexWithTargetCodec(
+						null,
+					);
 					const validateCurrent = async () =>
 						this.encryptionTransitionController.createRemoteTargetRecoveryPlan(
 							manifest,
@@ -2095,17 +2491,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					if (!current) {
 						throw new Error(t("notice.encryption_wrong_password"));
 					}
-					if (current.phase === "index-committed") {
-						this.indexManager.setMaintenance({
-							...current,
-							phase: "cleanup",
-						});
-						await this.indexManager.saveRemoteIndex();
-					}
-					if (manifest) {
-						await this.indexManager.deleteEncryptionManifest();
-					}
-					await this.requireCanonicalMaintenanceCleanupComplete();
+					await this.encryptionTransitionController.completeRemoteTarget(
+						current,
+						async () => {
+							if (manifest) {
+								await this.indexManager.deleteEncryptionManifest();
+							}
+						},
+						() => this.requireCanonicalMaintenanceCleanupComplete(),
+					);
 				} finally {
 					this.indexManager.clearIndexTransitionServices();
 				}
@@ -2115,22 +2509,29 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.encryptionStateChangeCallback?.();
 	}
 
-	private async tryRecoverRemoteTargetTransition(): Promise<void> {
+	private async tryRecoverRemoteTargetTransition(): Promise<boolean> {
 		try {
 			const manifest =
 				await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
 				const canonical =
-					await this.indexManager.readCanonicalIndexWithCodecIfPresent(null);
-				if (!canonical?.maintenance) return;
+					await this.indexManager.readCanonicalIndexWithCodecIfPresent(
+						null,
+					);
+				if (!canonical?.maintenance) {
+					return false;
+				}
 				this.encryptionTransitionController.createRemoteTargetRecoveryPlan(
 					null,
 					canonical.maintenance,
 				);
 				await this.syncEngine.runExclusiveMaintenance(async () => {
-					await this.recoverRemotePlaintextTargetTransition(null, null);
+					await this.recoverRemotePlaintextTargetTransition(
+						null,
+						null,
+					);
 				});
-				return;
+				return true;
 			}
 			const password = this.settings.encryptionPassword;
 			if (
@@ -2139,9 +2540,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.settings.encryptionSalt !== manifest.salt ||
 				this.settings.encryptionProfileId !== "hardened"
 			) {
-				return;
+				return false;
 			}
 			await this.connectToRemoteEncryptionForSync(password, manifest);
+			return true;
 		} catch (error) {
 			logger.warn("Target encryption transition recovery is blocked", {
 				error,
@@ -2165,9 +2567,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (!manifest) {
 				if (this.settings.enableEncryption) {
 					const plaintextCanonical =
-						await this.indexManager.readCanonicalIndexWithCodecIfPresent(null);
+						await this.indexManager.readCanonicalIndexWithCodecIfPresent(
+							null,
+						);
 					if (!plaintextCanonical) {
-						this.setEncryptionBlock(t("notice.encryption_remote_busy"));
+						this.setEncryptionBlock(
+							t("notice.encryption_remote_busy"),
+						);
 						return false;
 					}
 					if (plaintextCanonical.maintenance) {
@@ -2175,11 +2581,20 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							null,
 							plaintextCanonical.maintenance,
 						);
-						this.setEncryptionBlock(t("notice.encryption_remote_busy"));
-						if (!options.prompt) return false;
-						await this.syncEngine.runExclusiveMaintenance(async () => {
-							await this.recoverRemotePlaintextTargetTransition(null, null);
-						});
+						this.setEncryptionBlock(
+							t("notice.encryption_remote_busy"),
+						);
+						if (!options.prompt) {
+							return false;
+						}
+						await this.syncEngine.runExclusiveMaintenance(
+							async () => {
+								await this.recoverRemotePlaintextTargetTransition(
+									null,
+									null,
+								);
+							},
+						);
 						return true;
 					}
 					// A readable stable plaintext canonical proves remote disable.
@@ -2195,7 +2610,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 			if (manifest.state !== "enabled") {
 				this.setEncryptionBlock(t("notice.encryption_remote_busy"));
-				if (!options.prompt) return false;
+				if (!options.prompt) {
+					return false;
+				}
 				const recoveryKind =
 					this.encryptionTransitionController.getRemoteTargetRecoveryKind(
 						manifest,
@@ -2262,7 +2679,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		} catch (e) {
 			if (e instanceof UnsupportedHistoricalDataError) {
 				this.setEncryptionBlock(null, false);
-				this.setHistoricalBlock(t("notice.unsupported_historical_data"));
+				this.setHistoricalBlock(
+					t("notice.unsupported_historical_data"),
+				);
 				return false;
 			}
 			const message = e instanceof Error ? e.message : String(e);
@@ -2326,16 +2745,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		try {
-			if (this.stableCutoverPending) {
-				if (manifest.state !== "enabled") {
-					throw new Error(t("notice.encryption_remote_busy"));
-				}
-				await this.syncEngine.runExclusiveMaintenance(async () => {
-					await this.connectToRemoteEncryptionNow(password, manifest);
-				});
-			} else {
-				await this.connectToRemoteEncryptionForSync(password, manifest);
-			}
+			await this.connectToRemoteEncryptionForSync(password, manifest);
 			new Notice(t("notice.encryption_connected"));
 			this.encryptionStateChangeCallback?.();
 			return true;
@@ -2457,7 +2867,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		target: LocalEncryptionSnapshot,
 		sourceRawPaths: string[],
 		sourceFingerprints: Record<string, string>,
-		backupProof: EncryptionBackupProof,
+		backupProof: EncryptionBackupProof | null,
 	): Promise<LocalEncryptionTransition> {
 		const transition: LocalEncryptionTransition = {
 			id: `${this.settings.deviceId}:${kind}:${Date.now().toString(36)}`,
@@ -2494,16 +2904,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			transitionId: shortenDiagnosticValue(transition.id),
 			transitionKind: transition.kind,
 			transitionPhase: phase,
-			sourceCanonicalRevision:
-				transition.sourceCanonicalRevision,
+			sourceCanonicalRevision: transition.sourceCanonicalRevision,
 			sourceEncrypted: transition.source.enabled,
 			targetEncrypted: transition.target.enabled,
 			sourceEncryptionRevision: transition.source.revision,
 			targetEncryptionRevision: transition.target.revision,
 			sourceRawPaths: transition.sourceRawPaths.length,
-			targetRawPaths: Object.keys(
-				transition.targetRawByLogicalPath,
-			).length,
+			targetRawPaths: Object.keys(transition.targetRawByLogicalPath)
+				.length,
 		};
 	}
 
@@ -2513,48 +2921,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		return await this.encryptionManager.createModeDescriptor(snapshot);
 	}
 
-	/** Create and byte-verify a backup of one stable logical vault snapshot. */
-	private async createMandatoryEncryptionBackup(
+	private confirmOperationBackup(): Promise<OperationBackupChoice> {
+		return new Promise((resolve) =>
+			new OperationBackupModal(this.app, resolve).open(),
+		);
+	}
+
+	/** Bind the archive choice to the current canonical source. */
+	private async createSelectedEncryptionBackup(
+		choice: OperationBackupChoice | undefined,
 		password: string,
-	): Promise<EncryptionBackupProof> {
-		for (let attempt = 0; attempt < 2; attempt++) {
-			const before = await this.getLogicalVaultSnapshotDigest();
-			const result = await this.backupManager.createBackup(password);
-			if (
-				!result.success ||
-				!result.backupName ||
-				!result.sha256 ||
-				!result.snapshotDigest
-			) {
-				throw new Error(
-					result.error ?? "Mandatory encryption backup failed",
-				);
-			}
-			const after = await this.getLogicalVaultSnapshotDigest();
-			if (
-				before !== result.snapshotDigest ||
-				result.snapshotDigest !== after
-			) {
-				logger.warn("Vault changed while creating encryption backup", {
-					attempt: attempt + 1,
-				});
-				continue;
-			}
-			const canonical = this.indexManager.getRemoteIndex();
-			return {
-				path: joinPath(
-					this.settings.remotePath,
-					".backup",
-					result.backupName,
-				),
-				sha256: result.sha256,
-				epoch: canonical.epoch,
-				canonicalRevision: canonical.revision,
-				localSnapshotDigest: result.snapshotDigest,
-				createdAt: Date.now(),
-			};
-		}
-		throw new Error("Vault changed during mandatory encryption backup");
+	): Promise<EncryptionBackupProof | null> {
+		return await this.backupManager.createTransitionBackup(
+			choice,
+			password,
+			this.indexManager.getRemoteIndex(),
+		);
 	}
 
 	private async getLogicalVaultSnapshotDigest(): Promise<string> {
@@ -2582,88 +2964,43 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 	}
 
-	/**
-	 * Acquire distributed maintenance only against the revision reconciled by
-	 * the source preflight. A concurrent commit refreshes both the local
-	 * baseline and guarded source fingerprints before retrying.
-	 */
+	/** Claim the selected source revision without silently refreshing its archive. */
 	private async claimEncryptionMaintenance(
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
-		for (let attempt = 0; attempt < 3; attempt++) {
-			const canonical = this.indexManager.getRemoteIndex();
-			transition.sourceCanonicalRevision = canonical.revision;
-			const currentDigest = await this.getLogicalVaultSnapshotDigest();
+		const canonical = await this.indexManager.readCanonicalIndex();
+		if (
+			canonical.revision !== transition.sourceCanonicalRevision ||
+			canonical.epoch !== this.indexManager.getRemoteIndex().epoch ||
+			canonical.maintenance
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Encryption source changed before claim",
+			);
+		}
+		await this.assertTransitionSourceUnchanged(transition);
+		const proof = transition.backupProof;
+		if (proof !== null) {
 			if (
-				!transition.backupProof ||
-				transition.backupProof.epoch !== canonical.epoch ||
-				transition.backupProof.canonicalRevision !== canonical.revision ||
-				transition.backupProof.localSnapshotDigest !== currentDigest
+				proof.epoch !== canonical.epoch ||
+				proof.canonicalRevision !== canonical.revision ||
+				proof.localSnapshotDigest !==
+					(await this.getLogicalVaultSnapshotDigest())
 			) {
-				const backupPassword = transition.target.enabled
-					? transition.target.password
-					: transition.source.password;
-				if (!backupPassword) {
-					throw new Error("Encryption backup password is unavailable");
-				}
-				transition.backupProof =
-					await this.createMandatoryEncryptionBackup(backupPassword);
+				throw new Error(
+					"Encryption backup snapshot changed; start a new operation",
+				);
 			}
-			logger.info("Claiming encryption maintenance ownership", {
-				...this.getEncryptionTransitionLogContext(transition),
-				attempt: attempt + 1,
-				maxAttempts: 3,
-			});
-			try {
-				await this.commitCanonicalMaintenance(
-					transition,
-					"prepared",
+			const backup = await this.yandexClient.downloadStableRawFile(
+				proof.path,
+			);
+			if (!backup || (await computeSha256(backup.raw)) !== proof.sha256) {
+				throw new Error(
+					"Selected encryption backup is missing or changed",
 				);
-				logger.info("Encryption maintenance ownership acquired", {
-					...this.getEncryptionTransitionLogContext(transition),
-					attempt: attempt + 1,
-				});
-				return;
-			} catch (error) {
-				if (
-					!(error instanceof RemoteIndexConcurrentModificationError) ||
-					attempt === 2
-				) {
-					throw error;
-				}
-				logger.warn(
-					"Canonical changed before maintenance claim; repeating preflight",
-					{
-						...this.getEncryptionTransitionLogContext(
-							transition,
-						),
-						attempt: attempt + 1,
-						error,
-					},
-				);
-				await this.runEncryptionPreflight();
-				const backupPassword = transition.target.enabled
-					? transition.target.password
-					: transition.source.password;
-				if (!backupPassword) {
-					throw new Error("Encryption backup password is unavailable");
-				}
-				transition.backupProof =
-					await this.createMandatoryEncryptionBackup(backupPassword);
-				const sourceFiles =
-					await this.indexManager.getRemoteRawFileSnapshots();
-				transition.sourceRawPaths = sourceFiles.map(
-					(file) => file.path,
-				);
-				transition.sourceFingerprints = Object.fromEntries(
-					sourceFiles.map((file) => [
-						file.path,
-						file.fingerprint,
-					]),
-				);
-				await this.saveSettings();
 			}
 		}
+		await this.commitCanonicalMaintenance(transition, "prepared");
 	}
 
 	private async stageCanonicalMaintenance(
@@ -2682,19 +3019,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				phase === "index-committed" ||
 				phase === "cleanup" ||
 				phase === "stable"
-					? existing?.targetRevision ??
-						this.indexManager.getRemoteIndex().revision + 1
+					? (existing?.targetRevision ??
+						this.indexManager.getRemoteIndex().revision + 1)
 					: null,
 			source:
 				existing?.source ??
-				(await this.createEncryptionModeDescriptor(
-					transition.source,
-				)),
+				(await this.createEncryptionModeDescriptor(transition.source)),
 			target:
 				existing?.target ??
-				(await this.createEncryptionModeDescriptor(
-					transition.target,
-				)),
+				(await this.createEncryptionModeDescriptor(transition.target)),
 			cleanup,
 		};
 		this.indexManager.setMaintenance(maintenance);
@@ -2719,8 +3052,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.setEncryptionTransitionPhase(phase);
 		logger.info("Encryption maintenance phase committed", {
 			...this.getEncryptionTransitionLogContext(transition, phase),
-			canonicalRevision:
-				this.indexManager.getRemoteIndex().revision,
+			canonicalRevision: this.indexManager.getRemoteIndex().revision,
 			cleanupActions: cleanup.length,
 		});
 	}
@@ -2734,12 +3066,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.indexManager.clearMaintenance(transition.id);
 		await this.indexManager.saveRemoteIndex();
 		logger.info("Canonical encryption maintenance finished", {
-			...this.getEncryptionTransitionLogContext(
-				transition,
-				"stable",
-			),
-			canonicalRevision:
-				this.indexManager.getRemoteIndex().revision,
+			...this.getEncryptionTransitionLogContext(transition, "stable"),
+			canonicalRevision: this.indexManager.getRemoteIndex().revision,
 		});
 	}
 
@@ -2765,7 +3093,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private async setEncryptionTransitionPhase(
 		phase: EncryptionTransitionPhase,
 	): Promise<void> {
-		if (!this.encryptionTransition) return;
+		if (!this.encryptionTransition) {
+			return;
+		}
 		const previousPhase = this.encryptionTransition.phase;
 		this.encryptionTransition.phase = phase;
 		await this.saveSettings();
@@ -2814,7 +3144,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	): Promise<PhysicalRewriteUploadProof | null> {
 		const rawPath = transition.targetRawByLogicalPath[logicalPath];
 		if (!rawPath) {
-			throw new Error(`Transition target mapping is missing for ${logicalPath}`);
+			throw new Error(
+				`Transition target mapping is missing for ${logicalPath}`,
+			);
 		}
 		if (transition.target.enabled !== Boolean(targetService)) {
 			throw new Error("Transition target codec does not match its mode");
@@ -2842,13 +3174,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			targetService,
 		);
 		if (decodedPath !== logicalPath) {
-			throw new Error(`Transition target decodes to a different logical path`);
+			throw new Error(
+				`Transition target decodes to a different logical path`,
+			);
 		}
 		const plaintext = targetService
 			? await targetService.decrypt(snapshot.raw)
 			: snapshot.raw;
 		if ((await computeSha256(plaintext)) !== expectedSha256) {
-			throw new Error(`Transition target content does not match ${logicalPath}`);
+			throw new Error(
+				`Transition target content does not match ${logicalPath}`,
+			);
 		}
 		Object.defineProperty(transition.targetFingerprints, rawPath, {
 			value: snapshot.fingerprint,
@@ -2867,13 +3203,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private async assertTransitionSourceUnchanged(
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
-		const snapshots =
-			await this.indexManager.getRemoteRawFileSnapshots();
+		const snapshots = await this.indexManager.getRemoteRawFileSnapshots();
 		const current = new Map(
-			snapshots.map((snapshot) => [
-				snapshot.path,
-				snapshot.fingerprint,
-			]),
+			snapshots.map((snapshot) => [snapshot.path, snapshot.fingerprint]),
 		);
 		for (const sourcePath of transition.sourceRawPaths) {
 			if (
@@ -2934,7 +3266,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private async recoverEncryptionTransition(): Promise<void> {
 		const transition = this.encryptionTransition;
-		if (!transition) return;
+		if (!transition) {
+			return;
+		}
 		// Recovery may upload a stable manifest or resume cleanup, so reject
 		// unsupported remote metadata before deciding either direction.
 		const manifest = await this.indexManager.downloadEncryptionManifest();
@@ -2970,37 +3304,45 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			await this.applyEncryptionSnapshot(transition.target);
 			await this.indexManager.loadRemoteIndex();
 			const maintenance = this.indexManager.getMaintenance();
-			await this.encryptionTransitionController.assertLocalRecoveryCoherence({
-				transition,
-				manifest,
-				maintenance,
-				deviceId: this.settings.deviceId,
-				authority: "target",
-				authoritativeService: this.encryptionService,
-			});
+			await this.encryptionTransitionController.assertLocalRecoveryCoherence(
+				{
+					transition,
+					manifest,
+					maintenance,
+					deviceId: this.settings.deviceId,
+					authority: "target",
+					authoritativeService: this.encryptionService,
+				},
+			);
 			if (!maintenance) {
 				if (this.hasPendingGuardedCleanup()) {
-					throw new Error("Stable encryption recovery still has pending cleanup");
+					throw new Error(
+						"Stable encryption recovery still has pending cleanup",
+					);
 				}
 				this.encryptionTransition = null;
 				await this.saveSettings();
 				this.setEncryptionBlock(null);
 				return;
 			}
-			await this.encryptionTransitionController.completeTarget(transition);
+			await this.encryptionTransitionController.completeTarget(
+				transition,
+			);
 			return;
 		} else {
 			await this.applyEncryptionSnapshot(transition.source);
 			await this.indexManager.loadRemoteIndex();
 			const maintenance = this.indexManager.getMaintenance();
-			await this.encryptionTransitionController.assertLocalRecoveryCoherence({
-				transition,
-				manifest,
-				maintenance,
-				deviceId: this.settings.deviceId,
-				authority: "source",
-				authoritativeService: this.encryptionService,
-			});
+			await this.encryptionTransitionController.assertLocalRecoveryCoherence(
+				{
+					transition,
+					manifest,
+					maintenance,
+					deviceId: this.settings.deviceId,
+					authority: "source",
+					authoritativeService: this.encryptionService,
+				},
+			);
 			let targetService: EncryptionCodec | null = null;
 			if (transition.target.enabled) {
 				if (
@@ -3008,7 +3350,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					!transition.target.salt ||
 					!transition.target.password
 				) {
-					throw new Error("Encrypted transition target is incomplete");
+					throw new Error(
+						"Encrypted transition target is incomplete",
+					);
 				}
 				targetService = await this.encryptionManager.createCodec(
 					transition.target.profileId,
@@ -3019,7 +3363,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			for (const logicalPath of Object.keys(
 				transition.targetRawByLogicalPath,
 			)) {
-				const metadata = this.indexManager.getRemoteIndex().files[logicalPath];
+				const metadata =
+					this.indexManager.getRemoteIndex().files[logicalPath];
 				if (!metadata || metadata.deleted) {
 					throw new Error(
 						`Transition target has no authoritative logical metadata for ${logicalPath}`,
@@ -3040,6 +3385,22 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					typeof transition.targetFingerprints[path] === "string" &&
 					transition.targetFingerprints[path].length > 0,
 			);
+			if (rollbackPaths.length > 0) {
+				if (!maintenance) {
+					throw new Error(
+						"Rollback cleanup has no canonical authority",
+					);
+				}
+				await this.commitCanonicalMaintenance(
+					transition,
+					maintenance.phase,
+					rollbackPaths.map((path) => ({
+						path,
+						expectedFingerprint:
+							transition.targetFingerprints[path]!,
+					})),
+				);
+			}
 			await this.prepareGuardedCleanup(
 				rollbackPaths,
 				transition.targetFingerprints,
@@ -3058,7 +3419,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						transition,
 					))
 				) {
-					throw new Error("Encryption rollback cleanup is incomplete");
+					throw new Error(
+						"Encryption rollback cleanup is incomplete",
+					);
 				}
 			} else if (this.hasPendingGuardedCleanup()) {
 				throw new Error("Encryption rollback cleanup is incomplete");
@@ -3136,79 +3499,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private async deleteRemoteRawPaths(
 		paths: string[],
-		expectedFingerprints?: Record<string, string>,
+		expectedFingerprints: Record<string, string> = {},
 	): Promise<void> {
-		if (paths.length === 0) {
-			return;
-		}
-
-		const transitionContext = this.encryptionTransition
-			? this.getEncryptionTransitionLogContext(
-					this.encryptionTransition,
-				)
-			: {};
-		logger.info(`Cleaning up ${paths.length} old remote files...`, {
-			...transitionContext,
-			cleanupActions: paths.length,
-		});
-		for (const path of paths) {
-			try {
-				const remotePath = joinPath(this.settings.remotePath, path);
-				const expected = expectedFingerprints?.[path];
-				if (expectedFingerprints) {
-					if (typeof expected !== "string" || !expected) {
-						logger.warn("Blocked encryption cleanup without a fingerprint", {
-							...transitionContext,
-							path,
-						});
-						continue;
-					}
-					const resource = await this.yandexClient.getResource(
-						remotePath,
-						1,
-						0,
-						true,
-					);
-					if (!resource) {
-						this.completeGuardedCleanup(path);
-						logger.info("Guarded encryption cleanup already complete", {
-							...transitionContext,
-							path,
-							expectedFingerprint:
-								shortenDiagnosticValue(expected),
-						});
-						continue;
-					}
-					const current = getPhysicalResourceFingerprint(resource);
-					if (
-						!matchesPhysicalResourceFingerprint(expected, resource)
-					) {
-						logger.warn("Skipped changed encryption cleanup target", {
-							...transitionContext,
-							path,
-							expectedFingerprint:
-								shortenDiagnosticValue(expected),
-							currentFingerprint:
-								shortenDiagnosticValue(current),
-						});
-						continue;
-					}
-				}
-				await this.yandexClient.deleteResource(remotePath, false, true);
-				this.completeGuardedCleanup(path);
-				logger.info("Guarded encryption cleanup confirmed", {
-					...transitionContext,
-					path,
-					expectedFingerprint:
-						shortenDiagnosticValue(expected),
-				});
-			} catch (e) {
-				logger.warn(`Failed to delete old remote file ${path}:`, {
-					error: e,
-				});
-			}
-		}
-		await this.saveSettings();
+		await this.encryptionTransitionController.cleanupRawPaths(
+			paths,
+			expectedFingerprints,
+		);
 	}
 
 	private async prepareGuardedCleanup(
@@ -3225,17 +3521,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 		for (const path of paths) {
 			const expectedFingerprint = fingerprints[path];
-			if (typeof expectedFingerprint !== "string" || !expectedFingerprint) {
+			if (
+				typeof expectedFingerprint !== "string" ||
+				!expectedFingerprint
+			) {
 				throw new Error(`Missing cleanup fingerprint for ${path}`);
 			}
-			this.indexManager.enqueuePhysicalAction(
-				"guarded-cleanup",
-				path,
-				{
-					expectedFingerprint,
-					origin: "encryption-cleanup",
-				},
-			);
+			this.indexManager.enqueuePhysicalAction("guarded-cleanup", path, {
+				expectedFingerprint,
+				origin: "encryption-cleanup",
+			});
 		}
 		await this.saveSettings();
 	}
@@ -3245,109 +3540,29 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			"guarded-cleanup",
 			path,
 		);
-		if (action) {
+		if (action?.epoch === this.indexManager.getRemoteIndex().epoch) {
 			this.indexManager.completePhysicalAction(action.id);
 		}
 	}
 
-	private async resumeGuardedCleanupActions(
-		cleanup: IndexMaintenance["cleanup"],
-	): Promise<void> {
-		const expectedByPath = new Map(
-			cleanup.map((action) => [action.path, action.expectedFingerprint]),
-		);
-		const currentEpoch = this.indexManager.getRemoteIndex().epoch;
-		const actions = this.indexManager
-			.getPendingPhysicalActions()
-			.filter(
-				(action) =>
-					action.type === "guarded-cleanup" &&
-					action.epoch === currentEpoch &&
-					action.expectedFingerprint === expectedByPath.get(action.path),
-			);
-		await this.deleteRemoteRawPaths(
-			actions.map((action) => action.path),
-			Object.fromEntries(
-				actions.flatMap((action) =>
-					action.expectedFingerprint
-						? [[action.path, action.expectedFingerprint]]
-						: [],
-				),
-			),
-		);
-	}
-
 	private async requireCanonicalMaintenanceCleanupComplete(): Promise<void> {
-		if (await this.resumeCanonicalMaintenanceCleanup()) return;
+		if (await this.resumeCanonicalMaintenanceCleanup()) {
+			return;
+		}
 		this.setEncryptionBlock(t("notice.encryption_remote_busy"));
 		throw new Error("Encryption cleanup is incomplete");
 	}
 
 	private async resumeCanonicalMaintenanceCleanup(): Promise<boolean> {
-		const maintenance = this.indexManager.getMaintenance();
-		if (!maintenance || maintenance.phase !== "cleanup") return true;
-		for (const cleanup of maintenance.cleanup) {
-			this.indexManager.enqueuePhysicalAction(
-				"guarded-cleanup",
-				cleanup.path,
-				{
-					expectedFingerprint: cleanup.expectedFingerprint,
-					origin: "encryption-cleanup",
-					canonicalRevision:
-						this.indexManager.getRemoteIndex().revision,
-				},
-			);
-		}
-		await this.resumeGuardedCleanupActions(maintenance.cleanup);
-		await this.deleteRemoteRawFolders(
-			maintenance.cleanup.map((cleanup) => cleanup.path),
-		);
-		const stillPending = this.hasPendingGuardedCleanup();
-		if (!stillPending) {
-			this.indexManager.clearMaintenance(maintenance.id);
-			await this.indexManager.saveRemoteIndex();
-		}
-		await this.saveSettings();
-		return !stillPending;
+		return await this.encryptionTransitionController.resumeCanonicalCleanup();
 	}
 
-	/**
-	 * Delete remote folders that were parents of the given raw file paths.
-	 * Used during encryption enable/rotate where the remote index already
-	 * reflects the new key and cannot be used to verify emptiness. Since
-	 * deleteRemoteRawPaths removed all files beforehand, the folders are
-	 * guaranteed to be empty. Deletes deepest first so children are gone
-	 * before parents are attempted.
-	 */
 	private async deleteRemoteRawFolders(
 		rawFilePaths: string[],
 	): Promise<void> {
-		if (rawFilePaths.length === 0) return;
-
-		const sorted = getAncestorDirectoriesDeepestFirst(rawFilePaths);
-		if (sorted.length === 0) return;
-
-		logger.info(`Cleaning up ${sorted.length} old remote folders...`);
-		for (const folder of sorted) {
-			if (isProtectedPath(folder)) {
-				logger.debug(
-					`Skipping protected folder during cleanup: ${folder}`,
-				);
-				continue;
-			}
-			try {
-				const remotePath = joinPath(this.settings.remotePath, folder);
-				if (!(await this.yandexClient.isRawFolderEmpty(remotePath))) {
-					continue;
-				}
-				await this.yandexClient.deleteResource(remotePath, false, true);
-				logger.debug(`Deleted old remote folder: ${folder}`);
-			} catch (e) {
-				logger.warn(`Failed to delete old remote folder ${folder}:`, {
-					error: e,
-				});
-			}
-		}
+		await this.encryptionTransitionController.cleanupRawFolders(
+			rawFilePaths,
+		);
 	}
 
 	/**
@@ -3358,37 +3573,51 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		backupName?: string;
 		error?: string;
 	}> {
-		if (this.isForceSyncBusy()) return { success: false, error: t("notice.force_busy") };
-		if (!this.settings.yandexTokenSecret) {
-			return { success: false, error: t("notice.token_missing") };
-		}
-
-		try {
-			if (!(await this.ensureEncryptionReady({ prompt: true }))) {
-				return {
-					success: false,
-					error:
-						this.encryptionBlockReason ??
-						t("notice.unsupported_historical_data"),
-				};
+		return await this.withForegroundOperation("backup", async () => {
+			if (this.isForceSyncBusy()) {
+				return { success: false, error: t("notice.force_busy") };
 			}
-			new Notice(t("notice.backup_started"));
-			const result = await this.backupManager.createBackup();
+			if (!this.settings.yandexTokenSecret) {
+				return { success: false, error: t("notice.token_missing") };
+			}
 
-			if (result.success && result.backupName) {
-				new Notice(
-					t("notice.backup_completed", { name: result.backupName }),
+			try {
+				if (!(await this.ensureEncryptionReady({ prompt: true }))) {
+					return {
+						success: false,
+						error:
+							this.encryptionBlockReason ??
+							t("notice.unsupported_historical_data"),
+					};
+				}
+				if (this.unloaded) {
+					throw new Error("Plugin was unloaded");
+				}
+				new Notice(t("notice.backup_started"));
+				const result = await this.syncEngine.runExclusiveMaintenance(
+					() => this.backupManager.createBackup(),
 				);
-				return { success: true, backupName: result.backupName };
-			} else {
-				return { success: false, error: result.error };
+
+				if (result.success && result.backupName) {
+					new Notice(
+						t("notice.backup_completed", {
+							name: result.backupName,
+						}),
+					);
+					return { success: true, backupName: result.backupName };
+				} else {
+					return { success: false, error: result.error };
+				}
+			} catch (error) {
+				const errorMessage =
+					error instanceof Error ? error.message : String(error);
+				logger.error("Backup creation failed:", { error });
+				return { success: false, error: errorMessage };
 			}
-		} catch (error) {
-			const errorMessage =
-				error instanceof Error ? error.message : String(error);
-			logger.error("Backup creation failed:", { error });
-			return { success: false, error: errorMessage };
-		}
+		}).catch((error: unknown) => ({
+			success: false,
+			error: error instanceof Error ? error.message : String(error),
+		}));
 	}
 
 	/**
@@ -3438,38 +3667,40 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/** Persist one coherent snapshot of every device-local sync queue. */
-	private async persistPluginData(): Promise<void> {
+	private async persistPluginData(patch?: UserSettingsPatch): Promise<void> {
 		this.assertPluginDataLoaded();
 		const generation = this.pluginDataLoadGeneration;
-		const stableSnapshot = this.stableCutoverPending
-			? this.stablePluginDataSnapshot
-			: null;
-		const stableSettings = stableSnapshot
-			? {
-					...this.settings,
-					syncPatterns: [...this.settings.syncPatterns],
-					excludePatterns: [...this.settings.excludePatterns],
-				}
-			: null;
 		const persistence = this.pluginDataPersistenceTail.then(async () => {
 			this.assertPluginDataLoaded();
 			if (generation !== this.pluginDataLoadGeneration) {
-				throw new Error("Plugin data save was superseded by a new load");
-			}
-			if (stableSnapshot && stableSettings) {
-				const stable = serializeStable1xPluginData(
-					stableSnapshot,
-					stableSettings,
+				throw new Error(
+					"Plugin data save was superseded by a new load",
 				);
-				await this.saveData(stable);
-				if (this.stableCutoverPending) {
-					this.stablePluginDataSnapshot = stable;
-				}
-				return;
 			}
 			const current = this.buildPluginData();
-			await this.saveData(current);
+			if (patch) {
+				current.settings = prepareSettingsPatch(
+					current.settings,
+					patch,
+				).settings;
+			}
+			try {
+				await this.saveData(current);
+			} catch (error) {
+				if (patch) {
+					this.settingsPersistenceFailed = true;
+				}
+				throw error;
+			}
 			this.loadedPluginData = current;
+			if (patch) {
+				// Internal encryption state may advance while a logging draft is saved.
+				this.settings = prepareSettingsPatch(
+					this.settings,
+					patch,
+				).settings;
+				this.publishSettingsToComponents();
+			}
 		});
 		this.pluginDataPersistenceTail = persistence.then(
 			() => undefined,
@@ -3478,82 +3709,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await persistence;
 	}
 
-	/** Persist current plugin-data only after a verified migration boundary. */
-	private async completeStableLocalCutover(): Promise<void> {
-		this.assertPluginDataLoaded();
-		if (!this.stableCutoverPending) return;
-		const snapshot = this.stablePluginDataSnapshot;
-		this.stableCutoverPending = false;
-		this.stablePluginDataSnapshot = null;
-		try {
-			await this.persistPluginData();
-		} catch (error) {
-			this.stableCutoverPending = true;
-			this.stablePluginDataSnapshot = snapshot;
-			throw error;
-		}
-	}
-
 	/** A failed read must never turn defaults or stale memory into persisted data. */
 	private assertPluginDataLoaded(): void {
 		if (!this.pluginDataLoaded) {
-			throw new Error("Plugin data was not successfully loaded; saving is blocked");
-		}
-	}
-
-	/**
-	 * Protect a stable local snapshot before adopting a replacement canonical
-	 * committed by another current device. Startup and Resume remain read-only;
-	 * only an explicit manual Full sync enters this cutover path.
-	 */
-	private async completeStableCurrentAdoption(): Promise<boolean> {
-		const canonicalBefore =
-			await this.indexManager.captureForceCanonicalProof();
-		if (canonicalBefore.state !== "present") return false;
-		const snapshotBefore = await this.getLogicalVaultSnapshotDigest();
-		const backup = await this.backupManager.createBackup();
-		if (
-			!backup.success ||
-			!backup.backupName ||
-			!backup.sha256 ||
-			!backup.snapshotDigest
-		) {
-			new Notice(
-				t("notice.stable_adoption_backup_failed", {
-					message: backup.error ?? "unknown error",
-				}),
-				10000,
+			throw new Error(
+				"Plugin data was not successfully loaded; saving is blocked",
 			);
-			return false;
 		}
-		const [canonicalAfter, snapshotAfter] = await Promise.all([
-			this.indexManager.captureForceCanonicalProof(),
-			this.getLogicalVaultSnapshotDigest(),
-		]);
-		const canonicalStable =
-			canonicalAfter.state === "present" &&
-			canonicalAfter.rawSha256 === canonicalBefore.rawSha256;
-		if (
-			!canonicalStable ||
-			snapshotBefore !== backup.snapshotDigest ||
-			backup.snapshotDigest !== snapshotAfter
-		) {
-			new Notice(t("notice.force_backup_stale"), 10000);
-			return false;
-		}
-		await this.completeStableLocalCutover();
-		this.setMigrationBlock(null);
-		this.remoteStateValidated = true;
-		return true;
 	}
 
 	private assertForceIdle(): void {
-		if (this.isForceSyncBusy()) throw new Error(t("notice.force_busy"));
-	}
-
-	private assertStableCutoverComplete(): void {
-		if (this.stableCutoverPending) {
-			throw new LegacyIndexFormatError();
+		if (this.isForceSyncBusy()) {
+			throw new Error(t("notice.force_busy"));
 		}
 	}
 }

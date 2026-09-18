@@ -6,19 +6,26 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"notice.configuration_busy":
+			"The operation cannot start while synchronization, backup, or recovery work is pending.",
 		"notice.force_busy": "Force synchronization is already in progress.",
 		"notice.force_phase_preflight": "Checking before synchronization…",
-		"notice.force_phase_confirming": "Waiting for Force synchronization confirmation…",
+		"notice.force_phase_confirming":
+			"Waiting for Force synchronization confirmation…",
 		"notice.force_phase_creating-backup": "Creating backup…",
 		"notice.force_phase_uploading-backup": "Uploading backup…",
 		"notice.force_phase_verifying-backup": "Verifying backup…",
 		"notice.force_phase_syncing": "Force synchronization",
 		"notice.force_phase_persisting": "Saving synchronization state…",
 		"notice.force_phase_reconciling": "Final synchronization check",
-		"notice.force_migration_completed": "Upgrade to 2.0.0 completed. Synchronization finished.",
-		"notice.force_backup_failed": "Backup could not be verified. Force synchronization was not started.",
-		"notice.force_finalization_pending": "The new snapshot is saved, but synchronization needs another check. Run normal synchronization; do not repeat Force.",
-		"notice.force_flow_failed": "Force synchronization was interrupted. Check the connection and plugin status before retrying with a new backup. Files already transferred may have changed.",
+		"notice.force_migration_completed":
+			"Upgrade to 2.0.0 completed. Synchronization finished.",
+		"notice.force_backup_failed":
+			"Backup could not be verified. Force synchronization was not started.",
+		"notice.force_finalization_pending":
+			"The new snapshot is saved, but synchronization needs another check. Run normal synchronization; do not repeat Force.",
+		"notice.force_flow_failed":
+			"Force synchronization was interrupted. Check the connection and plugin status before starting a new attempt. Files already transferred may have changed.",
 		// Commands
 		"command.sync_now": "Sync with Yandex Disk now",
 		"command.toggle_sync": "Pause/Resume synchronization",
@@ -90,19 +97,15 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.sync_exception": "Synchronization failed: {message}",
 		"notice.force_sync_exception": "Force sync failed: {message}",
 		"notice.force_backup_stale":
-			"Force sync stopped because the canonical or protected data changed after backup verification. Create a new backup and try again.",
+			"Force sync stopped because the canonical or protected data changed after preflight. Start a new attempt and choose the archive option again.",
 		"notice.force_source_changed":
-			"Force sync stopped because the selected source changed during the operation. Create a new backup and try again.",
+			"Force sync stopped because the selected source changed during the operation. Start a new attempt and choose the archive option again.",
 		"notice.force_cleanup_pending":
 			"The replacement snapshot is committed. Cleanup is incomplete and will resume during normal synchronization; do not repeat Force sync.",
 		"notice.remote_recheck_required":
 			"Token or remote path changed. Remote state must be checked again before synchronization.",
 		"notice.remote_state_check_failed":
 			"Remote state could not be checked. Synchronization remains blocked without remote changes.",
-		"notice.stable_adoption_required":
-			"Another updated device completed the stable 1.1 migration. Run Full sync manually to create a verified local backup and adopt the new remote snapshot.",
-		"notice.stable_adoption_backup_failed":
-			"The mandatory local backup failed, so migration remains blocked: {message}",
 		"settings.migration_features_locked":
 			"Encryption and current-only settings stay locked until the stable 1.1 migration has completed.",
 		"notice.legacy_plugin_data_exposure":
@@ -116,17 +119,17 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Encryption operation failed: {message}",
 		"notice.legacy_index_blocked":
-			"This plugin version detected a stable 1.x synchronization index. Update every device, create a backup, then run Force sync once on the authoritative device to create the current canonical index.",
+			"This plugin version detected a stable 1.x synchronization index. Update every device, choose the archive option and run Force sync once on the authoritative device to create the current canonical index.",
 		"notice.unreadable_index_blocked":
-			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Create a backup, then use Force sync to select the authoritative side.",
+			"The remote sync index cannot be decoded. Normal sync is blocked to protect your data. Use Force sync and choose the archive option to select the authoritative side.",
 		"notice.invalid_index_blocked":
-			"The current remote sync index has an invalid structure. Normal sync is blocked without changing remote data. Create a backup, then use Force sync to select the authoritative side.",
+			"The current remote sync index has an invalid structure. Normal sync is blocked without changing remote data. Use Force sync and choose the archive option to select the authoritative side.",
 		"notice.epoch_adopted":
 			"The new remote snapshot was accepted and local changes were merged.",
 		"notice.epoch_adopted_conflicts":
 			"The new remote snapshot was accepted; local changes were merged with {conflicts} conflict copies.",
 		"notice.ambiguous_index_blocked":
-			"Several index locks were found. Normal sync is blocked; create a backup and use Force sync to choose the authoritative side.",
+			"Several index locks were found. Normal sync is blocked; use Force sync and choose the archive option to choose the authoritative side.",
 		"notice.sync_completed":
 			"Synchronization completed! ({successful} operations)",
 		"notice.sync_error": "Synchronization completed with errors: {errors}",
@@ -142,6 +145,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.status_title": "Synchronization status",
 
 		// Modal descriptions
+		"modal.operation_backup_title": "Backup before encryption change",
+		"modal.operation_backup_description":
+			"Create an optional full archive before continuing. Existing file conflict protection remains active.",
+		"modal.continue_without_backup": "Continue without backup",
 		"modal.cancel_button": "Cancel",
 		"modal.force_sync_legacy_devices_title":
 			"All stable 1.1 clients are stopped",
@@ -325,8 +332,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Changing encryption password. Re-uploading encrypted files...",
 		"notice.encryption_password_changed":
 			"Encryption password changed. Other devices will ask for the new password.",
-		"modal.encryption_enable_with_backup":
-			"Create backup and enable encryption",
+		"modal.encryption_enable_with_backup": "Continue",
 
 		"generic.yes": "Yes",
 		"generic.confirm": "Confirm",
@@ -345,7 +351,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_warning":
 			"WARNING: This operation is destructive and cannot be undone. Changes made after the sync on the overwritten side may be lost.",
 		"modal.force_sync_recommend_backup":
-			"A successful backup is required before Force sync can start.",
+			"Choose a full archive or continue without one. Snapshot and file protection checks remain active.",
 		"modal.force_sync_backup_button": "Create backup and proceed",
 		"notice.force_sync_from_local_started":
 			"Forcing sync from local to remote...",
@@ -353,22 +359,28 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Forcing sync from remote to local...",
 		"notice.force_sync_completed":
 			"Force sync completed! ({successful} operations)",
-
 	},
 	ru: {
+		"notice.configuration_busy":
+			"Операция недоступна, пока не завершены синхронизация, архивирование или восстановление.",
 		"notice.force_busy": "Принудительная синхронизация уже выполняется.",
 		"notice.force_phase_preflight": "Проверка перед синхронизацией…",
-		"notice.force_phase_confirming": "Ожидание подтверждения принудительной синхронизации…",
+		"notice.force_phase_confirming":
+			"Ожидание подтверждения принудительной синхронизации…",
 		"notice.force_phase_creating-backup": "Создание резервной копии…",
 		"notice.force_phase_uploading-backup": "Загрузка резервной копии…",
 		"notice.force_phase_verifying-backup": "Проверка резервной копии…",
 		"notice.force_phase_syncing": "Принудительная синхронизация",
 		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
 		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
-		"notice.force_migration_completed": "Переход на 2.0.0 завершён. Синхронизация выполнена.",
-		"notice.force_backup_failed": "Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
-		"notice.force_finalization_pending": "Новый снимок сохранён, но завершение синхронизации требует повторной проверки. Запустите обычную синхронизацию; повторять Force не нужно.",
-		"notice.force_flow_failed": "Принудительная синхронизация прервана. Проверьте соединение и статус плагина перед повтором с новой резервной копией. Уже переданные файлы могли измениться.",
+		"notice.force_migration_completed":
+			"Переход на 2.0.0 завершён. Синхронизация выполнена.",
+		"notice.force_backup_failed":
+			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
+		"notice.force_finalization_pending":
+			"Новый снимок сохранён, но завершение синхронизации требует повторной проверки. Запустите обычную синхронизацию; повторять Force не нужно.",
+		"notice.force_flow_failed":
+			"Принудительная синхронизация прервана. Проверьте соединение и статус плагина перед новым запуском. Уже переданные файлы могли измениться.",
 		// Commands
 		"command.sync_now": "Синхронизировать с Яндекс Диском сейчас",
 		"command.toggle_sync": "Приостановить/возобновить синхронизацию",
@@ -442,19 +454,15 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_sync_exception":
 			"Ошибка принудительной синхронизации: {message}",
 		"notice.force_backup_stale":
-			"Force sync остановлен: canonical или защищаемые данные изменились после проверки бекапа. Создайте новый бекап и повторите операцию.",
+			"Force sync остановлен: canonical или защищаемые данные изменились после предварительной проверки. Запустите новую попытку и снова выберите вариант архива.",
 		"notice.force_source_changed":
-			"Force sync остановлен: выбранный источник изменился во время операции. Создайте новый бекап и повторите операцию.",
+			"Force sync остановлен: выбранный источник изменился во время операции. Запустите новую попытку и снова выберите вариант архива.",
 		"notice.force_cleanup_pending":
 			"Новое состояние уже зафиксировано. Очистка не завершена и продолжится обычной синхронизацией; не повторяйте Force sync.",
 		"notice.remote_recheck_required":
 			"Токен или удалённый путь изменился. Перед синхронизацией нужно заново проверить удалённое состояние.",
 		"notice.remote_state_check_failed":
 			"Удалённое состояние не удалось проверить. Синхронизация остаётся заблокированной без изменений на диске.",
-		"notice.stable_adoption_required":
-			"Другое обновлённое устройство завершило миграцию stable 1.1. Запустите Full sync вручную: плагин создаст проверенный локальный бекап и примет новое удалённое состояние.",
-		"notice.stable_adoption_backup_failed":
-			"Обязательный локальный бекап не создан, поэтому миграция остаётся заблокированной: {message}",
 		"settings.migration_features_locked":
 			"Шифрование и настройки только для текущего формата заблокированы до завершения миграции stable 1.1.",
 		"notice.legacy_plugin_data_exposure":
@@ -468,7 +476,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_transition_error":
 			"Ошибка операции шифрования: {message}",
 		"notice.legacy_index_blocked":
-			"Текущая версия плагина обнаружила индекс синхронизации stable 1.x. Обновите все устройства, создайте резервную копию и один раз выполните Force sync на авторитетном устройстве, чтобы создать текущий canonical index.",
+			"Текущая версия плагина обнаружила индекс синхронизации stable 1.x. Обновите все устройства, выберите вариант архива и один раз выполните Force sync на авторитетном устройстве, чтобы создать текущий canonical index.",
 		"notice.unreadable_index_blocked":
 			"Удалённый индекс синхронизации не удалось декодировать. Обычная синхронизация заблокирована для защиты данных. Создайте резервную копию и выберите авторитетную сторону через Force sync.",
 		"notice.invalid_index_blocked":
@@ -478,7 +486,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.epoch_adopted_conflicts":
 			"Новое удалённое состояние принято; локальные изменения объединены, создано конфликтных копий: {conflicts}.",
 		"notice.ambiguous_index_blocked":
-			"Обнаружено несколько lock-файлов индекса. Обычная синхронизация заблокирована; создайте бекап и выберите авторитетную сторону через Force sync.",
+			"Обнаружено несколько lock-файлов индекса. Обычная синхронизация заблокирована; выберите авторитетную сторону и вариант архива через Force sync.",
 		"notice.sync_completed":
 			"Синхронизация завершена! ({successful} операций)",
 		"notice.sync_error": "Синхронизация завершена с ошибками: {errors}",
@@ -494,6 +502,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.status_title": "Статус синхронизации",
 
 		// Modal descriptions
+		"modal.operation_backup_title": "Архив перед изменением шифрования",
+		"modal.operation_backup_description":
+			"Можно создать полный архив перед продолжением. Существующая защита файлов при конфликтах остаётся включённой.",
+		"modal.continue_without_backup": "Продолжить без архива",
 		"modal.cancel_button": "Отмена",
 		"modal.force_sync_legacy_devices_title":
 			"Все клиенты stable 1.1 остановлены",
@@ -678,8 +690,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Смена пароля шифрования. Перезапись зашифрованных файлов...",
 		"notice.encryption_password_changed":
 			"Пароль шифрования изменён. Другие устройства запросят новый пароль.",
-		"modal.encryption_enable_with_backup":
-			"Сделать бекап и включить шифрование",
+		"modal.encryption_enable_with_backup": "Продолжить",
 
 		"generic.yes": "Да",
 		"generic.confirm": "Подтвердить",
@@ -699,7 +710,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_warning":
 			"ВНИМАНИЕ: Операция является деструктивной и не может быть отменена. Изменения, сделанные после синхронизации на перезаписываемой стороне, могут быть потеряны.",
 		"modal.force_sync_recommend_backup":
-			"Перед запуском Force sync необходимо успешно создать бекап.",
+			"Выберите полный архив или продолжение без него. Проверки снимков и защита отдельных файлов сохраняются.",
 		"modal.force_sync_backup_button": "Создать бекап и продолжить",
 		"notice.force_sync_from_local_started":
 			"Принудительная синхронизация из локального в удалённое...",
@@ -707,6 +718,5 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Принудительная синхронизация из удалённого в локальное...",
 		"notice.force_sync_completed":
 			"Принудительная синхронизация завершена! ({successful} операций)",
-
 	},
 };

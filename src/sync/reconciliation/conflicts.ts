@@ -2,20 +2,20 @@
  * Synchronization conflict resolution
  */
 
-import type {
-	FileMetadata,
-	FolderTombstone,
-	SyncOperation,
-} from "../types";
-import { getFileName, getDirectory, getExtension } from "../utils/path-utils";
-import { logger } from "../utils/logger";
-import { getRecordValue } from "../utils/record-utils";
-import { findFolderTombstone } from "./index-rules";
+import type { FileMetadata, FolderTombstone, SyncOperation } from "../../types";
+import {
+	getFileName,
+	getDirectory,
+	getExtension,
+} from "../../utils/path-utils";
+import { logger } from "../../utils/logger";
+import { getRecordValue } from "../../utils/record-utils";
+import { findFolderTombstone } from "../canonical/mutation-rules";
 import {
 	getRemotePhysicalDrift,
 	hasCanonicalMetadataChanged,
 	hasLocalContentChanged,
-} from "./baseline-rules";
+} from "../local/baseline-rules";
 
 export class ConflictResolver {
 	/**
@@ -41,16 +41,18 @@ export class ConflictResolver {
 			const physical = remoteFiles.get(path) ?? null;
 			const baseline = getRecordValue(previousBaseline, path) ?? null;
 			const canonicalEntry = getRecordValue(canonicalFiles, path) ?? null;
-			const remoteLive = canonicalEntry && !canonicalEntry.deleted
-				? {
-						...canonicalEntry,
-						remoteMtime:
-							physical?.remoteMtime ?? canonicalEntry.remoteMtime,
-						remoteFingerprint:
-							physical?.remoteFingerprint ??
-							canonicalEntry.remoteFingerprint,
-					}
-				: null;
+			const remoteLive =
+				canonicalEntry && !canonicalEntry.deleted
+					? {
+							...canonicalEntry,
+							remoteMtime:
+								physical?.remoteMtime ??
+								canonicalEntry.remoteMtime,
+							remoteFingerprint:
+								physical?.remoteFingerprint ??
+								canonicalEntry.remoteFingerprint,
+						}
+					: null;
 
 			const baselineLive = baseline !== null && !baseline.deleted;
 			const localChanged = baselineLive
@@ -63,8 +65,7 @@ export class ConflictResolver {
 				? physical === null ||
 					(getRemotePhysicalDrift(physical, canonicalEntry) ?? false)
 				: false;
-			const remoteChanged =
-				logicalRemoteChanged || physicalRemoteChanged;
+			const remoteChanged = logicalRemoteChanged || physicalRemoteChanged;
 
 			let operation: SyncOperation;
 			if (
@@ -133,9 +134,15 @@ export class ConflictResolver {
 							}
 						: { action: "none", path, reason: "Path is absent" };
 			} else {
-				operation = { action: "none", path, reason: "Path is unchanged" };
+				operation = {
+					action: "none",
+					path,
+					reason: "Path is unchanged",
+				};
 			}
-			if (operation.action !== "none") operations.push(operation);
+			if (operation.action !== "none") {
+				operations.push(operation);
+			}
 		}
 		return operations.map((operation) =>
 			this.withCausalOrigin(
@@ -224,8 +231,7 @@ export class ConflictResolver {
 				return {
 					action: "upload",
 					path,
-					reason:
-						"New file restores a previously deleted path",
+					reason: "New file restores a previously deleted path",
 					localMeta,
 					remoteMeta: remoteMeta || undefined,
 				};
@@ -243,8 +249,7 @@ export class ConflictResolver {
 				return {
 					action: "delete_remote",
 					path,
-					reason:
-						"Removing a physical file rejected by its tombstone",
+					reason: "Removing a physical file rejected by its tombstone",
 					remoteMeta,
 				};
 			}
@@ -253,15 +258,17 @@ export class ConflictResolver {
 		// Case 3: File deleted locally (was in local index, exists on disk)
 		if (!localMeta && remoteMeta && localIndexMeta?.deleted) {
 			if (
-				localIndexMeta.deletedByFolder &&
 				remoteIndexMeta &&
-				!remoteIndexMeta.deleted
+				!remoteIndexMeta.deleted &&
+				(localIndexMeta.deletedByFolder ||
+					(typeof localIndexMeta.changedRevision === "number" &&
+						(remoteIndexMeta.changedRevision ?? 0) >
+							localIndexMeta.changedRevision))
 			) {
 				return {
 					action: "download",
 					path,
-					reason:
-						"Concurrent descendant survived folder deletion",
+					reason: "Canonical live state supersedes the local deletion baseline",
 					remoteMeta,
 				};
 			}
@@ -289,8 +296,7 @@ export class ConflictResolver {
 				return {
 					action: "none",
 					path,
-					reason:
-						"Stale local deletion has no pending causal mutation",
+					reason: "Stale local deletion has no pending causal mutation",
 				};
 			}
 			if (remoteIndexMeta?.deleted && !localIndexMeta?.deleted) {
@@ -328,8 +334,7 @@ export class ConflictResolver {
 				return {
 					action: "upload",
 					path,
-					reason:
-						"Repairing a physical file missing from canonical state",
+					reason: "Repairing a physical file missing from canonical state",
 					localMeta,
 				};
 			}
@@ -406,17 +411,13 @@ export class ConflictResolver {
 			return {
 				action: "conflict",
 				path,
-				reason:
-					"Different local and remote files share a path without a baseline",
+				reason: "Different local and remote files share a path without a baseline",
 				localMeta,
 				remoteMeta,
 			};
 		}
 
-		const localChanged = hasLocalContentChanged(
-			localMeta,
-			localIndexMeta,
-		);
+		const localChanged = hasLocalContentChanged(localMeta, localIndexMeta);
 		const canonicalChanged = hasCanonicalMetadataChanged(
 			remoteIndexMeta,
 			localIndexMeta,
@@ -430,8 +431,7 @@ export class ConflictResolver {
 			return {
 				action: "conflict",
 				path,
-				reason:
-					"Both local and canonical/remote changed since the device baseline",
+				reason: "Both local and canonical/remote changed since the device baseline",
 				localMeta,
 				remoteMeta,
 			};
@@ -449,8 +449,7 @@ export class ConflictResolver {
 			return {
 				action: "download",
 				path,
-				reason:
-					"Only canonical/remote content changed since the device baseline",
+				reason: "Only canonical/remote content changed since the device baseline",
 				localMeta,
 				remoteMeta,
 			};
@@ -552,10 +551,7 @@ export class ConflictResolver {
 			const remoteMeta = remoteFiles.get(path) || null;
 			const localIndexMeta = getRecordValue(localIndex, path) ?? null;
 			const remoteIndexMeta = getRecordValue(remoteIndex, path) ?? null;
-			const folderTombstone = findFolderTombstone(
-				path,
-				folderTombstones,
-			);
+			const folderTombstone = findFolderTombstone(path, folderTombstones);
 			const tombstoneApplies =
 				folderTombstone !== null &&
 				(remoteIndexMeta?.changedRevision ?? 0) <
@@ -573,8 +569,7 @@ export class ConflictResolver {
 					operations.push({
 						action: "conflict",
 						path,
-						reason:
-							"Both descendants changed during folder deletion",
+						reason: "Both descendants changed during folder deletion",
 						localMeta,
 						remoteMeta,
 					});
@@ -584,8 +579,7 @@ export class ConflictResolver {
 					operations.push({
 						action: "upload",
 						path,
-						reason:
-							"New or modified file survives concurrent folder deletion",
+						reason: "New or modified file survives concurrent folder deletion",
 						localMeta,
 						remoteMeta: remoteMeta || undefined,
 					});
@@ -595,8 +589,7 @@ export class ConflictResolver {
 					operations.push({
 						action: "download",
 						path,
-						reason:
-							"New or modified remote file survives concurrent folder deletion",
+						reason: "New or modified remote file survives concurrent folder deletion",
 						remoteMeta,
 					});
 					continue;
@@ -628,10 +621,10 @@ export class ConflictResolver {
 				localMeta,
 				remoteMeta,
 				localIndexMeta,
-					remoteIndexMeta,
-					syncStartTime,
-					pendingLocalDeletes.has(path),
-				);
+				remoteIndexMeta,
+				syncStartTime,
+				pendingLocalDeletes.has(path),
+			);
 
 			if (operation.action !== "none") {
 				operations.push(operation);

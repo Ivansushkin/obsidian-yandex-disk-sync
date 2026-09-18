@@ -13,7 +13,7 @@ import {
 	shouldApplyFileMutation,
 	shouldPreserveConcurrentFolderChild,
 	advanceMutationSequence,
-} from "../src/sync/index-rules";
+} from "../src/sync/canonical/mutation-rules";
 
 function file(
 	path: string,
@@ -40,10 +40,7 @@ function file(
 	};
 }
 
-function tombstone(
-	path: string,
-	changedRevision: number,
-): FolderTombstone {
+function tombstone(path: string, changedRevision: number): FolderTombstone {
 	return {
 		path,
 		deletedAt: 1,
@@ -58,13 +55,8 @@ test("folder matching respects segment boundaries and deep paths", () => {
 	assert.equal(isPathInsideFolder("a/b", "a/b"), true);
 	assert.equal(isPathInsideFolder("a/bb/file.md", "a/b"), false);
 
-	const deepFolder = Array.from({ length: 100 }, (_, i) => `d${i}`).join(
-		"/",
-	);
-	assert.equal(
-		isPathInsideFolder(`${deepFolder}/file.md`, deepFolder),
-		true,
-	);
+	const deepFolder = Array.from({ length: 100 }, (_, i) => `d${i}`).join("/");
+	assert.equal(isPathInsideFolder(`${deepFolder}/file.md`, deepFolder), true);
 });
 
 test("folder delete targets skip a historical rename tombstone", () => {
@@ -163,39 +155,56 @@ test("newest containing folder tombstone is selected", () => {
 test("folder tombstone lookup scales with path depth, not history size", () => {
 	const history: Record<string, FolderTombstone> = {};
 	for (let index = 0; index < 10_000; index++) {
-		history[`unrelated-${index}`] = tombstone(
-			`unrelated-${index}`,
-			index,
-		);
+		history[`unrelated-${index}`] = tombstone(`unrelated-${index}`, index);
 	}
 	history["a/b"] = tombstone("a/b", 10_001);
 	let reads = 0;
 	const observed = new Proxy(history, {
 		get(target, property, receiver) {
 			void receiver;
-			if (typeof property !== "string") return undefined;
+			if (typeof property !== "string") {
+				return undefined;
+			}
 			reads++;
 			return target[property];
 		},
 	});
 
-	assert.equal(
-		findFolderTombstone("a/b/c/file.md", observed)?.path,
-		"a/b",
-	);
+	assert.equal(findFolderTombstone("a/b/c/file.md", observed)?.path, "a/b");
 	assert.equal(reads, 3);
 });
 
 test("exact deletion wins concurrent puts but permits causally later restoration", () => {
 	const deleted = file("note.md", { deleted: true, changedRevision: 6 });
 	const cases = [
-		{ label: "stale put", current: deleted, incoming: file("note.md"), base: 5, expected: false },
-		{ label: "observed deletion", current: deleted, incoming: file("note.md"), base: 6, expected: true },
-		{ label: "concurrent delete", current: file("note.md", { changedRevision: 8 }),
-			incoming: file("note.md", { deleted: true }), base: 5, expected: true },
+		{
+			label: "stale put",
+			current: deleted,
+			incoming: file("note.md"),
+			base: 5,
+			expected: false,
+		},
+		{
+			label: "observed deletion",
+			current: deleted,
+			incoming: file("note.md"),
+			base: 6,
+			expected: true,
+		},
+		{
+			label: "concurrent delete",
+			current: file("note.md", { changedRevision: 8 }),
+			incoming: file("note.md", { deleted: true }),
+			base: 5,
+			expected: true,
+		},
 	];
 	for (const { label, current, incoming, base, expected } of cases) {
-		assert.equal(shouldApplyFileMutation(current, incoming, base), expected, label);
+		assert.equal(
+			shouldApplyFileMutation(current, incoming, base),
+			expected,
+			label,
+		);
 	}
 });
 
@@ -205,14 +214,8 @@ test("concurrent live puts with different hashes do not overwrite each other", (
 		changedRevision: 5,
 	});
 	const incoming = file("note.md", { sha256: "device-b" });
-	assert.equal(
-		shouldApplyFileMutation(current, incoming, 4),
-		false,
-	);
-	assert.equal(
-		shouldApplyFileMutation(current, incoming, 5),
-		true,
-	);
+	assert.equal(shouldApplyFileMutation(current, incoming, 4), false);
+	assert.equal(shouldApplyFileMutation(current, incoming, 5), true);
 });
 
 test("modified descendant wins over a concurrent folder deletion", () => {
@@ -238,11 +241,7 @@ test("an explicit same-content put survives a concurrent folder deletion", () =>
 		deletedByFolder: "folder",
 	});
 	assert.equal(
-		shouldApplyFileMutation(
-			currentDelete,
-			file("folder/note.md"),
-			5,
-		),
+		shouldApplyFileMutation(currentDelete, file("folder/note.md"), 5),
 		true,
 	);
 });
@@ -256,10 +255,7 @@ test("folder deletion does not overwrite a concurrently modified descendant", ()
 		deleted: true,
 		deletedByFolder: "folder",
 	});
-	assert.equal(
-		shouldApplyFileMutation(currentPut, folderDelete, 5),
-		false,
-	);
+	assert.equal(shouldApplyFileMutation(currentPut, folderDelete, 5), false);
 });
 
 test("child created after folder baseline is preserved", () => {
@@ -324,12 +320,7 @@ test("unsequenced current child never authorizes a destructive folder mutation",
 		lastModifiedBy: "device-a",
 	});
 	assert.equal(
-		canApplyDestructiveFolderMutation(
-			current,
-			7,
-			"device-a",
-			4,
-		),
+		canApplyDestructiveFolderMutation(current, 7, "device-a", 4),
 		false,
 	);
 	current.mutationSeq = 4;
@@ -394,12 +385,10 @@ test("same-device replay is idempotent or stale but never a conflict", () => {
 		mutationSeq: 8,
 	});
 	assert.equal(
-		classifyFileMutation(
-			current,
-			{ ...current },
-			35,
-			{ currentWatermark: 8, desiredWatermark: 8 },
-		),
+		classifyFileMutation(current, { ...current }, 35, {
+			currentWatermark: 8,
+			desiredWatermark: 8,
+		}),
 		"idempotent",
 	);
 	assert.equal(

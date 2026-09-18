@@ -21,9 +21,7 @@ export function setRecordValue<T>(
  * JSON-compatible object prototype. The placeholder is non-enumerable and is
  * replaced by {@link setRecordValue} when `__proto__` is a real persisted key.
  */
-export function protectRecord<T>(
-	record: Record<string, T>,
-): Record<string, T> {
+export function protectRecord<T>(record: Record<string, T>): Record<string, T> {
 	if (!Object.prototype.hasOwnProperty.call(record, "__proto__")) {
 		Object.defineProperty(record, "__proto__", {
 			value: undefined,

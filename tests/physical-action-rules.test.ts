@@ -10,7 +10,7 @@ import {
 	classifyPhysicalDeleteResource,
 	isPhysicalDeleteAuthorized,
 	shouldBackupLocalDelete,
-} from "../src/sync/physical-action-rules";
+} from "../src/sync/files/action-rules";
 
 function action(
 	epoch: string,
@@ -37,10 +37,7 @@ test("a newer live canonical state cancels an old physical delete", () => {
 		syncedAt: 1,
 		changedRevision: 3,
 	};
-	assert.equal(
-		isPhysicalDeleteAuthorized(action("epoch"), canonical),
-		false,
-	);
+	assert.equal(isPhysicalDeleteAuthorized(action("epoch"), canonical), false);
 });
 
 test("canonical tombstone authorizes exact and folder physical deletion", () => {
@@ -54,15 +51,9 @@ test("canonical tombstone authorizes exact and folder physical deletion", () => 
 		deleted: true,
 		changedRevision: 3,
 	};
+	assert.equal(isPhysicalDeleteAuthorized(action("epoch"), canonical), true);
 	assert.equal(
-		isPhysicalDeleteAuthorized(action("epoch"), canonical),
-		true,
-	);
-	assert.equal(
-		isPhysicalDeleteAuthorized(
-			action("epoch", "folder-delete"),
-			canonical,
-		),
+		isPhysicalDeleteAuthorized(action("epoch", "folder-delete"), canonical),
 		true,
 	);
 });

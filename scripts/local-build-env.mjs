@@ -10,7 +10,9 @@ export const LOCAL_ENV_FILE = ".env";
  */
 export function readLocalPluginPath(rootDir = process.cwd()) {
 	const envPath = path.join(rootDir, LOCAL_ENV_FILE);
-	if (!existsSync(envPath)) return null;
+	if (!existsSync(envPath)) {
+		return null;
+	}
 
 	let localEnvironment;
 	try {
@@ -21,13 +23,16 @@ export function readLocalPluginPath(rootDir = process.cwd()) {
 			.filter((line) => line && !line.startsWith("#"));
 		if (
 			assignmentLines.some(
-				(line) => !/^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/u.test(line),
+				(line) =>
+					!/^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/u.test(line),
 			) ||
 			assignmentLines.filter((line) =>
 				/^(?:export\s+)?YANDEX_PLUGIN_PATH\s*=/u.test(line),
 			).length > 1
 		) {
-			throw new Error("unsupported syntax or duplicate YANDEX_PLUGIN_PATH");
+			throw new Error(
+				"unsupported syntax or duplicate YANDEX_PLUGIN_PATH",
+			);
 		}
 		localEnvironment = parse(source);
 	} catch (error) {
@@ -35,7 +40,9 @@ export function readLocalPluginPath(rootDir = process.cwd()) {
 	}
 
 	const configuredPath = localEnvironment.YANDEX_PLUGIN_PATH?.trim();
-	if (!configuredPath) return null;
+	if (!configuredPath) {
+		return null;
+	}
 	if (!path.isAbsolute(configuredPath)) {
 		throw new Error("YANDEX_PLUGIN_PATH in .env must be an absolute path");
 	}

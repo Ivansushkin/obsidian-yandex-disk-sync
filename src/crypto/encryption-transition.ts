@@ -1,9 +1,12 @@
-import type {
-	EncryptionCodec,
-	EncryptionProfileId,
-} from "./encryption";
-import type { IndexManager } from "../sync/index-manager";
-import type { SyncEngine } from "../sync/sync-engine";
+import type { YandexDiskClient } from "../api/yandex-client";
+import { matchesPhysicalResourceFingerprint } from "../utils/resource-fingerprint";
+import {
+	getAncestorDirectoriesDeepestFirst,
+	joinPath,
+} from "../utils/path-utils";
+import type { EncryptionCodec, EncryptionProfileId } from "./encryption";
+import type { IndexManager } from "../sync/canonical/manager";
+import type { SyncEngine } from "../sync/engine";
 import type {
 	EncryptionTransitionPhase,
 	EncryptionModeDescriptor,
@@ -11,7 +14,7 @@ import type {
 	PendingPhysicalAction,
 	RemoteEncryptionManifest,
 } from "../types";
-import type { PhysicalRewriteUploadProof } from "../sync/sync-engine";
+import type { PhysicalRewriteUploadProof } from "../sync/engine";
 import { isProtectedPath, normalizePath } from "../utils/path-utils";
 import { protectRecord } from "../utils/record-utils";
 
@@ -43,12 +46,14 @@ export interface LocalEncryptionTransition {
 	sourceFingerprints: Record<string, string>;
 	targetFingerprints: Record<string, string>;
 	sourceCanonicalRevision: number;
-	backupProof: EncryptionBackupProof;
+	backupProof: EncryptionBackupProof | null;
 }
 
 interface EncryptionTransitionLifecycle {
 	claim(transition: LocalEncryptionTransition): Promise<void>;
-	applyTarget(snapshot: LocalEncryptionSnapshot): Promise<EncryptionCodec | null>;
+	applyTarget(
+		snapshot: LocalEncryptionSnapshot,
+	): Promise<EncryptionCodec | null>;
 	resolveTargetPaths(transition: LocalEncryptionTransition): Promise<void>;
 	assertSourceUnchanged(transition: LocalEncryptionTransition): Promise<void>;
 	verifyTargetUpload(
@@ -93,6 +98,13 @@ export interface EncryptionRewriteOptions {
 	publishIndexCommitted?(): Promise<void>;
 }
 
+interface EncryptionCleanupIO {
+	client: YandexDiskClient;
+	getRemotePath(): string;
+	completeAction(path: string): void;
+	persist(): Promise<void>;
+}
+
 /**
  * Executes the shared causal workflow for enable, disable, and key rotation.
  * Mode-specific callers only provide manifest publication policy.
@@ -102,6 +114,7 @@ export class EncryptionTransitionController {
 		private readonly indexManager: IndexManager,
 		private readonly syncEngine: SyncEngine,
 		private readonly lifecycle: EncryptionTransitionLifecycle,
+		private readonly cleanupIO?: EncryptionCleanupIO,
 	) {}
 
 	async execute(options: EncryptionRewriteOptions): Promise<void> {
@@ -119,9 +132,7 @@ export class EncryptionTransitionController {
 				options.sourceService,
 				targetService,
 			);
-			let result: Awaited<
-				ReturnType<SyncEngine["reencodeRemoteFiles"]>
-			>;
+			let result: Awaited<ReturnType<SyncEngine["reencodeRemoteFiles"]>>;
 			try {
 				result = await this.syncEngine.reencodeRemoteFiles({
 					skipEncryptionGuard: true,
@@ -165,11 +176,7 @@ export class EncryptionTransitionController {
 		this.syncEngine.showMaintenanceCleanupPhase();
 		const cleanup = requireCleanupProof(transition);
 		await this.lifecycle.publishStable(transition.target);
-		await this.lifecycle.commitMaintenance(
-			transition,
-			"cleanup",
-			cleanup,
-		);
+		await this.lifecycle.commitMaintenance(transition, "cleanup", cleanup);
 		await this.lifecycle.prepareCleanup(
 			transition.sourceRawPaths,
 			transition.sourceFingerprints,
@@ -184,6 +191,236 @@ export class EncryptionTransitionController {
 		}
 		await this.lifecycle.clearLocalTransition();
 		this.lifecycle.clearBlock();
+	}
+
+	/** Every retry revalidates authority and content; absence alone completes an action. */
+	async cleanupRawPaths(
+		paths: string[],
+		fingerprints: Record<string, string>,
+	): Promise<void> {
+		if (paths.length === 0) {
+			return;
+		}
+		const io = this.cleanupIO;
+		const authority = this.indexManager.getMaintenance();
+		const epoch = this.indexManager.getRemoteIndex().epoch;
+		if (!io || !authority) {
+			throw new Error("Encryption cleanup has no canonical authority");
+		}
+		for (const path of paths) {
+			const expected = fingerprints[path];
+			const remotePath = joinPath(io.getRemotePath(), path);
+			const validate = async (): Promise<void> => {
+				const current =
+					await this.indexManager.assertMaintenanceAuthority(
+						epoch,
+						authority,
+					);
+				if (
+					!expected ||
+					!current.maintenance?.cleanup.some(
+						(action) =>
+							action.path === path &&
+							action.expectedFingerprint === expected,
+					)
+				) {
+					throw new Error(
+						"Encryption cleanup action is no longer authorized",
+					);
+				}
+				await this.assertNotLiveRawTarget(remotePath, current.files);
+				const resource = await io.client.getResource(
+					remotePath,
+					1,
+					0,
+					true,
+				);
+				if (
+					resource &&
+					!matchesPhysicalResourceFingerprint(expected, resource)
+				) {
+					throw new Error("Encryption cleanup target changed");
+				}
+				await this.indexManager.assertMaintenanceAuthority(
+					epoch,
+					authority,
+				);
+			};
+			await validate();
+			let deletionError: unknown;
+			try {
+				await io.client.deleteResource(
+					remotePath,
+					false,
+					true,
+					validate,
+				);
+			} catch (error) {
+				deletionError = error;
+			}
+			await this.indexManager.assertMaintenanceAuthority(
+				epoch,
+				authority,
+			);
+			if (await io.client.getResource(remotePath, 1, 0, true)) {
+				throw deletionError instanceof Error
+					? deletionError
+					: new Error("Encryption cleanup deletion is incomplete");
+			}
+			io.completeAction(path);
+			await io.persist();
+		}
+	}
+
+	/** Empty folders still require the same live canonical cleanup ownership. */
+	async cleanupRawFolders(paths: string[]): Promise<void> {
+		const folders = getAncestorDirectoriesDeepestFirst(paths);
+		if (folders.length === 0) {
+			return;
+		}
+		const io = this.cleanupIO;
+		const authority = this.indexManager.getMaintenance();
+		const epoch = this.indexManager.getRemoteIndex().epoch;
+		if (!io || !authority) {
+			throw new Error("Encryption folder cleanup has no authority");
+		}
+		for (const folder of folders) {
+			if (isProtectedPath(folder)) {
+				continue;
+			}
+			const remotePath = joinPath(io.getRemotePath(), folder);
+			const validate = async (): Promise<void> => {
+				const current =
+					await this.indexManager.assertMaintenanceAuthority(
+						epoch,
+						authority,
+					);
+				if (
+					!current.maintenance?.cleanup.some((action) =>
+						action.path.startsWith(`${folder}/`),
+					)
+				) {
+					throw new Error(
+						"Encryption folder cleanup is no longer authorized",
+					);
+				}
+				await this.assertNotLiveRawTarget(
+					remotePath,
+					current.files,
+					true,
+				);
+				if (!(await io.client.isRawFolderEmpty(remotePath))) {
+					throw new Error("Cleanup folder is not empty");
+				}
+				await this.indexManager.assertMaintenanceAuthority(
+					epoch,
+					authority,
+				);
+			};
+			await validate();
+			await io.client.deleteResource(remotePath, false, true, validate);
+			await this.indexManager.assertMaintenanceAuthority(
+				epoch,
+				authority,
+			);
+			if (await io.client.getResource(remotePath, 1, 0, true)) {
+				throw new Error("Folder cleanup is incomplete");
+			}
+		}
+	}
+
+	private async assertNotLiveRawTarget(
+		rawPath: string,
+		files: Record<string, import("../types").FileMetadata>,
+		folder = false,
+	): Promise<void> {
+		const io = this.cleanupIO!;
+		for (const [logical, meta] of Object.entries(files)) {
+			if (meta.deleted) {
+				continue;
+			}
+			const live = await io.client.getPhysicalPath(
+				joinPath(io.getRemotePath(), logical),
+			);
+			if (
+				live === rawPath ||
+				(folder && live.startsWith(`${rawPath}/`))
+			) {
+				throw new Error("Cleanup would delete a live canonical target");
+			}
+		}
+	}
+
+	/** Publish target authority before advancing the canonical cleanup phase. */
+	async completeRemoteTarget(
+		maintenance: IndexMaintenance,
+		publishStable: () => Promise<void>,
+		cleanup: () => Promise<void>,
+	): Promise<void> {
+		const epoch = this.indexManager.getRemoteIndex().epoch;
+		await this.indexManager.assertMaintenanceAuthority(epoch, maintenance);
+		await publishStable();
+		await this.indexManager.assertMaintenanceAuthority(epoch, maintenance);
+		if (maintenance.phase !== "cleanup") {
+			this.indexManager.setMaintenance({
+				...maintenance,
+				phase: "cleanup",
+			});
+			await this.indexManager.saveRemoteIndex();
+		}
+		await cleanup();
+	}
+
+	/** Finish canonical cleanup without adopting a foreign epoch or replaying its local queues. */
+	async resumeCanonicalCleanup(): Promise<boolean> {
+		const maintenance = this.indexManager.getMaintenance();
+		if (!maintenance || maintenance.phase !== "cleanup") {
+			return true;
+		}
+		const io = this.cleanupIO;
+		if (!io) {
+			throw new Error("Encryption cleanup I/O is unavailable");
+		}
+		const epoch = this.indexManager.getRemoteIndex().epoch;
+		const ownsLocalEpoch = this.indexManager.getObservedEpoch() === epoch;
+		if (ownsLocalEpoch) {
+			for (const action of maintenance.cleanup) {
+				this.indexManager.enqueuePhysicalAction(
+					"guarded-cleanup",
+					action.path,
+					{
+						expectedFingerprint: action.expectedFingerprint,
+						origin: "encryption-cleanup",
+						canonicalRevision:
+							this.indexManager.getRemoteIndex().revision,
+					},
+				);
+			}
+			await io.persist();
+		}
+		const paths = maintenance.cleanup.map((action) => action.path);
+		await this.cleanupRawPaths(
+			paths,
+			Object.fromEntries(
+				maintenance.cleanup.map((action) => [
+					action.path,
+					action.expectedFingerprint,
+				]),
+			),
+		);
+		await this.cleanupRawFolders(paths);
+		const pending =
+			ownsLocalEpoch &&
+			hasPendingEncryptionCleanup(
+				this.indexManager.getPendingPhysicalActions(),
+				epoch,
+			);
+		if (!pending) {
+			this.indexManager.clearMaintenance(maintenance.id);
+			await this.indexManager.saveRemoteIndex();
+		}
+		await io.persist();
+		return !pending;
 	}
 
 	getRemoteTargetRecoveryKind(
@@ -206,7 +443,9 @@ export class EncryptionTransitionController {
 		maintenance: IndexMaintenance | undefined,
 		service: EncryptionCodec,
 	): Promise<void> {
-		if (!maintenance) return;
+		if (!maintenance) {
+			return;
+		}
 		if (
 			(maintenance.phase !== "index-committed" &&
 				maintenance.phase !== "cleanup" &&
@@ -215,7 +454,9 @@ export class EncryptionTransitionController {
 			!maintenance.target.enabled ||
 			(maintenance.kind !== "enable" && maintenance.kind !== "rotate")
 		) {
-			throw new Error("Stable manifest conflicts with active maintenance");
+			throw new Error(
+				"Stable manifest conflicts with active maintenance",
+			);
 		}
 		if (
 			manifest.revision !== maintenance.target.revision ||
@@ -223,7 +464,9 @@ export class EncryptionTransitionController {
 			!maintenance.target.verifier ||
 			!(await verifies(service, maintenance.target.verifier))
 		) {
-			throw new Error("Stable manifest does not match maintenance target");
+			throw new Error(
+				"Stable manifest does not match maintenance target",
+			);
 		}
 	}
 
@@ -246,8 +489,13 @@ export class EncryptionTransitionController {
 		} = options;
 		const sourceAuthoritative = authority === "source";
 		if (sourceAuthoritative) {
-			if (transition.phase !== "prepared" && transition.phase !== "files-copied") {
-				throw new Error("Local transition phase cannot select source authority");
+			if (
+				transition.phase !== "prepared" &&
+				transition.phase !== "files-copied"
+			) {
+				throw new Error(
+					"Local transition phase cannot select source authority",
+				);
 			}
 		} else if (
 			!maintenance &&
@@ -255,7 +503,9 @@ export class EncryptionTransitionController {
 			transition.phase !== "cleanup" &&
 			transition.phase !== "stable"
 		) {
-			throw new Error("Target authority has no committed local or canonical phase");
+			throw new Error(
+				"Target authority has no committed local or canonical phase",
+			);
 		}
 
 		if (maintenance) {
@@ -266,12 +516,23 @@ export class EncryptionTransitionController {
 				maintenance.id !== transition.id ||
 				maintenance.kind !== transition.kind ||
 				maintenance.initiatedBy !== deviceId ||
-				maintenance.sourceRevision !== transition.sourceCanonicalRevision ||
-				!snapshotMatchesModeDescriptor(transition.source, maintenance.source) ||
-				!snapshotMatchesModeDescriptor(transition.target, maintenance.target) ||
-				(sourceAuthoritative ? !maintenancePreCommit : maintenancePreCommit)
+				maintenance.sourceRevision !==
+					transition.sourceCanonicalRevision ||
+				!snapshotMatchesModeDescriptor(
+					transition.source,
+					maintenance.source,
+				) ||
+				!snapshotMatchesModeDescriptor(
+					transition.target,
+					maintenance.target,
+				) ||
+				(sourceAuthoritative
+					? !maintenancePreCommit
+					: maintenancePreCommit)
 			) {
-				throw new Error("Local transition does not match canonical maintenance");
+				throw new Error(
+					"Local transition does not match canonical maintenance",
+				);
 			}
 		}
 
@@ -280,7 +541,9 @@ export class EncryptionTransitionController {
 			: transition.target;
 		if (authoritativeSnapshot.enabled) {
 			if (!authoritativeService) {
-				throw new Error("Encrypted recovery authority requires its codec");
+				throw new Error(
+					"Encrypted recovery authority requires its codec",
+				);
 			}
 			const maintenanceMode = maintenance
 				? sourceAuthoritative
@@ -290,26 +553,36 @@ export class EncryptionTransitionController {
 			if (
 				maintenanceMode &&
 				(!maintenanceMode.verifier ||
-					!(await verifies(authoritativeService, maintenanceMode.verifier)))
+					!(await verifies(
+						authoritativeService,
+						maintenanceMode.verifier,
+					)))
 			) {
-				throw new Error("Canonical maintenance verifier does not match recovery authority");
+				throw new Error(
+					"Canonical maintenance verifier does not match recovery authority",
+				);
 			}
 			const manifestDescribesAuthority =
 				manifest?.state === "enabled" ||
 				(sourceAuthoritative && manifest?.state === "disabling") ||
 				(!sourceAuthoritative &&
-					(manifest?.state === "enabling" || manifest?.state === "rotating"));
+					(manifest?.state === "enabling" ||
+						manifest?.state === "rotating"));
 			if (
 				manifestDescribesAuthority &&
 				manifest &&
 				!(await verifies(authoritativeService, manifest.verifier))
 			) {
-				throw new Error("Manifest verifier does not match recovery authority");
+				throw new Error(
+					"Manifest verifier does not match recovery authority",
+				);
 			}
 		}
 		if (!manifest) {
 			if (authoritativeSnapshot.enabled) {
-				throw new Error("Encrypted recovery authority requires a manifest");
+				throw new Error(
+					"Encrypted recovery authority requires a manifest",
+				);
 			}
 			return;
 		}
@@ -319,12 +592,16 @@ export class EncryptionTransitionController {
 				manifest.salt !== authoritativeSnapshot.salt ||
 				manifest.revision !== authoritativeSnapshot.revision
 			) {
-				throw new Error("Stable manifest does not match local recovery authority");
+				throw new Error(
+					"Stable manifest does not match local recovery authority",
+				);
 			}
 			return;
 		}
 		if (!maintenance || !manifest.transition) {
-			throw new Error("Transitional manifest requires matching maintenance");
+			throw new Error(
+				"Transitional manifest requires matching maintenance",
+			);
 		}
 		const expectedState = {
 			enable: "enabling",
@@ -345,19 +622,25 @@ export class EncryptionTransitionController {
 			descriptor.initiatedBy !== deviceId ||
 			!sameModeDescriptor(descriptor.source, maintenance.source) ||
 			!sameModeDescriptor(descriptor.target, maintenance.target) ||
-			!snapshotMatchesModeDescriptor(transition.source, descriptor.source) ||
-			!snapshotMatchesModeDescriptor(transition.target, descriptor.target) ||
+			!snapshotMatchesModeDescriptor(
+				transition.source,
+				descriptor.source,
+			) ||
+			!snapshotMatchesModeDescriptor(
+				transition.target,
+				descriptor.target,
+			) ||
 			(!exactPhase && !allowedPreCommitPublicationWindow)
 		) {
-			throw new Error("Manifest does not match local transition recovery");
+			throw new Error(
+				"Manifest does not match local transition recovery",
+			);
 		}
 	}
 }
 
 export type EncryptionRecoveryDecision =
-	| "finish-target"
-	| "rollback-source"
-	| "blocked";
+	"finish-target" | "rollback-source" | "blocked";
 
 /**
  * Select the only safe recovery direction around the canonical index commit.
@@ -389,9 +672,15 @@ export interface RemoteTargetRecoveryPlan {
 export function getRemoteTargetRecoveryKind(
 	manifest: RemoteEncryptionManifest | null,
 ): RemoteTargetRecoveryKind | null {
-	if (!manifest || manifest.state === "enabled") return null;
-	if (manifest.state === "enabling") return "enable";
-	if (manifest.state === "rotating") return "rotate";
+	if (!manifest || manifest.state === "enabled") {
+		return null;
+	}
+	if (manifest.state === "enabling") {
+		return "enable";
+	}
+	if (manifest.state === "rotating") {
+		return "rotate";
+	}
 	return "disable";
 }
 
@@ -418,7 +707,9 @@ export function createTargetRawMapping(
 			sourceAncestors.has(rawPath) ||
 			hasPathAncestor(rawPath, source)
 		) {
-			throw new Error(`Encryption target collides with source path ${rawPath}`);
+			throw new Error(
+				`Encryption target collides with source path ${rawPath}`,
+			);
 		}
 		const existingLogicalPath = logicalByRaw.get(rawPath);
 		if (
@@ -431,7 +722,9 @@ export function createTargetRawMapping(
 			);
 		}
 		if (rawByLogical.has(logicalPath)) {
-			throw new Error(`Duplicate encryption logical target ${logicalPath}`);
+			throw new Error(
+				`Duplicate encryption logical target ${logicalPath}`,
+			);
 		}
 		logicalByRaw.set(rawPath, logicalPath);
 		targetPaths.add(rawPath);
@@ -456,11 +749,16 @@ function collectPathAncestors(paths: Iterable<string>): Set<string> {
 	return result;
 }
 
-function hasPathAncestor(path: string, candidates: ReadonlySet<string>): boolean {
+function hasPathAncestor(
+	path: string,
+	candidates: ReadonlySet<string>,
+): boolean {
 	const segments = path.split("/");
 	let ancestor = segments[0] ?? "";
 	for (let index = 1; index < segments.length; index++) {
-		if (candidates.has(ancestor)) return true;
+		if (candidates.has(ancestor)) {
+			return true;
+		}
 		ancestor = `${ancestor}/${segments[index]}`;
 	}
 	return false;
@@ -473,9 +771,12 @@ export function assertSafeTransitionPath(path: string, label: string): void {
 		isProtectedPath(path) ||
 		path.includes("\\") ||
 		path.includes("\0") ||
-		path.split("/").some((segment) =>
-			segment === "" || segment === "." || segment === ".."
-		)
+		path
+			.split("/")
+			.some(
+				(segment) =>
+					segment === "" || segment === "." || segment === "..",
+			)
 	) {
 		throw new Error(`Invalid encryption ${label} path`);
 	}
@@ -519,7 +820,9 @@ export function createRemoteTargetRecoveryPlan(
 
 	if (!manifest) {
 		if (kind !== "disable" || maintenance.target.enabled) {
-			throw new Error("Missing manifest is valid only for plaintext target");
+			throw new Error(
+				"Missing manifest is valid only for plaintext target",
+			);
 		}
 		return { kind, maintenance, passwordMode: "none" };
 	}
@@ -529,10 +832,16 @@ export function createRemoteTargetRecoveryPlan(
 		!transition ||
 		transition.id !== maintenance.id ||
 		transition.initiatedBy !== maintenance.initiatedBy ||
-		transition.phase !== maintenance.phase ||
+		(transition.phase !== maintenance.phase &&
+			!(
+				maintenance.phase === "cleanup" &&
+				transition.phase === "index-committed"
+			)) ||
 		manifest.updatedBy !== transition.initiatedBy
 	) {
-		throw new Error("Remote transition identity does not match maintenance");
+		throw new Error(
+			"Remote transition identity does not match maintenance",
+		);
 	}
 	if (
 		!sameModeDescriptor(transition.source, maintenance.source) ||
@@ -540,7 +849,9 @@ export function createRemoteTargetRecoveryPlan(
 		transition.sourceRevision !== maintenance.source.revision ||
 		transition.targetRevision !== maintenance.target.revision
 	) {
-		throw new Error("Remote transition descriptors do not match maintenance");
+		throw new Error(
+			"Remote transition descriptors do not match maintenance",
+		);
 	}
 	if (
 		transition.sourceProfileId !==
@@ -551,9 +862,8 @@ export function createRemoteTargetRecoveryPlan(
 		throw new Error("Remote transition profiles do not match maintenance");
 	}
 
-	const declaredMode = kind === "disable"
-		? maintenance.source
-		: maintenance.target;
+	const declaredMode =
+		kind === "disable" ? maintenance.source : maintenance.target;
 	const manifestMode: EncryptionModeDescriptor = {
 		enabled: true,
 		revision: manifest.revision,
@@ -584,7 +894,9 @@ function assertModePair(
 				(target.revision ?? 0) <= (source.revision ?? 0) ||
 				target.salt === source.salt ||
 				target.verifier === source.verifier));
-	if (invalid) throw new Error("Encryption maintenance modes do not match its kind");
+	if (invalid) {
+		throw new Error("Encryption maintenance modes do not match its kind");
+	}
 }
 
 function sameModeDescriptor(

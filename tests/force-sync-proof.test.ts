@@ -1,13 +1,14 @@
+import * as forceSync from "../src/sync/workflows/force";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import { SyncEngine } from "../src/sync/sync-engine";
+import { SyncEngine } from "../src/sync/engine";
 import {
 	ForceBackupStaleError,
 	ForceSourceChangedError,
 	type IndexManager,
-} from "../src/sync/index-manager";
+} from "../src/sync/canonical/manager";
 import { DEFAULT_SETTINGS } from "../src/types";
 import { captureLogicalVaultSnapshot } from "../src/backup/backup-snapshot";
 import { computeSha256 } from "../src/utils/hash-utils";
@@ -29,28 +30,7 @@ function metadata(
 	};
 }
 
-function createSourceProofAccess() {
-	const engine = new SyncEngine(
-		{} as YandexDiskClient,
-		{} as VaultAdapter,
-		{} as IndexManager,
-		DEFAULT_SETTINGS,
-	);
-	return engine as unknown as {
-		getForceLocalSourceIdentity(files: Map<string, FileMetadata>): string;
-		getForceRemoteSourceIdentity(files: Map<string, FileMetadata>): string;
-		assertForceLocalSourceUnchanged(
-			expected: string,
-			files: Map<string, FileMetadata>,
-		): void;
-		assertForceRemoteSourceUnchanged(
-			expected: string,
-			files: Map<string, FileMetadata>,
-		): void;
-	};
-}
-
-test("Force backup proof is required before any destructive operation", async () => {
+test("Force preflight proof is required before any destructive operation", async () => {
 	const engine = new SyncEngine(
 		{
 			getApiReadMetrics: () => ({}),
@@ -91,43 +71,62 @@ test("Force backup proof accepts only the matching protected snapshot", async ()
 		getApiReadMetrics: () => ({}),
 		downloadStableRawFile: async () => ({ raw: backupBytes.slice(0) }),
 	} as unknown as YandexDiskClient;
-	const engine = new SyncEngine(
-		yandexClient,
-		vaultAdapter,
-		indexManager,
-		{ ...DEFAULT_SETTINGS, remotePath: "vault" },
-	);
-	const access = engine as unknown as {
-		assertForceBackupProof(
-			direction: "from_remote",
-			proof: {
-				direction: "from_remote";
-				canonical: { state: "absent" };
-				snapshotDigest: string;
-				backupName: string;
-				backupSha256: string;
-			},
-		): Promise<void>;
-	};
+	const engine = new SyncEngine(yandexClient, vaultAdapter, indexManager, {
+		...DEFAULT_SETTINGS,
+		remotePath: "vault",
+	});
+	const deps = (
+		engine as unknown as { forceSyncDependencies(): forceSync.Dependencies }
+	).forceSyncDependencies();
 	const proof = {
 		direction: "from_remote" as const,
 		canonical: { state: "absent" as const },
-		snapshotDigest: (await captureLogicalVaultSnapshot(vaultAdapter)).digest,
+		snapshotDigest: (await captureLogicalVaultSnapshot(vaultAdapter))
+			.digest,
 		backupName: "verified.zip",
 		backupSha256: await computeSha256(backupBytes),
 	};
 
-	await access.assertForceBackupProof("from_remote", proof);
-	assert.equal(canonicalChecked, true);
-	localBytes = encoder.encode("after").buffer;
+	const withoutArchive = {
+		direction: proof.direction,
+		canonical: proof.canonical,
+		snapshotDigest: proof.snapshotDigest,
+		backup: null,
+	};
+	const choices = [
+		{ forceBackupProof: proof },
+		{ forcePreflightProof: withoutArchive },
+		{
+			forcePreflightProof: {
+				...withoutArchive,
+				backup: {
+					backupName: proof.backupName,
+					backupSha256: proof.backupSha256,
+				},
+			},
+		},
+	];
+	for (const options of choices) {
+		localBytes = encoder.encode("before").buffer;
+		await forceSync.assertForcePreflightProof(deps, "from_remote", options);
+		assert.equal(canonicalChecked, true);
+		localBytes = encoder.encode("after").buffer;
+		await assert.rejects(
+			forceSync.assertForcePreflightProof(deps, "from_remote", options),
+			ForceBackupStaleError,
+		);
+	}
 	await assert.rejects(
-		access.assertForceBackupProof("from_remote", proof),
-		ForceBackupStaleError,
+		forceSync.assertForcePreflightProof(deps, "from_remote", {
+			forceBackupProof: proof,
+			forcePreflightProof: withoutArchive,
+		}),
+		/Conflicting Force proofs/,
 	);
 });
 
 test("Force local source drift aborts before replacement commit", () => {
-	const access = createSourceProofAccess();
+	const access = forceSync;
 	const source = new Map([["note.md", metadata("note.md", "before")]]);
 	const identity = access.getForceLocalSourceIdentity(source);
 	access.assertForceLocalSourceUnchanged(identity, source);
@@ -139,7 +138,7 @@ test("Force local source drift aborts before replacement commit", () => {
 });
 
 test("Force remote source drift aborts before replacement commit", () => {
-	const access = createSourceProofAccess();
+	const access = forceSync;
 	const source = new Map([
 		["note.md", metadata("note.md", "logical", "remote-before")],
 	]);

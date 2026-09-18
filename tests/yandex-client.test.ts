@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-	YandexDiskClient,
-} from "../src/api/yandex-client";
+import { YandexDiskClient } from "../src/api/yandex-client";
 import type { YandexResource } from "../src/types";
 
 interface TestRequestParams {
@@ -18,9 +16,7 @@ interface TestResponse {
 }
 
 const requestGlobal = globalThis as typeof globalThis & {
-	__obsidianRequestUrl?: (
-		params: TestRequestParams,
-	) => Promise<TestResponse>;
+	__obsidianRequestUrl?: (params: TestRequestParams) => Promise<TestResponse>;
 };
 
 function response(status: number, json: unknown = {}): TestResponse {
@@ -90,10 +86,7 @@ test("stable raw read reuses caller metadata as its before observation", async (
 	const client = new StableReadClient([
 		fileResource("vault/index", { md5: "same", sha256: "strong" }),
 	]);
-	const snapshot = await client.downloadStableRawFile(
-		"vault/index",
-		before,
-	);
+	const snapshot = await client.downloadStableRawFile("vault/index", before);
 	assert.ok(snapshot);
 	assert.equal(snapshot.fingerprint, "sha256:strong");
 });
@@ -139,11 +132,16 @@ class TreeClient extends YandexDiskClient {
 			"vault/b": [fileResource("vault/b/b.md", { md5: "b" })],
 		};
 		const items = children[path];
-		if (!items) return null;
+		if (!items) {
+			return null;
+		}
 		return this.directory(path, items);
 	}
 
-	private directory(path: string, items: YandexResource[] = []): YandexResource {
+	private directory(
+		path: string,
+		items: YandexResource[] = [],
+	): YandexResource {
 		return {
 			name: path.split("/").pop() ?? path,
 			path,
@@ -177,14 +175,11 @@ test("observed remote folders skip redundant mkdir", async () => {
 	const calls: string[] = [];
 	requestGlobal.__obsidianRequestUrl = async (params) => {
 		calls.push(`${params.method ?? "GET"} ${params.url}`);
-		return response(
-			200,
-			{
-				...fileResource("vault"),
-				type: "dir",
-				_embedded: { items: [], total: 0, limit: 1, offset: 0 },
-			},
-		);
+		return response(200, {
+			...fileResource("vault"),
+			type: "dir",
+			_embedded: { items: [], total: 0, limit: 1, offset: 0 },
+		});
 	};
 	try {
 		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
@@ -367,6 +362,41 @@ test("missing cached upload parent is recreated before retry", async () => {
 		assert.equal(uploadLinkAttempts, 2);
 		assert.equal(folderCreates, 1);
 		assert.equal(contentUploads, 1);
+	} finally {
+		delete requestGlobal.__obsidianRequestUrl;
+	}
+});
+
+test("DELETE retry revalidates revoked authority before sending another request", async () => {
+	const original = new TextEncoder().encode("current plaintext").buffer;
+	let remoteBytes = original;
+	let authorized = true;
+	let requests = 0;
+	requestGlobal.__obsidianRequestUrl = async () => {
+		requests++;
+		if (requests === 1) {
+			authorized = false;
+			return response(503);
+		}
+		remoteBytes = new ArrayBuffer(0);
+		return response(204);
+	};
+	try {
+		const client = new YandexDiskClient({
+			token: "synthetic",
+			maxRetries: 2,
+			retryDelay: 0,
+		});
+		await assert.rejects(
+			client.deleteResource("vault/note.md", false, true, async () => {
+				if (!authorized) {
+					throw new Error("cleanup authority revoked");
+				}
+			}),
+			/authority revoked/,
+		);
+		assert.equal(requests, 1);
+		assert.deepEqual(remoteBytes, original);
 	} finally {
 		delete requestGlobal.__obsidianRequestUrl;
 	}

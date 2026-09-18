@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { YandexDiskClient } from "../src/api/yandex-client";
-import {
-	EncryptionService,
-	SALT_LENGTH,
-} from "../src/crypto/encryption";
+import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
 
 async function createEncryptedClient(): Promise<{
 	client: YandexDiskClient;
@@ -60,9 +57,7 @@ test("invalid encrypted resource name never falls back to a logical path", async
 });
 
 test("hardened folder moves keep descendant physical segments unchanged", async () => {
-	const service = new EncryptionService(
-		new Uint8Array(SALT_LENGTH).fill(9),
-	);
+	const service = new EncryptionService(new Uint8Array(SALT_LENGTH).fill(9));
 	await service.initializeKey("password");
 	const client = new YandexDiskClient({ token: "test-token" });
 	client.setRemotePath("vault");

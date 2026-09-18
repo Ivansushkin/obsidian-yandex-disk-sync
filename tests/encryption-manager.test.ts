@@ -2,9 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EncryptionManager } from "../src/crypto/encryption-manager";
 import { EncryptionService } from "../src/crypto/encryption";
-import type {
-	YandexDiskSyncSettings,
-} from "../src/types";
+import type { YandexDiskSyncSettings } from "../src/types";
 
 const manager = new EncryptionManager();
 const salt = EncryptionService.bytesToBase64(new Uint8Array(16).fill(7));

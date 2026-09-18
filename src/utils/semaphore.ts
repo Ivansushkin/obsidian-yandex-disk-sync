@@ -40,7 +40,6 @@ export class Semaphore {
 			}
 		}
 	}
-
 }
 
 /**
@@ -49,7 +48,7 @@ export class Semaphore {
 export async function runWithConcurrency<T>(
 	tasks: Array<() => Promise<T>>,
 	concurrency: number,
-	onProgress?: (completed: number, total: number) => void
+	onProgress?: (completed: number, total: number) => void,
 ): Promise<T[]> {
 	if (tasks.length === 0) {
 		return [];
@@ -91,8 +90,13 @@ export async function runWithConcurrency<T>(
 export async function runWithConcurrencySettled<T>(
 	tasks: Array<() => Promise<T>>,
 	concurrency: number,
-	onProgress?: (completed: number, total: number) => void
-): Promise<Array<{ status: "fulfilled"; value: T } | { status: "rejected"; reason: unknown }>> {
+	onProgress?: (completed: number, total: number) => void,
+): Promise<
+	Array<
+		| { status: "fulfilled"; value: T }
+		| { status: "rejected"; reason: unknown }
+	>
+> {
 	if (tasks.length === 0) {
 		return [];
 	}

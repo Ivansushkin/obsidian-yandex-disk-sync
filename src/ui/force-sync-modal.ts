@@ -1,3 +1,4 @@
+import type { OperationBackupChoice } from "../backup/operation-backup-choice";
 import { App, Modal, Setting } from "obsidian";
 import { t } from "../i18n";
 
@@ -5,14 +6,14 @@ export type ForceSyncDirection = "from_local" | "from_remote";
 
 export class ForceSyncModal extends Modal {
 	private direction: ForceSyncDirection;
-	private onAction: (action: "proceed" | "cancel") => void;
+	private onAction: (action: OperationBackupChoice) => void;
 	private requireLegacyClientsStopped: boolean;
 	private settled = false;
 
 	constructor(
 		app: App,
 		direction: ForceSyncDirection,
-		onAction: (action: "proceed" | "cancel") => void,
+		onAction: (action: OperationBackupChoice) => void,
 		requireLegacyClientsStopped = false,
 	) {
 		super(app);
@@ -40,7 +41,8 @@ export class ForceSyncModal extends Modal {
 			text: t("modal.force_sync_recommend_backup"),
 		});
 		let legacyClientsStopped = !this.requireLegacyClientsStopped;
-		let continueButton: { setDisabled(disabled: boolean): unknown } | null = null;
+		const continueButtons: { setDisabled(disabled: boolean): unknown }[] =
+			[];
 		if (this.requireLegacyClientsStopped) {
 			new Setting(contentEl)
 				.setName(t("modal.force_sync_legacy_devices_title"))
@@ -48,29 +50,41 @@ export class ForceSyncModal extends Modal {
 				.addToggle((toggle) =>
 					toggle.setValue(false).onChange((value) => {
 						legacyClientsStopped = value;
-						continueButton?.setDisabled(!value);
+						for (const button of continueButtons) {
+							button.setDisabled(!value);
+						}
 					}),
 				);
 		}
 
 		const setting = new Setting(contentEl)
 			.addButton((btn) =>
-				(continueButton = btn)
+				(continueButtons.push(btn), btn)
 					.setDisabled(this.requireLegacyClientsStopped)
 					.setButtonText(t("modal.force_sync_backup_button"))
 					.setCta()
 					.onClick(() => {
-						if (!legacyClientsStopped) return;
+						if (!legacyClientsStopped) {
+							return;
+						}
 						btn.setDisabled(true);
-						this.finish("proceed");
-					})
+						this.finish("with-backup");
+					}),
 			)
-			.addButton((btn) =>
-				btn
-					.setButtonText(t("modal.cancel_button"))
+			.addButton((btn) => {
+				continueButtons.push(btn);
+				btn.setDisabled(this.requireLegacyClientsStopped)
+					.setButtonText(t("modal.continue_without_backup"))
 					.onClick(() => {
-						this.finish("cancel");
-					})
+						if (legacyClientsStopped) {
+							this.finish("without-backup");
+						}
+					});
+			})
+			.addButton((btn) =>
+				btn.setButtonText(t("modal.cancel_button")).onClick(() => {
+					this.finish("cancel");
+				}),
 			);
 		setting.settingEl.addClass("force-sync-modal-buttons");
 	}
@@ -84,8 +98,10 @@ export class ForceSyncModal extends Modal {
 		}
 	}
 
-	private finish(action: "proceed" | "cancel"): void {
-		if (this.settled) return;
+	private finish(action: OperationBackupChoice): void {
+		if (this.settled) {
+			return;
+		}
 		this.settled = true;
 		this.onAction(action);
 		this.close();

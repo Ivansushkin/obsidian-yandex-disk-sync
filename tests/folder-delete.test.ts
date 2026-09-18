@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import { SyncEngine } from "../src/sync/sync-engine";
-import type { IndexManager } from "../src/sync/index-manager";
+import { SyncEngine } from "../src/sync/engine";
+import type { IndexManager } from "../src/sync/canonical/manager";
 import {
 	createEmptyIndex,
 	DEFAULT_SETTINGS,
@@ -60,10 +60,10 @@ class FolderDeleteIndexFake {
 			"folder/Без названия.md",
 			{ deleted: true, changedRevision: 6 },
 		);
-		this.index.files["folder/Чо как.md"] = metadata(
-			"folder/Чо как.md",
-			{ fingerprint: "live-fingerprint", changedRevision: 7 },
-		);
+		this.index.files["folder/Чо как.md"] = metadata("folder/Чо как.md", {
+			fingerprint: "live-fingerprint",
+			changedRevision: 7,
+		});
 		this.local.files = structuredClone(this.index.files);
 	}
 
@@ -134,7 +134,9 @@ class FolderDeleteIndexFake {
 		mutationSeq?: number,
 	) {
 		const current = this.index.files[path];
-		if (!current || current.deleted) return;
+		if (!current || current.deleted) {
+			return;
+		}
 		Object.assign(current, {
 			deleted: true,
 			deletedAt: 1,
@@ -147,7 +149,9 @@ class FolderDeleteIndexFake {
 
 	markLocalFileDeleted(path: string, deletedByFolder?: string) {
 		const current = this.local.files[path];
-		if (!current || current.deleted) return;
+		if (!current || current.deleted) {
+			return;
+		}
 		Object.assign(current, {
 			deleted: true,
 			deletedAt: 1,
@@ -201,8 +205,7 @@ class FolderDeleteIndexFake {
 			path,
 			targetPath: options.targetPath,
 			parentMutationId: options.parentMutationId,
-			canonicalRevision:
-				options.canonicalRevision ?? this.index.revision,
+			canonicalRevision: options.canonicalRevision ?? this.index.revision,
 			expectedFingerprint: options.expectedFingerprint,
 			createdAt: 1,
 		};
@@ -223,7 +226,9 @@ class FolderDeleteIndexFake {
 			}
 		}
 		const tombstone = this.index.folderTombstones.folder;
-		if (tombstone) tombstone.changedRevision = this.index.revision;
+		if (tombstone) {
+			tombstone.changedRevision = this.index.revision;
+		}
 		for (const move of Object.values(this.index.moves)) {
 			move.changedRevision = this.index.revision;
 		}
@@ -243,7 +248,9 @@ class FolderDeleteIndexFake {
 		const index = this.pendingMutations.findIndex(
 			(mutation) => mutation.id === id,
 		);
-		if (index >= 0) this.pendingMutations.splice(index, 1);
+		if (index >= 0) {
+			this.pendingMutations.splice(index, 1);
+		}
 	}
 
 	async readCanonicalIndex() {
@@ -260,7 +267,9 @@ class FolderDeleteIndexFake {
 		const index = this.pendingActions.findIndex(
 			(action) => action.id === id,
 		);
-		if (index >= 0) this.pendingActions.splice(index, 1);
+		if (index >= 0) {
+			this.pendingActions.splice(index, 1);
+		}
 	}
 
 	beginPhysicalRewriteCommit() {}
@@ -290,14 +299,18 @@ class FolderDeleteYandexFake {
 					type: "file",
 					modified: new Date(1).toISOString(),
 					size: 1,
-				  }
+				}
 			: null;
 	}
 
 	async moveResource(fromPath: string, toPath: string) {
 		const resource = this.resources.get(fromPath);
-		if (!resource) throw new Error("missing source");
-		if (this.resources.has(toPath)) throw new Error("target exists");
+		if (!resource) {
+			throw new Error("missing source");
+		}
+		if (this.resources.has(toPath)) {
+			throw new Error("target exists");
+		}
 		this.resources.set(toPath, resource);
 		this.resources.delete(fromPath);
 		this.moves.push({ fromPath, toPath });
@@ -339,13 +352,11 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		assert.equal(indexManager.pendingMutations.length, 0);
 		assert.equal(indexManager.pendingActions.length, 0);
 		assert.equal(
-			indexManager.index.files["folder/Без названия.md"]
-				?.changedRevision,
+			indexManager.index.files["folder/Без названия.md"]?.changedRevision,
 			6,
 		);
 		assert.equal(
-			indexManager.index.files["folder/Без названия.md"]
-				?.deletedByFolder,
+			indexManager.index.files["folder/Без названия.md"]?.deletedByFolder,
 			undefined,
 		);
 	});
@@ -399,7 +410,10 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			},
 		]);
 		assert.equal(indexManager.index.files["A/deep/note.md"]?.deleted, true);
-		assert.equal(indexManager.index.files["B/deep/note.md"]?.deleted, false);
+		assert.equal(
+			indexManager.index.files["B/deep/note.md"]?.deleted,
+			false,
+		);
 		assert.equal(
 			indexManager.index.files["B/deep/note.md"]?.mutationSeq,
 			2,
@@ -486,7 +500,9 @@ test("folder target conflict performs no canonical or physical writes", async ()
 	const yandexClient = new FolderDeleteYandexFake();
 	yandexClient.resources.clear();
 	yandexClient.resources.set("remote/A/note.md", { sha256: "hash" });
-	yandexClient.resources.set("remote/B/note.md", { sha256: "different-target" });
+	yandexClient.resources.set("remote/B/note.md", {
+		sha256: "different-target",
+	});
 	const engine = new SyncEngine(
 		yandexClient as unknown as YandexDiskClient,
 		{} as VaultAdapter,

@@ -11,7 +11,11 @@ import type {
 } from "../types";
 import type { EncryptionCodec } from "../crypto/encryption";
 import { logger } from "../utils/logger";
-import { encodePathForUrl, isProtectedPath, normalizePath } from "../utils/path-utils";
+import {
+	encodePathForUrl,
+	isProtectedPath,
+	normalizePath,
+} from "../utils/path-utils";
 import { runWithConcurrency } from "../utils/semaphore";
 import {
 	getMatchingStableContentFingerprint,
@@ -65,7 +69,9 @@ export class YandexDiskClient {
 	 * Update token
 	 */
 	setToken(token: string): void {
-		if (this.token !== token) this.clearFolderCache();
+		if (this.token !== token) {
+			this.clearFolderCache();
+		}
 		this.token = token;
 	}
 
@@ -74,7 +80,9 @@ export class YandexDiskClient {
 	 * Pass null to disable encryption.
 	 */
 	setEncryptionService(service: EncryptionCodec | null): void {
-		if (this.encryptionService !== service) this.clearFolderCache();
+		if (this.encryptionService !== service) {
+			this.clearFolderCache();
+		}
 		this.encryptionService = service;
 	}
 
@@ -93,7 +101,9 @@ export class YandexDiskClient {
 	 */
 	setRemotePath(remotePath: string): void {
 		const normalized = normalizePath(remotePath);
-		if (this.remotePath !== normalized) this.clearFolderCache();
+		if (this.remotePath !== normalized) {
+			this.clearFolderCache();
+		}
 		this.remotePath = normalized;
 	}
 
@@ -119,7 +129,9 @@ export class YandexDiskClient {
 	/** Invalidate a folder observation and every cached descendant. */
 	private invalidateFolder(path: string): void {
 		const normalized = this.normalizeFolderObservation(path);
-		if (!normalized) return;
+		if (!normalized) {
+			return;
+		}
 		for (const cached of [...this.folderCache]) {
 			if (cached === normalized || cached.startsWith(`${normalized}/`)) {
 				this.folderCache.delete(cached);
@@ -150,11 +162,14 @@ export class YandexDiskClient {
 	): Promise<StableRawFileSnapshot | null> {
 		const startedAt = Date.now();
 		const before =
-			expectedResource ??
-			(await this.getResource(path, 1, 0, true));
-		if (!before) return null;
+			expectedResource ?? (await this.getResource(path, 1, 0, true));
+		if (!before) {
+			return null;
+		}
 		if (!this.getContentFingerprint(before)) {
-			throw new Error("Remote service file has no stable content fingerprint");
+			throw new Error(
+				"Remote service file has no stable content fingerprint",
+			);
 		}
 
 		const raw = await this.downloadFile(path, true);
@@ -187,7 +202,9 @@ export class YandexDiskClient {
 	): Promise<StableLogicalFileSnapshot | null> {
 		const before =
 			expectedResource ?? (await this.getLogicalResource(path));
-		if (!before || !this.getContentFingerprint(before)) return null;
+		if (!before || !this.getContentFingerprint(before)) {
+			return null;
+		}
 		const content = await this.downloadFile(path);
 		const after = await this.getLogicalResource(path);
 		if (!after) {
@@ -239,72 +256,99 @@ export class YandexDiskClient {
 	// ============================================================================
 
 	private async encryptContent(data: ArrayBuffer): Promise<ArrayBuffer> {
-		if (!this.encryptionService) return data;
+		if (!this.encryptionService) {
+			return data;
+		}
 		return this.encryptionService.encrypt(data);
 	}
 
 	private async decryptContent(data: ArrayBuffer): Promise<ArrayBuffer> {
-		if (!this.encryptionService) return data;
+		if (!this.encryptionService) {
+			return data;
+		}
 		return this.encryptionService.decrypt(data);
 	}
 
 	/** Map a logical file path to the current physical layout. */
 	private async encryptFilePath(path: string): Promise<string> {
-		if (!this.encryptionService) return path;
-		if (isProtectedPath(path)) return path;
+		if (!this.encryptionService) {
+			return path;
+		}
+		if (isProtectedPath(path)) {
+			return path;
+		}
 
 		const base = this.remotePath;
 		const full = normalizePath(path);
-		if (!full || full === base) return path;
+		if (!full || full === base) {
+			return path;
+		}
 
 		const hasBase = base !== "" && full.startsWith(base + "/");
 		const relative = hasBase ? full.slice(base.length + 1) : full;
 		const encrypted = await Promise.all(
-			relative.split("/").map((seg) => this.encryptionService!.encryptFilename(seg))
+			relative
+				.split("/")
+				.map((seg) => this.encryptionService!.encryptFilename(seg)),
 		);
 		const joined = encrypted.join("/");
 		return hasBase ? `${base}/${joined}` : joined;
 	}
 
 	private async decryptFileName(name: string): Promise<string> {
-		if (!this.encryptionService) return name;
+		if (!this.encryptionService) {
+			return name;
+		}
 		return await this.encryptionService.decryptFilename(name);
 	}
 
 	/** Decode a physical resource path without accepting ciphertext fallback. */
 	private async decryptFilePath(path: string): Promise<string> {
-		if (!this.encryptionService) return path;
-		if (isProtectedPath(path)) return path;
+		if (!this.encryptionService) {
+			return path;
+		}
+		if (isProtectedPath(path)) {
+			return path;
+		}
 
 		const diskPrefix = path.startsWith("disk:/") ? "disk:/" : "";
 		const clean = normalizePath(path.replace(/^disk:\//, ""));
 		const base = normalizePath(this.remotePath.replace(/^disk:\//, ""));
-		if (!clean || clean === base) return path;
+		if (!clean || clean === base) {
+			return path;
+		}
 
 		const hasBase = base !== "" && clean.startsWith(base + "/");
 		const relative = hasBase ? clean.slice(base.length + 1) : clean;
 		const decrypted = await Promise.all(
-			relative.split("/").map((seg) => this.decryptFileName(seg))
+			relative.split("/").map((seg) => this.decryptFileName(seg)),
 		);
 		const joined = decrypted.join("/");
-		return hasBase ? `${diskPrefix}${base}/${joined}` : `${diskPrefix}${joined}`;
+		return hasBase
+			? `${diskPrefix}${base}/${joined}`
+			: `${diskPrefix}${joined}`;
 	}
 
-	private async decryptResource(resource: YandexResource): Promise<YandexResource> {
-		if (!this.encryptionService) return resource;
+	private async decryptResource(
+		resource: YandexResource,
+	): Promise<YandexResource> {
+		if (!this.encryptionService) {
+			return resource;
+		}
 		const protectedRawResource = isProtectedPath(resource.path);
 		return {
 			...resource,
-			name:
-				protectedRawResource
-					? resource.name
-					: await this.decryptFileName(resource.name),
+			name: protectedRawResource
+				? resource.name
+				: await this.decryptFileName(resource.name),
 			path: await this.decryptFilePath(resource.path),
 			_embedded: resource._embedded
 				? {
 						...resource._embedded,
 						items: await Promise.all(
-							resource._embedded.items.map((item) => this.decryptResource(item))
+							resource._embedded.items.map((item) =>
+								this.decryptResource(item),
+							),
 						),
 					}
 				: undefined,
@@ -314,9 +358,7 @@ export class YandexDiskClient {
 	/**
 	 * Convert raw Yandex resource metadata to the active logical path.
 	 */
-	async toLogicalResource(
-		resource: YandexResource,
-	): Promise<YandexResource> {
+	async toLogicalResource(resource: YandexResource): Promise<YandexResource> {
 		return await this.decryptResource(resource);
 	}
 
@@ -327,16 +369,18 @@ export class YandexDiskClient {
 		path: string,
 		limit = 1000,
 		offset = 0,
-		raw = false
+		raw = false,
 	): Promise<YandexResource | null> {
 		try {
 			const encodedPath = encodePathForUrl(path);
 			const response = await this.request(
 				"GET",
-				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`
+				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`,
 			);
 			const resource = response.json as YandexResource;
-			if (resource.type === "dir") this.rememberFolder(path);
+			if (resource.type === "dir") {
+				this.rememberFolder(path);
+			}
 			if (raw) {
 				return resource;
 			}
@@ -372,9 +416,13 @@ export class YandexDiskClient {
 	): Promise<string> {
 		const normalized = normalizePath(path);
 		if (!normalized || normalized !== path || isProtectedPath(normalized)) {
-			throw new Error("Transition target contains an invalid physical path");
+			throw new Error(
+				"Transition target contains an invalid physical path",
+			);
 		}
-		if (!service) return normalized;
+		if (!service) {
+			return normalized;
+		}
 		return (
 			await Promise.all(
 				normalized
@@ -402,15 +450,20 @@ export class YandexDiskClient {
 			const currentLevel = [...new Set(level)]
 				.filter((currentPath) => !visited.has(currentPath))
 				.sort((left, right) => left.localeCompare(right));
-			for (const currentPath of currentLevel) visited.add(currentPath);
+			for (const currentPath of currentLevel) {
+				visited.add(currentPath);
+			}
 			const batches = await runWithConcurrency(
-				currentLevel.map((currentPath) => async () =>
-					await this.readDirectoryPageSet(currentPath, raw),
+				currentLevel.map(
+					(currentPath) => async () =>
+						await this.readDirectoryPageSet(currentPath, raw),
 				),
 				limit,
 			);
 			level = batches.flatMap((batch) => batch.directories);
-			for (const batch of batches) results.push(...batch.files);
+			for (const batch of batches) {
+				results.push(...batch.files);
+			}
 		}
 		logger.debug("Remote tree traversal completed", {
 			folders: visited.size,
@@ -434,24 +487,32 @@ export class YandexDiskClient {
 		const limit = 1000;
 		while (true) {
 			const resource = await this.getResource(path, limit, offset, true);
-			if (!resource) break;
+			if (!resource) {
+				break;
+			}
 			if (resource.type === "file") {
-				files.push(raw ? resource : await this.decryptResource(resource));
+				files.push(
+					raw ? resource : await this.decryptResource(resource),
+				);
 				break;
 			}
 			const embedded = resource._embedded;
-			if (!embedded) break;
+			if (!embedded) {
+				break;
+			}
 			for (const item of embedded.items) {
 				if (item.type === "dir") {
-					this.rememberFolder(
-						item.path.replace(/^disk:\//, ""),
-					);
-					if (!isProtectedPath(item.path)) directories.push(item.path);
+					this.rememberFolder(item.path.replace(/^disk:\//, ""));
+					if (!isProtectedPath(item.path)) {
+						directories.push(item.path);
+					}
 				} else {
 					files.push(raw ? item : await this.decryptResource(item));
 				}
 			}
-			if (offset + embedded.items.length >= embedded.total) break;
+			if (offset + embedded.items.length >= embedded.total) {
+				break;
+			}
 			offset += limit;
 		}
 		return { files, directories };
@@ -481,7 +542,9 @@ export class YandexDiskClient {
 				this.rememberFolder(path);
 			} else if (this.isConflictError(e)) {
 				const existing = await this.getResource(path, 1, 0, true);
-				if (existing?.type !== "dir") throw e;
+				if (existing?.type !== "dir") {
+					throw e;
+				}
 				this.rememberFolder(path);
 			} else {
 				throw e;
@@ -551,7 +614,9 @@ export class YandexDiskClient {
 	async isFolderEmpty(remotePath: string): Promise<boolean> {
 		const target = await this.encryptFilePath(remotePath);
 		const resource = await this.getResource(target, 1000, 0, true);
-		if (!resource) return true;
+		if (!resource) {
+			return true;
+		}
 		const items = resource._embedded?.items ?? [];
 		return items.length === 0;
 	}
@@ -561,13 +626,10 @@ export class YandexDiskClient {
 	 * encryption.
 	 */
 	async isRawFolderEmpty(remotePath: string): Promise<boolean> {
-		const resource = await this.getResource(
-			remotePath,
-			1000,
-			0,
-			true,
-		);
-		if (!resource) return true;
+		const resource = await this.getResource(remotePath, 1000, 0, true);
+		if (!resource) {
+			return true;
+		}
 		return (resource._embedded?.items ?? []).length === 0;
 	}
 
@@ -577,13 +639,13 @@ export class YandexDiskClient {
 	async getUploadLink(
 		path: string,
 		overwrite = true,
-		raw = false
+		raw = false,
 	): Promise<YandexUploadLink> {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
 		const response = await this.request(
 			"GET",
-			`/resources/upload?path=${encodedPath}&overwrite=${overwrite}`
+			`/resources/upload?path=${encodedPath}&overwrite=${overwrite}`,
 		);
 		return response.json as YandexUploadLink;
 	}
@@ -625,19 +687,20 @@ export class YandexDiskClient {
 			) {
 				await this.recreateUploadParent(remotePath, raw);
 				await this.putFile(remotePath, content, raw, overwrite);
-				logger.debug(`Uploaded file after folder recovery: ${remotePath}`);
+				logger.debug(
+					`Uploaded file after folder recovery: ${remotePath}`,
+				);
 				return;
 			}
-			if (!skipFolderCheck) throw e;
+			if (!skipFolderCheck) {
+				throw e;
+			}
 			// Only retry when the failure is consistent with a missing/vanished
 			// parent folder (404 not found). Other errors
 			// (auth, quota, network, 5xx) are not caused by a missing folder
 			// and would just waste an extra upload attempt while masking the
 			// real cause.
-			if (
-				!(e instanceof YandexApiError) ||
-				e.status !== 404
-			) {
+			if (!(e instanceof YandexApiError) || e.status !== 404) {
 				throw e;
 			}
 			// The preflight-created parent may have been pruned between preflight
@@ -666,20 +729,17 @@ export class YandexDiskClient {
 		skipFolderCheck = false,
 		raw = false,
 	): Promise<void> {
-		await this.uploadFile(
-			remotePath,
-			content,
-			skipFolderCheck,
-			raw,
-			false,
-		);
+		await this.uploadFile(remotePath, content, skipFolderCheck, raw, false);
 	}
 
 	/**
 	 * Ensure the parent folder of the given target path exists, deriving the
 	 * parent from the (optionally encrypted) target path.
 	 */
-	private async ensureUploadParent(remotePath: string, raw: boolean): Promise<void> {
+	private async ensureUploadParent(
+		remotePath: string,
+		raw: boolean,
+	): Promise<void> {
 		const parentPath = await this.getUploadParent(remotePath, raw);
 		if (parentPath) {
 			await this.createFolderRecursive(parentPath);
@@ -692,7 +752,9 @@ export class YandexDiskClient {
 		raw: boolean,
 	): Promise<void> {
 		const parentPath = await this.getUploadParent(remotePath, raw);
-		if (!parentPath) return;
+		if (!parentPath) {
+			return;
+		}
 		this.invalidateFolder(parentPath);
 		await this.createFolderRecursive(parentPath);
 	}
@@ -727,11 +789,7 @@ export class YandexDiskClient {
 			: await this.encryptContent(bytes.buffer);
 
 		// Get upload link with optionally encrypted path
-		const uploadLink = await this.getUploadLink(
-			remotePath,
-			overwrite,
-			raw,
-		);
+		const uploadLink = await this.getUploadLink(remotePath, overwrite, raw);
 
 		let lastError: Error | null = null;
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -742,12 +800,13 @@ export class YandexDiskClient {
 					body: bodyContent,
 					throw: false,
 				});
-				if (response.status >= 200 && response.status < 300) return;
+				if (response.status >= 200 && response.status < 300) {
+					return;
+				}
 
 				const errorData = response.json as YandexError;
 				const error = new YandexApiError(
-					errorData?.description ||
-						`Upload HTTP ${response.status}`,
+					errorData?.description || `Upload HTTP ${response.status}`,
 					response.status,
 					errorData?.error,
 				);
@@ -766,7 +825,9 @@ export class YandexDiskClient {
 					throw e;
 				}
 				lastError = e as Error;
-				if (attempt === this.maxRetries) break;
+				if (attempt === this.maxRetries) {
+					break;
+				}
 			}
 			await this.sleep(this.getRetryDelay(attempt));
 		}
@@ -776,12 +837,15 @@ export class YandexDiskClient {
 	/**
 	 * Get download link for file
 	 */
-	async getDownloadLink(path: string, raw = false): Promise<YandexDownloadLink> {
+	async getDownloadLink(
+		path: string,
+		raw = false,
+	): Promise<YandexDownloadLink> {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
 		const response = await this.request(
 			"GET",
-			`/resources/download?path=${encodedPath}`
+			`/resources/download?path=${encodedPath}`,
 		);
 		return response.json as YandexDownloadLink;
 	}
@@ -835,13 +899,7 @@ export class YandexDiskClient {
 	): Promise<void> {
 		const plain = new TextEncoder().encode(content).buffer;
 		const encoded = service ? await service.encrypt(plain) : plain;
-		await this.uploadFile(
-			remotePath,
-			encoded,
-			true,
-			true,
-			overwrite,
-		);
+		await this.uploadFile(remotePath, encoded, true, true, overwrite);
 	}
 
 	/**
@@ -851,21 +909,26 @@ export class YandexDiskClient {
 	async deleteResource(
 		path: string,
 		permanently = false,
-		raw = false
+		raw = false,
+		beforeAttempt?: () => Promise<void>,
 	): Promise<void> {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
 		try {
 			const response = await this.request(
 				"DELETE",
-				`/resources?path=${encodedPath}&permanently=${permanently}`
+				`/resources?path=${encodedPath}&permanently=${permanently}`,
+				undefined,
+				beforeAttempt,
 			);
 			await this.waitForAsyncOperation(response);
 			this.invalidateFolder(targetPath);
 			logger.debug(`Deleted resource: ${path}`);
 		} catch (e: unknown) {
 			// Ignore error if resource doesn't exist
-			if (!this.isNotFoundError(e)) throw e;
+			if (!this.isNotFoundError(e)) {
+				throw e;
+			}
 			this.invalidateFolder(targetPath);
 		}
 	}
@@ -876,7 +939,7 @@ export class YandexDiskClient {
 	async moveResource(
 		fromPath: string,
 		toPath: string,
-		overwrite = false
+		overwrite = false,
 	): Promise<void> {
 		const encryptedFrom = await this.encryptFilePath(fromPath);
 		const encryptedTo = await this.encryptFilePath(toPath);
@@ -884,14 +947,17 @@ export class YandexDiskClient {
 		const encodedTo = encodePathForUrl(encryptedTo);
 
 		// Ensure target folder exists — derive parent from the encrypted path.
-		const parentPath = encryptedTo.substring(0, encryptedTo.lastIndexOf("/"));
+		const parentPath = encryptedTo.substring(
+			0,
+			encryptedTo.lastIndexOf("/"),
+		);
 		if (parentPath) {
 			await this.createFolderRecursive(parentPath);
 		}
 
 		const response = await this.request(
 			"POST",
-			`/resources/move?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`
+			`/resources/move?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`,
 		);
 		await this.waitForAsyncOperation(response);
 		this.invalidateFolder(encryptedFrom);
@@ -914,7 +980,8 @@ export class YandexDiskClient {
 	private async request(
 		method: string,
 		endpoint: string,
-		body?: unknown
+		body?: unknown,
+		beforeAttempt?: () => Promise<void>,
 	): Promise<RequestUrlResponse> {
 		const url = `${API_BASE_URL}${endpoint}`;
 		const endpointName = endpoint.split("?", 1)[0] ?? endpoint;
@@ -936,6 +1003,9 @@ export class YandexDiskClient {
 		let lastError: Error | null = null;
 
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+			if (beforeAttempt) {
+				await beforeAttempt();
+			}
 			try {
 				if (method === "GET") {
 					this.recordApiRead(endpoint);
@@ -959,43 +1029,45 @@ export class YandexDiskClient {
 				const errorData = response.json as YandexError;
 
 				// Errors that can be retried
-				if (
-					this.isTransientStatus(response.status)
-				) {
+				if (this.isTransientStatus(response.status)) {
 					lastError = new YandexApiError(
 						errorData?.description ||
-						"Rate limit or service unavailable",
+							"Rate limit or service unavailable",
 						response.status,
-						errorData?.error
+						errorData?.error,
 					);
 
-					logger.warn(`API rate/service error: ${method} ${endpointName} -> ${response.status}`, {
-						code: errorData?.error,
-						description: errorData?.description,
-						attempt: attempt + 1,
-					});
+					logger.warn(
+						`API rate/service error: ${method} ${endpointName} -> ${response.status}`,
+						{
+							code: errorData?.error,
+							description: errorData?.description,
+							attempt: attempt + 1,
+						},
+					);
 
 					if (attempt < this.maxRetries) {
 						const delay = this.getRetryDelay(attempt);
-						logger.warn(
-							`Retrying API request in ${delay}ms`
-						);
+						logger.warn(`Retrying API request in ${delay}ms`);
 						await this.sleep(delay);
 						continue;
 					}
 				}
 
-			// Other errors - don't retry
-			logger.debug(`API error: ${method} ${endpointName} -> ${response.status}`, {
-				code: errorData?.error,
-				description: errorData?.description,
-				message: errorData?.message,
-				reason: errorData?.reason,
-			});
+				// Other errors - don't retry
+				logger.debug(
+					`API error: ${method} ${endpointName} -> ${response.status}`,
+					{
+						code: errorData?.error,
+						description: errorData?.description,
+						message: errorData?.message,
+						reason: errorData?.reason,
+					},
+				);
 				throw new YandexApiError(
 					errorData?.description || `HTTP ${response.status}`,
 					response.status,
-					errorData?.error
+					errorData?.error,
 				);
 			} catch (e) {
 				if (e instanceof YandexApiError) {
@@ -1010,9 +1082,7 @@ export class YandexDiskClient {
 
 				if (attempt < this.maxRetries) {
 					const delay = this.getRetryDelay(attempt);
-					logger.warn(
-						`Network error, retry in ${delay}ms:`
-					);
+					logger.warn(`Network error, retry in ${delay}ms:`);
 					await this.sleep(delay);
 				}
 			}
@@ -1057,9 +1127,13 @@ export class YandexDiskClient {
 	private async waitForAsyncOperation(
 		response: RequestUrlResponse,
 	): Promise<void> {
-		if (response.status !== 202) return;
+		if (response.status !== 202) {
+			return;
+		}
 		const href = (response.json as { href?: unknown } | null)?.href;
-		if (typeof href !== "string" || !href) return;
+		if (typeof href !== "string" || !href) {
+			return;
+		}
 		const operationUrl = href.startsWith("http")
 			? href
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
@@ -1079,9 +1153,7 @@ export class YandexDiskClient {
 			) {
 				if (
 					(operationResponse.status === 409 ||
-						this.isTransientStatus(
-							operationResponse.status,
-						)) &&
+						this.isTransientStatus(operationResponse.status)) &&
 					attempt < 119
 				) {
 					await this.sleep(this.getRetryDelay(attempt % 4));
@@ -1096,10 +1168,10 @@ export class YandexDiskClient {
 				operationResponse.json as { status?: unknown } | null
 			)?.status;
 			const status =
-				typeof rawStatus === "string"
-					? rawStatus.toLowerCase()
-					: "";
-			if (status === "success") return;
+				typeof rawStatus === "string" ? rawStatus.toLowerCase() : "";
+			if (status === "success") {
+				return;
+			}
 			if (status === "failed") {
 				throw new YandexApiError(
 					"Yandex Disk asynchronous operation failed",
@@ -1127,7 +1199,11 @@ export class YandexDiskClient {
  * Yandex API error
  */
 export class YandexApiError extends Error {
-	constructor(message: string, public status: number, public code?: string) {
+	constructor(
+		message: string,
+		public status: number,
+		public code?: string,
+	) {
 		super(message);
 		this.name = "YandexApiError";
 	}

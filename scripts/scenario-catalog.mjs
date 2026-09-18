@@ -3,10 +3,16 @@ const PRIORITIES = new Set(["P0", "P1", "P2"]);
 /** Parse user-scenario rows while ignoring invariant and Markdown header rows. */
 export function parseScenarioRows(markdown) {
 	return markdown.split("\n").flatMap((line, index) => {
-		if (!line.startsWith("|")) return [];
+		if (!line.startsWith("|")) {
+			return [];
+		}
 		const cells = line.split("|").map((cell) => cell.trim());
-		if (!/^[A-Z]+-\d+$/.test(cells[1] ?? "")) return [];
-		if (!PRIORITIES.has(cells[2] ?? "")) return [];
+		if (!/^[A-Z]+-\d+$/.test(cells[1] ?? "")) {
+			return [];
+		}
+		if (!PRIORITIES.has(cells[2] ?? "")) {
+			return [];
+		}
 		return [
 			{
 				id: cells[1],
@@ -65,7 +71,10 @@ export function collectNodeTestNames(sources) {
 				names.add(name);
 				continue;
 			}
-			if (name.includes("${mode}") && !name.replace("${mode}", "").includes("${")) {
+			if (
+				name.includes("${mode}") &&
+				!name.replace("${mode}", "").includes("${")
+			) {
 				names.add(name.replace("${mode}", "plaintext"));
 				names.add(name.replace("${mode}", "encrypted"));
 			}
@@ -106,7 +115,9 @@ export function validateScenarioCatalog(markdown, testSources, smokeTests) {
 	const errors = [];
 
 	for (const row of rows) {
-		if (seen.has(row.id)) errors.push(`${row.id}: duplicate scenario ID`);
+		if (seen.has(row.id)) {
+			errors.push(`${row.id}: duplicate scenario ID`);
+		}
 		seen.add(row.id);
 		const evidence = parseScenarioEvidence(row.evidence);
 		for (const fragment of evidence.invalidFragments) {
@@ -122,7 +133,9 @@ export function validateScenarioCatalog(markdown, testSources, smokeTests) {
 			if (!coveredScenarios) {
 				errors.push(`${row.id}: missing manual case ${manualCase}`);
 			} else if (!coveredScenarios.has(row.id)) {
-				errors.push(`${row.id}: ${manualCase} does not declare this scenario`);
+				errors.push(
+					`${row.id}: ${manualCase} does not declare this scenario`,
+				);
 			}
 		}
 		if (
@@ -131,7 +144,9 @@ export function validateScenarioCatalog(markdown, testSources, smokeTests) {
 			!evidence.manualRequired &&
 			evidence.manualCases.length === 0
 		) {
-			errors.push(`${row.id}: P0/P1 scenario has no executable or manual evidence`);
+			errors.push(
+				`${row.id}: P0/P1 scenario has no executable or manual evidence`,
+			);
 		}
 	}
 	for (const [manualCase, coveredScenarios] of manualCoverage) {

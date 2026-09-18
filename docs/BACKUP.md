@@ -11,6 +11,18 @@
   Server fingerprint сам по себе недостаточен.
 - Старые backup не удаляются и не перешифровываются.
 
+## Контекст операции
+
+Ручное создание архива резервирует foreground operation до первого await и выполняется
+через maintenance существующего coordinator. Папка, режим и пароль фиксируются до
+чтения файлов и создания ZIP; изменение settings не перенаправляет архив. Force и
+transition используют собственное владение, без вложенной очереди.
+
+Connection/scope и конкурирующие foreground операции заблокированы до completion.
+Список и download привязаны к поколению конфигурации. После смены settings или закрытия
+окна старые результаты не применяются; перед повторным download после password prompt
+проверяется контекст. Это не мешает открыть старый архив его собственным паролем.
+
 ## Имена
 
 Новый формат:
@@ -64,7 +76,7 @@ Password policy:
 `creating-backup`, `uploading-backup`, `verifying-backup`. Это только UI-события:
 этап проверки ещё не означает успеха. Результат `success` возвращается после
 проверки exact bytes; потеря ответа и collision могут повторить upload/read-back.
-Force показывает эти этапы в persistent Notice с момента подтверждения,
+При выборе архива Force показывает эти этапы в persistent Notice с момента подтверждения,
 удерживая блокировку кнопок до окончания всего сценария.
 
 После success, timeout или 409 клиент выполняет stable raw download. Возможны
@@ -74,37 +86,37 @@ Force показывает эти этапы в persistent Notice с момен�
 - объект отсутствует или bytes отличаются — имя считается collision, создаётся
   новое random имя; существующий объект не перезаписывается.
 
-Force и encryption transition не переходят к destructive phase без успешно
-подтверждённого backup. Encryption transition proof привязан к canonical
-epoch/revision и digest точных logical bytes, попавших в backup; concurrent
-commit или local change инвалидирует proof.
+Перед Force и enable/disable/rotate пользователь выбирает `with-backup`,
+`without-backup` или `cancel`. Выбор не сохраняется как настройка. При отказе от
+архива операции проходят те же проверки canonical, source snapshot, codec и
+fingerprints. Защитные копии отдельных перезаписываемых/удаляемых файлов и
+conflict copies остаются обязательными по прежним правилам.
 
-Force сначала выполняет read-only canonical preflight, затем создаёт backup и
-передаёт proof внутрь сериализованной Force-сессии. Proof содержит SHA-256
-точных remote backup bytes, raw identity canonical и digest защищаемого
-snapshot: `remote-raw` для Force local, `logical-vault` для Force remote. До
-первого `mkdir`, upload/delete либо local overwrite/delete `SyncEngine` заново
-скачивает backup и переснимает canonical/snapshot. Любое отличие блокирует
-Force как stale и требует новый backup.
+Force выполняет read-only canonical preflight и фиксирует digest защищаемой
+стороны: remote-raw для Force local, logical-vault для Force remote. В coordinator
+передаётся `ForcePreflightProof` с raw canonical identity, snapshot digest и
+`backup: null` либо именем/SHA-256 выбранного архива. Перед первой mutation
+canonical и snapshot повторно проверяются; для архива проверяется также raw SHA.
+Source проверяется на каждом transfer и ещё раз перед replacement commit.
+Старый `ForceBackupProof` адаптируется к варианту с архивом; два proof одновременно
+запрещены. Ошибка архива или drift завершает попытку, без fallback и повторного
+архива. Следующий запуск снова предлагает выбор.
 
-Metadata scan и сам `remote-raw` snapshot fail closed при обнаружении старой
-remote plugin directory: её содержимое не скачивается и не попадает в ZIP.
-После такого обнаружения non-secret local marker требует сначала удалить
-directory, затем заменить OAuth token; обычный restart этот gate не снимает.
+Encryption snapshot содержит обязательное `backupProof: EncryptionBackupProof | null`.
+Отсутствующее поле недопустимо. Claim проверяет исходную revision и fingerprints
+при любом выборе; заполненный proof дополнительно связывает архив с epoch/revision
+и logical snapshot. Изменившийся source требует нового запуска. Recovery использует
+сохранённый выбор и не создаёт новый архив; подключение к существующему шифрованию
+также не архивирует vault.
 
-При migration stable 1.1 эта повторная проверка является границей local
-`data.json`: до неё на диск пишется только rollback-readable stable shape.
-После успешной проверки Force фиксирует source identity и portable-path gates,
-повторяет metadata safety check, сохраняет current `plugin-data` и только затем
-начинает replacement. Crash после local cutover, но до
-canonical commit, не переиспользует старый proof — пользователь создаёт новый
-backup. Если replacement commit уже подтверждён, повторный Force запрещён:
-оставшийся cleanup возобновляет normal full.
+Metadata scan и remote-raw snapshot блокируют старую remote plugin directory до
+скачивания её содержимого. Non-secret remediation marker сохраняет требование
+удалить directory и заменить OAuth token.
 
-Второй stable-local device после Force первого не переключается автоматически.
-Явный Full создаёт собственный `logical-vault` backup с exact read-back,
-проверяет digest local snapshot до/после и raw SHA canonical до/после; только
-затем записывает current `plugin-data` и принимает replacement epoch.
+Stable local data необратимо преобразуется в current snapshot при загрузке, после
+installation identity и до автоматизации. Ни эта запись, ни foreign epoch adoption
+не создают архив. После подтверждённого replacement commit authoritative новый
+epoch; незавершённый cleanup продолжает normal full.
 
 ## Download
 
@@ -123,9 +135,9 @@ Non-envelope `.enc.zip` отклоняется без вызова compatibility
 
 ## Memory
 
-Encryption transition создаёт один logical backup после source preflight, а не
-объединяет полные local и remote snapshots. Force создаёт только один snapshot
-защищаемой стороны. Это сохраняет прежний memory peak. Mobile PERF-006 остаётся
+При выборе архива encryption transition создаёт один logical backup после
+source preflight; Force архивирует только защищаемую сторону. Без архива
+полный ZIP не создаётся. Это сохраняет прежний memory peak. Mobile PERF-006 остаётся
 обязательным release gate.
 
 ## Проверки

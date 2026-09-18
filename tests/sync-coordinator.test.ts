@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SyncCoordinator } from "../src/sync/sync-coordinator";
-import { SyncEngine, type SyncRunOptions } from "../src/sync/sync-engine";
+import { SyncCoordinator } from "../src/sync/coordinator";
+import { SyncEngine, type SyncRunOptions } from "../src/sync/engine";
 import { DEFAULT_SETTINGS, type SyncState } from "../src/types";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import type { IndexManager } from "../src/sync/index-manager";
+import type { IndexManager } from "../src/sync/canonical/manager";
 import { logger } from "../src/utils/logger";
 
 logger.configure({ consoleEnabled: false });
@@ -109,19 +109,38 @@ test("settlement completes before the next session starts", async () => {
 });
 
 test("Force session progress ignores foreign activity and unsubscribes after settlement", async () => {
-	const engine = new SyncEngine({} as YandexDiskClient, {} as VaultAdapter, {} as IndexManager, DEFAULT_SETTINGS);
+	const engine = new SyncEngine(
+		{} as YandexDiskClient,
+		{} as VaultAdapter,
+		{} as IndexManager,
+		DEFAULT_SETTINGS,
+	);
 	const access = engine as unknown as {
-		runCoordinatedSession(kind: "force", options: SyncRunOptions, task: () => Promise<void>): Promise<void>;
+		runCoordinatedSession(
+			kind: "force",
+			options: SyncRunOptions,
+			task: () => Promise<void>,
+		): Promise<void>;
 		updateState(state: Partial<SyncState>): void;
 		eventListeners: unknown[];
 	};
 	const observed: SyncState[] = [];
-	await access.runCoordinatedSession("force", { onActivity: (state) => observed.push(state) }, async () => {
-		const own = engine.getState();
-		access.updateState({ status: "syncing", sessionId: "foreign", currentOperation: "foreign progress" });
-		access.updateState({ ...own, currentOperation: "owned progress" });
-	});
-	assert.ok(observed.some((state) => state.currentOperation === "owned progress"));
+	await access.runCoordinatedSession(
+		"force",
+		{ onActivity: (state) => observed.push(state) },
+		async () => {
+			const own = engine.getState();
+			access.updateState({
+				status: "syncing",
+				sessionId: "foreign",
+				currentOperation: "foreign progress",
+			});
+			access.updateState({ ...own, currentOperation: "owned progress" });
+		},
+	);
+	assert.ok(
+		observed.some((state) => state.currentOperation === "owned progress"),
+	);
 	assert.ok(observed.every((state) => state.sessionId !== "foreign"));
 	assert.equal(access.eventListeners.length, 0);
 });

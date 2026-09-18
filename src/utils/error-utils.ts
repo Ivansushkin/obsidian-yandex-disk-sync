@@ -16,7 +16,9 @@ export function findErrorCause(
 	const visited = new Set<unknown>();
 	let current = error;
 	while (current instanceof Error && !visited.has(current)) {
-		if (predicate(current)) return current;
+		if (predicate(current)) {
+			return current;
+		}
 		visited.add(current);
 		current = "cause" in current ? current.cause : undefined;
 	}

@@ -122,9 +122,9 @@ proof.
 
 Все операции используют `EncryptionTransitionController` и одну схему recovery:
 
-- enable создаёт `hardened` target и backup под target password;
-- rotate создаёт новый `hardened` target и backup под new password;
-- disable создаёт backup под source password и target plaintext;
+- enable создаёт `hardened` target и выбранный backup под target password;
+- rotate создаёт новый `hardened` target и выбранный backup под new password;
+- disable создаёт выбранный backup под source password и target plaintext;
 - `clearIndexTransitionServices()` всегда выполняется через `finally`.
 
 Публичные методы плагина сохранены:
@@ -142,3 +142,33 @@ proof.
 прогон — в [`SMOKE_TESTS.md`](./SMOKE_TESTS.md). Stable запрещён без реального
 двухпрофильного прогона, mobile PERF-006/PBKDF2 evidence и полного P0/P1
 evidence файла `release-evidence/2.0.0.json`.
+
+## Архивы и завершение другим устройством
+
+Enable/disable/rotate предлагают архив, продолжение без архива или отмену.
+`backupProof` в local transition обязателен и nullable; отсутствие поля не означает
+отказ от архива. Все source/canonical/codec/fingerprint проверки сохраняются.
+Пароль архива: target для enable/rotate, source для disable. Recovery и connect
+не создают архив повторно; source drift завершает текущую попытку.
+
+Foreign target recovery сначала доказывает target canonical и matching descriptors,
+затем публикует stable target manifest или удаляет manifest для plaintext, переводит
+canonical в cleanup, выполняет guarded удаления и завершает maintenance. Старое окно
+canonical cleanup + manifest index-committed допускается только с той же identity
+и descriptors. Manifest перечитывается после recovery. Wrong password и Cancel
+не сохраняют candidate credentials и не делают remote mutations.
+
+На каждом delete/retry свежие authority, action, live target mapping и fingerprint
+обязательны. Timeout/202/успешный ответ без проверки отсутствия не завершают action.
+Старый worker не возвращает completed maintenance сохранением устаревшего снимка.
+Matching target recovery нового epoch не принимает его как local baseline и не
+replay старые mutations; обычный full затем обрабатывает offline changes.
+
+## Admission и настройки
+
+Публичные enable/disable/rotate/connect резервируют foreground operation до первого
+await и освобождают её через finally. Backup choice dialog не удерживает coordinator;
+внутренние connect/recovery/preflight не приобретают повторно reservation владельца.
+Настройки path/scope блокируются также сохранённым pending transition. Idle token repair
+разрешён для восстановления доступа, но не снимает encryption authority checks.
+Internal сохранение target snapshot и очередей не проходит пользовательский allowlist.

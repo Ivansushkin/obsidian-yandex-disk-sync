@@ -11,7 +11,7 @@ import {
 	PortablePathCollisionError,
 	LegacyPluginDataExposureError,
 	LegacyServicePathCollisionError,
-} from "../src/sync/index-manager";
+} from "../src/sync/canonical/manager";
 import {
 	CURRENT_INDEX_FORMAT,
 	createEmptyIndex,
@@ -93,7 +93,9 @@ class FakeIndexYandex {
 	async downloadFile(path: string, raw = false): Promise<ArrayBuffer> {
 		this.downloadedPaths.push(path);
 		const value = this.files.get(path);
-		if (!value) throw new Error(`Missing file: ${path}`);
+		if (!value) {
+			throw new Error(`Missing file: ${path}`);
+		}
 		const copy = value.slice(0);
 		return raw || !this.encryption
 			? copy
@@ -107,7 +109,9 @@ class FakeIndexYandex {
 	} | null> {
 		this.stableReadCount++;
 		const resource = await this.getResource(path);
-		if (!resource) return null;
+		if (!resource) {
+			return null;
+		}
 		const raw = await this.downloadFile(path, true);
 		return {
 			raw,
@@ -117,9 +121,15 @@ class FakeIndexYandex {
 	}
 
 	getContentFingerprint(resource: YandexResource | null): string | null {
-		if (!resource) return null;
-		if (resource.sha256) return `sha256:${resource.sha256}`;
-		if (resource.md5) return `md5:${resource.md5}`;
+		if (!resource) {
+			return null;
+		}
+		if (resource.sha256) {
+			return `sha256:${resource.sha256}`;
+		}
+		if (resource.md5) {
+			return `md5:${resource.md5}`;
+		}
 		if (resource.modified) {
 			return `modified:${resource.modified}:size:${resource.size ?? -1}`;
 		}
@@ -180,9 +190,13 @@ class FakeIndexYandex {
 		fromPath: string,
 		toPath: string,
 	): Promise<void> {
-		if (this.files.has(toPath)) throw new Error("target exists");
+		if (this.files.has(toPath)) {
+			throw new Error("target exists");
+		}
 		const value = this.files.get(fromPath);
-		if (!value) throw new Error("source missing");
+		if (!value) {
+			throw new Error("source missing");
+		}
 		this.files.set(toPath, value);
 		this.files.delete(fromPath);
 		this.moveCount++;
@@ -235,10 +249,7 @@ class FakeIndexYandex {
 		);
 	}
 
-	private createResource(
-		path: string,
-		content: ArrayBuffer,
-	): YandexResource {
+	private createResource(path: string, content: ArrayBuffer): YandexResource {
 		const identity = this.fingerprint(content);
 		return {
 			name: path.split("/").pop() ?? path,
@@ -318,10 +329,7 @@ test("remote paths rewritten by current normalization fail before indexing", asy
 		createSettings("device-a"),
 	);
 
-	await assert.rejects(
-		manager.getRemoteFiles(),
-		PortablePathCollisionError,
-	);
+	await assert.rejects(manager.getRemoteFiles(), PortablePathCollisionError);
 });
 
 async function runLegacyForceCommit(
@@ -344,9 +352,7 @@ async function runLegacyForceCommit(
 	const legacyBytes = new TextEncoder().encode(legacy).buffer;
 	client.files.set(
 		canonicalPath,
-		encryption
-			? await encryption.encrypt(legacyBytes)
-			: legacyBytes,
+		encryption ? await encryption.encrypt(legacyBytes) : legacyBytes,
 	);
 	const originalRaw = client.files.get(canonicalPath)!.slice(0);
 	const manager = new IndexManager(
@@ -372,9 +378,7 @@ async function runLegacyForceCommit(
 
 	const raw = client.files.get(canonicalPath)!;
 	const plain = encryption ? await encryption.decrypt(raw) : raw;
-	const canonical = JSON.parse(
-		new TextDecoder().decode(plain),
-	) as {
+	const canonical = JSON.parse(new TextDecoder().decode(plain)) as {
 		format: string;
 		epoch: string;
 		revision: number;
@@ -427,9 +431,14 @@ test("plaintext stable 1.0/1.1 Force commits and verifies current canonical", as
 
 test("stable fractional mtime survives Force replacement and current canonical readback", async () => {
 	const source = structuredClone(stableCanonicalFixture);
-	for (const metadata of Object.values(source.files)) metadata.mtime += 0.375;
+	for (const metadata of Object.values(source.files)) {
+		metadata.mtime += 0.375;
+	}
 	const { manager } = await runLegacyForceCommit(null, source);
-	assert.equal(manager.getRemoteIndex().files["deleted.md"]?.mtime, source.files["deleted.md"].mtime);
+	assert.equal(
+		manager.getRemoteIndex().files["deleted.md"]?.mtime,
+		source.files["deleted.md"].mtime,
+	);
 });
 
 test("Force replacement tombstones survive initiator loss", async () => {
@@ -494,8 +503,9 @@ test("versioned data outside the exact stable 1.x shape is rejected before Force
 });
 
 test("encrypted legacy index is rejected before Force acquires a lock", async () => {
-	const encryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const { manager, client } = await createIndexManagerWithContent(
 		stable1xIndex(),
 		encryption,
@@ -736,9 +746,7 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 			salt: "target-salt",
 			verifier: "target-verifier",
 		},
-		cleanup: [
-			{ path: "old-raw", expectedFingerprint: "sha256:old" },
-		],
+		cleanup: [{ path: "old-raw", expectedFingerprint: "sha256:old" }],
 	};
 	const access = manager as unknown as {
 		assertMaintenanceCompatible(value: typeof index): void;
@@ -747,7 +755,9 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 		index.maintenance.phase = phase;
 		assert.throws(() => access.assertMaintenanceCompatible(index));
 		await manager.runTargetMaintenanceRecovery("transition-a", async () => {
-			assert.doesNotThrow(() => access.assertMaintenanceCompatible(index));
+			assert.doesNotThrow(() =>
+				access.assertMaintenanceCompatible(index),
+			);
 			index.maintenance!.phase = "files-copied";
 			assert.throws(() => access.assertMaintenanceCompatible(index));
 			index.maintenance!.phase = phase;
@@ -757,8 +767,9 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 });
 
 test("plaintext target recovery reads committed disable canonical without source key", async () => {
-	const sourceEncryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const sourceEncryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const index = createEmptyIndex("source-device", "epoch-disable");
 	index.revision = 2;
 	index.maintenance = {
@@ -796,12 +807,43 @@ test("plaintext target recovery reads committed disable canonical without source
 		manager.loadRemoteIndexWithTargetCodec(null),
 		/requires recovery ownership/,
 	);
+	manager.loadLocalIndexFromData({
+		observedEpoch: "old-epoch",
+		observedRevision: 1,
+		files: {},
+		nextMutationSeq: 1,
+	});
+	manager.enqueueMutation("put", "offline.md", { sha256: "offline-sha" });
+	const oldState = structuredClone(manager.getLocalIndexData());
+	const oldQueue = structuredClone(manager.getPendingMutations());
 	const recovered = await manager.runTargetMaintenanceRecovery(
 		"transition-disable",
-		async () => manager.loadRemoteIndexWithTargetCodec(null),
+		async () => {
+			manager.setIndexTransitionServices(null, null);
+			try {
+				await manager.loadRemoteIndexWithTargetCodec(null);
+				manager.setMaintenance({
+					...manager.getMaintenance()!,
+					phase: "cleanup",
+				});
+				await manager.saveRemoteIndex();
+				assert.deepEqual(manager.getPendingMutations(), oldQueue);
+				assert.equal(
+					manager.getRemoteIndex().files["offline.md"],
+					undefined,
+				);
+				manager.clearMaintenance("transition-disable");
+				await manager.saveRemoteIndex();
+				return manager.getRemoteIndex();
+			} finally {
+				manager.clearIndexTransitionServices();
+			}
+		},
 	);
 	assert.equal(recovered.epoch, "epoch-disable");
-	assert.equal(recovered.maintenance?.phase, "index-committed");
+	assert.equal(recovered.maintenance, undefined);
+	assert.deepEqual(manager.getLocalIndexData(), oldState);
+	assert.deepEqual(manager.getPendingMutations(), oldQueue);
 });
 
 async function createIndexManagerWithContent(
@@ -821,9 +863,7 @@ async function createIndexManagerWithContent(
 	const plain = new TextEncoder().encode(json).buffer;
 	client.files.set(
 		canonicalPath,
-		storageEncryption
-			? await storageEncryption.encrypt(plain)
-			: plain,
+		storageEncryption ? await storageEncryption.encrypt(plain) : plain,
 	);
 	return {
 		client,
@@ -841,10 +881,7 @@ test("plaintext stable 1.x startup preserves LegacyIndexFormatError", async () =
 		stable1xIndex(),
 		null,
 	);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		LegacyIndexFormatError,
-	);
+	await assert.rejects(manager.loadRemoteIndex(), LegacyIndexFormatError);
 });
 
 test("legacy protected plugin data blocks migration without content download", async () => {
@@ -890,7 +927,10 @@ test("legacy service-name collision blocks migration before remote writes", asyn
 		mtime: 1,
 		syncedAt: 2,
 	};
-	const { manager, client } = await createIndexManagerWithContent(source, null);
+	const { manager, client } = await createIndexManagerWithContent(
+		source,
+		null,
+	);
 	await assert.rejects(
 		manager.assertLegacyMigrationPathsSafe(),
 		LegacyServicePathCollisionError,
@@ -908,7 +948,10 @@ test("legacy paths that current normalization would rewrite block migration", as
 		mtime: 1,
 		syncedAt: 2,
 	};
-	const { manager, client } = await createIndexManagerWithContent(source, null);
+	const { manager, client } = await createIndexManagerWithContent(
+		source,
+		null,
+	);
 	await assert.rejects(
 		manager.assertLegacyMigrationPathsSafe(),
 		LegacyServicePathCollisionError,
@@ -932,13 +975,11 @@ test("legacy physical-only service collision is not silently filtered", async ()
 });
 
 test("encrypted legacy startup is rejected as unsupported data", async () => {
-	const encryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(
-			stable1xIndex(),
-			encryption,
-		);
+		await createIndexManagerWithContent(stable1xIndex(), encryption);
 	const originalRaw = client.files.get(canonicalPath)!.slice(0);
 	await assert.rejects(
 		manager.loadRemoteIndex(),
@@ -952,22 +993,21 @@ test("encrypted legacy startup is rejected as unsupported data", async () => {
 });
 
 test("plaintext legacy index never falls back from an active encryption codec", async () => {
-	const encryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const { manager } = await createIndexManagerWithContent(
 		stable1xIndex(),
 		encryption,
 		null,
 	);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		UnreadableRemoteIndexError,
-	);
+	await assert.rejects(manager.loadRemoteIndex(), UnreadableRemoteIndexError);
 });
 
 test("encrypted current index loads without plaintext fallback", async () => {
-	const encryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const { manager } = await createIndexManagerWithContent(
 		{
 			...createEmptyIndex("device-current", "epoch-current"),
@@ -1008,22 +1048,42 @@ test("canonical file metadata preserves timestamp precision and validates causal
 	const index = createEmptyIndex("device-current", "epoch-current");
 	index.revision = 4;
 	index.files["note.md"] = {
-		path: "note.md", sha256: "hash", size: 4, mtime: 1.375, syncedAt: 1,
-		changedRevision: 4, baseRevision: 3, mutationSeq: 0,
+		path: "note.md",
+		sha256: "hash",
+		size: 4,
+		mtime: 1.375,
+		syncedAt: 1,
+		changedRevision: 4,
+		baseRevision: 3,
+		mutationSeq: 0,
 		lastModifiedBy: "device-current",
 	};
 	index.appliedMutationSeq["device-current"] = 1;
 	const { manager } = await createIndexManagerWithContent(index, null);
-	assert.equal((await manager.loadRemoteIndex()).files["note.md"]?.mtime, 1.375);
+	assert.equal(
+		(await manager.loadRemoteIndex()).files["note.md"]?.mtime,
+		1.375,
+	);
 	for (const patch of [
-		...[-1, NaN, Infinity, Number.MAX_VALUE, "1", null].map((mtime) => ({ mtime })),
-		{ size: 1.375 }, { mutationSeq: 0.375 }, { changedRevision: 1.375 },
-		{ mutationSeq: undefined }, { mutationSeq: 2 },
+		...[-1, NaN, Infinity, Number.MAX_VALUE, "1", null].map((mtime) => ({
+			mtime,
+		})),
+		{ size: 1.375 },
+		{ mutationSeq: 0.375 },
+		{ changedRevision: 1.375 },
+		{ mutationSeq: undefined },
+		{ mutationSeq: 2 },
 	]) {
 		const invalid = structuredClone(index);
 		Object.assign(invalid.files["note.md"]!, patch);
-		const { manager, client } = await createIndexManagerWithContent(invalid, null);
-		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		const { manager, client } = await createIndexManagerWithContent(
+			invalid,
+			null,
+		);
+		await assert.rejects(
+			manager.loadRemoteIndex(),
+			InvalidCurrentIndexError,
+		);
 		assert.equal(client.moveCount, 0);
 	}
 });
@@ -1087,16 +1147,28 @@ test("malformed maintenance is rejected before any remote write", async () => {
 	for (const maintenance of variants) {
 		const index = createEmptyIndex("device-current", "epoch-current");
 		index.maintenance = maintenance as typeof index.maintenance;
-		const { manager, client } = await createIndexManagerWithContent(index, null);
-		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		const { manager, client } = await createIndexManagerWithContent(
+			index,
+			null,
+		);
+		await assert.rejects(
+			manager.loadRemoteIndex(),
+			InvalidCurrentIndexError,
+		);
 		assert.equal(client.moveCount, 0);
 	}
 	for (const targetRevision of [5, 7]) {
 		const index = createEmptyIndex("device-current", "epoch-current");
 		index.revision = 6;
 		index.maintenance = { ...valid, targetRevision };
-		const { manager, client } = await createIndexManagerWithContent(index, null);
-		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		const { manager, client } = await createIndexManagerWithContent(
+			index,
+			null,
+		);
+		await assert.rejects(
+			manager.loadRemoteIndex(),
+			InvalidCurrentIndexError,
+		);
 		assert.equal(client.moveCount, 0);
 	}
 	for (const [phase, revision] of [
@@ -1106,14 +1178,23 @@ test("malformed maintenance is rejected before any remote write", async () => {
 		const index = createEmptyIndex("device-current", "epoch-current");
 		index.revision = revision;
 		index.maintenance = { ...valid, phase };
-		const { manager, client } = await createIndexManagerWithContent(index, null);
-		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		const { manager, client } = await createIndexManagerWithContent(
+			index,
+			null,
+		);
+		await assert.rejects(
+			manager.loadRemoteIndex(),
+			InvalidCurrentIndexError,
+		);
 		assert.equal(client.moveCount, 0);
 	}
 	const staleSource = createEmptyIndex("device-current", "epoch-current");
 	staleSource.revision = 6;
 	staleSource.maintenance = { ...valid, sourceRevision: 6 };
-	const { manager, client } = await createIndexManagerWithContent(staleSource, null);
+	const { manager, client } = await createIndexManagerWithContent(
+		staleSource,
+		null,
+	);
 	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
 	assert.equal(client.moveCount, 0);
 });
@@ -1123,7 +1204,10 @@ test("current canonical rejects an extra numeric format marker", async () => {
 		...createEmptyIndex("device-current", "epoch-current"),
 		version: 4,
 	};
-	const { manager, client } = await createIndexManagerWithContent(current, null);
+	const { manager, client } = await createIndexManagerWithContent(
+		current,
+		null,
+	);
 	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
 	assert.equal(client.moveCount, 0);
 });
@@ -1134,35 +1218,61 @@ test("canonical transaction accepts causal continuation and rejects foreign edit
 		const current = createEmptyIndex(author, "epoch-a");
 		current.revision = 36;
 		current.files["note.md"] = {
-			path: "note.md", sha256: "previous", size: 8, mtime: 1, syncedAt: 1,
-			changedRevision: 36, baseRevision: 35, lastModifiedBy: author,
+			path: "note.md",
+			sha256: "previous",
+			size: 8,
+			mtime: 1,
+			syncedAt: 1,
+			changedRevision: 36,
+			baseRevision: 35,
+			lastModifiedBy: author,
 			mutationSeq: foreign ? 3 : 7,
 		};
 		current.appliedMutationSeq = { "device-a": 7, "device-b": 3 };
 		const { manager, client, canonicalPath } =
-			await createIndexManagerWithContent(current, null, null, "device-a");
+			await createIndexManagerWithContent(
+				current,
+				null,
+				null,
+				"device-a",
+			);
 		manager.loadLocalIndexFromData({
-			deviceId: "device-a", observedEpoch: "epoch-a", observedRevision: 35,
-			files: foreign ? {} : { "note.md": { ...current.files["note.md"] } },
-			folderTombstones: {}, nextMutationSeq: 8,
+			deviceId: "device-a",
+			observedEpoch: "epoch-a",
+			observedRevision: 35,
+			files: foreign
+				? {}
+				: { "note.md": { ...current.files["note.md"] } },
+			folderTombstones: {},
+			nextMutationSeq: 8,
 		});
 		manager.loadPendingMutations(undefined);
 		await manager.loadRemoteIndex();
 		const mutation = manager.enqueueMutation("put", "note.md", {
-			sha256: "latest", baseRevision: 35, epoch: "epoch-a",
+			sha256: "latest",
+			baseRevision: 35,
+			epoch: "epoch-a",
 		});
 		assert.equal(mutation.seq, 8, author);
 		manager.updateRemoteFile("note.md", {
-			...current.files["note.md"], sha256: "latest", lastModifiedBy: "device-a",
-			baseRevision: 35, mutationSeq: mutation.seq,
+			...current.files["note.md"],
+			sha256: "latest",
+			lastModifiedBy: "device-a",
+			baseRevision: 35,
+			mutationSeq: mutation.seq,
 			...(foreign ? { remoteFingerprint: "uploaded-device-a" } : {}),
 		});
 		manager.stageMutation(mutation);
 		await manager.saveRemoteIndex();
 
-		const canonical = JSON.parse(new TextDecoder().decode(client.files.get(canonicalPath))) as
-			ReturnType<typeof createEmptyIndex>;
-		assert.equal(canonical.files["note.md"]?.sha256, foreign ? "previous" : "latest", author);
+		const canonical = JSON.parse(
+			new TextDecoder().decode(client.files.get(canonicalPath)),
+		) as ReturnType<typeof createEmptyIndex>;
+		assert.equal(
+			canonical.files["note.md"]?.sha256,
+			foreign ? "previous" : "latest",
+			author,
+		);
 		const rejected = manager.consumeRejectedPuts();
 		if (foreign) {
 			assert.equal(rejected[0]?.reason, "conflict");
@@ -1178,8 +1288,9 @@ test("canonical transaction accepts causal continuation and rejects foreign edit
 test("wrong encrypted index key is classified as unreadable", async () => {
 	const currentEncryption =
 		new RejectingEncryptionService() as unknown as EncryptionCodec;
-	const storageEncryption =
-		new XorEncryptionService(0x5a) as unknown as EncryptionCodec;
+	const storageEncryption = new XorEncryptionService(
+		0x5a,
+	) as unknown as EncryptionCodec;
 	const { manager } = await createIndexManagerWithContent(
 		{
 			...createEmptyIndex("device-current", "epoch-current"),
@@ -1204,19 +1315,14 @@ test("wrong encrypted index key is classified as unreadable", async () => {
 });
 
 test("invalid plaintext index is classified as unreadable", async () => {
-	const { manager } = await createIndexManagerWithContent(
-		"not-json",
-		null,
-	);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		UnreadableRemoteIndexError,
-	);
+	const { manager } = await createIndexManagerWithContent("not-json", null);
+	await assert.rejects(manager.loadRemoteIndex(), UnreadableRemoteIndexError);
 });
 
 test("historical format errors are not masked by codec fallback", async () => {
-	const encryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const { manager } = await createIndexManagerWithContent(
 		{ version: 999, files: {} },
 		encryption,
@@ -1242,8 +1348,9 @@ test("numeric historical canonical formats are rejected during normal load", asy
 });
 
 test("explicit transition codec does not fall back to plaintext", async () => {
-	const encryption =
-		new XorEncryptionService(0xa5) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0xa5,
+	) as unknown as EncryptionCodec;
 	const { manager, client, canonicalPath } =
 		await createIndexManagerWithContent(
 			{
@@ -1264,12 +1371,7 @@ test("explicit transition codec does not fall back to plaintext", async () => {
 		): Promise<unknown>;
 	};
 	await assert.rejects(
-		decoder.decodeIndexSnapshot(
-			raw,
-			false,
-			encryption,
-			"source",
-		),
+		decoder.decodeIndexSnapshot(raw, false, encryption, "source"),
 		(error: unknown) =>
 			error instanceof UnreadableRemoteIndexError &&
 			error.attempts.length === 1 &&
@@ -1280,11 +1382,13 @@ test("explicit transition codec does not fall back to plaintext", async () => {
 test("Force rejects numeric historical canonical before any remote move", async () => {
 	const client = new FakeIndexYandex("vault", null);
 	const canonicalPath = "vault/.obsidian-sync-index.json";
-	const source = new TextEncoder().encode(JSON.stringify({
-		version: 4,
-		revision: 1,
-		files: {},
-	})).buffer;
+	const source = new TextEncoder().encode(
+		JSON.stringify({
+			version: 4,
+			revision: 1,
+			files: {},
+		}),
+	).buffer;
 	client.files.set(canonicalPath, source.slice(0));
 	const manager = new IndexManager(
 		client as unknown as YandexDiskClient,
@@ -1331,17 +1435,16 @@ test("Force canonical proof becomes stale before any replacement write", async (
 });
 
 test("successful final move with a lost response still commits", async () => {
-	const { client } = await runLegacyForceCommit(
-		null,
-		undefined,
-		{ throwAfterFinalMove: true },
-	);
+	const { client } = await runLegacyForceCommit(null, undefined, {
+		throwAfterFinalMove: true,
+	});
 	assert.equal(client.moveCount, 2);
 });
 
 test("unverified modified lock restores the encrypted source bytes", async () => {
-	const encryption =
-		new XorEncryptionService(0x5a) as unknown as EncryptionCodec;
+	const encryption = new XorEncryptionService(
+		0x5a,
+	) as unknown as EncryptionCodec;
 	const client = new FakeIndexYandex("vault", encryption, {
 		corruptIndexUpload: true,
 	});
@@ -1373,10 +1476,7 @@ test("unverified modified lock restores the encrypted source bytes", async () =>
 	});
 	manager.stageMutation(mutation);
 
-	await assert.rejects(
-		manager.saveRemoteIndex(),
-		RemoteIndexRolledBackError,
-	);
+	await assert.rejects(manager.saveRemoteIndex(), RemoteIndexRolledBackError);
 	assert.equal(
 		Buffer.from(client.files.get(canonicalPath)!).equals(
 			Buffer.from(originalRaw),
@@ -1402,4 +1502,200 @@ test("semantic epoch rollback is not retried while transient rollback is", () =>
 	);
 	assert.equal(semantic.retryable, false);
 	assert.equal(transient.retryable, true);
+});
+
+test("foreign target recovery survives restart at each persistent step without replaying old epoch work", async () => {
+	const { EncryptionService, SALT_LENGTH } =
+		await import("../src/crypto/encryption");
+	const { EncryptionTransitionController } =
+		await import("../src/crypto/encryption-transition");
+	const { computeSha256 } = await import("../src/utils/hash-utils");
+	const codec = new EncryptionService(new Uint8Array(SALT_LENGTH).fill(31));
+	await codec.initializeKey("synthetic-target-password");
+	const verifier = await codec.createVerifier();
+	const bytes = new TextEncoder().encode("preserved target bytes").buffer;
+	for (const kind of ["enable", "rotate", "disable"] as const) {
+		const targetCodec = kind === "disable" ? null : codec;
+		const rawTarget = targetCodec
+			? await codec.encryptFilename("note.md")
+			: "note.md";
+		for (const crashAt of ["manifest", "canonical", "physical"] as const) {
+			const canonical = createEmptyIndex("A", "E2");
+			canonical.revision = 5;
+			canonical.files["note.md"] = {
+				path: "note.md",
+				sha256: await computeSha256(bytes),
+				size: bytes.byteLength,
+				mtime: 1,
+				syncedAt: 1,
+				mutationSeq: 0,
+				changedRevision: 5,
+				baseRevision: 4,
+				lastModifiedBy: "A",
+			};
+			const target = {
+				enabled: targetCodec !== null,
+				revision: targetCodec ? 2 : null,
+				salt: targetCodec
+					? EncryptionService.bytesToBase64(
+							new Uint8Array(SALT_LENGTH).fill(31),
+						)
+					: null,
+				verifier: targetCodec ? verifier : null,
+			};
+			canonical.maintenance = {
+				id: "transition-A",
+				kind,
+				phase: "index-committed",
+				initiatedBy: "A",
+				sourceRevision: 4,
+				targetRevision: 5,
+				source:
+					kind === "enable"
+						? {
+								enabled: false,
+								revision: null,
+								salt: null,
+								verifier: null,
+							}
+						: {
+								enabled: true,
+								revision: 1,
+								salt: "source-salt",
+								verifier: "source-verifier",
+							},
+				target,
+				cleanup: [],
+			};
+			const { client } = await createIndexManagerWithContent(
+				canonical,
+				targetCodec,
+			);
+			client.files.set(
+				`vault/${rawTarget}`,
+				targetCodec ? await targetCodec.encrypt(bytes) : bytes,
+			);
+			client.files.set("vault/old-object", bytes);
+			canonical.maintenance.cleanup = [
+				{
+					path: "old-object",
+					expectedFingerprint: (await client.getResource(
+						"vault/old-object",
+					))!.md5!,
+				},
+			];
+			await client.uploadFile(
+				"vault/.obsidian-sync-index.json",
+				JSON.stringify(canonical),
+			);
+			let stablePublished = false;
+			let interrupted = false;
+			const run = async () => {
+				const manager = new IndexManager(
+					client as unknown as YandexDiskClient,
+					{} as VaultAdapter,
+					createSettings("B"),
+				);
+				manager.loadLocalIndexFromData({
+					observedEpoch: "E1",
+					observedRevision: 2,
+					files: {},
+					nextMutationSeq: 1,
+				});
+				manager.enqueueMutation("put", "offline.md", {
+					sha256: "offline",
+				});
+				const saved = manager.captureLocalCausalState();
+				const cleanupClient = {
+					getResource: client.getResource.bind(client),
+					getPhysicalPath: async () => `vault/${rawTarget}`,
+					deleteResource: async (
+						path: string,
+						_permanent: boolean,
+						_raw: boolean,
+						guard: () => Promise<void>,
+					) => {
+						await guard();
+						await client.deleteResource(path);
+					},
+				} as unknown as YandexDiskClient;
+				const controller = new EncryptionTransitionController(
+					manager,
+					{} as never,
+					{} as never,
+					{
+						client: cleanupClient,
+						getRemotePath: () => "vault",
+						completeAction: () => {},
+						persist: async () => {},
+					},
+				);
+				const crash = (step: typeof crashAt) => {
+					if (!interrupted && step === crashAt) {
+						interrupted = true;
+						throw new Error(`crash:${step}`);
+					}
+				};
+				try {
+					await manager.runTargetMaintenanceRecovery(
+						"transition-A",
+						async () => {
+							await manager.loadRemoteIndexWithTargetCodec(
+								targetCodec,
+							);
+							await controller.completeRemoteTarget(
+								manager.getMaintenance()!,
+								async () => {
+									stablePublished = true;
+									crash("manifest");
+								},
+								async () => {
+									assert.equal(stablePublished, true);
+									assert.equal(
+										manager.getMaintenance()?.phase,
+										"cleanup",
+									);
+									crash("canonical");
+									await controller.cleanupRawPaths(
+										["old-object"],
+										{
+											"old-object":
+												canonical.maintenance!
+													.cleanup[0]!
+													.expectedFingerprint,
+										},
+									);
+									crash("physical");
+									assert.equal(
+										await controller.resumeCanonicalCleanup(),
+										true,
+									);
+								},
+							);
+						},
+					);
+				} finally {
+					assert.deepEqual(manager.captureLocalCausalState(), saved);
+				}
+				return manager;
+			};
+			await assert.rejects(run(), /crash:/);
+			const recovered = await run();
+			assert.equal(recovered.getMaintenance(), undefined);
+			assert.equal(
+				recovered.getRemoteIndex().files["offline.md"],
+				undefined,
+			);
+			assert.equal(client.files.has("vault/old-object"), false);
+			const stored = client.files.get(`vault/${rawTarget}`)!;
+			assert.deepEqual(
+				targetCodec ? await targetCodec.decrypt(stored) : stored,
+				bytes,
+			);
+			await assert.rejects(
+				recovered.loadRemoteIndex(),
+				IndexEpochMismatchError,
+			);
+		}
+	}
 });

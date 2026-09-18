@@ -1,27 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TFile, type App } from "obsidian";
-import { FileWatcher, type DeferredWatcherEvent } from "../src/sync/file-watcher";
-import type { SyncEngine } from "../src/sync/sync-engine";
-import type { RealtimeFileEvent } from "../src/sync/realtime-rules";
+import {
+	FileWatcher,
+	type DeferredWatcherEvent,
+} from "../src/sync/realtime/watcher";
+import type { SyncEngine } from "../src/sync/engine";
+import type { RealtimeFileEvent } from "../src/sync/realtime/rules";
 import { DEFAULT_SETTINGS } from "../src/types";
 
 interface FileWatcherTestAccess {
 	isEnabled: boolean;
 	deferredEvents: DeferredWatcherEvent[];
-	submittedFileEvents: Map<string, {
-		id: string;
-		path: string;
-		action: "upload" | "delete";
-		epoch: string | null;
-		baseRevision: number | null;
-		createdAt: number;
-		superseded?: boolean;
-		mutationId?: string;
-		mutationSeq?: number;
-		snapshotSha256?: string;
-		supersededByRenameId?: string;
-	}>;
+	submittedFileEvents: Map<
+		string,
+		{
+			id: string;
+			path: string;
+			action: "upload" | "delete";
+			epoch: string | null;
+			baseRevision: number | null;
+			createdAt: number;
+			superseded?: boolean;
+			mutationId?: string;
+			mutationSeq?: number;
+			snapshotSha256?: string;
+			supersededByRenameId?: string;
+		}
+	>;
 	submittedWatcherEventIds: Set<string>;
 	deferEvent(event: DeferredWatcherEvent): boolean;
 	handleFileRename(file: TFile, oldPath: string): void;
@@ -61,10 +67,7 @@ interface FileWatcherTestAccess {
 		}>;
 	}): void;
 	cancelPendingSync(path: string): void;
-	captureFullSyncBarrier(context: {
-		sessionId: string;
-		kind: "full";
-	}): void;
+	captureFullSyncBarrier(context: { sessionId: string; kind: "full" }): void;
 	completeFullSyncBarrier(outcome: {
 		sessionId: string;
 		kind: "full";
@@ -79,11 +82,7 @@ function createWatcher(): FileWatcher {
 			baseRevision: 7,
 		}),
 	} as unknown as SyncEngine;
-	return new FileWatcher(
-		{} as App,
-		syncEngine,
-		DEFAULT_SETTINGS,
-	);
+	return new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
 }
 
 test("legacy watcher file events receive durable causal metadata", () => {
@@ -100,10 +99,7 @@ test("legacy watcher file events receive durable causal metadata", () => {
 	assert.equal(loaded.action, "upload");
 	assert.equal("id" in loaded, true);
 	assert.equal("epoch" in loaded ? loaded.epoch : undefined, "epoch-a");
-	assert.equal(
-		"baseRevision" in loaded ? loaded.baseRevision : undefined,
-		7,
-	);
+	assert.equal("baseRevision" in loaded ? loaded.baseRevision : undefined, 7);
 	assert.equal(
 		"createdAt" in loaded && typeof loaded.createdAt === "number",
 		true,
@@ -337,9 +333,9 @@ test("queued target modify is absorbed but recreate of source remains", () => {
 		true,
 	);
 	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) =>
-			"id" in event ? event.id : null,
-		),
+		watcher
+			.getDeferredEvents()
+			.map((event) => ("id" in event ? event.id : null)),
 		["rename-a", "recreate-a"],
 	);
 });
@@ -395,9 +391,9 @@ test("file rename durably links the newest submitted source upload", () => {
 
 	access.handleFileRename(target, "A.md");
 
-	const rename = watcher.getDeferredEvents().find(
-		(event) => event.action === "rename",
-	);
+	const rename = watcher
+		.getDeferredEvents()
+		.find((event) => event.action === "rename");
 	assert.ok(rename?.action === "rename" && rename.kind === "file");
 	assert.equal(rename.predecessorUploadId, "upload-current");
 	assert.equal(
@@ -607,17 +603,49 @@ test("full barrier settles captured uploads only after success and retains later
 		const access = watcher as unknown as FileWatcherTestAccess;
 		const context = { epoch: "epoch-a", baseRevision: 7, createdAt: 1 };
 		watcher.loadDeferredEvents([
-			{ ...context, id: "covered-upload", action: "upload", path: "covered.md" },
-			{ ...context, id: "delete-event", action: "delete", path: "deleted.md" },
-			{ ...context, id: "rename-event", action: "rename", path: "A.md",
-				targetPath: "B.md", kind: "file" },
+			{
+				...context,
+				id: "covered-upload",
+				action: "upload",
+				path: "covered.md",
+			},
+			{
+				...context,
+				id: "delete-event",
+				action: "delete",
+				path: "deleted.md",
+			},
+			{
+				...context,
+				id: "rename-event",
+				action: "rename",
+				path: "A.md",
+				targetPath: "B.md",
+				kind: "file",
+			},
 		]);
 		access.captureFullSyncBarrier({ sessionId: "full-1", kind: "full" });
-		access.deferEvent({ ...context, id: "during-full-upload", action: "upload", path: "during.md" });
-		access.completeFullSyncBarrier({ sessionId: "full-1", kind: "full", success });
+		access.deferEvent({
+			...context,
+			id: "during-full-upload",
+			action: "upload",
+			path: "during.md",
+		});
+		access.completeFullSyncBarrier({
+			sessionId: "full-1",
+			kind: "full",
+			success,
+		});
 		assert.deepEqual(
-			watcher.getDeferredEvents().map((event) => "id" in event ? event.id : event.path),
-			[...(success ? [] : ["covered-upload"]), "delete-event", "rename-event", "during-full-upload"],
+			watcher
+				.getDeferredEvents()
+				.map((event) => ("id" in event ? event.id : event.path)),
+			[
+				...(success ? [] : ["covered-upload"]),
+				"delete-event",
+				"rename-event",
+				"during-full-upload",
+			],
 			`success=${success}`,
 		);
 	}
@@ -630,55 +658,81 @@ test("session resume replays only new paused events after success", async () => 
 		access.isEnabled = true;
 		const context = { epoch: "epoch-a", baseRevision: 7, createdAt: 1 };
 		watcher.loadDeferredEvents([
-			{ ...context, id: "old-rename", action: "rename", path: "A.md",
-				targetPath: "B.md", kind: "file" },
+			{
+				...context,
+				id: "old-rename",
+				action: "rename",
+				path: "A.md",
+				targetPath: "B.md",
+				kind: "file",
+			},
 		]);
 		const replayed: string[][] = [];
-		access.flushDeferredEvents = async (onlyIds) => { replayed.push([...(onlyIds ?? [])]); };
-		const session = { sessionId: "maintenance-1", kind: "maintenance" as const };
+		access.flushDeferredEvents = async (onlyIds) => {
+			replayed.push([...(onlyIds ?? [])]);
+		};
+		const session = {
+			sessionId: "maintenance-1",
+			kind: "maintenance" as const,
+		};
 		await watcher.pauseForSync(session);
-		access.deferEvent({ ...context, id: "new-upload", action: "upload", path: "new.md" });
+		access.deferEvent({
+			...context,
+			id: "new-upload",
+			action: "upload",
+			path: "new.md",
+		});
 		await watcher.resumeAfterSync({ ...session, success });
-		assert.deepEqual(replayed, success ? [["new-upload"]] : [], `success=${success}`);
-		if (!success) assert.equal(watcher.getDeferredEvents().length, 2);
+		assert.deepEqual(
+			replayed,
+			success ? [["new-upload"]] : [],
+			`success=${success}`,
+		);
+		if (!success) {
+			assert.equal(watcher.getDeferredEvents().length, 2);
+		}
 	}
 });
 
 test("full barrier acknowledgement is persisted before resume completes", async () => {
-	const watcher = createWatcher();
-	watcher.loadDeferredEvents([
-		{
-			id: "covered-upload",
-			action: "upload",
-			path: "covered.md",
-			epoch: "epoch-a",
-			baseRevision: 7,
-			createdAt: 1,
-		},
-	]);
-	const persistedQueues: string[][] = [];
-	watcher.setPersistCallback(async () => {
-		persistedQueues.push(
-			watcher.getDeferredEvents().map((event) =>
-				"id" in event && event.id ? event.id : event.path,
-			),
-		);
-	});
-	const access = watcher as unknown as FileWatcherTestAccess;
-	access.isEnabled = true;
-	access.captureFullSyncBarrier({
-		sessionId: "full-1",
-		kind: "full",
-	});
+	for (const enabled of [true, false]) {
+		const watcher = createWatcher();
+		watcher.loadDeferredEvents([
+			{
+				id: "covered-upload",
+				action: "upload",
+				path: "covered.md",
+				epoch: "epoch-a",
+				baseRevision: 7,
+				createdAt: 1,
+			},
+		]);
+		const persistedQueues: string[][] = [];
+		watcher.setPersistCallback(async () => {
+			persistedQueues.push(
+				watcher
+					.getDeferredEvents()
+					.map((event) =>
+						"id" in event && event.id ? event.id : event.path,
+					),
+			);
+		});
+		const access = watcher as unknown as FileWatcherTestAccess;
+		access.isEnabled = enabled;
+		access.captureFullSyncBarrier({
+			sessionId: "full-1",
+			kind: "full",
+		});
 
-	await watcher.resumeAfterSync({
-		sessionId: "full-1",
-		kind: "full",
-		success: true,
-	});
+		await watcher.resumeAfterSync({
+			sessionId: "full-1",
+			kind: "full",
+			success: true,
+		});
 
-	assert.deepEqual(persistedQueues, [[]]);
-	assert.deepEqual(watcher.getDeferredEvents(), []);
+		assert.deepEqual(persistedQueues, [[]]);
+		assert.deepEqual(watcher.getDeferredEvents(), []);
+	}
 });
 
 test("failed full sync postpones watcher replay", async () => {
@@ -688,21 +742,17 @@ test("failed full sync postpones watcher replay", async () => {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		}),
-			syncFileBatch: async () => {
+		syncFileBatch: async () => {
 			fileBatchCalls++;
 			return {
 				completed: [],
 				superseded: [],
-					retry: ["covered-upload"],
-					uploadReceipts: [],
+				retry: ["covered-upload"],
+				uploadReceipts: [],
 			};
 		},
 	} as unknown as SyncEngine;
-	const watcher = new FileWatcher(
-		{} as App,
-		syncEngine,
-		DEFAULT_SETTINGS,
-	);
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
 	watcher.loadDeferredEvents([
 		{
 			id: "covered-upload",
@@ -729,9 +779,9 @@ test("failed full sync postpones watcher replay", async () => {
 
 	assert.equal(fileBatchCalls, 0);
 	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) =>
-			"id" in event ? event.id : event.path,
-		),
+		watcher
+			.getDeferredEvents()
+			.map((event) => ("id" in event ? event.id : event.path)),
 		["covered-upload"],
 	);
 });
@@ -771,7 +821,9 @@ test("realtime epoch replacement requests one full and keeps the event durable",
 		},
 	]);
 
-	await (watcher as unknown as FileWatcherTestAccess).flushDeferredEventsNow();
+	await (
+		watcher as unknown as FileWatcherTestAccess
+	).flushDeferredEventsNow();
 	await Promise.resolve();
 
 	assert.equal(fullRequests, 1);
@@ -791,11 +843,7 @@ test("structured watcher retry remains durable without throwing", async () => {
 			uploadReceipts: [],
 		}),
 	} as unknown as SyncEngine;
-	const watcher = new FileWatcher(
-		{} as App,
-		syncEngine,
-		DEFAULT_SETTINGS,
-	);
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
 	watcher.loadDeferredEvents([
 		{
 			id: "retry-upload",
@@ -812,9 +860,9 @@ test("structured watcher retry remains durable without throwing", async () => {
 	).flushDeferredEventsNow();
 
 	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) =>
-			"id" in event ? event.id : event.path,
-		),
+		watcher
+			.getDeferredEvents()
+			.map((event) => ("id" in event ? event.id : event.path)),
 		["retry-upload"],
 	);
 });
@@ -833,11 +881,7 @@ test("startup blocks before reconciliation when an upload rename chain is unreso
 			uploadReceipts: [],
 		}),
 	} as unknown as SyncEngine;
-	const watcher = new FileWatcher(
-		{} as App,
-		syncEngine,
-		DEFAULT_SETTINGS,
-	);
+	const watcher = new FileWatcher({} as App, syncEngine, DEFAULT_SETTINGS);
 	watcher.loadDeferredEvents([
 		{
 			id: "upload-a",

@@ -7,7 +7,9 @@ import {
 	sealBackupEnvelope,
 } from "../src/backup/backup-envelope";
 
-const plaintext = new TextEncoder().encode("PK\u0003\u0004 test ZIP bytes").buffer;
+const plaintext = new TextEncoder().encode(
+	"PK\u0003\u0004 test ZIP bytes",
+).buffer;
 
 test("backup envelope is self-contained and authenticated", async () => {
 	const envelope = await sealBackupEnvelope(plaintext, "backup-password", {
@@ -68,7 +70,10 @@ test("backup envelope rejects unbounded or unsupported headers before KDF", asyn
 	const encoded = new TextEncoder().encode(JSON.stringify(header));
 	assert.equal(encoded.length, headerLength);
 	envelope.set(encoded, 12);
-	await assert.rejects(openBackupEnvelope(envelope.buffer, "password"), /header/);
+	await assert.rejects(
+		openBackupEnvelope(envelope.buffer, "password"),
+		/header/,
+	);
 });
 
 test("numbered historical backup magic is not accepted as a current envelope", () => {
@@ -98,5 +103,8 @@ test("backup envelope rejects a numbered authenticated header field", async () =
 	new DataView(resized.buffer).setUint32(8, encoded.length, false);
 	resized.set(encoded, 12);
 	resized.set(envelope.slice(12 + headerLength), 12 + encoded.length);
-	await assert.rejects(openBackupEnvelope(resized.buffer, "password"), /header/);
+	await assert.rejects(
+		openBackupEnvelope(resized.buffer, "password"),
+		/header/,
+	);
 });

@@ -19,10 +19,8 @@ const obsidianStubPlugin = {
 			path: "obsidian-test-stub",
 			namespace: "test",
 		}));
-		build.onLoad(
-			{ filter: /.*/, namespace: "test" },
-			() => ({
-				contents: `
+		build.onLoad({ filter: /.*/, namespace: "test" }, () => ({
+			contents: `
 					export class App {}
 					export class Vault {}
 					export class Plugin {}
@@ -56,9 +54,8 @@ const obsidianStubPlugin = {
 				export class TFolder {}
 					export function setIcon() {}
 				`,
-				loader: "js",
-			}),
-		);
+			loader: "js",
+		}));
 	},
 };
 
@@ -81,7 +78,9 @@ try {
 		child.on("error", reject);
 		child.on("exit", (code) => resolve(code ?? 1));
 	});
-	if (exitCode !== 0) process.exitCode = exitCode;
+	if (exitCode !== 0) {
+		process.exitCode = exitCode;
+	}
 } finally {
 	await rm(outputDir, { recursive: true, force: true });
 }

@@ -83,10 +83,17 @@ export async function sealBackupEnvelope(
 		content,
 	);
 	const result = new Uint8Array(
-		MAGIC.length + HEADER_LENGTH_BYTES + headerBytes.length + ciphertext.byteLength,
+		MAGIC.length +
+			HEADER_LENGTH_BYTES +
+			headerBytes.length +
+			ciphertext.byteLength,
 	);
 	result.set(MAGIC, 0);
-	new DataView(result.buffer).setUint32(MAGIC.length, headerBytes.length, false);
+	new DataView(result.buffer).setUint32(
+		MAGIC.length,
+		headerBytes.length,
+		false,
+	);
 	result.set(headerBytes, MAGIC.length + HEADER_LENGTH_BYTES);
 	result.set(
 		new Uint8Array(ciphertext),
@@ -101,7 +108,9 @@ export async function openBackupEnvelope(
 	password: string,
 ): Promise<OpenedBackupEnvelope> {
 	const bytes = new Uint8Array(data);
-	if (!isBackupEnvelope(data)) throw new Error("Unsupported backup envelope");
+	if (!isBackupEnvelope(data)) {
+		throw new Error("Unsupported backup envelope");
+	}
 	if (bytes.length < MAGIC.length + HEADER_LENGTH_BYTES) {
 		throw new Error("Backup envelope is truncated");
 	}
@@ -239,7 +248,9 @@ function decodeSizedBase64(
 	} catch {
 		throw new Error(`Invalid backup envelope ${label}`);
 	}
-	const result = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+	const result = Uint8Array.from(binary, (character) =>
+		character.charCodeAt(0),
+	);
 	if (result.length !== expectedLength || bytesToBase64(result) !== value) {
 		throw new Error(`Invalid backup envelope ${label}`);
 	}
@@ -248,6 +259,8 @@ function decodeSizedBase64(
 
 function bytesToBase64(bytes: Uint8Array): string {
 	let binary = "";
-	for (const byte of bytes) binary += String.fromCharCode(byte);
+	for (const byte of bytes) {
+		binary += String.fromCharCode(byte);
+	}
 	return btoa(binary);
 }

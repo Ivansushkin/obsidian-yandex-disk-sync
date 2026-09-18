@@ -1,4 +1,4 @@
-import type { SyncIndex } from "../types";
+import type { SyncIndex } from "../../types";
 
 export interface Page<T> {
 	items: T[];
@@ -10,11 +10,7 @@ export interface Page<T> {
  */
 export function stableSerialize(value: unknown): string {
 	const serialized = JSON.stringify(value, (_key, item: unknown) => {
-		if (
-			item !== null &&
-			typeof item === "object" &&
-			!Array.isArray(item)
-		) {
+		if (item !== null && typeof item === "object" && !Array.isArray(item)) {
 			return Object.fromEntries(
 				Object.entries(item as Record<string, unknown>).sort(
 					([left], [right]) => left.localeCompare(right),
@@ -39,7 +35,9 @@ export async function collectPaginatedItems<T>(
 		const page = await loadPage(limit, offset);
 		result.push(...page.items);
 		offset += page.items.length;
-		if (offset >= page.total || page.items.length === 0) return result;
+		if (offset >= page.total || page.items.length === 0) {
+			return result;
+		}
 	}
 }
 
@@ -64,13 +62,13 @@ export async function collectStablePaginatedItems<T>(
 		const items = [...unique.values()].sort((left, right) =>
 			getPath(left).localeCompare(getPath(right)),
 		);
-		const signature = stableSerialize(
-			[
-				getSnapshotVersion?.() ?? "",
-				items.map((item) => [getPath(item), getVersion(item)]),
-			],
-		);
-		if (signature === previousSignature) return items;
+		const signature = stableSerialize([
+			getSnapshotVersion?.() ?? "",
+			items.map((item) => [getPath(item), getVersion(item)]),
+		]);
+		if (signature === previousSignature) {
+			return items;
+		}
 		previousSignature = signature;
 	}
 	throw new UnstablePaginationError(

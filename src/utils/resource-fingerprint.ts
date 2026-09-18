@@ -7,9 +7,15 @@ import type { YandexResource } from "../types";
 export function getStableContentFingerprint(
 	resource: YandexResource | null,
 ): string | null {
-	if (!resource) return null;
-	if (resource.sha256) return `sha256:${resource.sha256}`;
-	if (resource.md5) return `md5:${resource.md5}`;
+	if (!resource) {
+		return null;
+	}
+	if (resource.sha256) {
+		return `sha256:${resource.sha256}`;
+	}
+	if (resource.md5) {
+		return `md5:${resource.md5}`;
+	}
 	if (resource.modified) {
 		return `modified:${resource.modified}:size:${resource.size ?? -1}`;
 	}
@@ -22,8 +28,7 @@ export function isHashStableContentFingerprint(
 ): fingerprint is string {
 	return (
 		typeof fingerprint === "string" &&
-		(fingerprint.startsWith("sha256:") ||
-			fingerprint.startsWith("md5:"))
+		(fingerprint.startsWith("sha256:") || fingerprint.startsWith("md5:"))
 	);
 }
 
@@ -32,7 +37,9 @@ export function matchesStableContentFingerprint(
 	expected: string | null | undefined,
 	resource: YandexResource | null,
 ): boolean {
-	if (!expected || !resource) return false;
+	if (!expected || !resource) {
+		return false;
+	}
 	if (expected.startsWith("sha256:")) {
 		return resource.sha256 === expected.slice("sha256:".length);
 	}
@@ -50,9 +57,7 @@ export function getMatchingStableContentFingerprint(
 	after: YandexResource,
 ): string | null {
 	if (before.sha256 && after.sha256) {
-		return before.sha256 === after.sha256
-			? `sha256:${after.sha256}`
-			: null;
+		return before.sha256 === after.sha256 ? `sha256:${after.sha256}` : null;
 	}
 	if (before.md5 && after.md5) {
 		return before.md5 === after.md5 ? `md5:${after.md5}` : null;
@@ -72,7 +77,9 @@ export function getMatchingStableContentFingerprint(
 export function getPhysicalResourceFingerprint(
 	resource: YandexResource | null,
 ): string | null {
-	if (!resource) return null;
+	if (!resource) {
+		return null;
+	}
 	return (
 		resource.sha256 ??
 		resource.md5 ??
@@ -89,7 +96,9 @@ export function matchesPhysicalResourceFingerprint(
 	expected: string | undefined,
 	resource: YandexResource | null,
 ): boolean {
-	if (!expected || !resource) return false;
+	if (!expected || !resource) {
+		return false;
+	}
 	return [
 		resource.sha256,
 		resource.md5,

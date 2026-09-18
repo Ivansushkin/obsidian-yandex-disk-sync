@@ -1,18 +1,18 @@
+import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { App, DataAdapter, Stat } from "obsidian";
 import { VaultAdapter } from "../src/api/vault-adapter";
 import type { YandexDiskClient } from "../src/api/yandex-client";
-import { SyncEngine } from "../src/sync/sync-engine";
-import type { IndexManager } from "../src/sync/index-manager";
+import { SyncEngine } from "../src/sync/engine";
+import type { IndexManager } from "../src/sync/canonical/manager";
 import { DEFAULT_SETTINGS } from "../src/types";
 import { logger } from "../src/utils/logger";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
 const TEST_CONFIG_DIR = ".config-hidden-test";
-const TEST_BACKUP_DIR =
-	`${TEST_CONFIG_DIR}/plugins/yandex-disk-sync/overwritten`;
+const TEST_BACKUP_DIR = `${TEST_CONFIG_DIR}/plugins/yandex-disk-sync/overwritten`;
 
 class FakeHiddenDataAdapter {
 	readonly files = new Map<string, ArrayBuffer>();
@@ -42,13 +42,17 @@ class FakeHiddenDataAdapter {
 	}
 
 	async writeBinary(path: string, content: ArrayBuffer): Promise<void> {
-		if (this.failWrite) throw new Error("write failed");
+		if (this.failWrite) {
+			throw new Error("write failed");
+		}
 		this.files.set(path, content.slice(0));
 	}
 
 	async readBinary(path: string): Promise<ArrayBuffer> {
 		const content = this.files.get(path);
-		if (!content) throw new Error(`Missing file: ${path}`);
+		if (!content) {
+			throw new Error(`Missing file: ${path}`);
+		}
 		return content.slice(0);
 	}
 
@@ -59,9 +63,7 @@ class FakeHiddenDataAdapter {
 				type: "file",
 				ctime: Date.now(),
 				mtime: Date.now(),
-				size:
-					content.byteLength +
-					(this.failStatVerification ? 1 : 0),
+				size: content.byteLength + (this.failStatVerification ? 1 : 0),
 			};
 		}
 		if (this.directories.has(path)) {
@@ -91,7 +93,9 @@ class FakeHiddenDataAdapter {
 	}
 
 	async trashSystem(path: string): Promise<boolean> {
-		if (!this.systemTrashAvailable) return false;
+		if (!this.systemTrashAvailable) {
+			return false;
+		}
 		this.systemTrash.push(path);
 		this.files.delete(path);
 		return true;
@@ -106,9 +110,7 @@ class FakeHiddenDataAdapter {
 	}
 }
 
-function createVaultAdapter(
-	dataAdapter = new FakeHiddenDataAdapter(),
-): {
+function createVaultAdapter(dataAdapter = new FakeHiddenDataAdapter()): {
 	dataAdapter: FakeHiddenDataAdapter;
 	vaultAdapter: VaultAdapter;
 } {
@@ -142,10 +144,7 @@ test("hidden plugin backup uses DataAdapter and preserves exact bytes", async ()
 	);
 
 	assert.notEqual(firstPath, secondPath);
-	assert.match(
-		firstPath,
-		new RegExp(`^${TEST_BACKUP_DIR}/`),
-	);
+	assert.match(firstPath, new RegExp(`^${TEST_BACKUP_DIR}/`));
 	assert.deepEqual(
 		new Uint8Array(await dataAdapter.readBinary(firstPath)),
 		new Uint8Array(content),
@@ -197,18 +196,14 @@ test("backup cleanup uses system trash and never local vault trash", async () =>
 	const dataAdapter = new FakeHiddenDataAdapter();
 	const backupDir = TEST_BACKUP_DIR;
 	dataAdapter.directories.add(`${TEST_CONFIG_DIR}/plugins`);
-	dataAdapter.directories.add(
-		`${TEST_CONFIG_DIR}/plugins/yandex-disk-sync`,
-	);
+	dataAdapter.directories.add(`${TEST_CONFIG_DIR}/plugins/yandex-disk-sync`);
 	dataAdapter.directories.add(backupDir);
 	const oldPath = `${backupDir}/old`;
 	dataAdapter.seedFile(oldPath, new Uint8Array([1]).buffer);
 	const originalStat = dataAdapter.stat.bind(dataAdapter);
 	dataAdapter.stat = async (path: string): Promise<Stat | null> => {
 		const stat = await originalStat(path);
-		return stat && path === oldPath
-			? { ...stat, mtime: 0 }
-			: stat;
+		return stat && path === oldPath ? { ...stat, mtime: 0 } : stat;
 	};
 	const { vaultAdapter } = createVaultAdapter(dataAdapter);
 
@@ -227,9 +222,7 @@ test("unavailable system trash preserves stale backup", async () => {
 	const originalStat = dataAdapter.stat.bind(dataAdapter);
 	dataAdapter.stat = async (path: string): Promise<Stat | null> => {
 		const stat = await originalStat(path);
-		return stat && path === oldPath
-			? { ...stat, mtime: 0 }
-			: stat;
+		return stat && path === oldPath ? { ...stat, mtime: 0 } : stat;
 	};
 	const { vaultAdapter } = createVaultAdapter(dataAdapter);
 
@@ -276,9 +269,63 @@ test("failed mandatory backup prevents a local overwrite", async () => {
 		},
 	);
 
-	await assert.rejects(
-		engine.downloadFile("note.md"),
-		/backup unavailable/,
-	);
+	await assert.rejects(engine.downloadFile("note.md"), /backup unavailable/);
 	assert.equal(writeCalled, false);
+});
+
+test("download preserves local changes during remote I/O and protective backup", async () => {
+	const encode = (value: string) => new TextEncoder().encode(value).buffer;
+	const codec = new EncryptionService(new Uint8Array(SALT_LENGTH).fill(21));
+	await codec.initializeKey("synthetic-download-password");
+	for (const service of [null, codec]) {
+		for (const timing of ["create", "edit", "backup"] as const) {
+			let local = timing === "create" ? null : encode("old local");
+			const remote = encode("remote");
+			const stored = service ? await service.encrypt(remote) : remote;
+			const vault = {
+				fileExists: () => local !== null,
+				readFile: async () => local!,
+				writeFile: async () => {
+					assert.fail("stale download wrote local bytes");
+				},
+				backupOverwrittenFile: async () => {
+					local = encode("late edit");
+				},
+			};
+			const index = {
+				getLocalIndex: () => ({
+					files:
+						timing === "backup"
+							? { "note.md": { sha256: "baseline" } }
+							: {},
+				}),
+			};
+			const engine = new SyncEngine(
+				{
+					downloadFile: async () => {
+						if (timing !== "backup") {
+							local = encode("late edit");
+						}
+						return service ? await service.decrypt(stored) : stored;
+					},
+				} as unknown as YandexDiskClient,
+				vault as unknown as VaultAdapter,
+				index as unknown as IndexManager,
+				{ ...DEFAULT_SETTINGS },
+			);
+			await assert.rejects(
+				engine.downloadFile("note.md"),
+				/Local file changed/,
+			);
+			assert.equal(new TextDecoder().decode(local!), "late edit");
+			assert.deepEqual(
+				service ? await service.decrypt(stored) : stored,
+				remote,
+			);
+			assert.equal(
+				engine.consumeInternalWatcherEvent("note.md", "upload"),
+				false,
+			);
+		}
+	}
 });

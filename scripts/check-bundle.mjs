@@ -29,6 +29,8 @@ if (increase > 12 * 1024) {
 	throw new Error(`@noble/ciphers adds ${increase} bytes; limit is 12288`);
 }
 if (readFileSync("build/main.js", "utf8").includes("dotenv")) {
-	throw new Error("Runtime bundle must not contain the dev-only dotenv package");
+	throw new Error(
+		"Runtime bundle must not contain the dev-only dotenv package",
+	);
 }
 console.log(`@noble/ciphers minified contribution: ${increase} bytes`);

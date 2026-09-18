@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { App } from "obsidian";
-import {
-	DEFAULT_LOG_RELATIVE_PATH,
-	Logger,
-} from "../src/utils/logger";
+import { DEFAULT_LOG_RELATIVE_PATH, Logger } from "../src/utils/logger";
 
 interface MemoryLogAdapter {
 	files: Map<string, string>;
@@ -101,7 +98,10 @@ test("logger serializes concurrent flushes without losing entries", async () => 
 	const path = `.custom-config/${DEFAULT_LOG_RELATIVE_PATH}`;
 	const contents = memory.files.get(path) ?? "";
 	for (let index = 0; index < 20; index++) {
-		assert.equal(contents.match(new RegExp(`entry-${index}(?!\\d)`, "g"))?.length, 1);
+		assert.equal(
+			contents.match(new RegExp(`entry-${index}(?!\\d)`, "g"))?.length,
+			1,
+		);
 	}
 });
 

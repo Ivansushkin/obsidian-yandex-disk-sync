@@ -8,6 +8,9 @@
 - Read the applicable files in `docs/` before making changes. The normative
   behavior catalogue is `docs/SYNC_USER_SCENARIOS.md`.
 - Do not use emoji.
+- Always use braces for control-flow bodies, including single-line `if`/`else`.
+- Use ESLint for code rules and Prettier for formatting. Run `npm run lint:fix`
+  and `npm run format` after edits; never disable the pre-commit hook.
 - Write concise, useful English JSDoc for non-trivial functions and classes.
 - Do not add comments that merely restate code. Avoid deeply nested control flow.
 - Reuse existing coordinator, store, transaction, and utility modules first.
@@ -29,6 +32,7 @@
   npm install
   npm test
   npm run lint
+  npm run format:check
   npm run build
   ```
 
@@ -38,7 +42,10 @@
 - Never commit `build/`, `main.js`, `node_modules/`, or other generated files.
   Release assets are `main.js`, `manifest.json`, and `styles.css`.
 - After code changes, run `npm test`, `npm run lint`, `npm run build`, and
-  `git diff --check`.
+  `npm run format:check`, then `git diff --check`.
+- `npm install` installs Husky hooks through `prepare`. The pre-commit hook
+  runs lint-staged: ESLint fixes code before Prettier formats staged files;
+  unstaged hunks are preserved. Non-fixable lint errors block the commit.
 
 ## Synchronization architecture
 
@@ -103,11 +110,13 @@
 - Concurrent use of older builds and 2.0.0 is unsupported. Only plaintext
   stable 1.0/1.1 local data and their numeric canonical formats are migratable;
   encrypted legacy data and every other historical format fail closed.
-- Preserve an exact stable 1.0/1.1 `data.json` shape until a verified backup
-  and protected snapshot recheck reach the explicit local cutover. Startup,
-  settings saves, installation ID setup, Resume, and unload must not perform
-  that cutover. A foreign replacement epoch requires its own verified local
-  backup before adoption.
+- Stable plaintext 1.0/1.1 local migration is irreversible. Persist one coherent
+  current snapshot after installation identity initialization and before automation.
+  A failed initial save blocks sync and unload must not retry it.
+- Full archives before Force and encryption transitions are explicit per-run choices:
+  with-backup, without-backup, or cancel. Recovery and epoch adoption never create
+  an archive automatically. Canonical, source, codec and fingerprint guards always
+  apply. Mandatory protective copies of individual overwritten/deleted files remain.
 - Startup blocks are non-persisted and typed. Only `migration` may permit a
   confirmed Force; encryption, historical, and authentication blocks may not.
   Load local state and register lifecycle callbacks before token/remote checks.
@@ -118,8 +127,8 @@
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
   translations, and migration messages.
-- Release metadata exposes one 2.0.0 line; do not add historical development
-  entries back to `CHANGELOG.md` or `versions.json`.
+- Release metadata retains stable 1.1.0 compatibility and one current 2.0.0
+  entry. Do not add historical development entries or remove the stable fallback.
 
 ## Documentation and testing
 

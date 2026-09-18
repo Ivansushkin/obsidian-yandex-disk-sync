@@ -2,6 +2,7 @@ import tseslint from "typescript-eslint";
 import obsidianmd from "eslint-plugin-obsidianmd";
 import globals from "globals";
 import { globalIgnores } from "eslint/config";
+import prettier from "eslint-config-prettier/flat";
 
 export default tseslint.config(
 	{
@@ -9,21 +10,18 @@ export default tseslint.config(
 			globals: {
 				...globals.browser,
 			},
-			parserOptions: {
-				projectService: {
-					allowDefaultProject: [
-						"eslint.config.mts",
-						"*.config.mjs",
-						"version-bump.mjs",
-						"manifest.json",
-					],
-				},
-				tsconfigRootDir: import.meta.dirname,
-				extraFileExtensions: [".json"],
-			},
 		},
 	},
 	...obsidianmd.configs.recommended,
+	{
+		files: ["src/**/*.ts", "tests/**/*.ts"],
+		languageOptions: {
+			parserOptions: {
+				projectService: true,
+				tsconfigRootDir: import.meta.dirname,
+			},
+		},
+	},
 	{
 		files: ["package.json"],
 		rules: {
@@ -31,13 +29,13 @@ export default tseslint.config(
 				"error",
 				{
 					presets: ["native", "microutilities", "preferred"],
-					allowed: ["dotenv"],
+					allowed: ["dotenv", "lint-staged"],
 				},
 			],
 		},
 	},
 	{
-		files: ["eslint.config.mts", "*.mjs"],
+		files: ["eslint.config.mts", "**/*.{js,mjs,cjs}"],
 		languageOptions: {
 			globals: {
 				...globals.node,
@@ -59,11 +57,27 @@ export default tseslint.config(
 			"@typescript-eslint/no-floating-promises": "off",
 		},
 	},
+	{
+		files: ["tests/helpers/**/*.ts"],
+		rules: {
+			// Synthetic vaults define configDir instead of reading a real vault.
+			"obsidianmd/hardcoded-config-path": "off",
+		},
+	},
 	globalIgnores([
 		"node_modules",
 		"dist",
 		"build",
 		"versions.json",
 		"main.js",
+		".husky/_/**",
+		".env*",
 	]),
+	prettier,
+	{
+		files: ["**/*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
+		rules: {
+			curly: ["error", "all"],
+		},
+	},
 );

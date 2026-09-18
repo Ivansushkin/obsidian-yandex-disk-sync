@@ -1,10 +1,20 @@
+import type { UserSettingsPatch } from "./settings-workflow";
 /**
  * Yandex Disk Sync plugin settings
  */
 
-import { App, ButtonComponent, Notice, PluginSettingTab, Setting, TextAreaComponent, TextComponent, ToggleComponent } from "obsidian";
+import {
+	App,
+	ButtonComponent,
+	Notice,
+	PluginSettingTab,
+	Setting,
+	TextAreaComponent,
+	TextComponent,
+	ToggleComponent,
+} from "obsidian";
 import type YandexDiskSyncPlugin from "./main";
-import { t } from "./i18n";
+import { t } from "./i18n/index";
 import { logger } from "./utils/logger";
 import { BackupListModal } from "./ui/backup-list-modal";
 import { LogViewerModal } from "./ui/log-viewer-modal";
@@ -28,6 +38,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private forceActivityEl: HTMLElement | null = null;
 	private controlsEl: HTMLFieldSetElement | null = null;
 	private renderGeneration = 0;
+	private displayed = false;
 
 	constructor(app: App, plugin: YandexDiskSyncPlugin) {
 		super(app, plugin);
@@ -38,7 +49,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		if (!this.plugin.settings.yandexTokenSecret.trim()) {
 			return t("settings.backup_unavailable");
 		}
-		if (this.backupStatusPromise) return await this.backupStatusPromise;
+		if (this.backupStatusPromise) {
+			return await this.backupStatusPromise;
+		}
 		this.backupStatusPromise = this.loadLastBackupText().finally(() => {
 			this.backupStatusPromise = null;
 		});
@@ -47,9 +60,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 	private async loadLastBackupText(): Promise<string> {
 		try {
-			const backups: BackupInfo[] =
-				await this.plugin.getBackupManager().listBackups();
-			return backups[0]?.created.toLocaleString() ?? t("settings.backup_never");
+			const backups: BackupInfo[] = await this.plugin
+				.getBackupManager()
+				.listBackups();
+			return (
+				backups[0]?.created.toLocaleString() ??
+				t("settings.backup_never")
+			);
 		} catch (error) {
 			if (
 				!(error instanceof YandexApiError) ||
@@ -62,6 +79,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	hide(): void {
+		this.displayed = false;
 		this.detachActivity();
 		this.renderGeneration++;
 		this.plugin.encryptionStateChangeCallback = null;
@@ -69,33 +87,53 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	private detachActivity(): void {
-		for (const unsubscribe of this.activityUnsubscribers) unsubscribe();
+		for (const unsubscribe of this.activityUnsubscribers) {
+			unsubscribe();
+		}
 		this.activityUnsubscribers = [];
 	}
 
 	/** Update existing controls without rebuilding focused settings on every progress event. */
 	private updateActivity(): void {
-		const busy = this.plugin.isForceSyncBusy();
+		const busy = this.plugin.isConfigurationBusy();
 		if (this.controlsEl) {
 			this.controlsEl.disabled = busy;
 			this.controlsEl.setAttribute("aria-busy", String(busy));
 		}
-		for (const button of this.forceButtons) button.setDisabled(this.plugin.isForceSyncUnavailable());
+		for (const button of this.forceButtons) {
+			button.setDisabled(this.plugin.isForceSyncUnavailable());
+		}
 		const state = this.plugin.getForceSyncController().getState();
 		if (this.forceActivityEl) {
 			this.forceActivityEl.hidden = !busy;
-			this.forceActivityEl.setText(state?.active ? formatForceActivity(state) : "");
+			this.forceActivityEl.setText(
+				state?.active ? formatForceActivity(state) : "",
+			);
 			this.forceActivityEl.toggleClass("force-flow-active", busy);
+		}
+	}
+
+	private async applyDraft(patch: UserSettingsPatch): Promise<void> {
+		try {
+			await this.plugin.applySettingsPatch(patch);
+		} catch (error) {
+			new Notice(error instanceof Error ? error.message : String(error));
+			this.renderSettings();
 		}
 	}
 
 	private showToggleSpinner(tgl: ToggleComponent): HTMLElement {
 		tgl.setDisabled(true);
 		tgl.toggleEl.addClass("encryption-toggle-hidden");
-		return tgl.toggleEl.parentElement!.createSpan({ cls: "encryption-toggle-spinner" });
+		return tgl.toggleEl.parentElement!.createSpan({
+			cls: "encryption-toggle-spinner",
+		});
 	}
 
-	private hideToggleSpinner(tgl: ToggleComponent, spinner: HTMLElement): void {
+	private hideToggleSpinner(
+		tgl: ToggleComponent,
+		spinner: HTMLElement,
+	): void {
 		spinner.remove();
 		tgl.toggleEl.removeClass("encryption-toggle-hidden");
 		tgl.setDisabled(false);
@@ -118,10 +156,15 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		if (remoteManifest) {
 			const password = await this.promptConnectEncryptionPassword();
-			if (!password) return;
+			if (!password) {
+				return;
+			}
 
 			try {
-				await this.plugin.connectToRemoteEncryption(password, remoteManifest);
+				await this.plugin.connectToRemoteEncryption(
+					password,
+					remoteManifest,
+				);
 				new Notice(t("notice.encryption_connected"));
 			} catch (e) {
 				new Notice(e instanceof Error ? e.message : String(e));
@@ -130,7 +173,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 
 		const password = await this.promptNewEncryptionPassword();
-		if (!password) return;
+		if (!password) {
+			return;
+		}
 
 		try {
 			await this.plugin.enableEncryption(password);
@@ -141,12 +186,16 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 	private async disableEncryptionFlow(): Promise<void> {
 		const currentPassword = await this.promptCurrentEncryptionPassword();
-		if (!currentPassword) return;
+		if (!currentPassword) {
+			return;
+		}
 
 		const confirmed = await new Promise<boolean>((resolve) => {
 			new DisableEncryptionModal(this.app, resolve).open();
 		});
-		if (!confirmed) return;
+		if (!confirmed) {
+			return;
+		}
 
 		try {
 			await this.plugin.disableEncryption({ reuploadPlaintext: true });
@@ -168,55 +217,81 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				resolve,
 				t("modal.encryption_connect_title"),
 				t("modal.encryption_connect_desc"),
-				t("modal.encryption_connect_button")
+				t("modal.encryption_connect_button"),
 			).open();
 		});
 	}
 
 	private async promptCurrentEncryptionPassword(): Promise<string | null> {
 		return await new Promise<string | null>((resolve) => {
-			new VerifyPasswordModal(
-				this.app,
-				resolve,
-				async (pw) => this.plugin.verifyEncryptionPassword(pw)
+			new VerifyPasswordModal(this.app, resolve, async (pw) =>
+				this.plugin.verifyEncryptionPassword(pw),
 			).open();
 		});
 	}
 
 	display(): void {
+		this.displayed = true;
+		this.renderSettings();
+	}
+
+	private renderSettings(): void {
+		if (!this.displayed) {
+			return;
+		}
 		this.detachActivity();
 		this.renderGeneration++;
 		this.forceButtons = [];
 		this.forceActivityEl = null;
-		// eslint-disable-next-line @typescript-eslint/no-deprecated
-		this.plugin.encryptionStateChangeCallback = () => { this.display(); };
+		this.plugin.encryptionStateChangeCallback = () => {
+			this.renderSettings();
+		};
 		const { containerEl } = this;
 		containerEl.empty();
-		this.controlsEl = containerEl.createEl("fieldset", { cls: "force-settings-controls" });
+		this.controlsEl = containerEl.createEl("fieldset", {
+			cls: "force-settings-controls",
+		});
 		// Obsidian toggles are custom elements; native fieldset disabling alone is insufficient.
 		for (const event of ["click", "keydown", "input", "change"]) {
-			this.controlsEl.addEventListener(event, (e) => {
-				if (!this.plugin.isForceSyncBusy()) return;
-				if (e instanceof KeyboardEvent && e.key === "Tab") return;
-				e.preventDefault();
-				e.stopImmediatePropagation();
-			}, true);
+			this.controlsEl.addEventListener(
+				event,
+				(e) => {
+					if (!this.plugin.isForceSyncBusy()) {
+						return;
+					}
+					if (e instanceof KeyboardEvent && e.key === "Tab") {
+						return;
+					}
+					e.preventDefault();
+					e.stopImmediatePropagation();
+				},
+				true,
+			);
 		}
 		this.activityUnsubscribers = [
-			this.plugin.getForceSyncController().subscribe(() => this.updateActivity()),
+			this.plugin
+				.getForceSyncController()
+				.subscribe(() => this.updateActivity()),
 			this.plugin.onSyncActivityChange(() => this.updateActivity()),
 		];
 		this.updateActivity();
 		void this.renderDisplay(this.controlsEl, this.renderGeneration);
 	}
 
-	private async renderDisplay(containerEl: HTMLElement, generation: number): Promise<void> {
+	private async renderDisplay(
+		containerEl: HTMLElement,
+		generation: number,
+	): Promise<void> {
 		const migrationPending = this.plugin.isStableMigrationPending();
 
 		// Connection section
-		new Setting(containerEl).setName(t("settings.connection_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.connection_section"))
+			.setHeading();
 
-		const connectionBlock = containerEl.createDiv({ cls: "connection-block" });
+		const connectionBlock = containerEl.createDiv({
+			cls: "connection-block",
+		});
 
 		const oauthSetting = new Setting(connectionBlock);
 
@@ -245,11 +320,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.setPlaceholder(t("settings.client_id_placeholder"))
 			.setValue(this.plugin.settings.clientId)
 			.onChange(async (value) => {
-				if (this.plugin.isForceSyncBusy()) return;
-				this.plugin.settings.clientId = value;
-				await this.plugin.saveSettings();
-				// eslint-disable-next-line @typescript-eslint/no-deprecated
-				this.display();
+				if (this.plugin.isForceSyncBusy()) {
+					return;
+				}
+				await this.applyDraft({ clientId: value });
+				this.renderSettings();
 			});
 
 		new ButtonComponent(controlEl)
@@ -268,16 +343,19 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.setPlaceholder(t("settings.oauth_token_placeholder"))
 			.setValue(this.plugin.settings.yandexTokenSecret)
 			.onChange(async (value) => {
-				if (this.plugin.isForceSyncBusy()) return;
-				this.plugin.settings.yandexTokenSecret = value;
-				await this.plugin.saveSettings();
+				if (this.plugin.isForceSyncBusy()) {
+					return;
+				}
+				await this.applyDraft({ yandexTokenSecret: value });
 			});
 
 		const syncButton = new ButtonComponent(controlEl)
 			.setButtonText(t("settings.sync_button"))
 			.setCta();
 		syncButton.onClick(async () => {
-			if (this.plugin.isForceSyncBusy()) return;
+			if (this.plugin.isForceSyncBusy()) {
+				return;
+			}
 			syncButton.setDisabled(true);
 			syncButton.setButtonText(t("settings.syncing_button"));
 			try {
@@ -299,14 +377,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setPlaceholder(t("settings.remote_path_placeholder"))
 					.setValue(this.plugin.settings.remotePath)
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.remotePath = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ remotePath: value });
+					}),
 			);
 
 		// Automatic sync section
-		new Setting(containerEl).setName(t("settings.automatic_sync_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.automatic_sync_section"))
+			.setHeading();
 
 		// Enable real-time sync
 		new Setting(containerEl)
@@ -316,10 +397,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				toggle
 					.setValue(this.plugin.settings.enableRealtimeSync)
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.enableRealtimeSync = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ enableRealtimeSync: value });
+					}),
 			);
 
 		// Sync interval
@@ -333,10 +415,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.syncInterval = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ syncInterval: value });
+					}),
 			);
 
 		// Debounce delay
@@ -350,10 +433,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.debounceDelay = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ debounceDelay: value });
+					}),
 			);
 
 		// Max concurrency
@@ -367,14 +451,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.maxConcurrency = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ maxConcurrency: value });
+					}),
 			);
 
 		// Force Sync section
-		new Setting(containerEl).setName(t("settings.force_sync_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.force_sync_section"))
+			.setHeading();
 
 		new Setting(containerEl)
 			.setDesc(t("settings.force_sync_desc"))
@@ -396,11 +483,16 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						void this.plugin.runForceSyncFromRemote();
 					});
 			});
-		this.forceActivityEl = containerEl.createDiv({ cls: "force-flow-status", attr: { role: "status", "aria-live": "polite" } });
+		this.forceActivityEl = containerEl.createDiv({
+			cls: "force-flow-status",
+			attr: { role: "status", "aria-live": "polite" },
+		});
 		this.updateActivity();
 
 		// Encryption section
-		new Setting(containerEl).setName(t("settings.encryption_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.encryption_section"))
+			.setHeading();
 
 		const infoSetting = new Setting(containerEl)
 			.setName(t("settings.encryption_info_title"))
@@ -431,20 +523,27 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.enableEncryption)
 					.setDisabled(migrationPending)
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
 						const spinner = this.showToggleSpinner(toggle);
 						try {
-							if (value && !this.plugin.settings.enableEncryption) {
+							if (
+								value &&
+								!this.plugin.settings.enableEncryption
+							) {
 								await this.enableEncryptionFlow();
-							} else if (!value && this.plugin.settings.enableEncryption) {
+							} else if (
+								!value &&
+								this.plugin.settings.enableEncryption
+							) {
 								await this.disableEncryptionFlow();
 							}
 						} finally {
 							this.hideToggleSpinner(toggle, spinner);
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							this.display();
+							this.renderSettings();
 						}
-					})
+					});
 			});
 
 		if (this.plugin.settings.enableEncryption) {
@@ -452,49 +551,57 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				.setDesc(t("settings.encryption_status_active"))
 				.addButton((button) =>
 					button
-								.setButtonText(t("settings.encryption_change_password"))
-								.onClick(async () => {
-									if (this.plugin.isForceSyncBusy()) return;
-									const spinner = encryptionToggle
-										? this.showToggleSpinner(encryptionToggle)
-										: null;
-									try {
-										const currentPassword =
-											await this.promptCurrentEncryptionPassword();
-										if (!currentPassword) return;
+						.setButtonText(t("settings.encryption_change_password"))
+						.onClick(async () => {
+							if (this.plugin.isForceSyncBusy()) {
+								return;
+							}
+							const spinner = encryptionToggle
+								? this.showToggleSpinner(encryptionToggle)
+								: null;
+							try {
+								const currentPassword =
+									await this.promptCurrentEncryptionPassword();
+								if (!currentPassword) {
+									return;
+								}
 
-										const newPassword = await new Promise<string | null>(
-											(resolve) =>
-												new ChangePasswordModal(
-													this.app,
-													resolve,
-												).open(),
-										);
-										if (!newPassword) return;
+								const newPassword = await new Promise<
+									string | null
+								>((resolve) =>
+									new ChangePasswordModal(
+										this.app,
+										resolve,
+									).open(),
+								);
+								if (!newPassword) {
+									return;
+								}
 
-										try {
-											await this.plugin.rotateEncryptionPassword(
-												newPassword,
-											);
-										} catch {
-											// The plugin owns the single progress and result Notice.
-										}
-									} finally {
-										if (spinner && encryptionToggle) {
-											this.hideToggleSpinner(
-												encryptionToggle,
-												spinner,
-											);
-										}
-										// eslint-disable-next-line @typescript-eslint/no-deprecated
-										this.display();
-									}
-								}),
+								try {
+									await this.plugin.rotateEncryptionPassword(
+										newPassword,
+									);
+								} catch {
+									// The plugin owns the single progress and result Notice.
+								}
+							} finally {
+								if (spinner && encryptionToggle) {
+									this.hideToggleSpinner(
+										encryptionToggle,
+										spinner,
+									);
+								}
+								this.renderSettings();
+							}
+						}),
 				);
 		}
 
 		// File filters section
-		new Setting(containerEl).setName(t("settings.file_filters_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.file_filters_section"))
+			.setHeading();
 
 		// Sync config folder
 		new Setting(containerEl)
@@ -504,10 +611,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				toggle
 					.setValue(this.plugin.settings.syncDotObsidian)
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.syncDotObsidian = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ syncDotObsidian: value });
+					}),
 			);
 
 		// Include patterns
@@ -519,12 +627,15 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setPlaceholder(t("settings.include_patterns_placeholder"))
 					.setValue(this.plugin.settings.syncPatterns.join("\n"))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.syncPatterns = value
-							.split("\n")
-							.map((s) => s.trim())
-							.filter((s) => s.length > 0);
-						await this.plugin.saveSettings();
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({
+							syncPatterns: value
+								.split("\n")
+								.map((s) => s.trim())
+								.filter((s) => s.length > 0),
+						});
 					});
 				textArea.inputEl.rows = 4;
 				textArea.inputEl.cols = 30;
@@ -539,19 +650,24 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setPlaceholder(t("settings.exclude_patterns_placeholder"))
 					.setValue(this.plugin.settings.excludePatterns.join("\n"))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.excludePatterns = value
-							.split("\n")
-							.map((s) => s.trim())
-							.filter((s) => s.length > 0);
-						await this.plugin.saveSettings();
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({
+							excludePatterns: value
+								.split("\n")
+								.map((s) => s.trim())
+								.filter((s) => s.length > 0),
+						});
 					});
 				textArea.inputEl.rows = 4;
 				textArea.inputEl.cols = 30;
 			});
 
 		// Logging section
-		new Setting(containerEl).setName(t("settings.logging_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.logging_section"))
+			.setHeading();
 
 		// Enable debug logging
 		new Setting(containerEl)
@@ -562,10 +678,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.enableDebugLogging)
 					.setDisabled(migrationPending)
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.enableDebugLogging = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ enableDebugLogging: value });
+					}),
 			);
 
 		// Write logs to file
@@ -577,10 +694,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.logToFile)
 					.setDisabled(migrationPending)
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) return;
-						this.plugin.settings.logToFile = value;
-						await this.plugin.saveSettings();
-					})
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
+						await this.applyDraft({ logToFile: value });
+					}),
 			);
 
 		// View logs button
@@ -591,7 +709,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setCta()
 					.onClick(() => {
 						new LogViewerModal(this.app).open();
-					})
+					}),
 			)
 			.addButton((button) =>
 				button
@@ -599,21 +717,25 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setWarning()
 					.onClick(async () => {
-						if (this.plugin.isForceSyncBusy()) return;
+						if (this.plugin.isForceSyncBusy()) {
+							return;
+						}
 						await logger.clearLogs();
 						new Notice(t("notice.logs_cleared"));
-					})
+					}),
 			);
 
 		// Information section
-		new Setting(containerEl).setName(t("settings.information_section")).setHeading();
+		new Setting(containerEl)
+			.setName(t("settings.information_section"))
+			.setHeading();
 
 		// Device ID
 		new Setting(containerEl)
 			.setName(t("settings.device_id"))
 			.setDesc(t("settings.device_id_desc"))
 			.addText((text) =>
-				text.setValue(this.plugin.settings.deviceId).setDisabled(true)
+				text.setValue(this.plugin.settings.deviceId).setDisabled(true),
 			);
 
 		// Backup section
@@ -624,41 +746,55 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		// Combined backup status and button
 		const lastBackupText = await this.getLastBackupText();
-		if (generation !== this.renderGeneration) return;
+		if (generation !== this.renderGeneration) {
+			return;
+		}
 
 		new Setting(containerEl)
 			.setName(lastBackupText)
 			.addButton((button) =>
-				button.setButtonText(t("settings.backup_button")).onClick(async () => {
-					if (this.plugin.isForceSyncBusy()) return;
-					button.setDisabled(true);
-					button.setButtonText(t("settings.backup_in_progress"));
-
-					try {
-						const result = await this.plugin.createBackup();
-
-						if (result.success) {
-							button.setButtonText(t("settings.backup_success"));
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							this.display();
-						} else {
-							button.setButtonText(t("settings.backup_error"));
+				button
+					.setButtonText(t("settings.backup_button"))
+					.onClick(async () => {
+						if (this.plugin.isForceSyncBusy()) {
+							return;
 						}
-					} catch (error) {
-						button.setButtonText(t("settings.backup_error"));
-						logger.error("Backup failed:", { error });
-					}
+						button.setDisabled(true);
+						button.setButtonText(t("settings.backup_in_progress"));
 
-					setTimeout(() => {
-						button.setDisabled(false);
-						button.setButtonText(t("settings.backup_button"));
-					}, 3000);
-				})
+						try {
+							const result = await this.plugin.createBackup();
+
+							if (result.success) {
+								button.setButtonText(
+									t("settings.backup_success"),
+								);
+								this.renderSettings();
+							} else {
+								button.setButtonText(
+									t("settings.backup_error"),
+								);
+							}
+						} catch (error) {
+							button.setButtonText(t("settings.backup_error"));
+							logger.error("Backup failed:", { error });
+						}
+
+						setTimeout(() => {
+							button.setDisabled(false);
+							button.setButtonText(t("settings.backup_button"));
+						}, 3000);
+					}),
 			)
 			.addButton((button) =>
-				button.setButtonText(t("settings.backup_show_all")).onClick(() => {
-					new BackupListModal(this.app, this.plugin.getBackupManager()).open();
-				})
+				button
+					.setButtonText(t("settings.backup_show_all"))
+					.onClick(() => {
+						new BackupListModal(
+							this.app,
+							this.plugin.getBackupManager(),
+						).open();
+					}),
 			);
 
 		this.updateActivity();

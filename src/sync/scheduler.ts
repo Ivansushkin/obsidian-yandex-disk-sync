@@ -2,7 +2,7 @@
  * Periodic synchronization scheduler
  */
 
-import { SyncEngine } from "./sync-engine";
+import type { SyncEngine } from "./engine";
 import type { YandexDiskSyncSettings } from "../types";
 import { logger } from "../utils/logger";
 
@@ -12,6 +12,7 @@ export class SyncScheduler {
 
 	private intervalId: ReturnType<typeof setInterval> | null = null;
 	private isRunning = false;
+	private generation = 0;
 
 	constructor(syncEngine: SyncEngine, settings: YandexDiskSyncSettings) {
 		this.syncEngine = syncEngine;
@@ -22,14 +23,7 @@ export class SyncScheduler {
 	 * Update settings
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
-		const oldInterval = this.settings.syncInterval;
 		this.settings = settings;
-
-		// Restart if interval changed
-		if (this.isRunning && oldInterval !== settings.syncInterval) {
-			this.stop();
-			this.start();
-		}
 	}
 
 	/**
@@ -43,21 +37,22 @@ export class SyncScheduler {
 		const intervalMinutes = this.settings.syncInterval;
 
 		if (intervalMinutes <= 0) {
-			logger.debug(
-				"Periodic synchronization disabled (interval = 0)"
-			);
+			logger.debug("Periodic synchronization disabled (interval = 0)");
 			return;
 		}
 
 		const intervalMs = intervalMinutes * 60 * 1000;
 
+		const generation = ++this.generation;
 		this.intervalId = setInterval(() => {
-			void this.runScheduledSync();
+			if (this.isRunning && generation === this.generation) {
+				void this.runScheduledSync();
+			}
 		}, intervalMs);
 
 		this.isRunning = true;
 		logger.info(
-			`SyncScheduler started with ${intervalMinutes} minute interval`
+			`SyncScheduler started with ${intervalMinutes} minute interval`,
 		);
 	}
 
@@ -65,6 +60,7 @@ export class SyncScheduler {
 	 * Stop scheduler
 	 */
 	stop(): void {
+		this.generation++;
 		if (!this.isRunning) {
 			return;
 		}
@@ -84,15 +80,13 @@ export class SyncScheduler {
 	private async runScheduledSync(): Promise<void> {
 		if (this.syncEngine.isSyncInProgress()) {
 			logger.debug(
-				"Skipping scheduled synchronization: already in progress"
+				"Skipping scheduled synchronization: already in progress",
 			);
 			return;
 		}
 
 		if (this.syncEngine.isSyncPaused()) {
-			logger.debug(
-				"Skipping scheduled synchronization: paused"
-			);
+			logger.debug("Skipping scheduled synchronization: paused");
 			return;
 		}
 
@@ -105,12 +99,11 @@ export class SyncScheduler {
 				logger.info("Scheduled synchronization completed successfully");
 			} else {
 				logger.warn(
-					`Scheduled synchronization completed with errors: ${result.errors.length}`
+					`Scheduled synchronization completed with errors: ${result.errors.length}`,
 				);
 			}
 		} catch (e) {
 			logger.error("Scheduled synchronization error:", { error: e });
 		}
 	}
-
 }

@@ -1,181 +1,49 @@
 # Архитектура плагина Yandex Disk Sync
 
-## Обзор
+Плагин работает в browser runtime Obsidian на desktop и mobile. Его source of
+truth — canonical index на Яндекс Диске; локальные baseline и durable queues
+описывают состояние конкретной установки. Нормативные пользовательские исходы
+перечислены в [SYNC_USER_SCENARIOS.md](SYNC_USER_SCENARIOS.md).
 
-Плагин реализует двустороннюю синхронизацию файлов между локальным vault Obsidian и облачным хранилищем Яндекс Диск. Архитектура построена на модульном подходе с чётким разделением ответственности.
+## Границы модулей
 
-Нормативные пользовательские сценарии и критерии приёмки описаны в
-[`SYNC_USER_SCENARIOS.md`](SYNC_USER_SCENARIOS.md).
+`main.ts` соединяет компоненты и владеет plugin lifecycle, UI и persistence.
+`api/yandex-client.ts` выполняет транспортные запросы и codec conversion;
+`api/vault-adapter.ts` работает через Obsidian Vault/DataAdapter и FileManager.
+`backup/` отвечает за snapshots, архивы, envelope и exact read-back;
+`crypto/` — за codecs, manifest и transition/recovery.
 
-## Структура проекта
+В `sync/` папки отражают ответственность: `canonical/` — индекс и транзакции,
+`local/` — baseline и очередь устройства, `files/` — физические операции,
+`reconciliation/` — commit/recovery и конфликты, `workflows/` — полные и служебные
+проходы, `realtime/` — watcher и обработка событий. Имена дополняют контекст папки;
+префикс `sync-` не повторяется. Импорты ведут прямо к владельцу без barrel-модулей.
 
-```
-src/
-├── main.ts                 # Точка входа, жизненный цикл плагина
-├── settings.ts             # UI настроек
-├── types.ts                # TypeScript интерфейсы и типы
-├── compatibility-errors.ts # Generic fail-closed historical error
-├── plugin-data-loader.ts    # Strict current/stable-1.0/1.1 local loader
-├── compatibility/
-│   └── stable-1x.ts        # Exact plaintext stable 1.0/1.1 parser
-│
-├── api/
-│   ├── yandex-client.ts    # HTTP клиент для Yandex Disk API
-│   └── vault-adapter.ts    # Адаптер для работы с Obsidian Vault
-│
-├── sync/
-│   ├── sync-engine.ts      # Основной движок синхронизации
-│   ├── index-manager.ts    # Управление индексами файлов
-│   ├── sync-coordinator.ts # Единая последовательная очередь сессий
-│   ├── local-operation-store.ts # Durable FIFO mutations/actions
-│   ├── index-transaction-rules.ts # Lock, pagination, stable comparison
-│   ├── index-rules.ts      # Причинный reducer
-│   ├── conflict-resolver.ts # Разрешение конфликтов
-│   ├── file-watcher.ts     # Отслеживание изменений файлов
-│   └── sync-scheduler.ts   # Планировщик периодической синхронизации
-│
-├── backup/
-│   ├── backup-manager.ts   # ZIP, raw upload и exact read-back
-│   └── backup-envelope.ts  # Self-contained OYDSBKP! envelope
-│
-├── crypto/
-│   ├── encryption.ts       # Единственный hardened codec
-│   ├── encryption-manager.ts # Profile, snapshot и manifest wire-shapes
-│   └── encryption-transition.ts # Общий transition executor и crash recovery
-│
-├── ui/
-│   ├── status-bar.ts       # Индикатор статуса в статус-баре
-│   ├── init-modal.ts       # Модальные окна
-│   ├── force-sync-modal.ts # Модал подтверждения Force Sync
-│   └── encryption-modals.ts # Модальные окна шифрования
-│
-└── utils/
-    ├── path-utils.ts       # Утилиты для работы с путями
-    ├── hash-utils.ts       # Вычисление SHA256 хешей
-    ├── resource-fingerprint.ts # Service/physical fingerprint rules
-    ├── semaphore.ts        # Контроль параллелизации
-    └── logger.ts           # Логирование
-```
+`SyncEngine` сохраняет публичные входы, один coordinator, session/lifecycle
+wrappers, guards, UI/listeners, pause/busy, expected watcher events и validation
+token. Изменяемые settings/callbacks читаются через актуальные getters.
+Неизменяемые сервисы передаются узкими зависимостями. Внутренние алгоритмы не
+импортируют runtime-фасад, не создают второй coordinator или persisted store.
+Watcher и scheduler используют его публичный API.
 
-## Компоненты
+| Модуль `src/sync`                              | Владелец алгоритма                                                              |
+| ---------------------------------------------- | ------------------------------------------------------------------------------- |
+| `contracts.ts`                                 | Публичные options, proofs, lifecycle и guards; engine сохраняет re-exports      |
+| `files/operations.ts`                          | Transfers, local writes, physical actions, folders и parallel execution         |
+| `files/remote-moves.ts`                        | Snapshot-matched moves, target materialization и guarded source deletion        |
+| `reconciliation/commits.ts`                    | Strict/best-effort commits, rejected puts, repairs, recovery, baselines/deletes |
+| `errors.ts`                                    | Классификация с прежним приоритетом cause                                       |
+| `workflows/force.ts`                           | Preflight, bootstrap, source snapshots, replacement и cleanup                   |
+| `workflows/encryption-rewrite.ts`              | Exclusive target upload, read-back, beforeIndexCommit и finally                 |
+| `workflows/full.ts`                            | Reconciliation, uploads, pending puts и epoch adoption                          |
+| `realtime/batch.ts`                            | Batch, receipts, prepared items, superseded/retry и handoff                     |
+| `files/rename.ts`, `files/folder-mutations.ts` | Rename/folder алгоритмы с прежним causal timing                                 |
 
-### Main (main.ts)
+Upload и публикация metadata остаются раздельными. Watcher finalization предшествует
+`markRemoteObserved`; settlement и очистка validation token остаются в фасаде.
+Force UI/архив принадлежат `ForceSyncController`, транзакции — `IndexManager`.
 
-Точка входа плагина. Отвечает за:
-
-- Инициализацию всех компонентов
-- Регистрацию команд
-- Обработку жизненного цикла (onload/onunload)
-- Координацию между модулями
-
-Enable, disable и rotate используют один `EncryptionTransitionController`.
-Контроллер выполняет общий причинный workflow поверх существующих
-`SyncEngine` и `IndexManager`: maintenance claim, re-encode, manifest/index
-commit, guarded cleanup и recovery. Mode-specific код определяет только
-source/target режим и способ публикации manifest. Этот же completion path
-используется после Force recovery незавершённого transition.
-
-Пароль удалённого vault сначала создаёт только candidate codec. Локальные
-settings и active codec меняются лишь после verifier, cross-artifact coherence
-и успешного чтения canonical этим candidate. Интерактивный password prompt
-выполняется до входа ручного запуска в `SyncCoordinator`; guard уже активной
-full/realtime-сессии остаётся read-only и никогда не ставит вложенную
-maintenance-сессию в ту же очередь.
-Source preflight допускает только coordinator nesting: encryption guard остаётся
-активным, а любая уже существующая canonical maintenance блокирует процесс до
-filesystem work. При повторе claim собственный local transition block не
-заменяет remote-проверку: preflight проходит сквозь него только для повторного
-чтения manifest/canonical и снова блокируется при любой incoherence.
-Поскольку verifier использует случайный IV, stable manifest и maintenance не
-сравниваются по ciphertext: уже аутентифицированный codec обязан отдельно
-проверить оба verifier до recovery write.
-
-### YandexDiskClient (api/yandex-client.ts)
-
-HTTP клиент для взаимодействия с Yandex Disk REST API.
-
-- `getResource(path)` — получить метаданные файла/папки
-- `getResourcesRecursive(path)` — рекурсивный список всех файлов
-- `uploadFile(path, content)` — загрузить файл
-- `downloadFile(path)` — скачать файл
-- `deleteResource(path)` — удалить файл/папку
-- `moveResource(from, to)` — переместить/переименовать
-
-**Особенности реализации:**
-
-- Двухшаговая загрузка файлов (получение upload URL → PUT контента)
-- Автоматический retry с exponential backoff и jitter для 423/429/503;
-  конфликт 409 обрабатывается причинно в lock/upload/move workflows
-- Пагинация для больших директорий
-- Обработка rate limiting
-- Stable raw read подтверждает service-файлы по `sha256 → md5 →
-  modified+size`; `resource_id` не считается content identity
-- Cache подтверждённых remote directories очищается после delete/move и смены
-  token, remote path или encryption codec. После 404 parent создаётся заново;
-  exclusive 409 не запускает `mkdir`
-
-### VaultAdapter (api/vault-adapter.ts)
-
-Адаптер для работы с файловой системой Obsidian Vault.
-
-**Основные методы:**
-
-- `getAllSyncableFiles()` — получить все файлы для синхронизации
-- `getAllFileMetadata()` — получить метаданные всех файлов с хешами
-- `readFile(path)` — читать содержимое файла
-- `writeFile(path, content)` — записать файл
-- `deleteFile(path)` — удалить файл
-
-**Особенности:**
-
-- Фильтрация по include/exclude паттернам
-- Поддержка конфигурируемой папки настроек Obsidian
-- Использование FileManager.trashFile() для удаления
-- **Параллельное вычисление SHA256 хешей** (concurrency=10) для повышения производительности
-
-### IndexManager (sync/index-manager.ts)
-
-Управление индексами синхронизации.
-
-**Структура индекса:**
-
-```typescript
-interface SyncIndex {
-	format: "sync-index";
-	epoch: string; // Generation, replaced only by explicit Force sync
-	revision: number; // Общая причинная ревизия
-	lastSyncTime: number; // Время последней синхронизации
-	deviceId: string; // ID устройства
-	files: Record<string, FileMetadata>;
-	folderTombstones: Record<string, FolderTombstone>;
-	moves: Record<string, IndexMove>;
-	appliedMutationSeq: Record<string, number>;
-	maintenance?: IndexMaintenance;
-}
-
-interface LocalSyncState {
-	observedEpoch: string | null;
-	observedRevision: number;
-	files: Record<string, FileMetadata>; // Last applied baseline
-	nextMutationSeq: number;
-}
-
-interface FileMetadata {
-	path: string; // Путь к файлу
-	sha256: string; // SHA256 хеш содержимого
-	size: number; // Размер в байтах
-	mtime: number; // Время модификации
-	syncedAt: number; // Время последней синхронизации
-	deleted?: boolean; // Флаг удаления
-	deletedAt?: number; // Время удаления
-	changedRevision?: number;
-	baseRevision?: number;
-	lastModifiedBy?: string;
-	mutationSeq?: number;
-}
-```
-
-**Хранение и транзакция:**
+## Canonical, baseline и причинность
 
 `LocalSyncState`, FIFO-очередь мутаций, durable watcher events и очередь
 незавершённых физических действий хранятся атомарно в `data.json`. Чтение
@@ -193,9 +61,7 @@ baseline/base revision; одинаковый sequence с разным logical st
 `.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
 перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,
 обновляется и перемещается обратно с `overwrite=false`. Неизменившийся за две
-минуты единственный lock восстанавливается другим устройством. Несколько lock
-или lock с той же ревизией, но другим содержимым, блокируют обычную
-синхронизацию до явного Force sync. Список lock читается с полной пагинацией;
+минуты единственный lock восстанавливается другим устройством. Несколько locks или несовместимые snapshots блокируют операции до устранения неоднозначности; Force не обходит эту защиту. Список lock читается с полной пагинацией;
 транзакция требует два последовательных одинаковых снимка root listing.
 Успешный commit возвращает временный `CanonicalCommitProof`. Он позволяет
 пропустить повторный index download только при совпавшем SHA-256/MD5 и
@@ -225,6 +91,15 @@ barrier не поглощает upload, на который ссылается r
 затронутые physical paths; полный remote-tree scan остаётся обязанностью full
 sync для external edit и orphan detection.
 
+File rename stages и сохраняет свой FIFO sequence до первого logical commit.
+Retry перечитывает canonical и использует исходную pending mutation; непрерывные
+target puts, поглощённые тем же snapshot, завершаются watermark-only no-op без
+пропуска чужих операций. Сбой не должен накапливать новые sequences на каждом retry.
+Быстрый перенос папки сохраняет порядок дочерних пользовательских действий и связь
+rename с running upload. Переименовываются оба пути ещё не выполненного события;
+механические child notifications промежуточных папок не создают отдельные mutations.
+Новые unsynced копии остаются в durable queue по конечному пути.
+
 До remote classification startup загружает local baseline/очереди и один раз
 регистрирует lifecycle callbacks. Это выполняется даже без token и при 401/403.
 Неперсистентные typed-блоки `migration`, `encryption`, `historical` и
@@ -232,7 +107,9 @@ sync для external edit и orphan detection.
 только `migration` пропускает подтверждённый Force. Resume сначала выполняет
 read-only recheck и не может скрыть активный блок статусом `idle`.
 Persisted watcher events загружаются в память, но watcher и scheduler
-запускаются только после успешной строгой проверки manifest/canonical.
+запускаются после строгой проверки manifest/canonical и успешного full reconciliation.
+Resume также выполняет full перед replay накопленных событий; неуспешная
+проверка, пауза или unload оставляют автоматику остановленной.
 Manifest и canonical читаются единым stable raw-примитивом
 `metadata → download → metadata`; неизменность подтверждается по `sha256`,
 затем `md5`, затем паре `server modified + size`. Canonical и lock находятся
@@ -240,36 +117,24 @@ Manifest и canonical читаются единым stable raw-примитив�
 с ограниченной параллельностью папок. Перед записью manifest проверяется по
 session token; для строгого no-op финальный запрос не выполняется.
 
-Plaintext stable 1.0/1.1 canonical с точной формой `version: 1` или
-`version: 2` не мигрируется обычной синхронизацией: пользователь один раз
-выполняет Force sync с обязательным backup на авторитетном устройстве.
-Точный stable `data.json` при загрузке конвертируется только в память. До
-успешного чтения и распознавания local storage сохранение запрещено, включая
-unload: ошибка загрузки не должна заменять исходный файл defaults/current data.
-Повторная загрузка инвалидирует queued saves и дожидается уже начатой записи
-до чтения; очередь проверяет допуск повторно непосредственно перед записью.
-Диагностика отказа содержит только фиксированную секцию схемы, без значений,
-пользовательских ключей и путей. Дробные миллисекунды filesystem `mtime`
-сохраняются без округления в stable baseline и current canonical; размеры и
-причинные счётчики остаются целыми числами. До
-verified backup он сохраняется legacy-сериализатором, поэтому простой запуск,
-смена token/path или unload не уничтожают возможность отката на 1.1. Current
-`plugin-data` записывается внутри сериализованной Force-сессии после повторной
-проверки backup/canonical/source и до первой filesystem/remote mutation. Crash
-после этого boundary продолжает migration из current state и требует новый
-backup proof, если replacement commit ещё не состоялся. Второй stable-local
-device, обнаруживший уже current canonical, не делает автоматический cutover:
-startup/Resume остаются read-only, а явный Full сначала создаёт и проверяет
-собственный logical backup, повторно сверяет local snapshot и canonical.
-Encrypted legacy и все остальные historical formats блокируются даже при
-Force. Force выполняет read-only classification до захвата canonical lock.
-UI запускает эту classification до создания обязательного backup. После
-exact byte read-back backup внутрь `SyncCoordinator` передаётся proof: SHA-256
-самого backup, точная raw identity canonical и digest защищаемого snapshot.
-`SyncEngine` повторно скачивает backup, canonical и защищаемый snapshot до
-`beginForceBootstrap`, создания папок и любых local/remote writes. Любое
-изменение делает proof stale и требует новый backup; index transaction
-дополнительно повторяет format guard непосредственно перед lock.
+Plaintext stable 1.0/1.1 canonical точной формы `version: 1`/`version: 2`
+требует явного Force на авторитетном устройстве. Stable local settings/hashes/baseline
+необратимо преобразуются и сохраняются одним current snapshot после installation
+identity, до автоматизации. Ошибка load/save блокирует sync; unload не заменяет
+непрочитанные данные. Lifecycle регистрируется до token/remote checks. Current
+canonical допускает normal full adoption, отсутствующий — initial sync. Автоматического
+архива при conversion или foreign adoption нет. Resume не снимает typed blocks;
+encrypted legacy и неподдерживаемые historical formats запрещают также Force.
+
+Force подтверждается выбором архива, продолжения без архива или отмены. В coordinator
+всегда передаётся `ForcePreflightProof`: canonical identity, protected snapshot digest
+и nullable archive proof. Canonical, protected snapshot, source и пути проверяются
+в обоих вариантах; raw SHA архива — только когда архив выбран. Drift либо ошибка
+архива останавливает попытку. Новый запуск требует нового подтверждения, без
+автоматического fallback/повторного архива. Source проверяется на transfers и перед
+replacement commit; после commit rollback запрещён. Старый `ForceBackupProof`
+поддерживается адаптером; одновременные proof запрещены.
+
 До backup metadata-only scan проверяет legacy canonical и physical tree. Любая
 копия `plugins/yandex-disk-sync`/`plugins/obsidian-yandex-disk-sync` блокирует
 migration без content download и требует удалить remote directory и заменить
@@ -300,7 +165,10 @@ Force создаёт новый `epoch` только на авторитетно
 сохраняют прежний baseline, сравнивают с ним текущий filesystem и новый
 canonical, затем атомарно продвигают `observedEpoch`. Старые mutations и
 physical actions не воспроизводятся; локальные изменения оформляются как новые
-операции нового epoch. Смена epoch во время realtime не повторяет index
+операции с epoch и base revision принятого canonical snapshot, не старого baseline.
+Новая live revision после подтверждённого удаления скачивается: отсутствие файла
+под старым deletion baseline не является новым пользовательским delete.
+Смена epoch во время realtime не повторяет index
 transaction, а оставляет событие durable и ставит один coalesced full.
 Replacement canonical содержит live entries выбранной стороны и tombstones с
 `mutationSeq: 0` для отсутствующих canonical/physical paths. Transfer принимает
@@ -311,235 +179,6 @@ local write Force remote блокирует exact/NFC/case-fold collisions. До
 source mode остаётся авторитетным; после подтверждённого commit rollback
 запрещён, migration block снимается, а fingerprint-guarded cleanup продолжает
 обычный full даже после потери инициатора.
-
-### SyncEngine (sync/sync-engine.ts)
-
-Основной движок синхронизации. Координирует весь процесс.
-
-**Алгоритм полной синхронизации:**
-
-```
-1. Загрузить canonical index и возобновить durable physical actions
-2. Построить локальный снимок vault
-3. Получить список файлов с Яндекс Диска
-4. Сравнить индексы и определить операции
-5. Для удалений сначала зафиксировать tombstone в удалённом индексе
-6. Выполнить upload/download; перед delete повторно проверить canonical и
-   server fingerprint
-7. Согласовать pending put с выбранным состоянием: совпавшие SHA подтверждаются
-   watermark, вытесненные операции становятся локальными `noop`
-8. Подтвердить непрерывный mutation `seq` и удалить его из локальной очереди
-9. Завершить сохранённые `PendingPhysicalAction` после фактического действия
-10. Подтвердить captured upload-события watcher только после успешного full
-```
-
-**Логика определения операций:**
-
-| Локально               | На диске                 | Действие      |
-| ---------------------- | ------------------------ | ------------- |
-| Новый файл             | Нет                      | Upload        |
-| Нет                    | Новый файл               | Download      |
-| Изменён от baseline    | Не изменён от baseline   | Upload        |
-| Не изменён от baseline | Изменён canonical/remote | Download      |
-| Изменены обе стороны   | Изменены обе стороны     | Conflict copy |
-| Удалён                 | Есть                     | Delete remote |
-| Есть                   | Удалён                   | Delete local  |
-
-### ConflictResolver (sync/conflict-resolver.ts)
-
-Разрешение конфликтов синхронизации.
-
-**Правила:**
-
-- локальное изменение определяется по SHA-256;
-- удалённое изменение определяется сначала по server fingerprint, затем по
-  любому изменению server mtime относительно baseline;
-- точечное удаление побеждает конкурентное изменение, изменённая локальная
-  копия сохраняется в backup;
-- новый или изменённый потомок переживает конкурентное удаление папки;
-- неизменённый потомок удаляется;
-- локальный файл без baseline на первой синхронизации считается новым; при
-  разных файлах с одинаковым путём создаётся conflict copy.
-
-### FileWatcher (sync/file-watcher.ts)
-
-Отслеживание изменений файлов в реальном времени.
-
-**События:**
-
-- `vault.on('create')` — создание файла → upload
-- `vault.on('modify')` — изменение файла → upload (с debounce)
-- `vault.on('delete')` — удаление файла → delete remote
-- `vault.on('rename')` — переименование → move remote
-- события удаления/rename папок объединяются в одну префиксную мутацию
-- пользовательские события во время полной синхронизации буферизуются, а
-  события, созданные самим движком, подавляются по зарегистрированному пути
-- каждое файловое событие сохраняется в `data.json` с `id`, `epoch`,
-  `baseRevision` и временем создания до постановки realtime-сессии
-- modify заменяет ещё не начатый upload того же пути; быстрые file rename
-  coalesce до конечного target; successor running-rename получает
-  подтверждённую canonical revision либо безопасно rebase-ится, если
-  промежуточный target исчез до remote-действий; повторно созданный old path
-  остаётся отдельным событием
-- событие удаляется только по ID после результата `completed` или
-  `superseded`; acknowledgement сохраняется внутри исходной
-  coordinator-сессии, а `retry` остаётся в durable-очереди
-
-**Debouncing:**
-
-- Задержка 2-3 секунды после последнего изменения
-- Предотвращает множественные загрузки при быстром наборе текста
-
-### SyncScheduler (sync/sync-scheduler.ts)
-
-Планировщик периодической синхронизации.
-
-- Запуск полной синхронизации по таймеру
-- Настраиваемый интервал (0 = отключено)
-- Автоматическая остановка при выгрузке плагина
-
-## Потоки данных
-
-### Реал-тайм синхронизация
-
-```
-[Пользователь редактирует файл]
-         ↓
-[FileWatcher: событие modify]
-         ↓
-[Debounce (2-3 сек)]
-         ↓
-[SyncEngine.uploadFile()]
-         ↓
-[YandexClient.uploadFile()]
-         ↓
-[Обновление индексов]
-```
-
-### Полная синхронизация
-
-```
-[Таймер / Команда "Sync now"]
-         ↓
-[SyncEngine.fullSync()]
-         ↓
-[IndexManager: построить локальный индекс]
-         ↓
-[IndexManager: загрузить удалённый индекс]
-         ↓
-[YandexClient: получить список файлов с диска]
-         ↓
-[Сравнение и генерация операций]
-         ↓
-[Выполнение операций (upload/download/delete)]
-         ↓
-[Сохранение индексов]
-```
-
-## Обработка ошибок
-
-### Retry логика
-
-```typescript
-// Exponential backoff для API ошибок
-const delays = [1000, 2000, 4000, 8000, 16000]; // мс
-
-async function requestWithRetry(fn, maxRetries = 5) {
-	for (let i = 0; i < maxRetries; i++) {
-		try {
-			return await fn();
-		} catch (error) {
-			if (isRetryable(error) && i < maxRetries - 1) {
-				await sleep(delays[i]);
-				continue;
-			}
-			throw error;
-		}
-	}
-}
-```
-
-### Обрабатываемые ошибки
-
-- `429 Too Many Requests` — retry с задержкой
-- `503 Service Unavailable` — retry с задержкой
-- `401 Unauthorized` — показать ошибку токена
-- `404 Not Found` — ресурс не существует (нормально для новых файлов)
-- Network errors — retry
-
-## Безопасность
-
-### Хранение токена
-
-OAuth токен хранится в `data.json` плагина. Рекомендации:
-
-- Не коммитить data.json в git
-- Использовать токен с минимальными правами
-- Учитывать, что token хранится в открытом виде: у мобильных плагинов Obsidian
-  нет переносимого доступа к системному хранилищу ключей
-
-### Валидация путей
-
-- Нормализация путей через Obsidian API
-- Проверка на path traversal атаки
-- Фильтрация недопустимых символов
-
-## Производительность
-
-### Оптимизации
-
-- **Инкрементальная синхронизация** — сравнение по SHA256 хешам
-- **Debouncing** — предотвращение частых операций
-- **Параллельные операции** — несколько файлов одновременно (1-20 concurrency)
-- **Кэширование индексов** — локальное хранение для быстрого старта
-- **Кэширование папок** — избежание повторных запросов к API
-- **Preflight создание папок** — заблаговременная подготовка структуры
-- **Параллельное вычисление хешей** — 10x ускорение для больших хранилищ
-
-### Рекомендации
-
-- Исключайте большие бинарные файлы из синхронизации
-- Используйте интервал синхронизации 5-15 минут
-- Не синхронизируйте папку `.obsidian` если не нужно
-
-## Расширение
-
-### Добавление новой стратегии конфликтов
-
-```typescript
-// В conflict-resolver.ts
-class ConflictResolver {
-	resolve(local: FileMetadata, remote: FileMetadata): SyncAction {
-		switch (this.strategy) {
-			case "myNewStrategy":
-				return this.myNewStrategyLogic(local, remote);
-			// ...
-		}
-	}
-
-	private myNewStrategyLogic(
-		local: FileMetadata,
-		remote: FileMetadata,
-	): SyncAction {
-		// Ваша логика
-	}
-}
-```
-
-### Добавление нового провайдера хранилища
-
-Создайте класс, реализующий интерфейс:
-
-```typescript
-interface StorageClient {
-	getResource(path: string): Promise<ResourceMetadata | null>;
-	listFolder(path: string): Promise<ResourceMetadata[]>;
-	uploadFile(path: string, content: ArrayBuffer): Promise<void>;
-	downloadFile(path: string): Promise<ArrayBuffer>;
-	deleteResource(path: string): Promise<void>;
-	moveResource(from: string, to: string): Promise<void>;
-}
-```
 
 ## Encryption profiles и migration
 
@@ -586,284 +225,67 @@ publication window; совпадения одного device ID недостат
 Подробный wire и recovery contract описан в
 [E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
 
-## Тестирование
+## Локальное применение и физический cleanup
 
-Массовая генерация юнит-тестов запрещена. Политика отбора закреплена в
-[AGENTS.md](../AGENTS.md#documentation-and-testing): компактные проверки
-допустимы только для сложных алгоритмов и взаимодействия функций. Сохраняем
-различающиеся риски причинности, конкурентности, транзакций, восстановления и
-сохранности данных; объединяем одинаковую подготовку и варианты одного правила.
-Тривиальные обёртки, форматирование, тексты UI и детали реализации юнитами не
-покрываем. Количество тестов и процент покрытия не являются целью.
+Download фиксирует отсутствие файла или его plaintext SHA до remote I/O.
+`VaultAdapter.writeFile` принимает необязательный guard: после подготовки папок
+проверяет identity и всё локальное дерево, затем регистрирует ожидаемое watcher
+событие непосредственно перед записью. Protective copy нужна для отличающихся
+неподтверждённых bytes, включая файл без baseline. Ошибка копии запрещает запись;
+после неё SHA проверяется повторно. Late edit/create остаётся для reconciliation,
+без подтверждения baseline или счётчика download.
 
-Исправление бага не требует нового юнита автоматически. Пользовательское
-поведение проверяем по [каталогу сценариев](SYNC_USER_SCENARIOS.md) и
-[smoke-прогону](SMOKE_TESTS.md) в реальном Obsidian. Успех автоматических
-проверок алгоритмов не заменяет функциональную проверку двух профилей.
+Конфликтная копия переиспользуется только по фактическим bytes. Её локальная
+правка сохраняется отдельно; новое имя создаётся с условием отсутствия.
+Exact/NFC/case-fold collisions сегментов, файл на месте папки или предка
+блокируют применение. Exact update, Unicode и `__proto__` допустимы.
 
-### Ручное тестирование
+Физическое удаление требует durable action и свежего canonical. Каждая сетевая
+попытка, включая retry, повторяет authority и fingerprint checks. Move cleanup
+проверяет также актуальный move и физически доступный target. Папка удаляется
+только при отсутствии live descendants в свежем canonical и фактической пустоте.
+После protective backup локальное удаление повторяет canonical/SHA checks;
+FileManager отправляет файл в trash. Изменившийся snapshot остаётся pending.
 
-1. Создайте тестовый vault
-2. Настройте плагин с тестовым токеном
-3. Проверьте сценарии:
-    - Создание/редактирование/удаление файлов
-    - Конфликты (изменение на двух устройствах)
-    - Офлайн → онлайн переход
-    - Большие файлы
+Результаты physical action различаются: `completed`, `cancelled`, `deferred`.
+Отмена устаревшей authority не означает удаление; deferred не увеличивает
+счётчик удалённых файлов и не подтверждает baseline. HTTP success/202 сам по себе
+не доказывает отсутствие объекта. Эти проверки не дают атомарной защиты от
+произвольной внешней записи между последним чтением и mutation.
 
-### Отладка
+## Настройки и автоматизация
 
-Включите **Настройки → Yandex Disk Sync → Логирование → Включить
-отладочное логирование**. Журнал записывается в
-`.obsidian/plugins/yandex-disk-sync/debug.log`, ограничивается 5 МБ и никогда
-не включается в пользовательскую синхронизацию, даже если включена
-синхронизация папки настроек.
+UI передаёт `UserSettingsPatch` через runtime allowlist. Installation identity и
+принятый encryption snapshot сохраняются внутренними workflow. Пользовательский
+candidate сохраняется согласованно с актуальными queues в существующей persistence
+очереди; только после успеха он публикуется компонентам. Failed save не публикует
+candidate и блокирует sync до восстановления persistence.
 
-Каждая сессия получает `sessionId`; canonical-транзакция дополнительно
-получает `indexTransactionId`. На durable-границах журнал содержит epoch,
-observed/canonical revision, mutation/action ID, ожидаемые fingerprint и фазы
-перехода шифрования. Токены, пароли и ключи очищаются централизованно перед
-выводом. API diagnostics выводят только endpoint name без query values, поэтому
-metadata-only migration scan не раскрывает полный remote plugin-data path.
+Connection/scope нельзя менять при preparing/queued/running sync, Force preflight,
+encryption operation или backup. Pending transition блокирует смену папки и состава
+файлов, но idle token repair разрешён и не снимает encryption block. Непустые durable
+queues запрещают перенос destination. Сначала watcher останавливается и сохраняет
+события, затем ставится задача settings persistence: обратный порядок создаёт deadlock.
 
-`main.ts` остаётся composition root: lifecycle, UI/Notice и публичные методы
-делегируют profile selection, codec construction, snapshot и manifest
-wire-shapes в `EncryptionManager`. Единственный transition executor —
-`EncryptionTransitionController`; отдельный coordinator не создаётся.
+Назначение settings само не запускает watcher/scheduler. После изменения выполняются
+cache invalidation и read-only recheck; смена destination/scope требует full до
+realtime. Остановленный watcher участвует в full settlement, но не запускает replay.
+Автоматизация учитывает layout readiness, typed startup blocks, явную паузу и unload.
+Подробности очередей и параллелизма: [PARALLELIZATION.md](PARALLELIZATION.md).
 
-## Параллелизация операций
+## Архивы и пользовательские операции
 
-Начиная с версии 1.1.0, плагин поддерживает параллельное выполнение операций синхронизации.
+Force и enable/disable/rotate предлагают with-backup, without-backup и cancel на
+один запуск. Обязательные source/canonical/codec/fingerprint guards действуют всегда.
+Полный архив не заменяет отдельные protective/conflict copies. Ручной backup проходит
+через существующий coordinator; папка, режим и пароль фиксируются до чтения файлов.
+Настройки и другие foreground operations заблокированы до завершения.
 
-### Архитектура параллелизации
+Список/скачивание архивов учитывают поколение конфигурации и закрытие UI. Архив может
+открываться собственным паролем после смены vault codec. Формат, limits, password policy
+и совместимость описаны в [BACKUP.md](BACKUP.md).
 
-```
-Sync Flow:
-┌────────────────────────────────────────────────────────┐
-│ 1. Preparation (sequential)                            │
-│    - Build local index (parallel hash computation)     │
-│    - Load remote index                                 │
-│    - Determine operations                              │
-└────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│ 2. Preflight (sequential by depth)                     │
-│    - Collect all required folders                      │
-│    - Create folders level by level                     │
-│    - Cache created folders                             │
-└────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│ 3. Parallel Execution (with Semaphore)                 │
-│    ┌──────────────────────────────────────────────┐   │
-│    │ Uploads      (parallel, concurrency=N)       │   │
-│    └──────────────────────────────────────────────┘   │
-│    ┌──────────────────────────────────────────────┐   │
-│    │ Downloads    (parallel, concurrency=N)       │   │
-│    └──────────────────────────────────────────────┘   │
-│    ┌──────────────────────────────────────────────┐   │
-│    │ Deletes      (parallel, concurrency=N)       │   │
-│    └──────────────────────────────────────────────┘   │
-│    ┌──────────────────────────────────────────────┐   │
-│    │ Conflicts    (sequential)                    │   │
-│    └──────────────────────────────────────────────┘   │
-└────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│ 4. Finalization (sequential)                           │
-│    - Update sync time                                  │
-│    - Save remote index                                 │
-│    - Cleanup old deleted records                       │
-└────────────────────────────────────────────────────────┘
-```
-
-### Ключевые компоненты
-
-#### Semaphore (utils/semaphore.ts)
-
-Контролирует количество одновременно выполняемых операций:
-
-```typescript
-class Semaphore {
-	private permits: number;
-	async acquire(): Promise<void>;
-	release(): void;
-}
-```
-
-#### runWithConcurrency / runWithConcurrencySettled
-
-Утилитные функции для параллельного выполнения задач с ограничением concurrency:
-
-```typescript
-// Прерывается при первой ошибке
-await runWithConcurrency(tasks, maxConcurrency, onProgress);
-
-// Выполняет все задачи, собирает ошибки
-await runWithConcurrencySettled(tasks, maxConcurrency, onProgress);
-```
-
-### Оптимизации
-
-1. **Параллельное вычисление хешей**
-    - Вычисление SHA256 для всех файлов происходит параллельно (concurrency=10)
-    - Ускорение в ~10x для больших хранилищ
-
-2. **Preflight создание папок**
-    - Все папки создаются заранее перед началом загрузки
-    - Позволяет параллельно загружать файлы без проверки папок
-    - Кэширование созданных папок предотвращает повторные запросы
-
-3. **Folder caching в YandexDiskClient**
-    - Кэш созданных папок (`folderCache: Set<string>`)
-    - Проверка кэша перед каждым API запросом
-    - Автоматическое добавление в кэш при 409 (Already Exists)
-
-4. **Группировка операций**
-    - Операции группируются по типам (upload/download/delete/conflict)
-    - Каждая группа выполняется параллельно
-    - Conflicts обрабатываются последовательно (требуют особой логики)
-
-### Настройки производительности
-
-**maxConcurrency** (1-20, по умолчанию 10):
-
-- Контролирует количество одновременных операций
-- Можно настроить через Settings → Automatic sync
-- Рекомендуемые значения:
-    - 1-3: медленное соединение
-    - 5-7: стандартное соединение
-    - 8-15: быстрое соединение
-    - 16-20: очень быстрое соединение
-
-### Производительность
-
-Бенчмарки (maxConcurrency=5):
-
-| Операция                      | Последовательно | Параллельно | Ускорение |
-| ----------------------------- | --------------- | ----------- | --------- |
-| 100 uploads                   | ~100 сек        | ~20 сек     | 5x        |
-| 50 uploads + 50 downloads     | ~100 сек        | ~15 сек     | 6.7x      |
-| Вычисление хешей (500 файлов) | ~50 сек         | ~5 сек      | 10x       |
-
-Подробнее см. [PARALLELIZATION.md](./PARALLELIZATION.md)
-
-## Система резервного копирования
-
-Плагин включает встроенную систему резервного копирования для создания моментальных снимков хранилища.
-
-### Архитектура бекапов
-
-```
-backup/
-└── backup-manager.ts   # Управление резервным копированием
-```
-
-### BackupManager (backup/backup-manager.ts)
-
-Отвечает за:
-
-- Создание ZIP-архивов всех синхронизируемых файлов
-- Загрузку бекапов на Яндекс.Диск в защищенную папку `.backup`
-- Проверку raw remote-файла по exact SHA-256 и bytes read-back
-- Создание raw remote snapshot перед Force local
-
-### Интеграция с синхронизацией
-
-- Canonical index не содержит время или список backup
-- Каждое устройство читает общий список напрямую из remote `.backup`
-- Папка `.backup` жестко исключена из операций синхронизации
-
-### Формат бекапов
-
-- **Расширение**: `.zip`
-- **Именование**:
-  `backup_YYYY-MM-DD_HH-MM-SS-SSS_<96-bit-random>[.enc].zip`
-- **Encryption**: self-contained `OYDSBKP!` envelope, независимый от active
-  vault codec
-- **Содержимое**: Все файлы, подлежащие синхронизации
-- **Расположение**: `{remotePath}/.backup/`
-
-### Безопасность
-
-- Папка `.backup` защищена от случайного удаления
-- Фильтрация на уровне `path-utils` и `IndexManager`
-- Бекапы не участвуют в конфликтах синхронизации
-- Upload использует `overwrite=false`; success/timeout/409 принимаются только
-  после exact raw read-back
-
-Подробнее см. [BACKUP.md](./BACKUP.md)
-
-## Force Sync
-
-Force Sync — функция принудительной синхронизации, игнорирующая все условия (даты модификации, хеши файлов, состояние индексов). Создаёт точную копию хранилища в указанном направлении.
-
-### ForceSyncModal (ui/force-sync-modal.ts)
-
-Модальное окно подтверждения перед выполнением Force Sync.
-
-**Возможности:**
-
-- Пояснение операции в зависимости от направления
-- Предупреждение о деструктивности операции
-- Единственная кнопка продолжения закрывает окно и запускает обязательный
-  бекап в фоне; отмена/закрытие до подтверждения не запускает операцию
-- Обязательное подтверждение, что stable 1.1 остановлена на остальных devices
-- Кнопка отмены
-
-### Force Sync From Local
-
-Перезаписывает ВСЕ файлы на Яндекс.Диске локальными версиями. Файлы, отсутствующие локально, удаляются с диска.
-
-**Алгоритм:**
-
-```
-1. Проверить exact backup proof и выполнить local plugin-data cutover
-2. Зафиксировать sorted local path/SHA/size snapshot
-3. Получить physical remote tree
-4. Загружать только bytes с ожидаемым SHA; перед commit повторить local scan
-5. Создать новый `epoch`: live local entries плюс tombstones отсутствующих paths
-6. Commit replacement canonical
-7. Удалить remote-only объекты guarded-действиями по fingerprint
-8. Очистить старые locks только после подтверждённого replacement commit
-```
-
-### Force Sync From Remote
-
-Перезаписывает ВСЕ локальные файлы версиями с Яндекс.Диска. Локальные файлы, отсутствующие на диске, удаляются.
-
-**Алгоритм:**
-
-```
-1. Проверить exact backup proof и выполнить local plugin-data cutover
-2. Построить local snapshot (для определения удаляемых файлов)
-3. Получить фактический список файлов с Яндекс.Диска, не используя
-   legacy/ambiguous index как источник истины
-4. Проверить combined local/remote portable-path collisions
-5. Каждый remote файл прочитать stable metadata/download/metadata
-6. Повторить remote-tree scan перед commit
-7. Commit нового epoch с live remote entries и local-only tombstones/actions
-8. Только после commit удалить local-only files
-```
-
-### Особенности реализации
-
-- **Не использует ConflictResolver** — операции генерируются вручную без сравнения
-- **Не использует сравнение mtime/sha256** — безусловная перезапись
-- **Всегда требует backup** — Force local сохраняет raw remote snapshot,
-  Force remote сохраняет локальный vault
-- **Не допускает source drift** — любое отличие до replacement commit требует
-  нового backup
-- **После commit не откатывается** — unfinished cleanup возобновляется normal full
-- **FileWatcher приостанавливается** через существующие `syncPauseCallbacks`
-- **Прогресс отображается** через единый `SyncState`: название фазы всегда,
-  `N/M` только для известного набора операций
-- **Параллелизация** через `executeOperationsParallel()`
-
-### Состояние синхронизации и уведомления
+## Состояние синхронизации и уведомления
 
 `SyncCoordinator` назначает каждой full, realtime, Force или maintenance-сессии
 идентификатор и тип. `SyncEngine` публикует через один `SyncState` стабильную
@@ -879,14 +301,14 @@ deduplicated persistent Notice. UI-состояние не сохраняетс�
 участвует в causal merge, lock-транзакции или выборе encryption codec.
 
 `ForceSyncController` владеет полным пользовательским сценарием обоих
-направлений: read-only preflight → подтверждение → backup с exact read-back →
+направлений: read-only preflight → выбор архива → необязательный backup с exact read-back →
 Force через существующий coordinator → persistence → завершающий normal full.
 Он резервирует busy-состояние до первого await, не создаёт очередь и не
 позволяет повторному клику запустить второй backup или отложенный Force.
 `main.ts` подключает зависимости и Obsidian UI. `SyncRunOptions.onActivity`
 передаёт только события с ID принадлежащей вызову coordinator-сессии.
 
-Один persistent Notice показывает создание, загрузку и проверку backup,
+При выборе архива один persistent Notice показывает создание, загрузку и проверку backup,
 далее фазы Force, сохранение и итоговую проверку. Настройки подписаны на
 тот же неперсистентный flow-state; оба Force-контрола блокируются также при
 другой активной sync-сессии. Во время Force настройки и ручные mutating-действия
@@ -900,21 +322,15 @@ persistence, успешного итогового full и отсутствия 
 миграция не предлагаются. Ошибка backup не запускает Force. Поздние события
 предыдущего flow и таймеры не меняют новое уведомление.
 
-### UI в настройках
+## Проверки
 
-Секция **Force Sync** расположена в конце страницы настроек, после секции Backup:
+Компактные тесты выполняют реальные алгоритмы причинности, транзакций, конкурентности
+и recovery с synthetic transport. Они проверяют bytes, canonical, baseline и queues,
+а не только вызовы mocks. Wire types определены в `src/types.ts`; строгие loaders
+не допускают неявного расширения исторических форматов.
 
-- **From local to remote** — кнопка принудительной синхронизации из локального в удалённое
-- **From remote to local** — кнопка принудительной синхронизации из удалённого в локальное
-
-## TODO
-
-- [x] Параллельная загрузка/скачивание файлов
-- [x] Прогресс-бар для больших операций
-- [x] Force Sync (From Local / From Remote)
-- [ ] UI для просмотра истории конфликтов
-- [ ] Перенести token в системное хранилище, если Obsidian предоставит
-  переносимый API для desktop и mobile
-- [ ] Поддержка Yandex Disk App Folder API
-- [x] Компактные автоматические проверки алгоритмов и взаимодействия модулей
-- [ ] Adaptive concurrency (автоматическое снижение при 429)
+`npm test`, lint, изолированный build, bundle check и scenario validator дополняются
+[SMOKE_TESTS.md](SMOKE_TESTS.md). Build читает optional root `.env` для deployment;
+агент проверяет сборку в разрешённой копии без `.env` и рабочего vault. Реальный
+двухпрофильный прогон обязателен для release. Статус manual evidence хранится отдельно
+в `docs/release-evidence/`; успех автоматических проверок его не меняет.

@@ -70,14 +70,18 @@ export class EncryptionService implements EncryptionCodec {
 
 	static bytesToBase64(bytes: Uint8Array): string {
 		let binary = "";
-		for (const byte of bytes) binary += String.fromCharCode(byte);
+		for (const byte of bytes) {
+			binary += String.fromCharCode(byte);
+		}
 		return btoa(binary);
 	}
 
 	static base64ToBytes(base64: string): Uint8Array {
 		const binary = atob(base64);
 		const bytes = new Uint8Array(binary.length);
-		for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+		for (let i = 0; i < binary.length; i++) {
+			bytes[i] = binary.charCodeAt(i);
+		}
 		return bytes;
 	}
 
@@ -93,7 +97,9 @@ export class EncryptionService implements EncryptionCodec {
 			throw new Error("Encrypted filename is not canonical Base64URL");
 		}
 		let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
-		while (base64.length % 4 !== 0) base64 += "=";
+		while (base64.length % 4 !== 0) {
+			base64 += "=";
+		}
 		const decoded = EncryptionService.base64ToBytes(base64);
 		if (EncryptionService.base64UrlEncode(decoded) !== base64url) {
 			throw new Error("Encrypted filename is not canonical Base64URL");
@@ -161,7 +167,9 @@ export class EncryptionService implements EncryptionCodec {
 	async encryptFilename(originalPath: string): Promise<string> {
 		assertValidLogicalPathSegment(originalPath);
 		const cached = this.filenameEncCache.get(originalPath);
-		if (cached !== undefined) return cached;
+		if (cached !== undefined) {
+			return cached;
+		}
 		const encrypted = aessiv(this.getFilenameKey(), FILENAME_AAD).encrypt(
 			new TextEncoder().encode(originalPath),
 		);
@@ -172,15 +180,16 @@ export class EncryptionService implements EncryptionCodec {
 
 	async decryptFilename(encryptedName: string): Promise<string> {
 		const cached = this.filenameDecCache.get(encryptedName);
-		if (cached !== undefined) return cached;
+		if (cached !== undefined) {
+			return cached;
+		}
 		const ciphertext = EncryptionService.base64UrlDecode(encryptedName);
 		if (ciphertext.length <= 16) {
 			throw new Error("Encrypted filename is truncated");
 		}
-		const decrypted = aessiv(
-			this.getFilenameKey(),
-			FILENAME_AAD,
-		).decrypt(ciphertext);
+		const decrypted = aessiv(this.getFilenameKey(), FILENAME_AAD).decrypt(
+			ciphertext,
+		);
 		const result = assertValidLogicalPathSegment(
 			new TextDecoder("utf-8", { fatal: true }).decode(decrypted),
 		);

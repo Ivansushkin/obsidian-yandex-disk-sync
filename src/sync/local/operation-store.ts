@@ -4,9 +4,9 @@ import type {
 	PendingPhysicalAction,
 	PendingPhysicalActionOrigin,
 	PendingPhysicalActionType,
-} from "../types";
-import { advanceMutationSequence } from "./index-rules";
-import { logger, shortenDiagnosticValue } from "../utils/logger";
+} from "../../types";
+import { advanceMutationSequence } from "../canonical/mutation-rules";
+import { logger, shortenDiagnosticValue } from "../../utils/logger";
 
 interface MutationOptions {
 	targetPath?: string;
@@ -67,8 +67,7 @@ export class LocalOperationStore {
 			Math.max(
 				Math.max(0, nextMutationSeq - 1),
 				this.pendingMutations.reduce(
-					(maximum, mutation) =>
-						Math.max(maximum, mutation.seq),
+					(maximum, mutation) => Math.max(maximum, mutation.seq),
 					0,
 				),
 			) + 1;
@@ -131,10 +130,12 @@ export class LocalOperationStore {
 		this.nextMutationSeq = 1;
 	}
 
-	findLatestPutBaseRevision(
-		path: string,
-	): number | null | undefined {
-		for (let index = this.pendingMutations.length - 1; index >= 0; index--) {
+	findLatestPutBaseRevision(path: string): number | null | undefined {
+		for (
+			let index = this.pendingMutations.length - 1;
+			index >= 0;
+			index--
+		) {
 			const mutation = this.pendingMutations[index];
 			if (mutation?.type === "put" && mutation.path === path) {
 				return mutation.baseRevision;
@@ -144,7 +145,11 @@ export class LocalOperationStore {
 	}
 
 	findLatestPutBaselineSha(path: string): string | undefined {
-		for (let index = this.pendingMutations.length - 1; index >= 0; index--) {
+		for (
+			let index = this.pendingMutations.length - 1;
+			index >= 0;
+			index--
+		) {
 			const mutation = this.pendingMutations[index];
 			if (mutation?.type === "put" && mutation.path === path) {
 				return mutation.baselineSha256;
@@ -163,9 +168,15 @@ export class LocalOperationStore {
 		sha256: string,
 		baselineSha256?: string,
 	): PendingMutation | undefined {
-		for (let index = this.pendingMutations.length - 1; index >= 0; index--) {
+		for (
+			let index = this.pendingMutations.length - 1;
+			index >= 0;
+			index--
+		) {
 			const mutation = this.pendingMutations[index];
-			if (mutation?.type !== "put" || mutation.path !== oldPath) continue;
+			if (mutation?.type !== "put" || mutation.path !== oldPath) {
+				continue;
+			}
 			mutation.path = newPath;
 			mutation.sha256 = sha256;
 			if (baselineSha256 !== undefined) {
@@ -190,7 +201,9 @@ export class LocalOperationStore {
 		const mutation = this.pendingMutations.find(
 			(candidate) => candidate.id === id && candidate.type === "put",
 		);
-		if (!mutation) return undefined;
+		if (!mutation) {
+			return undefined;
+		}
 		mutation.type = "delete-file";
 		mutation.targetPath = undefined;
 		mutation.resourceKind = undefined;
@@ -211,7 +224,9 @@ export class LocalOperationStore {
 		const mutation = this.pendingMutations.find(
 			(candidate) => candidate.id === id && candidate.type === "put",
 		);
-		if (!mutation) return undefined;
+		if (!mutation) {
+			return undefined;
+		}
 		mutation.type = "noop";
 		mutation.targetPath = undefined;
 		mutation.resourceKind = undefined;
@@ -248,9 +263,7 @@ export class LocalOperationStore {
 		return staged;
 	}
 
-	stagePendingMutations(
-		appliedMutationSeq: Record<string, number>,
-	): void {
+	stagePendingMutations(appliedMutationSeq: Record<string, number>): void {
 		for (const mutation of [...this.pendingMutations].sort(
 			(left, right) => left.seq - right.seq,
 		)) {
@@ -263,9 +276,13 @@ export class LocalOperationStore {
 		appliedMutationSeq: Record<string, number>,
 	): void {
 		const mutation = this.pendingMutations.find((item) => item.id === id);
-		if (!mutation) return;
+		if (!mutation) {
+			return;
+		}
 		const applied = appliedMutationSeq[this.deviceId] || 0;
-		if (mutation.seq > applied) return;
+		if (mutation.seq > applied) {
+			return;
+		}
 		this.pendingMutations = this.pendingMutations.filter(
 			(item) => item.id !== id,
 		);
@@ -280,16 +297,16 @@ export class LocalOperationStore {
 		const discarded = this.pendingMutations.find(
 			(mutation) => mutation.id === id,
 		);
-		if (!discarded || discarded.seq !== this.nextMutationSeq - 1) return;
+		if (!discarded || discarded.seq !== this.nextMutationSeq - 1) {
+			return;
+		}
 		this.pendingMutations = this.pendingMutations.filter(
 			(mutation) => mutation.id !== id,
 		);
 		this.nextMutationSeq--;
 	}
 
-	confirmAppliedMutations(
-		appliedMutationSeq: Record<string, number>,
-	): void {
+	confirmAppliedMutations(appliedMutationSeq: Record<string, number>): void {
 		const applied = appliedMutationSeq[this.deviceId] || 0;
 		const before = this.pendingMutations.length;
 		this.pendingMutations = this.pendingMutations.filter(
@@ -304,15 +321,13 @@ export class LocalOperationStore {
 		}
 	}
 
-	loadPhysicalActions(
-		actions: PendingPhysicalAction[] | undefined,
-	): void {
+	loadPhysicalActions(actions: PendingPhysicalAction[] | undefined): void {
 		this.pendingPhysicalActions = Array.isArray(actions)
-				? actions.map((action) => ({
-						...action,
-						epoch: action.epoch ?? null,
-						origin: action.origin ?? "exact-delete",
-					}))
+			? actions.map((action) => ({
+					...action,
+					epoch: action.epoch ?? null,
+					origin: action.origin ?? "exact-delete",
+				}))
 			: [];
 		logger.debug("Loaded durable physical action queue", {
 			pendingPhysicalActions: this.pendingPhysicalActions.length,
@@ -358,15 +373,14 @@ export class LocalOperationStore {
 			existing.canonicalRevision =
 				options?.canonicalRevision ?? existing.canonicalRevision;
 			existing.expectedFingerprint =
-				options?.expectedFingerprint ??
-				existing.expectedFingerprint;
+				options?.expectedFingerprint ?? existing.expectedFingerprint;
 			existing.expectedChangedRevision =
 				options?.expectedChangedRevision ??
 				existing.expectedChangedRevision;
 			existing.expectedTargetFingerprint =
 				options?.expectedTargetFingerprint ??
 				existing.expectedTargetFingerprint;
-			 existing.baselineSha256 =
+			existing.baselineSha256 =
 				options?.baselineSha256 ?? existing.baselineSha256;
 			existing.parentMutationId =
 				options?.parentMutationId ?? existing.parentMutationId;
@@ -376,8 +390,7 @@ export class LocalOperationStore {
 				origin: existing.origin,
 				epoch: shortenDiagnosticValue(existing.epoch),
 				canonicalRevision: existing.canonicalRevision,
-				expectedChangedRevision:
-					existing.expectedChangedRevision,
+				expectedChangedRevision: existing.expectedChangedRevision,
 				expectedFingerprint: shortenDiagnosticValue(
 					existing.expectedFingerprint,
 				),

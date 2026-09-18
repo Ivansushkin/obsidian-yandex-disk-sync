@@ -27,9 +27,7 @@ export class LogViewerModal extends Modal {
 			.setDesc(t("modal.log_viewer_desc"))
 			.addTextArea((textArea: TextAreaComponent) => {
 				this.textArea = textArea;
-				textArea
-					.setValue(this.logContent)
-					.setDisabled(true);
+				textArea.setValue(this.logContent).setDisabled(true);
 				textArea.inputEl.rows = 24;
 				textArea.inputEl.addClass("log-viewer-textarea");
 			});
@@ -43,14 +41,14 @@ export class LogViewerModal extends Modal {
 						if (this.textArea) {
 							this.textArea.setValue(this.logContent);
 						}
-					})
+					}),
 			)
 			.addButton((button) =>
 				button
 					.setButtonText(t("modal.log_viewer_copy"))
 					.onClick(async () => {
 						await navigator.clipboard.writeText(this.logContent);
-					})
+					}),
 			)
 			.addButton((button) =>
 				button
@@ -63,7 +61,7 @@ export class LogViewerModal extends Modal {
 						if (this.textArea) {
 							this.textArea.setValue("");
 						}
-					})
+					}),
 			);
 	}
 

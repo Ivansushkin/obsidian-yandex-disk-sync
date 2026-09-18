@@ -1,17 +1,10 @@
-import type { SyncIndex } from "../types";
+import type { SyncIndex } from "../../types";
 
 export type IndexTransactionStage =
-	| "acquired"
-	| "written"
-	| "verified"
-	| "move-attempted"
-	| "committed";
+	"acquired" | "written" | "verified" | "move-attempted" | "committed";
 
 export type IndexTransactionOutcome =
-	| "committed"
-	| "rolled-back"
-	| "concurrent"
-	| "ambiguous";
+	"committed" | "rolled-back" | "concurrent" | "ambiguous";
 
 export type IndexCodec = "current" | "source" | "target" | "plaintext";
 
@@ -31,10 +24,7 @@ export interface CanonicalCommitProof {
 }
 
 export type IndexMoveRecoveryDecision =
-	| "committed"
-	| "retry-move"
-	| "concurrent"
-	| "ambiguous";
+	"committed" | "retry-move" | "concurrent" | "ambiguous";
 
 export interface IndexMoveObservation {
 	canonicalExists: boolean;
@@ -96,11 +86,15 @@ export function rawBuffersEqual(
 	left: ArrayBuffer,
 	right: ArrayBuffer,
 ): boolean {
-	if (left.byteLength !== right.byteLength) return false;
+	if (left.byteLength !== right.byteLength) {
+		return false;
+	}
 	const leftBytes = new Uint8Array(left);
 	const rightBytes = new Uint8Array(right);
 	for (let index = 0; index < leftBytes.length; index++) {
-		if (leftBytes[index] !== rightBytes[index]) return false;
+		if (leftBytes[index] !== rightBytes[index]) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -121,13 +115,17 @@ export async function rollbackRawIndexSnapshot(
 		backend.exists(lockPath),
 	]);
 	if (canonicalExists) {
-		if (lockExists) return "ambiguous";
+		if (lockExists) {
+			return "ambiguous";
+		}
 		const canonicalRaw = await backend.readRaw(canonicalPath);
 		return rawBuffersEqual(canonicalRaw, originalRaw)
 			? "rolled-back"
 			: "concurrent";
 	}
-	if (!lockExists) return "ambiguous";
+	if (!lockExists) {
+		return "ambiguous";
+	}
 
 	try {
 		await backend.writeRaw(lockPath, originalRaw);
@@ -135,7 +133,9 @@ export async function rollbackRawIndexSnapshot(
 		// Verify the lock bytes because the upload may have succeeded remotely.
 	}
 	const restoredLock = await backend.readRaw(lockPath);
-	if (!rawBuffersEqual(restoredLock, originalRaw)) return "ambiguous";
+	if (!rawBuffersEqual(restoredLock, originalRaw)) {
+		return "ambiguous";
+	}
 	await assertReadable(restoredLock);
 	try {
 		await backend.moveExclusive(lockPath, canonicalPath);
@@ -143,12 +143,13 @@ export async function rollbackRawIndexSnapshot(
 		// The path read-back below resolves a lost or ambiguous move response.
 	}
 
-	const [restoredCanonicalExists, remainingLockExists] =
-		await Promise.all([
-			backend.exists(canonicalPath),
-			backend.exists(lockPath),
-		]);
-	if (!restoredCanonicalExists || remainingLockExists) return "ambiguous";
+	const [restoredCanonicalExists, remainingLockExists] = await Promise.all([
+		backend.exists(canonicalPath),
+		backend.exists(lockPath),
+	]);
+	if (!restoredCanonicalExists || remainingLockExists) {
+		return "ambiguous";
+	}
 	const restoredCanonical = await backend.readRaw(canonicalPath);
 	if (!rawBuffersEqual(restoredCanonical, originalRaw)) {
 		return "concurrent";

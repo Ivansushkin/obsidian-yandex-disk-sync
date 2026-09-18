@@ -11,19 +11,29 @@
 		"test": "node test.config.mjs",
 		"validate:release": "node scripts/validate-release.mjs",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
-		"lint": "eslint . --max-warnings 0"
+		"lint": "eslint . --max-warnings 0",
+		"lint:fix": "eslint . --fix --max-warnings 0",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"lint:staged": "lint-staged",
+		"prepare": "husky"
 	},
 	"keywords": [],
-	"license": "0-BSD",
+	"license": "MIT",
 	"devDependencies": {
 		"@eslint/js": "9.30.1",
 		"@types/node": "^16.11.6",
 		"dotenv": "17.4.2",
 		"esbuild": "0.25.5",
+		"eslint": "9.39.4",
+		"eslint-config-prettier": "10.1.8",
 		"eslint-plugin-obsidianmd": "0.1.9",
 		"globals": "14.0.0",
+		"husky": "9.1.7",
 		"jiti": "2.6.1",
+		"lint-staged": "16.4.0",
 		"obsidian": "1.13.1",
+		"prettier": "3.9.8",
 		"tslib": "2.4.0",
 		"typescript": "^5.8.3",
 		"typescript-eslint": "8.35.1"
@@ -31,5 +41,12 @@
 	"dependencies": {
 		"@noble/ciphers": "2.2.0",
 		"jszip": "3.10.1"
+	},
+	"lint-staged": {
+		"*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}": [
+			"eslint --fix --max-warnings 0 --no-warn-ignored",
+			"prettier --write"
+		],
+		"*.{json,css,md,yml,yaml}": "prettier --write"
 	}
 }

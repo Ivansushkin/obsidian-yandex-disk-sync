@@ -78,10 +78,7 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 // ============================================================================
 
 export type EncryptionManifestState =
-	| "enabled"
-	| "enabling"
-	| "rotating"
-	| "disabling";
+	"enabled" | "enabling" | "rotating" | "disabling";
 
 export const ENCRYPTION_MANIFEST_FORMAT = "encryption-manifest" as const;
 
@@ -104,11 +101,7 @@ export interface EncryptionManifestCipherParams {
 }
 
 export type EncryptionTransitionPhase =
-	| "prepared"
-	| "files-copied"
-	| "index-committed"
-	| "stable"
-	| "cleanup";
+	"prepared" | "files-copied" | "index-committed" | "stable" | "cleanup";
 
 export interface EncryptionTransitionDescriptor {
 	/** Stable transition identifier */
@@ -329,11 +322,7 @@ export interface IndexMove {
 }
 
 export type PendingMutationType =
-	| "put"
-	| "noop"
-	| "delete-file"
-	| "delete-folder"
-	| "move";
+	"put" | "noop" | "delete-file" | "delete-folder" | "move";
 
 export interface PendingMutation {
 	/** Globally unique, stable mutation identifier */
@@ -361,10 +350,7 @@ export interface PendingMutation {
 }
 
 export type PendingPhysicalActionType =
-	| "delete-local"
-	| "delete-remote"
-	| "move-remote"
-	| "guarded-cleanup";
+	"delete-local" | "delete-remote" | "move-remote" | "guarded-cleanup";
 
 export type PendingPhysicalActionOrigin =
 	| "exact-delete"
@@ -408,7 +394,9 @@ export interface PendingPhysicalAction {
 
 export function createSyncEpoch(): string {
 	const uuid = globalThis.crypto?.randomUUID?.();
-	if (uuid) return uuid;
+	if (uuid) {
+		return uuid;
+	}
 	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
@@ -455,11 +443,7 @@ export type SyncStatus =
 	| "migration-required"
 	| "encryption-required";
 
-export type SyncSessionKind =
-	| "full"
-	| "force"
-	| "realtime"
-	| "maintenance";
+export type SyncSessionKind = "full" | "force" | "realtime" | "maintenance";
 
 export type SyncPhase =
 	| "preparing-local"
@@ -521,9 +505,7 @@ export type SyncAction =
 	| "none";
 
 export type SyncCausalOrigin =
-	| "new-local-operation"
-	| "apply-canonical"
-	| "physical-repair";
+	"new-local-operation" | "apply-canonical" | "physical-repair";
 
 export interface SyncOperation {
 	/** Operation type */

@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { aessiv } from "@noble/ciphers/aes.js";
-import {
-	EncryptionService,
-	SALT_LENGTH,
-} from "../src/crypto/encryption";
+import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
 
 function hex(value: string): Uint8Array {
 	return Uint8Array.from(
@@ -25,9 +22,7 @@ test("AES-SIV matches the RFC 5297 deterministic vector", () => {
 });
 
 const hardenedServicePromise = (async () => {
-	const service = new EncryptionService(
-		new Uint8Array(SALT_LENGTH).fill(11),
-	);
+	const service = new EncryptionService(new Uint8Array(SALT_LENGTH).fill(11));
 	await service.initializeKey("hardened-password");
 	return service;
 })();
@@ -275,7 +270,9 @@ test("hardened codec rejects content and filename ciphertext from numbered histo
 		historicalContentKey,
 		new TextEncoder().encode("historical content"),
 	);
-	const historicalContent = new Uint8Array(iv.length + encryptedContent.byteLength);
+	const historicalContent = new Uint8Array(
+		iv.length + encryptedContent.byteLength,
+	);
 	historicalContent.set(iv);
 	historicalContent.set(new Uint8Array(encryptedContent), iv.length);
 	await assert.rejects(

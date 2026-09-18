@@ -6,7 +6,7 @@ import {
 	loadPluginData,
 	loadPluginDataWithSource,
 } from "../src/plugin-data-loader";
-import { parseStable1xIndex, serializeStable1xPluginData } from "../src/compatibility/stable-1x";
+import { parseStable1xIndex } from "../src/compatibility/stable-1x";
 import { DEFAULT_SETTINGS, type LocalSyncState } from "../src/types";
 import stableFilledFixture from "./fixtures/stable-1.1/plugin-data-filled.json";
 import stableEmptyFixture from "./fixtures/stable-1.1/plugin-data-empty.json";
@@ -16,7 +16,15 @@ test("stable timestamps allow filesystem precision without relaxing sizes or cou
 	const source = structuredClone(stableFilledFixture);
 	source.localIndex.files["note.md"].mtime += 0.375;
 	assert.ok(parseStable1xIndex(source.localIndex));
-	for (const invalid of [-1, NaN, Infinity, -Infinity, Number.MAX_VALUE, "1", null]) {
+	for (const invalid of [
+		-1,
+		NaN,
+		Infinity,
+		-Infinity,
+		Number.MAX_VALUE,
+		"1",
+		null,
+	]) {
 		const index = structuredClone(source.localIndex);
 		Object.assign(index.files["note.md"], { mtime: invalid });
 		assert.equal(parseStable1xIndex(index), null);
@@ -30,16 +38,27 @@ test("stable timestamps allow filesystem precision without relaxing sizes or cou
 
 test("stable snapshot rejection identifies only fixed schema sections", () => {
 	const sentinel = "private-value-must-not-appear";
-	for (const section of ["root fields", "settings", "localIndex", "lastSyncStats"]) {
+	for (const section of [
+		"root fields",
+		"settings",
+		"localIndex",
+		"lastSyncStats",
+	]) {
 		const source = structuredClone(stableFilledFixture);
-		if (section === "root fields") Object.assign(source, { [sentinel]: sentinel });
-		else Object.assign(source, { [section]: { [sentinel]: sentinel } });
-		assert.throws(() => loadPluginData(source), (error: unknown) => {
-			assert.ok(error instanceof UnsupportedHistoricalDataError);
-			assert.ok(error.message.includes(`invalid ${section}`));
-			assert.equal(error.message.includes(sentinel), false);
-			return true;
-		});
+		if (section === "root fields") {
+			Object.assign(source, { [sentinel]: sentinel });
+		} else {
+			Object.assign(source, { [section]: { [sentinel]: sentinel } });
+		}
+		assert.throws(
+			() => loadPluginData(source),
+			(error: unknown) => {
+				assert.ok(error instanceof UnsupportedHistoricalDataError);
+				assert.ok(error.message.includes(`invalid ${section}`));
+				assert.equal(error.message.includes(sentinel), false);
+				return true;
+			},
+		);
 	}
 });
 
@@ -144,40 +163,21 @@ test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty qu
 	assert.equal(migrated?.settings.encryptionProfileId, null);
 	assert.equal(migrated?.settings.deviceId, source.settings.deviceId);
 	assert.equal(migrated?.settings.syncInterval, source.settings.syncInterval);
-	assert.deepEqual(migrated?.settings.syncPatterns, source.settings.syncPatterns);
+	assert.deepEqual(
+		migrated?.settings.syncPatterns,
+		source.settings.syncPatterns,
+	);
 	assert.equal(migrated?.localState.observedEpoch, null);
 	assert.equal(migrated?.localState.observedRevision, 0);
-	assert.equal(migrated?.localState.files["note.md"]?.sha256, source.localIndex.files["note.md"].sha256);
+	assert.equal(
+		migrated?.localState.files["note.md"]?.sha256,
+		source.localIndex.files["note.md"].sha256,
+	);
 	assert.deepEqual(migrated?.pendingMutations, []);
 	assert.deepEqual(migrated?.pendingPhysicalActions, []);
 	assert.deepEqual(migrated?.pendingWatcherEvents, []);
 	assert.equal(migrated?.encryptionTransition, null);
 	assert.deepEqual(migrated?.lastSyncStats, source.lastSyncStats);
-});
-
-test("stable 1.1 data remains rollback-readable until verified Force cutover", () => {
-	const loaded = loadPluginDataWithSource(stableFilledFixture);
-	assert.equal(loaded.source, "stable-1x");
-	assert.ok(loaded.stableSnapshot);
-	const inMemorySettings = {
-		...DEFAULT_SETTINGS,
-		...loaded.data?.settings,
-		deviceId: "current-installation-id",
-		remotePath: "changed/remote-path",
-	};
-	const persisted = serializeStable1xPluginData(
-		loaded.stableSnapshot,
-		inMemorySettings,
-	);
-	assert.deepEqual(Object.keys(persisted).sort(), [
-		"lastSyncStats",
-		"localIndex",
-		"settings",
-	]);
-	assert.equal("format" in persisted, false);
-	assert.equal(persisted.settings.deviceId, "stable-device-filled");
-	assert.equal(persisted.settings.remotePath, "changed/remote-path");
-	assert.ok(loadPluginDataWithSource(persisted).stableSnapshot);
 });
 
 test("stable 1.1 empty golden fixture preserves zero interval and config sync", () => {
@@ -193,8 +193,12 @@ test("stable 1.1 empty golden fixture preserves zero interval and config sync", 
 });
 
 test("legacy root __proto__ path survives stable conversion", () => {
-	const source = JSON.parse(JSON.stringify(stableFilledFixture)) as typeof stableFilledFixture;
-	if (!source.localIndex) throw new Error("fixture local index is missing");
+	const source = JSON.parse(
+		JSON.stringify(stableFilledFixture),
+	) as typeof stableFilledFixture;
+	if (!source.localIndex) {
+		throw new Error("fixture local index is missing");
+	}
 	Object.defineProperty(source.localIndex.files, "__proto__", {
 		value: {
 			path: "__proto__",
@@ -219,10 +223,7 @@ test("legacy root __proto__ path survives stable conversion", () => {
 		),
 		true,
 	);
-	assert.equal(
-		current.localState.files["__proto__"]?.sha256,
-		"proto-sha",
-	);
+	assert.equal(current.localState.files["__proto__"]?.sha256, "proto-sha");
 });
 
 test("current semantic format preserves causal data with explicit profiles", () => {
@@ -262,50 +263,97 @@ test("already converted current local data can finish a stable 1.1 migration", (
 	const loaded = loadPluginDataWithSource(current);
 	assert.equal(loaded.source, "current");
 	assert.strictEqual(loaded.data, current);
-	assert.equal(loaded.stableSnapshot, null);
 });
 
 test("unsupported local formats fail closed instead of migrating", () => {
 	const cases: [string, unknown][] = [
 		["unmarked queues", { ...stableFilledFixture, pendingMutations: [] }],
-		["partial stable", { settings: { enableEncryption: false }, localIndex: null }],
+		[
+			"partial stable",
+			{ settings: { enableEncryption: false }, localIndex: null },
+		],
 		["numeric schema", { schemaVersion: 2, settings: {} }],
-		["historical profile", currentData({
-			settings: { enableEncryption: true, encryptionProfileId: "hardened-v3" },
-			encryptionTransition: null,
-		})],
+		[
+			"historical profile",
+			currentData({
+				settings: {
+					enableEncryption: true,
+					encryptionProfileId: "hardened-v3",
+				},
+				encryptionTransition: null,
+			}),
+		],
 		...[false, true].map((enabled): [string, unknown] => [
 			`legacy encryption ${enabled}`,
 			{
-				settings: { enableEncryption: enabled, encryptionSalt: enabled ? "salt" : null,
-					encryptedPassword: enabled ? "password-placeholder" : null },
+				settings: {
+					enableEncryption: enabled,
+					encryptionSalt: enabled ? "salt" : null,
+					encryptedPassword: enabled ? "password-placeholder" : null,
+				},
 				localIndex: null,
 				lastSyncStats: {},
 			},
 		]),
 	];
 	for (const [label, value] of cases) {
-		assert.throws(() => loadPluginData(value as Parameters<typeof loadPluginData>[0]), UnsupportedHistoricalDataError, label);
+		assert.throws(
+			() => loadPluginData(value as Parameters<typeof loadPluginData>[0]),
+			UnsupportedHistoricalDataError,
+			label,
+		);
 	}
 });
 
 test("persisted transitions require current authority backup and target proofs", () => {
+	assert.doesNotThrow(() =>
+		loadPluginData(
+			currentData({
+				encryptionTransition: {
+					...currentTransition(),
+					backupProof: null,
+				},
+			}),
+		),
+	);
 	const cases: [string, (transition: Record<string, unknown>) => void][] = [
-		["profile", (transition) => {
-			delete (transition.source as Record<string, unknown>).profileId;
-		}],
-		["backup proof", (transition) => { delete transition.backupProof; }],
-		["target fingerprints", (transition) => { transition.targetFingerprints = {}; }],
-		["historical mapping", (transition) => {
-			delete transition.targetRawByLogicalPath;
-			transition.targetRawPaths = ["new"];
-		}],
+		[
+			"profile",
+			(transition) => {
+				delete (transition.source as Record<string, unknown>).profileId;
+			},
+		],
+		[
+			"backup proof",
+			(transition) => {
+				delete transition.backupProof;
+			},
+		],
+		[
+			"target fingerprints",
+			(transition) => {
+				transition.targetFingerprints = {};
+			},
+		],
+		[
+			"historical mapping",
+			(transition) => {
+				delete transition.targetRawByLogicalPath;
+				transition.targetRawPaths = ["new"];
+			},
+		],
 	];
 	for (const [label, invalidate] of cases) {
-		const transition = currentTransition() as unknown as Record<string, unknown>;
+		const transition = currentTransition() as unknown as Record<
+			string,
+			unknown
+		>;
 		invalidate(transition);
 		assert.throws(
-			() => loadPluginData(currentData({ encryptionTransition: transition })),
+			() =>
+				loadPluginData(
+					currentData({ encryptionTransition: transition }),
+				),
 			UnsupportedHistoricalDataError,
 			label,
 		);
@@ -325,7 +373,9 @@ test("current transition requires an injective disjoint target mapping", () => {
 		};
 		assert.throws(
 			() =>
-				loadPluginData(currentData({ encryptionTransition: transition })),
+				loadPluginData(
+					currentData({ encryptionTransition: transition }),
+				),
 			UnsupportedHistoricalDataError,
 		);
 	}
@@ -337,7 +387,9 @@ test("__proto__ transition paths cannot impersonate persisted fingerprints", () 
 	missingSourceFingerprint.sourceFingerprints = {};
 	assert.throws(
 		() =>
-			loadPluginData(currentData({ encryptionTransition: missingSourceFingerprint })),
+			loadPluginData(
+				currentData({ encryptionTransition: missingSourceFingerprint }),
+			),
 		UnsupportedHistoricalDataError,
 	);
 
@@ -348,7 +400,9 @@ test("__proto__ transition paths cannot impersonate persisted fingerprints", () 
 	missingTargetFingerprint.targetFingerprints = {};
 	assert.throws(
 		() =>
-			loadPluginData(currentData({ encryptionTransition: missingTargetFingerprint })),
+			loadPluginData(
+				currentData({ encryptionTransition: missingTargetFingerprint }),
+			),
 		UnsupportedHistoricalDataError,
 	);
 });

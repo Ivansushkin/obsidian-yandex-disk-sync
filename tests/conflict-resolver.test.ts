@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-	FileMetadata,
-	FolderTombstone,
-} from "../src/types";
-import { ConflictResolver } from "../src/sync/conflict-resolver";
+import type { FileMetadata, FolderTombstone } from "../src/types";
+import { ConflictResolver } from "../src/sync/reconciliation/conflicts";
 
 function file(
 	path: string,
@@ -272,7 +269,9 @@ test("epoch adoption reapplies local changes and accepts remote-only changes", (
 		canonical,
 	);
 	assert.deepEqual(
-		Object.fromEntries(operations.map((operation) => [operation.path, operation.action])),
+		Object.fromEntries(
+			operations.map((operation) => [operation.path, operation.action]),
+		),
 		{
 			"local-edit.md": "upload",
 			"remote-edit.md": "download",
@@ -301,7 +300,9 @@ test("epoch adoption restores a remote deletion and conflicts on two live edits"
 		canonical,
 	);
 	assert.deepEqual(
-		Object.fromEntries(operations.map((operation) => [operation.path, operation.action])),
+		Object.fromEntries(
+			operations.map((operation) => [operation.path, operation.action]),
+		),
 		{ "restore.md": "upload", "conflict.md": "conflict" },
 	);
 });

@@ -19,15 +19,15 @@ import type {
 	EncryptionModeDescriptor,
 	RemoteEncryptionManifest,
 	IndexMaintenance,
-} from "../types";
+} from "../../types";
 import {
 	CURRENT_INDEX_FORMAT,
 	ENCRYPTION_MANIFEST_FORMAT,
 	createEmptyIndex,
 	createEmptyLocalState,
-} from "../types";
-import { YandexApiError, YandexDiskClient } from "../api/yandex-client";
-import { VaultAdapter } from "../api/vault-adapter";
+} from "../../types";
+import { YandexApiError, YandexDiskClient } from "../../api/yandex-client";
+import { VaultAdapter } from "../../api/vault-adapter";
 import {
 	isProtectedPath,
 	isLegacyPluginDataPath,
@@ -35,35 +35,32 @@ import {
 	joinPath,
 	normalizePath,
 	toLocalPath,
-} from "../utils/path-utils";
+} from "../../utils/path-utils";
 import {
 	createSafeRecord,
 	getRecordValue,
 	protectRecord,
 	setRecordValue,
-} from "../utils/record-utils";
-import { logger, shortenDiagnosticValue } from "../utils/logger";
-import { findErrorCause } from "../utils/error-utils";
-import { isFileModificationTime } from "../utils/timestamp-utils";
-import {
-	computeSha256,
-	computeSha256FromString,
-} from "../utils/hash-utils";
+} from "../../utils/record-utils";
+import { logger, shortenDiagnosticValue } from "../../utils/logger";
+import { findErrorCause } from "../../utils/error-utils";
+import { isFileModificationTime } from "../../utils/timestamp-utils";
+import { computeSha256, computeSha256FromString } from "../../utils/hash-utils";
 import {
 	HARDENED_PBKDF2_ITERATIONS,
 	AES_KEY_LENGTH,
 	FILENAME_KEY_LENGTH,
 	IV_LENGTH,
-} from "../crypto/encryption";
-import { UnsupportedHistoricalDataError } from "../compatibility-errors";
-import { parseStable1xIndex } from "../compatibility/stable-1x";
-import type { EncryptionCodec } from "../crypto/encryption";
+} from "../../crypto/encryption";
+import { UnsupportedHistoricalDataError } from "../../compatibility-errors";
+import { parseStable1xIndex } from "../../compatibility/stable-1x";
+import type { EncryptionCodec } from "../../crypto/encryption";
 import {
 	getPhysicalResourceFingerprint,
 	getStableContentFingerprint,
 	isHashStableContentFingerprint,
 	matchesStableContentFingerprint,
-} from "../utils/resource-fingerprint";
+} from "../../utils/resource-fingerprint";
 import {
 	canApplyDestructiveFolderMutation,
 	classifyFileMutation,
@@ -72,15 +69,15 @@ import {
 	isStableLockStale,
 	mergeFileMutation,
 	shouldPreserveConcurrentFolderChild,
-} from "./index-rules";
-import { LocalOperationStore } from "./local-operation-store";
-import { mergePhysicalMetadata } from "./baseline-rules";
+} from "./mutation-rules";
+import { LocalOperationStore } from "../local/operation-store";
+import { mergePhysicalMetadata } from "../local/baseline-rules";
 import {
 	collectStablePaginatedItems,
 	didCanonicalChangeBeforeMaintenanceClaim,
 	isOrphanIndexAmbiguous,
 	stableSerialize,
-} from "./index-transaction-rules";
+} from "./transaction-rules";
 import {
 	classifyIndexMoveRecovery,
 	rollbackRawIndexSnapshot,
@@ -90,7 +87,7 @@ import {
 	type IndexFileSnapshot,
 	type IndexTransactionOutcome,
 	type IndexTransactionStage,
-} from "./index-transaction";
+} from "./transaction";
 
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
 const REMOTE_INDEX_LOCK_PREFIX = ".obsidian-sync-index.lock.";
@@ -126,14 +123,12 @@ export interface LocalCausalSnapshot {
 }
 
 export type ForceCanonicalProof =
-	| { state: "absent" }
-	| { state: "present"; rawSha256: string };
+	{ state: "absent" } | { state: "present"; rawSha256: string };
 
 export type RemoteCanonicalFormat = "absent" | "legacy" | "current";
 
 type IndexCodecAttemptResult =
-	| { data: unknown }
-	| { attempt: IndexDecodeAttempt };
+	{ data: unknown } | { attempt: IndexDecodeAttempt };
 
 type JsonRecord = Record<string, unknown>;
 
@@ -161,7 +156,12 @@ function isLogicalPath(value: unknown): value is string {
 		!value.endsWith("/") &&
 		!value.includes("\\") &&
 		!value.includes("\u0000") &&
-		value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..")
+		value
+			.split("/")
+			.every(
+				(segment) =>
+					segment !== "" && segment !== "." && segment !== "..",
+			)
 	);
 }
 
@@ -170,7 +170,9 @@ function assertIndexSection(
 	section: string,
 	reason: string,
 ): asserts condition {
-	if (!condition) throw new InvalidCurrentIndexError(section, reason);
+	if (!condition) {
+		throw new InvalidCurrentIndexError(section, reason);
+	}
 }
 
 function validateEncryptionModeDescriptor(
@@ -186,7 +188,11 @@ function validateEncryptionModeDescriptor(
 		section,
 		"fields do not match the current mode descriptor",
 	);
-	assertIndexSection(typeof value.enabled === "boolean", section, "enabled must be boolean");
+	assertIndexSection(
+		typeof value.enabled === "boolean",
+		section,
+		"enabled must be boolean",
+	);
 	assertIndexSection(
 		value.revision === null || isNonNegativeInteger(value.revision),
 		section,
@@ -215,14 +221,18 @@ function validateEncryptionModeDescriptor(
 		);
 	} else {
 		assertIndexSection(
-			value.revision === null && value.salt === null && value.verifier === null,
+			value.revision === null &&
+				value.salt === null &&
+				value.verifier === null,
 			section,
 			"plaintext mode requires null encryption fields",
 		);
 	}
 }
 
-function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord & SyncIndex {
+function validateCurrentIndexShape(
+	data: JsonRecord,
+): asserts data is JsonRecord & SyncIndex {
 	const requiredRootKeys = [
 		"format",
 		"epoch",
@@ -246,60 +256,230 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		"root",
 		"format marker is invalid",
 	);
-	assertIndexSection(typeof data.epoch === "string" && data.epoch.length > 0, "root", "epoch is required");
-	assertIndexSection(isNonNegativeInteger(data.revision), "root", "revision must be a non-negative integer");
-	assertIndexSection(isNonNegativeInteger(data.lastSyncTime), "root", "lastSyncTime must be a non-negative integer");
-	assertIndexSection(typeof data.deviceId === "string" && data.deviceId.length > 0, "root", "deviceId is required");
+	assertIndexSection(
+		typeof data.epoch === "string" && data.epoch.length > 0,
+		"root",
+		"epoch is required",
+	);
+	assertIndexSection(
+		isNonNegativeInteger(data.revision),
+		"root",
+		"revision must be a non-negative integer",
+	);
+	assertIndexSection(
+		isNonNegativeInteger(data.lastSyncTime),
+		"root",
+		"lastSyncTime must be a non-negative integer",
+	);
+	assertIndexSection(
+		typeof data.deviceId === "string" && data.deviceId.length > 0,
+		"root",
+		"deviceId is required",
+	);
 	assertIndexSection(isJsonRecord(data.files), "files", "must be an object");
 	for (const [path, raw] of Object.entries(data.files)) {
-		assertIndexSection(isLogicalPath(path), "files", "contains an invalid path key");
-		assertIndexSection(isJsonRecord(raw), "files", "metadata must be an object");
-		assertIndexSection(raw.path === path, "files", "metadata path must match its key");
-		assertIndexSection(typeof raw.sha256 === "string", "files", "sha256 must be a string");
-		assertIndexSection(isNonNegativeInteger(raw.size), "files", "size must be a non-negative integer");
-		assertIndexSection(isFileModificationTime(raw.mtime), "files", "mtime must be a finite non-negative timestamp");
-		assertIndexSection(isNonNegativeInteger(raw.syncedAt), "files", "syncedAt must be a non-negative integer");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.remoteMtime), "files", "remoteMtime must be a non-negative integer");
-		assertIndexSection(isOptionalString(raw.remoteFingerprint), "files", "remoteFingerprint must be a string");
-		assertIndexSection(raw.deleted === undefined || typeof raw.deleted === "boolean", "files", "deleted must be boolean");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.deletedAt), "files", "deletedAt must be a non-negative integer");
-		assertIndexSection(isOptionalString(raw.deletedByFolder), "files", "deletedByFolder must be a string");
-		assertIndexSection(isOptionalString(raw.lastModifiedBy), "files", "lastModifiedBy must be a string");
-		assertIndexSection(isNonNegativeInteger(raw.mutationSeq), "files", "mutationSeq must be a non-negative integer");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.changedRevision), "files", "changedRevision must be a non-negative integer");
-		assertIndexSection(isOptionalNonNegativeInteger(raw.baseRevision), "files", "baseRevision must be a non-negative integer");
+		assertIndexSection(
+			isLogicalPath(path),
+			"files",
+			"contains an invalid path key",
+		);
+		assertIndexSection(
+			isJsonRecord(raw),
+			"files",
+			"metadata must be an object",
+		);
+		assertIndexSection(
+			raw.path === path,
+			"files",
+			"metadata path must match its key",
+		);
+		assertIndexSection(
+			typeof raw.sha256 === "string",
+			"files",
+			"sha256 must be a string",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.size),
+			"files",
+			"size must be a non-negative integer",
+		);
+		assertIndexSection(
+			isFileModificationTime(raw.mtime),
+			"files",
+			"mtime must be a finite non-negative timestamp",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.syncedAt),
+			"files",
+			"syncedAt must be a non-negative integer",
+		);
+		assertIndexSection(
+			isOptionalNonNegativeInteger(raw.remoteMtime),
+			"files",
+			"remoteMtime must be a non-negative integer",
+		);
+		assertIndexSection(
+			isOptionalString(raw.remoteFingerprint),
+			"files",
+			"remoteFingerprint must be a string",
+		);
+		assertIndexSection(
+			raw.deleted === undefined || typeof raw.deleted === "boolean",
+			"files",
+			"deleted must be boolean",
+		);
+		assertIndexSection(
+			isOptionalNonNegativeInteger(raw.deletedAt),
+			"files",
+			"deletedAt must be a non-negative integer",
+		);
+		assertIndexSection(
+			isOptionalString(raw.deletedByFolder),
+			"files",
+			"deletedByFolder must be a string",
+		);
+		assertIndexSection(
+			isOptionalString(raw.lastModifiedBy),
+			"files",
+			"lastModifiedBy must be a string",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.mutationSeq),
+			"files",
+			"mutationSeq must be a non-negative integer",
+		);
+		assertIndexSection(
+			isOptionalNonNegativeInteger(raw.changedRevision),
+			"files",
+			"changedRevision must be a non-negative integer",
+		);
+		assertIndexSection(
+			isOptionalNonNegativeInteger(raw.baseRevision),
+			"files",
+			"baseRevision must be a non-negative integer",
+		);
 	}
-	assertIndexSection(isJsonRecord(data.folderTombstones), "folderTombstones", "must be an object");
+	assertIndexSection(
+		isJsonRecord(data.folderTombstones),
+		"folderTombstones",
+		"must be an object",
+	);
 	for (const [path, raw] of Object.entries(data.folderTombstones)) {
-		assertIndexSection(isLogicalPath(path), "folderTombstones", "contains an invalid path key");
-		assertIndexSection(isJsonRecord(raw), "folderTombstones", "entry must be an object");
-		assertIndexSection(raw.path === path, "folderTombstones", "path must match its key");
-		assertIndexSection(isNonNegativeInteger(raw.deletedAt), "folderTombstones", "deletedAt must be a non-negative integer");
-		assertIndexSection(isNonNegativeInteger(raw.changedRevision), "folderTombstones", "changedRevision must be a non-negative integer");
-		assertIndexSection(isNonNegativeInteger(raw.baseRevision), "folderTombstones", "baseRevision must be a non-negative integer");
-		assertIndexSection(typeof raw.lastModifiedBy === "string" && raw.lastModifiedBy.length > 0, "folderTombstones", "lastModifiedBy is required");
-		assertIndexSection(isNonNegativeInteger(raw.mutationSeq), "folderTombstones", "mutationSeq must be a non-negative integer");
+		assertIndexSection(
+			isLogicalPath(path),
+			"folderTombstones",
+			"contains an invalid path key",
+		);
+		assertIndexSection(
+			isJsonRecord(raw),
+			"folderTombstones",
+			"entry must be an object",
+		);
+		assertIndexSection(
+			raw.path === path,
+			"folderTombstones",
+			"path must match its key",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.deletedAt),
+			"folderTombstones",
+			"deletedAt must be a non-negative integer",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.changedRevision),
+			"folderTombstones",
+			"changedRevision must be a non-negative integer",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.baseRevision),
+			"folderTombstones",
+			"baseRevision must be a non-negative integer",
+		);
+		assertIndexSection(
+			typeof raw.lastModifiedBy === "string" &&
+				raw.lastModifiedBy.length > 0,
+			"folderTombstones",
+			"lastModifiedBy is required",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.mutationSeq),
+			"folderTombstones",
+			"mutationSeq must be a non-negative integer",
+		);
 	}
 	assertIndexSection(isJsonRecord(data.moves), "moves", "must be an object");
 	for (const [id, raw] of Object.entries(data.moves)) {
-		assertIndexSection(id.length > 0 && isJsonRecord(raw), "moves", "entry must be an object");
+		assertIndexSection(
+			id.length > 0 && isJsonRecord(raw),
+			"moves",
+			"entry must be an object",
+		);
 		assertIndexSection(raw.id === id, "moves", "id must match its key");
-		assertIndexSection(isLogicalPath(raw.fromPath), "moves", "fromPath is invalid");
-		assertIndexSection(isLogicalPath(raw.toPath), "moves", "toPath is invalid");
-		assertIndexSection(raw.kind === "file" || raw.kind === "folder", "moves", "kind is invalid");
-		assertIndexSection(isNonNegativeInteger(raw.baseRevision), "moves", "baseRevision must be a non-negative integer");
-		assertIndexSection(isNonNegativeInteger(raw.changedRevision), "moves", "changedRevision must be a non-negative integer");
-		assertIndexSection(typeof raw.pending === "boolean", "moves", "pending must be boolean");
-		assertIndexSection(typeof raw.lastModifiedBy === "string" && raw.lastModifiedBy.length > 0, "moves", "lastModifiedBy is required");
-		assertIndexSection(isNonNegativeInteger(raw.mutationSeq), "moves", "mutationSeq must be a non-negative integer");
+		assertIndexSection(
+			isLogicalPath(raw.fromPath),
+			"moves",
+			"fromPath is invalid",
+		);
+		assertIndexSection(
+			isLogicalPath(raw.toPath),
+			"moves",
+			"toPath is invalid",
+		);
+		assertIndexSection(
+			raw.kind === "file" || raw.kind === "folder",
+			"moves",
+			"kind is invalid",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.baseRevision),
+			"moves",
+			"baseRevision must be a non-negative integer",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.changedRevision),
+			"moves",
+			"changedRevision must be a non-negative integer",
+		);
+		assertIndexSection(
+			typeof raw.pending === "boolean",
+			"moves",
+			"pending must be boolean",
+		);
+		assertIndexSection(
+			typeof raw.lastModifiedBy === "string" &&
+				raw.lastModifiedBy.length > 0,
+			"moves",
+			"lastModifiedBy is required",
+		);
+		assertIndexSection(
+			isNonNegativeInteger(raw.mutationSeq),
+			"moves",
+			"mutationSeq must be a non-negative integer",
+		);
 	}
-	assertIndexSection(isJsonRecord(data.appliedMutationSeq), "appliedMutationSeq", "must be an object");
-	for (const [deviceId, sequence] of Object.entries(data.appliedMutationSeq)) {
-		assertIndexSection(deviceId.length > 0 && isNonNegativeInteger(sequence), "appliedMutationSeq", "contains an invalid watermark");
+	assertIndexSection(
+		isJsonRecord(data.appliedMutationSeq),
+		"appliedMutationSeq",
+		"must be an object",
+	);
+	for (const [deviceId, sequence] of Object.entries(
+		data.appliedMutationSeq,
+	)) {
+		assertIndexSection(
+			deviceId.length > 0 && isNonNegativeInteger(sequence),
+			"appliedMutationSeq",
+			"contains an invalid watermark",
+		);
 	}
-	if (data.maintenance === undefined) return;
+	if (data.maintenance === undefined) {
+		return;
+	}
 	const maintenance = data.maintenance;
-	assertIndexSection(isJsonRecord(maintenance), "maintenance", "must be an object");
+	assertIndexSection(
+		isJsonRecord(maintenance),
+		"maintenance",
+		"must be an object",
+	);
 	const maintenanceKeys = [
 		"id",
 		"kind",
@@ -317,12 +497,46 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		"maintenance",
 		"fields do not match the current maintenance format",
 	);
-	assertIndexSection(typeof maintenance.id === "string" && maintenance.id.length > 0, "maintenance", "id is required");
-	assertIndexSection(maintenance.kind === "enable" || maintenance.kind === "disable" || maintenance.kind === "rotate", "maintenance", "kind is invalid");
-	assertIndexSection(["prepared", "files-copied", "index-committed", "stable", "cleanup"].includes(String(maintenance.phase)), "maintenance", "phase is invalid");
-	assertIndexSection(typeof maintenance.initiatedBy === "string" && maintenance.initiatedBy.length > 0, "maintenance", "initiatedBy is required");
-	assertIndexSection(isNonNegativeInteger(maintenance.sourceRevision), "maintenance", "sourceRevision must be a non-negative integer");
-	assertIndexSection(maintenance.targetRevision === null || isNonNegativeInteger(maintenance.targetRevision), "maintenance", "targetRevision must be null or a non-negative integer");
+	assertIndexSection(
+		typeof maintenance.id === "string" && maintenance.id.length > 0,
+		"maintenance",
+		"id is required",
+	);
+	assertIndexSection(
+		maintenance.kind === "enable" ||
+			maintenance.kind === "disable" ||
+			maintenance.kind === "rotate",
+		"maintenance",
+		"kind is invalid",
+	);
+	assertIndexSection(
+		[
+			"prepared",
+			"files-copied",
+			"index-committed",
+			"stable",
+			"cleanup",
+		].includes(String(maintenance.phase)),
+		"maintenance",
+		"phase is invalid",
+	);
+	assertIndexSection(
+		typeof maintenance.initiatedBy === "string" &&
+			maintenance.initiatedBy.length > 0,
+		"maintenance",
+		"initiatedBy is required",
+	);
+	assertIndexSection(
+		isNonNegativeInteger(maintenance.sourceRevision),
+		"maintenance",
+		"sourceRevision must be a non-negative integer",
+	);
+	assertIndexSection(
+		maintenance.targetRevision === null ||
+			isNonNegativeInteger(maintenance.targetRevision),
+		"maintenance",
+		"targetRevision must be null or a non-negative integer",
+	);
 	assertIndexSection(
 		maintenance.sourceRevision < data.revision,
 		"maintenance.sourceRevision",
@@ -332,7 +546,9 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 	const target = maintenance.target;
 	validateEncryptionModeDescriptor(source, "maintenance.source");
 	validateEncryptionModeDescriptor(target, "maintenance.target");
-	const preCommit = maintenance.phase === "prepared" || maintenance.phase === "files-copied";
+	const preCommit =
+		maintenance.phase === "prepared" ||
+		maintenance.phase === "files-copied";
 	assertIndexSection(
 		preCommit
 			? maintenance.targetRevision === null
@@ -357,8 +573,10 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		);
 	}
 	const modeMismatch =
-		(maintenance.kind === "enable" && (source.enabled || !target.enabled)) ||
-		(maintenance.kind === "disable" && (!source.enabled || target.enabled)) ||
+		(maintenance.kind === "enable" &&
+			(source.enabled || !target.enabled)) ||
+		(maintenance.kind === "disable" &&
+			(!source.enabled || target.enabled)) ||
 		(maintenance.kind === "rotate" &&
 			(!source.enabled ||
 				!target.enabled ||
@@ -370,7 +588,11 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		"maintenance",
 		"source and target modes do not match its kind",
 	);
-	assertIndexSection(Array.isArray(maintenance.cleanup), "maintenance.cleanup", "must be an array");
+	assertIndexSection(
+		Array.isArray(maintenance.cleanup),
+		"maintenance.cleanup",
+		"must be an array",
+	);
 	assertIndexSection(
 		!preCommit || maintenance.cleanup.length === 0,
 		"maintenance.cleanup",
@@ -378,7 +600,11 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 	);
 	const cleanupPaths = new Set<string>();
 	for (const action of maintenance.cleanup) {
-		assertIndexSection(isJsonRecord(action), "maintenance.cleanup", "entry must be an object");
+		assertIndexSection(
+			isJsonRecord(action),
+			"maintenance.cleanup",
+			"entry must be an object",
+		);
 		assertIndexSection(
 			Object.keys(action).length === 2 &&
 				"path" in action &&
@@ -397,7 +623,12 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 			"path is duplicated",
 		);
 		cleanupPaths.add(action.path);
-		assertIndexSection(typeof action.expectedFingerprint === "string" && action.expectedFingerprint.length > 0, "maintenance.cleanup", "expectedFingerprint is required");
+		assertIndexSection(
+			typeof action.expectedFingerprint === "string" &&
+				action.expectedFingerprint.length > 0,
+			"maintenance.cleanup",
+			"expectedFingerprint is required",
+		);
 	}
 }
 
@@ -406,8 +637,12 @@ function validateCurrentIndexCausality(index: SyncIndex): void {
 		section: string,
 		entry: Pick<FileMetadata, "lastModifiedBy" | "mutationSeq">,
 	): void => {
-		if (entry.mutationSeq === undefined) return;
-		if (entry.mutationSeq === 0) return;
+		if (entry.mutationSeq === undefined) {
+			return;
+		}
+		if (entry.mutationSeq === 0) {
+			return;
+		}
 		assertIndexSection(
 			typeof entry.lastModifiedBy === "string" &&
 				entry.lastModifiedBy.length > 0,
@@ -524,7 +759,9 @@ export class IndexManager {
 			0,
 			true,
 		);
-		if (!resource) return { state: "absent" };
+		if (!resource) {
+			return { state: "absent" };
+		}
 		const allowPlaintextLegacy =
 			this.transitionIndexReadService === undefined &&
 			!this.yandexClient.hasEncryptionService();
@@ -562,7 +799,9 @@ export class IndexManager {
 			0,
 			true,
 		);
-		if (!resource) return "absent";
+		if (!resource) {
+			return "absent";
+		}
 		try {
 			await this.downloadIndexSnapshot(
 				canonicalPath,
@@ -573,7 +812,9 @@ export class IndexManager {
 			);
 			return "current";
 		} catch (error) {
-			if (!(error instanceof LegacyIndexFormatError)) throw error;
+			if (!(error instanceof LegacyIndexFormatError)) {
+				throw error;
+			}
 			await this.downloadIndexSnapshot(
 				canonicalPath,
 				true,
@@ -590,7 +831,9 @@ export class IndexManager {
 	 */
 	async assertLegacyMigrationPathsSafe(): Promise<void> {
 		const format = await this.inspectRemoteCanonicalFormat();
-		if (format === "current") return;
+		if (format === "current") {
+			return;
+		}
 		if (format === "legacy") {
 			const canonical = await this.downloadIndexSnapshot(
 				this.getRemoteIndexPath(),
@@ -602,10 +845,7 @@ export class IndexManager {
 				if (isLegacyPluginDataPath(path)) {
 					throw new LegacyPluginDataExposureError();
 				}
-				if (
-					path.includes("\\") ||
-					isLegacyServicePathCollision(path)
-				) {
+				if (path.includes("\\") || isLegacyServicePathCollision(path)) {
 					throw new LegacyServicePathCollisionError();
 				}
 			}
@@ -729,7 +969,9 @@ export class IndexManager {
 		}
 		for (const [path, baseline] of Object.entries(this.localState.files)) {
 			const canonical = this.remoteIndex.files[path];
-			if (!canonical) continue;
+			if (!canonical) {
+				continue;
+			}
 			setRecordValue(this.localState.files, path, {
 				...baseline,
 				sha256: canonical.sha256,
@@ -783,9 +1025,7 @@ export class IndexManager {
 	 * Load local index from saved plugin data
 	 */
 	loadLocalIndexFromData(data: Partial<LocalSyncState> | null): void {
-		if (
-			data && typeof data.observedRevision === "number"
-		) {
+		if (data && typeof data.observedRevision === "number") {
 			this.localState = {
 				deviceId: this.settings.deviceId,
 				observedEpoch:
@@ -921,9 +1161,7 @@ export class IndexManager {
 		this.operationStore.completePhysicalAction(id);
 	}
 
-	getPendingPutBaseRevision(
-		path: string,
-	): number | null | undefined {
+	getPendingPutBaseRevision(path: string): number | null | undefined {
 		return this.operationStore.findLatestPutBaseRevision(path);
 	}
 
@@ -947,18 +1185,14 @@ export class IndexManager {
 	/**
 	 * Reuse a put sequence for a delete that superseded it before commit.
 	 */
-	replacePendingPutWithDelete(
-		id: string,
-	): PendingMutation | undefined {
+	replacePendingPutWithDelete(id: string): PendingMutation | undefined {
 		return this.operationStore.replacePutWithDelete(id);
 	}
 
 	/**
 	 * Reuse a put sequence as a watermark-only full-sync settlement.
 	 */
-	replacePendingPutWithNoop(
-		id: string,
-	): PendingMutation | undefined {
+	replacePendingPutWithNoop(id: string): PendingMutation | undefined {
 		return this.operationStore.replacePutWithNoop(id);
 	}
 
@@ -1007,7 +1241,9 @@ export class IndexManager {
 					...Object.keys(this.remoteIndex.files),
 				]);
 				for (const path of paths) {
-					if (!path.startsWith(prefix)) continue;
+					if (!path.startsWith(prefix)) {
+						continue;
+					}
 					const current = this.remoteIndex.files[path];
 					if (
 						current &&
@@ -1054,12 +1290,14 @@ export class IndexManager {
 			type,
 			path,
 			options?.epoch === undefined
-				? this.localState.observedEpoch
+				? (this.epochAdoptionTarget ?? this.localState.observedEpoch)
 				: options.epoch,
 			options?.baseRevision === undefined
-				? this.localState.observedEpoch === null
-					? null
-					: this.localState.observedRevision
+				? this.epochAdoptionTarget !== null
+					? this.loadedRemoteIndex.revision
+					: this.localState.observedEpoch === null
+						? null
+						: this.localState.observedRevision
 				: options.baseRevision,
 			options,
 		);
@@ -1144,7 +1382,9 @@ export class IndexManager {
 					false,
 				);
 			} catch (error) {
-				if (!this.isLockContention(error)) throw error;
+				if (!this.isLockContention(error)) {
+					throw error;
+				}
 			}
 			discovery = stableRootDiscovery
 				? await this.waitForCanonicalIndexFromStableRoot()
@@ -1202,7 +1442,9 @@ export class IndexManager {
 		service: EncryptionCodec | null,
 	): Promise<SyncIndex> {
 		const index = await this.readCanonicalIndexWithCodecIfPresent(service);
-		if (index) return index;
+		if (index) {
+			return index;
+		}
 		throw new RemoteIndexConcurrentModificationError(
 			"Canonical index is missing",
 		);
@@ -1213,7 +1455,9 @@ export class IndexManager {
 		service: EncryptionCodec | null,
 	): Promise<SyncIndex | null> {
 		const path = await this.waitForCanonicalIndex();
-		if (!path) return null;
+		if (!path) {
+			return null;
+		}
 		return await this.downloadIndex(path, false, service);
 	}
 
@@ -1222,9 +1466,14 @@ export class IndexManager {
 		service: EncryptionCodec | null,
 	): Promise<SyncIndex> {
 		if (this.targetRecoveryMaintenanceId === null) {
-			throw new Error("Explicit target codec requires recovery ownership");
+			throw new Error(
+				"Explicit target codec requires recovery ownership",
+			);
 		}
 		const index = await this.readCanonicalIndexWithCodec(service);
+		if (!this.isTargetRecoveryIndex(index)) {
+			throw new Error("Target recovery authority changed");
+		}
 		this.assertEpochCompatible(index);
 		this.assertMaintenanceCompatible(index);
 		this.remoteIndex = this.cloneIndex(index);
@@ -1308,7 +1557,9 @@ export class IndexManager {
 	}
 
 	clearMaintenance(id: string): void {
-		if (this.remoteIndex.maintenance?.id !== id) return;
+		if (this.remoteIndex.maintenance?.id !== id) {
+			return;
+		}
 		delete this.remoteIndex.maintenance;
 	}
 
@@ -1316,9 +1567,7 @@ export class IndexManager {
 	 * Save remote index to Yandex Disk
 	 */
 	async saveRemoteIndex(): Promise<CanonicalCommitProof> {
-		const save = this.saveChain.then(() =>
-			this.saveRemoteIndexWithRetry(),
-		);
+		const save = this.saveChain.then(() => this.saveRemoteIndexWithRetry());
 		this.saveChain = save.then(
 			() => undefined,
 			() => undefined,
@@ -1332,12 +1581,9 @@ export class IndexManager {
 			try {
 				return await this.saveRemoteIndexLocked();
 			} catch (e) {
-				if (
-					!(
-						e instanceof RemoteIndexTransactionError &&
-						e.retryable
-					)
-				) {
+				if (!(
+					e instanceof RemoteIndexTransactionError && e.retryable
+				)) {
 					throw e;
 				}
 				lastError = e;
@@ -1350,9 +1596,7 @@ export class IndexManager {
 					epoch: shortenDiagnosticValue(this.remoteIndex.epoch),
 					error: e,
 				});
-				await this.wait(
-					INDEX_LOCK_RETRY_MS + Math.random() * 500,
-				);
+				await this.wait(INDEX_LOCK_RETRY_MS + Math.random() * 500);
 			}
 		}
 		throw (
@@ -1377,8 +1621,7 @@ export class IndexManager {
 			loadedRevision: this.loadedRemoteIndex.revision,
 			epoch: shortenDiagnosticValue(this.remoteIndex.epoch),
 			pendingMutations: this.getPendingMutations().length,
-			pendingPhysicalActions:
-				this.getPendingPhysicalActions().length,
+			pendingPhysicalActions: this.getPendingPhysicalActions().length,
 		};
 		logger.info("Canonical index transaction started", transactionContext);
 
@@ -1417,7 +1660,9 @@ export class IndexManager {
 					);
 					break;
 				}
-				if (!this.isLockContention(e)) throw e;
+				if (!this.isLockContention(e)) {
+					throw e;
+				}
 				if (attempt === 0 || (attempt + 1) % 10 === 0) {
 					logger.debug("Waiting for canonical index lock", {
 						...transactionContext,
@@ -1480,9 +1725,7 @@ export class IndexManager {
 				latestRevision: latest.revision,
 				mergedRevision: merged.revision,
 				fileEntries: Object.keys(merged.files).length,
-				folderTombstones: Object.keys(
-					merged.folderTombstones,
-				).length,
+				folderTombstones: Object.keys(merged.folderTombstones).length,
 				pendingMoves: Object.keys(merged.moves).length,
 			});
 			if (
@@ -1544,9 +1787,7 @@ export class IndexManager {
 				logger.debug("Written index lock verified", {
 					...transactionContext,
 					mergedRevision: merged.revision,
-					lockFingerprint: shortenDiagnosticValue(
-						writtenFingerprint,
-					),
+					lockFingerprint: shortenDiagnosticValue(writtenFingerprint),
 				});
 			}
 			if (writtenFingerprint === null) {
@@ -1556,8 +1797,7 @@ export class IndexManager {
 					0,
 					true,
 				);
-				writtenFingerprint =
-					this.getResourceFingerprint(writtenLock);
+				writtenFingerprint = this.getResourceFingerprint(writtenLock);
 				stage = "verified";
 			}
 			stage = "move-attempted";
@@ -1669,9 +1909,7 @@ export class IndexManager {
 						? originalSnapshot?.index.epoch
 						: null,
 				),
-				expectedFingerprint: shortenDiagnosticValue(
-					writtenFingerprint,
-				),
+				expectedFingerprint: shortenDiagnosticValue(writtenFingerprint),
 				actualFingerprint: shortenDiagnosticValue(
 					rollbackOutcome === "rolled-back"
 						? originalSnapshot?.fingerprint
@@ -1680,7 +1918,9 @@ export class IndexManager {
 				error: e,
 			});
 			if (rollbackOutcome === "rolled-back") {
-				if (e instanceof UnsupportedHistoricalDataError) throw e;
+				if (e instanceof UnsupportedHistoricalDataError) {
+					throw e;
+				}
 				throw new RemoteIndexRolledBackError(
 					e instanceof Error
 						? e.message
@@ -1718,8 +1958,7 @@ export class IndexManager {
 			...metadata,
 			baseRevision:
 				metadata.baseRevision ?? this.localState.observedRevision,
-			lastModifiedBy:
-				metadata.lastModifiedBy ?? this.settings.deviceId,
+			lastModifiedBy: metadata.lastModifiedBy ?? this.settings.deviceId,
 		});
 	}
 
@@ -1732,7 +1971,9 @@ export class IndexManager {
 		mutationSeq?: number,
 	): void {
 		const meta = this.localState.files[path];
-		if (!meta) return;
+		if (!meta) {
+			return;
+		}
 		if (!meta.deleted) {
 			meta.deleted = true;
 			meta.deletedAt = Date.now();
@@ -1741,7 +1982,9 @@ export class IndexManager {
 			meta.deletedByFolder = deletedByFolder;
 		}
 		meta.lastModifiedBy = this.settings.deviceId;
-		if (mutationSeq !== undefined) meta.mutationSeq = mutationSeq;
+		if (mutationSeq !== undefined) {
+			meta.mutationSeq = mutationSeq;
+		}
 	}
 
 	/**
@@ -1759,8 +2002,7 @@ export class IndexManager {
 			...metadata,
 			baseRevision:
 				metadata.baseRevision ?? this.loadedRemoteIndex.revision,
-			lastModifiedBy:
-				metadata.lastModifiedBy ?? this.settings.deviceId,
+			lastModifiedBy: metadata.lastModifiedBy ?? this.settings.deviceId,
 		});
 	}
 
@@ -1779,11 +2021,19 @@ export class IndexManager {
 	applyServerMtimes(remoteFiles: Map<string, FileMetadata>): boolean {
 		let stamped = 0;
 		for (const [path, meta] of Object.entries(this.remoteIndex.files)) {
-			if (typeof meta.remoteMtime === "number") continue;
-			if (meta.deleted) continue;
+			if (typeof meta.remoteMtime === "number") {
+				continue;
+			}
+			if (meta.deleted) {
+				continue;
+			}
 			const live = remoteFiles.get(path);
-			if (!live) continue;
-			if (typeof live.remoteMtime !== "number") continue;
+			if (!live) {
+				continue;
+			}
+			if (typeof live.remoteMtime !== "number") {
+				continue;
+			}
 			setRecordValue(this.remoteIndex.files, path, {
 				...meta,
 				remoteMtime: live.remoteMtime,
@@ -1808,8 +2058,7 @@ export class IndexManager {
 		baseRevision = this.loadedRemoteIndex.revision,
 		mutationSeq?: number,
 	): void {
-		const meta =
-			this.remoteIndex.files[path] ||
+		const meta = this.remoteIndex.files[path] ||
 			this.localState.files[path] || {
 				path,
 				sha256: "",
@@ -1818,7 +2067,9 @@ export class IndexManager {
 				syncedAt: 0,
 			};
 		setRecordValue(this.remoteIndex.files, path, meta);
-		if (meta.deleted) return;
+		if (meta.deleted) {
+			return;
+		}
 		if (mutationSeq === undefined) {
 			throw new Error(
 				`A live canonical entry cannot be deleted without a mutation sequence: ${path}`,
@@ -1839,10 +2090,15 @@ export class IndexManager {
 	): void {
 		const tombstone = this.remoteIndex.folderTombstones[folderPath];
 		if (!tombstone) {
-			throw new Error(`Canonical folder tombstone is missing: ${folderPath}`);
+			throw new Error(
+				`Canonical folder tombstone is missing: ${folderPath}`,
+			);
 		}
-		const meta = this.remoteIndex.files[path] ?? this.localState.files[path];
-		if (!meta || meta.deleted) return;
+		const meta =
+			this.remoteIndex.files[path] ?? this.localState.files[path];
+		if (!meta || meta.deleted) {
+			return;
+		}
 		setRecordValue(this.remoteIndex.files, path, {
 			...meta,
 			deleted: true,
@@ -1872,7 +2128,11 @@ export class IndexManager {
 			lastModifiedBy: this.settings.deviceId,
 			mutationSeq,
 		};
-		setRecordValue(this.remoteIndex.folderTombstones, normalized, tombstone);
+		setRecordValue(
+			this.remoteIndex.folderTombstones,
+			normalized,
+			tombstone,
+		);
 		setRecordValue(this.localState.folderTombstones, normalized, {
 			...tombstone,
 		});
@@ -1904,7 +2164,9 @@ export class IndexManager {
 	}
 
 	completeMove(id: string): void {
-		if (!this.remoteIndex.moves[id]) return;
+		if (!this.remoteIndex.moves[id]) {
+			return;
+		}
 		delete this.remoteIndex.moves[id];
 		this.completedMoveIds.add(id);
 	}
@@ -1940,7 +2202,9 @@ export class IndexManager {
 				rawResource.path,
 				this.settings.remotePath,
 			);
-			if (cleanupPaths.has(normalizePath(rawLocalPath))) continue;
+			if (cleanupPaths.has(normalizePath(rawLocalPath))) {
+				continue;
+			}
 			const resource =
 				await this.yandexClient.toLogicalResource(rawResource);
 
@@ -2037,8 +2301,12 @@ export class IndexManager {
 			}
 
 			const locks = await this.getIndexLocks();
-			if (locks.length === 0) return null;
-			if (this.replaceRemoteOnNextSave) return null;
+			if (locks.length === 0) {
+				return null;
+			}
+			if (this.replaceRemoteOnNextSave) {
+				return null;
+			}
 			if (locks.length > 1) {
 				throw new AmbiguousRemoteIndexLockError(
 					"Multiple remote index locks require an explicit force sync",
@@ -2061,8 +2329,7 @@ export class IndexManager {
 	}> {
 		const canonicalPath = this.getRemoteIndexPath();
 		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
-			const { resources, rootExists } =
-				await this.getStableRootListing();
+			const { resources, rootExists } = await this.getStableRootListing();
 			const canonical = resources.find(
 				(resource) =>
 					resource.type === "file" &&
@@ -2098,7 +2365,9 @@ export class IndexManager {
 
 	private async ensureCanonicalIndex(): Promise<void> {
 		const existing = await this.waitForCanonicalIndex();
-		if (existing) return;
+		if (existing) {
+			return;
+		}
 
 		const empty = createEmptyIndex("");
 		try {
@@ -2109,7 +2378,9 @@ export class IndexManager {
 				false,
 			);
 		} catch (e) {
-			if (!this.isLockContention(e)) throw e;
+			if (!this.isLockContention(e)) {
+				throw e;
+			}
 		}
 	}
 
@@ -2119,11 +2390,7 @@ export class IndexManager {
 		serviceOverride?: EncryptionCodec | null,
 	): Promise<SyncIndex> {
 		return (
-			await this.downloadIndexSnapshot(
-				path,
-				allowLegacy,
-				serviceOverride,
-			)
+			await this.downloadIndexSnapshot(path, allowLegacy, serviceOverride)
 		).index;
 	}
 
@@ -2184,19 +2451,16 @@ export class IndexManager {
 	): Promise<{ index: SyncIndex; codec: IndexCodec }> {
 		if (serviceOverride !== undefined) {
 			const codec =
-				codecLabel ??
-				(serviceOverride ? "current" : "plaintext");
+				codecLabel ?? (serviceOverride ? "current" : "plaintext");
 			const decoded = await this.tryDecodeIndexCodec(
 				raw,
 				serviceOverride,
 				codec,
 			);
 			if ("attempt" in decoded) {
-				throw await this.createUnreadableIndexError(
-					raw,
-					fingerprint,
-					[decoded.attempt],
-				);
+				throw await this.createUnreadableIndexError(raw, fingerprint, [
+					decoded.attempt,
+				]);
 			}
 			logger.debug("Decoded remote index snapshot", { codec });
 			return {
@@ -2239,7 +2503,10 @@ export class IndexManager {
 	): Promise<IndexCodecAttemptResult> {
 		let content: ArrayBuffer;
 		try {
-			content = await this.yandexClient.decodeServiceFileContent(raw, service);
+			content = await this.yandexClient.decodeServiceFileContent(
+				raw,
+				service,
+			);
 		} catch (error) {
 			return {
 				attempt: {
@@ -2252,7 +2519,9 @@ export class IndexManager {
 		try {
 			return { data: this.parseIndexJson(content) };
 		} catch (error) {
-			if (!(error instanceof SyntaxError)) throw error;
+			if (!(error instanceof SyntaxError)) {
+				throw error;
+			}
 			return {
 				attempt: {
 					codec,
@@ -2264,9 +2533,7 @@ export class IndexManager {
 	}
 
 	private parseIndexJson(content: ArrayBuffer): unknown {
-		return JSON.parse(
-			new TextDecoder().decode(content),
-		) as unknown;
+		return JSON.parse(new TextDecoder().decode(content)) as unknown;
 	}
 
 	private normalizeParsedIndex(
@@ -2332,9 +2599,7 @@ export class IndexManager {
 				"Legacy canonical data is not an exact stable 1.0/1.1 index",
 			);
 		}
-		const normalized = createEmptyIndex(
-			stable.deviceId,
-		);
+		const normalized = createEmptyIndex(stable.deviceId);
 		normalized.lastSyncTime = stable.lastSyncTime;
 		for (const [path, metadata] of Object.entries(stable.files)) {
 			setRecordValue(normalized.files, path, {
@@ -2409,6 +2674,38 @@ export class IndexManager {
 		const baseRevision = this.loadedRemoteIndex.revision;
 		const desiredMaintenance = this.remoteIndex.maintenance;
 		if (
+			this.loadedRemoteIndex.maintenance &&
+			!this.sameValue(
+				this.loadedRemoteIndex.maintenance,
+				latest.maintenance,
+			)
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Maintenance changed since it was observed",
+			);
+		}
+		if (this.targetRecoveryMaintenanceId !== null) {
+			if (
+				!this.isTargetRecoveryIndex(latest) ||
+				latest.epoch !== this.loadedRemoteIndex.epoch ||
+				(desiredMaintenance &&
+					desiredMaintenance.id !== this.targetRecoveryMaintenanceId)
+			) {
+				throw new RemoteIndexConcurrentModificationError(
+					"Target recovery authority changed before commit",
+				);
+			}
+			if (!this.sameValue(desiredMaintenance, latest.maintenance)) {
+				if (desiredMaintenance) {
+					merged.maintenance = this.cloneValue(desiredMaintenance);
+				} else {
+					delete merged.maintenance;
+				}
+				merged.revision = nextRevision;
+			}
+			return merged;
+		}
+		if (
 			desiredMaintenance?.phase === "prepared" &&
 			!this.sameValue(
 				desiredMaintenance,
@@ -2426,7 +2723,9 @@ export class IndexManager {
 
 		for (const [path, desired] of Object.entries(this.remoteIndex.files)) {
 			const baseline = this.loadedRemoteIndex.files[path];
-			if (this.sameValue(desired, baseline)) continue;
+			if (this.sameValue(desired, baseline)) {
+				continue;
+			}
 
 			const current = merged.files[path];
 			if (this.physicalRewriteOnNextSave) {
@@ -2520,9 +2819,7 @@ export class IndexManager {
 								: "conflict",
 						remoteFingerprint: desired.remoteFingerprint,
 						baselineSha256:
-							this.operationStore.findLatestPutBaselineSha(
-								path,
-							),
+							this.operationStore.findLatestPutBaselineSha(path),
 					});
 				}
 				logger.debug("File mutation reduced without logical write", {
@@ -2577,11 +2874,8 @@ export class IndexManager {
 				lastModifiedBy: this.settings.deviceId,
 				mutationSeq: tombstone.mutationSeq,
 			});
-			const mutationBase =
-				tombstone.baseRevision ?? baseRevision;
-			for (const [filePath, current] of Object.entries(
-				merged.files,
-			)) {
+			const mutationBase = tombstone.baseRevision ?? baseRevision;
+			for (const [filePath, current] of Object.entries(merged.files)) {
 				if (
 					!isPathInsideFolder(filePath, path) ||
 					!shouldPreserveConcurrentFolderChild(
@@ -2612,8 +2906,8 @@ export class IndexManager {
 				);
 			}
 			if (
-				(this.remoteIndex.appliedMutationSeq[move.lastModifiedBy] ?? 0) <
-				move.mutationSeq
+				(this.remoteIndex.appliedMutationSeq[move.lastModifiedBy] ??
+					0) < move.mutationSeq
 			) {
 				throw new InvalidCurrentIndexError(
 					"moves",
@@ -2629,7 +2923,9 @@ export class IndexManager {
 			changed = true;
 		}
 		for (const id of this.completedMoveIds) {
-			if (!merged.moves[id]) continue;
+			if (!merged.moves[id]) {
+				continue;
+			}
 			delete merged.moves[id];
 			changed = true;
 		}
@@ -2638,7 +2934,9 @@ export class IndexManager {
 			this.remoteIndex.appliedMutationSeq,
 		)) {
 			const current = merged.appliedMutationSeq[deviceId] || 0;
-			if (sequence <= current) continue;
+			if (sequence <= current) {
+				continue;
+			}
 			setRecordValue(merged.appliedMutationSeq, deviceId, sequence);
 			changed = true;
 		}
@@ -2682,7 +2980,9 @@ export class IndexManager {
 					offset,
 					true,
 				);
-				if (offset === 0) rootExists = root !== null;
+				if (offset === 0) {
+					rootExists = root !== null;
+				}
 				return {
 					items: root?._embedded?.items ?? [],
 					total: root?._embedded?.total ?? 0,
@@ -2738,7 +3038,9 @@ export class IndexManager {
 		knownLocks?: YandexResource[],
 	): Promise<void> {
 		const locks = knownLocks || (await this.getIndexLocks());
-		if (locks.length === 0) return;
+		if (locks.length === 0) {
+			return;
+		}
 		if (locks.length > 1) {
 			throw new AmbiguousRemoteIndexLockError(
 				"Multiple remote index locks require an explicit force sync",
@@ -2746,12 +3048,11 @@ export class IndexManager {
 		}
 
 		for (const resource of locks) {
-			if (!this.isObservedLockStale(resource)) continue;
+			if (!this.isObservedLockStale(resource)) {
+				continue;
+			}
 
-			const lockPath = joinPath(
-				this.settings.remotePath,
-				resource.name,
-			);
+			const lockPath = joinPath(this.settings.remotePath, resource.name);
 			await this.assertStaleLockReadable(lockPath);
 			try {
 				await this.yandexClient.moveResourceExclusive(
@@ -2762,7 +3063,9 @@ export class IndexManager {
 				logger.warn(`Recovered stale index lock: ${resource.name}`);
 				return;
 			} catch (e) {
-				if (!this.isLockContention(e)) throw e;
+				if (!this.isLockContention(e)) {
+					throw e;
+				}
 			}
 		}
 	}
@@ -2810,7 +3113,9 @@ export class IndexManager {
 			);
 		}
 		for (const resource of locks) {
-			if (!this.isObservedLockStale(resource)) continue;
+			if (!this.isObservedLockStale(resource)) {
+				continue;
+			}
 			const canonical = await this.downloadIndex(
 				this.getRemoteIndexPath(),
 				this.allowLegacyWriteOnce,
@@ -2851,12 +3156,7 @@ export class IndexManager {
 		try {
 			const [lock, canonical] = await Promise.all([
 				this.yandexClient.getResource(lockPath, 1, 0, true),
-				this.yandexClient.getResource(
-					canonicalPath,
-					1,
-					0,
-					true,
-				),
+				this.yandexClient.getResource(canonicalPath, 1, 0, true),
 			]);
 			return lock !== null && canonical === null;
 		} catch {
@@ -2964,10 +3264,7 @@ export class IndexManager {
 				);
 				return "committed";
 			} catch (error) {
-				if (
-					error instanceof
-					RemoteIndexConcurrentModificationError
-				) {
+				if (error instanceof RemoteIndexConcurrentModificationError) {
 					return "concurrent";
 				}
 				return "ambiguous";
@@ -2998,9 +3295,8 @@ export class IndexManager {
 			logger.debug("Canonical commit verified from content hash", {
 				commitVerification: "hash-fast",
 				canonicalRevision: expected.revision,
-				canonicalFingerprint: shortenDiagnosticValue(
-					expectedFingerprint,
-				),
+				canonicalFingerprint:
+					shortenDiagnosticValue(expectedFingerprint),
 			});
 			return this.createCanonicalCommitProof(
 				expected,
@@ -3136,7 +3432,9 @@ export class IndexManager {
 					);
 				},
 			);
-			if (outcome !== "rolled-back") return outcome;
+			if (outcome !== "rolled-back") {
+				return outcome;
+			}
 			logger.warn("Canonical index transaction rolled back", {
 				...context,
 				outcome: "rolled-back",
@@ -3166,7 +3464,9 @@ export class IndexManager {
 		this.allowLegacyWriteOnce = false;
 		const replacedRemote = this.replaceRemoteOnNextSave;
 		this.replaceRemoteOnNextSave = false;
-		if (!replacedRemote) return;
+		if (!replacedRemote) {
+			return;
+		}
 
 		this.finalizeForceEpoch(merged);
 		try {
@@ -3195,7 +3495,9 @@ export class IndexManager {
 			const actualValue = stableSerialize(
 				(actual as unknown as Record<string, unknown>)[key],
 			);
-			if (expectedValue === actualValue) continue;
+			if (expectedValue === actualValue) {
+				continue;
+			}
 			const [expectedHash, actualHash] = await Promise.all([
 				computeSha256FromString(expectedValue),
 				computeSha256FromString(actualValue),
@@ -3243,7 +3545,46 @@ export class IndexManager {
 			.slice(2, 10)}`;
 	}
 
+	private isTargetRecoveryIndex(index: SyncIndex): boolean {
+		const maintenance = index.maintenance;
+		return (
+			this.targetRecoveryMaintenanceId !== null &&
+			maintenance?.id === this.targetRecoveryMaintenanceId &&
+			maintenance.targetRevision !== null &&
+			["index-committed", "cleanup", "stable"].includes(maintenance.phase)
+		);
+	}
+
+	/** Re-read cleanup ownership independently of physical content identity. */
+	async assertMaintenanceAuthority(
+		epoch: string,
+		expected: IndexMaintenance,
+	): Promise<SyncIndex> {
+		const current = await this.readCanonicalIndex();
+		const maintenance = current.maintenance;
+		if (
+			current.epoch !== epoch ||
+			!maintenance ||
+			maintenance.id !== expected.id ||
+			maintenance.kind !== expected.kind ||
+			maintenance.initiatedBy !== expected.initiatedBy ||
+			maintenance.sourceRevision !== expected.sourceRevision ||
+			maintenance.targetRevision !== expected.targetRevision ||
+			!this.sameValue(maintenance.source, expected.source) ||
+			!this.sameValue(maintenance.target, expected.target) ||
+			maintenance.phase !== expected.phase
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Encryption cleanup authority changed",
+			);
+		}
+		return current;
+	}
+
 	private assertEpochCompatible(index: SyncIndex): void {
+		if (this.isTargetRecoveryIndex(index)) {
+			return;
+		}
 		const observedEpoch = this.localState.observedEpoch;
 		if (
 			observedEpoch &&
@@ -3351,8 +3692,12 @@ export class IndexManager {
 			0,
 			true,
 		);
-		if (token === "absent") return resource === null;
-		if (!resource) return false;
+		if (token === "absent") {
+			return resource === null;
+		}
+		if (!resource) {
+			return false;
+		}
 		const fingerprint = this.yandexClient.getContentFingerprint(resource);
 		if (!fingerprint) {
 			const current = await this.downloadEncryptionManifestForGuard();
@@ -3492,19 +3837,21 @@ export class IndexManager {
 		if (transition) {
 			const invalidModes =
 				(state === "enabling" &&
-					(transition.source.enabled || !transition.target.enabled)) ||
+					(transition.source.enabled ||
+						!transition.target.enabled)) ||
 				(state === "disabling" &&
-					(!transition.source.enabled || transition.target.enabled)) ||
+					(!transition.source.enabled ||
+						transition.target.enabled)) ||
 				(state === "rotating" &&
 					(!transition.source.enabled ||
 						!transition.target.enabled ||
 						(transition.target.revision ?? 0) <=
 							(transition.source.revision ?? 0) ||
 						transition.target.salt === transition.source.salt ||
-						transition.target.verifier === transition.source.verifier));
-			const declared = state === "disabling"
-				? transition.source
-				: transition.target;
+						transition.target.verifier ===
+							transition.source.verifier));
+			const declared =
+				state === "disabling" ? transition.source : transition.target;
 			if (
 				invalidModes ||
 				updatedBy !== transition.initiatedBy ||
@@ -3617,7 +3964,9 @@ export class IndexManager {
 	private parseEncryptionTransition(
 		value: unknown,
 	): EncryptionTransitionDescriptor | undefined {
-		if (value === undefined) return undefined;
+		if (value === undefined) {
+			return undefined;
+		}
 		if (!value || typeof value !== "object") {
 			throw new Error("Invalid encryption manifest: invalid transition");
 		}
@@ -3673,7 +4022,9 @@ export class IndexManager {
 			source.revision !== data.sourceRevision ||
 			target.revision !== data.targetRevision
 		) {
-			throw new Error("Invalid encryption manifest: profile/mode mismatch");
+			throw new Error(
+				"Invalid encryption manifest: profile/mode mismatch",
+			);
 		}
 		return {
 			id: data.id,
@@ -3691,8 +4042,12 @@ export class IndexManager {
 	private parseEncryptionProfileId(
 		value: unknown,
 	): EncryptionTransitionDescriptor["sourceProfileId"] {
-		if (value === null) return null;
-		if (value === "hardened") return value;
+		if (value === null) {
+			return null;
+		}
+		if (value === "hardened") {
+			return value;
+		}
 		throw new Error("Invalid encryption manifest: invalid profile ID");
 	}
 
@@ -3718,8 +4073,7 @@ export class IndexManager {
 				Number.isSafeInteger(descriptor.revision)
 			) ||
 			!(
-				descriptor.salt === null ||
-				typeof descriptor.salt === "string"
+				descriptor.salt === null || typeof descriptor.salt === "string"
 			) ||
 			!(
 				descriptor.verifier === null ||
@@ -3743,7 +4097,12 @@ export class IndexManager {
 					"Invalid encryption manifest: invalid encrypted mode descriptor",
 				);
 			}
-			this.assertManifestBase64(descriptor.salt, 16, 16, "transition salt");
+			this.assertManifestBase64(
+				descriptor.salt,
+				16,
+				16,
+				"transition salt",
+			);
 			this.assertManifestBase64(
 				descriptor.verifier,
 				28,
@@ -3805,14 +4164,20 @@ export class IndexManager {
 function isTransientIndexCause(error: unknown): boolean {
 	const semantic = findErrorCause(
 		error,
-		(candidate): candidate is IndexEpochMismatchError | RemoteMaintenanceActiveError =>
+		(
+			candidate,
+		): candidate is
+			IndexEpochMismatchError | RemoteMaintenanceActiveError =>
 			candidate instanceof IndexEpochMismatchError ||
 			candidate instanceof RemoteMaintenanceActiveError,
 	);
-	if (semantic) return false;
+	if (semantic) {
+		return false;
+	}
 	const apiError = findErrorCause(
 		error,
-		(candidate): candidate is YandexApiError => candidate instanceof YandexApiError,
+		(candidate): candidate is YandexApiError =>
+			candidate instanceof YandexApiError,
 	);
 	if (apiError) {
 		return [409, 423, 429, 503].includes(apiError.status);
@@ -3883,14 +4248,18 @@ export class ForceBackupStaleError extends Error {
 
 export class ForceSourceChangedError extends Error {
 	constructor() {
-		super("Force source changed after verification; create a new backup and retry");
+		super(
+			"Force source changed after verification; create a new backup and retry",
+		);
 		this.name = "ForceSourceChangedError";
 	}
 }
 
 export class PortablePathCollisionError extends Error {
 	constructor() {
-		super("Remote paths collide under Unicode normalization or case folding");
+		super(
+			"Remote paths collide under Unicode normalization or case folding",
+		);
 		this.name = "PortablePathCollisionError";
 	}
 }

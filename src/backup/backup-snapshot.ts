@@ -1,10 +1,7 @@
 import type { YandexDiskClient } from "../api/yandex-client";
 import type { VaultAdapter } from "../api/vault-adapter";
 import { computeSha256, computeSha256FromString } from "../utils/hash-utils";
-import {
-	isLegacyPluginDataPath,
-	toLocalPath,
-} from "../utils/path-utils";
+import { isLegacyPluginDataPath, toLocalPath } from "../utils/path-utils";
 
 export interface BackupSnapshotFile {
 	path: string;
@@ -22,8 +19,8 @@ export async function captureLogicalVaultSnapshot(
 	vaultAdapter: VaultAdapter,
 ): Promise<BackupSnapshot> {
 	const files: BackupSnapshotFile[] = [];
-	for (const file of [...vaultAdapter.getAllSyncableFiles()].sort((left, right) =>
-		left.path.localeCompare(right.path),
+	for (const file of [...vaultAdapter.getAllSyncableFiles()].sort(
+		(left, right) => left.path.localeCompare(right.path),
 	)) {
 		files.push({
 			path: file.path,
@@ -38,7 +35,10 @@ export async function captureRemoteRawSnapshot(
 	yandexClient: YandexDiskClient,
 	remotePath: string,
 ): Promise<BackupSnapshot> {
-	const resources = await yandexClient.getResourcesRecursive(remotePath, true);
+	const resources = await yandexClient.getResourcesRecursive(
+		remotePath,
+		true,
+	);
 	if (
 		resources.some((resource) =>
 			isLegacyPluginDataPath(toLocalPath(resource.path, remotePath)),
@@ -50,7 +50,9 @@ export async function captureRemoteRawSnapshot(
 	}
 	const remoteFiles = resources
 		.filter((resource) => {
-			if (resource.type !== "file") return false;
+			if (resource.type !== "file") {
+				return false;
+			}
 			const relative = toLocalPath(resource.path, remotePath);
 			return relative !== ".backup" && !relative.startsWith(".backup/");
 		})

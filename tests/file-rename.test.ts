@@ -1,14 +1,16 @@
+import * as syncReconciliation from "../src/sync/reconciliation/commits";
+import * as fullSync from "../src/sync/workflows/full";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { App } from "obsidian";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import { SyncEngine } from "../src/sync/sync-engine";
-import { ConflictResolver } from "../src/sync/conflict-resolver";
-import { FileWatcher } from "../src/sync/file-watcher";
-import type { RealtimeFileEvent } from "../src/sync/realtime-rules";
-import type { IndexManager } from "../src/sync/index-manager";
-import { LocalOperationStore } from "../src/sync/local-operation-store";
+import { SyncEngine } from "../src/sync/engine";
+import { ConflictResolver } from "../src/sync/reconciliation/conflicts";
+import { FileWatcher } from "../src/sync/realtime/watcher";
+import type { RealtimeFileEvent } from "../src/sync/realtime/rules";
+import type { IndexManager } from "../src/sync/canonical/manager";
+import { LocalOperationStore } from "../src/sync/local/operation-store";
 import { computeSha256 } from "../src/utils/hash-utils";
 import {
 	createEmptyIndex,
@@ -34,7 +36,9 @@ class RenameVaultFake {
 
 	async readFile(path: string) {
 		const content = this.files.get(path);
-		if (!content) throw new Error(`Missing local file: ${path}`);
+		if (!content) {
+			throw new Error(`Missing local file: ${path}`);
+		}
 		return content.slice(0);
 	}
 
@@ -73,13 +77,17 @@ class RenameYandexFake {
 
 	async downloadFile(path: string) {
 		const resource = this.resources.get(path);
-		if (!resource) throw new Error(`Missing remote file: ${path}`);
+		if (!resource) {
+			throw new Error(`Missing remote file: ${path}`);
+		}
 		return resource.content.slice(0);
 	}
 
 	async getLogicalResource(path: string) {
 		const resource = this.resources.get(path);
-		if (!resource) return null;
+		if (!resource) {
+			return null;
+		}
 		return {
 			name: path.split("/").pop() ?? path,
 			path,
@@ -92,7 +100,9 @@ class RenameYandexFake {
 
 	async moveResource(from: string, to: string) {
 		const source = this.resources.get(from);
-		if (!source) throw new Error(`Missing remote move source: ${from}`);
+		if (!source) {
+			throw new Error(`Missing remote move source: ${from}`);
+		}
 		if (this.resources.has(to)) {
 			throw new Error(`Remote move target exists: ${to}`);
 		}
@@ -175,11 +185,7 @@ class RenameIndexFake {
 		);
 	}
 
-	retargetPendingPut(
-		oldPath: string,
-		newPath: string,
-		sha256: string,
-	) {
+	retargetPendingPut(oldPath: string, newPath: string, sha256: string) {
 		return this.store.retargetLatestPut(oldPath, newPath, sha256);
 	}
 
@@ -230,12 +236,16 @@ class RenameIndexFake {
 
 	markLocalFileDeleted(path: string) {
 		const metadata = this.local.files[path];
-		if (metadata) metadata.deleted = true;
+		if (metadata) {
+			metadata.deleted = true;
+		}
 	}
 
 	markRemoteFileDeleted(path: string) {
 		const metadata = this.index.files[path];
-		if (metadata) metadata.deleted = true;
+		if (metadata) {
+			metadata.deleted = true;
+		}
 	}
 
 	recordMove(
@@ -277,7 +287,10 @@ class RenameIndexFake {
 		);
 	}
 
-	getPendingPhysicalAction(type: PendingPhysicalAction["type"], path: string) {
+	getPendingPhysicalAction(
+		type: PendingPhysicalAction["type"],
+		path: string,
+	) {
 		return this.store.findPhysicalAction(type, path);
 	}
 
@@ -291,6 +304,13 @@ class RenameIndexFake {
 
 	consumeRejectedPuts() {
 		return [];
+	}
+
+	async refreshCanonicalForMutation() {
+		return await this.readCanonicalIndex();
+	}
+	confirmAppliedMutations() {
+		this.store.confirmAppliedMutations(this.index.appliedMutationSeq);
 	}
 
 	async saveRemoteIndex() {
@@ -338,7 +358,12 @@ function createRenameEngine(
 		yandex as unknown as YandexDiskClient,
 		vault as unknown as VaultAdapter,
 		index as unknown as IndexManager,
-		{ ...DEFAULT_SETTINGS, deviceId: "device-a", remotePath: "remote", enableEncryption: encrypted },
+		{
+			...DEFAULT_SETTINGS,
+			deviceId: "device-a",
+			remotePath: "remote",
+			enableEncryption: encrypted,
+		},
 	);
 }
 
@@ -378,17 +403,12 @@ test("foreign delete after commit cancels proof-based physical repair", async ()
 	};
 	const engine = createRenameEngine(yandex, vault, index);
 
-	await (
-		engine as unknown as {
-			repairMissingAcceptedUploads(
-				items: Array<{
-					path: string;
-					snapshot: { content: ArrayBuffer; sha256: string };
-				}>,
-				commitProof: typeof proof,
-			): Promise<void>;
-		}
-	).repairMissingAcceptedUploads(
+	await syncReconciliation.repairMissingAcceptedUploads(
+		(
+			engine as unknown as {
+				syncReconciliationDependencies(): syncReconciliation.Dependencies;
+			}
+		).syncReconciliationDependencies(),
 		[{ path: "note.md", snapshot: { content: fileContent, sha256 } }],
 		proof,
 	);
@@ -427,18 +447,12 @@ test("encryption change blocks proof-based physical repair", async () => {
 	}));
 
 	await assert.rejects(
-		(
-			engine as unknown as {
-				repairMissingAcceptedUploads(
-					items: Array<{
-						path: string;
-						snapshot: { content: ArrayBuffer; sha256: string };
-					}>,
-					commitProof: typeof proof,
-					validationToken: string,
-				): Promise<void>;
-			}
-		).repairMissingAcceptedUploads(
+		syncReconciliation.repairMissingAcceptedUploads(
+			(
+				engine as unknown as {
+					syncReconciliationDependencies(): syncReconciliation.Dependencies;
+				}
+			).syncReconciliationDependencies(),
 			[{ path: "note.md", snapshot: { content: fileContent, sha256 } }],
 			proof,
 			"old-manifest",
@@ -476,7 +490,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		});
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 
 		await engine.renameFile("A.md", "deep/Б.md", {
 			epoch: "epoch-a",
@@ -488,10 +507,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		assert.equal(index.index.files["A.md"], undefined);
 		assert.equal(index.index.moves[original.id], undefined);
 		assert.deepEqual(index.getPendingMutations(), []);
-		assert.equal(
-			index.index.appliedMutationSeq["device-a"],
-			original.seq,
-		);
+		assert.equal(index.index.appliedMutationSeq["device-a"], original.seq);
 		const confirmed = index.local.files["deep/Б.md"];
 		assert.ok(confirmed);
 		assert.equal(
@@ -526,12 +542,13 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		});
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
-		const watcher = new FileWatcher(
-			{} as App,
-			engine,
-			DEFAULT_SETTINGS,
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
 		);
+		const watcher = new FileWatcher({} as App, engine, DEFAULT_SETTINGS);
 		watcher.setPersistCallback(async () => {});
 		watcher.loadDeferredEvents([
 			{
@@ -577,12 +594,13 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const targetContent = content("final-target");
 		vault.files.set("A.md", sourceContent);
 		const index = new RenameIndexFake(yandex);
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
-		const watcher = new FileWatcher(
-			{} as App,
-			engine,
-			DEFAULT_SETTINGS,
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
 		);
+		const watcher = new FileWatcher({} as App, engine, DEFAULT_SETTINGS);
 		watcher.setPersistCallback(async () => {});
 		watcher.loadDeferredEvents([
 			{
@@ -663,7 +681,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const targetContent = content("target");
 		vault.files.set("A.md", sourceContent);
 		const index = new RenameIndexFake(yandex);
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 		const event: RealtimeFileEvent = {
 			id: "upload-a",
 			action: "upload" as const,
@@ -720,7 +743,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			remoteFingerprint: sourceSha,
 			lastModifiedBy: "device-a",
 		};
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 		const event: RealtimeFileEvent = {
 			id: "upload-a",
 			action: "upload",
@@ -767,7 +795,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			lastModifiedBy: "device-a",
 			mutationSeq: 7,
 		};
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 
 		const replay = await engine.syncFileBatch([
 			{
@@ -793,7 +826,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const vault = new RenameVaultFake();
 		vault.files.set("A.md", content("source"));
 		const index = new RenameIndexFake(yandex);
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 		const event: RealtimeFileEvent = {
 			id: "upload-a",
 			action: "upload",
@@ -826,7 +864,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		});
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 
 		const batch = await engine.syncFileBatch([
 			{
@@ -881,7 +924,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			mtime: 1,
 			syncedAt: 1,
 		};
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 
 		await engine.renameFile("A.md", "B.md", {
 			epoch: "epoch-a",
@@ -915,7 +963,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		};
 		index.index.files["A.md"] = { ...baseline };
 		index.local.files["A.md"] = { ...baseline };
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 
 		await engine.renameFile("A.md", "deep/B.md", {
 			epoch: "epoch-a",
@@ -960,7 +1013,12 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		};
 		index.index.files["A.md"] = { ...baseline };
 		index.local.files["A.md"] = { ...baseline };
-		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
+		const engine = createRenameEngine(
+			yandex,
+			vault,
+			index,
+			mode === "encrypted",
+		);
 
 		await engine.renameFile("A.md", "deep/B.md", {
 			epoch: "epoch-a",
@@ -970,10 +1028,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		assert.deepEqual(yandex.uploads, ["remote/deep/B.md"]);
 		assert.deepEqual(yandex.moves, []);
 		assert.equal(yandex.resources.has("remote/A.md"), false);
-		assert.equal(
-			yandex.resources.get("remote/deep/B.md")?.sha256,
-			newSha,
-		);
+		assert.equal(yandex.resources.get("remote/deep/B.md")?.sha256, newSha);
 		assert.deepEqual(index.index.moves, {});
 		assert.deepEqual(index.getPendingPhysicalActions(), []);
 	});
@@ -1030,14 +1085,15 @@ test("missing move target is materialized and completed", async () => {
 	const engine = createRenameEngine(yandex, vault, index);
 	const recoveryResult = result();
 
-	await (
-		engine as unknown as {
-			resumePendingMoves(
-				syncResult: SyncResult,
-				reportUnresolved: boolean,
-			): Promise<void>;
-		}
-	).resumePendingMoves(recoveryResult, true);
+	await syncReconciliation.resumePendingMoves(
+		(
+			engine as unknown as {
+				syncReconciliationDependencies(): syncReconciliation.Dependencies;
+			}
+		).syncReconciliationDependencies(),
+		recoveryResult,
+		true,
+	);
 
 	assert.deepEqual(yandex.uploads, ["remote/folder/B.md"]);
 	assert.equal(yandex.resources.has("remote/A.md"), false);
@@ -1295,10 +1351,7 @@ test("different physical target is not overwritten by rename", async () => {
 		/Move target already exists/,
 	);
 
-	assert.equal(
-		yandex.resources.get("remote/B.md")?.sha256,
-		concurrentSha,
-	);
+	assert.equal(yandex.resources.get("remote/B.md")?.sha256, concurrentSha);
 	assert.equal(yandex.resources.has("remote/A.md"), true);
 	assert.equal(Object.keys(index.index.moves).length, 1);
 	assert.equal(index.getPendingPhysicalActions().length, 1);
@@ -1334,14 +1387,15 @@ test("unresolved final move recovery records a full-sync error", async () => {
 	const engine = createRenameEngine(yandex, vault, index);
 	const recoveryResult = result();
 
-	await (
-		engine as unknown as {
-			resumePendingMoves(
-				syncResult: SyncResult,
-				reportUnresolved: boolean,
-			): Promise<void>;
-		}
-	).resumePendingMoves(recoveryResult, true);
+	await syncReconciliation.resumePendingMoves(
+		(
+			engine as unknown as {
+				syncReconciliationDependencies(): syncReconciliation.Dependencies;
+			}
+		).syncReconciliationDependencies(),
+		recoveryResult,
+		true,
+	);
 
 	assert.equal(recoveryResult.errors.length, 1);
 	assert.match(recoveryResult.errors[0]?.message ?? "", /Pending move/);
@@ -1379,15 +1433,13 @@ test("full sync settles accepted and superseded puts through one watermark", () 
 	});
 	const engine = createRenameEngine(yandex, vault, index);
 
-	const settlement = (
-		engine as unknown as {
-			settleFullSyncPendingPuts(): {
-				pendingWatermarks: number;
-				matchingPuts: number;
-				noopPuts: number;
-			};
-		}
-	).settleFullSyncPendingPuts();
+	const settlement = fullSync.settleFullSyncPendingPuts(
+		(
+			engine as unknown as {
+				fullSyncDependencies(): fullSync.Dependencies;
+			}
+		).fullSyncDependencies(),
+	);
 
 	assert.deepEqual(settlement, {
 		pendingWatermarks: 2,

@@ -30,22 +30,26 @@ export class EncryptionManager {
 		validateAuthority(): Promise<T>;
 		persist(authority: T): Promise<void>;
 	}): Promise<T | null> {
-		if (!options.service) return null;
+		if (!options.service) {
+			return null;
+		}
 		let authenticated = false;
 		try {
-			authenticated = await options.service.verifyVerifier(options.verifier);
+			authenticated = await options.service.verifyVerifier(
+				options.verifier,
+			);
 		} catch {
 			authenticated = false;
 		}
-		if (!authenticated) return null;
+		if (!authenticated) {
+			return null;
+		}
 		const authority = await options.validateAuthority();
 		await options.persist(authority);
 		return authority;
 	}
 
-	getManifestProfileId(
-		manifest: EncryptionManifest,
-	): EncryptionProfileId {
+	getManifestProfileId(manifest: EncryptionManifest): EncryptionProfileId {
 		return manifest.profileId;
 	}
 
@@ -147,13 +151,16 @@ export class EncryptionManager {
 		transition?: LocalEncryptionTransition;
 		maintenance?: IndexMaintenance;
 	}): Promise<EncryptionManifest> {
-		const { service, salt, state, revision, deviceId, transition } = options;
+		const { service, salt, state, revision, deviceId, transition } =
+			options;
 		if (service.profileId !== "hardened") {
 			throw new Error("Only hardened manifests can be written");
 		}
 		const maintenance = transition ? options.maintenance : undefined;
 		if (transition && !maintenance) {
-			throw new Error("Transition manifest requires canonical maintenance");
+			throw new Error(
+				"Transition manifest requires canonical maintenance",
+			);
 		}
 		if (transition && maintenance) {
 			const expectedState = {
@@ -166,7 +173,8 @@ export class EncryptionManager {
 				maintenance.id !== transition.id ||
 				maintenance.kind !== transition.kind ||
 				maintenance.initiatedBy !== deviceId ||
-				maintenance.sourceRevision !== transition.sourceCanonicalRevision ||
+				maintenance.sourceRevision !==
+					transition.sourceCanonicalRevision ||
 				!snapshotMatchesMode(transition.source, maintenance.source) ||
 				!snapshotMatchesMode(transition.target, maintenance.target)
 			) {
@@ -196,14 +204,17 @@ export class EncryptionManager {
 				!declaredMode.verifier ||
 				!verifierMatches
 			) {
-				throw new Error("Transition manifest service does not match its declared mode");
+				throw new Error(
+					"Transition manifest service does not match its declared mode",
+				);
 			}
 		}
 		const common = {
 			state,
 			revision,
 			salt,
-			verifier: declaredMode?.verifier ?? (await service.createVerifier()),
+			verifier:
+				declaredMode?.verifier ?? (await service.createVerifier()),
 			cipher: {
 				name: "AES-GCM" as const,
 				keyLength: AES_KEY_LENGTH,
@@ -248,7 +259,9 @@ export class EncryptionManager {
 function requireProfileId(
 	profileId: EncryptionProfileId | null,
 ): EncryptionProfileId {
-	if (!profileId) throw new Error("Encrypted snapshot requires a profile ID");
+	if (!profileId) {
+		throw new Error("Encrypted snapshot requires a profile ID");
+	}
 	return profileId;
 }
 

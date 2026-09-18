@@ -10,10 +10,7 @@ import {
 	type YandexDiskClient,
 } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import type {
-	YandexDiskSyncSettings,
-	YandexResource,
-} from "../src/types";
+import type { YandexDiskSyncSettings, YandexResource } from "../src/types";
 import { DEFAULT_SETTINGS } from "../src/types";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
 
@@ -58,13 +55,17 @@ class FakeBackupClient {
 		fingerprint: string;
 	} | null> {
 		const raw = this.files.get(path);
-		return raw ? { raw: raw.slice(0), fingerprint: `sha256:${raw.byteLength}` } : null;
+		return raw
+			? { raw: raw.slice(0), fingerprint: `sha256:${raw.byteLength}` }
+			: null;
 	}
 
 	async downloadFile(path: string): Promise<ArrayBuffer> {
 		this.downloadedPaths.push(path);
 		const value = this.files.get(path);
-		if (!value) throw new Error("missing backup");
+		if (!value) {
+			throw new Error("missing backup");
+		}
 		return value.slice(0);
 	}
 
@@ -76,7 +77,6 @@ class FakeBackupClient {
 	async getResourcesRecursive(): Promise<YandexResource[]> {
 		return this.resources.map((resource) => ({ ...resource }));
 	}
-
 }
 
 function createManager(
@@ -115,7 +115,10 @@ test("both Force backup directions report upload and readback before returning v
 	for (const remote of [false, true]) {
 		const client = new FakeBackupClient();
 		client.encrypted = false;
-		const { manager } = createManager(client, async () => new TextEncoder().encode("content").buffer);
+		const { manager } = createManager(
+			client,
+			async () => new TextEncoder().encode("content").buffer,
+		);
 		const phases: string[] = [];
 		const upload = client.uploadFileExclusive.bind(client);
 		client.uploadFileExclusive = async (path, bytes) => {
@@ -128,12 +131,41 @@ test("both Force backup directions report upload and readback before returning v
 			return await read(path);
 		};
 		const result = remote
-			? await manager.createRemoteSnapshotBackup(undefined, (phase) => phases.push(phase))
-			: await manager.createBackup(undefined, (phase) => phases.push(phase));
+			? await manager.createRemoteSnapshotBackup(undefined, (phase) =>
+					phases.push(phase),
+				)
+			: await manager.createBackup(undefined, (phase) =>
+					phases.push(phase),
+				);
 		assert.equal(result.success, true);
 		assert.ok(result.sha256);
-		assert.deepEqual(phases, ["creating-backup", "uploading-backup", "verifying-backup"]);
+		assert.deepEqual(phases, [
+			"creating-backup",
+			"uploading-backup",
+			"verifying-backup",
+		]);
 	}
+});
+
+test("backup retains its destination and encryption password across a settings update", async () => {
+	const client = new FakeBackupClient();
+	const { manager, settings } = createManager(client, async () => {
+		manager.updateSettings({
+			...settings,
+			remotePath: "other",
+			encryptionPassword: null,
+		});
+		client.encrypted = false;
+		return new TextEncoder().encode("synthetic note").buffer;
+	});
+	const result = await manager.createBackup();
+	assert.equal(result.success, true);
+	assert.equal(client.uploadedPaths.length, 1);
+	const path = client.uploadedPaths[0]!;
+	assert.ok(path.startsWith("vault/.backup/"));
+	assert.equal(isBackupEnvelope(client.files.get(path)!), true);
+	const opened = await manager.downloadBackup(path, "backup-password");
+	assert.equal(new Uint8Array(opened)[0], 0x50);
 });
 
 test("Force backup proof binds the exact logical and remote snapshots", async () => {
@@ -182,7 +214,10 @@ test("remote snapshot backup rejects legacy plugin data before download", async 
 			size: 8,
 		},
 	];
-	client.files.set(exposedPath, new TextEncoder().encode("do-not-read").buffer);
+	client.files.set(
+		exposedPath,
+		new TextEncoder().encode("do-not-read").buffer,
+	);
 	const { manager } = createManager(client);
 
 	const result = await manager.createRemoteSnapshotBackup();
@@ -322,10 +357,64 @@ test("unknown historical zip bytes fail closed without decryption fallback", asy
 	);
 	const { manager } = createManager(client);
 	await assert.rejects(
-		manager.downloadBackup(
-			"vault/.backup/backup_2026-08-20_10-00-00.zip",
-		),
+		manager.downloadBackup("vault/.backup/backup_2026-08-20_10-00-00.zip"),
 		UnsupportedHistoricalDataError,
 	);
 	assert.equal(client.decodeCalls, 0);
+});
+
+test("optional transition archive retains exact bytes and fails closed on source drift", async () => {
+	const client = new FakeBackupClient();
+	let content = "source";
+	const { manager } = createManager(
+		client,
+		async () => new TextEncoder().encode(content).buffer,
+	);
+	const canonical = { epoch: "E1", revision: 4 };
+	assert.equal(
+		await manager.createTransitionBackup(
+			"without-backup",
+			"target-password",
+			canonical,
+		),
+		null,
+	);
+	await assert.rejects(
+		manager.createTransitionBackup("cancel", "target-password", canonical),
+		/explicit backup choice/,
+	);
+	assert.equal(client.files.size, 0);
+	const proof = await manager.createTransitionBackup(
+		"with-backup",
+		"target-password",
+		canonical,
+	);
+	assert.ok(proof);
+	assert.equal(proof.epoch, "E1");
+	assert.equal(proof.canonicalRevision, 4);
+	const { computeSha256 } = await import("../src/utils/hash-utils");
+	assert.equal(
+		await computeSha256(client.files.get(proof.path)!),
+		proof.sha256,
+	);
+	const { openBackupEnvelope } =
+		await import("../src/backup/backup-envelope");
+	await assert.doesNotReject(
+		openBackupEnvelope(client.files.get(proof.path)!, "target-password"),
+	);
+	const read = client.downloadStableRawFile.bind(client);
+	client.downloadStableRawFile = async (path) => {
+		content = "late change";
+		return await read(path);
+	};
+	await assert.rejects(
+		manager.createTransitionBackup(
+			"with-backup",
+			"target-password",
+			canonical,
+		),
+		/Vault changed/,
+	);
+	assert.equal(client.files.size, 2);
+	assert.equal(content, "late change");
 });

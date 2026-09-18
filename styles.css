@@ -239,7 +239,9 @@
 }
 
 @keyframes encryption-spin {
-	to { transform: rotate(360deg); }
+	to {
+		transform: rotate(360deg);
+	}
 }
 
 .force-settings-controls {
@@ -267,5 +269,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.force-flow-active::before { animation: none; }
+	.force-flow-active::before {
+		animation: none;
+	}
 }

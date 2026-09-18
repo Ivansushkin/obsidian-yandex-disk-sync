@@ -35,7 +35,6 @@ TC-01–TC-07 без расширенного шифрования — окол�
 3. Второй full должен дать `0/0/0`, без conflict и index commit.
 4. Не должно быть старых, промежуточных и дублирующихся путей.
 5. В логах не должно оставаться:
-
    - `pendingWatcherEvents`;
    - `pendingMutations`;
    - `pendingPhysicalActions`;
@@ -103,7 +102,6 @@ TC-01–TC-07 без расширенного шифрования — окол�
 - Существует только `Путешествия/2026/Япония/Маршрут.md`.
 - Содержимое — `Токио — Киото`.
 - Не появились:
-
   - `Без названия.md`;
   - `Маршрут.md` в корне;
   - старая папка `Поездка`;
@@ -227,7 +225,6 @@ TC-01–TC-07 без расширенного шифрования — окол�
 
 1. Отключить сеть на Device 2.
 2. На Device 2:
-
    - изменить `Проект/changed.md`;
    - создать `Проект/new.md`.
 
@@ -294,9 +291,8 @@ TC-01–TC-07 без расширенного шифрования — окол�
 Отдельно на изолированной копии vault проверить загрузку local storage:
 
 1. Использовать plaintext stable 1.1 snapshot с дробным `mtime` и перезапустить
-   2.0.0. До Force проверить сохранение stable shape и точности timestamp после
-   изменения совместимой настройки и unload. После verified Force повторный
-   startup должен принять current local data и canonical.
+   2.0.0. Проверить немедленное сохранение current shape и точности timestamp до
+   автоматизации, после settings save и unload. Restart принимает current data.
 2. Подготовить заведомо нераспознаваемый snapshot без реальных credentials.
    После отказа startup и отключения плагина файл должен остаться неизменным;
    в диагностике допустимо только имя фиксированной секции схемы.
@@ -309,7 +305,7 @@ TC-01–TC-07 без расширенного шифрования — окол�
 2. Изменить защищаемый source snapshot либо canonical.
 3. Продолжить Force.
 4. Убедиться, что операция остановилась как stale до upload/delete/overwrite
-   и потребовала создать новый backup.
+   и потребовала новый запуск с повторным выбором архива.
 
 Отдельными fault-прогонами:
 
@@ -336,7 +332,7 @@ TC-01–TC-07 без расширенного шифрования — окол�
   повторной migration.
 - Повторный full обоих устройств — `0/0/0`.
 
-Покрывает: `INIT-028`, `INIT-030`, `INIT-031`, `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`,
+Покрывает: `INIT-022`, `FORCE-012`, `SAFE-009`, `FORCE-031`, `INIT-028`, `INIT-030`, `INIT-031`, `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`,
 `FORCE-017`, `FORCE-023`, `FORCE-024`, `FORCE-025`, `FORCE-026`,
 `FORCE-027`, `FORCE-028`, `FORCE-029`, `FORCE-030`,
 `MULTI-012`, `MIG-004`, `UI-006`.
@@ -350,42 +346,35 @@ conflict/backup-файлы, если они мешают проверке.
 
 ### Stable 1.0/1.1 plaintext boundary
 
-1. Подготовить plaintext `data.json` и canonical с `version: 2` из stable 1.1
-   на Device 1.
-2. Сохранить byte/JSON-снимок исходного `data.json`, обновить плагин и открыть
-   настройки без Force. Проверить, что на диске осталась stable-структура без
-   `format`, current queues и 2.0-only fields; 1.1 всё ещё может её прочитать.
-3. Проверить перенос settings, hashes и `localIndex` в in-memory unobserved
-   baseline; current queues должны быть пустыми.
-4. Проверить, что installation-scoped ID используется в памяти/local storage,
-   переживает перезапуск и отличается у второго профиля, но до cutover не
-   заменяет stable device ID внутри `data.json`.
-5. Запустить без token, с неверным token и после исправления. Baseline/lifecycle
-   должны загружаться всегда, но watcher/scheduler — только после успешной
-   read-only classification.
-6. Проверить, что Resume не снимает `migration-required` и normal sync
-   заблокирован инструкцией Force.
-7. Выполнить Force local с обязательным backup и получить canonical с
-   `format: "sync-index"`.
-8. Проверить, что current `plugin-data` появился только после повторной
-   проверки backup/canonical/source. Crash сразу после local cutover требует
-   новый backup, но продолжает migration из current local state.
-9. На Device 2 выполнить обычный Full, проверить его отдельный verified local
-   backup и принятие нового epoch.
-10. Повторить Force remote на отдельной копии stable vault.
+1. На двух независимых тестовых профилях подготовить synthetic plaintext stable
+   local data и canonical `version: 2`. После upgrade current `plugin-data`
+   должен сохраниться до автоматизации: settings/hashes/baseline перенесены,
+   installation ID устойчив к restart и отличается на другом профиле.
+2. Проверить отсутствие автоматического архива при загрузке/settings/unload.
+   Ошибка первоначального save блокирует sync и не ретраится unload.
+3. Без token и с неверным token lifecycle/baseline загружены, автоматизация
+   остановлена. Resume не обходит legacy/historical/auth/encryption blocks.
+4. Выполнить Force local с архивом и без него на отдельных snapshots, затем
+   Force remote в обоих вариантах. Получить current canonical с новым epoch.
+5. После каждого replacement второй профиль принимает epoch обычным full,
+   сохраняя offline edits по существующим conflict rules, без нового архива.
+6. Прервать Force до commit: новый запуск снова предлагает выбор архива. После
+   commit normal full завершает cleanup; повторный Force не требуется.
+7. С current canonical обычный full разрешён; с отсутствующим — initial sync;
+   с неподдерживаемым historical — все writes, включая Force, заблокированы.
 
 ### Stable config-directory exposure и paths
 
 1. При `syncDotObsidian=true` поместить на remote fixture metadata для
    `*/plugins/yandex-disk-sync/**`, не раскрывая содержимое.
 2. Убедиться, что migration блокируется без download этого object, полный path
-	не показывается и remote-raw backup не создаётся. Удалить remote plugin
-	directory, перезапустить plugin и убедиться, что non-secret remediation marker
-	по-прежнему блокирует Force со старым token; затем заменить OAuth token в
-	настройках и повторить read-only preflight.
+   не показывается и remote-raw backup не создаётся. Удалить remote plugin
+   directory, перезапустить plugin и убедиться, что non-secret remediation marker
+   по-прежнему блокирует Force со старым token; затем заменить OAuth token в
+   настройках и повторить read-only preflight.
 3. Отдельно проверить user path с current service name: требуется ручное
-	переименование, silent skip запрещён. Повторить для legacy имени с `\`, которое
-	current normalization преобразовало бы в другой logical path.
+   переименование, silent skip запрещён. Повторить для legacy имени с `\`, которое
+   current normalization преобразовало бы в другой logical path.
 4. Проверить корневой файл `__proto__`: он сохраняется при conversion/Force.
 5. Для Force remote проверить exact/NFC/case-fold collisions до local writes.
 
@@ -552,3 +541,76 @@ TC:
 Если хотя бы в одном тесте появляются старый путь, лишний файл, повторный
 conflict, Force-loop, неочищенная очередь или второй full не равен `0/0/0`,
 релиз следует блокировать.
+
+## TC-09. Конкурентные изменения и восстановление — PENDING
+
+Все пункты выполняются на реальном Yandex Disk с двумя независимыми профилями;
+применимые сценарии повторяются в plaintext и hardened encrypted режимах.
+
+1. Force local/remote и enable/disable/rotate: with-backup / without-backup /
+   cancel; при отказе нет ZIP/upload/readback фаз, но stale source/canonical
+   блокирует операцию. Ошибка выбранного архива не вызывает fallback/повтор.
+2. A: enable, пауза cleanup; B: завершение, затем disable; A: продолжение.
+   Даже одинаковые bytes нового plaintext объекта не разрешают старое удаление.
+   Повторить changed/missing fingerprint, timeout/202 и пустые папки.
+3. Crash после target commit, stable manifest, canonical cleanup и physical delete.
+   Другой профиль завершает recovery с target password; wrong password/Cancel
+   не сохраняют credentials и не пишут remote. Затем manifest перечитывается.
+4. B с E1 и offline edits завершает transition A после Force E2. До full adoption
+   старые baseline/queues неизменны, cleanup не публикует старые mutations.
+5. Приостановить download, затем create/edit локальный файл; повторить edit во
+   время protective backup. Старые remote bytes не перезаписывают правку;
+   следующий full сохраняет обе версии по conflict rules. Ошибка protective
+   backup по-прежнему блокирует перезапись.
+6. `Foo/a.md` + `foo/b.md`, NFC-варианты родителей, `folder` + `folder/note.md`,
+   локальная несинхронизируемая директория на месте remote файла: блок до local
+   writes. Exact updates, Unicode и `__proto__` продолжают работать.
+7. На паузах full/realtime/Force/maintenance изменить token/client/path/filters
+   через UI и программный settings workflow: live memory и persistence неизменны.
+   Внутренние baseline/queues сохраняются; после освобождения busy настройки доступны.
+8. Проверить один постоянный Notice, double click, reopen settings, отсутствие
+   backup-фаз без архива и success только после persistence/full/cleanup.
+9. Restore encrypted backup до/после rotate/disable, desktop/mobile, offline
+   return, crash/restart; в конце два full дают `0/0/0` без pending queues.
+
+Автоматические regression tests не переводят эти пункты в PASS.
+
+Покрывает: `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
+
+Дополнительные шаги TC-09:
+
+- Во время mkdir перед download создать файл назначения; повторить Force remote без
+  полного архива для файла без baseline. Проверить bytes protective copy и отсутствие
+  ошибочного baseline/suppression после отказа записи.
+- Изменить уже существующую conflict copy, затем повторить rejected-put recovery и
+  restart: обе версии сохранены, повтор не создаёт дополнительную копию.
+- После 503 перед повторным DELETE восстановить файл с другого профиля; отдельно
+  изменить move target/source и добавить excluded descendant в очищаемую папку.
+  Canonical live state и physical bytes сохраняются; pending не отображается успехом.
+- Отредактировать файл во время protective backup перед локальным trash. Проверить,
+  что сохранены новая local версия, прежняя backup-версия и durable action.
+- Сбой settings save, первый token, явная Pause, pending transition с заменой token,
+  изменение remotePath при durable queues. Проверить память и persisted snapshot,
+  отсутствие deadlock, full до realtime и отсутствие replay в другой destination.
+- На паузе создания ручного ZIP попытаться изменить настройки/codec и запустить Force.
+  Архив получает исходный пароль/папку. Закрыть список backup либо изменить конфигурацию
+  во время list/download/password prompt: устаревший результат не показывается.
+
+Новые смежные сценарии этого раздела также остаются PENDING до реального прогона.
+
+- Создать папку и вложенную папку, быстро скопировать несколько заметок, изменить и
+  переименовать их; переместить папку A → B → C и снова переименовать дочернюю заметку.
+  Повторить во время незавершённого upload, удалить одну копию и создать другую.
+  Сверить реальные bytes и конечные пути на Диске и втором профиле; промежуточных
+  файлов, fifo-gap и зависшей очереди быть не должно.
+- Потерять ответ после выполненного move; прервать commit rename, перезапустить
+  профиль с сохранённой очередью и копиями позади rename. Все события завершаются
+  без повторных имён; два последующих full дают 0/0/0.
+- После Force local на A вернуть B с offline edit удалённого пути. Повторить со
+  сбоем первого adoption commit и restart B. Проверить, что A скачал восстановленную
+  версию B, а не удалил её повторно. Повторить обычное delete → restore на B без Force.
+
+- На B создать и удалить target, пока A переименовывает в него source со старого
+  baseline. Во время protective backup на A изменить target: late bytes остаются
+  локально, операция показывает pending/retry. После restart/full late bytes доступны
+  в проверенной protective copy, tombstones не отменяются и очереди завершаются.

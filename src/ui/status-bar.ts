@@ -4,7 +4,7 @@
 
 import { setIcon } from "obsidian";
 import type { SyncState, SyncStatus } from "../types";
-import { SyncEngine } from "../sync/sync-engine";
+import { SyncEngine } from "../sync/engine";
 import { t } from "../i18n";
 
 export class SyncStatusBar {
@@ -62,7 +62,7 @@ export class SyncStatusBar {
 			"sync-offline",
 			"sync-initializing",
 			"sync-migration-required",
-			"sync-encryption-required"
+			"sync-encryption-required",
 		);
 		this.statusBarEl.addClass(`sync-${state.status}`);
 
@@ -103,7 +103,9 @@ export class SyncStatusBar {
 		switch (state.status) {
 			case "idle":
 				if (state.lastSyncTime) {
-					return t("status.last_sync", { time: this.formatTime(state.lastSyncTime) });
+					return t("status.last_sync", {
+						time: this.formatTime(state.lastSyncTime),
+					});
 				}
 				return t("status.ready_full");
 
@@ -153,7 +155,11 @@ export class SyncStatusBar {
 					);
 				}
 				if (state.currentOperation) {
-					lines.push(t("status.tooltip.syncing_current", { operation: state.currentOperation }));
+					lines.push(
+						t("status.tooltip.syncing_current", {
+							operation: state.currentOperation,
+						}),
+					);
 				}
 				if (state.progress) {
 					lines.push(
@@ -174,7 +180,11 @@ export class SyncStatusBar {
 			case "error":
 				lines.push(t("status.tooltip.error"));
 				if (state.errorMessage) {
-					lines.push(t("status.tooltip.error_details", { message: state.errorMessage }));
+					lines.push(
+						t("status.tooltip.error_details", {
+							message: state.errorMessage,
+						}),
+					);
 				}
 				break;
 			case "paused":
@@ -194,12 +204,18 @@ export class SyncStatusBar {
 				break;
 			case "migration-required":
 				lines.push(t("status.tooltip.migration_required"));
-				if (state.errorMessage) lines.push(state.errorMessage);
+				if (state.errorMessage) {
+					lines.push(state.errorMessage);
+				}
 				break;
 		}
 
 		if (state.lastSyncTime) {
-			lines.push(t("status.tooltip.last_sync", { datetime: this.formatDateTime(state.lastSyncTime) }));
+			lines.push(
+				t("status.tooltip.last_sync", {
+					datetime: this.formatDateTime(state.lastSyncTime),
+				}),
+			);
 		}
 
 		return lines.join("\n");
@@ -243,6 +259,8 @@ export class SyncStatusBar {
 /** Format one sync activity consistently for the status bar and Notice. */
 export function formatSyncActivity(state: SyncState): string {
 	const operation = state.currentOperation ?? t("status.syncing");
-	if (!state.progress || state.progress.total <= 0) return operation;
+	if (!state.progress || state.progress.total <= 0) {
+		return operation;
+	}
 	return `${operation} ${state.progress.completed}/${state.progress.total}`;
 }
