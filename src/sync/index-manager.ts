@@ -44,6 +44,7 @@ import {
 } from "../utils/record-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
 import { findErrorCause } from "../utils/error-utils";
+import { isFileModificationTime } from "../utils/timestamp-utils";
 import {
 	computeSha256,
 	computeSha256FromString,
@@ -256,7 +257,7 @@ function validateCurrentIndexShape(data: JsonRecord): asserts data is JsonRecord
 		assertIndexSection(raw.path === path, "files", "metadata path must match its key");
 		assertIndexSection(typeof raw.sha256 === "string", "files", "sha256 must be a string");
 		assertIndexSection(isNonNegativeInteger(raw.size), "files", "size must be a non-negative integer");
-		assertIndexSection(isNonNegativeInteger(raw.mtime), "files", "mtime must be a non-negative integer");
+		assertIndexSection(isFileModificationTime(raw.mtime), "files", "mtime must be a finite non-negative timestamp");
 		assertIndexSection(isNonNegativeInteger(raw.syncedAt), "files", "syncedAt must be a non-negative integer");
 		assertIndexSection(isOptionalNonNegativeInteger(raw.remoteMtime), "files", "remoteMtime must be a non-negative integer");
 		assertIndexSection(isOptionalString(raw.remoteFingerprint), "files", "remoteFingerprint must be a string");

@@ -186,26 +186,17 @@ test("folder tombstone lookup scales with path depth, not history size", () => {
 	assert.equal(reads, 3);
 });
 
-test("exact deletion wins over a concurrent put", () => {
-	const currentDelete = file("note.md", {
-		deleted: true,
-		changedRevision: 6,
-	});
-	assert.equal(
-		shouldApplyFileMutation(currentDelete, file("note.md"), 5),
-		false,
-	);
-});
-
-test("put after observing deletion restores the file", () => {
-	const currentDelete = file("note.md", {
-		deleted: true,
-		changedRevision: 6,
-	});
-	assert.equal(
-		shouldApplyFileMutation(currentDelete, file("note.md"), 6),
-		true,
-	);
+test("exact deletion wins concurrent puts but permits causally later restoration", () => {
+	const deleted = file("note.md", { deleted: true, changedRevision: 6 });
+	const cases = [
+		{ label: "stale put", current: deleted, incoming: file("note.md"), base: 5, expected: false },
+		{ label: "observed deletion", current: deleted, incoming: file("note.md"), base: 6, expected: true },
+		{ label: "concurrent delete", current: file("note.md", { changedRevision: 8 }),
+			incoming: file("note.md", { deleted: true }), base: 5, expected: true },
+	];
+	for (const { label, current, incoming, base, expected } of cases) {
+		assert.equal(shouldApplyFileMutation(current, incoming, base), expected, label);
+	}
 });
 
 test("concurrent live puts with different hashes do not overwrite each other", () => {
@@ -546,17 +537,6 @@ test("force snapshot is followed by sequence one in the same epoch", () => {
 			{ currentWatermark: 0, desiredWatermark: 1 },
 		),
 		"apply",
-	);
-});
-
-test("deletion always replaces a concurrent present state", () => {
-	assert.equal(
-		shouldApplyFileMutation(
-			file("note.md", { changedRevision: 8 }),
-			file("note.md", { deleted: true }),
-			5,
-		),
-		true,
 	);
 });
 

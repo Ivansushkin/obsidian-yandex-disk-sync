@@ -359,7 +359,7 @@ async function runLegacyForceCommit(
 		path: "note.md",
 		sha256: "hash",
 		size: 4,
-		mtime: 10,
+		mtime: 10.375,
 		syncedAt: 10,
 		remoteMtime: undefined,
 	});
@@ -385,6 +385,7 @@ async function runLegacyForceCommit(
 	assert.equal(canonical.revision, 1);
 	assert.ok(canonical.epoch);
 	assert.equal(canonical.files["note.md"]?.mutationSeq, 0);
+	assert.equal(canonical.files["note.md"]?.mtime, 10.375);
 	assert.equal(manager.getObservedEpoch(), canonical.epoch);
 	assert.equal(manager.getObservedRevision(), canonical.revision);
 	assert.equal(client.moveCount, 2);
@@ -422,6 +423,13 @@ test("plaintext stable 1.0/1.1 Force commits and verifies current canonical", as
 		fixtureResult.manager.getRemoteIndex().files["deleted.md"];
 	assert.equal(historicalDelete?.deleted, true);
 	assert.equal(historicalDelete?.mutationSeq, 0);
+});
+
+test("stable fractional mtime survives Force replacement and current canonical readback", async () => {
+	const source = structuredClone(stableCanonicalFixture);
+	for (const metadata of Object.values(source.files)) metadata.mtime += 0.375;
+	const { manager } = await runLegacyForceCommit(null, source);
+	assert.equal(manager.getRemoteIndex().files["deleted.md"]?.mtime, source.files["deleted.md"].mtime);
 });
 
 test("Force replacement tombstones survive initiator loss", async () => {
@@ -973,24 +981,6 @@ test("encrypted current index loads without plaintext fallback", async () => {
 	assert.equal(index.revision, 4);
 });
 
-test("current canonical file without mutationSeq is rejected", async () => {
-	const index = createEmptyIndex("device-current", "epoch-current");
-	index.revision = 4;
-	index.files["note.md"] = {
-		path: "note.md",
-		sha256: "hash",
-		size: 4,
-		mtime: 1,
-		syncedAt: 1,
-		changedRevision: 4,
-		baseRevision: 3,
-		lastModifiedBy: "device-current",
-	};
-	const { manager, client } = await createIndexManagerWithContent(index, null);
-	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
-	assert.equal(client.moveCount, 0);
-});
-
 test("only full discovery may load a replacement current epoch", async () => {
 	const { manager } = await createIndexManagerWithContent(
 		{
@@ -1012,6 +1002,30 @@ test("only full discovery may load a replacement current epoch", async () => {
 	const replacement = await manager.loadRemoteIndex(false, false, true);
 	assert.equal(replacement.epoch, "epoch-b");
 	assert.equal(manager.getObservedEpoch(), "epoch-a");
+});
+
+test("canonical file metadata preserves timestamp precision and validates causal counters", async () => {
+	const index = createEmptyIndex("device-current", "epoch-current");
+	index.revision = 4;
+	index.files["note.md"] = {
+		path: "note.md", sha256: "hash", size: 4, mtime: 1.375, syncedAt: 1,
+		changedRevision: 4, baseRevision: 3, mutationSeq: 0,
+		lastModifiedBy: "device-current",
+	};
+	index.appliedMutationSeq["device-current"] = 1;
+	const { manager } = await createIndexManagerWithContent(index, null);
+	assert.equal((await manager.loadRemoteIndex()).files["note.md"]?.mtime, 1.375);
+	for (const patch of [
+		...[-1, NaN, Infinity, Number.MAX_VALUE, "1", null].map((mtime) => ({ mtime })),
+		{ size: 1.375 }, { mutationSeq: 0.375 }, { changedRevision: 1.375 },
+		{ mutationSeq: undefined }, { mutationSeq: 2 },
+	]) {
+		const invalid = structuredClone(index);
+		Object.assign(invalid.files["note.md"]!, patch);
+		const { manager, client } = await createIndexManagerWithContent(invalid, null);
+		await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
+		assert.equal(client.moveCount, 0);
+	}
 });
 
 test("malformed current canonical is rejected as a semantic index error", async () => {
@@ -1114,139 +1128,51 @@ test("current canonical rejects an extra numeric format marker", async () => {
 	assert.equal(client.moveCount, 0);
 });
 
-test("file mutation sequence cannot exceed its device watermark", async () => {
-	const invalid = createEmptyIndex("device-current", "epoch-current");
-	invalid.revision = 4;
-	invalid.files["note.md"] = {
-		path: "note.md",
-		sha256: "hash",
-		size: 4,
-		mtime: 1,
-		syncedAt: 1,
-		changedRevision: 4,
-		baseRevision: 3,
-		lastModifiedBy: "device-a",
-		mutationSeq: 2,
-	};
-	invalid.appliedMutationSeq["device-a"] = 1;
-	const { manager } = await createIndexManagerWithContent(invalid, null);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		(error: unknown) =>
-			error instanceof InvalidCurrentIndexError &&
-			error.section === "files",
-	);
-});
+test("canonical transaction accepts causal continuation and rejects foreign edits", async () => {
+	for (const author of ["device-a", "device-b"] as const) {
+		const foreign = author === "device-b";
+		const current = createEmptyIndex(author, "epoch-a");
+		current.revision = 36;
+		current.files["note.md"] = {
+			path: "note.md", sha256: "previous", size: 8, mtime: 1, syncedAt: 1,
+			changedRevision: 36, baseRevision: 35, lastModifiedBy: author,
+			mutationSeq: foreign ? 3 : 7,
+		};
+		current.appliedMutationSeq = { "device-a": 7, "device-b": 3 };
+		const { manager, client, canonicalPath } =
+			await createIndexManagerWithContent(current, null, null, "device-a");
+		manager.loadLocalIndexFromData({
+			deviceId: "device-a", observedEpoch: "epoch-a", observedRevision: 35,
+			files: foreign ? {} : { "note.md": { ...current.files["note.md"] } },
+			folderTombstones: {}, nextMutationSeq: 8,
+		});
+		manager.loadPendingMutations(undefined);
+		await manager.loadRemoteIndex();
+		const mutation = manager.enqueueMutation("put", "note.md", {
+			sha256: "latest", baseRevision: 35, epoch: "epoch-a",
+		});
+		assert.equal(mutation.seq, 8, author);
+		manager.updateRemoteFile("note.md", {
+			...current.files["note.md"], sha256: "latest", lastModifiedBy: "device-a",
+			baseRevision: 35, mutationSeq: mutation.seq,
+			...(foreign ? { remoteFingerprint: "uploaded-device-a" } : {}),
+		});
+		manager.stageMutation(mutation);
+		await manager.saveRemoteIndex();
 
-test("canonical transaction accepts a continuous same-device edit", async () => {
-	const current = createEmptyIndex("device-a", "epoch-a");
-	current.revision = 36;
-	current.files["note.md"] = {
-		path: "note.md",
-		sha256: "previous",
-		size: 8,
-		mtime: 1,
-		syncedAt: 1,
-		changedRevision: 36,
-		baseRevision: 35,
-		lastModifiedBy: "device-a",
-		mutationSeq: 7,
-	};
-	current.appliedMutationSeq["device-a"] = 7;
-	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(
-			current,
-			null,
-			null,
-			"device-a",
-		);
-	manager.loadLocalIndexFromData({
-		deviceId: "device-a",
-		observedEpoch: "epoch-a",
-		observedRevision: 35,
-		files: { "note.md": { ...current.files["note.md"] } },
-		folderTombstones: {},
-		nextMutationSeq: 8,
-	});
-	manager.loadPendingMutations(undefined);
-	await manager.loadRemoteIndex();
-	const mutation = manager.enqueueMutation("put", "note.md", {
-		sha256: "latest",
-		baseRevision: 35,
-		epoch: "epoch-a",
-	});
-	assert.equal(mutation.seq, 8);
-	manager.updateRemoteFile("note.md", {
-		...current.files["note.md"],
-		sha256: "latest",
-		baseRevision: 35,
-		mutationSeq: mutation.seq,
-	});
-	manager.stageMutation(mutation);
-	await manager.saveRemoteIndex();
-
-	const canonical = JSON.parse(
-		new TextDecoder().decode(client.files.get(canonicalPath)),
-	) as ReturnType<typeof createEmptyIndex>;
-	assert.equal(canonical.revision, 37);
-	assert.equal(canonical.files["note.md"]?.sha256, "latest");
-	assert.equal(canonical.files["note.md"]?.mutationSeq, 8);
-	assert.equal(canonical.appliedMutationSeq["device-a"], 8);
-	assert.deepEqual(manager.consumeRejectedPuts(), []);
-});
-
-test("canonical transaction still rejects a concurrent foreign edit", async () => {
-	const current = createEmptyIndex("device-b", "epoch-a");
-	current.revision = 36;
-	current.files["note.md"] = {
-		path: "note.md",
-		sha256: "device-b",
-		size: 8,
-		mtime: 1,
-		syncedAt: 1,
-		changedRevision: 36,
-		baseRevision: 35,
-		lastModifiedBy: "device-b",
-		mutationSeq: 3,
-	};
-	current.appliedMutationSeq = { "device-a": 7, "device-b": 3 };
-	const { manager } = await createIndexManagerWithContent(
-		current,
-		null,
-		null,
-		"device-a",
-	);
-	manager.loadLocalIndexFromData({
-		deviceId: "device-a",
-		observedEpoch: "epoch-a",
-		observedRevision: 35,
-		files: {},
-		folderTombstones: {},
-		nextMutationSeq: 8,
-	});
-	manager.loadPendingMutations(undefined);
-	await manager.loadRemoteIndex();
-	const mutation = manager.enqueueMutation("put", "note.md", {
-		sha256: "device-a",
-		baseRevision: 35,
-		epoch: "epoch-a",
-	});
-	manager.updateRemoteFile("note.md", {
-		...current.files["note.md"],
-		sha256: "device-a",
-		remoteFingerprint: "uploaded-device-a",
-		lastModifiedBy: "device-a",
-		baseRevision: 35,
-		mutationSeq: mutation.seq,
-	});
-	manager.stageMutation(mutation);
-	await manager.saveRemoteIndex();
-
-	assert.equal(
-		manager.getRemoteIndex().files["note.md"]?.sha256,
-		"device-b",
-	);
-	assert.equal(manager.consumeRejectedPuts()[0]?.reason, "conflict");
+		const canonical = JSON.parse(new TextDecoder().decode(client.files.get(canonicalPath))) as
+			ReturnType<typeof createEmptyIndex>;
+		assert.equal(canonical.files["note.md"]?.sha256, foreign ? "previous" : "latest", author);
+		const rejected = manager.consumeRejectedPuts();
+		if (foreign) {
+			assert.equal(rejected[0]?.reason, "conflict");
+		} else {
+			assert.equal(canonical.revision, 37);
+			assert.equal(canonical.files["note.md"]?.mutationSeq, 8);
+			assert.equal(canonical.appliedMutationSeq["device-a"], 8);
+			assert.deepEqual(rejected, []);
+		}
+	}
 });
 
 test("wrong encrypted index key is classified as unreadable", async () => {

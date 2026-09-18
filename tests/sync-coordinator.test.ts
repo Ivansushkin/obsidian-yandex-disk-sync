@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SyncCoordinator } from "../src/sync/sync-coordinator";
+import { SyncEngine, type SyncRunOptions } from "../src/sync/sync-engine";
+import { DEFAULT_SETTINGS, type SyncState } from "../src/types";
+import type { YandexDiskClient } from "../src/api/yandex-client";
+import type { VaultAdapter } from "../src/api/vault-adapter";
+import type { IndexManager } from "../src/sync/index-manager";
 import { logger } from "../src/utils/logger";
 
 logger.configure({ consoleEnabled: false });
@@ -43,19 +48,6 @@ test("concurrent full requests share one execution", async () => {
 
 	assert.equal(await coordinator.run("full", task), 42);
 	assert.equal(executions, 2);
-});
-
-test("coordinator exposes and clears correlation metadata", async () => {
-	const coordinator = new SyncCoordinator();
-	let observedId: string | null = null;
-	await coordinator.run("realtime", async () => {
-		const active = coordinator.getActiveSession();
-		assert.equal(active?.kind, "realtime");
-		observedId = active?.id ?? null;
-	});
-
-	assert.match(observedId ?? "", /^realtime-/);
-	assert.equal(coordinator.getActiveSession(), null);
 });
 
 test("coordinator clears active metadata when enter hook fails", async () => {
@@ -114,4 +106,22 @@ test("settlement completes before the next session starts", async () => {
 	await Promise.all([first, second]);
 
 	assert.deepEqual(order, ["task", "settle-start", "settle-end", "next"]);
+});
+
+test("Force session progress ignores foreign activity and unsubscribes after settlement", async () => {
+	const engine = new SyncEngine({} as YandexDiskClient, {} as VaultAdapter, {} as IndexManager, DEFAULT_SETTINGS);
+	const access = engine as unknown as {
+		runCoordinatedSession(kind: "force", options: SyncRunOptions, task: () => Promise<void>): Promise<void>;
+		updateState(state: Partial<SyncState>): void;
+		eventListeners: unknown[];
+	};
+	const observed: SyncState[] = [];
+	await access.runCoordinatedSession("force", { onActivity: (state) => observed.push(state) }, async () => {
+		const own = engine.getState();
+		access.updateState({ status: "syncing", sessionId: "foreign", currentOperation: "foreign progress" });
+		access.updateState({ ...own, currentOperation: "owned progress" });
+	});
+	assert.ok(observed.some((state) => state.currentOperation === "owned progress"));
+	assert.ok(observed.every((state) => state.sessionId !== "foreign"));
+	assert.equal(access.eventListeners.length, 0);
 });

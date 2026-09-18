@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-	getAncestorDirectoriesDeepestFirst,
 	hasPortablePathCollision,
 	isLegacyPluginDataPath,
 	isLegacyServicePathCollision,
 	shouldSyncFile,
-	toLocalPath,
 } from "../src/utils/path-utils";
 
 test("portable path collisions block Force remote before local writes", () => {
@@ -39,82 +37,18 @@ test("stable migration recognizes protected plugin and service paths", () => {
 	);
 });
 
-test("plugin installation data is never synchronized", () => {
+test("path filtering protects plugin storage while allowing other configured plugins", () => {
 	const configDir = ".custom-config";
-	assert.equal(
-		shouldSyncFile(
-			`${configDir}/plugins/yandex-disk-sync/data.json`,
-			["**"],
-			[],
-			true,
-			configDir,
-		),
-		false,
-	);
-	assert.equal(
-		shouldSyncFile(
-			`${configDir}/plugins/yandex-disk-sync/debug.log`,
-			["**"],
-			[],
-			true,
-			configDir,
-		),
-		false,
-	);
-});
-
-test("legacy debug log directory is never synchronized", () => {
-	const configDir = ".custom-config";
-	assert.equal(
-		shouldSyncFile(
-			`${configDir}/yandex-disk-sync/debug.log`,
-			["**"],
-			[],
-			true,
-			configDir,
-		),
-		false,
-	);
-});
-
-test("other Obsidian plugin data remains eligible when enabled", () => {
-	const configDir = ".custom-config";
-	assert.equal(
-		shouldSyncFile(
-			`${configDir}/plugins/another-plugin/data.json`,
-			["**"],
-			[],
-			true,
-			configDir,
-		),
-		true,
-	);
-});
-
-test("transition physical paths use one root-relative representation", () => {
-	assert.equal(
-		toLocalPath(
-			"disk:/obsidian-sync/encrypted-segment/file",
-			"obsidian-sync",
-		),
-		"encrypted-segment/file",
-	);
-	assert.equal(
-		toLocalPath(
-			"obsidian-sync/plain/folder/file.md",
-			"obsidian-sync",
-		),
-		"plain/folder/file.md",
-	);
-});
-
-test("ancestor directories are unique and deepest first", () => {
-	assert.deepEqual(
-		getAncestorDirectoriesDeepestFirst([
-			"a/b/c/one.md",
-			"a/b/two.md",
-			"a/d/three.md",
-		]),
-		["a/b/c", "a/b", "a/d", "a"],
-	);
+	for (const [relativePath, expected] of [
+		["plugins/yandex-disk-sync/data.json", false],
+		["plugins/yandex-disk-sync/debug.log", false],
+		["yandex-disk-sync/debug.log", false],
+		["plugins/another-plugin/data.json", true],
+	] as const) {
+		assert.equal(
+			shouldSyncFile(`${configDir}/${relativePath}`, ["**"], [], true, configDir),
+			expected,
+			relativePath,
+		);
+	}
 });

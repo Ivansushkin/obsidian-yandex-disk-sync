@@ -26,27 +26,13 @@ const obsidianStubPlugin = {
 					export class App {}
 					export class Vault {}
 					export class Plugin {}
-					export class Modal {
-						constructor(app) { this.app = app; this.contentEl = {}; }
-						open() {}
-						close() {}
-					}
+					export class Modal { open() {} close() {} }
 					export class PluginSettingTab {}
-					export class Setting {
-						constructor() { this.settingEl = { addClass() {} }; }
-						setName() { return this; }
-						setDesc() { return this; }
-						addButton() { return this; }
-						addToggle() { return this; }
-						addText() { return this; }
-						addTextArea() { return this; }
-						addSlider() { return this; }
-						addDropdown() { return this; }
-					}
+					export class Setting {}
 					export class Notice {
-						constructor(message) { this.message = message; }
+						constructor(message) { this.message = message; this.noticeEl = { isConnected: true }; }
 						setMessage(message) { this.message = message; }
-						hide() {}
+						hide() { this.noticeEl.isConnected = false; }
 					}
 					export class ButtonComponent {}
 					export class TextAreaComponent {}

@@ -91,11 +91,6 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		);
 	}
 	const stable = parseStable1xPluginData(data);
-	if (!stable) {
-		throw new UnsupportedHistoricalDataError(
-			"Unmarked plugin data is not an exact stable 1.0/1.1 snapshot",
-		);
-	}
 	const settings: Partial<YandexDiskSyncSettings> = { ...stable.settings };
 	settings.encryptionProfileId = null;
 	const converted = {

@@ -299,6 +299,14 @@ release artifacts.
 npm run lint
 ```
 
+### Testing policy
+
+Bulk unit-test generation is prohibited. Keep only compact tests of complex
+algorithms and function interactions; avoid trivial checks, UI mocks, and
+coverage-driven growth. A bug fix does not automatically require a new unit test.
+Follow [AGENTS.md](AGENTS.md#documentation-and-testing) and verify user behavior
+with the [real Obsidian smoke scenarios](docs/SMOKE_TESTS.md).
+
 ## Architecture
 
 The normative catalogue of synchronization, multi-device, failure-recovery,

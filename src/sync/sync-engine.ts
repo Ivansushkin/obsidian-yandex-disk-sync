@@ -133,6 +133,8 @@ export interface PhysicalRewriteUploadProof {
 }
 
 export interface SyncRunOptions {
+	/** Report only activity owned by this invocation, including queue preparation. */
+	onActivity?: (state: SyncState) => void;
 	/** Use the startup discovery path inside the regular full-sync session. */
 	startup?: boolean;
 	/** Skip encryption state guard for internal encryption maintenance flows. */
@@ -4711,27 +4713,26 @@ export class SyncEngine {
 			return await run();
 		}
 		let preparedSessionId: string | null = null;
+		const unsubscribe = options?.onActivity
+			? this.onStateChange((state) => {
+				if (state.sessionId === preparedSessionId) options.onActivity?.(state);
+			})
+			: undefined;
 		try {
 			return await this.coordinator.run(kind, run, {
-				prepare:
-					kind === "full"
-						? async (session) => {
-								preparedSessionId = session.id;
-								this.beginUiActivity(
-									session.id,
-									session.kind,
-									"preparing-local",
-								);
-								const context: SyncLifecycleContext = {
-									sessionId: session.id,
-									kind: session.kind,
-									startup: options?.startup,
-								};
-								for (const callback of this.syncPrepareCallbacks) {
-									await callback(context);
-								}
-							}
-						: undefined,
+				prepare: async (session) => {
+					preparedSessionId = session.id;
+					if (kind !== "full") return;
+					this.beginUiActivity(session.id, session.kind, "preparing-local");
+					const context: SyncLifecycleContext = {
+						sessionId: session.id,
+						kind: session.kind,
+						startup: options?.startup,
+					};
+					for (const callback of this.syncPrepareCallbacks) {
+						await callback(context);
+					}
+				},
 			});
 		} catch (error) {
 			if (
@@ -4754,6 +4755,8 @@ export class SyncEngine {
 				});
 			}
 			throw error;
+		} finally {
+			unsubscribe?.();
 		}
 	}
 

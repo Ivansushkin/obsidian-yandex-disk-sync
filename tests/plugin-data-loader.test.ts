@@ -6,36 +6,42 @@ import {
 	loadPluginData,
 	loadPluginDataWithSource,
 } from "../src/plugin-data-loader";
-import { serializeStable1xPluginData } from "../src/compatibility/stable-1x";
-import { DEFAULT_SETTINGS } from "../src/types";
+import { parseStable1xIndex, serializeStable1xPluginData } from "../src/compatibility/stable-1x";
+import { DEFAULT_SETTINGS, type LocalSyncState } from "../src/types";
 import stableFilledFixture from "./fixtures/stable-1.1/plugin-data-filled.json";
 import stableEmptyFixture from "./fixtures/stable-1.1/plugin-data-empty.json";
 import type { LocalEncryptionTransition } from "../src/crypto/encryption-transition";
 
-function stable1xSettings() {
-	return {
-		yandexTokenSecret: "stable-token",
-		clientId: "stable-client",
-		remotePath: "stable-vault",
-		syncInterval: 5,
-		enableRealtimeSync: true,
-		syncPatterns: ["**"],
-		excludePatterns: ["cache"],
-		syncDotObsidian: false,
-		deviceId: "stable-device",
-		debounceDelay: 1000,
-		maxConcurrency: 10,
-	};
-}
+test("stable timestamps allow filesystem precision without relaxing sizes or counters", () => {
+	const source = structuredClone(stableFilledFixture);
+	source.localIndex.files["note.md"].mtime += 0.375;
+	assert.ok(parseStable1xIndex(source.localIndex));
+	for (const invalid of [-1, NaN, Infinity, -Infinity, Number.MAX_VALUE, "1", null]) {
+		const index = structuredClone(source.localIndex);
+		Object.assign(index.files["note.md"], { mtime: invalid });
+		assert.equal(parseStable1xIndex(index), null);
+	}
+	for (const field of ["size", "syncedAt"] as const) {
+		const index = structuredClone(source.localIndex);
+		index.files["note.md"][field] += 0.375;
+		assert.equal(parseStable1xIndex(index), null);
+	}
+});
 
-function stable1xStats() {
-	return {
-		uploaded: 1,
-		downloaded: 2,
-		deleted: 3,
-		errors: 4,
-	};
-}
+test("stable snapshot rejection identifies only fixed schema sections", () => {
+	const sentinel = "private-value-must-not-appear";
+	for (const section of ["root fields", "settings", "localIndex", "lastSyncStats"]) {
+		const source = structuredClone(stableFilledFixture);
+		if (section === "root fields") Object.assign(source, { [sentinel]: sentinel });
+		else Object.assign(source, { [section]: { [sentinel]: sentinel } });
+		assert.throws(() => loadPluginData(source), (error: unknown) => {
+			assert.ok(error instanceof UnsupportedHistoricalDataError);
+			assert.ok(error.message.includes(`invalid ${section}`));
+			assert.equal(error.message.includes(sentinel), false);
+			return true;
+		});
+	}
+});
 
 function currentTransition(): LocalEncryptionTransition {
 	return {
@@ -82,6 +88,21 @@ function currentEncryptedSettings() {
 	};
 }
 
+/** Build one current snapshot so rejection cases specify only their difference. */
+function currentData(overrides: Record<string, unknown> = {}) {
+	return {
+		format: PLUGIN_DATA_FORMAT,
+		settings: currentEncryptedSettings(),
+		localState: null,
+		pendingMutations: [],
+		pendingPhysicalActions: [],
+		pendingWatcherEvents: [],
+		encryptionTransition: currentTransition(),
+		lastSyncStats: {},
+		...overrides,
+	};
+}
+
 function currentPlaintextSettings() {
 	return {
 		enableEncryption: false,
@@ -104,41 +125,16 @@ test("fresh plugin data accepts nullish storage and rejects arbitrary roots", ()
 });
 
 test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues", () => {
-	const migrated = loadPluginData({
-		settings: stable1xSettings(),
-		localIndex: {
-			version: 2,
-			lastSyncTime: 10,
-			deviceId: "stable-device",
-			files: {
-				"note.md": {
-					path: "note.md",
-					sha256: "legacy-sha",
-					size: 7,
-					mtime: 8,
-					syncedAt: 9,
-				},
-			},
-		},
-		lastSyncStats: stable1xStats(),
-	}) as unknown as {
-		format: "plugin-data";
-		settings: {
-			encryptionProfileId: string | null;
-			deviceId: string;
-			syncInterval: number;
-			syncPatterns: string[];
-		};
-		localState: {
-			observedEpoch: string | null;
-			observedRevision: number;
-			files: Record<string, { sha256: string }>;
-		};
+	const source = structuredClone(stableFilledFixture);
+	const migrated = loadPluginData(source) as unknown as {
+		format: string;
+		settings: typeof DEFAULT_SETTINGS;
+		localState: LocalSyncState;
 		pendingMutations: unknown[];
 		pendingPhysicalActions: unknown[];
 		pendingWatcherEvents: unknown[];
 		encryptionTransition: LocalEncryptionTransition | null;
-		lastSyncStats: ReturnType<typeof stable1xStats>;
+		lastSyncStats: unknown;
 	};
 	assert.ok(migrated);
 	assert.equal(migrated?.format, PLUGIN_DATA_FORMAT);
@@ -146,17 +142,17 @@ test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty qu
 	assert.equal("version" in migrated, false);
 	assert.equal("version" in migrated.localState, false);
 	assert.equal(migrated?.settings.encryptionProfileId, null);
-	assert.equal(migrated?.settings.deviceId, "stable-device");
-	assert.equal(migrated?.settings.syncInterval, 5);
-	assert.deepEqual(migrated?.settings.syncPatterns, ["**"]);
+	assert.equal(migrated?.settings.deviceId, source.settings.deviceId);
+	assert.equal(migrated?.settings.syncInterval, source.settings.syncInterval);
+	assert.deepEqual(migrated?.settings.syncPatterns, source.settings.syncPatterns);
 	assert.equal(migrated?.localState.observedEpoch, null);
 	assert.equal(migrated?.localState.observedRevision, 0);
-	assert.equal(migrated?.localState.files["note.md"]?.sha256, "legacy-sha");
+	assert.equal(migrated?.localState.files["note.md"]?.sha256, source.localIndex.files["note.md"].sha256);
 	assert.deepEqual(migrated?.pendingMutations, []);
 	assert.deepEqual(migrated?.pendingPhysicalActions, []);
 	assert.deepEqual(migrated?.pendingWatcherEvents, []);
 	assert.equal(migrated?.encryptionTransition, null);
-	assert.deepEqual(migrated?.lastSyncStats, stable1xStats());
+	assert.deepEqual(migrated?.lastSyncStats, source.lastSyncStats);
 });
 
 test("stable 1.1 data remains rollback-readable until verified Force cutover", () => {
@@ -269,88 +265,51 @@ test("already converted current local data can finish a stable 1.1 migration", (
 	assert.equal(loaded.stableSnapshot, null);
 });
 
-test("unmarked historical queues are rejected", () => {
-	assert.throws(
-		() =>
-			loadPluginData({
-				settings: stable1xSettings(),
+test("unsupported local formats fail closed instead of migrating", () => {
+	const cases: [string, unknown][] = [
+		["unmarked queues", { ...stableFilledFixture, pendingMutations: [] }],
+		["partial stable", { settings: { enableEncryption: false }, localIndex: null }],
+		["numeric schema", { schemaVersion: 2, settings: {} }],
+		["historical profile", currentData({
+			settings: { enableEncryption: true, encryptionProfileId: "hardened-v3" },
+			encryptionTransition: null,
+		})],
+		...[false, true].map((enabled): [string, unknown] => [
+			`legacy encryption ${enabled}`,
+			{
+				settings: { enableEncryption: enabled, encryptionSalt: enabled ? "salt" : null,
+					encryptedPassword: enabled ? "password-placeholder" : null },
 				localIndex: null,
-				lastSyncStats: stable1xStats(),
-				pendingMutations: [],
-			}),
-		UnsupportedHistoricalDataError,
-	);
-});
-
-test("partial unmarked data is not mistaken for stable 1.0/1.1", () => {
-	assert.throws(
-		() =>
-			loadPluginData({
-				settings: { enableEncryption: false },
-				localIndex: null,
-			}),
-		UnsupportedHistoricalDataError,
-	);
-});
-
-test("unmarked encrypted legacy data is deliberately unsupported", () => {
-	for (const enableEncryption of [false, true]) {
-		assert.throws(
-			() =>
-				loadPluginData({
-					settings: {
-						enableEncryption,
-						encryptionSalt: enableEncryption ? "salt" : null,
-						encryptedPassword: enableEncryption ? "password" : null,
-					},
-					localIndex: null,
-					lastSyncStats: {},
-				}),
-			UnsupportedHistoricalDataError,
-		);
+				lastSyncStats: {},
+			},
+		]),
+	];
+	for (const [label, value] of cases) {
+		assert.throws(() => loadPluginData(value as Parameters<typeof loadPluginData>[0]), UnsupportedHistoricalDataError, label);
 	}
 });
 
-test("current transition without profile metadata is rejected", () => {
-	const transition = currentTransition() as unknown as {
-		source: { profileId?: string };
-	};
-	delete transition.source.profileId;
-	assert.throws(
-		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: currentEncryptedSettings(),
-				localState: null,
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition:
-					transition as unknown as LocalEncryptionTransition,
-				lastSyncStats: {},
-			}),
-		UnsupportedHistoricalDataError,
-	);
-});
-
-test("current transition without mandatory backup proof is rejected", () => {
-	const transition = currentTransition() as unknown as Record<string, unknown>;
-	delete transition.backupProof;
-	assert.throws(
-		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: currentEncryptedSettings(),
-				localState: null,
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition:
-					transition as unknown as LocalEncryptionTransition,
-				lastSyncStats: {},
-			}),
-		UnsupportedHistoricalDataError,
-	);
+test("persisted transitions require current authority backup and target proofs", () => {
+	const cases: [string, (transition: Record<string, unknown>) => void][] = [
+		["profile", (transition) => {
+			delete (transition.source as Record<string, unknown>).profileId;
+		}],
+		["backup proof", (transition) => { delete transition.backupProof; }],
+		["target fingerprints", (transition) => { transition.targetFingerprints = {}; }],
+		["historical mapping", (transition) => {
+			delete transition.targetRawByLogicalPath;
+			transition.targetRawPaths = ["new"];
+		}],
+	];
+	for (const [label, invalidate] of cases) {
+		const transition = currentTransition() as unknown as Record<string, unknown>;
+		invalidate(transition);
+		assert.throws(
+			() => loadPluginData(currentData({ encryptionTransition: transition })),
+			UnsupportedHistoricalDataError,
+			label,
+		);
+	}
 });
 
 test("current transition requires an injective disjoint target mapping", () => {
@@ -366,38 +325,10 @@ test("current transition requires an injective disjoint target mapping", () => {
 		};
 		assert.throws(
 			() =>
-				loadPluginData({
-					format: PLUGIN_DATA_FORMAT,
-					settings: currentEncryptedSettings(),
-					localState: null,
-					pendingMutations: [],
-					pendingPhysicalActions: [],
-					pendingWatcherEvents: [],
-					encryptionTransition: transition,
-					lastSyncStats: {},
-				}),
+				loadPluginData(currentData({ encryptionTransition: transition })),
 			UnsupportedHistoricalDataError,
 		);
 	}
-});
-
-test("copied transition requires a fingerprint for every target object", () => {
-	const transition = currentTransition();
-	transition.targetFingerprints = {};
-	assert.throws(
-		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: currentEncryptedSettings(),
-				localState: null,
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition: transition,
-				lastSyncStats: {},
-			}),
-		UnsupportedHistoricalDataError,
-	);
 });
 
 test("__proto__ transition paths cannot impersonate persisted fingerprints", () => {
@@ -406,16 +337,7 @@ test("__proto__ transition paths cannot impersonate persisted fingerprints", () 
 	missingSourceFingerprint.sourceFingerprints = {};
 	assert.throws(
 		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: currentEncryptedSettings(),
-				localState: null,
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition: missingSourceFingerprint,
-				lastSyncStats: {},
-			}),
+			loadPluginData(currentData({ encryptionTransition: missingSourceFingerprint })),
 		UnsupportedHistoricalDataError,
 	);
 
@@ -426,16 +348,7 @@ test("__proto__ transition paths cannot impersonate persisted fingerprints", () 
 	missingTargetFingerprint.targetFingerprints = {};
 	assert.throws(
 		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: currentEncryptedSettings(),
-				localState: null,
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition: missingTargetFingerprint,
-				lastSyncStats: {},
-			}),
+			loadPluginData(currentData({ encryptionTransition: missingTargetFingerprint })),
 		UnsupportedHistoricalDataError,
 	);
 });
@@ -460,27 +373,6 @@ test("current settings must match the source or target transition mode", () => {
 	);
 });
 
-test("historical transition target path arrays are rejected", () => {
-	const transition = currentTransition() as unknown as Record<string, unknown>;
-	delete transition.targetRawByLogicalPath;
-	transition.targetRawPaths = ["new"];
-	assert.throws(
-		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: currentEncryptedSettings(),
-				localState: null,
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition:
-					transition as unknown as LocalEncryptionTransition,
-				lastSyncStats: {},
-			}),
-		UnsupportedHistoricalDataError,
-	);
-});
-
 test("numbered local state marker is rejected from current plugin data", () => {
 	assert.throws(
 		() =>
@@ -497,37 +389,6 @@ test("numbered local state marker is rejected from current plugin data", () => {
 					folderTombstones: {},
 					nextMutationSeq: 1,
 				},
-				pendingMutations: [],
-				pendingPhysicalActions: [],
-				pendingWatcherEvents: [],
-				encryptionTransition: null,
-				lastSyncStats: {},
-			}),
-		UnsupportedHistoricalDataError,
-	);
-});
-
-test("numeric historical plugin schemas are rejected instead of downgraded", () => {
-	assert.throws(
-		() =>
-			loadPluginData({
-				schemaVersion: 2,
-				settings: {},
-			}),
-		UnsupportedHistoricalDataError,
-	);
-});
-
-test("historical encryption profile is rejected from current plugin data", () => {
-	assert.throws(
-		() =>
-			loadPluginData({
-				format: PLUGIN_DATA_FORMAT,
-				settings: {
-					enableEncryption: true,
-					encryptionProfileId: "hardened-v3",
-				} as never,
-				localState: null,
 				pendingMutations: [],
 				pendingPhysicalActions: [],
 				pendingWatcherEvents: [],

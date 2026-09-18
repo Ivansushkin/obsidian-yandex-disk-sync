@@ -5,7 +5,6 @@ export type ForceSyncDirection = "from_local" | "from_remote";
 
 export class ForceSyncModal extends Modal {
 	private direction: ForceSyncDirection;
-	private onBackup: () => Promise<{ success: boolean }>;
 	private onAction: (action: "proceed" | "cancel") => void;
 	private requireLegacyClientsStopped: boolean;
 	private settled = false;
@@ -13,13 +12,11 @@ export class ForceSyncModal extends Modal {
 	constructor(
 		app: App,
 		direction: ForceSyncDirection,
-		onBackup: () => Promise<{ success: boolean }>,
 		onAction: (action: "proceed" | "cancel") => void,
 		requireLegacyClientsStopped = false,
 	) {
 		super(app);
 		this.direction = direction;
-		this.onBackup = onBackup;
 		this.onAction = onAction;
 		this.requireLegacyClientsStopped = requireLegacyClientsStopped;
 	}
@@ -62,18 +59,9 @@ export class ForceSyncModal extends Modal {
 					.setDisabled(this.requireLegacyClientsStopped)
 					.setButtonText(t("modal.force_sync_backup_button"))
 					.setCta()
-					.onClick(async () => {
+					.onClick(() => {
 						if (!legacyClientsStopped) return;
 						btn.setDisabled(true);
-						btn.setButtonText(t("settings.backup_in_progress"));
-						const result = await this.onBackup();
-						if (!result.success) {
-							btn.setDisabled(false);
-							btn.setButtonText(
-								t("modal.force_sync_backup_button"),
-							);
-							return;
-						}
 						this.finish("proceed");
 					})
 			)

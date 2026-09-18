@@ -60,6 +60,13 @@ Password policy:
 
 ## Upload verification
 
+Оба способа создания backup предоставляют необязательный callback этапов:
+`creating-backup`, `uploading-backup`, `verifying-backup`. Это только UI-события:
+этап проверки ещё не означает успеха. Результат `success` возвращается после
+проверки exact bytes; потеря ответа и collision могут повторить upload/read-back.
+Force показывает эти этапы в persistent Notice с момента подтверждения,
+удерживая блокировку кнопок до окончания всего сценария.
+
 После success, timeout или 409 клиент выполняет stable raw download. Возможны
 только два результата:
 

@@ -327,6 +327,21 @@ class RenameIndexFake {
 	}
 }
 
+/** Wire the real engine to independent in-memory resources for each scenario. */
+function createRenameEngine(
+	yandex: RenameYandexFake,
+	vault: RenameVaultFake,
+	index: RenameIndexFake,
+	encrypted = false,
+): SyncEngine {
+	return new SyncEngine(
+		yandex as unknown as YandexDiskClient,
+		vault as unknown as VaultAdapter,
+		index as unknown as IndexManager,
+		{ ...DEFAULT_SETTINGS, deviceId: "device-a", remotePath: "remote", enableEncryption: encrypted },
+	);
+}
+
 test("foreign delete after commit cancels proof-based physical repair", async () => {
 	const yandex = new RenameYandexFake();
 	const vault = new RenameVaultFake();
@@ -361,16 +376,7 @@ test("foreign delete after commit cancels proof-based physical repair", async ()
 			mutationSeq: 1,
 		};
 	};
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	await (
 		engine as unknown as {
@@ -415,16 +421,7 @@ test("encryption change blocks proof-based physical repair", async () => {
 		index: structuredClone(index.index),
 		contentFingerprint: "md5:accepted",
 	};
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 	engine.setSyncGuardCallback(async (token) => ({
 		blockReason: token === "old-manifest" ? "manifest changed" : null,
 	}));
@@ -479,17 +476,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		});
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 
 		await engine.renameFile("A.md", "deep/Б.md", {
 			epoch: "epoch-a",
@@ -539,17 +526,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		});
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 		const watcher = new FileWatcher(
 			{} as App,
 			engine,
@@ -600,17 +577,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const targetContent = content("final-target");
 		vault.files.set("A.md", sourceContent);
 		const index = new RenameIndexFake(yandex);
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 		const watcher = new FileWatcher(
 			{} as App,
 			engine,
@@ -696,17 +663,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const targetContent = content("target");
 		vault.files.set("A.md", sourceContent);
 		const index = new RenameIndexFake(yandex);
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 		const event: RealtimeFileEvent = {
 			id: "upload-a",
 			action: "upload" as const,
@@ -763,17 +720,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			remoteFingerprint: sourceSha,
 			lastModifiedBy: "device-a",
 		};
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 		const event: RealtimeFileEvent = {
 			id: "upload-a",
 			action: "upload",
@@ -820,17 +767,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			lastModifiedBy: "device-a",
 			mutationSeq: 7,
 		};
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 
 		const replay = await engine.syncFileBatch([
 			{
@@ -856,17 +793,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const vault = new RenameVaultFake();
 		vault.files.set("A.md", content("source"));
 		const index = new RenameIndexFake(yandex);
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 		const event: RealtimeFileEvent = {
 			id: "upload-a",
 			action: "upload",
@@ -899,17 +826,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			epoch: "epoch-a",
 			baseRevision: 7,
 		});
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 
 		const batch = await engine.syncFileBatch([
 			{
@@ -964,17 +881,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			mtime: 1,
 			syncedAt: 1,
 		};
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 
 		await engine.renameFile("A.md", "B.md", {
 			epoch: "epoch-a",
@@ -1008,17 +915,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		};
 		index.index.files["A.md"] = { ...baseline };
 		index.local.files["A.md"] = { ...baseline };
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 
 		await engine.renameFile("A.md", "deep/B.md", {
 			epoch: "epoch-a",
@@ -1063,17 +960,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		};
 		index.index.files["A.md"] = { ...baseline };
 		index.local.files["A.md"] = { ...baseline };
-		const engine = new SyncEngine(
-			yandex as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			index as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-a",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
+		const engine = createRenameEngine(yandex, vault, index, mode === "encrypted");
 
 		await engine.renameFile("A.md", "deep/B.md", {
 			epoch: "epoch-a",
@@ -1140,16 +1027,7 @@ test("missing move target is materialized and completed", async () => {
 		targetPath: "folder/B.md",
 		origin: "move",
 	});
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 	const recoveryResult = result();
 
 	await (
@@ -1202,16 +1080,7 @@ test("accepted source put is confirmed before the following move", async () => {
 	};
 	index.index.files["A.md"] = { ...baseline };
 	index.local.files["A.md"] = { ...baseline };
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	await engine.renameFile("A.md", "B.md", {
 		epoch: "epoch-a",
@@ -1257,16 +1126,7 @@ test("source changed after rename base survives as a concurrent file", async () 
 		lastModifiedBy: "device-b",
 	};
 	index.index.revision = 8;
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	await engine.renameFile("A.md", "B.md", {
 		epoch: "epoch-a",
@@ -1308,16 +1168,7 @@ test("rename replay completes an already materialized canonical move", async () 
 		lastModifiedBy: "device-a",
 	};
 	index.recordMove("device-a:3", "A.md", "B.md", "file", 7);
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	await engine.renameFile("A.md", "B.md", {
 		epoch: "epoch-a",
@@ -1360,16 +1211,7 @@ test("rename acknowledgement replay detects an already applied target", async ()
 		lastModifiedBy: "device-a",
 	};
 	index.index.revision = 8;
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	const outcome = await engine.renameFile("A.md", "B.md", {
 		epoch: "epoch-a",
@@ -1405,16 +1247,7 @@ test("lost remote move response is confirmed from final state", async () => {
 	};
 	index.index.files["A.md"] = { ...baseline };
 	index.local.files["A.md"] = { ...baseline };
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	await engine.renameFile("A.md", "B.md", {
 		epoch: "epoch-a",
@@ -1452,16 +1285,7 @@ test("different physical target is not overwritten by rename", async () => {
 	};
 	index.index.files["A.md"] = { ...baseline };
 	index.local.files["A.md"] = { ...baseline };
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	await assert.rejects(
 		engine.renameFile("A.md", "B.md", {
@@ -1507,16 +1331,7 @@ test("unresolved final move recovery records a full-sync error", async () => {
 		lastModifiedBy: "device-a",
 	};
 	index.recordMove("device-a:3", "A.md", "B.md", "file", 7);
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 	const recoveryResult = result();
 
 	await (
@@ -1562,16 +1377,7 @@ test("full sync settles accepted and superseded puts through one watermark", () 
 	const superseded = index.enqueueMutation("put", "remote-wins.md", {
 		sha256: "obsolete-local-sha",
 	});
-	const engine = new SyncEngine(
-		yandex as unknown as YandexDiskClient,
-		vault as unknown as VaultAdapter,
-		index as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-a",
-			remotePath: "remote",
-		},
-	);
+	const engine = createRenameEngine(yandex, vault, index);
 
 	const settlement = (
 		engine as unknown as {

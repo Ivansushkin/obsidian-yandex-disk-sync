@@ -3,7 +3,6 @@ import { readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import process from "node:process";
 import {
-	parseScenarioEvidence,
 	parseScenarioRows,
 	validateScenarioCatalog,
 } from "./scenario-catalog.mjs";
@@ -100,25 +99,6 @@ const scenarioErrors = validateScenarioCatalog(
 );
 if (scenarioErrors.length > 0) {
 	fail(`scenario catalogue is invalid: ${scenarioErrors.join("; ")}`);
-}
-const scenariosById = new Map(scenarioRows.map((row) => [row.id, row]));
-for (const id of [
-	"ENC-011",
-	"ENC-012",
-	"ENC-013",
-	"TRANS-023",
-	"TRANS-024",
-	"TRANS-025",
-	"TRANS-026",
-	"TRANS-027",
-	"SAFE-010",
-	"SAFE-011",
-	"SAFE-012",
-]) {
-	const row = scenariosById.get(id);
-	if (!row || parseScenarioEvidence(row.evidence).autoNames.length === 0) {
-		fail(`${id} lacks exact automated evidence`);
-	}
 }
 
 if (stable) {

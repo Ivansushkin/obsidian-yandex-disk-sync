@@ -1,5 +1,7 @@
 import type { FileMetadata, YandexDiskSyncSettings } from "../types";
 import { createSafeRecord, setRecordValue } from "../utils/record-utils";
+import { isFileModificationTime } from "../utils/timestamp-utils";
+import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -79,7 +81,7 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 			raw.path !== path ||
 			typeof raw.sha256 !== "string" ||
 			!isNonNegativeInteger(raw.size) ||
-			!isNonNegativeInteger(raw.mtime) ||
+			!isFileModificationTime(raw.mtime) ||
 			!isNonNegativeInteger(raw.syncedAt) ||
 			(raw.deleted !== undefined && typeof raw.deleted !== "boolean") ||
 			(raw.deletedAt !== undefined && !isNonNegativeInteger(raw.deletedAt)) ||
@@ -110,19 +112,29 @@ export function parseStable1xIndex(value: unknown): Stable1xIndex | null {
 /** Parse only the complete plaintext plugin snapshot written by stable 1.0/1.1. */
 export function parseStable1xPluginData(
 	value: unknown,
-): Stable1xPluginData | null {
-	if (!isRecord(value) || !hasExactKeys(value, PLUGIN_DATA_KEYS)) return null;
-	if (!isStable1xSettings(value.settings) || !isStable1xStats(value.lastSyncStats)) {
-		return null;
+): Stable1xPluginData {
+	if (!isRecord(value) || !hasExactKeys(value, PLUGIN_DATA_KEYS)) {
+		rejectStableSnapshot("root fields");
 	}
+	if (!isStable1xSettings(value.settings)) rejectStableSnapshot("settings");
+	if (!isStable1xStats(value.lastSyncStats)) rejectStableSnapshot("lastSyncStats");
 	const localIndex =
 		value.localIndex === null ? null : parseStable1xIndex(value.localIndex);
-	if (value.localIndex !== null && !localIndex) return null;
+	if (value.localIndex !== null && !localIndex) rejectStableSnapshot("localIndex");
 	return {
 		settings: { ...value.settings },
 		localIndex,
 		lastSyncStats: { ...value.lastSyncStats },
 	};
+}
+
+/** Report only fixed schema sections, never user-provided keys, paths or values. */
+function rejectStableSnapshot(
+	section: "root fields" | "settings" | "lastSyncStats" | "localIndex",
+): never {
+	throw new UnsupportedHistoricalDataError(
+		`Unmarked plugin data is not an exact stable 1.0/1.1 snapshot (invalid ${section})`,
+	);
 }
 
 /**

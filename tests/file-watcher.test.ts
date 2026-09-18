@@ -601,168 +601,47 @@ test("queued rename followed by delete reduces to source deletion", () => {
 	);
 });
 
-test("successful full barrier acknowledges only pre-full uploads", () => {
-	const watcher = createWatcher();
-	watcher.loadDeferredEvents([
-		{
-			id: "covered-upload",
-			action: "upload",
-			path: "covered.md",
-			epoch: "epoch-a",
-			baseRevision: 7,
-			createdAt: 1,
-		},
-		{
-			id: "delete-event",
-			action: "delete",
-			path: "deleted.md",
-			epoch: "epoch-a",
-			baseRevision: 7,
-			createdAt: 2,
-		},
-		{
-			id: "rename-event",
-			action: "rename",
-			path: "A.md",
-			targetPath: "B.md",
-			kind: "file",
-			epoch: "epoch-a",
-			baseRevision: 7,
-			createdAt: 3,
-		},
-	]);
-	const access = watcher as unknown as FileWatcherTestAccess;
-
-	access.captureFullSyncBarrier({
-		sessionId: "full-1",
-		kind: "full",
-	});
-	access.deferEvent({
-		id: "during-full-upload",
-		action: "upload",
-		path: "during.md",
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 4,
-	});
-	access.completeFullSyncBarrier({
-		sessionId: "full-1",
-		kind: "full",
-		success: true,
-	});
-
-	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) =>
-			"id" in event ? event.id : event.path,
-		),
-		["delete-event", "rename-event", "during-full-upload"],
-	);
+test("full barrier settles captured uploads only after success and retains later work", () => {
+	for (const success of [true, false]) {
+		const watcher = createWatcher();
+		const access = watcher as unknown as FileWatcherTestAccess;
+		const context = { epoch: "epoch-a", baseRevision: 7, createdAt: 1 };
+		watcher.loadDeferredEvents([
+			{ ...context, id: "covered-upload", action: "upload", path: "covered.md" },
+			{ ...context, id: "delete-event", action: "delete", path: "deleted.md" },
+			{ ...context, id: "rename-event", action: "rename", path: "A.md",
+				targetPath: "B.md", kind: "file" },
+		]);
+		access.captureFullSyncBarrier({ sessionId: "full-1", kind: "full" });
+		access.deferEvent({ ...context, id: "during-full-upload", action: "upload", path: "during.md" });
+		access.completeFullSyncBarrier({ sessionId: "full-1", kind: "full", success });
+		assert.deepEqual(
+			watcher.getDeferredEvents().map((event) => "id" in event ? event.id : event.path),
+			[...(success ? [] : ["covered-upload"]), "delete-event", "rename-event", "during-full-upload"],
+			`success=${success}`,
+		);
+	}
 });
 
-test("failed full barrier retains every captured upload", () => {
-	const watcher = createWatcher();
-	watcher.loadDeferredEvents([
-		{
-			id: "covered-upload",
-			action: "upload",
-			path: "covered.md",
-			epoch: "epoch-a",
-			baseRevision: 7,
-			createdAt: 1,
-		},
-	]);
-	const access = watcher as unknown as FileWatcherTestAccess;
-
-	access.captureFullSyncBarrier({
-		sessionId: "full-1",
-		kind: "full",
-	});
-	access.completeFullSyncBarrier({
-		sessionId: "full-1",
-		kind: "full",
-		success: false,
-	});
-
-	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) =>
-			"id" in event ? event.id : event.path,
-		),
-		["covered-upload"],
-	);
-});
-
-test("successful session replays only watcher events created while paused", async () => {
-	const watcher = createWatcher();
-	const access = watcher as unknown as FileWatcherTestAccess;
-	access.isEnabled = true;
-	watcher.loadDeferredEvents([
-		{
-			id: "old-rename",
-			action: "rename",
-			path: "A.md",
-			targetPath: "B.md",
-			kind: "file",
-			epoch: "epoch-a",
-			baseRevision: 7,
-			createdAt: 1,
-		},
-	]);
-	const replayed: string[][] = [];
-	access.flushDeferredEvents = async (onlyIds) => {
-		replayed.push([...(onlyIds ?? [])]);
-	};
-
-	await watcher.pauseForSync({
-		sessionId: "maintenance-1",
-		kind: "maintenance",
-	});
-	access.deferEvent({
-		id: "new-upload",
-		action: "upload",
-		path: "new.md",
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 2,
-	});
-	await watcher.resumeAfterSync({
-		sessionId: "maintenance-1",
-		kind: "maintenance",
-		success: true,
-	});
-
-	assert.deepEqual(replayed, [["new-upload"]]);
-});
-
-test("failed session does not replay watcher events created while paused", async () => {
-	const watcher = createWatcher();
-	const access = watcher as unknown as FileWatcherTestAccess;
-	access.isEnabled = true;
-	watcher.loadDeferredEvents([]);
-	let replayed = false;
-	access.flushDeferredEvents = async () => {
-		replayed = true;
-	};
-
-	await watcher.pauseForSync({
-		sessionId: "maintenance-1",
-		kind: "maintenance",
-	});
-	access.deferEvent({
-		id: "new-upload",
-		action: "upload",
-		path: "new.md",
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 2,
-	});
-	await watcher.resumeAfterSync({
-		sessionId: "maintenance-1",
-		kind: "maintenance",
-		success: false,
-	});
-
-	assert.equal(replayed, false);
-	assert.equal(watcher.getDeferredEvents().length, 1);
+test("session resume replays only new paused events after success", async () => {
+	for (const success of [true, false]) {
+		const watcher = createWatcher();
+		const access = watcher as unknown as FileWatcherTestAccess;
+		access.isEnabled = true;
+		const context = { epoch: "epoch-a", baseRevision: 7, createdAt: 1 };
+		watcher.loadDeferredEvents([
+			{ ...context, id: "old-rename", action: "rename", path: "A.md",
+				targetPath: "B.md", kind: "file" },
+		]);
+		const replayed: string[][] = [];
+		access.flushDeferredEvents = async (onlyIds) => { replayed.push([...(onlyIds ?? [])]); };
+		const session = { sessionId: "maintenance-1", kind: "maintenance" as const };
+		await watcher.pauseForSync(session);
+		access.deferEvent({ ...context, id: "new-upload", action: "upload", path: "new.md" });
+		await watcher.resumeAfterSync({ ...session, success });
+		assert.deepEqual(replayed, success ? [["new-upload"]] : [], `success=${success}`);
+		if (!success) assert.equal(watcher.getDeferredEvents().length, 2);
+	}
 });
 
 test("full barrier acknowledgement is persisted before resume completes", async () => {

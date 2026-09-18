@@ -93,7 +93,8 @@ test("resume cannot start automation while legacy migration is required", async 
 	assert.deepEqual(restores, []);
 });
 
-test("foreign device revalidates a stale legacy migration block", async () => {
+/** Isolate startup classification from unrelated UI and lifecycle setup. */
+function createStartupPlugin() {
 	const plugin = Object.create(YandexDiskSyncPlugin.prototype) as unknown as {
 		refreshRemoteStartupState(prompt: boolean): Promise<string>;
 		settings: typeof DEFAULT_SETTINGS;
@@ -113,65 +114,7 @@ test("foreign device revalidates a stale legacy migration block", async () => {
 		blockingNotice: null;
 		regularSyncStarted: boolean;
 	};
-	let canonicalReads = 0;
-	plugin.settings = { ...DEFAULT_SETTINGS, yandexTokenSecret: "configured" };
-	plugin.remoteStateValidated = true;
-	plugin.migrationBlockReason = "legacy migration required";
-	plugin.historicalBlockReason = null;
-	plugin.authenticationBlockReason = null;
-	plugin.encryptionBlockReason = null;
-	plugin.encryptionTransition = null;
-	plugin.stableCutoverPending = false;
-	plugin.blockingNotice = null;
-	plugin.regularSyncStarted = false;
-	plugin.indexManager = {
-		downloadEncryptionManifest: async () => null,
-		inspectRemoteCanonicalFormat: async () => {
-			canonicalReads++;
-			return "current";
-		},
-	};
-	plugin.syncEngine = {
-		setExternalBlock: () => {},
-		isSyncInProgress: () => false,
-	};
-	plugin.fileWatcher = { stop: () => {} };
-	plugin.syncScheduler = { stop: () => {} };
-	plugin.tryRecoverRemoteTargetTransition = async () => {};
-	plugin.ensureEncryptionReady = async () => true;
-
-	assert.equal(await plugin.refreshRemoteStartupState(false), "ready");
-	assert.equal(canonicalReads, 1);
-	assert.equal(plugin.migrationBlockReason, null);
-});
-
-test("encrypted current local state cannot Force a plaintext stable migration", async () => {
-	const plugin = Object.create(YandexDiskSyncPlugin.prototype) as unknown as {
-		refreshRemoteStartupState(prompt: boolean): Promise<string>;
-		settings: typeof DEFAULT_SETTINGS;
-		remoteStateValidated: boolean;
-		migrationBlockReason: string | null;
-		historicalBlockReason: string | null;
-		authenticationBlockReason: string | null;
-		encryptionBlockReason: string | null;
-		encryptionTransition: null;
-		stableCutoverPending: boolean;
-		indexManager: Record<string, (...args: unknown[]) => unknown>;
-		syncEngine: Record<string, (...args: unknown[]) => unknown>;
-		fileWatcher: Record<string, (...args: unknown[]) => unknown>;
-		syncScheduler: Record<string, (...args: unknown[]) => unknown>;
-		blockingNotice: null;
-		regularSyncStarted: boolean;
-	};
-	plugin.settings = {
-		...DEFAULT_SETTINGS,
-		yandexTokenSecret: "configured-placeholder",
-		enableEncryption: true,
-		encryptionSalt: "current-salt",
-		encryptionPassword: "password-placeholder",
-		encryptionRevision: 1,
-		encryptionProfileId: "hardened",
-	};
+	plugin.settings = { ...DEFAULT_SETTINGS, yandexTokenSecret: "configured-placeholder" };
 	plugin.remoteStateValidated = false;
 	plugin.migrationBlockReason = null;
 	plugin.historicalBlockReason = null;
@@ -181,17 +124,42 @@ test("encrypted current local state cannot Force a plaintext stable migration", 
 	plugin.stableCutoverPending = false;
 	plugin.blockingNotice = null;
 	plugin.regularSyncStarted = false;
-	plugin.indexManager = {
-		downloadEncryptionManifest: async () => null,
-		inspectRemoteCanonicalFormat: async () => "legacy",
-	};
 	plugin.syncEngine = {
 		setExternalBlock: () => {},
 		isSyncInProgress: () => false,
 	};
 	plugin.fileWatcher = { stop: () => {} };
 	plugin.syncScheduler = { stop: () => {} };
+	plugin.tryRecoverRemoteTargetTransition = async () => {};
+	plugin.ensureEncryptionReady = async () => true;
+	return plugin;
+}
 
+test("foreign device revalidates a stale legacy migration block", async () => {
+	const plugin = createStartupPlugin();
+	let canonicalReads = 0;
+	plugin.remoteStateValidated = true;
+	plugin.migrationBlockReason = "legacy migration required";
+	plugin.indexManager = {
+		downloadEncryptionManifest: async () => null,
+		inspectRemoteCanonicalFormat: async () => { canonicalReads++; return "current"; },
+	};
+	assert.equal(await plugin.refreshRemoteStartupState(false), "ready");
+	assert.equal(canonicalReads, 1);
+	assert.equal(plugin.migrationBlockReason, null);
+});
+
+test("encrypted current local state cannot Force a plaintext stable migration", async () => {
+	const plugin = createStartupPlugin();
+	Object.assign(plugin.settings, {
+		enableEncryption: true, encryptionSalt: "current-salt",
+		encryptionPassword: "password-placeholder", encryptionRevision: 1,
+		encryptionProfileId: "hardened",
+	});
+	plugin.indexManager = {
+		downloadEncryptionManifest: async () => null,
+		inspectRemoteCanonicalFormat: async () => "legacy",
+	};
 	assert.equal(await plugin.refreshRemoteStartupState(false), "blocked");
 	assert.equal(plugin.migrationBlockReason, null);
 	assert.notEqual(plugin.historicalBlockReason, null);
@@ -211,6 +179,8 @@ test("foreign current canonical requires verified local backup before stable cut
 		stableCutoverPending: boolean;
 		stablePluginDataSnapshot: Stable1xPluginData;
 		pluginDataPersistenceTail: Promise<void>;
+		pluginDataLoaded: boolean;
+		pluginDataLoadGeneration: number;
 		indexManager: Record<string, (...args: unknown[]) => unknown>;
 		backupManager: Record<string, (...args: unknown[]) => unknown>;
 		vaultAdapter: Record<string, (...args: unknown[]) => unknown>;
@@ -250,6 +220,8 @@ test("foreign current canonical requires verified local backup before stable cut
 	plugin.stableCutoverPending = true;
 	plugin.stablePluginDataSnapshot = stableSnapshot;
 	plugin.pluginDataPersistenceTail = Promise.resolve();
+	plugin.pluginDataLoaded = true;
+	plugin.pluginDataLoadGeneration = 0;
 	plugin.blockingNotice = null;
 	plugin.regularSyncStarted = false;
 	plugin.indexManager = {
@@ -305,6 +277,8 @@ test("queued stable persistence cannot cross the verified cutover boundary", asy
 		stableCutoverPending: boolean;
 		stablePluginDataSnapshot: Stable1xPluginData;
 		pluginDataPersistenceTail: Promise<void>;
+		pluginDataLoaded: boolean;
+		pluginDataLoadGeneration: number;
 		loadedPluginData: unknown;
 		buildPluginData(): Record<string, unknown>;
 		saveData(data: unknown): Promise<void>;
@@ -318,6 +292,8 @@ test("queued stable persistence cannot cross the verified cutover boundary", asy
 		lastSyncStats: { uploaded: 0, downloaded: 0, deleted: 0, errors: 0 },
 	} satisfies Stable1xPluginData;
 	let releaseTail = () => {};
+	plugin.pluginDataLoaded = true;
+	plugin.pluginDataLoadGeneration = 0;
 	plugin.pluginDataPersistenceTail = new Promise<void>((resolve) => {
 		releaseTail = resolve;
 	});
@@ -345,75 +321,119 @@ test("queued stable persistence cannot cross the verified cutover boundary", asy
 
 test("post-commit Force failure resumes cleanup without repeating migration", async () => {
 	const plugin = Object.create(YandexDiskSyncPlugin.prototype) as unknown as {
-		runConfirmedForceSync(
-			direction: "from_local",
-			task: (options: SyncRunOptions) => Promise<SyncResult>,
-		): Promise<void>;
-		settings: typeof DEFAULT_SETTINGS;
-		remoteStateValidated: boolean;
-		indexManager: Record<string, (...args: unknown[]) => unknown>;
-		confirmForceSync(): Promise<Record<string, unknown>>;
+		getForceSyncController(): import("../src/sync/force-sync-controller").ForceSyncController;
+		prepareForceSync(): Promise<unknown>;
+		confirmForceSync(): Promise<boolean>;
+		recheckLegacyMigrationSafety(): Promise<boolean>;
+		ensureEncryptionReady(): Promise<boolean>;
 		completeStableLocalCutover(): Promise<void>;
-		beginSyncNotice(): void;
-		finishSyncNotice(): void;
+		renderForceProgress(): void;
 		updateLastSyncStats(): void;
 		persistPluginData(): Promise<void>;
 		setMigrationBlock(reason: string | null): void;
-		startSync(): Promise<void>;
+		runFullSync(options: SyncRunOptions, notice: boolean, owned: boolean): Promise<SyncResult>;
+		remoteStateValidated: boolean;
+		indexManager: Record<string, (...args: unknown[]) => unknown>;
+		syncEngine: { isSyncInProgress(): boolean; forceSyncFromLocal(options: SyncRunOptions): Promise<SyncResult> };
+		backupManager: { createRemoteSnapshotBackup(): Promise<unknown> };
+		fileWatcher: { start(): void };
+		syncScheduler: { start(): void };
 	};
 	let cleanupStarts = 0;
 	let migrationReason: string | null = "migration required";
-	plugin.settings = { ...DEFAULT_SETTINGS, yandexTokenSecret: "configured" };
 	plugin.remoteStateValidated = true;
-	plugin.indexManager = {
-		captureForceCanonicalProof: async () => ({
-			state: "present",
-			rawSha256: "canonical-before",
-		}),
-		assertLegacyMigrationPathsSafe: async () => {},
-	};
-	plugin.confirmForceSync = async () => ({
-		success: true,
-		backupName: "verified.zip",
-		sha256: "backup-sha",
-		snapshotDigest: "snapshot-sha",
-	});
+	plugin.prepareForceSync = async () => ({ canonical: { state: "absent" }, migration: true });
+	plugin.indexManager = { getPendingPhysicalActions: () => [], getMaintenance: () => undefined };
+	plugin.confirmForceSync = async () => true;
+	plugin.backupManager = { createRemoteSnapshotBackup: async () => ({
+		success: true, backupName: "verified.zip", sha256: "backup-sha",
+		snapshotDigest: "snapshot-sha", fileCount: 1, totalSize: 10,
+	}) };
+	plugin.recheckLegacyMigrationSafety = async () => true;
+	plugin.ensureEncryptionReady = async () => true;
 	plugin.completeStableLocalCutover = async () => {};
-	plugin.beginSyncNotice = () => {};
-	plugin.finishSyncNotice = () => {};
+	plugin.renderForceProgress = () => {};
 	plugin.updateLastSyncStats = () => {};
 	plugin.persistPluginData = async () => {};
-	plugin.setMigrationBlock = (reason) => {
-		migrationReason = reason;
+	plugin.setMigrationBlock = (reason) => { migrationReason = reason; };
+	const result: SyncResult = {
+		success: false, replacementCommitted: true, uploaded: 1, downloaded: 0,
+		deleted: 0, conflicts: 0, startTime: 1, endTime: 2,
+		errors: [{ path: "old.md", operation: "delete_remote", message: "cleanup interrupted" }],
 	};
-	plugin.startSync = async () => {
+	plugin.syncEngine = {
+		isSyncInProgress: () => false,
+		forceSyncFromLocal: async (options) => {
+			await options.beforeForceMutation?.();
+			return result;
+		},
+	};
+	plugin.runFullSync = async (options, notice, owned) => {
+		assert.equal(notice, false); assert.equal(owned, true);
+		assert.equal(typeof options.onActivity, "function");
 		cleanupStarts++;
+		return { ...result, success: true, errors: [] };
 	};
-
-	await plugin.runConfirmedForceSync("from_local", async (options) => {
-		await options.beforeForceMutation?.();
-		return {
-			success: false,
-			replacementCommitted: true,
-			uploaded: 1,
-			downloaded: 0,
-			deleted: 0,
-			conflicts: 0,
-			errors: [
-				{
-					path: "old.md",
-					operation: "delete_remote",
-					message: "cleanup interrupted",
-				},
-			],
-			startTime: 1,
-			endTime: 2,
-		};
-	});
-
+	plugin.fileWatcher = { start() {} };
+	plugin.syncScheduler = { start() {} };
+	await plugin.getForceSyncController().run("from_local");
 	assert.equal(migrationReason, null);
 	assert.equal(plugin.remoteStateValidated, false);
 	assert.equal(cleanupStarts, 1);
+	assert.equal(plugin.getForceSyncController().getState()?.outcome, "success");
+});
+
+test("manual full preflight prevents Force from stealing foreground operation ownership", async () => {
+	let release = () => {};
+	const pending = new Promise<void>((done) => { release = done; });
+	const plugin = Object.create(YandexDiskSyncPlugin.prototype) as unknown as {
+		settings: typeof DEFAULT_SETTINGS;
+		syncEngine: { isSyncInProgress(): boolean };
+		restoreLocalStateOnce(): void;
+		registerSyncLifecycleOnce(): void;
+		refreshRemoteStartupState(): Promise<string>;
+		prepareForceSync(): Promise<never>;
+		runFullSync(): Promise<SyncResult | null>;
+		runForceSyncFromLocal(): Promise<void>;
+		isForceSyncUnavailable(): boolean;
+	};
+	plugin.settings = { ...DEFAULT_SETTINGS, yandexTokenSecret: "configured" };
+	plugin.syncEngine = { isSyncInProgress: () => false };
+	plugin.restoreLocalStateOnce = () => {};
+	plugin.registerSyncLifecycleOnce = () => {};
+	plugin.refreshRemoteStartupState = async () => { await pending; return "blocked"; };
+	plugin.prepareForceSync = async () => { throw new Error("Force must not start"); };
+	const full = plugin.runFullSync();
+	assert.equal(plugin.isForceSyncUnavailable(), true);
+	await plugin.runForceSyncFromLocal();
+	release(); await full;
+	assert.equal(plugin.isForceSyncUnavailable(), false);
+});
+
+test("encrypted Force permits owned authentication but blocks independent encryption actions", async () => {
+	const plugin = Object.create(YandexDiskSyncPlugin.prototype) as unknown as {
+		isForceSyncBusy(): boolean;
+		connectToRemoteEncryption(password: string): Promise<void>;
+		connectToRemoteEncryptionForSync(password: string): Promise<void>;
+		connectToRemoteEncryptionNow(password: string): Promise<void>;
+		enableEncryption(password: string): Promise<void>;
+		disableEncryption(): Promise<unknown>;
+		rotateEncryptionPassword(password: string): Promise<void>;
+		syncEngine: { runExclusiveMaintenance(task: () => Promise<void>): Promise<void> };
+	};
+	let authenticated = 0;
+	let maintenance = 0;
+	plugin.isForceSyncBusy = () => true;
+	plugin.connectToRemoteEncryptionNow = async () => { authenticated++; };
+	plugin.syncEngine = { runExclusiveMaintenance: async (task) => { maintenance++; await task(); } };
+	await assert.rejects(plugin.connectToRemoteEncryption("test-password"), /already in progress/);
+	await assert.rejects(plugin.enableEncryption("test-password"), /already in progress/);
+	await assert.rejects(plugin.rotateEncryptionPassword("test-password"), /already in progress/);
+	await assert.rejects(plugin.disableEncryption(), /already in progress/);
+	assert.equal(authenticated, 0);
+	await plugin.connectToRemoteEncryptionForSync("test-password");
+	assert.equal(authenticated, 1);
+	assert.equal(maintenance, 1);
 });
 
 test("remote path change invalidates the previous migration decision", () => {

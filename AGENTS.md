@@ -114,7 +114,7 @@
 - Do not change the `sync-index`, `encryption-manifest`, or `plugin-data`
   markers, profile `hardened`, epoch/revision, mutation FIFO, or the persisted
   physical-action schema without a separate migration design, scenarios, and
-  tests.
+  appropriate automated or manual verification.
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
   translations, and migration messages.
@@ -122,6 +122,24 @@
   entries back to `CHANGELOG.md` or `versions.json`.
 
 ## Documentation and testing
+
+- Bulk generation of unit tests is prohibited. Do not add a test for every
+  function, branch, or change, or increase test counts to chase coverage.
+- Unit tests are allowed only for complex algorithms in functions or their
+  interactions: causality, concurrency, transactions, recovery, data
+  transformation, and data preservation.
+- Before adding a test, identify the concrete failure it detects and confirm
+  that existing tests do not cover the same failure at the same boundary.
+- Keep only the minimum distinct scenarios, small fixtures, and outcome
+  assertions. Combine equivalent variants in readable tables. Compact means
+  less setup and duplication, not compressed lines or hidden test logic.
+- Do not unit-test trivial wrappers, formatting, UI wording, obvious
+  assignments, or implementation details. Do not build large UI mocks.
+- Execute real project algorithms. Mock call counts alone are not evidence;
+  assert call order only when it is necessary for correctness.
+- A bug fix does not automatically require a new unit test. Validate user
+  behavior with an appropriate functional check instead.
+- Passing unit tests do not prove that the plugin works in Obsidian.
 
 - Any synchronization algorithm change must update
   `docs/SYNC_USER_SCENARIOS.md` with a stable ID, expected canonical/local/
@@ -131,8 +149,10 @@
   `docs/PARALLELIZATION.md` must not contradict it.
 - Network and crash tests must cover ambiguous responses, restart, idempotent
   replay, and absence of false-success logs.
-- Multi-device changes must cover at least two independent local states,
-  offline return, reordered events, and plaintext/encrypted modes.
+- Validate multi-device changes with at least two independent local states,
+  offline return, reordered events, and plaintext/encrypted modes. Use focused
+  algorithm tests or functional checks; do not generate a unit-test matrix
+  for every change.
 - A release requires a manual run with two Obsidian profiles against real
   Yandex Disk. Automated tests do not replace it.
 

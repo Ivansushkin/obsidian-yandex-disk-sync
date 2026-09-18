@@ -12,38 +12,45 @@ import type { IndexManager } from "../src/sync/index-manager";
 import type { SyncEngine } from "../src/sync/sync-engine";
 import type { IndexMaintenance, RemoteEncryptionManifest } from "../src/types";
 
-test("pre-commit transition rolls back only when source is authoritative", () => {
-	assert.equal(
-		decideEncryptionRecovery("prepared", false, true),
-		"rollback-source",
-	);
-	assert.equal(
-		decideEncryptionRecovery("files-copied", false, true),
-		"rollback-source",
-	);
-});
+type TransitionLifecycle = ConstructorParameters<typeof EncryptionTransitionController>[2];
 
-test("target-readable canonical index completes a transition around commit", () => {
-	assert.equal(
-		decideEncryptionRecovery("files-copied", true, false),
-		"finish-target",
-	);
-});
+/** Supply inert boundaries; each scenario overrides the phase it exercises. */
+function createLifecycle(overrides: Partial<TransitionLifecycle> = {}): TransitionLifecycle {
+	return {
+		claim: async () => undefined,
+		applyTarget: async () => null,
+		resolveTargetPaths: async () => undefined,
+		assertSourceUnchanged: async () => undefined,
+		verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
+		setPhase: async () => undefined,
+		stageMaintenance: async () => undefined,
+		commitMaintenance: async () => undefined,
+		publishStable: async () => undefined,
+		prepareCleanup: async () => undefined,
+		deletePaths: async () => undefined,
+		deleteFolders: async () => undefined,
+		finishMaintenance: async () => true,
+		clearLocalTransition: async () => undefined,
+		recover: async () => undefined,
+		clearBlock: () => undefined,
+		createSyncFailure: () => new Error("sync failed"),
+		...overrides,
+	};
+}
 
-test("post-commit phases never roll back", () => {
-	for (const phase of ["index-committed", "stable", "cleanup"] as const) {
-		assert.equal(
-			decideEncryptionRecovery(phase, false, true),
-			"finish-target",
-		);
+test("encryption recovery follows canonical authority across the commit boundary", () => {
+	const cases = [
+		["prepared", false, true, "rollback-source"],
+		["files-copied", false, true, "rollback-source"],
+		["files-copied", true, false, "finish-target"],
+		["index-committed", false, true, "finish-target"],
+		["stable", false, true, "finish-target"],
+		["cleanup", false, true, "finish-target"],
+		["prepared", false, false, "blocked"],
+	] as const;
+	for (const [phase, targetReadable, sourceReadable, expected] of cases) {
+		assert.equal(decideEncryptionRecovery(phase, targetReadable, sourceReadable), expected, phase);
 	}
-});
-
-test("unreadable canonical state blocks automatic recovery", () => {
-	assert.equal(
-		decideEncryptionRecovery("prepared", false, false),
-		"blocked",
-	);
 });
 
 test("unrelated guarded cleanup does not block encryption recovery", () => {
@@ -154,60 +161,6 @@ function createTransition(): LocalEncryptionTransition {
 	};
 }
 
-test("transition services are cleared after a failed re-encode", async () => {
-	const calls: string[] = [];
-	const indexManager = {
-		setIndexTransitionServices: () => calls.push("set-codecs"),
-		clearIndexTransitionServices: () => calls.push("clear-codecs"),
-	} as unknown as IndexManager;
-	const syncEngine = {
-		reencodeRemoteFiles: async () => {
-			calls.push("reencode");
-			throw new Error("upload failed");
-		},
-	} as unknown as SyncEngine;
-	const lifecycle = {
-		claim: async () => undefined,
-		applyTarget: async () => null,
-		resolveTargetPaths: async () => undefined,
-		assertSourceUnchanged: async () => undefined,
-		verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-		setPhase: async () => undefined,
-		stageMaintenance: async () => undefined,
-		commitMaintenance: async () => undefined,
-		publishStable: async () => undefined,
-		prepareCleanup: async () => undefined,
-		deletePaths: async () => undefined,
-		deleteFolders: async () => undefined,
-		finishMaintenance: async () => true,
-		clearLocalTransition: async () => undefined,
-		recover: async () => {
-			calls.push("recover");
-		},
-		clearBlock: () => undefined,
-		createSyncFailure: () => new Error("sync failed"),
-	};
-	const controller = new EncryptionTransitionController(
-		indexManager,
-		syncEngine,
-		lifecycle,
-	);
-
-	await assert.rejects(
-		controller.execute({
-			transition: createTransition(),
-			sourceService: null,
-		}),
-		/upload failed/,
-	);
-	assert.deepEqual(calls, [
-		"set-codecs",
-		"reencode",
-		"clear-codecs",
-		"recover",
-	]);
-});
-
 test("target manifest is published after claim and before target writes", async () => {
 	const calls: string[] = [];
 	const indexManager = {
@@ -230,7 +183,7 @@ test("target manifest is published after claim and before target writes", async 
 			};
 		},
 	} as unknown as SyncEngine;
-	const lifecycle = {
+	const lifecycle = createLifecycle({
 		claim: async () => {
 			calls.push("claim");
 		},
@@ -241,21 +194,7 @@ test("target manifest is published after claim and before target writes", async 
 		resolveTargetPaths: async () => {
 			calls.push("resolve-target");
 		},
-		assertSourceUnchanged: async () => undefined,
-		verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-		setPhase: async () => undefined,
-		stageMaintenance: async () => undefined,
-		commitMaintenance: async () => undefined,
-		publishStable: async () => undefined,
-		prepareCleanup: async () => undefined,
-		deletePaths: async () => undefined,
-		deleteFolders: async () => undefined,
-		finishMaintenance: async () => true,
-		clearLocalTransition: async () => undefined,
-		recover: async () => undefined,
-		clearBlock: () => undefined,
-		createSyncFailure: () => new Error("sync failed"),
-	};
+	});
 	const controller = new EncryptionTransitionController(
 		indexManager,
 		syncEngine,
@@ -302,13 +241,7 @@ test("cleanup proof is committed atomically with target canonical state", async 
 			};
 		},
 	} as unknown as SyncEngine;
-	const lifecycle = {
-		claim: async () => undefined,
-		applyTarget: async () => null,
-		resolveTargetPaths: async () => undefined,
-		assertSourceUnchanged: async () => undefined,
-		verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-		setPhase: async () => undefined,
+	const lifecycle = createLifecycle({
 		stageMaintenance: async (
 			_unusedTransition: LocalEncryptionTransition,
 			phase: string,
@@ -316,17 +249,7 @@ test("cleanup proof is committed atomically with target canonical state", async 
 		) => {
 			if (phase === "index-committed") stagedCleanup = cleanup ?? [];
 		},
-		commitMaintenance: async () => undefined,
-		publishStable: async () => undefined,
-		prepareCleanup: async () => undefined,
-		deletePaths: async () => undefined,
-		deleteFolders: async () => undefined,
-		finishMaintenance: async () => true,
-		clearLocalTransition: async () => undefined,
-		recover: async () => undefined,
-		clearBlock: () => undefined,
-		createSyncFailure: () => new Error("sync failed"),
-	};
+	});
 	await new EncryptionTransitionController(
 		indexManager,
 		syncEngine,
@@ -356,25 +279,7 @@ test("missing source fingerprint blocks transition before canonical commit", asy
 			throw new Error("unexpected commit");
 		},
 	} as unknown as SyncEngine;
-	const lifecycle = {
-		claim: async () => undefined,
-		applyTarget: async () => null,
-		resolveTargetPaths: async () => undefined,
-		assertSourceUnchanged: async () => undefined,
-		verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-		setPhase: async () => undefined,
-		stageMaintenance: async () => undefined,
-		commitMaintenance: async () => undefined,
-		publishStable: async () => undefined,
-		prepareCleanup: async () => undefined,
-		deletePaths: async () => undefined,
-		deleteFolders: async () => undefined,
-		finishMaintenance: async () => true,
-		clearLocalTransition: async () => undefined,
-		recover: async () => undefined,
-		clearBlock: () => undefined,
-		createSyncFailure: () => new Error("sync failed"),
-	};
+	const lifecycle = createLifecycle();
 
 	await assert.rejects(
 		new EncryptionTransitionController(
@@ -418,11 +323,7 @@ test("each rewritten target is proven before the canonical commit", async () => 
 			};
 		},
 	} as unknown as SyncEngine;
-	const lifecycle = {
-		claim: async () => undefined,
-		applyTarget: async () => null,
-		resolveTargetPaths: async () => undefined,
-		assertSourceUnchanged: async () => undefined,
+	const lifecycle = createLifecycle({
 		verifyTargetUpload: async (
 			_received: LocalEncryptionTransition,
 			path: string,
@@ -433,19 +334,7 @@ test("each rewritten target is proven before the canonical commit", async () => 
 			calls.push("stable-readback-proof");
 			return { remoteFingerprint: "sha256:target" };
 		},
-		setPhase: async () => undefined,
-		stageMaintenance: async () => undefined,
-		commitMaintenance: async () => undefined,
-		publishStable: async () => undefined,
-		prepareCleanup: async () => undefined,
-		deletePaths: async () => undefined,
-		deleteFolders: async () => undefined,
-		finishMaintenance: async () => true,
-		clearLocalTransition: async () => undefined,
-		recover: async () => undefined,
-		clearBlock: () => undefined,
-		createSyncFailure: () => new Error("sync failed"),
-	};
+	});
 	await new EncryptionTransitionController(
 		indexManager,
 		syncEngine,
@@ -490,30 +379,18 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 				};
 			},
 		} as unknown as SyncEngine;
-		const lifecycle = {
+		const lifecycle = createLifecycle({
 			claim: async () => failAt("claim"),
 			applyTarget: async () => {
 				failAt("apply-target");
 				return null;
 			},
-			resolveTargetPaths: async () => undefined,
 			assertSourceUnchanged: async () => failAt("before-commit"),
-			verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-			setPhase: async () => undefined,
-			stageMaintenance: async () => undefined,
 			commitMaintenance: async () => failAt("cleanup"),
-			publishStable: async () => undefined,
-			prepareCleanup: async () => undefined,
-			deletePaths: async () => undefined,
-			deleteFolders: async () => undefined,
-			finishMaintenance: async () => true,
-			clearLocalTransition: async () => undefined,
 			recover: async () => {
 				calls.push("recover");
 			},
-			clearBlock: () => undefined,
-			createSyncFailure: () => new Error("sync failed"),
-		};
+		});
 		const controller = new EncryptionTransitionController(
 			indexManager,
 			syncEngine,
@@ -534,6 +411,9 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 			calls.includes("clear-codecs"),
 			`codec scope leaked at ${fault}`,
 		);
+		if (calls.includes("set-codecs")) {
+			assert.ok(calls.indexOf("clear-codecs") < calls.indexOf("recover"), fault);
+		}
 	}
 });
 
@@ -561,14 +441,7 @@ test("all rewrite modes use the same post-commit cleanup", async () => {
 				};
 			},
 		} as unknown as SyncEngine;
-		const lifecycle = {
-			claim: async () => undefined,
-			applyTarget: async () => null,
-			resolveTargetPaths: async () => undefined,
-			assertSourceUnchanged: async () => undefined,
-			verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-			setPhase: async () => undefined,
-			stageMaintenance: async () => undefined,
+		const lifecycle = createLifecycle({
 			commitMaintenance: async () => {
 				calls.push("commit-cleanup");
 			},
@@ -595,8 +468,7 @@ test("all rewrite modes use the same post-commit cleanup", async () => {
 				calls.push("recover");
 			},
 			clearBlock: () => calls.push("clear-block"),
-			createSyncFailure: () => new Error("sync failed"),
-		};
+		});
 		const controller = new EncryptionTransitionController(
 			indexManager,
 			syncEngine,
@@ -625,29 +497,15 @@ test("incomplete cleanup keeps the transition blocked and local state durable", 
 	const syncEngine = {
 		showMaintenanceCleanupPhase: () => undefined,
 	} as unknown as SyncEngine;
-	const lifecycle = {
-		claim: async () => undefined,
-		applyTarget: async () => null,
-		resolveTargetPaths: async () => undefined,
-		assertSourceUnchanged: async () => undefined,
-		verifyTargetUpload: async () => ({ remoteFingerprint: "target" }),
-		setPhase: async () => undefined,
-		stageMaintenance: async () => undefined,
-		commitMaintenance: async () => undefined,
-		publishStable: async () => undefined,
-		prepareCleanup: async () => undefined,
-		deletePaths: async () => undefined,
-		deleteFolders: async () => undefined,
+	const lifecycle = createLifecycle({
 		finishMaintenance: async () => false,
 		clearLocalTransition: async () => {
 			clearedLocal = true;
 		},
-		recover: async () => undefined,
 		clearBlock: () => {
 			clearedBlock = true;
 		},
-		createSyncFailure: () => new Error("sync failed"),
-	};
+	});
 
 	await assert.rejects(
 		new EncryptionTransitionController(

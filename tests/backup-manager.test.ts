@@ -111,6 +111,31 @@ function createManager(
 	};
 }
 
+test("both Force backup directions report upload and readback before returning verified success", async () => {
+	for (const remote of [false, true]) {
+		const client = new FakeBackupClient();
+		client.encrypted = false;
+		const { manager } = createManager(client, async () => new TextEncoder().encode("content").buffer);
+		const phases: string[] = [];
+		const upload = client.uploadFileExclusive.bind(client);
+		client.uploadFileExclusive = async (path, bytes) => {
+			assert.equal(phases[phases.length - 1], "uploading-backup");
+			await upload(path, bytes);
+		};
+		const read = client.downloadStableRawFile.bind(client);
+		client.downloadStableRawFile = async (path) => {
+			assert.equal(phases[phases.length - 1], "verifying-backup");
+			return await read(path);
+		};
+		const result = remote
+			? await manager.createRemoteSnapshotBackup(undefined, (phase) => phases.push(phase))
+			: await manager.createBackup(undefined, (phase) => phases.push(phase));
+		assert.equal(result.success, true);
+		assert.ok(result.sha256);
+		assert.deepEqual(phases, ["creating-backup", "uploading-backup", "verifying-backup"]);
+	}
+});
+
 test("Force backup proof binds the exact logical and remote snapshots", async () => {
 	const client = new FakeBackupClient();
 	let localContent = "local-a";

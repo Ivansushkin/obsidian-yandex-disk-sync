@@ -6,6 +6,19 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"notice.force_busy": "Force synchronization is already in progress.",
+		"notice.force_phase_preflight": "Checking before synchronization…",
+		"notice.force_phase_confirming": "Waiting for Force synchronization confirmation…",
+		"notice.force_phase_creating-backup": "Creating backup…",
+		"notice.force_phase_uploading-backup": "Uploading backup…",
+		"notice.force_phase_verifying-backup": "Verifying backup…",
+		"notice.force_phase_syncing": "Force synchronization",
+		"notice.force_phase_persisting": "Saving synchronization state…",
+		"notice.force_phase_reconciling": "Final synchronization check",
+		"notice.force_migration_completed": "Upgrade to 2.0.0 completed. Synchronization finished.",
+		"notice.force_backup_failed": "Backup could not be verified. Force synchronization was not started.",
+		"notice.force_finalization_pending": "The new snapshot is saved, but synchronization needs another check. Run normal synchronization; do not repeat Force.",
+		"notice.force_flow_failed": "Force synchronization was interrupted. Check the connection and plugin status before retrying with a new backup. Files already transferred may have changed.",
 		// Commands
 		"command.sync_now": "Sync with Yandex Disk now",
 		"command.toggle_sync": "Pause/Resume synchronization",
@@ -343,6 +356,19 @@ export const translations: Record<Language, Record<string, string>> = {
 
 	},
 	ru: {
+		"notice.force_busy": "Принудительная синхронизация уже выполняется.",
+		"notice.force_phase_preflight": "Проверка перед синхронизацией…",
+		"notice.force_phase_confirming": "Ожидание подтверждения принудительной синхронизации…",
+		"notice.force_phase_creating-backup": "Создание резервной копии…",
+		"notice.force_phase_uploading-backup": "Загрузка резервной копии…",
+		"notice.force_phase_verifying-backup": "Проверка резервной копии…",
+		"notice.force_phase_syncing": "Принудительная синхронизация",
+		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
+		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
+		"notice.force_migration_completed": "Переход на 2.0.0 завершён. Синхронизация выполнена.",
+		"notice.force_backup_failed": "Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
+		"notice.force_finalization_pending": "Новый снимок сохранён, но завершение синхронизации требует повторной проверки. Запустите обычную синхронизацию; повторять Force не нужно.",
+		"notice.force_flow_failed": "Принудительная синхронизация прервана. Проверьте соединение и статус плагина перед повтором с новой резервной копией. Уже переданные файлы могли измениться.",
 		// Commands
 		"command.sync_now": "Синхронизировать с Яндекс Диском сейчас",
 		"command.toggle_sync": "Приостановить/возобновить синхронизацию",

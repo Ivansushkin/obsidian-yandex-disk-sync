@@ -32,6 +32,8 @@ export interface BackupResult {
 	error?: string;
 }
 
+export type BackupProgress = "creating-backup" | "uploading-backup" | "verifying-backup";
+
 export class BackupPasswordRequiredError extends Error {
 	constructor() {
 		super("A password is required to open this backup");
@@ -63,8 +65,12 @@ export class BackupManager {
 	/**
 	 * Create backup of all synchronized files
 	 */
-	async createBackup(passwordOverride?: string): Promise<BackupResult> {
+	async createBackup(
+		passwordOverride?: string,
+		onProgress?: (phase: BackupProgress) => void,
+	): Promise<BackupResult> {
 		try {
+			onProgress?.("creating-backup");
 			logger.info("Starting backup creation...");
 
 			const snapshot = await captureLogicalVaultSnapshot(this.vaultAdapter);
@@ -100,6 +106,7 @@ export class BackupManager {
 				uploadContent,
 				Boolean(password),
 				createdAt,
+				onProgress,
 			);
 
 			logger.info("Backup upload verified", {
@@ -140,8 +147,10 @@ export class BackupManager {
 	 */
 	async createRemoteSnapshotBackup(
 		passwordOverride?: string,
+		onProgress?: (phase: BackupProgress) => void,
 	): Promise<BackupResult> {
 		try {
+			onProgress?.("creating-backup");
 			const snapshot = await captureRemoteRawSnapshot(
 				this.yandexClient,
 				this.settings.remotePath,
@@ -173,6 +182,7 @@ export class BackupManager {
 				uploadContent,
 				Boolean(password),
 				createdAt,
+				onProgress,
 			);
 			logger.info("Remote snapshot backup upload verified", {
 				backupName: uploaded.backupName,
@@ -207,6 +217,7 @@ export class BackupManager {
 		content: ArrayBuffer,
 		encrypted: boolean,
 		createdAt: number,
+		onProgress?: (phase: BackupProgress) => void,
 	): Promise<{
 		backupName: string;
 		remoteFingerprint: string;
@@ -227,6 +238,7 @@ export class BackupManager {
 				backupName,
 			);
 			try {
+				onProgress?.("uploading-backup");
 				await this.yandexClient.uploadFileExclusive(
 					backupPath,
 					content,
@@ -238,6 +250,7 @@ export class BackupManager {
 			}
 
 			try {
+				onProgress?.("verifying-backup");
 				const readback =
 					await this.yandexClient.downloadStableRawFile(backupPath);
 				if (readback) {
