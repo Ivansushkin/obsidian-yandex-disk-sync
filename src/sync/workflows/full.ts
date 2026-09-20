@@ -296,7 +296,7 @@ export async function reconcileFullSync(
 	const localIndex = deps.indexManager.getLocalIndex();
 	const remoteIndex = deps.indexManager.getRemoteIndex();
 
-	const operations = adoption.adoptionSnapshot
+	let operations = adoption.adoptionSnapshot
 		? deps.conflictResolver.determineEpochAdoptionOperations(
 				localFiles,
 				remoteFiles,
@@ -312,6 +312,33 @@ export async function reconcileFullSync(
 				remoteIndex.folderTombstones,
 				deps.indexManager.getPendingLocalDeletePaths(),
 			);
+	if (
+		!adoption.adoptionSnapshot &&
+		!hadPendingCausalWork &&
+		!remoteIndex.maintenance
+	) {
+		operations = operations.filter((operation) => {
+			const { path } = operation;
+			if (
+				operation.action !== "delete_local" ||
+				!remoteIndex.files[path]?.deleted ||
+				localFiles.has(path) ||
+				remoteFiles.has(path)
+			) {
+				return true;
+			}
+			if (
+				deps.fileOperations.vaultAdapter.fileExists(path) ||
+				deps.fileOperations.vaultAdapter.folderExists(path)
+			) {
+				throw new Error(
+					"Local object exists outside the scanned snapshot; reconciliation required",
+				);
+			}
+			// Absence already matches the tombstone; there is no physical work to stage.
+			return false;
+		});
+	}
 	const pendingMutationsBeforeBaselines =
 		deps.indexManager.getPendingMutations().length;
 	const baselinesChanged = syncReconciliation.recordConfirmedBaselines(

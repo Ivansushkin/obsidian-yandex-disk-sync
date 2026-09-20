@@ -1428,13 +1428,21 @@ export class IndexManager {
 	 * replacing the in-memory desired state.
 	 */
 	async readCanonicalIndex(): Promise<SyncIndex> {
-		const path = await this.waitForCanonicalIndex();
-		if (!path) {
+		const discovery = await this.waitForCanonicalIndexFromStableRoot();
+		if (!discovery.path) {
 			throw new RemoteIndexConcurrentModificationError(
 				"Canonical index is missing",
 			);
 		}
-		return await this.downloadIndex(path, false);
+		return (
+			await this.downloadIndexSnapshot(
+				discovery.path,
+				false,
+				undefined,
+				undefined,
+				discovery.resource,
+			)
+		).index;
 	}
 
 	/** Read canonical with an explicit target codec without changing local state. */
@@ -1454,11 +1462,19 @@ export class IndexManager {
 	async readCanonicalIndexWithCodecIfPresent(
 		service: EncryptionCodec | null,
 	): Promise<SyncIndex | null> {
-		const path = await this.waitForCanonicalIndex();
-		if (!path) {
+		const discovery = await this.waitForCanonicalIndexFromStableRoot();
+		if (!discovery.path) {
 			return null;
 		}
-		return await this.downloadIndex(path, false, service);
+		return (
+			await this.downloadIndexSnapshot(
+				discovery.path,
+				false,
+				service,
+				undefined,
+				discovery.resource,
+			)
+		).index;
 	}
 
 	/** Adopt explicitly decoded canonical only inside matching target recovery. */

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { YandexDiskClient } from "../src/api/yandex-client";
+import { YandexApiError, YandexDiskClient } from "../src/api/yandex-client";
 import type { YandexResource } from "../src/types";
 
 interface TestRequestParams {
@@ -397,6 +397,61 @@ test("DELETE retry revalidates revoked authority before sending another request"
 		);
 		assert.equal(requests, 1);
 		assert.deepEqual(remoteBytes, original);
+	} finally {
+		delete requestGlobal.__obsidianRequestUrl;
+	}
+});
+
+test("DELETE guard failures are not treated as resource absence", async () => {
+	const client = new YandexDiskClient({
+		token: "synthetic",
+		maxRetries: 1,
+		retryDelay: 0,
+	});
+	try {
+		for (const priorAttempts of [0, 1]) {
+			for (const failure of [
+				new YandexApiError("canonical disappeared", 404),
+				new YandexApiError("authentication failed", 401),
+				new Error("decryption failed"),
+			]) {
+				let sent = 0;
+				requestGlobal.__obsidianRequestUrl = async () => {
+					sent++;
+					return response(503);
+				};
+				await assert.rejects(
+					client.deleteResource(
+						"vault/note.md",
+						false,
+						true,
+						async () => {
+							if (sent === priorAttempts) {
+								throw failure;
+							}
+						},
+					),
+					(error) => error === failure,
+				);
+				assert.equal(sent, priorAttempts);
+			}
+		}
+		let checked = false;
+		requestGlobal.__obsidianRequestUrl = async () => {
+			assert.equal(checked, true);
+			return response(404);
+		};
+		await client.deleteResource("vault/note.md", false, true, async () => {
+			checked = true;
+		});
+		requestGlobal.__obsidianRequestUrl = async (params) =>
+			params.method === "DELETE"
+				? response(202, { href: "https://synthetic.invalid/operation" })
+				: response(404);
+		await assert.rejects(
+			client.deleteResource("vault/note.md", false, true),
+			(error) => error instanceof YandexApiError && error.status === 404,
+		);
 	} finally {
 		delete requestGlobal.__obsidianRequestUrl;
 	}

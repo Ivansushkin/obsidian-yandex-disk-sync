@@ -349,7 +349,6 @@ export async function deleteRemoteFile(
 		}
 	};
 	try {
-		await revalidate();
 		await deps.yandexClient.deleteResource(
 			remotePath,
 			false,

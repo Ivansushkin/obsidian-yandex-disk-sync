@@ -10,8 +10,200 @@ import test from "node:test";
 import { computeSha256 } from "../src/utils/hash-utils";
 import { MemoryDisk, bytes, codecFor, device } from "./helpers/sync-flow";
 
+test("canonical reads reuse stable root metadata without weakening snapshot checks", async () => {
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "device-a", codec);
+		const b = device(
+			disk,
+			"device-b",
+			encrypted ? null : await codecFor(true),
+		);
+		const path = "vault/.obsidian-sync-index.json";
+		try {
+			a.vault.put("__proto__", bytes("kept"));
+			await a.full();
+			const raw = disk.files.get(path)!.slice(0);
+			let requests = 0;
+			disk.beforeRequest = async (method) => {
+				assert.equal(method, "GET");
+				requests++;
+			};
+			const canonical = await a.index.readCanonicalIndex();
+			assert.equal(
+				canonical.files["__proto__"]?.sha256,
+				await computeSha256(bytes("kept")),
+			);
+			assert.equal(requests, 5);
+			requests = 0;
+			assert.deepEqual(
+				await b.index.readCanonicalIndexWithCodecIfPresent(codec),
+				canonical,
+			);
+			assert.equal(requests, 5);
+			assert.deepEqual(disk.files.get(path), raw);
+
+			// Change raw bytes after download, before the final metadata observation.
+			disk.afterRequest = async (_method, endpoint, resourcePath) => {
+				if (endpoint === "/download" && resourcePath === path) {
+					const changed = new Uint8Array(raw.slice(0));
+					changed[0] = (changed[0] ?? 0) ^ 1;
+					disk.files.set(path, changed.buffer);
+				}
+			};
+			await assert.rejects(
+				a.index.readCanonicalIndex(),
+				/changed while being read/,
+			);
+			disk.afterRequest = undefined;
+			disk.files.set(path, raw);
+			assert.deepEqual(await a.index.readCanonicalIndex(), canonical);
+
+			const locks = [
+				"vault/.obsidian-sync-index.lock.a.1",
+				"vault/.obsidian-sync-index.lock.b.2",
+			];
+			for (const lock of locks) {
+				disk.files.set(lock, raw);
+			}
+			await assert.rejects(
+				a.index.readCanonicalIndex(),
+				/Multiple orphan index locks/,
+			);
+			for (const lock of locks) {
+				disk.files.delete(lock);
+			}
+			disk.files.delete(path);
+			assert.equal(
+				await b.index.readCanonicalIndexWithCodecIfPresent(codec),
+				null,
+			);
+			await assert.rejects(
+				a.index.readCanonicalIndex(),
+				/Canonical index is missing/,
+			);
+			assert.equal(disk.files.has(path), false);
+			disk.files.set(path, raw);
+			assert.deepEqual(a.vault.files.get("__proto__"), bytes("kept"));
+			assert.deepEqual(a.index.getPendingMutations(), []);
+			assert.deepEqual(a.index.getPendingPhysicalActions(), []);
+		} finally {
+			disk.beforeRequest = undefined;
+			disk.afterRequest = undefined;
+			await a.stop();
+			await b.stop();
+		}
+	}
+});
+
 for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
+	test(`${mode} absent foreign tombstones stay read-only across restart`, async () => {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "device-a", codec);
+		let b = device(disk, "device-b", codec);
+		const known = "Папка/известный #?&+.md";
+		const unknown = "Папка/📝 %2F/__proto__.md";
+		const expected = { "Keep.md": "keep" };
+		try {
+			a.vault.put("Keep.md", bytes("keep"));
+			a.vault.put(known, bytes("known"));
+			await a.full();
+			await b.full();
+			b.vault.remove(known);
+			a.vault.put(unknown, bytes("unseen"));
+			await a.full();
+			a.vault.remove(known);
+			a.vault.remove(unknown);
+			await a.full();
+			const committed = disk.files
+				.get("vault/.obsidian-sync-index.json")!
+				.slice(0);
+			let writes = 0;
+			disk.beforeRequest = async (method) => {
+				if (method !== "GET") {
+					writes++;
+				}
+			};
+			for (let pass = 0; pass < 2; pass++) {
+				const result = await b.full();
+				assert.equal(result.deleted, 0);
+				assert.equal(writes, 0);
+				assert.deepEqual(
+					disk.files.get("vault/.obsidian-sync-index.json"),
+					committed,
+				);
+				assert.equal(
+					b.index.getLocalIndex().files[known]?.deleted,
+					true,
+				);
+				assert.equal(b.index.getLocalIndex().files[unknown], undefined);
+				await b.assertSettled(expected);
+				const saved = await b.saved();
+				await b.stop();
+				b = device(disk, "device-b", codec, b.vault, saved);
+			}
+
+			// A scan read failure and an existing folder are not proof of absence.
+			b.vault.put(unknown, bytes("unreadable local file"));
+			const read = b.vault.readBinary.bind(b.vault);
+			b.vault.readBinary = async (file) => {
+				if (file.path === unknown) {
+					throw new Error("synthetic local read failure");
+				}
+				return await read(file);
+			};
+			assert.equal((await b.engine.fullSync()).success, false);
+			assert.deepEqual(
+				b.vault.files.get(unknown),
+				bytes("unreadable local file"),
+			);
+			assert.equal(writes, 0);
+			b.vault.readBinary = read;
+			b.vault.remove(unknown);
+			b.vault.folder(unknown);
+			assert.equal((await b.engine.fullSync()).success, false);
+			assert.equal(b.adapter.folderExists(unknown), true);
+			assert.equal(writes, 0);
+			b.vault.remove(unknown);
+
+			// A failed local save cannot turn a read-only reconciliation into success.
+			b.engine.setIndexSaveCallback(async () => {
+				throw new Error("synthetic persistence failure");
+			});
+			assert.equal((await b.engine.fullSync()).success, false);
+			assert.equal(writes, 0);
+			const saved = await b.saved();
+			await b.stop();
+			b = device(disk, "device-b", codec, b.vault, saved);
+
+			// The local scan is already finished when the physical tree is requested.
+			const list = b.index.getRemoteFiles.bind(b.index);
+			b.index.getRemoteFiles = async () => {
+				const files = await list();
+				b.vault.put(unknown, bytes("late create"));
+				return files;
+			};
+			const late = await b.engine.fullSync();
+			assert.equal(late.success, false);
+			assert.equal(late.deleted, 0);
+			assert.deepEqual(b.vault.files.get(unknown), bytes("late create"));
+			assert.equal(writes, 0);
+			assert.deepEqual(b.index.getPendingPhysicalActions(), []);
+			b.index.getRemoteFiles = list;
+			disk.beforeRequest = undefined;
+			await b.full();
+			await a.full();
+			await b.assertSettled({ ...expected, [unknown]: "late create" });
+			await a.assertSettled({ ...expected, [unknown]: "late create" });
+		} finally {
+			disk.beforeRequest = undefined;
+			await a.stop();
+			await b.stop();
+		}
+	});
 	test(
 		`${mode} real transactions drain rapid note and folder operations`,
 		{ timeout: 30_000 },

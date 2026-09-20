@@ -68,6 +68,19 @@ baseline/base revision; одинаковый sequence с разным logical st
 отсутствующих locks. Proof не сохраняется и не разрешает physical write:
 corrective upload заново проверяет canonical и encryption manifest.
 
+Обычное чтение canonical и чтение с явным recovery codec используют metadata
+из двух совпавших root listings как начальное наблюдение stable raw read.
+Проверка после download остаётся обязательной. Наблюдение живёт только внутри
+одного чтения: оно не кешируется между операциями и не разрешает physical write.
+
+Full без adoption, maintenance и начатой ранее causal/physical работы не создаёт
+delete action для tombstone, когда оба scan подтверждают отсутствие объекта и
+VaultAdapter повторно подтверждает отсутствие файла и папки. Такой путь не
+увеличивает `deleted` и не требует canonical commit. Неизвестному файлу не
+добавляется фиктивный baseline; existing baseline и observed revision сохраняются
+через обычное успешное завершение full. Появившийся после scan локальный объект
+или ошибка чтения существующего файла требуют повторного reconciliation.
+
 `SyncCoordinator` последовательно выполняет full, Force, realtime batch и
 encryption maintenance. Повторные full-запросы объединяются в один запуск.
 Watcher использует один durable drain для upload, delete, rename и folder

@@ -316,7 +316,13 @@ class FolderDeleteYandexFake {
 		this.moves.push({ fromPath, toPath });
 	}
 
-	async deleteResource(path: string) {
+	async deleteResource(
+		path: string,
+		_permanently = false,
+		_raw = false,
+		beforeAttempt?: () => Promise<void>,
+	) {
+		await beforeAttempt?.();
 		this.deletes.push(path);
 		this.resources.delete(path);
 	}

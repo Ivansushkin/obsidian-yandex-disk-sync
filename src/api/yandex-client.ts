@@ -914,19 +914,32 @@ export class YandexDiskClient {
 	): Promise<void> {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
+		let preflightFailed = false;
+		let deleteAccepted = false;
+		const revalidate = beforeAttempt
+			? async () => {
+					try {
+						await beforeAttempt();
+					} catch (error) {
+						preflightFailed = true;
+						throw error;
+					}
+				}
+			: undefined;
 		try {
 			const response = await this.request(
 				"DELETE",
 				`/resources?path=${encodedPath}&permanently=${permanently}`,
 				undefined,
-				beforeAttempt,
+				revalidate,
 			);
+			deleteAccepted = true;
 			await this.waitForAsyncOperation(response);
 			this.invalidateFolder(targetPath);
 			logger.debug(`Deleted resource: ${path}`);
 		} catch (e: unknown) {
-			// Ignore error if resource doesn't exist
-			if (!this.isNotFoundError(e)) {
+			// Only the DELETE response can prove absence, never a guard or polling failure.
+			if (preflightFailed || deleteAccepted || !this.isNotFoundError(e)) {
 				throw e;
 			}
 			this.invalidateFolder(targetPath);
