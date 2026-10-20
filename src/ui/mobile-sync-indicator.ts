@@ -14,9 +14,12 @@ interface MobileSyncContext {
 	foreground: "encryption" | "backup" | null;
 }
 
-/** Passive mobile counterpart of the desktop status bar, owned by the plugin lifecycle. */
+/** Collapsible mobile status; native disclosure state belongs to this lifecycle only. */
 export class MobileSyncIndicator extends Component {
-	private element: HTMLElement | null = null;
+	private element: HTMLDetailsElement | null = null;
+	private summaryEl!: HTMLElement;
+	private loaderEl!: HTMLElement;
+	private accessibleStatus = "";
 	private iconEl!: HTMLElement;
 	private textEl!: HTMLElement;
 	private detailEl!: HTMLElement;
@@ -38,20 +41,32 @@ export class MobileSyncIndicator extends Component {
 	}
 
 	onload(): void {
-		this.element = this.app.workspace.containerEl.createDiv({
+		this.element = this.app.workspace.containerEl.createEl("details", {
 			cls: "yandex-sync-mobile",
-			attr: {
-				role: "status",
-				"aria-live": "polite",
-				"aria-atomic": "true",
-			},
 		});
-		this.iconEl = this.element.createSpan({
+		this.summaryEl = this.element.createEl("summary", {
+			cls: "yandex-sync-mobile-summary",
+		});
+		this.summaryEl.createSpan({
+			cls: "yandex-sync-mobile-brand",
+			text: "YD",
+		});
+		this.loaderEl = this.summaryEl.createSpan({
+			cls: "yandex-sync-mobile-loader",
+			attr: { "aria-hidden": "true" },
+		});
+		setIcon(this.loaderEl, "loader-circle");
+		this.iconEl = this.summaryEl.createSpan({
 			cls: "yandex-sync-status-icon",
 			attr: { "aria-hidden": "true" },
 		});
 		const content = this.element.createDiv({
 			cls: "yandex-sync-mobile-content",
+			attr: {
+				role: "status",
+				"aria-live": "polite",
+				"aria-atomic": "true",
+			},
 		});
 		const heading = content.createDiv({
 			cls: "yandex-sync-mobile-heading",
@@ -64,6 +79,10 @@ export class MobileSyncIndicator extends Component {
 		this.insetProbe = this.element.createDiv({
 			cls: "yandex-sync-mobile-inset",
 			attr: { "aria-hidden": "true" },
+		});
+		this.registerDomEvent(this.element, "toggle", () => {
+			this.updateDisclosureLabel();
+			this.schedulePosition();
 		});
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => this.update()),
@@ -132,7 +151,7 @@ export class MobileSyncIndicator extends Component {
 		let text: string;
 		let detail = "";
 		let progress = "";
-		let idleLabel = "";
+
 		if (force?.active) {
 			state = { ...sync, status: "syncing" };
 			text = t(`notice.force_phase_${force.phase}`);
@@ -151,8 +170,7 @@ export class MobileSyncIndicator extends Component {
 			state = { ...sync, status: "syncing" };
 			text = t(`status.mobile.${foreground}`);
 		} else if (sync.status === "idle") {
-			text = "YD";
-			idleLabel = t("status.mobile.ready");
+			text = t("status.mobile.ready");
 			if (sync.lastSyncTime) {
 				const time = new Date(sync.lastSyncTime).toLocaleTimeString(
 					[],
@@ -162,8 +180,7 @@ export class MobileSyncIndicator extends Component {
 						hour12: false,
 					},
 				);
-				text += ` · ${time}`;
-				idleLabel = `${t("status.mobile.last_sync")} ${time}`;
+				text = `${t("status.mobile.last_sync")} ${time}`;
 			}
 		} else {
 			text =
@@ -172,8 +189,20 @@ export class MobileSyncIndicator extends Component {
 					: getSyncStatusText(sync);
 			detail = sync.errorMessage ?? "";
 		}
-		this.element.className = `yandex-sync-mobile sync-${state.status}${idleLabel ? " is-compact" : ""}${detail && state.status === "syncing" ? " has-error" : ""}`;
-		const icon = getSyncStatusIcon(state.status);
+		this.element.className = `yandex-sync-mobile sync-${state.status}${detail && state.status === "syncing" ? " has-error" : ""}`;
+		const busy =
+			state.status === "syncing" || state.status === "initializing";
+		this.loaderEl.hidden = !busy;
+		let icon = busy ? "cloud" : getSyncStatusIcon(state.status);
+		if (busy && force?.active) {
+			icon = "replace";
+		}
+		if (busy && foreground) {
+			icon = foreground === "encryption" ? "lock-keyhole" : "archive";
+		}
+		if (busy && detail) {
+			icon = "triangle-alert";
+		}
 		if (this.iconEl.dataset.icon !== icon) {
 			setIcon(this.iconEl, icon);
 			this.iconEl.dataset.icon = icon;
@@ -187,11 +216,24 @@ export class MobileSyncIndicator extends Component {
 		this.detailEl.hidden = !detail;
 		this.progressEl.setText(progress);
 		this.progressEl.hidden = !progress;
-		this.element.setAttribute(
-			"aria-label",
-			`Yandex Disk Sync: ${idleLabel || text}${progress ? ` ${progress}` : ""}${detail ? ` ${detail}` : ""}`,
-		);
+		this.accessibleStatus = busy
+			? t("status.syncing")
+			: state.status === "idle"
+				? t("status.mobile.ready")
+				: getSyncStatusText(state);
+		if (busy && detail) {
+			this.accessibleStatus += ` · ${t("status.error")}`;
+		}
+		this.updateDisclosureLabel();
 		this.schedulePosition();
+	}
+
+	/** Keep the compact control understandable without putting details in its label. */
+	private updateDisclosureLabel(): void {
+		this.summaryEl.setAttribute(
+			"aria-label",
+			`Yandex Disk Sync: ${this.accessibleStatus} · ${t(this.element?.open ? "status.mobile.collapse" : "status.mobile.expand")}`,
+		);
 	}
 
 	/** Workspace restoration can remove plugin-owned nodes during a cold launch. */
@@ -299,6 +341,10 @@ export class MobileSyncIndicator extends Component {
 		this.element.style.setProperty(
 			"--yandex-sync-mobile-top",
 			`${top + 8}px`,
+		);
+		this.element.style.setProperty(
+			"--yandex-sync-mobile-content-height",
+			`${Math.max(0, viewportBottom - top - 8 - this.summaryEl.getBoundingClientRect().height - 14)}px`,
 		);
 		this.element.style.setProperty(
 			"--yandex-sync-mobile-right",

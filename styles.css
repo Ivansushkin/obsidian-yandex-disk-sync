@@ -18,10 +18,7 @@
 	height: 14px;
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-syncing
-	.yandex-sync-status-icon
-	svg,
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-initializing
+.yandex-sync-status:is(.sync-syncing, .sync-initializing)
 	.yandex-sync-status-icon
 	svg {
 	animation: yandex-sync-spin 1.2s linear infinite;
@@ -58,7 +55,7 @@
 	font-weight: 600;
 }
 
-/* Passive mobile indicator: does not intercept editor or navigation touches. */
+/* Native mobile disclosure intercepts only touches inside its own bounds. */
 .yandex-sync-mobile {
 	position: fixed;
 	top: var(
@@ -81,13 +78,11 @@
 		)
 	);
 	z-index: var(--layer-status-bar, 15);
-	display: inline-flex;
-	align-items: center;
-	gap: 8px;
+	display: block;
 	box-sizing: border-box;
 	width: max-content;
 	max-width: var(--yandex-sync-mobile-width, min(360px, calc(100vw - 24px)));
-	padding: 6px 10px;
+	padding: 0;
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 10px;
 	background: var(--background-primary);
@@ -95,12 +90,61 @@
 	box-shadow: var(--shadow-s);
 	font-size: var(--font-ui-small);
 	line-height: 1.35;
-	pointer-events: none;
+	pointer-events: auto;
 }
 
-.yandex-sync-mobile.is-compact {
-	gap: 4px;
-	padding: 4px 8px;
+.yandex-sync-mobile[open] {
+	width: var(--yandex-sync-mobile-width, min(360px, calc(100vw - 24px)));
+}
+
+.yandex-sync-mobile-summary {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 44px;
+	padding: 8px 12px;
+	box-sizing: border-box;
+	list-style: none;
+	cursor: pointer;
+	touch-action: manipulation;
+	user-select: none;
+}
+
+.yandex-sync-mobile-summary::-webkit-details-marker {
+	display: none;
+}
+
+.yandex-sync-mobile-summary:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 2px;
+	border-radius: 10px;
+}
+
+.yandex-sync-mobile-brand {
+	font-weight: 600;
+}
+
+.yandex-sync-mobile-loader {
+	display: inline-flex;
+	flex-shrink: 0;
+}
+
+.yandex-sync-mobile-loader[hidden] {
+	display: none;
+}
+
+.yandex-sync-mobile-loader svg {
+	width: 14px;
+	height: 14px;
+	animation: yandex-sync-spin 1.2s linear infinite;
+}
+
+.yandex-sync-mobile .yandex-sync-status-icon svg {
+	animation: none;
+}
+
+.yandex-sync-mobile.has-error .yandex-sync-status-icon {
+	color: var(--text-error);
 }
 
 .yandex-sync-mobile .yandex-sync-status-icon {
@@ -109,11 +153,23 @@
 
 .yandex-sync-mobile-content {
 	min-width: 0;
+	max-height: min(
+		320px,
+		45vh,
+		var(--yandex-sync-mobile-content-height, 320px)
+	);
+	box-sizing: border-box;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	padding: 10px 12px;
+	border-top: 1px solid var(--background-modifier-border);
+	user-select: text;
+	-webkit-user-select: text;
 }
 
 .yandex-sync-mobile-heading {
 	display: flex;
-	align-items: baseline;
+	align-items: flex-start;
 	gap: 8px;
 }
 
@@ -130,22 +186,13 @@
 
 .yandex-sync-mobile-text,
 .yandex-sync-mobile-detail {
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 .yandex-sync-mobile-detail {
+	margin-top: 8px;
 	color: var(--text-muted);
-}
-
-.yandex-sync-mobile.sync-error .yandex-sync-mobile-detail,
-.yandex-sync-mobile.has-error .yandex-sync-mobile-detail {
-	white-space: normal;
-	overflow-wrap: anywhere;
-	display: -webkit-box;
-	-webkit-line-clamp: 3;
-	-webkit-box-orient: vertical;
 }
 
 .sync-status-error-details {
@@ -181,6 +228,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+	.yandex-sync-mobile-loader svg {
+		animation: none;
+	}
+
 	:is(.yandex-sync-status, .yandex-sync-mobile):is(
 			.sync-syncing,
 			.sync-initializing
