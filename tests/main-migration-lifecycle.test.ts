@@ -1,3 +1,4 @@
+import { NetworkRequestError, type FailureSummary } from "../src/errors";
 import { SyncCoordinator } from "../src/sync/coordinator";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -147,16 +148,22 @@ test("storage admission classifies startup failures and recovers after connectio
 	for (const error of [
 		new YandexApiError("synthetic unauthorized", 401),
 		new YandexApiError("synthetic forbidden", 403),
-		new Error("synthetic offline"),
+		new NetworkRequestError(new Error("synthetic offline")),
+		new Error("synthetic unknown"),
 		new StorageScopeError("synthetic root mismatch"),
 		null,
 	]) {
 		const plugin = createStartupPlugin();
 		const blocks = new Map<string, string>();
+		let summary: FailureSummary | undefined;
 		plugin.syncEngine.setExternalBlock = (
 			kind: unknown,
 			reason: unknown,
+			failure?: unknown,
 		) => {
+			if (reason) {
+				summary = failure as FailureSummary | undefined;
+			}
 			if (typeof reason === "string") {
 				blocks.set(String(kind), String(reason));
 			} else {
@@ -188,6 +195,22 @@ test("storage admission classifies startup failures and recovers after connectio
 			error === null || error instanceof StorageScopeError;
 		assert.equal(blocks.has("local-state"), scopeFailure);
 		assert.equal(plugin.authenticationBlockReason !== null, !scopeFailure);
+		if (error) {
+			assert.equal(
+				summary?.category,
+				error instanceof YandexApiError
+					? "access"
+					: error instanceof NetworkRequestError
+						? "unavailable"
+						: error instanceof StorageScopeError
+							? "safety"
+							: "unknown",
+			);
+			assert.equal(
+				summary?.stage,
+				scopeFailure ? "storage-admission" : "startup",
+			);
+		}
 		repaired = true;
 		assert.equal(await plugin.refreshRemoteStartupState(false), "ready");
 		assert.equal(blocks.size, 0);

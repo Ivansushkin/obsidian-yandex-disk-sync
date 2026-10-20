@@ -1,5 +1,5 @@
 import { VaultAdapter } from "../../api/vault-adapter";
-import { YandexDiskClient } from "../../api/yandex-client";
+import { YandexDiskClient, isRemoteReadTimeout } from "../../api/yandex-client";
 import type {
 	FileMetadata,
 	PendingMutation,
@@ -31,6 +31,7 @@ import {
 	shouldBackupLocalDelete,
 } from "./action-rules";
 import type { SyncGuardCallback } from "../contracts";
+import { createSyncError } from "../errors";
 export interface Dependencies {
 	getSyncGuardResult: SyncGuardCallback;
 	vaultAdapter: VaultAdapter;
@@ -47,6 +48,7 @@ export interface Dependencies {
 		progress?: SyncProgress,
 	) => void;
 	isPaused: boolean;
+	onOperationError?: (error: SyncError) => void;
 }
 
 /** Upload file to Yandex Disk.  When `stampRemoteMtime` is true (default) the server-side mtime of the just-uploaded resource is fetched and stored on the remote index entry so the next sync can detect external remote changes via server-mtime comparison. Set it to false for bulk upload flows that perform a single batch re-read of the remote file list afterwards (see `IndexManager.applyServerMtimes`); this saves one `getResource` API call per uploaded file. */
@@ -231,8 +233,10 @@ export async function applyDownloadedContent(
 		remoteFingerprint?: string;
 	},
 	expectedLocalSha?: string | null,
+	validateAuthority?: () => Promise<void>,
 ): Promise<void> {
 	await deps.indexManager.assertRemoteScope();
+	await validateAuthority?.();
 	const expected =
 		expectedLocalSha === undefined
 			? await readLocalDownloadIdentity(deps, path)
@@ -255,7 +259,10 @@ export async function applyDownloadedContent(
 	assertPortableLocalTree(deps, [path]);
 	await deps.vaultAdapter.writeFile(path, content, {
 		expectedSha256: expected,
-		validateBeforeWrite: () => deps.indexManager.assertRemoteScope(),
+		validateBeforeWrite: async () => {
+			await deps.indexManager.assertRemoteScope();
+			await validateAuthority?.();
+		},
 		beforeWrite: () => deps.expectWatcherEvent(path, "upload"),
 	});
 
@@ -421,6 +428,7 @@ export async function deleteRemoteFile(
 export async function deleteLocalFile(
 	deps: Dependencies,
 	path: string,
+	validateAuthority?: () => Promise<void>,
 ): Promise<PhysicalActionOutcome> {
 	const physicalAction = requirePhysicalAction(deps, "delete-local", path);
 	const actionContext = {
@@ -472,6 +480,7 @@ export async function deleteLocalFile(
 		deps.indexManager.completePhysicalAction(physicalAction.id);
 		return "cancelled";
 	}
+	await validateAuthority?.();
 	if ((await readLocalDownloadIdentity(deps, path)) !== expected) {
 		return "deferred";
 	}
@@ -764,6 +773,25 @@ export async function executeOperationsParallel(
 		tasks,
 		concurrency,
 		onProgress,
+		{
+			stopOnError: isRemoteReadTimeout,
+			onError: (reason, index) => {
+				const operation = operations[index];
+				if (operation) {
+					const error =
+						reason instanceof Error
+							? reason
+							: new Error(String(reason));
+					deps.onOperationError?.(
+						createSyncError(
+							error,
+							operation.path,
+							operation.action,
+						),
+					);
+				}
+			},
+		},
 	);
 
 	const errors: SyncError[] = [];
@@ -778,15 +806,7 @@ export async function executeOperationsParallel(
 		}
 
 		if (res.status === "rejected") {
-			const errorMessage =
-				res.reason instanceof Error
-					? res.reason.message
-					: String(res.reason);
-			errors.push({
-				path: op.path,
-				operation: op.action,
-				message: errorMessage,
-			});
+			errors.push(createSyncError(res.reason, op.path, op.action));
 			logger.error(
 				`Error executing ${op.action} operation for ${op.path}:`,
 				{ error: res.reason },

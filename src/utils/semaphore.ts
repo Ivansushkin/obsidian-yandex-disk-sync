@@ -91,6 +91,10 @@ export async function runWithConcurrencySettled<T>(
 	tasks: Array<() => Promise<T>>,
 	concurrency: number,
 	onProgress?: (completed: number, total: number) => void,
+	options?: {
+		stopOnError?: (reason: unknown) => boolean;
+		onError?: (reason: unknown, index: number) => void;
+	},
 ): Promise<
 	Array<
 		| { status: "fulfilled"; value: T }
@@ -114,14 +118,26 @@ export async function runWithConcurrencySettled<T>(
 	}
 	const semaphore = new Semaphore(concurrency);
 	let completed = 0;
+	let stopped = false;
+	let stopReason: unknown;
 
 	const wrappedTasks = tasks.map((task, index) => async () => {
 		await semaphore.acquire();
+		if (stopped) {
+			results[index] = { status: "rejected", reason: stopReason };
+			semaphore.release();
+			return;
+		}
 		try {
 			const value = await task();
 			results[index] = { status: "fulfilled", value };
 		} catch (reason) {
 			results[index] = { status: "rejected", reason };
+			if (options?.stopOnError?.(reason)) {
+				stopped = true;
+				stopReason = reason;
+			}
+			options?.onError?.(reason, index);
 		} finally {
 			completed++;
 			if (onProgress) {

@@ -6,6 +6,54 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"failure.stage.upload-verification": "upload result verification",
+		"failure.stage.preflight": "preflight",
+		"failure.stage.confirming": "confirmation",
+		"failure.stage.protected-snapshot": "protected snapshot",
+		"failure.stage.storage-admission": "storage verification",
+		"failure.stage.startup": "startup verification",
+		"failure.stage.download": "download",
+		"failure.stage.upload": "upload",
+		"failure.stage.delete_local": "local deletion",
+		"failure.stage.delete_remote": "remote deletion",
+		"failure.stage.conflict": "conflict resolution",
+		"failure.stage.creating-backup": "backup creation",
+		"failure.stage.uploading-backup": "backup upload",
+		"failure.stage.verifying-backup": "backup verification",
+		"failure.stage.protective-backup": "mandatory protective copy",
+		"failure.stage.persisting": "local state persistence",
+		"failure.stage.reconciling": "final reconciliation",
+		"failure.stage.encryption": "encryption",
+		"failure.stage.encryption-validation": "encryption verification",
+		"failure.stage.encryption-rewrite": "encryption rewrite",
+		"failure.stage.encryption-recovery": "encryption recovery",
+		"failure.stage.physical-recovery": "pending physical actions",
+		"failure.stage.backup": "backup",
+		"failure.retry": "Retry {attempt}/{maxAttempts}",
+		"failure.category.unavailable": "Remote temporarily unavailable",
+		"failure.category.access": "Access denied",
+		"failure.category.safety": "Safety condition failed",
+		"failure.category.local": "Local operation failed",
+		"failure.category.unknown": "Operation failed",
+		"failure.stage": "Stage: {stage}",
+		"failure.outcome.stopped-before-write":
+			"Stopped before replacing synchronized files.",
+		"failure.outcome.partial":
+			"Partially completed; finalization is pending.",
+		"failure.outcome.write-unconfirmed":
+			"The write result needs verification.",
+		"failure.outcome.unknown":
+			"The operation did not complete; previous changes may have been applied.",
+		"failure.next.unavailable":
+			"Check the connection, then run normal synchronization.",
+		"failure.next.access": "Check the token and folder permissions.",
+		"failure.next.safety":
+			"Check plugin status and resolve the safety block before retrying.",
+		"failure.next.local":
+			"Check local storage and backup access before retrying.",
+		"failure.next.unknown":
+			"Check plugin status and diagnostics before retrying.",
+		"notice.force_phase_protected-snapshot": "Reading protected snapshot…",
 		"storage.title": "Confirm synchronization storage",
 		"storage.confirm_previous":
 			"Is {path} your previous remote storage? Keeping history allows previous deletions to be applied to this folder. Confirm only if this is the same storage.",
@@ -376,6 +424,55 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"failure.stage.upload-verification": "проверка результата загрузки",
+		"failure.stage.preflight": "предварительная проверка",
+		"failure.stage.confirming": "подтверждение",
+		"failure.stage.protected-snapshot": "защищаемый снимок",
+		"failure.stage.storage-admission": "проверка хранилища",
+		"failure.stage.startup": "проверка при запуске",
+		"failure.stage.download": "скачивание",
+		"failure.stage.upload": "загрузка на Диск",
+		"failure.stage.delete_local": "локальное удаление",
+		"failure.stage.delete_remote": "удаление на Диске",
+		"failure.stage.conflict": "разрешение конфликта",
+		"failure.stage.creating-backup": "создание резервной копии",
+		"failure.stage.uploading-backup": "загрузка резервной копии",
+		"failure.stage.verifying-backup": "проверка резервной копии",
+		"failure.stage.protective-backup": "обязательная защитная копия",
+		"failure.stage.persisting": "сохранение локального состояния",
+		"failure.stage.reconciling": "финальная сверка",
+		"failure.stage.encryption": "шифрование",
+		"failure.stage.encryption-validation": "проверка шифрования",
+		"failure.stage.encryption-rewrite": "перекодирование",
+		"failure.stage.encryption-recovery": "восстановление шифрования",
+		"failure.stage.physical-recovery": "незавершённые физические операции",
+		"failure.stage.backup": "резервная копия",
+		"failure.retry": "Повтор {attempt}/{maxAttempts}",
+		"failure.category.unavailable":
+			"Удалённое хранилище временно недоступно",
+		"failure.category.access": "Доступ запрещён",
+		"failure.category.safety": "Не выполнено условие безопасности",
+		"failure.category.local": "Ошибка локальной операции",
+		"failure.category.unknown": "Ошибка операции",
+		"failure.stage": "Этап: {stage}",
+		"failure.outcome.stopped-before-write":
+			"Остановлено до перезаписи синхронизируемых файлов.",
+		"failure.outcome.partial":
+			"Частично выполнено; требуется завершение операции.",
+		"failure.outcome.write-unconfirmed":
+			"Результат записи требует проверки.",
+		"failure.outcome.unknown":
+			"Операция не завершена; предыдущие изменения могли примениться.",
+		"failure.next.unavailable":
+			"Проверьте соединение и запустите обычную синхронизацию.",
+		"failure.next.access": "Проверьте токен и права доступа к папке.",
+		"failure.next.safety":
+			"Проверьте статус плагина и устраните блокировку перед повтором.",
+		"failure.next.local":
+			"Проверьте локальное хранилище и доступ к резервным копиям.",
+		"failure.next.unknown":
+			"Проверьте статус плагина и диагностику перед повтором.",
+		"notice.force_phase_protected-snapshot": "Чтение защищаемого снимка…",
 		"storage.title": "Подтвердите хранилище синхронизации",
 		"storage.confirm_previous":
 			"{path} — ваше прежнее удалённое хранилище? Сохранение истории разрешит применение прежних удалений к этой папке. Подтверждайте только для того же хранилища.",

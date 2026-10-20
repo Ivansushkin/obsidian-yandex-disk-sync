@@ -1,3 +1,4 @@
+import { createSyncError } from "../errors";
 import { VaultAdapter } from "../../api/vault-adapter";
 import { YandexApiError, YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
@@ -120,14 +121,14 @@ export async function rewriteRemoteFiles(
 			continue;
 		}
 		const path = liveCanonical[index]?.[0] ?? "";
-		result.errors.push({
-			path,
-			operation: "upload",
-			message:
-				outcome?.reason instanceof Error
-					? outcome.reason.message
-					: String(outcome?.reason),
-		});
+		result.errors.push(
+			createSyncError(
+				outcome?.reason,
+				path,
+				"upload",
+				"encryption-rewrite",
+			),
+		);
 	}
 	if (result.errors.length > 0) {
 		return;

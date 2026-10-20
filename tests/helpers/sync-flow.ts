@@ -374,6 +374,7 @@ export function device(
 	codec: EncryptionCodec | null,
 	vault = new MemoryVault(),
 	saved?: SavedDevice,
+	clientOptions: { readTimeoutMs?: number } = {},
 ) {
 	disk.install();
 	logger.configure({ consoleEnabled: false, fileEnabled: false });
@@ -395,6 +396,7 @@ export function device(
 	const adapter = new VaultAdapter(app, settings);
 	const client = new YandexDiskClient({
 		token: "synthetic",
+		...clientOptions,
 		retryDelay: 0,
 		maxRetries: 0,
 	});

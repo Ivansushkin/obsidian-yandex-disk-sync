@@ -1,3 +1,4 @@
+import { formatSyncRetry } from "./sync-status-presentation";
 import { App, Component, ItemView, setIcon } from "obsidian";
 import { t } from "../i18n";
 import type { SyncState } from "../types";
@@ -19,6 +20,7 @@ export class MobileSyncIndicator extends Component {
 	private iconEl!: HTMLElement;
 	private textEl!: HTMLElement;
 	private detailEl!: HTMLElement;
+	private progressEl!: HTMLElement;
 	private insetProbe!: HTMLElement;
 	private frame: number | null = null;
 	private disposed = false;
@@ -51,7 +53,13 @@ export class MobileSyncIndicator extends Component {
 		const content = this.element.createDiv({
 			cls: "yandex-sync-mobile-content",
 		});
-		this.textEl = content.createDiv({ cls: "yandex-sync-mobile-text" });
+		const heading = content.createDiv({
+			cls: "yandex-sync-mobile-heading",
+		});
+		this.textEl = heading.createDiv({ cls: "yandex-sync-mobile-text" });
+		this.progressEl = heading.createSpan({
+			cls: "yandex-sync-mobile-progress",
+		});
 		this.detailEl = content.createDiv({ cls: "yandex-sync-mobile-detail" });
 		this.insetProbe = this.element.createDiv({
 			cls: "yandex-sync-mobile-inset",
@@ -123,17 +131,22 @@ export class MobileSyncIndicator extends Component {
 		let state = sync;
 		let text: string;
 		let detail = "";
+		let progress = "";
 		let idleLabel = "";
 		if (force?.active) {
 			state = { ...sync, status: "syncing" };
 			text = t(`notice.force_phase_${force.phase}`);
 			if (force.activity?.status === "syncing") {
 				text += `: ${force.activity.currentOperation ?? t("status.syncing")}`;
-				detail = this.progressText(force.activity);
+				progress =
+					this.progressText(force.activity) +
+					formatSyncRetry(force.activity);
+				detail = force.activity.errorMessage ?? "";
 			}
 		} else if (sync.status === "syncing") {
 			text = sync.currentOperation ?? t("status.syncing");
-			detail = this.progressText(sync);
+			progress = this.progressText(sync) + formatSyncRetry(sync);
+			detail = sync.errorMessage ?? "";
 		} else if (foreground) {
 			state = { ...sync, status: "syncing" };
 			text = t(`status.mobile.${foreground}`);
@@ -159,7 +172,7 @@ export class MobileSyncIndicator extends Component {
 					: getSyncStatusText(sync);
 			detail = sync.errorMessage ?? "";
 		}
-		this.element.className = `yandex-sync-mobile sync-${state.status}${idleLabel ? " is-compact" : ""}`;
+		this.element.className = `yandex-sync-mobile sync-${state.status}${idleLabel ? " is-compact" : ""}${detail && state.status === "syncing" ? " has-error" : ""}`;
 		const icon = getSyncStatusIcon(state.status);
 		if (this.iconEl.dataset.icon !== icon) {
 			setIcon(this.iconEl, icon);
@@ -172,9 +185,11 @@ export class MobileSyncIndicator extends Component {
 			this.detailEl.setText(detail);
 		}
 		this.detailEl.hidden = !detail;
+		this.progressEl.setText(progress);
+		this.progressEl.hidden = !progress;
 		this.element.setAttribute(
 			"aria-label",
-			`Yandex Disk Sync: ${idleLabel || text}${detail ? ` ${detail}` : ""}`,
+			`Yandex Disk Sync: ${idleLabel || text}${progress ? ` ${progress}` : ""}${detail ? ` ${detail}` : ""}`,
 		);
 		this.schedulePosition();
 	}

@@ -12,6 +12,22 @@ import type {
 import type { EncryptionCodec } from "../crypto/encryption";
 import { logger } from "../utils/logger";
 import {
+	YandexApiError,
+	RemoteHttpError,
+	RemoteReadTimeoutError,
+	NetworkRequestError,
+	OperationFailure,
+	decideRecovery,
+	withFailureContext,
+	type RetryProgress,
+	isRemoteReadTimeout,
+} from "../errors";
+export {
+	YandexApiError,
+	RemoteReadTimeoutError,
+	isRemoteReadTimeout,
+} from "../errors";
+import {
 	encodePathForUrl,
 	isProtectedPath,
 	normalizePath,
@@ -28,6 +44,13 @@ export interface YandexClientConfig {
 	token: string;
 	maxRetries?: number;
 	retryDelay?: number;
+	readTimeoutMs?: number;
+	downloadTimeoutMs?: number;
+}
+
+interface DownloadReadBudget {
+	deadline: number;
+	timeoutMs: number;
 }
 
 interface StableRawFileSnapshot {
@@ -46,8 +69,16 @@ type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
 
 export class YandexDiskClient {
 	private token: string;
+	private retryCallback?: (progress?: RetryProgress) => void;
+
+	/** Report existing backoff without opening a new session or Notice. */
+	setRetryCallback(callback?: (progress?: RetryProgress) => void): void {
+		this.retryCallback = callback;
+	}
 	private maxRetries: number;
 	private retryDelay: number;
+	private readonly readTimeoutMs: number;
+	private readonly downloadTimeoutMs: number;
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
@@ -69,6 +100,8 @@ export class YandexDiskClient {
 		this.token = config.token;
 		this.maxRetries = config.maxRetries ?? 3;
 		this.retryDelay = config.retryDelay ?? 1000;
+		this.readTimeoutMs = config.readTimeoutMs ?? 60_000;
+		this.downloadTimeoutMs = config.downloadTimeoutMs ?? 60_000;
 	}
 
 	/**
@@ -165,10 +198,12 @@ export class YandexDiskClient {
 	async downloadStableRawFile(
 		path: string,
 		expectedResource?: YandexResource,
+		budget = this.createDownloadBudget(),
 	): Promise<StableRawFileSnapshot | null> {
 		const startedAt = Date.now();
 		const before =
-			expectedResource ?? (await this.getResource(path, 1, 0, true));
+			expectedResource ??
+			(await this.getResource(path, 1, 0, true, budget));
 		if (!before) {
 			return null;
 		}
@@ -178,8 +213,8 @@ export class YandexDiskClient {
 			);
 		}
 
-		const raw = await this.downloadFile(path, true);
-		const after = await this.getResource(path, 1, 0, true);
+		const raw = await this.downloadFile(path, true, budget);
+		const after = await this.getResource(path, 1, 0, true, budget);
 		if (!after) {
 			throw new Error("Remote service file disappeared while being read");
 		}
@@ -205,14 +240,15 @@ export class YandexDiskClient {
 	async downloadStableLogicalFile(
 		path: string,
 		expectedResource?: YandexResource,
+		budget = this.createDownloadBudget(),
 	): Promise<StableLogicalFileSnapshot | null> {
 		const before =
-			expectedResource ?? (await this.getLogicalResource(path));
+			expectedResource ?? (await this.getLogicalResource(path, budget));
 		if (!before || !this.getContentFingerprint(before)) {
 			return null;
 		}
-		const content = await this.downloadFile(path);
-		const after = await this.getLogicalResource(path);
+		const content = await this.downloadFile(path, false, budget);
+		const after = await this.getLogicalResource(path, budget);
 		if (!after) {
 			throw new Error("Remote user file disappeared while being read");
 		}
@@ -376,12 +412,16 @@ export class YandexDiskClient {
 		limit = 1000,
 		offset = 0,
 		raw = false,
+		budget?: DownloadReadBudget,
 	): Promise<YandexResource | null> {
 		try {
 			const encodedPath = encodePathForUrl(path);
 			const response = await this.request(
 				"GET",
 				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`,
+				undefined,
+				undefined,
+				budget,
 			);
 			const resource = response.json as YandexResource;
 			if (resource.type === "dir") {
@@ -403,9 +443,12 @@ export class YandexDiskClient {
 	/**
 	 * Get a resource addressed by its logical, unencrypted path.
 	 */
-	async getLogicalResource(path: string): Promise<YandexResource | null> {
+	async getLogicalResource(
+		path: string,
+		budget?: DownloadReadBudget,
+	): Promise<YandexResource | null> {
 		const target = await this.encryptFilePath(path);
-		return await this.getResource(target, 1000, 0, true);
+		return await this.getResource(target, 1000, 0, true, budget);
 	}
 
 	/**
@@ -827,8 +870,9 @@ export class YandexDiskClient {
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			await beforeAttempt?.();
 			await this.writeGuard?.();
+			const startedAt = Date.now();
 			try {
-				const response = await requestUrl({
+				const response = await this.requestNative({
 					url: uploadLink.href,
 					method: "PUT",
 					body: bodyContent,
@@ -838,7 +882,7 @@ export class YandexDiskClient {
 					return;
 				}
 
-				const errorData = response.json as YandexError;
+				const errorData = this.readProviderError(response);
 				const error = new YandexApiError(
 					errorData?.description || `Upload HTTP ${response.status}`,
 					response.status,
@@ -846,24 +890,45 @@ export class YandexDiskClient {
 				);
 				throw error;
 			} catch (e) {
-				if (
-					e instanceof YandexApiError &&
-					!this.isTransientStatus(e.status)
-				) {
-					throw e;
-				}
 				lastError = e as Error;
-				if (
-					confirmAmbiguousResult &&
-					(await confirmAmbiguousResult())
-				) {
-					return;
+				const decision = this.recovery(
+					e,
+					"put",
+					this.maxRetries - attempt,
+				);
+				if (decision.confirm) {
+					const context = {
+						stage: "upload",
+						action: "put" as const,
+						requestState: "completed" as const,
+						outcome: "write-unconfirmed" as const,
+						durationMs: Date.now() - startedAt,
+					};
+					withFailureContext(e, context);
+					logger.warn("PUT response requires verification", {
+						error: new OperationFailure(e, context),
+						attempt: attempt + 1,
+					});
+					try {
+						if (await confirmAmbiguousResult?.()) {
+							return;
+						}
+					} catch (verificationError) {
+						throw withFailureContext(verificationError, {
+							...context,
+							stage: "upload-verification",
+						});
+					}
 				}
-				if (attempt === this.maxRetries) {
+				if (!decision.retry) {
 					break;
 				}
 			}
-			await this.sleep(this.getRetryDelay(attempt));
+			await this.waitBeforeRetry(
+				this.getRetryDelay(attempt),
+				attempt,
+				"upload",
+			);
 		}
 		throw lastError || new Error("Upload failed");
 	}
@@ -874,36 +939,117 @@ export class YandexDiskClient {
 	async getDownloadLink(
 		path: string,
 		raw = false,
+		budget?: DownloadReadBudget,
 	): Promise<YandexDownloadLink> {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
 		const response = await this.request(
 			"GET",
 			`/resources/download?path=${encodedPath}`,
+			undefined,
+			undefined,
+			budget,
 		);
 		return response.json as YandexDownloadLink;
 	}
 
 	/**
-	 * Download file from Yandex Disk.
-	 * When `raw` is true, skips path and content decryption (for metadata files).
+	 * Download complete bytes, retrying transient transfers with a fresh signed link.
+	 * Decode only after transfer success; codec failures are not network retries.
+	 * When `raw` is true, skip path and content decryption for service files.
 	 */
-	async downloadFile(remotePath: string, raw = false): Promise<ArrayBuffer> {
-		const downloadLink = await this.getDownloadLink(remotePath, raw);
-
-		logger.debug(`Downloading file directly: ${remotePath}`);
-		const response = await requestUrl({
-			url: downloadLink.href,
-			method: "GET",
-			throw: true,
-		});
-
-		const result = raw
-			? response.arrayBuffer
-			: await this.decryptContent(response.arrayBuffer);
-
-		logger.debug(`Downloaded file: ${remotePath}`);
-		return result;
+	async downloadFile(
+		remotePath: string,
+		raw = false,
+		budget = this.createDownloadBudget(),
+	): Promise<ArrayBuffer> {
+		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+			const downloadLink = await this.getDownloadLink(
+				remotePath,
+				raw,
+				budget,
+			);
+			let response: RequestUrlResponse | undefined;
+			const startedAt = Date.now();
+			logger.debug("Download transfer started", {
+				attempt: attempt + 1,
+				timeoutMs: this.readTimeoutMs,
+			});
+			try {
+				response = await this.requestRead(
+					{
+						url: downloadLink.href,
+						method: "GET",
+						throw: false,
+					},
+					"download transfer",
+					budget,
+				);
+			} catch (error) {
+				logger.warn("Download transfer failed", {
+					attempt: attempt + 1,
+					durationMs: Date.now() - startedAt,
+					kind: isRemoteReadTimeout(error) ? "timeout" : "network",
+				});
+				this.remainingReadTime(budget, "download transfer");
+				if (
+					!this.recovery(
+						error,
+						"read",
+						this.maxRetries - attempt,
+						budget,
+					).retry
+				) {
+					throw error;
+				}
+			}
+			if (response) {
+				if (response.status >= 200 && response.status < 300) {
+					logger.debug("Download transfer completed", {
+						attempt: attempt + 1,
+						durationMs: Date.now() - startedAt,
+						size: response.arrayBuffer.byteLength,
+						status: response.status,
+					});
+					const result = raw
+						? response.arrayBuffer
+						: await this.decryptContent(response.arrayBuffer);
+					this.remainingReadTime(budget, "download decode");
+					logger.debug(`Downloaded file: ${remotePath}`);
+					return result;
+				}
+				if (
+					!this.recovery(
+						new YandexApiError("Download failed", response.status),
+						"read",
+						this.maxRetries - attempt,
+						budget,
+					).retry
+				) {
+					const message = `Download HTTP ${response.status}`;
+					if (response.status === 401 || response.status === 403) {
+						throw new YandexApiError(message, response.status);
+					}
+					// A signed-link 404 does not prove that the API resource is absent.
+					throw withFailureContext(
+						new RemoteHttpError(message, response.status),
+						{
+							stage: "download",
+							action: "read",
+							requestState: "completed",
+						},
+					);
+				}
+			}
+			const delay = this.getRetryDelay(attempt);
+			logger.warn("Download transfer interrupted; retrying", {
+				attempt: attempt + 1,
+				delay,
+				status: response?.status,
+			});
+			await this.waitBeforeRetry(delay, attempt, "download", budget);
+		}
+		throw new Error("Download failed");
 	}
 
 	/**
@@ -1029,6 +1175,7 @@ export class YandexDiskClient {
 		endpoint: string,
 		body?: unknown,
 		beforeAttempt?: () => Promise<void>,
+		budget?: DownloadReadBudget,
 	): Promise<RequestUrlResponse> {
 		const url = `${API_BASE_URL}${endpoint}`;
 		const endpointName = endpoint.split("?", 1)[0] ?? endpoint;
@@ -1056,6 +1203,7 @@ export class YandexDiskClient {
 			if (method !== "GET") {
 				await this.writeGuard?.();
 			}
+			const startedAt = Date.now();
 			try {
 				if (method === "GET") {
 					this.recordApiRead(endpoint);
@@ -1065,7 +1213,14 @@ export class YandexDiskClient {
 					maxRetries: this.maxRetries,
 				});
 
-				const response = await requestUrl(params);
+				const response =
+					method === "GET"
+						? await this.requestRead(
+								params,
+								`API ${method} ${endpointName}`,
+								budget,
+							)
+						: await this.requestNative(params);
 
 				// Successful statuses
 				if (response.status >= 200 && response.status < 300) {
@@ -1075,54 +1230,54 @@ export class YandexDiskClient {
 					return response;
 				}
 
-				// Handle errors
-				const errorData = response.json as YandexError;
-
-				// Errors that can be retried
-				if (this.isTransientStatus(response.status)) {
-					lastError = new YandexApiError(
-						errorData?.description ||
-							"Rate limit or service unavailable",
-						response.status,
-						errorData?.error,
-					);
-
-					logger.warn(
-						`API rate/service error: ${method} ${endpointName} -> ${response.status}`,
-						{
-							code: errorData?.error,
-							description: errorData?.description,
-							attempt: attempt + 1,
-						},
-					);
-
-					if (attempt < this.maxRetries) {
-						const delay = this.getRetryDelay(attempt);
-						logger.warn(`Retrying API request in ${delay}ms`);
-						await this.sleep(delay);
-						continue;
-					}
-				}
-
-				// Other errors - don't retry
-				logger.debug(
-					`API error: ${method} ${endpointName} -> ${response.status}`,
-					{
-						code: errorData?.error,
-						description: errorData?.description,
-						message: errorData?.message,
-						reason: errorData?.reason,
-					},
-				);
-				throw new YandexApiError(
+				const errorData = this.readProviderError(response);
+				const failure = new YandexApiError(
 					errorData?.description || `HTTP ${response.status}`,
 					response.status,
 					errorData?.error,
 				);
+				const diagnostic = new OperationFailure(failure, {
+					stage: `API ${method} ${endpointName}`,
+					durationMs: Date.now() - startedAt,
+					action: method === "GET" ? "read" : "write",
+				});
+				logger.debug("API response failed", {
+					failure: diagnostic.summary,
+					attempt: attempt + 1,
+				});
+				if (
+					this.recovery(
+						failure,
+						method === "GET" ? "read" : "write",
+						this.maxRetries - attempt,
+						budget,
+					).retry
+				) {
+					lastError = failure;
+					const delay = this.getRetryDelay(attempt);
+					logger.warn("Retrying API request", {
+						failure: diagnostic.summary,
+						attempt: attempt + 1,
+						delay,
+					});
+					await this.waitBeforeRetry(
+						delay,
+						attempt,
+						`API ${method} ${endpointName}`,
+						budget,
+					);
+					continue;
+				}
+				throw withFailureContext(failure, {
+					stage: `API ${method} ${endpointName}`,
+					action: method === "GET" ? "read" : "write",
+					requestState: "completed",
+				});
 			} catch (e) {
-				if (e instanceof YandexApiError) {
+				if (e instanceof YandexApiError || isRemoteReadTimeout(e)) {
 					throw e;
 				}
+				this.remainingReadTime(budget, `API ${method} ${endpointName}`);
 				lastError = e as Error;
 
 				logger.error(`API request failed: ${method} ${endpointName}`, {
@@ -1130,15 +1285,159 @@ export class YandexDiskClient {
 					error: (e as Error).message,
 				});
 
-				if (attempt < this.maxRetries) {
+				if (
+					this.recovery(
+						e,
+						method === "GET" ? "read" : "write",
+						this.maxRetries - attempt,
+						budget,
+					).retry
+				) {
 					const delay = this.getRetryDelay(attempt);
 					logger.warn(`Network error, retry in ${delay}ms:`);
-					await this.sleep(delay);
+					await this.waitBeforeRetry(
+						delay,
+						attempt,
+						`API ${method} ${endpointName}`,
+						budget,
+					);
+				} else {
+					throw e;
 				}
 			}
 		}
 
 		throw lastError || new Error("Unknown error");
+	}
+
+	/** HTTP status remains authoritative when an optional provider error body is not JSON. */
+	private readProviderError(
+		response: RequestUrlResponse,
+	): YandexError | undefined {
+		try {
+			return response.json as YandexError;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Isolate native rejection from application and provider response parsing failures. */
+	private async requestNative(
+		params: RequestUrlParam,
+	): Promise<RequestUrlResponse> {
+		try {
+			return await requestUrl(params);
+		} catch (error) {
+			throw new NetworkRequestError(error);
+		}
+	}
+
+	private recovery(
+		error: unknown,
+		action: "read" | "write" | "put" | "poll",
+		attemptsRemaining: number,
+		budget?: DownloadReadBudget,
+	) {
+		return decideRecovery(
+			new OperationFailure(error, { stage: "transport", action }),
+			{
+				attemptsRemaining,
+				remainingMs: budget ? budget.deadline - Date.now() : Infinity,
+			},
+		);
+	}
+
+	/** Bound read waiting without retrying an unresolved native request or applying its late result. */
+	private async requestRead(
+		params: RequestUrlParam,
+		operation: string,
+		budget?: DownloadReadBudget,
+	): Promise<RequestUrlResponse> {
+		const timeoutMs = Math.min(
+			this.readTimeoutMs,
+			this.remainingReadTime(budget, operation),
+		);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const response = await Promise.race([
+				this.requestNative(params),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new RemoteReadTimeoutError(
+									timeoutMs,
+									operation,
+								),
+							),
+						timeoutMs,
+					);
+				}),
+			]);
+			this.remainingReadTime(budget, operation);
+			return response;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** Share one wall-clock deadline across a stable snapshot and its retries. */
+	createDownloadBudget(): DownloadReadBudget {
+		return {
+			deadline: Date.now() + this.downloadTimeoutMs,
+			timeoutMs: this.downloadTimeoutMs,
+		};
+	}
+
+	private remainingReadTime(
+		budget: DownloadReadBudget | undefined,
+		operation: string,
+	): number {
+		if (!budget) {
+			return this.readTimeoutMs;
+		}
+		const remaining = budget.deadline - Date.now();
+		if (remaining <= 0) {
+			throw new RemoteReadTimeoutError(budget.timeoutMs, operation);
+		}
+		return remaining;
+	}
+
+	/** Presentation must never change transport success, retry count or budget. */
+	private async waitBeforeRetry(
+		delayMs: number,
+		attempt: number,
+		stage: string,
+		budget?: DownloadReadBudget,
+	): Promise<void> {
+		const notify = (progress?: RetryProgress) => {
+			try {
+				this.retryCallback?.(progress);
+			} catch (error) {
+				logger.warn("Retry presentation failed", { error });
+			}
+		};
+		notify({
+			stage,
+			attempt: attempt + 2,
+			maxAttempts: stage === "polling" ? 120 : this.maxRetries + 1,
+			delayMs,
+		});
+		try {
+			await this.sleepBeforeReadRetry(delayMs, budget);
+		} finally {
+			notify();
+		}
+	}
+
+	/** Backoff consumes the same budget, without starting another native read. */
+	private async sleepBeforeReadRetry(
+		delay: number,
+		budget?: DownloadReadBudget,
+	): Promise<void> {
+		const remaining = this.remainingReadTime(budget, "download retry");
+		await this.sleep(budget ? Math.min(delay, remaining) : delay);
+		this.remainingReadTime(budget, "download retry");
 	}
 
 	private recordApiRead(endpoint: string): void {
@@ -1167,10 +1466,6 @@ export class YandexDiskClient {
 		);
 	}
 
-	private isTransientStatus(status: number): boolean {
-		return status === 423 || status === 429 || status === 503;
-	}
-
 	/**
 	 * Wait for a server-side operation returned as HTTP 202.
 	 */
@@ -1189,24 +1484,36 @@ export class YandexDiskClient {
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
 
 		for (let attempt = 0; attempt < 120; attempt++) {
-			const operationResponse = await requestUrl({
-				url: operationUrl,
-				method: "GET",
-				headers: {
-					Authorization: `OAuth ${this.token}`,
+			const operationResponse = await this.requestRead(
+				{
+					url: operationUrl,
+					method: "GET",
+					headers: {
+						Authorization: `OAuth ${this.token}`,
+					},
+					throw: false,
 				},
-				throw: false,
-			});
+				"operation status",
+			);
 			if (
 				operationResponse.status < 200 ||
 				operationResponse.status >= 300
 			) {
 				if (
-					(operationResponse.status === 409 ||
-						this.isTransientStatus(operationResponse.status)) &&
-					attempt < 119
+					this.recovery(
+						new YandexApiError(
+							"Operation polling failed",
+							operationResponse.status,
+						),
+						"poll",
+						119 - attempt,
+					).retry
 				) {
-					await this.sleep(this.getRetryDelay(attempt % 4));
+					await this.waitBeforeRetry(
+						this.getRetryDelay(attempt % 4),
+						attempt,
+						"polling",
+					);
 					continue;
 				}
 				throw new YandexApiError(
@@ -1242,19 +1549,5 @@ export class YandexDiskClient {
 
 	private isConflictError(e: unknown): boolean {
 		return e instanceof YandexApiError && e.status === 409;
-	}
-}
-
-/**
- * Yandex API error
- */
-export class YandexApiError extends Error {
-	constructor(
-		message: string,
-		public status: number,
-		public code?: string,
-	) {
-		super(message);
-		this.name = "YandexApiError";
 	}
 }

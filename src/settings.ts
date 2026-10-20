@@ -28,14 +28,16 @@ import {
 import type { BackupInfo, RemoteEncryptionManifest } from "./types";
 import { YandexApiError } from "./api/yandex-client";
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
-import { formatForceActivity } from "./ui/force-sync-progress";
+import type { ForceDirection } from "./sync/workflows/force-controller";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
 	private backupStatusPromise: Promise<string> | null = null;
 	private activityUnsubscribers: (() => void)[] = [];
-	private forceButtons: ButtonComponent[] = [];
-	private forceActivityEl: HTMLElement | null = null;
+	private forceButtons: {
+		button: ButtonComponent;
+		direction: ForceDirection;
+	}[] = [];
 	private controlsEl: HTMLFieldSetElement | null = null;
 	private renderGeneration = 0;
 	private displayed = false;
@@ -100,16 +102,14 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			this.controlsEl.disabled = busy;
 			this.controlsEl.setAttribute("aria-busy", String(busy));
 		}
-		for (const button of this.forceButtons) {
-			button.setDisabled(this.plugin.isForceSyncUnavailable());
-		}
 		const state = this.plugin.getForceSyncController().getState();
-		if (this.forceActivityEl) {
-			this.forceActivityEl.hidden = !busy;
-			this.forceActivityEl.setText(
-				state?.active ? formatForceActivity(state) : "",
-			);
-			this.forceActivityEl.toggleClass("force-flow-active", busy);
+		const forceUnavailable = this.plugin.isForceSyncUnavailable();
+		for (const { button, direction } of this.forceButtons) {
+			const active =
+				state?.active === true && state.direction === direction;
+			button.setDisabled(forceUnavailable);
+			button.buttonEl.setAttribute("aria-busy", String(active));
+			button.buttonEl.toggleClass("force-sync-button-active", active);
 		}
 	}
 
@@ -242,7 +242,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.detachActivity();
 		this.renderGeneration++;
 		this.forceButtons = [];
-		this.forceActivityEl = null;
 		this.plugin.encryptionStateChangeCallback = () => {
 			this.renderSettings();
 		};
@@ -466,7 +465,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setDesc(t("settings.force_sync_desc"))
 			.addButton((button) => {
-				this.forceButtons.push(button);
+				this.forceButtons.push({ button, direction: "from_local" });
 				return button
 					.setButtonText(t("settings.force_sync_from_local_button"))
 					.setCta()
@@ -475,7 +474,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					});
 			})
 			.addButton((button) => {
-				this.forceButtons.push(button);
+				this.forceButtons.push({ button, direction: "from_remote" });
 				return button
 					.setButtonText(t("settings.force_sync_from_remote_button"))
 					.setCta()
@@ -483,10 +482,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						void this.plugin.runForceSyncFromRemote();
 					});
 			});
-		this.forceActivityEl = containerEl.createDiv({
-			cls: "force-flow-status",
-			attr: { role: "status", "aria-live": "polite" },
-		});
 		this.updateActivity();
 
 		// Encryption section

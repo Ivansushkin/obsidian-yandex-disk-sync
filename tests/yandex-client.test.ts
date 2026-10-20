@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { YandexApiError, YandexDiskClient } from "../src/api/yandex-client";
-import type { YandexResource } from "../src/types";
+import { DEFAULT_SETTINGS, type YandexResource } from "../src/types";
+import { IndexManager } from "../src/sync/canonical/manager";
+import type { VaultAdapter } from "../src/api/vault-adapter";
+import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
+import { MemoryDisk, bytes } from "./helpers/sync-flow";
 
 interface TestRequestParams {
 	url: string;
@@ -18,6 +22,67 @@ interface TestResponse {
 const requestGlobal = globalThis as typeof globalThis & {
 	__obsidianRequestUrl?: (params: TestRequestParams) => Promise<TestResponse>;
 };
+
+test("remote snapshot retries server listing errors and preserves persistent failures", async () => {
+	for (const [status, failures, invalidBody] of [
+		[500, 1, false],
+		[503, 1, true],
+		[502, 1, false],
+		[504, 1],
+		[500, 9],
+	] as const) {
+		const disk = new MemoryDisk();
+		disk.files.set("vault/note.md", bytes("remote bytes"));
+		let listings = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			if (params.url.includes("/resources?")) {
+				listings++;
+				if (listings <= failures) {
+					if (invalidBody) {
+						return Object.defineProperty(response(status), "json", {
+							get: () => {
+								throw new Error(
+									"synthetic non-JSON provider body",
+								);
+							},
+						});
+					}
+					return response(status, {
+						error: "InternalServerError",
+						description: "synthetic server failure",
+					});
+				}
+			}
+			return await disk.request(params);
+		};
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				maxRetries: 2,
+				retryDelay: 0,
+			});
+			if (failures === 9) {
+				await assert.rejects(
+					captureRemoteRawSnapshot(client, "vault"),
+					(error) =>
+						error instanceof YandexApiError && error.status === 500,
+				);
+				assert.equal(listings, 3);
+			} else {
+				const snapshot = await captureRemoteRawSnapshot(
+					client,
+					"vault",
+				);
+				assert.deepEqual(snapshot.files, [
+					{ path: "note.md", content: bytes("remote bytes") },
+				]);
+				assert.equal(listings, 2);
+			}
+		} finally {
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
 
 function response(status: number, json: unknown = {}): TestResponse {
 	return {
@@ -452,6 +517,247 @@ test("DELETE guard failures are not treated as resource absence", async () => {
 			client.deleteResource("vault/note.md", false, true),
 			(error) => error instanceof YandexApiError && error.status === 404,
 		);
+	} finally {
+		delete requestGlobal.__obsidianRequestUrl;
+	}
+});
+
+test("direct download retries transient transfer failures with fresh links and stops at final errors", async () => {
+	const content = new TextEncoder().encode("complete download").buffer;
+	for (const kind of [
+		"network",
+		503,
+		500,
+		502,
+		504,
+		"exhausted",
+		"authentication",
+	] as const) {
+		let links = 0;
+		let transfers = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			if (params.url.includes("/resources/download?")) {
+				links++;
+				return response(200, {
+					href: `https://synthetic.invalid/content/${links}`,
+				});
+			}
+			transfers++;
+			assert.equal(
+				params.url,
+				`https://synthetic.invalid/content/${transfers}`,
+			);
+			if (kind === "authentication") {
+				return response(401);
+			}
+			if (
+				kind === "exhausted" ||
+				(kind === "network" && transfers === 1)
+			) {
+				throw new Error(
+					"Request Failed. SocketException Software caused connection abort",
+				);
+			}
+			if (typeof kind === "number" && transfers === 1) {
+				return response(kind);
+			}
+			return { ...response(200), arrayBuffer: content };
+		};
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				maxRetries: 2,
+				retryDelay: 0,
+			});
+			if (kind === "exhausted") {
+				await assert.rejects(
+					client.downloadFile("vault/note.md"),
+					/connection abort/,
+				);
+			} else if (kind === "authentication") {
+				await assert.rejects(
+					client.downloadFile("vault/note.md"),
+					(error) =>
+						error instanceof YandexApiError && error.status === 401,
+				);
+			} else {
+				assert.deepEqual(
+					await client.downloadFile("vault/note.md"),
+					content,
+				);
+			}
+			assert.equal(
+				transfers,
+				kind === "exhausted" ? 3 : kind === "authentication" ? 1 : 2,
+			);
+			assert.equal(links, transfers);
+		} finally {
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
+
+test("signed download 404 cannot classify a present encryption manifest as absent", async () => {
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		if (params.url.includes("/resources/download?")) {
+			return response(200, { href: "https://synthetic.invalid/content" });
+		}
+		if (params.url.includes("/resources?")) {
+			return response(
+				200,
+				fileResource("vault/.obsidian-encrypt.json", {
+					sha256: "present",
+				}),
+			);
+		}
+		return response(404);
+	};
+	try {
+		const client = new YandexDiskClient({
+			token: "synthetic",
+			maxRetries: 0,
+		});
+		const manager = new IndexManager(client, {} as VaultAdapter, {
+			...DEFAULT_SETTINGS,
+			remotePath: "vault",
+		});
+		await assert.rejects(
+			manager.downloadEncryptionManifestForGuard(),
+			/Download HTTP 404/,
+		);
+	} finally {
+		delete requestGlobal.__obsidianRequestUrl;
+	}
+});
+
+test("download budget includes metadata, fresh links and completed network failures", async () => {
+	const originalNow = Date.now;
+	for (const kind of ["raw", "logical", "retries"] as const) {
+		let now = originalNow();
+		Date.now = () => now;
+		let transfers = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			now += 20;
+			if (params.url.includes("/resources/download?")) {
+				return response(200, {
+					href: "https://synthetic.invalid/content",
+				});
+			}
+			if (params.url.includes("/resources?")) {
+				return response(
+					200,
+					fileResource("vault/note.md", { sha256: "stable" }),
+				);
+			}
+			transfers++;
+			if (kind === "retries") {
+				throw new Error("synthetic completed network failure");
+			}
+			return response(200);
+		};
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				retryDelay: 0,
+				readTimeoutMs: 1000,
+				downloadTimeoutMs: 50,
+			});
+			await assert.rejects(
+				kind === "raw"
+					? client.downloadStableRawFile("vault/note.md")
+					: kind === "logical"
+						? client.downloadStableLogicalFile("vault/note.md")
+						: client.downloadFile("vault/note.md"),
+				/Remote read timed out/,
+			);
+			assert.equal(
+				transfers,
+				1,
+				"Budget exhaustion cannot start another transfer",
+			);
+		} finally {
+			Date.now = originalNow;
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
+
+test("stalled remote reads expire without retrying an unresolved native request", async () => {
+	for (const stage of ["link", "bytes", "metadata"] as const) {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let blockedRequests = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			const link = params.url.includes("/resources/download?");
+			if (
+				(stage === "link" && link) ||
+				stage === "metadata" ||
+				(stage === "bytes" && !link)
+			) {
+				blockedRequests++;
+				await gate;
+			}
+			return link
+				? response(200, { href: "https://synthetic.invalid/content" })
+				: response(200);
+		};
+		let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				maxRetries: 3,
+				retryDelay: 0,
+				readTimeoutMs: 10,
+			});
+			const operation =
+				stage === "metadata"
+					? client.getResource("vault/note.md")
+					: client.downloadFile("vault/note.md");
+			await assert.rejects(
+				Promise.race([
+					operation,
+					new Promise((_, reject) => {
+						safetyTimer = setTimeout(
+							() => reject(new Error("test safety deadline")),
+							250,
+						);
+					}),
+				]),
+				/Remote read timed out/,
+			);
+			assert.equal(blockedRequests, 1);
+		} finally {
+			clearTimeout(safetyTimer);
+			release();
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
+
+test("unknown response decoding failure stops snapshot capture without transport retry", async () => {
+	let requests = 0;
+	const cause = new Error("synthetic invalid provider response");
+	requestGlobal.__obsidianRequestUrl = async () => {
+		requests++;
+		return Object.defineProperty(response(200), "json", {
+			get: () => {
+				throw cause;
+			},
+		});
+	};
+	try {
+		const client = new YandexDiskClient({
+			token: "synthetic",
+			maxRetries: 3,
+			retryDelay: 0,
+		});
+		await assert.rejects(
+			captureRemoteRawSnapshot(client, "vault"),
+			(error) => error === cause,
+		);
+		assert.equal(requests, 1);
 	} finally {
 		delete requestGlobal.__obsidianRequestUrl;
 	}

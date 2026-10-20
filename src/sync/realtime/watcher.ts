@@ -93,6 +93,7 @@ export class FileWatcher {
 	private persistError: unknown = null;
 	private fullSyncBarrier: {
 		sessionId: string;
+		initialReceive: boolean;
 		cutoffEventIds: Set<string>;
 		uploadEventIds: Set<string>;
 		renameCandidateIds: Set<string>;
@@ -102,6 +103,7 @@ export class FileWatcher {
 	} | null = null;
 	private preparedFullBarrier: {
 		sessionId: string;
+		initialReceive: boolean;
 		uploadEventIds: Set<string>;
 		cutoffEventIds: Set<string>;
 		renameCandidateIds: Set<string>;
@@ -187,6 +189,8 @@ export class FileWatcher {
 		);
 		this.preparedFullBarrier = {
 			sessionId: context.sessionId,
+			initialReceive:
+				this.syncEngine.isInitialRemoteReceivePending?.() ?? false,
 			uploadEventIds,
 			cutoffEventIds,
 			renameCandidateIds: new Set(),
@@ -206,7 +210,11 @@ export class FileWatcher {
 				await this.deferredDrainPromise;
 			}
 			const destructiveIds = new Set(
-				[...cutoffEventIds].filter((id) => !uploadEventIds.has(id)),
+				this.preparedFullBarrier?.initialReceive
+					? []
+					: [...cutoffEventIds].filter(
+							(id) => !uploadEventIds.has(id),
+						),
 			);
 			if (destructiveIds.size > 0) {
 				await this.flushDeferredEvents(destructiveIds);
@@ -399,6 +407,7 @@ export class FileWatcher {
 		this.preparedFullBarrier = null;
 		this.fullSyncBarrier = {
 			sessionId: context.sessionId,
+			initialReceive: prepared?.initialReceive ?? false,
 			cutoffEventIds:
 				prepared?.sessionId === context.sessionId
 					? prepared.cutoffEventIds
@@ -447,6 +456,20 @@ export class FileWatcher {
 				acknowledgedEvents: barrier.cutoffEventIds.size,
 				pendingWatcherEvents: this.deferredEvents.length,
 			});
+			return;
+		}
+		if (barrier.initialReceive) {
+			const settled = this.deferredEvents.flatMap((event) => {
+				const id = this.getEventId(event);
+				return id &&
+					barrier.cutoffEventIds.has(id) &&
+					this.pausedEventSignatures?.get(id) ===
+						this.getEventSignature(event)
+					? [id]
+					: [];
+			});
+			this.acknowledgeEvents(settled);
+			await this.waitForPersistence();
 			return;
 		}
 
@@ -1162,6 +1185,9 @@ export class FileWatcher {
 		onlyIds?: ReadonlySet<string>,
 	): Promise<void> {
 		await this.waitForPersistence();
+		if (this.syncEngine.isInitialRemoteReceivePending?.()) {
+			return;
+		}
 		const events = this.deferredEvents.filter((event) => {
 			const id = this.getEventId(event);
 			if (onlyIds && (!id || !onlyIds.has(id))) {
@@ -1935,7 +1961,11 @@ export class FileWatcher {
 	}
 
 	private isWatcherFrozen(): boolean {
-		return this.isPausedForSync || this.isPreparingFullSync;
+		return (
+			this.isPausedForSync ||
+			this.isPreparingFullSync ||
+			(this.syncEngine.isInitialRemoteReceivePending?.() ?? false)
+		);
 	}
 
 	private createEventId(): string {

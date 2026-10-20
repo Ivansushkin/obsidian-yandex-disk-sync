@@ -42,6 +42,12 @@ target; coalesced parent переносит оба пути зависимого
 промежуточной папки используется только для поглощения механических notifications
 её descendants и не переживает остановку watcher.
 
+До завершённого initial remote receive watcher хранит события локально и не
+публикует mutations. Full prepare не выполняет pre-drain destructive events;
+после успешного full сверяются filesystem и сохранённые signatures cutoff events.
+События, изменившиеся во время прохода, остаются для replay; failed full не
+подтверждает очередь. Обычный pre-drain после подключения работает по прежним правилам.
+
 Full prepare фиксирует cutoff событий до входа в очередь. Destructive/rename work
 завершается заранее, uploads покрываются full barrier. Upload receipt передаёт
 подтверждённую revision последующему rename внутри coordinator settlement. Неоднозначная
@@ -116,3 +122,9 @@ watcher, engine, IndexManager, HTTP client, VaultAdapter и криптограф
 точные local/physical bytes, отсутствие промежуточных файлов, JSON restart и пустые
 очереди. Это проверка взаимодействия алгоритмов, не доказательство работы реальных
 Obsidian events, сетевых задержек и Yandex API.
+
+Remote reads имеют deadline 60 s на запрос. Timeout останавливает запуск queued
+downloads full/Force, но не освобождает сессию до завершения уже начатых tasks.
+Поздние bytes timed-out read не применяются. Пропущенные tasks сохраняют error
+outcome без продвижения progress; первая фактическая ошибка видна до конца batch.
+Native request не отменяется; лимит ожидания не доказывает восстановление сети.

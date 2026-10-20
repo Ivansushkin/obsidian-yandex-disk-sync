@@ -1,5 +1,6 @@
 import { YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
+import { createSyncError } from "../errors";
 import type {
 	PendingMutation,
 	SyncError,
@@ -19,6 +20,7 @@ import type {
 	SyncRunOptions,
 } from "../contracts";
 import * as syncReconciliation from "../reconciliation/commits";
+import { receiveInitialRemoteState } from "./initial-receive";
 export interface Dependencies {
 	indexManager: IndexManager;
 	settings: YandexDiskSyncSettings;
@@ -212,6 +214,26 @@ export async function reconcileFullSync(
 			"Encryption preflight requires a stable canonical index",
 		);
 	}
+	const initialCanonical = deps.indexManager.getRemoteIndex();
+	if (
+		deps.indexManager.isInitialRemoteReceivePending?.() &&
+		!options?.skipEncryptionGuard &&
+		!options?.skipMaintenanceGuard &&
+		!initialCanonical.maintenance &&
+		!(initialCanonical.appliedMutationSeq[deps.settings.deviceId] ?? 0)
+	) {
+		if (
+			Object.values(initialCanonical.moves).some((move) => move.pending)
+		) {
+			throw new Error(
+				"Initial remote receive waits for pending canonical moves to finish",
+			);
+		}
+		await receiveInitialRemoteState(deps, result, validationToken);
+		if (result.errors.length > 0) {
+			return;
+		}
+	}
 	const localStateBeforeAdoption = deps.indexManager.getLocalIndex();
 	const canonicalEpoch = deps.indexManager.getRemoteIndex().epoch;
 	const replacesObservedEpoch =
@@ -358,6 +380,30 @@ export async function reconcileFullSync(
 			return false;
 		});
 	}
+	for (const operation of operations) {
+		if (operation.action !== "conflict") {
+			continue;
+		}
+		const baseline = (adoption.adoptionSnapshot?.state.files ??
+			localIndex.files)[operation.path];
+		const canonical = remoteIndex.files[operation.path];
+		logger.warn("Conflict classification", {
+			path: operation.path,
+			reason: operation.reason,
+			epochAdoption: Boolean(adoption.adoptionSnapshot),
+			baselinePresent: Boolean(baseline),
+			baselineLive: Boolean(baseline && !baseline.deleted),
+			localMatchesBaseline: baseline
+				? operation.localMeta?.sha256 === baseline.sha256
+				: null,
+			canonicalMatchesBaseline: baseline
+				? canonical?.sha256 === baseline.sha256
+				: null,
+			localMatchesCanonical: canonical
+				? operation.localMeta?.sha256 === canonical.sha256
+				: null,
+		});
+	}
 	const pendingMutationsBeforeBaselines =
 		deps.indexManager.getPendingMutations().length;
 	operations = operations.map((operation) =>
@@ -393,6 +439,18 @@ export async function reconcileFullSync(
 
 	const uploads = operations.filter((op) => op.action === "upload");
 	const downloads = operations.filter((op) => op.action === "download");
+	logger.debug("Download batch planned", {
+		count: downloads.length,
+		expectedBytes: downloads.reduce(
+			(sum, operation) => sum + (operation.remoteMeta?.size ?? 0),
+			0,
+		),
+		largestFileBytes: downloads.reduce(
+			(size, operation) =>
+				Math.max(size, operation.remoteMeta?.size ?? 0),
+			0,
+		),
+	});
 	let deletes = operations.filter(
 		(op) => op.action === "delete_remote" || op.action === "delete_local",
 	);
@@ -422,7 +480,10 @@ export async function reconcileFullSync(
 	}
 
 	if (downloads.length > 0) {
-		deps.setSyncPhase("applying", t("status.op.downloading_files"));
+		deps.setSyncPhase("applying", t("status.op.downloading_files"), {
+			completed: uploads.length,
+			total: totalOps,
+		});
 		const downloadResults = await fileOperations.executeOperationsParallel(
 			deps.fileOperations,
 			downloads,
@@ -433,6 +494,10 @@ export async function reconcileFullSync(
 		);
 		result.downloaded = downloadResults.succeeded;
 		result.errors.push(...downloadResults.errors);
+		if (downloadResults.errors.length > 0) {
+			await deps.indexSaveCallback?.();
+			return;
+		}
 	}
 
 	const mutationSettlement = settleFullSyncPendingPuts(deps);
@@ -675,7 +740,6 @@ async function resolveFullConflicts(
 			break;
 		}
 
-		processedOps++;
 		deps.setSyncPhase(
 			"applying",
 			t("status.op.conflict", { path: op.path }),
@@ -689,15 +753,14 @@ async function resolveFullConflicts(
 			);
 			result.conflicts++;
 		} catch (e) {
-			const error: SyncError = {
-				path: op.path,
-				operation: op.action,
-				message: (e as Error).message,
-			};
+			const error: SyncError = createSyncError(e, op.path, op.action);
 			result.errors.push(error);
 			logger.error(`Error resolving conflict for ${op.path}:`, {
 				error: e,
 			});
+		} finally {
+			processedOps++;
+			deps.reportProgress(processedOps, totalOps);
 		}
 	}
 }

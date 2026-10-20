@@ -1,3 +1,4 @@
+import { OperationFailure } from "../errors";
 /**
  * Adapter for working with Obsidian Vault files
  */
@@ -344,11 +345,21 @@ export class VaultAdapter {
 			}
 			logger.info(`Backed up overwritten local file to: ${backupPath}`);
 			return backupPath;
-		} catch (e) {
-			logger.warn(`Failed to back up overwritten file ${originalPath}:`, {
-				error: e,
+		} catch (error) {
+			const failure = new OperationFailure(
+				error,
+				{
+					stage: "protective-backup",
+					path: originalPath,
+					action: "local",
+					outcome: "stopped-before-write",
+				},
+				{ category: "safety", code: "mandatory-backup-failed" },
+			);
+			logger.warn("Mandatory protective backup failed", {
+				error: failure,
 			});
-			throw e;
+			throw failure;
 		}
 	}
 

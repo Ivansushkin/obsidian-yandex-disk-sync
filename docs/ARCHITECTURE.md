@@ -216,6 +216,16 @@ source mode остаётся авторитетным; после подтвер
 запрещён, migration block снимается, а fingerprint-guarded cleanup продолжает
 обычный full даже после потери инициатора.
 
+Первое подключение pristine device выполняет `workflows/initial-receive.ts` внутри
+full coordinator: сначала cloud live paths и exact tombstones, затем coherent
+local save, после него обычная загрузка unknown local-only. Разные local bytes
+сохраняются защитными копиями вне sync scope; conflict copy не создаётся.
+Eligibility использует существующие revision/time/sequence/queues; partial baselines
+не завершают подключение. Legacy baseline с неизвестным epoch и существующие
+causal mutations не переводятся в этот режим. Persist failure откатывает только
+неподтверждённое завершение; уже применённые bytes и partial baselines остаются.
+Новых persisted fields или изменений canonical/physical-action schema нет.
+
 ## Encryption profiles и migration
 
 Новые vault используют `hardened`: PBKDF2 600k выводит master key, HKDF
@@ -262,6 +272,27 @@ publication window; совпадения одного device ID недостат
 [E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
 
 ## Локальное применение и физический cleanup
+
+Прямой GET bytes использует ограниченные `maxRetries` и backoff клиента при
+сетевом исключении или retryable HTTP-ответе (423/429/500/502/503/504). Каждая новая попытка
+получает новую signed download link; link не логируется. Окончательные HTTP-ошибки
+и ошибки декодирования не повторяются. HTTP 404 от signed link остаётся ошибкой
+передачи и не доказывает отсутствие API resource или encryption manifest.
+API GET также повторяет завершённые HTTP 500/502/504 в пределах maxRetries;
+правила PUT и polling записей не расширяются. Force preflight при постоянной
+ошибке чтения remote snapshot завершается до mutations, включая without-backup.
+До полного download и успешных apply guards
+локальные bytes/baseline не подтверждаются; retry не изменяет правила конфликтов.
+
+GET к API, signed download link и operation status имеют deadline 60 s на запрос.
+Stable raw/logical snapshot и direct download дополнительно имеют общий бюджет
+60 s: metadata, fresh link, bytes, retries и backoff используют оставшееся время.
+Timeout не повторяет запрос: Obsidian API не предоставляет отмену native request.
+Поздний ответ проигравшего Promise не достигает apply. Очередь full/Force downloads
+после timeout не начинает новые tasks и дожидается уже начатых. При ошибке download
+full сохраняет coherent snapshot и выходит до settlement, deletes и conflicts.
+Best-effort metadata stamp после применённого файла сохраняет прежний fallback;
+он не является authority guard. PUT и подтверждение неоднозначных writes не меняются.
 
 Download фиксирует отсутствие файла или его plaintext SHA до remote I/O.
 `VaultAdapter.writeFile` принимает необязательный guard: после подготовки папок
@@ -336,7 +367,10 @@ Force и enable/disable/rotate предлагают with-backup, without-backup 
 progress Notice для них не создаётся. Существующие foreground и blocking
 Notice сохраняются без изменений.
 
-При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
+При первой ошибке transfer ещё во время пачки `SyncState.errorMessage` получает
+причину; progress считается по завершённым tasks, включая ошибки, и не увеличивается
+для пропущенных queued tasks. Conflict task увеличивает completed после завершения
+попытки, а не перед чтением winner или загрузкой copy. При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
 причину с operation/code и общим числом ошибок. Сообщение проходит существующую
 маскировку credentials. Команда показа статуса открывает полный selectable текст
 текущей ошибки; это диагностика, без изменений baseline, очередей или canonical.
@@ -344,7 +378,8 @@ Notice сохраняются без изменений.
 Мобильная плашка находится справа сверху, на 8 px ниже видимых верхних
 панелей с учётом safe area. До двух строк в обычном состоянии; при ошибке —
 заголовок и до трёх строк причины. Ширина до 360 px и поля не менее
-12 px с учётом боковых safe area. Правый край закреплён; при изменении
+12 px с учётом боковых safe area. N/M показан с начала этапа в отдельном несжимаемом элементе рядом с названием.
+Правый край закреплён; при изменении
 текста плашка расширяется влево. Она пропускает касания и располагается ниже модальных окон и меню.
 DOM-зависимое измерение верхних панелей изолировано внутри компонента;
 `ItemView.contentEl` не считается границей системного UI: в floating/fullscreen
@@ -385,8 +420,10 @@ Force через существующий coordinator → persistence → зав
 
 При выборе архива один persistent Notice показывает создание, загрузку и проверку backup,
 далее фазы Force, сохранение и итоговую проверку. Настройки подписаны на
-тот же неперсистентный flow-state; оба Force-контрола блокируются также при
-другой активной sync-сессии. Во время Force настройки и ручные mutating-действия
+тот же неперсистентный flow-state: индикатор внутри кнопки выбранного направления
+работает только при active Force, сохраняя текст кнопки. Отдельной строки прогресса
+под кнопками нет; этапы остаются в Notice. Оба Force-контрола блокируются также при
+другой активной sync-сессии, но без индикатора. Во время Force настройки и ручные mutating-действия
 недоступны, включая промежутки между coordinator-сессиями. Повторное открытие
 настроек читает текущее состояние; закрытие снимает подписки, но не отменяет Force.
 
@@ -409,3 +446,39 @@ persistence, успешного итогового full и отсутствия 
 агент проверяет сборку в разрешённой копии без `.env` и рабочего vault. Реальный
 двухпрофильный прогон обязателен для release. Статус manual evidence хранится отдельно
 в `docs/release-evidence/`; успех автоматических проверок его не меняет.
+
+## Единый контракт ошибок
+
+`errors.ts` не зависит от UI и sync. Он хранит транспортные классы, in-memory
+`OperationFailure` с исходной `cause`, очищенную `FailureSummary` и решение
+`decideRecovery`. Клиент переэкспортирует прежние классы, поэтому их identity и
+существующие `instanceof` не меняются. Signed-download HTTP ошибки имеют
+отдельную identity: 404 signed link не доказывает отсутствие API resource.
+`sync/errors.ts` адаптирует domain exceptions; root, canonical, local identity
+и обязательный backup имеют приоритет над вложенной сетью или authentication.
+
+Политика разрешает попытку, но не выполняет её. Счётчики, backoff и deadlines
+остаются в клиенте; GET сохраняет 423/429/500/502/503/504, writes — 423/429/503,
+operation polling — 409/423/429/503. Только rejection native transport
+помечается как network; decode и неизвестная ошибка автоматически не повторяются.
+Незавершённый native timeout не повторяется. PUT с неоднозначным transient
+результатом проходит прежний guarded read-back даже после последней попытки.
+Новых повторов сессий или изменений scheduler нет.
+
+Sync/realtime, Force, startup, backup и encryption передают очищенную summary
+в неперсистентных результатах/статусах; исходная cause остаётся внутренней.
+Ни summary, ни cause не входят в plugin data, canonical, mutations или physical
+actions. Форматтер общий для Notice и status surfaces; старые message/code/
+errorMessage остаются совместимыми представлениями. Backoff отражается в текущем
+прогрессе без дополнительного Notice. Failure содержит этап, logical path,
+HTTP/provider code и известный исход; частичный результат не объявляет данные
+неизменными. Force preflight/protected snapshot сохраняют причину; post-commit
+сбой остаётся cleanup-pending. Cancel, пароль и ожидаемые blocked outcomes
+сохраняют отдельные сценарии. Startup сеть блокирует запуск с причиной
+недоступности, а не с утверждением о неверном токене; виды блоков и Force права
+не меняются.
+
+Логи сохраняют очищенную цепочку причин, этап, попытку и длительность, не
+response descriptions/body и не signed URLs. Provider error code проходит
+ограничение формата. Реальная доступность Диска и работа двух Obsidian-профилей
+проверяются отдельно от автоматических алгоритмических тестов.

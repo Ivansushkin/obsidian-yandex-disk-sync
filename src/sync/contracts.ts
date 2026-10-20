@@ -1,3 +1,4 @@
+import type { FailureSummary } from "../errors";
 import type { SyncSessionKind, SyncState } from "../types";
 import { type ForceCanonicalProof } from "./canonical/manager";
 
@@ -6,6 +7,7 @@ export type SyncEventCallback = (state: SyncState) => void;
 export type IndexSaveCallback = () => void | Promise<void>;
 
 export interface SyncGuardResult {
+	failure?: FailureSummary;
 	blockReason: string | null;
 	blockCode?: string;
 	blockStatus?: "error" | "migration-required" | "encryption-required";
@@ -24,6 +26,7 @@ export type ExternalSyncBlockKind =
 	| "authentication";
 
 export interface ExternalSyncBlock {
+	failure?: FailureSummary;
 	kind: ExternalSyncBlockKind;
 	reason: string;
 	code: string;

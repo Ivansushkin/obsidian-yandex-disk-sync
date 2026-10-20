@@ -246,12 +246,9 @@ export async function saveRemoteIndexOrAbort(
 			retryable: e.retryable,
 			error: e,
 		});
-		result.errors.push({
-			path: "",
-			operation: "none",
-			code: syncErrors.classifySyncError(e),
-			message: `Index transaction ${e.outcome} at ${e.stage}: ${e.message}`,
-		});
+		result.errors.push(
+			syncErrors.createSyncError(e, "", "none", `canonical-${e.stage}`),
+		);
 		result.success = false;
 		return null;
 	}
@@ -672,11 +669,13 @@ export async function handleConflict(
 	if (localSha256 !== op.localMeta.sha256) {
 		throw new Error("Local file changed after conflict classification");
 	}
+	logger.debug("Conflict stage", { stage: "read-remote-version" });
 	const remote = await readVerifiedRemoteVersion(deps, op.path);
 	if (remote.canonical.files[op.path]?.deleted) {
 		throw new Error("Canonical deletion superseded the conflict");
 	}
 	if (remote.sha256 === localSha256) {
+		logger.debug("Conflict stage", { stage: "apply-winner" });
 		await fileOperations.applyDownloadedContent(
 			deps.fileOperations,
 			op.path,
@@ -693,21 +692,26 @@ export async function handleConflict(
 		);
 		return;
 	}
+	logger.debug("Conflict stage", { stage: "preserve-local-copy" });
 	const conflictPath = await preserveLocalConflictCopy(
 		deps,
 		op.path,
 		localContent,
 	);
+	logger.debug("Conflict stage", { stage: "upload-copy" });
 	await uploadCausalConflictCopy(deps, conflictPath, localContent);
+	logger.debug("Conflict stage", { stage: "commit-copy" });
 	if (!(await saveRemoteIndexBestEffort(deps))) {
 		throw new Error("Conflict copy could not be committed");
 	}
+	logger.debug("Conflict stage", { stage: "verify-copy" });
 	await assertRetainedConflictCopy(
 		deps,
 		conflictPath,
 		localSha256,
 		remote.canonical.epoch,
 	);
+	logger.debug("Conflict stage", { stage: "reread-winner" });
 	const winner = await readVerifiedRemoteVersion(deps, op.path);
 	if (
 		winner.canonical.epoch !== remote.canonical.epoch ||
@@ -716,6 +720,7 @@ export async function handleConflict(
 	) {
 		throw new Error("Winner changed after preserving conflict copy");
 	}
+	logger.debug("Conflict stage", { stage: "apply-winner" });
 	await fileOperations.applyDownloadedContent(
 		deps.fileOperations,
 		op.path,
@@ -1148,14 +1153,16 @@ export async function resumePendingPhysicalActions(
 				});
 			}
 		} catch (error) {
-			result.errors.push({
-				path: action.path,
-				operation:
+			result.errors.push(
+				syncErrors.createSyncError(
+					error,
+					action.path,
 					action.type === "delete-local"
 						? "delete_local"
 						: "delete_remote",
-				message: error instanceof Error ? error.message : String(error),
-			});
+					"physical-recovery",
+				),
+			);
 		}
 	}
 	if (actions.length > 0 && deps.indexSaveCallback) {
