@@ -1,6 +1,6 @@
 import { t } from "../i18n";
 import type { ForceFlowState } from "../sync/workflows/force-controller";
-import { formatSyncActivity } from "./status-bar";
+import { formatSyncActivity } from "./sync-status-presentation";
 
 /** Shared presentation for the foreground Notice and settings activity row. */
 export function formatForceActivity(state: ForceFlowState): string {

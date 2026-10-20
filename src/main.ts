@@ -9,7 +9,7 @@ import type { OperationBackupChoice } from "./backup/operation-backup-choice";
  * File synchronization with Yandex Disk
  */
 
-import { Notice, Plugin } from "obsidian";
+import { Notice, Platform, Plugin } from "obsidian";
 import {
 	YandexDiskSyncSettings,
 	DEFAULT_SETTINGS,
@@ -41,7 +41,9 @@ import {
 } from "./sync/engine";
 import { DeferredWatcherEvent, FileWatcher } from "./sync/realtime/watcher";
 import { SyncScheduler } from "./sync/scheduler";
-import { formatSyncActivity, SyncStatusBar } from "./ui/status-bar";
+import { SyncStatusBar } from "./ui/status-bar";
+import { formatSyncActivity } from "./ui/sync-status-presentation";
+import { MobileSyncIndicator } from "./ui/mobile-sync-indicator";
 import { SyncStatusModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import {
@@ -126,6 +128,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private syncScheduler!: SyncScheduler;
 	private backupManager!: BackupManager;
 	private statusBar: SyncStatusBar | null = null;
+	private mobileSyncIndicator: MobileSyncIndicator | null = null;
 	private sidebarButton: HTMLElement | null = null;
 	private activeSyncNotice: Notice | null = null;
 	private syncNoticeUnsubscribe: (() => void) | null = null;
@@ -242,6 +245,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.statusBar) {
 			this.statusBar.destroy();
 		}
+		this.mobileSyncIndicator = null;
 		if (this.sidebarButton) {
 			this.sidebarButton.remove();
 			this.sidebarButton = null;
@@ -463,6 +467,20 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Create status bar
 	 */
 	private createStatusBar(): void {
+		if (Platform.isMobile) {
+			const indicator = this.addChild(
+				new MobileSyncIndicator(this.app, () => ({
+					sync: this.syncEngine.getState(),
+					force: this.forceSyncController?.getState() ?? null,
+					foreground: this.foregroundOperation,
+				})),
+			);
+			this.mobileSyncIndicator = indicator;
+			this.register(
+				this.syncEngine.onStateChange(() => indicator.update()),
+			);
+			return;
+		}
 		const statusBarEl = this.addStatusBarItem();
 		this.statusBar = new SyncStatusBar(statusBarEl, this.syncEngine);
 	}
@@ -1297,6 +1315,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private notifyManualActivity(): void {
+		this.mobileSyncIndicator?.update();
 		for (const callback of this.manualActivityListeners ?? []) {
 			try {
 				callback();
@@ -1308,6 +1327,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Keep one foreground Notice across backup, Force, persistence and full reconciliation. */
 	private renderForceProgress(state: ForceFlowState): void {
+		this.mobileSyncIndicator?.update();
 		if (state.active) {
 			if (state.outcome) {
 				return;

@@ -144,6 +144,18 @@ repeat Force local with an explicit archive choice.
 
 ## Usage
 
+### Synchronization indicator
+
+Desktop uses the status bar. Android, iPhone and iPad show a persistent compact
+badge at the top right, 8 px below the upper controls and safe area. Its right
+edge stays fixed as longer text expands to the left. It shows
+the current phase and known progress. When idle, it stays as a compact `YD`
+badge, with the last successful synchronization time when known. It is restored
+after a cold app launch even when synchronization does not run. Force, encryption and backup remain visible between internal stages.
+The badge does not handle taps; existing progress and error notices remain.
+Idle does not guarantee that deferred changes or changes on another device
+have already been synchronized.
+
 ### First Launch
 
 On first launch, the plugin will check for files locally and on Yandex Disk:
