@@ -179,8 +179,9 @@ function formatDateTime(timestamp: number): string {
 /** Format one sync activity consistently for the status bar and Notice. */
 export function formatSyncActivity(state: SyncState): string {
 	const operation = state.currentOperation ?? t("status.syncing");
-	if (!state.progress || state.progress.total <= 0) {
-		return operation;
-	}
-	return `${operation} ${state.progress.completed}/${state.progress.total}`;
+	const progress =
+		state.progress && state.progress.total > 0
+			? ` ${state.progress.completed}/${state.progress.total}`
+			: "";
+	return `${operation}${progress}${state.errorMessage ? `\n${state.errorMessage}` : ""}`;
 }

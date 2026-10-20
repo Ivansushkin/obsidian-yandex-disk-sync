@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import type { EncryptionCodec } from "../crypto/encryption";
 import { logger } from "../utils/logger";
+import { findErrorCause } from "../utils/error-utils";
 import {
 	encodePathForUrl,
 	isProtectedPath,
@@ -28,6 +29,7 @@ export interface YandexClientConfig {
 	token: string;
 	maxRetries?: number;
 	retryDelay?: number;
+	readTimeoutMs?: number;
 }
 
 interface StableRawFileSnapshot {
@@ -48,6 +50,7 @@ export class YandexDiskClient {
 	private token: string;
 	private maxRetries: number;
 	private retryDelay: number;
+	private readonly readTimeoutMs: number;
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
@@ -69,6 +72,7 @@ export class YandexDiskClient {
 		this.token = config.token;
 		this.maxRetries = config.maxRetries ?? 3;
 		this.retryDelay = config.retryDelay ?? 1000;
+		this.readTimeoutMs = config.readTimeoutMs ?? 60_000;
 	}
 
 	/**
@@ -893,19 +897,35 @@ export class YandexDiskClient {
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			const downloadLink = await this.getDownloadLink(remotePath, raw);
 			let response: RequestUrlResponse | undefined;
+			const startedAt = Date.now();
+			logger.debug("Download transfer started", {
+				attempt: attempt + 1,
+				timeoutMs: this.readTimeoutMs,
+			});
 			try {
-				response = await requestUrl({
+				response = await this.requestRead({
 					url: downloadLink.href,
 					method: "GET",
 					throw: false,
 				});
 			} catch (error) {
-				if (attempt === this.maxRetries) {
+				logger.warn("Download transfer failed", {
+					attempt: attempt + 1,
+					durationMs: Date.now() - startedAt,
+					kind: isRemoteReadTimeout(error) ? "timeout" : "network",
+				});
+				if (isRemoteReadTimeout(error) || attempt === this.maxRetries) {
 					throw error;
 				}
 			}
 			if (response) {
 				if (response.status >= 200 && response.status < 300) {
+					logger.debug("Download transfer completed", {
+						attempt: attempt + 1,
+						durationMs: Date.now() - startedAt,
+						size: response.arrayBuffer.byteLength,
+						status: response.status,
+					});
 					const result = raw
 						? response.arrayBuffer
 						: await this.decryptContent(response.arrayBuffer);
@@ -928,6 +948,7 @@ export class YandexDiskClient {
 			logger.warn("Download transfer interrupted; retrying", {
 				attempt: attempt + 1,
 				delay,
+				status: response?.status,
 			});
 			await this.sleep(delay);
 		}
@@ -1093,7 +1114,10 @@ export class YandexDiskClient {
 					maxRetries: this.maxRetries,
 				});
 
-				const response = await requestUrl(params);
+				const response =
+					method === "GET"
+						? await this.requestRead(params)
+						: await requestUrl(params);
 
 				// Successful statuses
 				if (response.status >= 200 && response.status < 300) {
@@ -1148,7 +1172,7 @@ export class YandexDiskClient {
 					errorData?.error,
 				);
 			} catch (e) {
-				if (e instanceof YandexApiError) {
+				if (e instanceof YandexApiError || isRemoteReadTimeout(e)) {
 					throw e;
 				}
 				lastError = e as Error;
@@ -1167,6 +1191,29 @@ export class YandexDiskClient {
 		}
 
 		throw lastError || new Error("Unknown error");
+	}
+
+	/** Bound read waiting without retrying an unresolved native request or applying its late result. */
+	private async requestRead(
+		params: RequestUrlParam,
+	): Promise<RequestUrlResponse> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				requestUrl(params),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new RemoteReadTimeoutError(this.readTimeoutMs),
+							),
+						this.readTimeoutMs,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	private recordApiRead(endpoint: string): void {
@@ -1217,7 +1264,7 @@ export class YandexDiskClient {
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
 
 		for (let attempt = 0; attempt < 120; attempt++) {
-			const operationResponse = await requestUrl({
+			const operationResponse = await this.requestRead({
 				url: operationUrl,
 				method: "GET",
 				headers: {
@@ -1285,4 +1332,22 @@ export class YandexApiError extends Error {
 		super(message);
 		this.name = "YandexApiError";
 	}
+}
+
+/** A native read exceeded its deadline; its underlying transport may still be running. */
+export class RemoteReadTimeoutError extends Error {
+	constructor(timeoutMs: number) {
+		super(`Remote read timed out after ${timeoutMs / 1000}s`);
+		this.name = "RemoteReadTimeoutError";
+	}
+}
+
+/** Preserve timeout identity through transaction and guard error causes. */
+export function isRemoteReadTimeout(error: unknown): boolean {
+	return (
+		findErrorCause(
+			error,
+			(cause) => cause instanceof RemoteReadTimeoutError,
+		) !== null
+	);
 }

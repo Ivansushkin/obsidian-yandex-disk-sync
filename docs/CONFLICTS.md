@@ -82,7 +82,10 @@ FIFO остаются для restart. Corrective upload сохраняет пр�
 ## Download и protective copies
 
 Сетевой обрыв передачи bytes запускает ограниченный retry с новой signed link.
-Исчерпание попыток оставляет download ошибкой без подтверждения baseline. После
+Исчерпание попыток оставляет download ошибкой без подтверждения baseline.
+Каждое remote чтение ограничено 60 s; timeout не повторяет неотменённый native
+request и запрещает применять его поздний ответ. Full выходит до последующих
+conflict/delete commits; уже начатые downloads завершаются с прежними guards. После
 restart неизменённый local файл с прежним baseline получает remote update без
 ложного конфликта; независимая local правка по-прежнему требует causal comparison.
 

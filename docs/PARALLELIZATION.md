@@ -116,3 +116,9 @@ watcher, engine, IndexManager, HTTP client, VaultAdapter и криптограф
 точные local/physical bytes, отсутствие промежуточных файлов, JSON restart и пустые
 очереди. Это проверка взаимодействия алгоритмов, не доказательство работы реальных
 Obsidian events, сетевых задержек и Yandex API.
+
+Remote reads имеют deadline 60 s на запрос. Timeout останавливает запуск queued
+downloads full/Force, но не освобождает сессию до завершения уже начатых tasks.
+Поздние bytes timed-out read не применяются. Пропущенные tasks сохраняют error
+outcome без продвижения progress; первая фактическая ошибка видна до конца batch.
+Native request не отменяется; лимит ожидания не доказывает восстановление сети.

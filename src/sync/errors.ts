@@ -1,4 +1,4 @@
-import { YandexApiError } from "../api/yandex-client";
+import { YandexApiError, isRemoteReadTimeout } from "../api/yandex-client";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { findErrorCause } from "../utils/error-utils";
 import { StorageScopeError } from "./local/storage-scope";
@@ -38,6 +38,9 @@ export function classifySyncError(error: Error): string | undefined {
 		)
 	) {
 		return "local-state-blocked";
+	}
+	if (isRemoteReadTimeout(error)) {
+		return "remote-read-timeout";
 	}
 	const apiError = findErrorCause(
 		error,

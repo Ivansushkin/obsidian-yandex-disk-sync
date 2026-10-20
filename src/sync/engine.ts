@@ -1386,6 +1386,15 @@ export class SyncEngine {
 				this.expectWatcherEvent(path, action),
 			setSyncPhase: (phase, currentOperation, progress) =>
 				this.setSyncPhase(phase, currentOperation, progress),
+			onOperationError: (error) => {
+				if (!this.state.errorMessage) {
+					this.updateState({
+						errorMessage: syncErrors.formatSyncErrorSummary([
+							error,
+						]),
+					});
+				}
+			},
 			get isPaused() {
 				return getIsPaused();
 			},

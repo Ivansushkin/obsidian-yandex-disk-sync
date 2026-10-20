@@ -563,3 +563,57 @@ test("signed download 404 cannot classify a present encryption manifest as absen
 		delete requestGlobal.__obsidianRequestUrl;
 	}
 });
+
+test("stalled remote reads expire without retrying an unresolved native request", async () => {
+	for (const stage of ["link", "bytes", "metadata"] as const) {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let blockedRequests = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			const link = params.url.includes("/resources/download?");
+			if (
+				(stage === "link" && link) ||
+				stage === "metadata" ||
+				(stage === "bytes" && !link)
+			) {
+				blockedRequests++;
+				await gate;
+			}
+			return link
+				? response(200, { href: "https://synthetic.invalid/content" })
+				: response(200);
+		};
+		let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				maxRetries: 3,
+				retryDelay: 0,
+				readTimeoutMs: 10,
+			});
+			const operation =
+				stage === "metadata"
+					? client.getResource("vault/note.md")
+					: client.downloadFile("vault/note.md");
+			await assert.rejects(
+				Promise.race([
+					operation,
+					new Promise((_, reject) => {
+						safetyTimer = setTimeout(
+							() => reject(new Error("test safety deadline")),
+							250,
+						);
+					}),
+				]),
+				/Remote read timed out/,
+			);
+			assert.equal(blockedRequests, 1);
+		} finally {
+			clearTimeout(safetyTimer);
+			release();
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});

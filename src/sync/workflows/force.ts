@@ -1,5 +1,5 @@
 import { VaultAdapter } from "../../api/vault-adapter";
-import { YandexDiskClient } from "../../api/yandex-client";
+import { YandexDiskClient, isRemoteReadTimeout } from "../../api/yandex-client";
 import {
 	captureLogicalVaultSnapshot,
 	captureRemoteRawSnapshot,
@@ -24,6 +24,7 @@ import {
 	matchesPhysicalResourceFingerprint,
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
+import { classifySyncError } from "../errors";
 import * as fileOperations from "../files/operations";
 import {
 	ForceBackupStaleError,
@@ -212,6 +213,24 @@ export async function executeForceRemoteDownloads(
 		}),
 		Math.max(1, deps.settings.maxConcurrency || 5),
 		onProgress,
+		{
+			stopOnError: isRemoteReadTimeout,
+			onError: (reason, index) => {
+				const operation = downloads[index];
+				if (operation) {
+					const error =
+						reason instanceof Error
+							? reason
+							: new Error(String(reason));
+					deps.fileOperations.onOperationError?.({
+						path: operation.path,
+						operation: operation.action,
+						message: error.message,
+						code: classifySyncError(error),
+					});
+				}
+			},
+		},
 	);
 	const result = { succeeded: 0, errors: [] as SyncError[] };
 	for (let index = 0; index < outcomes.length; index++) {
@@ -226,6 +245,10 @@ export async function executeForceRemoteDownloads(
 			result.errors.push({
 				path: operation.path,
 				operation: operation.action,
+				code:
+					outcome.reason instanceof Error
+						? classifySyncError(outcome.reason)
+						: undefined,
 				message:
 					outcome.reason instanceof Error
 						? outcome.reason.message
@@ -588,7 +611,10 @@ export async function reconcileForceRemote(
 	const deletes = operations.filter((op) => op.action === "delete_local");
 
 	if (downloads.length > 0) {
-		deps.setSyncPhase("applying", t("status.op.downloading_files"));
+		deps.setSyncPhase("applying", t("status.op.downloading_files"), {
+			completed: 0,
+			total: totalOps,
+		});
 		const downloadResults = await executeForceRemoteDownloads(
 			deps,
 			downloads,

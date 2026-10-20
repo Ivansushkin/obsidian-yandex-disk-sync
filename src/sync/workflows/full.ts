@@ -393,6 +393,18 @@ export async function reconcileFullSync(
 
 	const uploads = operations.filter((op) => op.action === "upload");
 	const downloads = operations.filter((op) => op.action === "download");
+	logger.debug("Download batch planned", {
+		count: downloads.length,
+		expectedBytes: downloads.reduce(
+			(sum, operation) => sum + (operation.remoteMeta?.size ?? 0),
+			0,
+		),
+		largestFileBytes: downloads.reduce(
+			(size, operation) =>
+				Math.max(size, operation.remoteMeta?.size ?? 0),
+			0,
+		),
+	});
 	let deletes = operations.filter(
 		(op) => op.action === "delete_remote" || op.action === "delete_local",
 	);
@@ -422,7 +434,10 @@ export async function reconcileFullSync(
 	}
 
 	if (downloads.length > 0) {
-		deps.setSyncPhase("applying", t("status.op.downloading_files"));
+		deps.setSyncPhase("applying", t("status.op.downloading_files"), {
+			completed: uploads.length,
+			total: totalOps,
+		});
 		const downloadResults = await fileOperations.executeOperationsParallel(
 			deps.fileOperations,
 			downloads,
@@ -433,6 +448,10 @@ export async function reconcileFullSync(
 		);
 		result.downloaded = downloadResults.succeeded;
 		result.errors.push(...downloadResults.errors);
+		if (downloadResults.errors.length > 0) {
+			await deps.indexSaveCallback?.();
+			return;
+		}
 	}
 
 	const mutationSettlement = settleFullSyncPendingPuts(deps);

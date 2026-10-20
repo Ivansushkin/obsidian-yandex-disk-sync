@@ -595,6 +595,105 @@ for (const encrypted of [false, true]) {
 		}
 	});
 
+	test(`${mode} timed out download stops queued work and ignores late bytes across restart`, async () => {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec, undefined, undefined, {
+			readTimeoutMs: 15,
+		});
+		b.settings.maxConcurrency = 1;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let restarted: ReturnType<typeof device> | undefined;
+		let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+		let running: ReturnType<typeof b.engine.fullSync> | undefined;
+		try {
+			for (const path of ["a.md", "b.md", "c.md", "delete.md"]) {
+				a.vault.put(path, bytes("base"));
+			}
+			await a.full();
+			await b.full();
+			for (const path of ["a.md", "b.md", "c.md"]) {
+				a.vault.put(path, bytes("remote edit"));
+			}
+			a.vault.remove("delete.md");
+			await a.full();
+			const before = structuredClone(b.index.getLocalIndex().files);
+			const userPaths = new Set(
+				await Promise.all(
+					["a.md", "b.md", "c.md"].map((path) =>
+						b.client.getPhysicalPath(`vault/${path}`),
+					),
+				),
+			);
+			let userRequests = 0;
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (endpoint === "/download" && userPaths.has(path)) {
+					userRequests++;
+					await gate;
+				}
+			};
+			let sawInitialProgress = false;
+			let sawEarlyError = false;
+			b.engine.onStateChange((state) => {
+				sawInitialProgress ||=
+					state.phase === "applying" &&
+					state.progress?.total === 4 &&
+					state.progress.completed === 0;
+				sawEarlyError ||=
+					state.status === "syncing" &&
+					/Remote read timed out/.test(state.errorMessage ?? "");
+			});
+			const failed = await Promise.race([
+				(running = b.engine.fullSync()),
+				new Promise<never>((_, reject) => {
+					safetyTimer = setTimeout(
+						() => reject(new Error("test safety deadline")),
+						350,
+					);
+				}),
+			]);
+			assert.equal(failed.success, false);
+			assert.equal(
+				failed.downloaded + failed.deleted + failed.conflicts,
+				0,
+			);
+			assert.equal(sawInitialProgress, true);
+			assert.equal(sawEarlyError, true);
+			assert.equal(
+				userRequests,
+				1,
+				"Queued downloads must not start after timeout",
+			);
+			assert.deepEqual(b.index.getLocalIndex().files, before);
+			const saved = await b.saved();
+			release();
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.deepEqual(b.vault.files.get("a.md"), bytes("base"));
+			assert.deepEqual(b.index.getLocalIndex().files, before);
+			await b.stop();
+			disk.beforeRequest = undefined;
+			restarted = device(disk, "b", codec, b.vault, saved);
+			assert.equal((await restarted.full()).conflicts, 0);
+			await restarted.assertSettled({
+				"a.md": "remote edit",
+				"b.md": "remote edit",
+				"c.md": "remote edit",
+			});
+		} finally {
+			clearTimeout(safetyTimer);
+			release();
+			await running;
+			disk.beforeRequest = undefined;
+			await a.stop();
+			await b.stop();
+			await restarted?.stop();
+		}
+	});
+
 	test(`${mode} failed download preserves baseline across restart without a false conflict`, async () => {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);

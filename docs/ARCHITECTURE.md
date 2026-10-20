@@ -271,6 +271,14 @@ publication window; совпадения одного device ID недостат
 До полного download и успешных apply guards
 локальные bytes/baseline не подтверждаются; retry не изменяет правила конфликтов.
 
+GET к API, signed download link и operation status имеют deadline 60 s на запрос.
+Timeout не повторяет запрос: Obsidian API не предоставляет отмену native request.
+Поздний ответ проигравшего Promise не достигает apply. Очередь full/Force downloads
+после timeout не начинает новые tasks и дожидается уже начатых. При ошибке download
+full сохраняет coherent snapshot и выходит до settlement, deletes и conflicts.
+Best-effort metadata stamp после применённого файла сохраняет прежний fallback;
+он не является authority guard. PUT и подтверждение неоднозначных writes не меняются.
+
 Download фиксирует отсутствие файла или его plaintext SHA до remote I/O.
 `VaultAdapter.writeFile` принимает необязательный guard: после подготовки папок
 проверяет identity и всё локальное дерево, затем регистрирует ожидаемое watcher
@@ -344,7 +352,9 @@ Force и enable/disable/rotate предлагают with-backup, without-backup 
 progress Notice для них не создаётся. Существующие foreground и blocking
 Notice сохраняются без изменений.
 
-При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
+При первой ошибке transfer ещё во время пачки `SyncState.errorMessage` получает
+причину; progress считается по завершённым tasks, включая ошибки, и не увеличивается
+для пропущенных queued tasks. При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
 причину с operation/code и общим числом ошибок. Сообщение проходит существующую
 маскировку credentials. Команда показа статуса открывает полный selectable текст
 текущей ошибки; это диагностика, без изменений baseline, очередей или canonical.
@@ -352,7 +362,8 @@ Notice сохраняются без изменений.
 Мобильная плашка находится справа сверху, на 8 px ниже видимых верхних
 панелей с учётом safe area. До двух строк в обычном состоянии; при ошибке —
 заголовок и до трёх строк причины. Ширина до 360 px и поля не менее
-12 px с учётом боковых safe area. Правый край закреплён; при изменении
+12 px с учётом боковых safe area. N/M показан с начала этапа в отдельном несжимаемом элементе рядом с названием.
+Правый край закреплён; при изменении
 текста плашка расширяется влево. Она пропускает касания и располагается ниже модальных окон и меню.
 DOM-зависимое измерение верхних панелей изолировано внутри компонента;
 `ItemView.contentEl` не считается границей системного UI: в floating/fullscreen

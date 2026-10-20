@@ -1,5 +1,5 @@
 import { VaultAdapter } from "../../api/vault-adapter";
-import { YandexDiskClient } from "../../api/yandex-client";
+import { YandexDiskClient, isRemoteReadTimeout } from "../../api/yandex-client";
 import type {
 	FileMetadata,
 	PendingMutation,
@@ -31,6 +31,7 @@ import {
 	shouldBackupLocalDelete,
 } from "./action-rules";
 import type { SyncGuardCallback } from "../contracts";
+import { classifySyncError } from "../errors";
 export interface Dependencies {
 	getSyncGuardResult: SyncGuardCallback;
 	vaultAdapter: VaultAdapter;
@@ -47,6 +48,7 @@ export interface Dependencies {
 		progress?: SyncProgress,
 	) => void;
 	isPaused: boolean;
+	onOperationError?: (error: SyncError) => void;
 }
 
 /** Upload file to Yandex Disk.  When `stampRemoteMtime` is true (default) the server-side mtime of the just-uploaded resource is fetched and stored on the remote index entry so the next sync can detect external remote changes via server-mtime comparison. Set it to false for bulk upload flows that perform a single batch re-read of the remote file list afterwards (see `IndexManager.applyServerMtimes`); this saves one `getResource` API call per uploaded file. */
@@ -764,6 +766,24 @@ export async function executeOperationsParallel(
 		tasks,
 		concurrency,
 		onProgress,
+		{
+			stopOnError: isRemoteReadTimeout,
+			onError: (reason, index) => {
+				const operation = operations[index];
+				if (operation) {
+					const error =
+						reason instanceof Error
+							? reason
+							: new Error(String(reason));
+					deps.onOperationError?.({
+						path: operation.path,
+						operation: operation.action,
+						message: error.message,
+						code: classifySyncError(error),
+					});
+				}
+			},
+		},
 	);
 
 	const errors: SyncError[] = [];
@@ -785,6 +805,10 @@ export async function executeOperationsParallel(
 			errors.push({
 				path: op.path,
 				operation: op.action,
+				code:
+					res.reason instanceof Error
+						? classifySyncError(res.reason)
+						: undefined,
 				message: errorMessage,
 			});
 			logger.error(

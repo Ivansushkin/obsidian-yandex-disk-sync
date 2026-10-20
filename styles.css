@@ -111,6 +111,23 @@
 	min-width: 0;
 }
 
+.yandex-sync-mobile-heading {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+}
+
+.yandex-sync-mobile-text {
+	min-width: 0;
+	flex: 1;
+}
+
+.yandex-sync-mobile-progress {
+	flex-shrink: 0;
+	white-space: nowrap;
+	font-variant-numeric: tabular-nums;
+}
+
 .yandex-sync-mobile-text,
 .yandex-sync-mobile-detail {
 	overflow: hidden;
@@ -122,7 +139,8 @@
 	color: var(--text-muted);
 }
 
-.yandex-sync-mobile.sync-error .yandex-sync-mobile-detail {
+.yandex-sync-mobile.sync-error .yandex-sync-mobile-detail,
+.yandex-sync-mobile.has-error .yandex-sync-mobile-detail {
 	white-space: normal;
 	overflow-wrap: anywhere;
 	display: -webkit-box;
