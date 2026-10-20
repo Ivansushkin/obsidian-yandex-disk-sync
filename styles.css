@@ -388,25 +388,22 @@
 	min-width: 0;
 }
 
-.force-flow-status {
-	color: var(--text-muted);
-	margin-block: 0.5em 1em;
-}
-
-.force-flow-active::before {
+.force-sync-button-active::before {
 	content: "";
 	display: inline-block;
 	width: 0.8em;
 	height: 0.8em;
 	margin-inline-end: 0.6em;
-	border: 2px solid var(--interactive-accent);
+	border: 2px solid currentColor;
 	border-top-color: transparent;
 	border-radius: 50%;
+	flex-shrink: 0;
+	vertical-align: middle;
 	animation: encryption-spin 0.8s linear infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.force-flow-active::before {
+	.force-sync-button-active::before {
 		animation: none;
 	}
 }
