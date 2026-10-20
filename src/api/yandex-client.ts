@@ -885,25 +885,53 @@ export class YandexDiskClient {
 	}
 
 	/**
-	 * Download file from Yandex Disk.
-	 * When `raw` is true, skips path and content decryption (for metadata files).
+	 * Download complete bytes, retrying transient transfers with a fresh signed link.
+	 * Decode only after transfer success; codec failures are not network retries.
+	 * When `raw` is true, skip path and content decryption for service files.
 	 */
 	async downloadFile(remotePath: string, raw = false): Promise<ArrayBuffer> {
-		const downloadLink = await this.getDownloadLink(remotePath, raw);
-
-		logger.debug(`Downloading file directly: ${remotePath}`);
-		const response = await requestUrl({
-			url: downloadLink.href,
-			method: "GET",
-			throw: true,
-		});
-
-		const result = raw
-			? response.arrayBuffer
-			: await this.decryptContent(response.arrayBuffer);
-
-		logger.debug(`Downloaded file: ${remotePath}`);
-		return result;
+		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+			const downloadLink = await this.getDownloadLink(remotePath, raw);
+			let response: RequestUrlResponse | undefined;
+			try {
+				response = await requestUrl({
+					url: downloadLink.href,
+					method: "GET",
+					throw: false,
+				});
+			} catch (error) {
+				if (attempt === this.maxRetries) {
+					throw error;
+				}
+			}
+			if (response) {
+				if (response.status >= 200 && response.status < 300) {
+					const result = raw
+						? response.arrayBuffer
+						: await this.decryptContent(response.arrayBuffer);
+					logger.debug(`Downloaded file: ${remotePath}`);
+					return result;
+				}
+				if (
+					!this.isTransientStatus(response.status) ||
+					attempt === this.maxRetries
+				) {
+					const message = `Download HTTP ${response.status}`;
+					if (response.status === 401 || response.status === 403) {
+						throw new YandexApiError(message, response.status);
+					}
+					// A signed-link 404 does not prove that the API resource is absent.
+					throw new Error(message);
+				}
+			}
+			const delay = this.getRetryDelay(attempt);
+			logger.warn("Download transfer interrupted; retrying", {
+				attempt: attempt + 1,
+				delay,
+			});
+			await this.sleep(delay);
+		}
+		throw new Error("Download failed");
 	}
 
 	/**

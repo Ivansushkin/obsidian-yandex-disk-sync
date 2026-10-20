@@ -595,6 +595,48 @@ for (const encrypted of [false, true]) {
 		}
 	});
 
+	test(`${mode} failed download preserves baseline across restart without a false conflict`, async () => {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		let restarted: ReturnType<typeof device> | undefined;
+		try {
+			a.vault.put("note.md", bytes("base"));
+			await a.full();
+			await b.full();
+			a.vault.put("note.md", bytes("remote edit"));
+			await a.full();
+			const before = structuredClone(
+				b.index.getLocalIndex().files["note.md"],
+			);
+			const original = await b.client.getPhysicalPath("vault/note.md");
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (endpoint === "/download" && path === original) {
+					throw new Error(
+						"Request Failed. SocketException Software caused connection abort",
+					);
+				}
+			};
+			const failed = await b.engine.fullSync();
+			assert.equal(failed.success, false);
+			assert.equal(failed.downloaded, 0);
+			assert.deepEqual(b.vault.files.get("note.md"), bytes("base"));
+			assert.deepEqual(b.index.getLocalIndex().files["note.md"], before);
+			const saved = await b.saved();
+			await b.stop();
+			disk.beforeRequest = undefined;
+			restarted = device(disk, "b", codec, b.vault, saved);
+			assert.equal((await restarted.full()).conflicts, 0);
+			await restarted.assertSettled({ "note.md": "remote edit" });
+		} finally {
+			disk.beforeRequest = undefined;
+			await a.stop();
+			await b.stop();
+			await restarted?.stop();
+		}
+	});
+
 	test(`${mode} conflict retry preserves one copy across restart`, async () => {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);

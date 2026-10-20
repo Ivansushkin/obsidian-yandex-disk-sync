@@ -263,6 +263,14 @@ publication window; совпадения одного device ID недостат
 
 ## Локальное применение и физический cleanup
 
+Прямой GET bytes использует ограниченные `maxRetries` и backoff клиента при
+сетевом исключении или retryable HTTP-ответе (423/429/503). Каждая новая попытка
+получает новую signed download link; link не логируется. Окончательные HTTP-ошибки
+и ошибки декодирования не повторяются. HTTP 404 от signed link остаётся ошибкой
+передачи и не доказывает отсутствие API resource или encryption manifest.
+До полного download и успешных apply guards
+локальные bytes/baseline не подтверждаются; retry не изменяет правила конфликтов.
+
 Download фиксирует отсутствие файла или его plaintext SHA до remote I/O.
 `VaultAdapter.writeFile` принимает необязательный guard: после подготовки папок
 проверяет identity и всё локальное дерево, затем регистрирует ожидаемое watcher

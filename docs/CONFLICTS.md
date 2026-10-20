@@ -81,6 +81,11 @@ FIFO остаются для restart. Corrective upload сохраняет пр�
 
 ## Download и protective copies
 
+Сетевой обрыв передачи bytes запускает ограниченный retry с новой signed link.
+Исчерпание попыток оставляет download ошибкой без подтверждения baseline. После
+restart неизменённый local файл с прежним baseline получает remote update без
+ложного конфликта; независимая local правка по-прежнему требует causal comparison.
+
 До подготовки overwrite проверяется привязка root. После подготовки parent folders,
 перед последней проверкой local identity и watcher suppression, raw identity root
 проверяется снова; это относится и к созданию conflict copy. Drift либо ошибка

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { YandexApiError, YandexDiskClient } from "../src/api/yandex-client";
-import type { YandexResource } from "../src/types";
+import { DEFAULT_SETTINGS, type YandexResource } from "../src/types";
+import { IndexManager } from "../src/sync/canonical/manager";
+import type { VaultAdapter } from "../src/api/vault-adapter";
 
 interface TestRequestParams {
 	url: string;
@@ -451,6 +453,111 @@ test("DELETE guard failures are not treated as resource absence", async () => {
 		await assert.rejects(
 			client.deleteResource("vault/note.md", false, true),
 			(error) => error instanceof YandexApiError && error.status === 404,
+		);
+	} finally {
+		delete requestGlobal.__obsidianRequestUrl;
+	}
+});
+
+test("direct download retries transient transfer failures with fresh links and stops at final errors", async () => {
+	const content = new TextEncoder().encode("complete download").buffer;
+	for (const kind of [
+		"network",
+		"service",
+		"exhausted",
+		"authentication",
+	] as const) {
+		let links = 0;
+		let transfers = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			if (params.url.includes("/resources/download?")) {
+				links++;
+				return response(200, {
+					href: `https://synthetic.invalid/content/${links}`,
+				});
+			}
+			transfers++;
+			assert.equal(
+				params.url,
+				`https://synthetic.invalid/content/${transfers}`,
+			);
+			if (kind === "authentication") {
+				return response(401);
+			}
+			if (
+				kind === "exhausted" ||
+				(kind === "network" && transfers === 1)
+			) {
+				throw new Error(
+					"Request Failed. SocketException Software caused connection abort",
+				);
+			}
+			if (kind === "service" && transfers === 1) {
+				return response(503);
+			}
+			return { ...response(200), arrayBuffer: content };
+		};
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				maxRetries: 2,
+				retryDelay: 0,
+			});
+			if (kind === "exhausted") {
+				await assert.rejects(
+					client.downloadFile("vault/note.md"),
+					/connection abort/,
+				);
+			} else if (kind === "authentication") {
+				await assert.rejects(
+					client.downloadFile("vault/note.md"),
+					(error) =>
+						error instanceof YandexApiError && error.status === 401,
+				);
+			} else {
+				assert.deepEqual(
+					await client.downloadFile("vault/note.md"),
+					content,
+				);
+			}
+			assert.equal(
+				transfers,
+				kind === "exhausted" ? 3 : kind === "authentication" ? 1 : 2,
+			);
+			assert.equal(links, transfers);
+		} finally {
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
+
+test("signed download 404 cannot classify a present encryption manifest as absent", async () => {
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		if (params.url.includes("/resources/download?")) {
+			return response(200, { href: "https://synthetic.invalid/content" });
+		}
+		if (params.url.includes("/resources?")) {
+			return response(
+				200,
+				fileResource("vault/.obsidian-encrypt.json", {
+					sha256: "present",
+				}),
+			);
+		}
+		return response(404);
+	};
+	try {
+		const client = new YandexDiskClient({
+			token: "synthetic",
+			maxRetries: 0,
+		});
+		const manager = new IndexManager(client, {} as VaultAdapter, {
+			...DEFAULT_SETTINGS,
+			remotePath: "vault",
+		});
+		await assert.rejects(
+			manager.downloadEncryptionManifestForGuard(),
+			/Download HTTP 404/,
 		);
 	} finally {
 		delete requestGlobal.__obsidianRequestUrl;
