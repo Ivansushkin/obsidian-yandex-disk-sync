@@ -67,92 +67,6 @@ export function getSyncStatusText(state: SyncState): string {
 }
 
 /**
- * Get tooltip
- */
-export function getSyncStatusTooltip(state: SyncState): string {
-	const lines: string[] = ["Yandex Disk Sync"];
-
-	switch (state.status) {
-		case "idle":
-			lines.push(t("status.tooltip.idle"));
-			break;
-		case "syncing":
-			lines.push(t("status.tooltip.syncing"));
-			if (state.sessionKind) {
-				lines.push(
-					t("status.tooltip.session", {
-						session: t(`status.session.${state.sessionKind}`),
-					}),
-				);
-			}
-			if (state.currentOperation) {
-				lines.push(
-					t("status.tooltip.syncing_current", {
-						operation: state.currentOperation,
-					}),
-				);
-			}
-			if (state.progress) {
-				lines.push(
-					t("status.tooltip.progress", {
-						completed: state.progress.completed,
-						total: state.progress.total,
-					}),
-				);
-			}
-			if (state.startedAt) {
-				lines.push(
-					t("status.tooltip.started", {
-						datetime: formatDateTime(state.startedAt),
-					}),
-				);
-			}
-			break;
-		case "error":
-			lines.push(t("status.tooltip.error"));
-			if (state.errorMessage) {
-				lines.push(
-					t("status.tooltip.error_details", {
-						message: state.errorMessage,
-					}),
-				);
-			}
-			break;
-		case "paused":
-			lines.push(t("status.tooltip.paused"));
-			break;
-		case "offline":
-			lines.push(t("status.tooltip.offline"));
-			break;
-		case "initializing":
-			lines.push(t("status.tooltip.initializing"));
-			break;
-		case "encryption-required":
-			lines.push(t("status.tooltip.encryption_required"));
-			if (state.errorMessage) {
-				lines.push(state.errorMessage);
-			}
-			break;
-		case "migration-required":
-			lines.push(t("status.tooltip.migration_required"));
-			if (state.errorMessage) {
-				lines.push(state.errorMessage);
-			}
-			break;
-	}
-
-	if (state.lastSyncTime) {
-		lines.push(
-			t("status.tooltip.last_sync", {
-				datetime: formatDateTime(state.lastSyncTime),
-			}),
-		);
-	}
-
-	return lines.join("\n");
-}
-
-/**
  * Format time (time only)
  */
 function formatTime(timestamp: number): string {
@@ -163,20 +77,7 @@ function formatTime(timestamp: number): string {
 	});
 }
 
-/**
- * Format date and time
- */
-function formatDateTime(timestamp: number): string {
-	const date = new Date(timestamp);
-	return date.toLocaleString("en-US", {
-		day: "2-digit",
-		month: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
-}
-
-/** Format one sync activity consistently for the status bar and Notice. */
+/** Format one sync activity consistently for the shared indicator and Notice. */
 export function formatSyncActivity(state: SyncState): string {
 	const operation = state.currentOperation ?? t("status.syncing");
 	const progress =

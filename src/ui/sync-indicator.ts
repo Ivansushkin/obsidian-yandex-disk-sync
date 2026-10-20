@@ -8,14 +8,14 @@ import {
 	getSyncStatusText,
 } from "./sync-status-presentation";
 
-interface MobileSyncContext {
+interface SyncIndicatorContext {
 	sync: SyncState;
 	force: ForceFlowState | null;
 	foreground: "encryption" | "backup" | null;
 }
 
-/** Collapsible mobile status; native disclosure state belongs to this lifecycle only. */
-export class MobileSyncIndicator extends Component {
+/** Shared collapsible status; native disclosure state belongs to this lifecycle only. */
+export class SyncIndicator extends Component {
 	private element: HTMLDetailsElement | null = null;
 	private summaryEl!: HTMLElement;
 	private loaderEl!: HTMLElement;
@@ -33,7 +33,8 @@ export class MobileSyncIndicator extends Component {
 
 	constructor(
 		private readonly app: App,
-		private readonly readContext: () => MobileSyncContext,
+		private readonly readContext: () => SyncIndicatorContext,
+		private readonly placement: "top" | "bottom",
 	) {
 		super();
 		this.win =
@@ -42,17 +43,18 @@ export class MobileSyncIndicator extends Component {
 
 	onload(): void {
 		this.element = this.app.workspace.containerEl.createEl("details", {
-			cls: "yandex-sync-mobile",
+			cls: "yandex-sync-indicator",
+			attr: { "data-placement": this.placement },
 		});
 		this.summaryEl = this.element.createEl("summary", {
-			cls: "yandex-sync-mobile-summary",
+			cls: "yandex-sync-indicator-summary",
 		});
 		this.summaryEl.createSpan({
-			cls: "yandex-sync-mobile-brand",
+			cls: "yandex-sync-indicator-brand",
 			text: "YD",
 		});
 		this.loaderEl = this.summaryEl.createSpan({
-			cls: "yandex-sync-mobile-loader",
+			cls: "yandex-sync-indicator-loader",
 			attr: { "aria-hidden": "true" },
 		});
 		setIcon(this.loaderEl, "loader-circle");
@@ -61,7 +63,7 @@ export class MobileSyncIndicator extends Component {
 			attr: { "aria-hidden": "true" },
 		});
 		const content = this.element.createDiv({
-			cls: "yandex-sync-mobile-content",
+			cls: "yandex-sync-indicator-content",
 			attr: {
 				role: "status",
 				"aria-live": "polite",
@@ -69,15 +71,17 @@ export class MobileSyncIndicator extends Component {
 			},
 		});
 		const heading = content.createDiv({
-			cls: "yandex-sync-mobile-heading",
+			cls: "yandex-sync-indicator-heading",
 		});
-		this.textEl = heading.createDiv({ cls: "yandex-sync-mobile-text" });
+		this.textEl = heading.createDiv({ cls: "yandex-sync-indicator-text" });
 		this.progressEl = heading.createSpan({
-			cls: "yandex-sync-mobile-progress",
+			cls: "yandex-sync-indicator-progress",
 		});
-		this.detailEl = content.createDiv({ cls: "yandex-sync-mobile-detail" });
+		this.detailEl = content.createDiv({
+			cls: "yandex-sync-indicator-detail",
+		});
 		this.insetProbe = this.element.createDiv({
-			cls: "yandex-sync-mobile-inset",
+			cls: "yandex-sync-indicator-inset",
 			attr: { "aria-hidden": "true" },
 		});
 		this.registerDomEvent(this.element, "toggle", () => {
@@ -189,7 +193,7 @@ export class MobileSyncIndicator extends Component {
 					: getSyncStatusText(sync);
 			detail = sync.errorMessage ?? "";
 		}
-		this.element.className = `yandex-sync-mobile sync-${state.status}${detail && state.status === "syncing" ? " has-error" : ""}`;
+		this.element.className = `yandex-sync-indicator sync-${state.status}${detail && state.status === "syncing" ? " has-error" : ""}`;
 		const busy =
 			state.status === "syncing" || state.status === "initializing";
 		this.loaderEl.hidden = !busy;
@@ -260,7 +264,7 @@ export class MobileSyncIndicator extends Component {
 		});
 	}
 
-	/** Keep all dependence on Obsidian header DOM in this geometry adapter. */
+	/** Keep dependence on Obsidian chrome in this geometry adapter. */
 	private position(): void {
 		if (this.disposed || !this.element) {
 			return;
@@ -285,15 +289,28 @@ export class MobileSyncIndicator extends Component {
 			12,
 			Number.parseFloat(insetStyle.paddingRight) || 0,
 		);
-		// Full-screen content may start under system chrome and floating controls.
-		const reservedTop =
-			viewportTop + Math.max(safeInset, headerOffset) + headerHeight;
-		const view = workspace.getActiveViewOfType(ItemView);
-		const content = view?.contentEl;
+		this.element.style.setProperty(
+			"--yandex-sync-indicator-right",
+			`${this.win.innerWidth - viewportLeft - width + rightGap}px`,
+		);
+		this.element.style.setProperty(
+			"--yandex-sync-indicator-width",
+			`${Math.max(0, Math.min(360, width - leftGap - rightGap))}px`,
+		);
 		const targets = new Set<Element>([
 			workspace.containerEl,
 			this.insetProbe,
 		]);
+		if (this.placement === "bottom") {
+			this.positionAboveStatusBar(viewportTop, viewportBottom, targets);
+			this.observeTargets(targets);
+			return;
+		}
+		// Full-screen mobile content may start under system chrome and floating controls.
+		const reservedTop =
+			viewportTop + Math.max(safeInset, headerOffset) + headerHeight;
+		const view = workspace.getActiveViewOfType(ItemView);
+		const content = view?.contentEl;
 		const contentRect = content?.getBoundingClientRect();
 		let top = reservedTop;
 		if (
@@ -339,21 +356,55 @@ export class MobileSyncIndicator extends Component {
 			}
 		}
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-top",
+			"--yandex-sync-indicator-top",
 			`${top + 8}px`,
 		);
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-content-height",
+			"--yandex-sync-indicator-content-height",
 			`${Math.max(0, viewportBottom - top - 8 - this.summaryEl.getBoundingClientRect().height - 14)}px`,
 		);
+		this.observeTargets(targets);
+	}
+
+	/** Anchor to this window's visible status bar, falling back to the window edge. */
+	private positionAboveStatusBar(
+		viewportTop: number,
+		viewportBottom: number,
+		targets: Set<Element>,
+	): void {
+		if (!this.element) {
+			return;
+		}
+		let anchor = viewportBottom - 8;
+		for (const bar of Array.from(
+			this.win.document.querySelectorAll<HTMLElement>(".status-bar"),
+		)) {
+			targets.add(bar);
+			const rect = bar.getBoundingClientRect();
+			const style = this.win.getComputedStyle(bar);
+			if (
+				rect.width > 0 &&
+				rect.height > 0 &&
+				rect.top >= viewportTop &&
+				rect.top < viewportBottom &&
+				style.visibility !== "hidden" &&
+				style.opacity !== "0"
+			) {
+				anchor = Math.min(anchor, rect.top - 8);
+			}
+		}
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-right",
-			`${this.win.innerWidth - viewportLeft - width + rightGap}px`,
+			"--yandex-sync-indicator-bottom",
+			`${this.win.innerHeight - anchor}px`,
 		);
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-width",
-			`${Math.max(0, Math.min(360, width - leftGap - rightGap))}px`,
+			"--yandex-sync-indicator-content-height",
+			`${Math.max(0, anchor - this.summaryEl.getBoundingClientRect().height - viewportTop - 22)}px`,
 		);
+	}
+
+	/** Observe only geometry targets still used by the current layout. */
+	private observeTargets(targets: Set<Element>): void {
 		for (const old of this.observed) {
 			if (!targets.has(old)) {
 				this.observer?.unobserve(old);
