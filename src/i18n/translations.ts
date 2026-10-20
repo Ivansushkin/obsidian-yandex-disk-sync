@@ -50,6 +50,12 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.migration_required": "YD: Migration required",
 		"status.last_sync": "YD: {time}",
 		"status.ready_full": "YD: Ready",
+		"status.mobile.ready": "YD: Ready to synchronize",
+		"status.mobile.last_sync": "YD: Last synchronization",
+		"status.mobile.paused": "Synchronization paused",
+		"status.mobile.error": "Synchronization error",
+		"status.mobile.encryption": "Encryption operation...",
+		"status.mobile.backup": "Creating backup...",
 
 		// Status bar tooltips
 		"status.tooltip.idle": "Status: Ready for synchronization",
@@ -414,6 +420,12 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.migration_required": "YD: Требуется миграция",
 		"status.last_sync": "YD: {time}",
 		"status.ready_full": "YD: Готов",
+		"status.mobile.ready": "YD: Готов к синхронизации",
+		"status.mobile.last_sync": "YD: Последняя синхронизация",
+		"status.mobile.paused": "Синхронизация приостановлена",
+		"status.mobile.error": "Ошибка синхронизации",
+		"status.mobile.encryption": "Операция шифрования...",
+		"status.mobile.backup": "Создание резервной копии...",
 
 		// Status bar tooltips
 		"status.tooltip.idle": "Статус: Готов к синхронизации",

@@ -18,8 +18,12 @@
 	height: 14px;
 }
 
-.yandex-sync-status.sync-syncing .yandex-sync-status-icon svg,
-.yandex-sync-status.sync-initializing .yandex-sync-status-icon svg {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-syncing
+	.yandex-sync-status-icon
+	svg,
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-initializing
+	.yandex-sync-status-icon
+	svg {
 	animation: yandex-sync-spin 1.2s linear infinite;
 }
 
@@ -29,29 +33,130 @@
 	}
 }
 
-.yandex-sync-status.sync-idle {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-idle {
 	color: var(--text-muted);
 }
 
-.yandex-sync-status.sync-syncing {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-syncing {
 	color: var(--text-accent);
 }
 
-.yandex-sync-status.sync-error {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-error {
 	color: var(--text-error);
 }
 
-.yandex-sync-status.sync-paused {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-paused {
 	color: var(--text-faint);
 }
 
-.yandex-sync-status.sync-offline {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-offline {
 	color: var(--text-faint);
 }
 
-.yandex-sync-status.sync-encryption-required {
+:is(.yandex-sync-status, .yandex-sync-mobile).sync-encryption-required {
 	color: var(--text-warning);
 	font-weight: 600;
+}
+
+/* Passive mobile indicator: does not intercept editor or navigation touches. */
+.yandex-sync-mobile {
+	position: fixed;
+	top: var(
+		--yandex-sync-mobile-top,
+		calc(
+			max(
+					env(safe-area-inset-top, 0px),
+					var(--safe-area-inset-top, 0px),
+					var(--view-header-top-offset, 0px)
+				) +
+				var(--view-header-height, var(--header-height, 48px)) + 8px
+		)
+	);
+	right: var(
+		--yandex-sync-mobile-right,
+		max(
+			12px,
+			env(safe-area-inset-right, 0px),
+			var(--safe-area-inset-right, 0px)
+		)
+	);
+	z-index: var(--layer-status-bar, 15);
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	box-sizing: border-box;
+	width: max-content;
+	max-width: var(--yandex-sync-mobile-width, min(360px, calc(100vw - 24px)));
+	padding: 6px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 10px;
+	background: var(--background-primary);
+	color: var(--text-muted);
+	box-shadow: var(--shadow-s);
+	font-size: var(--font-ui-small);
+	line-height: 1.35;
+	pointer-events: none;
+}
+
+.yandex-sync-mobile.is-compact {
+	gap: 4px;
+	padding: 4px 8px;
+}
+
+.yandex-sync-mobile .yandex-sync-status-icon {
+	flex-shrink: 0;
+}
+
+.yandex-sync-mobile-content {
+	min-width: 0;
+}
+
+.yandex-sync-mobile-text,
+.yandex-sync-mobile-detail {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.yandex-sync-mobile-detail {
+	color: var(--text-muted);
+}
+
+.yandex-sync-mobile.sync-migration-required {
+	color: var(--text-warning);
+}
+
+.yandex-sync-mobile-inset {
+	position: absolute;
+	width: 0;
+	height: var(--view-header-height, var(--header-height, 48px));
+	padding-top: max(
+		env(safe-area-inset-top, 0px),
+		var(--safe-area-inset-top, 0px)
+	);
+	padding-left: max(
+		env(safe-area-inset-left, 0px),
+		var(--safe-area-inset-left, 0px)
+	);
+	padding-right: max(
+		env(safe-area-inset-right, 0px),
+		var(--safe-area-inset-right, 0px)
+	);
+	margin-top: var(--view-header-top-offset, 0px);
+	box-sizing: content-box;
+	visibility: hidden;
+	pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:is(.yandex-sync-status, .yandex-sync-mobile):is(
+			.sync-syncing,
+			.sync-initializing
+		)
+		.yandex-sync-status-icon
+		svg {
+		animation: none;
+	}
 }
 
 /* Status modal */

@@ -24,6 +24,9 @@ const obsidianStubPlugin = {
 					export class App {}
 					export class Vault {}
 					export class Plugin {}
+					export class Component {}
+					export class ItemView {}
+					export const Platform = { isMobile: false };
 					export class Modal { open() {} close() {} }
 					export class PluginSettingTab {}
 					export class Setting {}

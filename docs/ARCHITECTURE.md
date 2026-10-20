@@ -329,11 +329,44 @@ Force и enable/disable/rotate предлагают with-backup, without-backup 
 удаляет прогресс предыдущей фазы, поэтому завершённая пачка не оставляет
 устаревший `N/M` во время записи canonical index или physical cleanup.
 
-`SyncStatusBar` форматирует это состояние для status bar. То же чистое
-форматирование переиспользует один обновляемый `Notice` ручной full, Force и
-enable/disable/rotate. Startup, scheduler и realtime отражаются только в
-status bar; блокировки, требующие действия пользователя, показываются одним
-deduplicated persistent Notice. UI-состояние не сохраняется в `data.json` и не
+`sync-status-presentation` содержит общее форматирование для desktop
+`SyncStatusBar`, мобильного `MobileSyncIndicator` и обновляемого `Notice`
+ручной full, Force и enable/disable/rotate. Startup, scheduler и realtime
+отражаются в status bar на desktop и в постоянной плашке на Android/iOS/iPadOS;
+progress Notice для них не создаётся. Существующие foreground и blocking
+Notice сохраняются без изменений.
+
+Мобильная плашка находится справа сверху, на 8 px ниже видимых верхних
+панелей с учётом safe area. До двух строк, ширина до 360 px и поля не менее
+12 px с учётом боковых safe area. Правый край закреплён; при изменении
+текста плашка расширяется влево. Она пропускает касания и располагается ниже модальных окон и меню.
+DOM-зависимое измерение верхних панелей изолировано внутри компонента;
+`ItemView.contentEl` не считается границей системного UI: в floating/fullscreen
+раскладке контент может начинаться с нулевой координаты под кнопками. Всегда
+резервируется высота верхней панели после максимума native safe area,
+Obsidian `--safe-area-inset-top` и `--view-header-top-offset`, без двойного
+сложения inset. Учитываются реальные нижние границы header и его плавающих
+контролов, даже когда они ниже начала контента; нижние split/tab панели
+исключены из верхней области измерения. Резерв остаётся при автоскрытии шапки.
+Layout, resize, visual viewport, scroll, завершение CSS transition и изменение
+размеров панелей/inset probe обновляют положение через один animation frame,
+без polling. Изменения class/style на body/html отслеживаются для смены
+мобильной раскладки и safe area. Plugin lifecycle снимает подписки и observers,
+отменяет frame и удаляет плашку. Reduced motion отключает вращение; состояние доступно
+скринридеру. Кнопок, настроек положения и переходов по нажатию нет.
+
+Плашка перечитывает актуальный UI-контекст: active Force flow → active sync →
+foreground encryption/backup → состояние движка. Force сохраняет ownership
+между внутренними sync-сессиями. В покое остаётся компактная строка `YD`
+либо `YD · HH:mm`, если известно время последней успешной синхронизации;
+полная подпись готовности/времени доступна скринридеру. Это не обещание
+«всё синхронизировано»: `idle` не доказывает отсутствие deferred events.
+При cold startup Obsidian может удалить plugin-owned DOM во время
+восстановления workspace. `onLayoutReady` и layout events перечитывают
+состояние и повторно подключают тот же элемент к актуальному workspace;
+это не зависит от запуска sync. CSS задаёт безопасную начальную позицию
+без скрытия до первого animation frame. После unload восстановление запрещено. Подробности ошибки могут
+занимать вторую строку. UI-состояние не сохраняется в `data.json` и не
 участвует в causal merge, lock-транзакции или выборе encryption codec.
 
 `ForceSyncController` владеет полным пользовательским сценарием обоих
