@@ -392,6 +392,10 @@ for (const encrypted of [false, true]) {
 			};
 			const failed = await a.engine.fullSync();
 			assert.equal(failed.success, false);
+			assert.match(
+				a.engine.getState().errorMessage ?? "",
+				/synthetic unavailable read-back/,
+			);
 			assert.equal(
 				failed.downloaded + failed.deleted + failed.conflicts,
 				0,

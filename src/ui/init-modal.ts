@@ -11,11 +11,13 @@ export class SyncStatusModal extends Modal {
 	private downloaded: number;
 	private deleted: number;
 	private errors: number;
+	private errorMessage: string | undefined;
 
 	constructor(
 		app: App,
 		stats: {
 			lastSyncTime?: number;
+			errorMessage?: string;
 			uploaded: number;
 			downloaded: number;
 			deleted: number;
@@ -24,6 +26,7 @@ export class SyncStatusModal extends Modal {
 	) {
 		super(app);
 		this.lastSyncTime = stats.lastSyncTime;
+		this.errorMessage = stats.errorMessage;
 		this.uploaded = stats.uploaded;
 		this.downloaded = stats.downloaded;
 		this.deleted = stats.deleted;
@@ -62,6 +65,12 @@ export class SyncStatusModal extends Modal {
 		statsEl.createEl("p", {
 			text: t("modal.status_errors", { count: this.errors }),
 		});
+		if (this.errorMessage) {
+			statsEl.createEl("pre", {
+				cls: "sync-status-error-details",
+				text: this.errorMessage,
+			});
+		}
 
 		new Setting(contentEl).addButton((btn) =>
 			btn.setButtonText(t("modal.close_button")).onClick(() => {

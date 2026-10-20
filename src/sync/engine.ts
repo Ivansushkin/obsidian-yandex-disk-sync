@@ -1132,9 +1132,7 @@ export class SyncEngine {
 						: this.state.lastSyncTime,
 					errorMessage: result.success
 						? undefined
-						: t("status.error_count", {
-								errors: result.errors.length,
-							}),
+						: syncErrors.formatSyncErrorSummary(result.errors),
 				});
 			}
 
@@ -1177,7 +1175,7 @@ export class SyncEngine {
 
 			this.updateState({
 				status: "error",
-				errorMessage: error.message,
+				errorMessage: syncErrors.formatSyncErrorSummary(result.errors),
 				progress: undefined,
 			});
 

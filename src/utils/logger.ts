@@ -122,6 +122,8 @@ function sanitizeString(value: string): string {
 		.replace(/\b(Bearer|OAuth)\s+[A-Za-z0-9_.\-/+=]{12,}/gi, "$1 ***");
 }
 
+export { sanitizeString as sanitizeDiagnosticMessage };
+
 /**
  * Recursively sanitize context data to avoid leaking secrets.
  */

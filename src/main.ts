@@ -66,7 +66,12 @@ import {
 } from "./backup/backup-snapshot";
 import { generateDeviceId, joinPath, toLocalPath } from "./utils/path-utils";
 import { computeSha256 } from "./utils/hash-utils";
-import { logger, shortenDiagnosticValue } from "./utils/logger";
+import {
+	logger,
+	sanitizeDiagnosticMessage,
+	shortenDiagnosticValue,
+} from "./utils/logger";
+import { formatSyncErrorSummary } from "./sync/errors";
 import { initI18n, t } from "./i18n/index";
 import {
 	createEncryptionCodec,
@@ -569,6 +574,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				const state = this.syncEngine.getState();
 				new SyncStatusModal(this.app, {
 					lastSyncTime: state.lastSyncTime,
+					errorMessage: state.errorMessage
+						? sanitizeDiagnosticMessage(state.errorMessage)
+						: undefined,
 					...this.lastSyncStats,
 				}).open();
 			},
@@ -935,9 +943,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 								? successful === 0
 									? t("notice.sync_no_changes")
 									: t("notice.sync_completed", { successful })
-								: t("notice.sync_error", {
-										errors: result.errors.length,
-									}),
+								: formatSyncErrorSummary(result.errors),
 						result.success ? 5000 : 10000,
 					);
 				}
