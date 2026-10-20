@@ -246,6 +246,7 @@ test("failed mandatory backup prevents a local overwrite", async () => {
 		},
 	};
 	const indexManager = {
+		assertRemoteScope: async () => {},
 		getLocalIndex: () => ({
 			files: {
 				"note.md": {
@@ -293,6 +294,7 @@ test("download preserves local changes during remote I/O and protective backup",
 				},
 			};
 			const index = {
+				assertRemoteScope: async () => {},
 				getLocalIndex: () => ({
 					files:
 						timing === "backup"

@@ -19,17 +19,73 @@ baseline. Клиентские часы не выбирают победител
 
 ## Conflict copies
 
-Имя содержит исходное имя, timestamp и suffix установки. При коллизии добавляется
-свободный suffix. Имя само по себе не доказывает, что файл можно переиспользовать:
+Новая копия получает детерминированное имя: исходное имя, `_conflict_` и SHA-256
+ключа «исходный logical path + NUL + plaintext SHA-256». Время и ID установки
+не определяют идентичность копии. При коллизии добавляется свободный suffix.
+Накопившиеся timestamp-копии не сканируются, не переименовываются и не очищаются.
+Имя само по себе не доказывает, что файл можно переиспользовать:
 сравниваются его фактические bytes. Отредактированная существующая копия сохраняется,
 а проигравшая версия получает другой путь. Новая копия создаётся с условием отсутствия;
-конкурентное появление файла не превращает создание в overwrite.
+конкурентное появление файла не превращает создание в overwrite. Remote upload
+использует exclusive create и stable plaintext read-back, включая 409 и потерянный
+ответ. После commit и до применения winner повторно подтверждаются live canonical
+и физические plaintext bytes копии: успешный transaction сам по себе не доказывает,
+что её put не был отклонён exact tombstone. Потеря reservation останавливает замену.
+Corrective upload повторяет canonical/physical/codec guards перед каждой PUT-попыткой,
+в том числе после промежуточного copy commit. Повтор
+переиспользует bytes и pending mutation, а отредактированный candidate сохраняется.
 
 Rejected-put recovery использует те же правила, что обычный conflict flow. Повторный
 запуск переиспользует совпадающую копию, не создавая дубль. Restore canonical winner
 в исходный путь проходит обычную защищённую процедуру download.
 
+Перед конфликтом metadata уточняется по содержимому. Серверный SHA ciphertext
+не сравнивается с plaintext SHA как логическое содержимое. Matching physical SHA
+может подтвердить plaintext SHA canonical; иначе используется stable logical
+download. Смена MD5 на SHA-256 или новый IV сами по себе не означают конфликт.
+Равные local/remote bytes не требуют копии; если canonical устарел, необходима
+причинная mutation, а не фиктивный no-op. Remote `A → X → A` допускает local
+`A → B` только при проверке исходного baseline в canonical transaction.
+
+## Подключение и потеря истории
+
+`LocalSyncState.remoteScope` связывает историю с нормализованным remote path и
+opaque `resource_id` корневой папки. Это идентичность папки, а не content proof.
+Смена токена для той же папки сохраняет baseline. Другая/пересозданная папка не
+получает прежние удаления. Неизвестная identity останавливает синхронизацию.
+
+Точная прежняя current local shape получает nullable binding без потери queues.
+Первое подключение непустой истории требует явного подтверждения прежнего storage,
+выбора нового либо отмены. До подтверждения recovery и sync не пишут remote.
+Новый storage допускается только без pending queues и transition; старый baseline
+сбрасывается согласованно, пользовательские файлы не удаляются. Failed save
+восстанавливает прежний snapshot. Отдельного каталога прошлых хранилищ нет.
+
+Полная потеря plugin data создаёт новую causal identity, независимо от старого ID
+в localStorage. Валидные pending IDs не перенумеровываются. Counter сверяется с
+watermark текущего epoch; чужие pending IDs и FIFO gaps блокируют операции.
+Пустой/недоступный cache ID не заменяет сохранённый actor. При чистом первом sync
+наблюдаемый epoch сохраняется до создания durable work, без подтверждения baseline
+или продвижения observed revision; crash сохраняет идентичность copy put.
+Без baseline разные bytes остаются одним настоящим конфликтом. Local/server mtime
+не доказывают, какую из неизвестных версий можно удалить.
+
+Неоднозначный ответ обычного или corrective PUT подтверждается только stable
+plaintext read-back с повторными scope/canonical/epoch/codec guards. Это подтверждение
+уже отправленного transfer, а не разрешение на повторный overwrite. Окончательные
+HTTP ошибки и ошибки preflight не превращаются в успех. Недоступная проверка
+оставляет работу незавершённой. При ошибке upload-группы full сохраняет coherent
+snapshot и выходит до settlement и последующих файловых операций; pending IDs и
+FIFO остаются для restart. Corrective upload сохраняет причинные поля принятой
+версии и публикует fingerprint через существующий guarded physical rewrite.
+
 ## Download и protective copies
+
+До подготовки overwrite проверяется привязка root. После подготовки parent folders,
+перед последней проверкой local identity и watcher suppression, raw identity root
+проверяется снова; это относится и к созданию conflict copy. Drift либо ошибка
+чтения не разрешают локальную запись. Между отдельными HTTP и filesystem operations
+атомарной гарантии нет.
 
 До remote I/O фиксируется local absence либо SHA. Проверка повторяется после protective
 backup и после подготовки parent folders в VaultAdapter. Late create/edit останавливает

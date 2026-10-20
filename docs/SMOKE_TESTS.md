@@ -544,6 +544,42 @@ conflict, Force-loop, неочищенная очередь или второй 
 
 ## TC-09. Конкурентные изменения и восстановление — PENDING
 
+Дополнительно на двух отдельных тестовых профилях повторить в plaintext и encrypted:
+
+- Одинаковые edits на обоих профилях, а также remote `A → X → A` против local
+  `A → B`: нет conflict copies, итоговые bytes/canonical/queues согласованы.
+- Повторная загрузка одинакового plaintext с новым IV не создаёт конфликт.
+- Заменить root между scan/download и локальной записью: исходник и baseline
+  остаются прежними, sync останавливается. Проверить также подготовку parent folders.
+- Потерять ответ записанного PUT: read-back подтверждает те же bytes без нового
+  sequence. При недоступном read-back и частичном upload restart сохраняет queue;
+  foreign winner, tombstone, новый epoch/codec не получают старый overwrite.
+- Повторить потерю ответа corrective PUT: copy сохранена, accepted causality и
+  новый physical fingerprint согласованы. Первый root read с 401/403/network failure
+  даёт правильный startup block; исправление connection снимает его.
+- Прервать применение winner после подтверждения conflict copy; перезапустить:
+  сохранена одна копия проигравшей версии, без ложного success на сбое.
+- Прервать первый sync перед commit копии: после restart сохраняются pending ID,
+  epoch и один путь копии. Отклонение copy put exact tombstone не разрешает замену
+  оригинала и не выдаёт success. Новый winner перед corrective PUT не затирается.
+- Удалить только cache installation ID в тестовом профиле: сохранённые actor и queue
+  продолжают работу; известный foreign ID с pending work блокирует загрузку.
+- Обновить точную прежнюю current local shape: Cancel сохраняет queues и не
+  запускает recovery; подтверждение прежней папки сохраняет историю и binding.
+  Ошибка local save оставляет startup заблокированным и допускает повтор выбора.
+- Сменить папку/аккаунт и пересоздать root по тому же пути: старые deletes не
+  применяются; непустые queues/transition запрещают новое подключение. Token
+  rotation для того же root сохраняет baseline. Повторный запуск не спрашивает
+  уже сохранённую привязку. Накопившиеся conflict files не очищаются.
+- Проверить binding перед Force и enable/rotate/disable, включая source/target
+  recovery после crash: иной root, wrong password, новая maintenance и drift
+  останавливают старые writes; подтверждение storage не ослабляет codec guards.
+- Переустановка с оставшимся localStorage ID и восстановление старого plugin
+  snapshot не переиспользуют FIFO sequence и не сообщают success со старым index.
+
+Эти шаги не выполняются на пользовательских vaults; до ручного выполнения
+статус остаётся PENDING.
+
 Все пункты выполняются на реальном Yandex Disk с двумя независимыми профилями;
 применимые сценарии повторяются в plaintext и hardened encrypted режимах.
 
@@ -575,7 +611,7 @@ conflict, Force-loop, неочищенная очередь или второй 
 
 Автоматические regression tests не переводят эти пункты в PASS.
 
-Покрывает: `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
+Покрывает: `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
 
 Дополнительные шаги TC-09:
 

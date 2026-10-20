@@ -51,6 +51,12 @@ export class YandexDiskClient {
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
+	private writeGuard: (() => Promise<void>) | null = null;
+
+	/** Check storage ownership again for each physical write or retry. */
+	setWriteGuard(guard: () => Promise<void>): void {
+		this.writeGuard = guard;
+	}
 	private apiReadMetrics: Record<ApiReadCategory, number> = {
 		manifest: 0,
 		index: 0,
@@ -668,7 +674,10 @@ export class YandexDiskClient {
 		skipFolderCheck = false,
 		raw = false,
 		overwrite = true,
+		beforeAttempt?: () => Promise<void>,
+		confirmAmbiguousResult?: () => Promise<boolean>,
 	): Promise<void> {
+		await beforeAttempt?.();
 		// Ensure parent folder exists (if not skipped) — derive the parent from
 		// the encrypted target path so encrypted folder segments are created.
 		if (!skipFolderCheck) {
@@ -676,7 +685,14 @@ export class YandexDiskClient {
 		}
 
 		try {
-			await this.putFile(remotePath, content, raw, overwrite);
+			await this.putFile(
+				remotePath,
+				content,
+				raw,
+				overwrite,
+				beforeAttempt,
+				confirmAmbiguousResult,
+			);
 			logger.debug(`Uploaded file: ${remotePath}`);
 			return;
 		} catch (e) {
@@ -686,7 +702,14 @@ export class YandexDiskClient {
 				e.status === 404
 			) {
 				await this.recreateUploadParent(remotePath, raw);
-				await this.putFile(remotePath, content, raw, overwrite);
+				await this.putFile(
+					remotePath,
+					content,
+					raw,
+					overwrite,
+					beforeAttempt,
+					confirmAmbiguousResult,
+				);
 				logger.debug(
 					`Uploaded file after folder recovery: ${remotePath}`,
 				);
@@ -712,7 +735,14 @@ export class YandexDiskClient {
 				skipFolderCheck: true,
 			});
 			await this.recreateUploadParent(remotePath, raw);
-			await this.putFile(remotePath, content, raw, overwrite);
+			await this.putFile(
+				remotePath,
+				content,
+				raw,
+				overwrite,
+				beforeAttempt,
+				confirmAmbiguousResult,
+			);
 			logger.debug(`Uploaded file after folder retry: ${remotePath}`);
 		}
 	}
@@ -778,6 +808,8 @@ export class YandexDiskClient {
 		content: ArrayBuffer | string,
 		raw: boolean,
 		overwrite: boolean,
+		beforeAttempt?: () => Promise<void>,
+		confirmAmbiguousResult?: () => Promise<boolean>,
 	): Promise<void> {
 		const bytes =
 			typeof content === "string"
@@ -793,6 +825,8 @@ export class YandexDiskClient {
 
 		let lastError: Error | null = null;
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+			await beforeAttempt?.();
+			await this.writeGuard?.();
 			try {
 				const response = await requestUrl({
 					url: uploadLink.href,
@@ -810,13 +844,7 @@ export class YandexDiskClient {
 					response.status,
 					errorData?.error,
 				);
-				if (
-					!this.isTransientStatus(response.status) ||
-					attempt === this.maxRetries
-				) {
-					throw error;
-				}
-				lastError = error;
+				throw error;
 			} catch (e) {
 				if (
 					e instanceof YandexApiError &&
@@ -825,6 +853,12 @@ export class YandexDiskClient {
 					throw e;
 				}
 				lastError = e as Error;
+				if (
+					confirmAmbiguousResult &&
+					(await confirmAmbiguousResult())
+				) {
+					return;
+				}
 				if (attempt === this.maxRetries) {
 					break;
 				}
@@ -1018,6 +1052,9 @@ export class YandexDiskClient {
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			if (beforeAttempt) {
 				await beforeAttempt();
+			}
+			if (method !== "GET") {
+				await this.writeGuard?.();
 			}
 			try {
 				if (method === "GET") {

@@ -1,6 +1,7 @@
 import { YandexApiError } from "../api/yandex-client";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { findErrorCause } from "../utils/error-utils";
+import { StorageScopeError } from "./local/storage-scope";
 import {
 	AmbiguousRemoteIndexLockError,
 	ForceBackupStaleError,
@@ -15,6 +16,14 @@ import {
 
 /** Preserve failure priority while inspecting nested transaction causes. */
 export function classifySyncError(error: Error): string | undefined {
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof StorageScopeError,
+		)
+	) {
+		return "local-state-blocked";
+	}
 	const apiError = findErrorCause(
 		error,
 		(candidate): candidate is YandexApiError =>

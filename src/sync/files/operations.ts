@@ -18,7 +18,10 @@ import {
 	hasPortablePathCollision,
 	joinPath,
 } from "../../utils/path-utils";
-import { getPhysicalResourceFingerprint } from "../../utils/resource-fingerprint";
+import {
+	getPhysicalResourceFingerprint,
+	matchesPhysicalResourceFingerprint,
+} from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { createConfirmedBaseline } from "../local/baseline-rules";
 import { IndexManager, PortablePathCollisionError } from "../canonical/manager";
@@ -27,7 +30,9 @@ import {
 	isPhysicalDeleteAuthorized,
 	shouldBackupLocalDelete,
 } from "./action-rules";
+import type { SyncGuardCallback } from "../contracts";
 export interface Dependencies {
+	getSyncGuardResult: SyncGuardCallback;
 	vaultAdapter: VaultAdapter;
 	yandexClient: YandexDiskClient;
 	settings: YandexDiskSyncSettings;
@@ -51,6 +56,8 @@ export async function uploadFile(
 	skipFolderCheck = false,
 	stampRemoteMtime = true,
 	snapshot?: { content: ArrayBuffer; sha256: string },
+	beforeAttempt?: () => Promise<void>,
+	confirmAmbiguousResult?: () => Promise<boolean>,
 ): Promise<void> {
 	const content =
 		snapshot?.content ?? (await deps.vaultAdapter.readFile(path));
@@ -61,6 +68,8 @@ export async function uploadFile(
 		{ content, sha256 },
 		skipFolderCheck,
 		stampRemoteMtime,
+		beforeAttempt,
+		confirmAmbiguousResult,
 	);
 	applyUploadedFileMetadata(deps, path, metadata);
 }
@@ -72,12 +81,18 @@ export async function materializeUploadedFile(
 	snapshot: { content: ArrayBuffer; sha256: string },
 	skipFolderCheck: boolean,
 	stampRemoteMtime: boolean,
+	beforeAttempt?: () => Promise<void>,
+	confirmAmbiguousResult?: () => Promise<boolean>,
 ): Promise<FileMetadata> {
 	logger.debug(`Uploading file: ${path}`);
 	await deps.yandexClient.uploadFile(
 		joinPath(deps.settings.remotePath, path),
 		snapshot.content,
 		skipFolderCheck,
+		false,
+		true,
+		beforeAttempt,
+		confirmAmbiguousResult,
 	);
 	const remoteStamp = stampRemoteMtime
 		? await fetchRemoteStamp(deps, path)
@@ -90,6 +105,34 @@ export async function materializeUploadedFile(
 		syncedAt: Date.now(),
 		...remoteStamp,
 	};
+}
+
+/** Confirm an ambiguous sent PUT without granting permission for another write. */
+export async function confirmUploadedSnapshot(
+	deps: Dependencies,
+	path: string,
+	sha256: string,
+	assertAuthority: () => Promise<void>,
+	validationToken?: string,
+): Promise<boolean> {
+	const before = await deps.getSyncGuardResult(validationToken);
+	if (before.blockReason) {
+		throw new Error(before.blockReason);
+	}
+	await assertAuthority();
+	const snapshot = await deps.yandexClient.downloadStableLogicalFile(
+		joinPath(deps.settings.remotePath, path),
+	);
+	await assertAuthority();
+	const after = await deps.getSyncGuardResult(
+		validationToken ?? before.validationToken,
+	);
+	if (after.blockReason) {
+		throw new Error(after.blockReason);
+	}
+	return (
+		snapshot !== null && (await computeSha256(snapshot.content)) === sha256
+	);
 }
 
 /** Publish metadata only after a realtime upload is still causally current. */
@@ -189,6 +232,7 @@ export async function applyDownloadedContent(
 	},
 	expectedLocalSha?: string | null,
 ): Promise<void> {
+	await deps.indexManager.assertRemoteScope();
 	const expected =
 		expectedLocalSha === undefined
 			? await readLocalDownloadIdentity(deps, path)
@@ -211,6 +255,7 @@ export async function applyDownloadedContent(
 	assertPortableLocalTree(deps, [path]);
 	await deps.vaultAdapter.writeFile(path, content, {
 		expectedSha256: expected,
+		validateBeforeWrite: () => deps.indexManager.assertRemoteScope(),
 		beforeWrite: () => deps.expectWatcherEvent(path, "upload"),
 	});
 
@@ -614,13 +659,79 @@ export async function executeOperationsParallel(
 
 		let outcome: PhysicalActionOutcome = "completed";
 		switch (op.action) {
-			case "upload":
+			case "upload": {
 				// Skip folder check since we pre-created all folders, and
 				// skip per-file server mtime fetch — the caller performs a
 				// single batch re-read of the remote file list after the
 				// upload group via `applyServerMtimes`.
-				await uploadFile(deps, op.path, true, false);
+				const expected =
+					deps.indexManager.getRemoteIndex().files[op.path];
+				const expectedEpoch = deps.indexManager.getRemoteIndex().epoch;
+				const guard = await deps.getSyncGuardResult();
+				if (guard.blockReason) {
+					throw new Error(guard.blockReason);
+				}
+				const content = await deps.vaultAdapter.readFile(op.path);
+				const sha256 = await computeSha256(content);
+				if (op.localMeta && sha256 !== op.localMeta.sha256) {
+					throw new Error("Local file changed after full scan");
+				}
+				const assertAuthority = async () => {
+					const currentGuard = await deps.getSyncGuardResult(
+						guard.validationToken,
+					);
+					if (currentGuard.blockReason) {
+						throw new Error(currentGuard.blockReason);
+					}
+					const canonical =
+						await deps.indexManager.readCanonicalIndex();
+					const current = canonical.files[op.path];
+					if (
+						canonical.epoch !== expectedEpoch ||
+						current?.sha256 !== expected?.sha256 ||
+						current?.changedRevision !==
+							expected?.changedRevision ||
+						current?.deleted !== expected?.deleted
+					) {
+						throw new Error("Canonical changed before full upload");
+					}
+				};
+				await uploadFile(
+					deps,
+					op.path,
+					true,
+					false,
+					{ content, sha256 },
+					async () => {
+						await assertAuthority();
+						const physical =
+							await deps.yandexClient.getLogicalResource(
+								joinPath(deps.settings.remotePath, op.path),
+							);
+						if (
+							op.remoteMeta
+								? !matchesPhysicalResourceFingerprint(
+										op.remoteMeta.remoteFingerprint,
+										physical,
+									)
+								: physical !== null
+						) {
+							throw new Error(
+								"Physical file changed before full upload",
+							);
+						}
+					},
+					() =>
+						confirmUploadedSnapshot(
+							deps,
+							op.path,
+							sha256,
+							assertAuthority,
+							guard.validationToken,
+						),
+				);
 				break;
+			}
 			case "download":
 				await downloadFile(
 					deps,

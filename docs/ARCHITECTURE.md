@@ -45,6 +45,29 @@ Force UI/архив принадлежат `ForceSyncController`, транзак
 
 ## Canonical, baseline и причинность
 
+Локальная история имеет nullable `remoteScope`: нормализованный remote path и
+opaque resource ID корневой папки. После точного перехода с прежней current shape
+непустая unbound-история требует одного ручного подтверждения прежнего хранилища.
+До admission не запускаются sync/recovery writes. Другой storage подключается
+только без durable queues и encryption transition, с новым локальным baseline.
+Ошибки persistence восстанавливают прежнее causal state. Привязка не заменяет
+content fingerprints; root identity проверяется перед physical writes/retries и
+canonical transactions. Download и conflict copy повторяют scope guard перед
+финальной local identity check после подготовки parent folders. Неоднозначный PUT
+проверяется read-back без ослабления write guards. Ошибка bulk upload сохраняет
+pending FIFO и останавливает full до settlement; corrective physical repair
+сохраняет accepted causality и использует guarded physical rewrite.
+Один активный baseline не является multi-storage database.
+
+Потеря plugin data означает нового actor даже при прежнем ID в localStorage.
+Существующий actor перед новыми allocations сверяет FIFO floor с canonical
+watermark того же epoch. Чужие очереди не переподписываются и gaps не заполняются
+догадками. Отсутствующий/недоступный localStorage восстанавливает ID из валидного
+local state; известный чужой cache ID не присваивает себе pending work.
+При чистом первом sync epoch фиксируется до enqueue/persist, без продвижения
+`observedRevision` и подтверждения baseline. Legacy baseline и replacement adoption
+сохраняют отдельные правила rollback. `local-state` — неперсистентный startup block без Force bypass.
+
 `LocalSyncState`, FIFO-очередь мутаций, durable watcher events и очередь
 незавершённых физических действий хранятся атомарно в `data.json`. Чтение
 canonical index не продвигает `observedRevision`: она меняется только после

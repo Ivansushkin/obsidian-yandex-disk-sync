@@ -17,7 +17,11 @@ export type SyncGuardCallback = (
 ) => SyncGuardResult | Promise<SyncGuardResult>;
 
 export type ExternalSyncBlockKind =
-	"migration" | "encryption" | "historical" | "authentication";
+	| "local-state"
+	| "migration"
+	| "encryption"
+	| "historical"
+	| "authentication";
 
 export interface ExternalSyncBlock {
 	kind: ExternalSyncBlockKind;

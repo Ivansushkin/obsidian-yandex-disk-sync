@@ -5,6 +5,8 @@ import YandexDiskSyncPlugin from "../src/main";
 import { DEFAULT_SETTINGS } from "../src/types";
 import type { SyncResult } from "../src/types";
 import type { SyncRunOptions } from "../src/sync/engine";
+import { YandexApiError } from "../src/api/yandex-client";
+import { StorageScopeError } from "../src/sync/local/storage-scope";
 
 interface MainAccess {
 	onLayoutReady(): Promise<void>;
@@ -137,8 +139,61 @@ function createStartupPlugin() {
 	plugin.syncScheduler = { stop: () => {} };
 	plugin.tryRecoverRemoteTargetTransition = async () => {};
 	plugin.ensureEncryptionReady = async () => true;
+	Object.assign(plugin, { storageBinding: { ensure: async () => true } });
 	return plugin;
 }
+
+test("storage admission classifies startup failures and recovers after connection repair", async () => {
+	for (const error of [
+		new YandexApiError("synthetic unauthorized", 401),
+		new YandexApiError("synthetic forbidden", 403),
+		new Error("synthetic offline"),
+		new StorageScopeError("synthetic root mismatch"),
+		null,
+	]) {
+		const plugin = createStartupPlugin();
+		const blocks = new Map<string, string>();
+		plugin.syncEngine.setExternalBlock = (
+			kind: unknown,
+			reason: unknown,
+		) => {
+			if (typeof reason === "string") {
+				blocks.set(String(kind), String(reason));
+			} else {
+				blocks.delete(String(kind));
+			}
+		};
+		let repaired = false;
+		let remoteReads = 0;
+		Object.assign(plugin, {
+			storageBinding: {
+				ensure: async () => {
+					if (!repaired && error) {
+						throw error;
+					}
+					return repaired;
+				},
+			},
+		});
+		plugin.indexManager = {
+			downloadEncryptionManifest: async () => {
+				remoteReads++;
+				return null;
+			},
+			inspectRemoteCanonicalFormat: async () => "current",
+		};
+		assert.equal(await plugin.refreshRemoteStartupState(false), "blocked");
+		assert.equal(remoteReads, 0);
+		const scopeFailure =
+			error === null || error instanceof StorageScopeError;
+		assert.equal(blocks.has("local-state"), scopeFailure);
+		assert.equal(plugin.authenticationBlockReason !== null, !scopeFailure);
+		repaired = true;
+		assert.equal(await plugin.refreshRemoteStartupState(false), "ready");
+		assert.equal(blocks.size, 0);
+		assert.equal(plugin.authenticationBlockReason, null);
+	}
+});
 
 test("foreign device revalidates a stale legacy migration block", async () => {
 	const plugin = createStartupPlugin();
@@ -487,6 +542,7 @@ test("encryption choice reserves admission before awaits and cancellation releas
 	Object.assign(plugin, {
 		syncEngine: { hasPendingWork: () => false },
 		confirmOperationBackup: () => choice,
+		ensureStorageBinding: async () => true,
 	});
 	const operation = plugin.disableEncryption({ reuploadPlaintext: true });
 	assert.equal(plugin.isForceSyncUnavailable(), true);

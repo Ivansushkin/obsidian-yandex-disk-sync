@@ -22,6 +22,7 @@ import { runWithConcurrency } from "../utils/semaphore";
 
 export interface LocalWriteGuard {
 	expectedSha256: string | null;
+	validateBeforeWrite?: () => Promise<void>;
 	beforeWrite?: () => void;
 }
 
@@ -180,6 +181,7 @@ export class VaultAdapter {
 		}
 
 		if (guard) {
+			await guard.validateBeforeWrite?.();
 			await this.assertLocalIdentity(
 				normalizedPath,
 				guard.expectedSha256,

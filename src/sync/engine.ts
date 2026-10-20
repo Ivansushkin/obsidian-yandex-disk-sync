@@ -1304,6 +1304,8 @@ export class SyncEngine {
 
 	private getExternalBlockCode(kind: ExternalSyncBlockKind): string {
 		switch (kind) {
+			case "local-state":
+				return "local-state-blocked";
 			case "migration":
 				return "migration-required";
 			case "historical":
@@ -1331,6 +1333,7 @@ export class SyncEngine {
 		include: (block: ExternalSyncBlock) => boolean = () => true,
 	): ExternalSyncBlock | null {
 		for (const kind of [
+			"local-state",
 			"historical",
 			"authentication",
 			"encryption",
@@ -1367,6 +1370,8 @@ export class SyncEngine {
 		const getIndexManager = () => this.indexManager;
 		const getIsPaused = () => this.isPaused;
 		return {
+			getSyncGuardResult: (validationToken) =>
+				this.getSyncGuardResult(false, validationToken),
 			get vaultAdapter() {
 				return getVaultAdapter();
 			},

@@ -65,18 +65,23 @@ test("conflict preservation retains edited copies and reuses its own bytes after
 			},
 		};
 		const deps = {
+			settings: DEFAULT_SETTINGS,
+			yandexClient: { getLogicalResource: async () => null },
+			conflictResolver: { generateConflictName: () => preferred },
 			vaultAdapter: new VaultAdapter(
 				{ vault } as unknown as App,
 				DEFAULT_SETTINGS,
 			),
-			indexManager: { readCanonicalIndex: async () => canonical },
+			indexManager: {
+				readCanonicalIndex: async () => canonical,
+				assertRemoteScope: async () => {},
+			},
 			expectWatcherEvent: () => {},
 		} as unknown as ReconciliationDependencies;
 		const target = await preserveLocalConflictCopy(
 			deps,
 			"note.md",
 			bytes("losing version"),
-			preferred,
 		);
 		assert.notEqual(target, preferred);
 		assert.equal(
@@ -92,7 +97,6 @@ test("conflict preservation retains edited copies and reuses its own bytes after
 				{ ...deps },
 				"note.md",
 				bytes("losing version"),
-				preferred,
 			),
 			target,
 		);
@@ -317,6 +321,7 @@ test("download protects differing local bytes without a baseline", async () => {
 		{
 			vaultAdapter: vault,
 			indexManager: {
+				assertRemoteScope: async () => {},
 				getLocalIndex: () => ({ files: {} }),
 				getRemoteIndex: () => ({ files: { "note.md": { sha256 } } }),
 				updateLocalFile: (

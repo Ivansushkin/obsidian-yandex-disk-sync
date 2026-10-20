@@ -246,7 +246,11 @@ test("current semantic format preserves causal data with explicit profiles", () 
 		lastSyncStats: { uploaded: 1 },
 	};
 	const migrated = loadPluginData(source);
-	assert.strictEqual(migrated, source);
+	assert.deepEqual(migrated, {
+		...source,
+		localState: { ...source.localState, remoteScope: null },
+	});
+	assert.equal("remoteScope" in source.localState, false);
 });
 
 test("already converted current local data can finish a stable 1.1 migration", () => {

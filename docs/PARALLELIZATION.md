@@ -15,6 +15,21 @@ Encryption preflight внутри уже принятого maintenance не с�
 
 ## Watcher и persistence
 
+Одноразовое подтверждение storage binding сохраняется той же очередью persistence,
+что baseline и durable work. Cancel не очищает work, failed save восстанавливает
+snapshot; смена scope не переподписывает pending operations. Foreground admission
+резервируется до первого await, в том числе до диалога binding. Physical write
+guard повторяет root identity check на каждой попытке; content-guarded full
+upload также перепроверяет canonical и ожидаемый physical fingerprint.
+Local write повторяет scope check после parent preparation и затем local identity,
+до watcher suppression. Ошибка upload-группы прекращает full до settlement и
+следующих операций; snapshot сохраняется с исходными pending IDs. Read-back после
+неоднозначного PUT не обходит canonical/codec guards и не разрешает новый overwrite.
+
+Новая conflict copy определяется path/content key, создаётся exclusive и
+подтверждается в canonical до применения winner. Crash/restart не меняет имя
+той же версии; повтор не создаёт новый sequence для уже подтверждённой копии.
+
 Watcher хранит события с identity, epoch, base revision и причинными связями.
 Debounce объединяет ещё не submitted edits; running upload/rename сохраняет successor.
 Folder events поглощают только механические события своих descendants. Новое содержимое

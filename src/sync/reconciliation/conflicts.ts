@@ -479,19 +479,13 @@ export class ConflictResolver {
 	/**
 	 * Generate name for conflict copy
 	 */
-	generateConflictName(path: string, deviceId: string): string {
+	generateConflictName(path: string, contentKey: string): string {
 		const dir = getDirectory(path);
 		const fileName = getFileName(path);
 		const ext = getExtension(path);
 		const baseName = ext ? fileName.slice(0, -(ext.length + 1)) : fileName;
 
-		const timestamp = new Date()
-			.toISOString()
-			.replace(/[:.]/g, "-")
-			.slice(0, 19);
-
-		const shortDeviceId = deviceId.slice(-6);
-		const conflictName = `${baseName}_conflict_${timestamp}_${shortDeviceId}${
+		const conflictName = `${baseName}_conflict_${contentKey}${
 			ext ? "." + ext : ""
 		}`;
 
@@ -567,7 +561,10 @@ export class ConflictResolver {
 						false);
 				if (localChanged && remoteChanged) {
 					operations.push({
-						action: "conflict",
+						action:
+							localMeta?.sha256 === remoteMeta?.sha256
+								? "upload"
+								: "conflict",
 						path,
 						reason: "Both descendants changed during folder deletion",
 						localMeta,

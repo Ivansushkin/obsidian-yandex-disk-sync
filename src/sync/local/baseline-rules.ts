@@ -20,7 +20,6 @@ export function hasCanonicalMetadataChanged(
 	return (
 		canonical === null ||
 		canonical.deleted !== baseline.deleted ||
-		canonical.changedRevision !== baseline.changedRevision ||
 		canonical.sha256 !== baseline.sha256
 	);
 }

@@ -29,6 +29,7 @@ const parent = (path: string) =>
 
 /** Synthetic HTTP storage: only transport is replaced, never commits or codecs. */
 export class MemoryDisk {
+	readonly identity = crypto.randomUUID();
 	files = new Map<string, ArrayBuffer>();
 	folders = new Set(["", "vault"]);
 	beforeRequest?: (
@@ -52,6 +53,7 @@ export class MemoryDisk {
 			type: content ? "file" : "dir",
 			created: "2026-01-01T00:00:00Z",
 			modified: "2026-01-01T00:00:00Z",
+			resource_id: `${this.identity}:${path}`,
 			size: content?.byteLength ?? 0,
 			...(content ? { sha256: await computeSha256(content) } : {}),
 		};
@@ -399,6 +401,7 @@ export function device(
 	client.setRemotePath("vault");
 	client.setEncryptionService(codec);
 	const index = new IndexManager(client, adapter, settings);
+	client.setWriteGuard(() => index.assertRemoteScope());
 	if (saved) {
 		index.loadLocalIndexFromData(saved.localState);
 		index.loadPendingMutations(saved.pendingMutations);
@@ -445,6 +448,7 @@ export function device(
 			await persist();
 			return structuredClone(persisted);
 		},
+		lastSaved: () => structuredClone(persisted),
 		async full() {
 			const result = await engine.fullSync();
 			assert.equal(result.success, true, JSON.stringify(result.errors));

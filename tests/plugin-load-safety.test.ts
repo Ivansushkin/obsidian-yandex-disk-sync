@@ -5,7 +5,7 @@ import YandexDiskSyncPlugin from "../src/main";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
 import { logger } from "../src/utils/logger";
 import stableFixture from "./fixtures/stable-1.1/plugin-data-filled.json";
-import { DEFAULT_SETTINGS } from "../src/types";
+import { DEFAULT_SETTINGS, createEmptyLocalState } from "../src/types";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
@@ -326,4 +326,91 @@ test("reload invalidates queued saves before reading storage", async () => {
 		persistence.persistPluginData(),
 		/not successfully loaded/,
 	);
+});
+
+test("persisted actor and queue survive missing installation cache but reject a known foreign owner", async () => {
+	const previous = Object.getOwnPropertyDescriptor(
+		globalThis,
+		"localStorage",
+	);
+	try {
+		for (const cached of [null, "unavailable", "foreign"] as const) {
+			const { plugin, writes } = harness();
+			Reflect.deleteProperty(plugin, "getInstallationDeviceId");
+			Object.defineProperty(globalThis, "localStorage", {
+				configurable: true,
+				value: {
+					getItem: () => {
+						if (cached === "unavailable") {
+							throw new Error("synthetic unavailable cache");
+						}
+						return cached;
+					},
+					setItem: () => {},
+				},
+			});
+			const localState = createEmptyLocalState("persisted-actor");
+			localState.observedEpoch = "epoch-a";
+			localState.nextMutationSeq = 2;
+			const pendingMutations = [
+				{
+					id: "persisted-actor:1",
+					seq: 1,
+					epoch: "epoch-a",
+					type: "put",
+					baseRevision: 0,
+					path: "note.md",
+					sha256: "abc",
+					createdAt: 1,
+				},
+			];
+			const source = {
+				format: "plugin-data",
+				settings: {
+					...DEFAULT_SETTINGS,
+					remotePath: "vault",
+					deviceId: "persisted-actor",
+				},
+				localState,
+				pendingMutations,
+				pendingPhysicalActions: [],
+				pendingWatcherEvents: [],
+				encryptionTransition: null,
+				lastSyncStats: {
+					uploaded: 0,
+					downloaded: 0,
+					deleted: 0,
+					errors: 0,
+				},
+			};
+			plugin.loadData = async () => structuredClone(source);
+			if (cached === "foreign") {
+				await assert.rejects(
+					plugin.loadSettings(),
+					/another installation/,
+				);
+				assert.deepEqual(writes, []);
+			} else {
+				await plugin.loadSettings();
+				assert.equal(plugin.settings.deviceId, "persisted-actor");
+				assert.deepEqual(
+					(writes[0] as { pendingMutations: unknown[] })
+						.pendingMutations,
+					pendingMutations,
+				);
+			}
+		}
+		const fresh = harness();
+		Reflect.deleteProperty(fresh.plugin, "getInstallationDeviceId");
+		fresh.plugin.loadData = async () => null;
+		await fresh.plugin.loadSettings();
+		assert.notEqual(fresh.plugin.settings.deviceId, "foreign");
+		assert.notEqual(fresh.plugin.settings.deviceId, "persisted-actor");
+	} finally {
+		if (previous) {
+			Object.defineProperty(globalThis, "localStorage", previous);
+		} else {
+			Reflect.deleteProperty(globalThis, "localStorage");
+		}
+	}
 });

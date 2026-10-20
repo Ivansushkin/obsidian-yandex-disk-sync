@@ -170,6 +170,7 @@ export type FileMutationDecision =
 export interface FileMutationCausalContext {
 	currentWatermark: number;
 	desiredWatermark: number;
+	baselineSha256?: string;
 }
 
 function hasSameLogicalFileState(
@@ -246,7 +247,8 @@ export function classifyFileMutation(
 		current &&
 		!current.deleted &&
 		(current.changedRevision ?? 0) > baseRevision &&
-		current.sha256 !== incoming.sha256
+		current.sha256 !== incoming.sha256 &&
+		current.sha256 !== causal?.baselineSha256
 	) {
 		return "concurrent-foreign";
 	}

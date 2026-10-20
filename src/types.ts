@@ -228,7 +228,14 @@ export interface IndexMaintenance {
  * index: reading remote state must not advance what this installation has
  * fully observed and applied.
  */
+export interface RemoteStorageScope {
+	remotePath: string;
+	rootResourceId: string;
+}
+
 export interface LocalSyncState {
+	/** Physical root that owns this device's causal history. */
+	remoteScope: RemoteStorageScope | null;
 	/** Installation identifier that owns pending FIFO sequences */
 	deviceId: string;
 	/** Canonical epoch last fully applied on this installation */
@@ -419,6 +426,7 @@ export function createEmptyIndex(
 
 export function createEmptyLocalState(deviceId: string): LocalSyncState {
 	return {
+		remoteScope: null,
 		deviceId,
 		observedEpoch: null,
 		observedRevision: 0,
