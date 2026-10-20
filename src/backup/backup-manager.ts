@@ -1,3 +1,4 @@
+import { OperationFailure, type FailureSummary } from "../errors";
 import type { OperationBackupChoice } from "./operation-backup-choice";
 import type { EncryptionBackupProof } from "../crypto/encryption-transition";
 /**
@@ -32,6 +33,8 @@ export interface BackupResult {
 	sha256?: string;
 	snapshotDigest?: string;
 	error?: string;
+	failure?: FailureSummary;
+	failureCause?: OperationFailure;
 }
 
 export type BackupProgress =
@@ -91,8 +94,9 @@ export class BackupManager {
 			!result.sha256 ||
 			!result.snapshotDigest
 		) {
-			throw new Error(
-				result.error ?? "Selected encryption backup failed",
+			throw (
+				result.failureCause ??
+				new Error(result.error ?? "Selected encryption backup failed")
 			);
 		}
 		const after = (await captureLogicalVaultSnapshot(this.vaultAdapter))
@@ -126,8 +130,16 @@ export class BackupManager {
 			(this.yandexClient.hasEncryptionService()
 				? (this.settings.encryptionPassword ?? undefined)
 				: undefined);
+		const activity: { stage: BackupProgress } = {
+			stage: "creating-backup",
+		};
+		const startedAt = Date.now();
+		const progress = (phase: BackupProgress) => {
+			activity.stage = phase;
+			onProgress?.(phase);
+		};
 		try {
-			onProgress?.("creating-backup");
+			progress("creating-backup");
 			logger.info("Starting backup creation...");
 
 			const snapshot = await captureLogicalVaultSnapshot(
@@ -161,7 +173,7 @@ export class BackupManager {
 				uploadContent,
 				Boolean(password),
 				createdAt,
-				onProgress,
+				progress,
 			);
 
 			logger.info("Backup upload verified", {
@@ -182,15 +194,28 @@ export class BackupManager {
 				snapshotDigest: snapshot.digest,
 			};
 		} catch (error) {
-			const errorMessage =
-				error instanceof Error ? error.message : String(error);
-			logger.error("Backup creation failed:", { error });
-
+			const failure = new OperationFailure(error, {
+				stage: activity.stage,
+				action:
+					activity.stage === "creating-backup"
+						? "local"
+						: activity.stage === "uploading-backup"
+							? "put"
+							: "read",
+				outcome:
+					activity.stage === "uploading-backup"
+						? "write-unconfirmed"
+						: "unknown",
+				durationMs: Date.now() - startedAt,
+			});
+			logger.error("Backup failed", { error: failure });
 			return {
 				success: false,
 				fileCount: 0,
 				totalSize: 0,
-				error: errorMessage,
+				error: failure.summary.message,
+				failure: failure.summary,
+				failureCause: failure,
 			};
 		}
 	}
@@ -210,8 +235,16 @@ export class BackupManager {
 			(this.yandexClient.hasEncryptionService()
 				? (this.settings.encryptionPassword ?? undefined)
 				: undefined);
+		const activity: { stage: BackupProgress } = {
+			stage: "creating-backup",
+		};
+		const startedAt = Date.now();
+		const progress = (phase: BackupProgress) => {
+			activity.stage = phase;
+			onProgress?.(phase);
+		};
 		try {
-			onProgress?.("creating-backup");
+			progress("creating-backup");
 			const snapshot = await captureRemoteRawSnapshot(
 				this.yandexClient,
 				remotePath,
@@ -239,7 +272,7 @@ export class BackupManager {
 				uploadContent,
 				Boolean(password),
 				createdAt,
-				onProgress,
+				progress,
 			);
 			logger.info("Remote snapshot backup upload verified", {
 				backupName: uploaded.backupName,
@@ -258,14 +291,28 @@ export class BackupManager {
 				snapshotDigest: snapshot.digest,
 			};
 		} catch (error) {
-			const message =
-				error instanceof Error ? error.message : String(error);
-			logger.error("Remote snapshot backup failed:", { error });
+			const failure = new OperationFailure(error, {
+				stage: activity.stage,
+				action:
+					activity.stage === "creating-backup"
+						? "local"
+						: activity.stage === "uploading-backup"
+							? "put"
+							: "read",
+				outcome:
+					activity.stage === "uploading-backup"
+						? "write-unconfirmed"
+						: "unknown",
+				durationMs: Date.now() - startedAt,
+			});
+			logger.error("Backup failed", { error: failure });
 			return {
 				success: false,
 				fileCount: 0,
 				totalSize: 0,
-				error: message,
+				error: failure.summary.message,
+				failure: failure.summary,
+				failureCause: failure,
 			};
 		}
 	}

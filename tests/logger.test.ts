@@ -1,3 +1,8 @@
+import {
+	OperationFailure,
+	NetworkRequestError,
+	YandexApiError,
+} from "../src/errors";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { App } from "obsidian";
@@ -65,11 +70,52 @@ test("logger writes correlated sanitized diagnostics to plugin data", async () =
 			"request failed: Authorization: Bearer embedded-secret-token-123456",
 		),
 	});
+	const provider = new YandexApiError(
+		"private-response-body",
+		503,
+		"ServiceUnavailable",
+	);
+	instance.error("Operation failed", {
+		error: new OperationFailure(provider, {
+			stage: "download",
+			action: "read",
+			durationMs: 50,
+		}),
+	});
+	instance.warn("Network failed", {
+		error: new OperationFailure(
+			new NetworkRequestError(
+				new Error(
+					"socket https://signed.example/object?key=private-link password=private-password",
+				),
+			),
+			{ stage: "download", action: "read" },
+		),
+	});
+	instance.error("Quoted credentials", {
+		error: new Error(
+			`password="first second third" token='quoted secret with spaces'`,
+		),
+	});
 	await instance.flush();
 
 	const path = `.custom-config/${DEFAULT_LOG_RELATIVE_PATH}`;
 	const contents = memory.files.get(path) ?? "";
 	assert.match(contents, /Diagnostic entry/);
+	assert.match(contents, /ServiceUnavailable/);
+	assert.match(contents, /download/);
+	for (const secret of [
+		"private-response-body",
+		"signed.example",
+		"private-link",
+		"private-password",
+		"first second third",
+		"second third",
+		"quoted secret",
+		"with spaces",
+	]) {
+		assert.equal(contents.includes(secret), false);
+	}
 	assert.match(contents, /device-test/);
 	assert.match(contents, /full-test-1/);
 	assert.match(contents, /transaction-test-1/);

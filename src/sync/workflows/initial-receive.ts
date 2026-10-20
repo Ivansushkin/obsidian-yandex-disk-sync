@@ -10,7 +10,7 @@ import {
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { stableSerialize } from "../canonical/transaction-rules";
 import { createConfirmedBaseline } from "../local/baseline-rules";
-import { classifySyncError } from "../errors";
+import { createSyncError } from "../errors";
 import * as fileOperations from "../files/operations";
 import { t } from "../../i18n";
 import { logger } from "../../utils/logger";
@@ -134,13 +134,7 @@ export async function receiveInitialRemoteState(
 				}
 				await deps.indexSaveCallback?.();
 			} catch (error) {
-				const syncError = {
-					path,
-					operation: "download" as const,
-					code: classifySyncError(error as Error),
-					message:
-						error instanceof Error ? error.message : String(error),
-				};
+				const syncError = createSyncError(error, path, "download");
 				result.errors.push(syncError);
 				deps.fileOperations.onOperationError?.(syncError);
 				throw error;
@@ -207,12 +201,7 @@ export async function receiveInitialRemoteState(
 			index.updateLocalFile(path, { ...target });
 			await deps.indexSaveCallback?.();
 		} catch (error) {
-			result.errors.push({
-				path,
-				operation: "delete_local",
-				code: classifySyncError(error as Error),
-				message: error instanceof Error ? error.message : String(error),
-			});
+			result.errors.push(createSyncError(error, path, "delete_local"));
 			return;
 		}
 	}

@@ -183,5 +183,12 @@ export function formatSyncActivity(state: SyncState): string {
 		state.progress && state.progress.total > 0
 			? ` ${state.progress.completed}/${state.progress.total}`
 			: "";
-	return `${operation}${progress}${state.errorMessage ? `\n${state.errorMessage}` : ""}`;
+	return `${operation}${progress}${formatSyncRetry(state)}${state.errorMessage ? `\n${state.errorMessage}` : ""}`;
+}
+
+/** The same bounded retry progress is visible on desktop, mobile and manual Notice. */
+export function formatSyncRetry(state: SyncState): string {
+	return state.retry
+		? ` · ${t("failure.retry", { attempt: state.retry.attempt, maxAttempts: state.retry.maxAttempts })}`
+		: "";
 }

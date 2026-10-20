@@ -24,7 +24,7 @@ import {
 	matchesPhysicalResourceFingerprint,
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
-import { classifySyncError } from "../errors";
+import { createSyncError } from "../errors";
 import * as fileOperations from "../files/operations";
 import {
 	ForceBackupStaleError,
@@ -222,12 +222,13 @@ export async function executeForceRemoteDownloads(
 						reason instanceof Error
 							? reason
 							: new Error(String(reason));
-					deps.fileOperations.onOperationError?.({
-						path: operation.path,
-						operation: operation.action,
-						message: error.message,
-						code: classifySyncError(error),
-					});
+					deps.fileOperations.onOperationError?.(
+						createSyncError(
+							error,
+							operation.path,
+							operation.action,
+						),
+					);
 				}
 			},
 		},
@@ -242,18 +243,13 @@ export async function executeForceRemoteDownloads(
 		if (outcome.status === "fulfilled") {
 			result.succeeded++;
 		} else {
-			result.errors.push({
-				path: operation.path,
-				operation: operation.action,
-				code:
-					outcome.reason instanceof Error
-						? classifySyncError(outcome.reason)
-						: undefined,
-				message:
-					outcome.reason instanceof Error
-						? outcome.reason.message
-						: String(outcome.reason),
-			});
+			result.errors.push(
+				createSyncError(
+					outcome.reason,
+					operation.path,
+					operation.action,
+				),
+			);
 		}
 	}
 	return result;

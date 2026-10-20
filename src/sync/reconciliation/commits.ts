@@ -246,12 +246,9 @@ export async function saveRemoteIndexOrAbort(
 			retryable: e.retryable,
 			error: e,
 		});
-		result.errors.push({
-			path: "",
-			operation: "none",
-			code: syncErrors.classifySyncError(e),
-			message: `Index transaction ${e.outcome} at ${e.stage}: ${e.message}`,
-		});
+		result.errors.push(
+			syncErrors.createSyncError(e, "", "none", `canonical-${e.stage}`),
+		);
 		result.success = false;
 		return null;
 	}
@@ -1156,14 +1153,16 @@ export async function resumePendingPhysicalActions(
 				});
 			}
 		} catch (error) {
-			result.errors.push({
-				path: action.path,
-				operation:
+			result.errors.push(
+				syncErrors.createSyncError(
+					error,
+					action.path,
 					action.type === "delete-local"
 						? "delete_local"
 						: "delete_remote",
-				message: error instanceof Error ? error.message : String(error),
-			});
+					"physical-recovery",
+				),
+			);
 		}
 	}
 	if (actions.length > 0 && deps.indexSaveCallback) {

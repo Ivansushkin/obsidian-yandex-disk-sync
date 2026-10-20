@@ -27,7 +27,7 @@ import {
 	SyncResult,
 } from "./types";
 import { YandexDiskSyncSettingTab } from "./settings";
-import { YandexApiError, YandexDiskClient } from "./api/yandex-client";
+import { YandexDiskClient } from "./api/yandex-client";
 import { VaultAdapter } from "./api/vault-adapter";
 import {
 	IndexManager,
@@ -71,7 +71,12 @@ import {
 	sanitizeDiagnosticMessage,
 	shortenDiagnosticValue,
 } from "./utils/logger";
-import { formatSyncErrorSummary } from "./sync/errors";
+import type { FailureSummary } from "./errors";
+import {
+	createSyncFailure,
+	formatOperationFailure,
+	formatSyncErrorSummary,
+} from "./sync/errors";
 import { initI18n, t } from "./i18n/index";
 import {
 	createEncryptionCodec,
@@ -317,6 +322,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.indexManager,
 			this.settings,
 		);
+		this.yandexClient.setRetryCallback((progress) =>
+			this.syncEngine.reportRetry(progress),
+		);
+		this.register(() => this.yandexClient.setRetryCallback());
+
 		this.encryptionTransitionController =
 			new EncryptionTransitionController(
 				this.indexManager,
@@ -666,12 +676,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (!(error instanceof StorageScopeError)) {
 				throw error;
 			}
+			const failure = createSyncFailure(error, {
+				stage: "storage-admission",
+				action: "read",
+				outcome: "stopped-before-write",
+			});
+			const message = formatOperationFailure(failure.summary);
 			this.syncEngine.setExternalBlock(
 				"local-state",
-				t("storage.blocked"),
+				message,
+				failure.summary,
 			);
 			this.stopRegularSync();
-			this.showBlockingNotice("local-state", t("storage.blocked"));
+			this.showBlockingNotice("local-state", message);
 			return false;
 		}
 		this.syncEngine.setExternalBlock(
@@ -844,17 +861,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.remoteStateValidated = true;
 				return "blocked";
 			}
-			if (
-				error instanceof YandexApiError &&
-				(error.status === 401 || error.status === 403)
-			) {
-				this.setAuthenticationBlock(t("notice.token_invalid"));
-				return "blocked";
-			}
-			logger.warn("Remote startup state could not be classified", {
-				error,
+			const failure = createSyncFailure(error, {
+				stage: "startup",
+				action: "read",
+				outcome: "unknown",
 			});
-			this.setAuthenticationBlock(t("notice.remote_state_check_failed"));
+			logger.warn("Remote startup validation failed", { error: failure });
+			this.setAuthenticationBlock(
+				formatOperationFailure(failure.summary),
+				failure.summary,
+			);
 			return "blocked";
 		}
 	}
@@ -952,9 +968,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				logger.error("Sync error:", { error: e });
 				if (showProgressNotice) {
 					this.finishSyncNotice(
-						t("notice.sync_exception", {
-							message: e instanceof Error ? e.message : String(e),
-						}),
+						formatOperationFailure(
+							createSyncFailure(e, {
+								stage: "sync",
+								action: "unknown",
+							}).summary,
+						),
 						10000,
 					);
 				}
@@ -1122,7 +1141,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Choose persistent or timed encryption error presentation by actionability. */
 	private finishEncryptionError(error: unknown): void {
-		const message = error instanceof Error ? error.message : String(error);
+		const originalMessage = error instanceof Error ? error.message : "";
 		const actionableMessages = new Set([
 			t("notice.encryption_wrong_password"),
 			t("notice.encryption_password_required"),
@@ -1130,14 +1149,30 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			t("notice.encryption_remote_busy"),
 		]);
 		if (
-			actionableMessages.has(message) ||
+			actionableMessages.has(originalMessage) ||
 			this.syncEngine.getState().status === "encryption-required"
 		) {
-			this.showBlockingNotice("encryption-state", message, true);
+			this.showBlockingNotice(
+				"encryption-state",
+				actionableMessages.has(originalMessage)
+					? originalMessage
+					: formatOperationFailure(
+							createSyncFailure(error, {
+								stage: "encryption",
+								action: "unknown",
+							}).summary,
+						),
+				true,
+			);
 			return;
 		}
 		this.finishSyncNotice(
-			t("notice.encryption_transition_error", { message }),
+			formatOperationFailure(
+				createSyncFailure(error, {
+					stage: "encryption",
+					action: "unknown",
+				}).summary,
+			),
 			10000,
 		);
 	}
@@ -1264,14 +1299,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				);
 				return null;
 			}
-			this.showBlockingNotice(
-				"force-preflight",
-				t("notice.force_sync_exception", {
-					message:
-						error instanceof Error ? error.message : String(error),
-				}),
-			);
-			return null;
+			throw createSyncFailure(error, {
+				stage: "preflight",
+				action: "read",
+				outcome: "stopped-before-write",
+			});
 		}
 		return { canonical, migration: startupState !== "ready" };
 	}
@@ -2808,7 +2840,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				);
 				return false;
 			}
-			const message = e instanceof Error ? e.message : String(e);
+			const message = formatOperationFailure(
+				createSyncFailure(e, {
+					stage: "encryption-validation",
+					action: "read",
+				}).summary,
+			);
 			logger.warn("Error checking remote encryption state:", {
 				error: e,
 			});
@@ -3595,9 +3632,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 	}
 
-	private setAuthenticationBlock(reason: string | null): void {
+	private setAuthenticationBlock(
+		reason: string | null,
+		failure?: FailureSummary,
+	): void {
 		this.authenticationBlockReason = reason;
-		this.syncEngine?.setExternalBlock("authentication", reason);
+		this.syncEngine?.setExternalBlock("authentication", reason, failure);
 		if (reason) {
 			this.stopRegularSync();
 			this.showBlockingNotice("authentication", reason);
@@ -3730,17 +3770,32 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					);
 					return { success: true, backupName: result.backupName };
 				} else {
-					return { success: false, error: result.error };
+					return {
+						success: false,
+						error: result.failure
+							? formatOperationFailure(result.failure)
+							: result.error,
+						failure: result.failure,
+					};
 				}
 			} catch (error) {
-				const errorMessage =
-					error instanceof Error ? error.message : String(error);
-				logger.error("Backup creation failed:", { error });
-				return { success: false, error: errorMessage };
+				const failure = createSyncFailure(error, {
+					stage: "backup",
+					action: "unknown",
+				});
+				logger.error("Backup creation failed:", { error: failure });
+				return {
+					success: false,
+					error: formatOperationFailure(failure.summary),
+					failure: failure.summary,
+				};
 			}
 		}).catch((error: unknown) => ({
 			success: false,
-			error: error instanceof Error ? error.message : String(error),
+			error: formatOperationFailure(
+				createSyncFailure(error, { stage: "backup", action: "unknown" })
+					.summary,
+			),
 		}));
 	}
 

@@ -1,3 +1,4 @@
+import type { FailureSummary, OperationFailure, RetryProgress } from "./errors";
 /**
  * Types and interfaces for Yandex Disk synchronization plugin
  */
@@ -476,6 +477,8 @@ export interface SyncProgress {
 }
 
 export interface SyncState {
+	retry?: RetryProgress;
+	failure?: FailureSummary;
 	/** Current synchronization status */
 	status: SyncStatus;
 	/** Error message (if any) */
@@ -533,6 +536,9 @@ export interface SyncOperation {
 }
 
 export interface SyncResult {
+	failure?: FailureSummary;
+	/** Original failure is internal and is never passed to presentation or persistence. */
+	failureCause?: OperationFailure;
 	/** Whether synchronization completed successfully */
 	success: boolean;
 	/** Number of uploaded files */
@@ -556,6 +562,9 @@ export interface SyncResult {
 }
 
 export interface SyncError {
+	failure?: FailureSummary;
+	/** Original failure is internal and is never passed to presentation or persistence. */
+	failureCause?: OperationFailure;
 	/** File path */
 	path: string;
 	/** Operation that caused the error */

@@ -6,6 +6,13 @@
  */
 
 import type { App } from "obsidian";
+import {
+	OperationFailure,
+	RemoteHttpError,
+	describeFailureCause,
+	sanitizeFailureMessage,
+} from "../errors";
+import { findErrorCause } from "./error-utils";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -115,11 +122,7 @@ function looksLikeToken(value: string): boolean {
  * or stack traces where there is no enclosing object key to inspect.
  */
 function sanitizeString(value: string): string {
-	const assignment =
-		/(["']?(?:token|authorization|password|secret|access[_-]?token|refresh[_-]?token|encryption[_-]?key)["']?\s*[:=]\s*["']?)(?:Bearer\s+|OAuth\s+)?([^"'\s,;&}]+)/gi;
-	return value
-		.replace(assignment, "$1***")
-		.replace(/\b(Bearer|OAuth)\s+[A-Za-z0-9_.\-/+=]{12,}/gi, "$1 ***");
+	return sanitizeFailureMessage(value);
 }
 
 export { sanitizeString as sanitizeDiagnosticMessage };
@@ -157,14 +160,39 @@ function sanitizeContext(context: unknown, parentKey?: string): unknown {
 		if (context instanceof Error) {
 			const result: Record<string, unknown> = {
 				name: context.name,
-				message: sanitizeString(context.message),
+				message: describeFailureCause(context),
 			};
-			if (context.stack) {
-				result.stack = sanitizeString(context.stack);
+			if (context.stack && !(context instanceof RemoteHttpError)) {
+				result.stack = sanitizeString(
+					context.stack.replace(
+						context.message,
+						describeFailureCause(context),
+					),
+				);
+			}
+			if (context instanceof OperationFailure) {
+				result.failure = context.summary;
+			} else {
+				const causes: string[] = [];
+				findErrorCause(context, (candidate) => {
+					causes.push(
+						sanitizeString(
+							`${candidate.name}: ${describeFailureCause(candidate)}`,
+						),
+					);
+					return false;
+				});
+				result.causes = causes;
 			}
 			const code = (context as { code?: unknown }).code;
-			if (code !== undefined) {
-				result.code = code;
+			if (
+				code !== undefined &&
+				(!(context instanceof RemoteHttpError) ||
+					(typeof code === "string" &&
+						/^[a-z0-9_-]{1,100}$/i.test(code)))
+			) {
+				result.code =
+					typeof code === "string" ? sanitizeString(code) : code;
 			}
 			return result;
 		}

@@ -550,9 +550,11 @@ for (const encrypted of [false, true]) {
 					}
 					throw new Error("synthetic lost PUT response");
 				};
+				const failed = await a.engine.fullSync();
+				assert.equal(failed.success, false, change);
 				assert.equal(
-					(await a.engine.fullSync()).success,
-					false,
+					failed.failure?.outcome,
+					"write-unconfirmed",
 					change,
 				);
 				assert.equal(lost, true);
@@ -674,6 +676,14 @@ for (const encrypted of [false, true]) {
 				}
 			};
 			const failed = await a.engine.fullSync();
+			assert.deepEqual(a.engine.getState().failure, failed.failure);
+			assert.equal(failed.failure?.category, "unavailable");
+			assert.equal(failed.failure?.path, "second.md");
+			assert.equal(
+				JSON.stringify(failed.failure).includes('"cause"'),
+				false,
+			);
+
 			assert.equal(failed.success, false);
 			assert.match(
 				a.engine.getState().errorMessage ?? "",

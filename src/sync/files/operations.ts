@@ -31,7 +31,7 @@ import {
 	shouldBackupLocalDelete,
 } from "./action-rules";
 import type { SyncGuardCallback } from "../contracts";
-import { classifySyncError } from "../errors";
+import { createSyncError } from "../errors";
 export interface Dependencies {
 	getSyncGuardResult: SyncGuardCallback;
 	vaultAdapter: VaultAdapter;
@@ -782,12 +782,13 @@ export async function executeOperationsParallel(
 						reason instanceof Error
 							? reason
 							: new Error(String(reason));
-					deps.onOperationError?.({
-						path: operation.path,
-						operation: operation.action,
-						message: error.message,
-						code: classifySyncError(error),
-					});
+					deps.onOperationError?.(
+						createSyncError(
+							error,
+							operation.path,
+							operation.action,
+						),
+					);
 				}
 			},
 		},
@@ -805,19 +806,7 @@ export async function executeOperationsParallel(
 		}
 
 		if (res.status === "rejected") {
-			const errorMessage =
-				res.reason instanceof Error
-					? res.reason.message
-					: String(res.reason);
-			errors.push({
-				path: op.path,
-				operation: op.action,
-				code:
-					res.reason instanceof Error
-						? classifySyncError(res.reason)
-						: undefined,
-				message: errorMessage,
-			});
+			errors.push(createSyncError(res.reason, op.path, op.action));
 			logger.error(
 				`Error executing ${op.action} operation for ${op.path}:`,
 				{ error: res.reason },

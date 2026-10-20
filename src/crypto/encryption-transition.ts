@@ -1,3 +1,5 @@
+import { logger } from "../utils/logger";
+import { createSyncFailure } from "../sync/errors";
 import type { YandexDiskClient } from "../api/yandex-client";
 import { matchesPhysicalResourceFingerprint } from "../utils/resource-fingerprint";
 import {
@@ -160,14 +162,32 @@ export class EncryptionTransitionController {
 			}
 
 			if (!result.success) {
-				throw this.lifecycle.createSyncFailure(result.errors.length);
+				throw (
+					result.failureCause ??
+					result.errors[0]?.failureCause ??
+					this.lifecycle.createSyncFailure(result.errors.length)
+				);
 			}
 			await this.lifecycle.setPhase("index-committed");
 			await options.publishIndexCommitted?.();
 			await this.completeTarget(transition);
 		} catch (error) {
-			await this.lifecycle.recover();
-			throw error;
+			const failure = createSyncFailure(error, {
+				stage: `encryption-${transition.phase}`,
+				action: "unknown",
+				outcome: "unknown",
+			});
+			try {
+				await this.lifecycle.recover();
+			} catch (recoveryError) {
+				logger.error("Encryption recovery failed", {
+					error: createSyncFailure(recoveryError, {
+						stage: "encryption-recovery",
+						action: "unknown",
+					}),
+				});
+			}
+			throw failure;
 		}
 	}
 

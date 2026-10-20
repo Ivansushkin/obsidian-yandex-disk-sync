@@ -24,9 +24,10 @@ const requestGlobal = globalThis as typeof globalThis & {
 };
 
 test("remote snapshot retries server listing errors and preserves persistent failures", async () => {
-	for (const [status, failures] of [
-		[500, 1],
-		[502, 1],
+	for (const [status, failures, invalidBody] of [
+		[500, 1, false],
+		[503, 1, true],
+		[502, 1, false],
 		[504, 1],
 		[500, 9],
 	] as const) {
@@ -37,6 +38,15 @@ test("remote snapshot retries server listing errors and preserves persistent fai
 			if (params.url.includes("/resources?")) {
 				listings++;
 				if (listings <= failures) {
+					if (invalidBody) {
+						return Object.defineProperty(response(status), "json", {
+							get: () => {
+								throw new Error(
+									"synthetic non-JSON provider body",
+								);
+							},
+						});
+					}
 					return response(status, {
 						error: "InternalServerError",
 						description: "synthetic server failure",
@@ -723,5 +733,32 @@ test("stalled remote reads expire without retrying an unresolved native request"
 			release();
 			delete requestGlobal.__obsidianRequestUrl;
 		}
+	}
+});
+
+test("unknown response decoding failure stops snapshot capture without transport retry", async () => {
+	let requests = 0;
+	const cause = new Error("synthetic invalid provider response");
+	requestGlobal.__obsidianRequestUrl = async () => {
+		requests++;
+		return Object.defineProperty(response(200), "json", {
+			get: () => {
+				throw cause;
+			},
+		});
+	};
+	try {
+		const client = new YandexDiskClient({
+			token: "synthetic",
+			maxRetries: 3,
+			retryDelay: 0,
+		});
+		await assert.rejects(
+			captureRemoteRawSnapshot(client, "vault"),
+			(error) => error === cause,
+		);
+		assert.equal(requests, 1);
+	} finally {
+		delete requestGlobal.__obsidianRequestUrl;
 	}
 });

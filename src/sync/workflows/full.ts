@@ -1,6 +1,6 @@
 import { YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
-import { classifySyncError } from "../errors";
+import { createSyncError } from "../errors";
 import type {
 	PendingMutation,
 	SyncError,
@@ -753,12 +753,7 @@ async function resolveFullConflicts(
 			);
 			result.conflicts++;
 		} catch (e) {
-			const error: SyncError = {
-				path: op.path,
-				operation: op.action,
-				message: (e as Error).message,
-				code: e instanceof Error ? classifySyncError(e) : undefined,
-			};
+			const error: SyncError = createSyncError(e, op.path, op.action);
 			result.errors.push(error);
 			logger.error(`Error resolving conflict for ${op.path}:`, {
 				error: e,

@@ -1,8 +1,9 @@
+import { formatOperationFailure } from "../sync/errors";
 import { t } from "../i18n";
 import type { ForceFlowState } from "../sync/workflows/force-controller";
 import { formatSyncActivity } from "./sync-status-presentation";
 
-/** Shared presentation for the foreground Notice and settings activity row. */
+/** Format the current Force phase for the foreground Notice. */
 export function formatForceActivity(state: ForceFlowState): string {
 	const stage = t(`notice.force_phase_${state.phase}`);
 	return state.activity?.status === "syncing"
@@ -18,6 +19,13 @@ export function formatForceResult(state: ForceFlowState): string {
 			: t("notice.force_sync_completed", {
 					successful: state.successful ?? 0,
 				});
+	}
+	if (state.failure) {
+		const prefix =
+			state.outcome === "cleanup-pending"
+				? `${t("notice.force_finalization_pending")} `
+				: "";
+		return prefix + formatOperationFailure(state.failure);
 	}
 	if (state.outcome === "backup-failed") {
 		return t("notice.force_backup_failed");

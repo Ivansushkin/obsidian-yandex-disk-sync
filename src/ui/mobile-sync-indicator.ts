@@ -1,3 +1,4 @@
+import { formatSyncRetry } from "./sync-status-presentation";
 import { App, Component, ItemView, setIcon } from "obsidian";
 import { t } from "../i18n";
 import type { SyncState } from "../types";
@@ -137,12 +138,14 @@ export class MobileSyncIndicator extends Component {
 			text = t(`notice.force_phase_${force.phase}`);
 			if (force.activity?.status === "syncing") {
 				text += `: ${force.activity.currentOperation ?? t("status.syncing")}`;
-				progress = this.progressText(force.activity);
+				progress =
+					this.progressText(force.activity) +
+					formatSyncRetry(force.activity);
 				detail = force.activity.errorMessage ?? "";
 			}
 		} else if (sync.status === "syncing") {
 			text = sync.currentOperation ?? t("status.syncing");
-			progress = this.progressText(sync);
+			progress = this.progressText(sync) + formatSyncRetry(sync);
 			detail = sync.errorMessage ?? "";
 		} else if (foreground) {
 			state = { ...sync, status: "syncing" };

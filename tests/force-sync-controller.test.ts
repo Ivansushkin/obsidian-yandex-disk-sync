@@ -300,3 +300,44 @@ test("Force without an archive retains preflight and owns final settlement", asy
 		assert.ok(!h.states.some((state) => state.phase.includes("backup")));
 	}
 });
+
+test("Force retains the failing boundary and committed outcome without starting preflight mutations", async () => {
+	for (const boundary of [
+		"preflight",
+		"captureProtectedSnapshot",
+		"persist",
+		"reconcile",
+	] as const) {
+		const cause = new Error("connection failed");
+		const h = harness({
+			[boundary]: async () => {
+				throw cause;
+			},
+		});
+		await h.controller.run("from_local");
+		const state = h.controller.getState()!;
+		assert.equal(
+			state.outcome,
+			boundary === "persist" || boundary === "reconcile"
+				? "cleanup-pending"
+				: "failed",
+		);
+		assert.equal(state.failure?.message, cause.message);
+		assert.equal(
+			state.failure?.stage,
+			boundary === "captureProtectedSnapshot"
+				? "protected-snapshot"
+				: boundary === "persist"
+					? "persisting"
+					: boundary === "reconcile"
+						? "reconciling"
+						: "preflight",
+		);
+		if (
+			boundary === "preflight" ||
+			boundary === "captureProtectedSnapshot"
+		) {
+			assert.equal(h.calls.includes("force"), false);
+		}
+	}
+});

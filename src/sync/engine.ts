@@ -1,3 +1,4 @@
+import type { FailureSummary, RetryProgress } from "../errors";
 import { VaultAdapter } from "../api/vault-adapter";
 import { YandexDiskClient } from "../api/yandex-client";
 import { t } from "../i18n";
@@ -100,6 +101,13 @@ export class SyncEngine {
 		) => void | Promise<void>
 	> = [];
 
+	/** Surface transport backoff only inside the currently owned activity. */
+	reportRetry(retry?: RetryProgress): void {
+		if (this.state.status === "syncing") {
+			this.updateState({ retry });
+		}
+	}
+
 	hasPendingWork(): boolean {
 		return this.coordinator.hasPendingWork();
 	}
@@ -150,9 +158,14 @@ export class SyncEngine {
 	}
 
 	/** Set or clear one non-persisted startup/runtime safety block. */
-	setExternalBlock(kind: ExternalSyncBlockKind, reason: string | null): void {
+	setExternalBlock(
+		kind: ExternalSyncBlockKind,
+		reason: string | null,
+		failure?: FailureSummary,
+	): void {
 		if (reason) {
 			this.externalBlocks.set(kind, {
+				failure,
 				kind,
 				reason,
 				code: this.getExternalBlockCode(kind),
@@ -163,7 +176,7 @@ export class SyncEngine {
 		}
 		const active = this.getHighestPriorityExternalBlock();
 		if (active) {
-			this.setBlockedState(active.reason, active.status);
+			this.setBlockedState(active.reason, active.status, active.failure);
 		} else if (
 			this.state.status === "encryption-required" ||
 			this.state.status === "migration-required" ||
@@ -172,6 +185,8 @@ export class SyncEngine {
 			this.updateState({
 				status: "idle",
 				errorMessage: undefined,
+				retry: undefined,
+				failure: undefined,
 				currentOperation: undefined,
 				progress: undefined,
 				phase: undefined,
@@ -401,6 +416,8 @@ export class SyncEngine {
 		this.updateState({
 			status: "syncing",
 			errorMessage: undefined,
+			retry: undefined,
+			failure: undefined,
 			sessionId,
 			sessionKind,
 			startedAt: existingOwner
@@ -486,13 +503,22 @@ export class SyncEngine {
 		const activeBlock = this.getHighestPriorityExternalBlock();
 		const failed =
 			!success || (this.state.status === "error" && !activeBlock);
+		const terminalFailure =
+			error instanceof Error
+				? syncErrors.createSyncFailure(error, {
+						stage: this.state.phase ?? session.kind,
+						action: "unknown",
+					}).summary
+				: (activeBlock?.failure ??
+					(failed ? this.state.failure : undefined));
 		this.updateState({
 			status: activeBlock?.status ?? (failed ? "error" : "idle"),
+			failure: terminalFailure,
 			lastSyncTime:
 				!failed && !activeBlock ? Date.now() : this.state.lastSyncTime,
 			errorMessage:
 				error instanceof Error
-					? error.message
+					? syncErrors.formatOperationFailure(terminalFailure!)
 					: activeBlock
 						? activeBlock.reason
 						: failed
@@ -504,6 +530,7 @@ export class SyncEngine {
 			startedAt: undefined,
 			currentOperation: undefined,
 			progress: undefined,
+			retry: undefined,
 		});
 	}
 
@@ -520,6 +547,7 @@ export class SyncEngine {
 			startedAt: undefined,
 			currentOperation: undefined,
 			progress: undefined,
+			retry: undefined,
 		});
 		logger.info("Synchronization paused");
 	}
@@ -1099,10 +1127,12 @@ export class SyncEngine {
 					operation: "none",
 					code: guard.blockCode ?? "encryption-blocked",
 					message: guard.blockReason,
+					failure: guard.failure,
 				});
 				this.setBlockedState(
 					guard.blockReason,
 					guard.blockStatus ?? "encryption-required",
+					guard.failure,
 				);
 			} else {
 				await body(result, startTime, guard.validationToken);
@@ -1128,6 +1158,7 @@ export class SyncEngine {
 				}
 			}
 			result.endTime = Date.now();
+			syncErrors.summarizeSyncFailure(result, this.state.phase ?? "sync");
 
 			if (!guard.blockReason) {
 				this.updateState({
@@ -1135,6 +1166,7 @@ export class SyncEngine {
 					lastSyncTime: result.success
 						? result.endTime
 						: this.state.lastSyncTime,
+					failure: result.failure,
 					errorMessage: result.success
 						? undefined
 						: syncErrors.formatSyncErrorSummary(result.errors),
@@ -1143,6 +1175,7 @@ export class SyncEngine {
 
 			const diagnosticResult = {
 				...this.getDiagnosticSnapshot(),
+				failure: result.failure,
 				durationMs: result.endTime - startTime,
 				apiReads: this.diffApiReadMetrics(
 					apiReadsBefore,
@@ -1168,18 +1201,21 @@ export class SyncEngine {
 
 			return result;
 		} catch (e) {
-			const error = e as Error;
 			result.success = false;
-			result.errors.push({
-				path: "",
-				operation: "none",
-				code: syncErrors.classifySyncError(error),
-				message: error.message,
-			});
+			result.errors.push(
+				syncErrors.createSyncError(
+					e,
+					"",
+					"none",
+					this.state.phase ?? "sync",
+				),
+			);
 			result.endTime = Date.now();
+			syncErrors.summarizeSyncFailure(result, this.state.phase ?? "sync");
 
 			this.updateState({
 				status: "error",
+				failure: result.failure,
 				errorMessage: syncErrors.formatSyncErrorSummary(result.errors),
 				progress: undefined,
 			});
@@ -1191,7 +1227,7 @@ export class SyncEngine {
 					apiReadsBefore,
 					this.yandexClient.getApiReadMetrics?.(),
 				),
-				error: e,
+				error: result.failureCause,
 			});
 			return result;
 		} finally {
@@ -1292,6 +1328,7 @@ export class SyncEngine {
 		if (external) {
 			return {
 				blockReason: external.reason,
+				failure: external.failure,
 				blockCode: external.code,
 				blockStatus: external.status,
 			};
@@ -1356,13 +1393,16 @@ export class SyncEngine {
 			| "error"
 			| "migration-required"
 			| "encryption-required" = "encryption-required",
+		failure?: FailureSummary,
 	): void {
 		this.updateState({
 			status,
 			errorMessage: reason,
+			failure,
 			currentOperation: undefined,
 			phase: undefined,
 			progress: undefined,
+			retry: undefined,
 		});
 	}
 
@@ -1394,6 +1434,7 @@ export class SyncEngine {
 			onOperationError: (error) => {
 				if (!this.state.errorMessage) {
 					this.updateState({
+						failure: error.failure,
 						errorMessage: syncErrors.formatSyncErrorSummary([
 							error,
 						]),

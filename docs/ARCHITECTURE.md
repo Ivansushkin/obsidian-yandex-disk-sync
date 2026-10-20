@@ -444,3 +444,39 @@ persistence, успешного итогового full и отсутствия 
 агент проверяет сборку в разрешённой копии без `.env` и рабочего vault. Реальный
 двухпрофильный прогон обязателен для release. Статус manual evidence хранится отдельно
 в `docs/release-evidence/`; успех автоматических проверок его не меняет.
+
+## Единый контракт ошибок
+
+`errors.ts` не зависит от UI и sync. Он хранит транспортные классы, in-memory
+`OperationFailure` с исходной `cause`, очищенную `FailureSummary` и решение
+`decideRecovery`. Клиент переэкспортирует прежние классы, поэтому их identity и
+существующие `instanceof` не меняются. Signed-download HTTP ошибки имеют
+отдельную identity: 404 signed link не доказывает отсутствие API resource.
+`sync/errors.ts` адаптирует domain exceptions; root, canonical, local identity
+и обязательный backup имеют приоритет над вложенной сетью или authentication.
+
+Политика разрешает попытку, но не выполняет её. Счётчики, backoff и deadlines
+остаются в клиенте; GET сохраняет 423/429/500/502/503/504, writes — 423/429/503,
+operation polling — 409/423/429/503. Только rejection native transport
+помечается как network; decode и неизвестная ошибка автоматически не повторяются.
+Незавершённый native timeout не повторяется. PUT с неоднозначным transient
+результатом проходит прежний guarded read-back даже после последней попытки.
+Новых повторов сессий или изменений scheduler нет.
+
+Sync/realtime, Force, startup, backup и encryption передают очищенную summary
+в неперсистентных результатах/статусах; исходная cause остаётся внутренней.
+Ни summary, ни cause не входят в plugin data, canonical, mutations или physical
+actions. Форматтер общий для Notice и status surfaces; старые message/code/
+errorMessage остаются совместимыми представлениями. Backoff отражается в текущем
+прогрессе без дополнительного Notice. Failure содержит этап, logical path,
+HTTP/provider code и известный исход; частичный результат не объявляет данные
+неизменными. Force preflight/protected snapshot сохраняют причину; post-commit
+сбой остаётся cleanup-pending. Cancel, пароль и ожидаемые blocked outcomes
+сохраняют отдельные сценарии. Startup сеть блокирует запуск с причиной
+недоступности, а не с утверждением о неверном токене; виды блоков и Force права
+не меняются.
+
+Логи сохраняют очищенную цепочку причин, этап, попытку и длительность, не
+response descriptions/body и не signed URLs. Provider error code проходит
+ограничение формата. Реальная доступность Диска и работа двух Obsidian-профилей
+проверяются отдельно от автоматических алгоритмических тестов.

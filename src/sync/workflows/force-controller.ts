@@ -2,12 +2,15 @@ import type { OperationBackupChoice } from "../../backup/operation-backup-choice
 import type { BackupProgress, BackupResult } from "../../backup/backup-manager";
 import type { SyncResult, SyncState } from "../../types";
 import type { ForcePreflightProof, SyncRunOptions } from "../contracts";
+import { createSyncFailure } from "../errors";
+import type { FailureSummary } from "../../errors";
 import { logger } from "../../utils/logger";
 
 export type ForceDirection = "from_local" | "from_remote";
 export type ForcePhase =
 	| "preflight"
 	| "confirming"
+	| "protected-snapshot"
 	| BackupProgress
 	| "syncing"
 	| "persisting"
@@ -29,6 +32,7 @@ export interface ForceFlowState {
 	activity?: SyncState;
 	outcome?: ForceOutcome;
 	errorCode?: string;
+	failure?: FailureSummary;
 	successful?: number;
 }
 
@@ -116,6 +120,36 @@ export class ForceSyncController {
 		const phase = (value: ForcePhase) =>
 			update({ phase: value, activity: undefined });
 		let committed = false;
+		const startedAt = Date.now();
+		const fail = (error: unknown, outcome: ForceOutcome) => {
+			const stage = this.state?.phase ?? "preflight";
+			const failure = createSyncFailure(error, {
+				stage,
+				action:
+					stage === "preflight" || stage === "protected-snapshot"
+						? "read"
+						: "unknown",
+				outcome: committed
+					? "partial"
+					: [
+								"preflight",
+								"confirming",
+								"protected-snapshot",
+								"creating-backup",
+								"uploading-backup",
+								"verifying-backup",
+						  ].includes(stage)
+						? "stopped-before-write"
+						: "unknown",
+				durationMs: Date.now() - startedAt,
+			});
+			this.deps.reportError(failure);
+			update({
+				outcome,
+				failure: failure.summary,
+				errorCode: failure.summary.code,
+			});
+		};
 		try {
 			update({});
 			const prepared = await this.deps.preflight();
@@ -137,6 +171,7 @@ export class ForceSyncController {
 				update({ outcome: "blocked" });
 				return;
 			}
+			phase("protected-snapshot");
 			const snapshotDigest =
 				await this.deps.captureProtectedSnapshot(direction);
 			let backupProof: ForcePreflightProof["backup"] = null;
@@ -146,8 +181,7 @@ export class ForceSyncController {
 				try {
 					backup = await this.deps.backup(direction, phase);
 				} catch (error) {
-					this.deps.reportError(error);
-					update({ outcome: "backup-failed" });
+					fail(error, "backup-failed");
 					return;
 				}
 				if (
@@ -156,7 +190,14 @@ export class ForceSyncController {
 					!backup.sha256 ||
 					backup.snapshotDigest !== snapshotDigest
 				) {
-					update({ outcome: "backup-failed" });
+					fail(
+						backup.failureCause ??
+							new Error(
+								backup.error ??
+									"Backup proof did not match the protected snapshot",
+							),
+						"backup-failed",
+					);
 					return;
 				}
 				backupProof = {
@@ -183,10 +224,18 @@ export class ForceSyncController {
 			phase("persisting");
 			await this.deps.persist(result);
 			if (!committed) {
-				update({
-					outcome: "failed",
-					errorCode: result.errors[0]?.code,
-				});
+				const first = result.errors[0];
+				fail(
+					first?.failureCause ??
+						new Error(
+							first?.message ??
+								"Force did not commit a replacement",
+						),
+					"failed",
+				);
+				if (first?.code) {
+					update({ errorCode: first.code });
+				}
 				return;
 			}
 			phase("reconciling");
@@ -194,7 +243,14 @@ export class ForceSyncController {
 				update({ activity }),
 			);
 			if (!reconciled?.success || this.deps.hasPendingCleanup()) {
-				update({ outcome: "cleanup-pending" });
+				fail(
+					reconciled?.errors[0]?.failureCause ??
+						new Error(
+							reconciled?.errors[0]?.message ??
+								"Committed replacement needs finalization",
+						),
+					"cleanup-pending",
+				);
 				return;
 			}
 			update({
@@ -203,8 +259,7 @@ export class ForceSyncController {
 					result.uploaded + result.downloaded + result.deleted,
 			});
 		} catch (error) {
-			this.deps.reportError(error);
-			update({ outcome: committed ? "cleanup-pending" : "failed" });
+			fail(error, committed ? "cleanup-pending" : "failed");
 		} finally {
 			update({ active: false });
 		}

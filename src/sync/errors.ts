@@ -1,11 +1,22 @@
-import { YandexApiError, isRemoteReadTimeout } from "../api/yandex-client";
+import {
+	OperationFailure,
+	type FailureContext,
+	type FailureSummary,
+} from "../errors";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { findErrorCause } from "../utils/error-utils";
+import { LocalFileChangedError } from "../api/vault-adapter";
 import { StorageScopeError } from "./local/storage-scope";
 import { t } from "../i18n";
-import type { SyncError } from "../types";
-import { sanitizeDiagnosticMessage } from "../utils/logger";
+import type { SyncError, SyncResult } from "../types";
+
 import {
+	AmbiguousRemoteIndexStateError,
+	RemoteIndexContentMismatchError,
+	RemoteIndexLockedError,
+	RemoteIndexTransactionError,
+	LegacyPluginDataExposureError,
+	LegacyServicePathCollisionError,
 	AmbiguousRemoteIndexLockError,
 	ForceBackupStaleError,
 	ForceSourceChangedError,
@@ -17,20 +28,103 @@ import {
 	UnreadableRemoteIndexError,
 } from "./canonical/manager";
 
-/** Keep the actual failure available to status surfaces instead of only a count. */
+/** Format one sanitized failure for Notice, desktop, mobile and dialogs. */
+export function formatOperationFailure(failure: FailureSummary): string {
+	const location = failure.path ? ` · ${failure.path}` : "";
+	const stageKey = `failure.stage.${failure.stage}`;
+	const translated = t(stageKey);
+	const stage = translated === stageKey ? failure.stage : translated;
+	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${failure.message}. ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${t(`failure.next.${failure.category}`)}`;
+}
+
+/** Preserve the first reason and total failures without exposing raw exceptions. */
 export function formatSyncErrorSummary(errors: readonly SyncError[]): string {
 	const count = t("status.error_count", { errors: errors.length });
 	const first = errors[0];
 	if (!first) {
 		return count;
 	}
-	const operation = first.operation === "none" ? "" : `${first.operation}: `;
-	const code = first.code ? `[${first.code}] ` : "";
-	return `${operation}${code}${sanitizeDiagnosticMessage(first.message)} (${count})`;
+	const failure =
+		first.failure ??
+		new OperationFailure(
+			new Error(first.message),
+			{
+				stage: first.operation,
+				path: first.path,
+				action: "unknown",
+			},
+			first.code ? { category: "safety", code: first.code } : undefined,
+		).summary;
+	return `${formatOperationFailure(failure)} (${count})`;
+}
+
+/** Adapt domain guards before considering any nested transport exception. */
+export function createSyncFailure(
+	error: unknown,
+	context: FailureContext,
+): OperationFailure {
+	const code =
+		error instanceof Error ? classifyDomainError(error) : undefined;
+	return new OperationFailure(
+		error,
+		context,
+		code ? { category: "safety", code } : undefined,
+	);
+}
+
+/** Keep legacy SyncError fields alongside the safe shared projection. */
+export function createSyncError(
+	error: unknown,
+	path: string,
+	operation: SyncError["operation"],
+	stage: string = operation,
+): SyncError {
+	const failure = createSyncFailure(error, {
+		stage,
+		path,
+		action:
+			operation === "download"
+				? "read"
+				: operation === "delete_local"
+					? "local"
+					: operation === "upload"
+						? "put"
+						: operation === "none"
+							? "unknown"
+							: "write",
+	});
+	return {
+		path,
+		operation,
+		message: failure.summary.message,
+		code: classifySyncError(failure),
+		failure: failure.summary,
+		failureCause: failure,
+	};
 }
 
 /** Preserve failure priority while inspecting nested transaction causes. */
 export function classifySyncError(error: Error): string | undefined {
+	const domain = classifyDomainError(error);
+	if (domain) {
+		return domain;
+	}
+	const { code } = new OperationFailure(error, {
+		stage: "classify",
+		action: "unknown",
+	}).summary;
+	return code === "unknown" ? undefined : code;
+}
+
+function classifyDomainError(error: Error): string | undefined {
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof LocalFileChangedError,
+		)
+	) {
+		return "local-file-changed";
+	}
 	if (
 		findErrorCause(
 			error,
@@ -38,17 +132,6 @@ export function classifySyncError(error: Error): string | undefined {
 		)
 	) {
 		return "local-state-blocked";
-	}
-	if (isRemoteReadTimeout(error)) {
-		return "remote-read-timeout";
-	}
-	const apiError = findErrorCause(
-		error,
-		(candidate): candidate is YandexApiError =>
-			candidate instanceof YandexApiError,
-	);
-	if (apiError && (apiError.status === 401 || apiError.status === 403)) {
-		return "authentication";
 	}
 	if (
 		findErrorCause(
@@ -130,5 +213,87 @@ export function classifySyncError(error: Error): string | undefined {
 	) {
 		return "portable-path-collision";
 	}
-	return undefined;
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof AmbiguousRemoteIndexStateError,
+		)
+	) {
+		return "ambiguous-index-state";
+	}
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof RemoteIndexContentMismatchError,
+		)
+	) {
+		return "index-content-mismatch";
+	}
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof RemoteIndexLockedError,
+		)
+	) {
+		return "remote-index-locked";
+	}
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof LegacyPluginDataExposureError,
+		)
+	) {
+		return "legacy-plugin-data-exposure";
+	}
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof LegacyServicePathCollisionError,
+		)
+	) {
+		return "legacy-service-path-collision";
+	}
+	const transaction = findErrorCause(
+		error,
+		(candidate): candidate is RemoteIndexTransactionError =>
+			candidate instanceof RemoteIndexTransactionError,
+	);
+	if (transaction) {
+		return `canonical-${transaction.outcome}`;
+	}
+	const inherited = findErrorCause(
+		error,
+		(candidate): candidate is OperationFailure =>
+			candidate instanceof OperationFailure &&
+			candidate.summary.category === "safety",
+	);
+	return inherited?.summary.code;
+}
+
+/** Publish a coherent first failure and partial outcome after all started work settles. */
+export function summarizeSyncFailure(result: SyncResult, stage: string): void {
+	const partial =
+		result.uploaded +
+			result.downloaded +
+			result.deleted +
+			result.conflicts >
+		0;
+	for (const error of result.errors) {
+		if (!error.failure) {
+			const failure = new OperationFailure(
+				error.failureCause ?? new Error(error.message),
+				{ stage, path: error.path, action: "unknown" },
+				error.code
+					? { category: "safety", code: error.code }
+					: undefined,
+			);
+			error.failure = failure.summary;
+			error.failureCause = failure;
+		}
+		if (partial) {
+			error.failure = { ...error.failure, outcome: "partial" };
+		}
+	}
+	result.failure = result.errors[0]?.failure;
+	result.failureCause = result.errors[0]?.failureCause;
 }
