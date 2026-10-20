@@ -6,6 +6,15 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"storage.title": "Confirm synchronization storage",
+		"storage.confirm_previous":
+			"Is {path} your previous remote storage? Keeping history allows previous deletions to be applied to this folder. Confirm only if this is the same storage.",
+		"storage.confirm_new":
+			"The remote folder {path} differs from the folder associated with this synchronization history. Connect it as a new storage only after pending work has been resolved.",
+		"storage.same": "This is the previous storage",
+		"storage.new": "Connect different storage",
+		"storage.blocked":
+			"Synchronization is stopped. Check the remote folder and confirm its connection with manual synchronization. Pending operations must remain in their original storage.",
 		"notice.configuration_busy":
 			"The operation cannot start while synchronization, backup, or recovery work is pending.",
 		"notice.force_busy": "Force synchronization is already in progress.",
@@ -367,6 +376,15 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"storage.title": "Подтвердите хранилище синхронизации",
+		"storage.confirm_previous":
+			"{path} — ваше прежнее удалённое хранилище? Сохранение истории разрешит применение прежних удалений к этой папке. Подтверждайте только для того же хранилища.",
+		"storage.confirm_new":
+			"Удалённая папка {path} отличается от папки, связанной с историей синхронизации. Подключить её как новое хранилище можно после завершения ожидающих операций.",
+		"storage.same": "Это прежнее хранилище",
+		"storage.new": "Подключаю другое хранилище",
+		"storage.blocked":
+			"Синхронизация остановлена. Проверьте удалённую папку и подтвердите подключение ручной синхронизацией. Ожидающие операции должны оставаться в исходном хранилище.",
 		"notice.configuration_busy":
 			"Операция недоступна, пока не завершены синхронизация, архивирование или восстановление.",
 		"notice.force_busy": "Принудительная синхронизация уже выполняется.",

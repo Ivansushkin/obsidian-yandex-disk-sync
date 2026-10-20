@@ -73,6 +73,11 @@ import {
 import { LocalOperationStore } from "../local/operation-store";
 import { mergePhysicalMetadata } from "../local/baseline-rules";
 import {
+	readRemoteStorageScope,
+	sameRemoteStorageScope,
+	StorageScopeError,
+} from "../local/storage-scope";
+import {
 	collectStablePaginatedItems,
 	didCanonicalChangeBeforeMaintenanceClaim,
 	isOrphanIndexAmbiguous,
@@ -719,6 +724,37 @@ export class IndexManager {
 		this.operationStore.updateDeviceId(settings.deviceId);
 	}
 
+	/** Bound history must never authorize work in another physical root. */
+	async assertRemoteScope(): Promise<void> {
+		const expected = this.localState.remoteScope;
+		if (!expected) {
+			return;
+		}
+		const actual = await readRemoteStorageScope(
+			this.yandexClient,
+			this.settings.remotePath,
+		);
+		if (!sameRemoteStorageScope(expected, actual)) {
+			throw new StorageScopeError(
+				"Remote storage changed; confirm the connection before synchronization",
+			);
+		}
+	}
+
+	/** Start a different storage only after all durable work has been settled. */
+	resetLocalStorageHistory(): void {
+		if (
+			this.getPendingMutations().length ||
+			this.getPendingPhysicalActions().length
+		) {
+			throw new StorageScopeError(
+				"Pending operations must be resolved in their original storage",
+			);
+		}
+		this.localState = createEmptyLocalState(this.settings.deviceId);
+		this.operationStore.loadMutations([], 1);
+	}
+
 	/**
 	 * Use different source and target codecs for the one canonical commit that
 	 * changes encryption mode.
@@ -894,6 +930,9 @@ export class IndexManager {
 	beginEpochAdoption(epoch: string): void {
 		this.epochAdoptionTarget = epoch;
 		this.operationStore.resetForEpoch(epoch);
+		this.operationStore.ensureSequenceFloor(
+			this.remoteIndex.appliedMutationSeq[this.settings.deviceId] ?? 0,
+		);
 		this.localState.nextMutationSeq = 1;
 	}
 
@@ -1027,6 +1066,7 @@ export class IndexManager {
 	loadLocalIndexFromData(data: Partial<LocalSyncState> | null): void {
 		if (data && typeof data.observedRevision === "number") {
 			this.localState = {
+				remoteScope: data.remoteScope ?? null,
 				deviceId: this.settings.deviceId,
 				observedEpoch:
 					typeof data.observedEpoch === "string"
@@ -1362,6 +1402,7 @@ export class IndexManager {
 		stableRootDiscovery = false,
 		allowEpochAdoption = false,
 	): Promise<SyncIndex> {
+		await this.assertRemoteScope();
 		let discovery: {
 			path: string | null;
 			resource?: YandexResource;
@@ -1407,6 +1448,16 @@ export class IndexManager {
 				)
 			).index;
 			this.loadedRemoteIndex = this.cloneIndex(this.remoteIndex);
+			if (
+				this.localState.observedEpoch === null ||
+				this.localState.observedEpoch === this.remoteIndex.epoch
+			) {
+				this.operationStore.ensureSequenceFloor(
+					this.remoteIndex.appliedMutationSeq[
+						this.settings.deviceId
+					] ?? 0,
+				);
+			}
 			if (!allowEpochAdoption) {
 				this.assertEpochCompatible(this.remoteIndex);
 			}
@@ -1428,6 +1479,7 @@ export class IndexManager {
 	 * replacing the in-memory desired state.
 	 */
 	async readCanonicalIndex(): Promise<SyncIndex> {
+		await this.assertRemoteScope();
 		const discovery = await this.waitForCanonicalIndexFromStableRoot();
 		if (!discovery.path) {
 			throw new RemoteIndexConcurrentModificationError(
@@ -1624,6 +1676,7 @@ export class IndexManager {
 	}
 
 	private async saveRemoteIndexLocked(): Promise<CanonicalCommitProof> {
+		await this.assertRemoteScope();
 		const canonicalPath = this.getRemoteIndexPath();
 		const transactionId = this.createTransactionId();
 		const lockPath = joinPath(
@@ -2780,6 +2833,8 @@ export class IndexManager {
 			const mutationDevice =
 				desired.lastModifiedBy ?? this.settings.deviceId;
 			const causalContext = {
+				baselineSha256:
+					this.operationStore.findLatestPutBaselineSha(path),
 				currentWatermark:
 					latest.appliedMutationSeq[mutationDevice] ?? 0,
 				desiredWatermark:

@@ -119,6 +119,25 @@ export class LocalOperationStore {
 		return this.nextMutationSeq;
 	}
 
+	/** Reconcile allocation with accepted FIFO without renumbering persisted work. */
+	ensureSequenceFloor(watermark: number): void {
+		let expected = watermark + 1;
+		for (const mutation of this.pendingMutations) {
+			if (mutation.id !== `${this.deviceId}:${mutation.seq}`) {
+				throw new Error(
+					"Pending mutation belongs to another installation",
+				);
+			}
+			if (mutation.seq <= watermark) {
+				continue;
+			}
+			if (mutation.seq !== expected++) {
+				throw new Error("Pending mutation FIFO contains a gap");
+			}
+		}
+		this.nextMutationSeq = Math.max(this.nextMutationSeq, expected);
+	}
+
 	/**
 	 * Drop work from a superseded Force epoch and restart the device FIFO.
 	 */

@@ -235,6 +235,19 @@ export async function reconcileFullSync(
 				.length,
 		});
 	}
+	if (
+		localStateBeforeAdoption.observedEpoch === null &&
+		Object.keys(localStateBeforeAdoption.files).length === 0 &&
+		Object.keys(localStateBeforeAdoption.folderTombstones).length === 0 &&
+		deps.indexManager.getPendingMutations().length === 0 &&
+		deps.indexManager.getPendingPhysicalActions().length === 0
+	) {
+		// Bind initial durable work to its epoch without claiming a reconciled baseline.
+		localStateBeforeAdoption.observedEpoch = canonicalEpoch;
+		if (deps.indexSaveCallback) {
+			await deps.indexSaveCallback();
+		}
+	}
 	const hadPendingCausalWork =
 		deps.indexManager.getPendingMutations().length > 0 ||
 		deps.indexManager.getPendingPhysicalActions().length > 0 ||
@@ -276,6 +289,12 @@ export async function reconcileFullSync(
 	// 4. Get remote files list
 	deps.setSyncPhase("scanning-remote");
 	const remoteFiles = await deps.indexManager.getRemoteFiles();
+	const verifiedMetadataChanged =
+		await syncReconciliation.verifyRemoteContentCandidates(
+			deps.syncReconciliation,
+			localFiles,
+			remoteFiles,
+		);
 	fileOperations.assertPortableLocalTree(deps.fileOperations, [
 		...localFiles.keys(),
 		...remoteFiles.keys(),
@@ -341,6 +360,11 @@ export async function reconcileFullSync(
 	}
 	const pendingMutationsBeforeBaselines =
 		deps.indexManager.getPendingMutations().length;
+	operations = operations.map((operation) =>
+		operation.action === "upload"
+			? { ...operation, remoteMeta: remoteFiles.get(operation.path) }
+			: operation,
+	);
 	const baselinesChanged = syncReconciliation.recordConfirmedBaselines(
 		deps.syncReconciliation,
 		localFiles,
@@ -390,6 +414,12 @@ export async function reconcileFullSync(
 		"Batch server metadata re-read after uploads failed",
 	);
 	stampFullUploadMutations(deps, fullUploadMutations);
+	if (result.errors.length > 0) {
+		if (deps.indexSaveCallback) {
+			await deps.indexSaveCallback();
+		}
+		return;
+	}
 
 	if (downloads.length > 0) {
 		deps.setSyncPhase("applying", t("status.op.downloading_files"));
@@ -497,6 +527,7 @@ export async function reconcileFullSync(
 	// index conflicts between devices. The local index is still
 	// persisted by the caller via indexSaveCallback.
 	const indexDirty =
+		verifiedMetadataChanged ||
 		hadOperations ||
 		mtimeStamped ||
 		tombstonesRemoved ||

@@ -55,6 +55,21 @@ canonical maintenance и local transition принимаются только с
 
 ## Локальное состояние
 
+Storage binding определяется raw identity корневой папки и не меняется от
+enable/rotate/disable или random IV. Проверка binding предшествует admission
+recovery и физическим writes. Unbound current history требует подтверждения;
+новое подключение не может отбросить сохранённый transition. Scope повторно
+проверяется перед локальной записью download/copy. Ambiguous PUT read-back сверяет
+plaintext и исходную codec authority до и после чтения; новый IV не мешает
+подтверждению, смена authority запрещает успех. Corrective repair сохраняет
+accepted mutationSeq и обновляет ciphertext fingerprint как physical rewrite.
+
+Conflict reconciliation сравнивает plaintext SHA, подтверждая canonical SHA
+физическим content hash или stable logical download. Изменение ciphertext при
+тех же plaintext bytes не создаёт копию. Копия перед overwrite получает exclusive
+upload, read-back и canonical confirmation. Проверки повторяют manifest/codec
+guards; plaintext buffers существуют только внутри операции и не журналируются.
+
 Current `data.json` содержит `format: "plugin-data"`. Encryption и transition
 snapshots обязаны иметь явный `profileId`. Загрузчик принимает только:
 

@@ -74,6 +74,12 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		);
 	}
 	if (data.format === PLUGIN_DATA_FORMAT) {
+		if (isRecord(data.localState) && !("remoteScope" in data.localState)) {
+			data = {
+				...data,
+				localState: { ...data.localState, remoteScope: null },
+			};
+		}
 		assertExactKeys(data, CURRENT_PLUGIN_DATA_KEYS, "current plugin data");
 		assertCurrentEncryptionState(data);
 		return {
@@ -127,6 +133,7 @@ function convertStable1xBaseline(
 	}
 	return {
 		deviceId,
+		remoteScope: null,
 		observedEpoch: null,
 		observedRevision: 0,
 		lastSyncTime: value?.lastSyncTime ?? 0,
@@ -187,6 +194,7 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 		assertExactKeys(
 			data.localState,
 			new Set([
+				"remoteScope",
 				"deviceId",
 				"observedEpoch",
 				"observedRevision",
@@ -206,6 +214,29 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 			);
 		}
 		protectRecord(data.localState.files);
+		const scope = data.localState.remoteScope;
+		if (scope !== null) {
+			if (!isRecord(scope)) {
+				throw new UnsupportedHistoricalDataError(
+					"Invalid storage binding",
+				);
+			}
+			assertExactKeys(
+				scope,
+				new Set(["remotePath", "rootResourceId"]),
+				"storage binding",
+			);
+			if (
+				typeof scope.remotePath !== "string" ||
+				!scope.remotePath ||
+				typeof scope.rootResourceId !== "string" ||
+				!scope.rootResourceId
+			) {
+				throw new UnsupportedHistoricalDataError(
+					"Invalid storage binding",
+				);
+			}
+		}
 		protectRecord(data.localState.folderTombstones);
 	}
 	if (data.encryptionTransition) {

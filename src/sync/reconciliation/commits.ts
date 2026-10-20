@@ -1,22 +1,21 @@
 import { VaultAdapter, LocalFileChangedError } from "../../api/vault-adapter";
-import { YandexDiskClient } from "../../api/yandex-client";
+import {
+	YandexDiskClient,
+	type StableLogicalFileSnapshot,
+} from "../../api/yandex-client";
 import type {
 	FileMetadata,
 	IndexMove,
 	PendingMutation,
 	SyncOperation,
 	SyncResult,
+	SyncIndex,
 	YandexDiskSyncSettings,
 } from "../../types";
 import { findErrorCause } from "../../utils/error-utils";
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
-import {
-	getDirectory,
-	getExtension,
-	getFileName,
-	joinPath,
-} from "../../utils/path-utils";
+import { getExtension, joinPath } from "../../utils/path-utils";
 import { setRecordValue } from "../../utils/record-utils";
 import {
 	getPhysicalResourceFingerprint,
@@ -60,6 +59,152 @@ export interface Dependencies {
 	) => void;
 	fileOperations: fileOperations.Dependencies;
 	remoteMoves: remoteMoves.Dependencies;
+}
+
+/** Verify one plaintext version while canonical authority and codec remain stable. */
+async function readVerifiedRemoteVersion(
+	deps: Dependencies,
+	path: string,
+): Promise<{
+	canonical: SyncIndex;
+	snapshot: StableLogicalFileSnapshot;
+	sha256: string;
+}> {
+	const guard = await deps.getSyncGuardResult(false);
+	if (guard.blockReason) {
+		throw new Error(guard.blockReason);
+	}
+	const before = await deps.indexManager.readCanonicalIndex();
+	const snapshot = await deps.yandexClient.downloadStableLogicalFile(
+		joinPath(deps.settings.remotePath, path),
+	);
+	if (!snapshot) {
+		throw new Error("Remote conflict version is not physically available");
+	}
+	const canonical = await deps.indexManager.readCanonicalIndex();
+	const expected = before.files[path];
+	const current = canonical.files[path];
+	if (
+		before.epoch !== canonical.epoch ||
+		expected?.sha256 !== current?.sha256 ||
+		expected?.changedRevision !== current?.changedRevision ||
+		expected?.deleted !== current?.deleted
+	) {
+		throw new Error("Canonical changed during content verification");
+	}
+	const unchanged = await deps.getSyncGuardResult(
+		false,
+		guard.validationToken,
+	);
+	if (unchanged.blockReason) {
+		throw new Error(unchanged.blockReason);
+	}
+	return {
+		canonical,
+		snapshot,
+		sha256: await computeSha256(snapshot.content),
+	};
+}
+
+/** Require accepted logical and physical copy bytes before replacing another version. */
+async function assertRetainedConflictCopy(
+	deps: Dependencies,
+	path: string,
+	sha256: string,
+	epoch: string,
+): Promise<void> {
+	const retained = await readVerifiedRemoteVersion(deps, path);
+	const canonical = retained.canonical.files[path];
+	if (
+		retained.canonical.epoch !== epoch ||
+		!canonical ||
+		canonical.deleted ||
+		canonical.sha256 !== sha256 ||
+		retained.sha256 !== sha256
+	) {
+		throw new Error(
+			"Conflict copy was not retained by canonical and physical storage",
+		);
+	}
+}
+
+/** Resolve metadata uncertainty using stable plaintext without retaining vault-sized buffers. */
+export async function verifyRemoteContentCandidates(
+	deps: Dependencies,
+	localFiles: Map<string, FileMetadata>,
+	remoteFiles: Map<string, FileMetadata>,
+): Promise<boolean> {
+	let changed = false;
+	const index = deps.indexManager.getRemoteIndex();
+	let guard: SyncGuardResult | undefined;
+	for (const [path, local] of localFiles) {
+		const remote = remoteFiles.get(path);
+		const canonical = index.files[path];
+		if (
+			!remote ||
+			canonical?.deleted ||
+			(local.sha256 === remote.sha256 &&
+				canonical?.sha256 === local.sha256)
+		) {
+			continue;
+		}
+		if (
+			canonical &&
+			remote.sha256 &&
+			canonical.remoteFingerprint === remote.sha256
+		) {
+			remoteFiles.set(path, { ...remote, sha256: canonical.sha256 });
+			continue;
+		}
+		guard ??= await deps.getSyncGuardResult(false);
+		if (guard.blockReason) {
+			throw new Error(guard.blockReason);
+		}
+		const snapshot = await deps.yandexClient.downloadStableLogicalFile(
+			joinPath(deps.settings.remotePath, path),
+		);
+		if (!snapshot) {
+			throw new Error(
+				"Remote content cannot be verified for reconciliation",
+			);
+		}
+		const sha256 = await computeSha256(snapshot.content);
+		await fileOperations.assertDownloadLocalUnchanged(
+			deps.fileOperations,
+			path,
+			local.sha256,
+		);
+		remoteFiles.set(path, {
+			...remote,
+			sha256,
+			remoteFingerprint:
+				getPhysicalResourceFingerprint(snapshot.resource) ?? undefined,
+			remoteMtime: new Date(snapshot.resource.modified).getTime(),
+		});
+		if (canonical && canonical.sha256 === sha256) {
+			const verified = remoteFiles.get(path)!;
+			if (
+				canonical.remoteFingerprint !== verified.remoteFingerprint ||
+				canonical.remoteMtime !== verified.remoteMtime
+			) {
+				index.files[path] = {
+					...canonical,
+					remoteFingerprint: verified.remoteFingerprint,
+					remoteMtime: verified.remoteMtime,
+				};
+				changed = true;
+			}
+		}
+	}
+	if (!guard) {
+		return changed;
+	}
+	const current = await deps.getSyncGuardResult(false, guard.validationToken);
+	if (current.blockReason) {
+		throw new Error(current.blockReason);
+	}
+	await deps.indexManager.assertCanonicalEpoch(index.epoch);
+	return changed;
 }
 
 /** Return whether a full session still has guarded physical work to resume. */
@@ -212,6 +357,9 @@ export async function repairMissingAcceptedUploads(
 		}
 		const remotePath = joinPath(deps.settings.remotePath, path);
 		const physical = await deps.yandexClient.getLogicalResource(remotePath);
+		let repairFingerprint =
+			getPhysicalResourceFingerprint(physical) ?? undefined;
+		let retainedCopy: { path: string; sha256: string } | undefined;
 		const physicalMatches =
 			physical !== null &&
 			accepted.remoteFingerprint !== undefined &&
@@ -256,26 +404,29 @@ export async function repairMissingAcceptedUploads(
 		}
 		accepted = currentlyAuthorized;
 		if (physical) {
-			const remoteContent =
-				await deps.yandexClient.downloadFile(remotePath);
-			const remoteSha256 = await computeSha256(remoteContent);
+			const verified = await readVerifiedRemoteVersion(deps, path);
+			repairFingerprint =
+				getPhysicalResourceFingerprint(verified.snapshot.resource) ??
+				undefined;
+			const remoteContent = verified.snapshot.content;
+			const remoteSha256 = verified.sha256;
 			if (remoteSha256 !== accepted.sha256) {
-				const conflictPath = deps.conflictResolver.generateConflictName(
+				const conflictPath = await preserveLocalConflictCopy(
+					deps,
 					path,
-					deps.settings.deviceId,
+					remoteContent,
 				);
-				deps.expectWatcherEvent(conflictPath, "upload");
-				await deps.vaultAdapter.writeFile(conflictPath, remoteContent);
-				await fileOperations.uploadFile(
-					deps.fileOperations,
+				await uploadCausalConflictCopy(
+					deps,
 					conflictPath,
-					false,
-					true,
-					{
-						content: remoteContent,
-						sha256: remoteSha256,
-					},
+					remoteContent,
 				);
+				if (!(await saveRemoteIndexBestEffort(deps))) {
+					throw new Error(
+						"Physical repair conflict copy was not committed",
+					);
+				}
+				retainedCopy = { path: conflictPath, sha256: remoteSha256 };
 			} else {
 				const remoteFingerprint =
 					getPhysicalResourceFingerprint(physical) ?? undefined;
@@ -294,16 +445,88 @@ export async function repairMissingAcceptedUploads(
 		setRecordValue(deps.indexManager.getRemoteIndex().files, path, {
 			...accepted,
 		});
-		await fileOperations.uploadFile(
+		const uploadGuard = await deps.getSyncGuardResult(
+			false,
+			validationToken,
+		);
+		if (uploadGuard.blockReason) {
+			throw new Error(uploadGuard.blockReason);
+		}
+		const uploadValidationToken =
+			validationToken ?? uploadGuard.validationToken;
+		const assertAuthority = async () => {
+			if (retainedCopy) {
+				await assertRetainedConflictCopy(
+					deps,
+					retainedCopy.path,
+					retainedCopy.sha256,
+					canonical.epoch,
+				);
+			}
+			const guard = await deps.getSyncGuardResult(
+				false,
+				uploadValidationToken,
+			);
+			if (guard.blockReason) {
+				throw new Error(guard.blockReason);
+			}
+			const latest = await deps.indexManager.readCanonicalIndex();
+			const current = latest.files[path];
+			if (
+				latest.maintenance ||
+				latest.epoch !== canonical.epoch ||
+				!current ||
+				current.deleted ||
+				current.sha256 !== accepted.sha256 ||
+				current.changedRevision !== accepted.changedRevision
+			) {
+				throw new Error("Canonical changed before corrective upload");
+			}
+		};
+		const uploaded = await fileOperations.materializeUploadedFile(
 			deps.fileOperations,
 			path,
+			snapshot,
 			false,
 			true,
-			snapshot,
+			async () => {
+				await assertAuthority();
+				const actual =
+					await deps.yandexClient.getLogicalResource(remotePath);
+				if (
+					physical
+						? !matchesPhysicalResourceFingerprint(
+								repairFingerprint,
+								actual,
+							)
+						: actual !== null
+				) {
+					throw new Error(
+						"Physical version changed before corrective upload",
+					);
+				}
+			},
+			() =>
+				fileOperations.confirmUploadedSnapshot(
+					deps.fileOperations,
+					path,
+					snapshot.sha256,
+					assertAuthority,
+					uploadValidationToken,
+				),
 		);
+		deps.indexManager.updateLocalFile(
+			path,
+			createConfirmedBaseline(uploaded, uploaded, accepted),
+		);
+		setRecordValue(deps.indexManager.getRemoteIndex().files, path, {
+			...accepted,
+			remoteFingerprint: uploaded.remoteFingerprint,
+			remoteMtime: uploaded.remoteMtime,
+		});
 		repaired = true;
 	}
-	if (repaired && !(await saveRemoteIndexBestEffort(deps))) {
+	if (repaired && !(await saveMoveCompletionBestEffort(deps))) {
 		throw new Error(
 			"Repaired uploads could not be confirmed in canonical index",
 		);
@@ -382,29 +605,10 @@ export async function preserveRejectedConcurrentPut(
 	const localContent = await deps.vaultAdapter.readFile(path);
 	const localSha256 = await computeSha256(localContent);
 	const currentCanonical = await deps.indexManager.readCanonicalIndex();
-	const directory = getDirectory(path);
-	const fileName = getFileName(path);
-	const extension = getExtension(path);
-	const baseName = extension
-		? fileName.slice(0, -(extension.length + 1))
-		: fileName;
-	const conflictPrefix = `${
-		directory ? `${directory}/` : ""
-	}${baseName}_conflict_`;
-	const existingConflict = Object.entries(currentCanonical.files).find(
-		([candidatePath, metadata]) =>
-			candidatePath.startsWith(conflictPrefix) &&
-			!metadata.deleted &&
-			metadata.sha256 === localSha256 &&
-			(extension
-				? candidatePath.endsWith(`.${extension}`)
-				: !getFileName(candidatePath).includes(".")),
-	)?.[0];
 	const conflictPath = await preserveLocalConflictCopy(
 		deps,
 		path,
 		localContent,
-		existingConflict,
 	);
 	const retained = currentCanonical.files[conflictPath];
 	if (!retained || retained.deleted || retained.sha256 !== localSha256) {
@@ -416,9 +620,17 @@ export async function preserveRejectedConcurrentPut(
 		if (!(await saveRemoteIndexBestEffort(deps))) {
 			throw new Error(`Could not commit conflict copy for ${path}`);
 		}
-		deps.indexManager.confirmMutation(mutation.id);
+		if (mutation) {
+			deps.indexManager.confirmMutation(mutation.id);
+		}
 	}
 
+	await assertRetainedConflictCopy(
+		deps,
+		conflictPath,
+		localSha256,
+		currentCanonical.epoch,
+	);
 	const canonical = await deps.indexManager.readCanonicalIndex();
 	const winner = canonical.files[path];
 	if (!winner || winner.deleted) {
@@ -452,27 +664,71 @@ export async function handleConflict(
 ): Promise<void> {
 	logger.warn(`Handling conflict: ${op.path}`);
 
-	// Strategy: create conflict copy of local file,
-	// then download remote version
-	if (op.localMeta && op.remoteMeta) {
-		const localContent = await deps.vaultAdapter.readFile(op.path);
-		const conflictPath = await preserveLocalConflictCopy(
-			deps,
-			op.path,
-			localContent,
-		);
-
-		await uploadCausalConflictCopy(deps, conflictPath, localContent);
-
-		// Download remote version
-		await fileOperations.downloadFile(
+	if (!op.localMeta || !op.remoteMeta) {
+		return;
+	}
+	const localContent = await deps.vaultAdapter.readFile(op.path);
+	const localSha256 = await computeSha256(localContent);
+	if (localSha256 !== op.localMeta.sha256) {
+		throw new Error("Local file changed after conflict classification");
+	}
+	const remote = await readVerifiedRemoteVersion(deps, op.path);
+	if (remote.canonical.files[op.path]?.deleted) {
+		throw new Error("Canonical deletion superseded the conflict");
+	}
+	if (remote.sha256 === localSha256) {
+		await fileOperations.applyDownloadedContent(
 			deps.fileOperations,
 			op.path,
-			op.remoteMeta?.remoteMtime ?? op.remoteMeta?.mtime,
+			remote.snapshot.content,
+			{
+				remoteFingerprint:
+					getPhysicalResourceFingerprint(remote.snapshot.resource) ??
+					undefined,
+				serverMtime: new Date(
+					remote.snapshot.resource.modified,
+				).getTime(),
+			},
+			localSha256,
 		);
-
-		logger.info(`Conflict resolved, copy created: ${conflictPath}`);
+		return;
 	}
+	const conflictPath = await preserveLocalConflictCopy(
+		deps,
+		op.path,
+		localContent,
+	);
+	await uploadCausalConflictCopy(deps, conflictPath, localContent);
+	if (!(await saveRemoteIndexBestEffort(deps))) {
+		throw new Error("Conflict copy could not be committed");
+	}
+	await assertRetainedConflictCopy(
+		deps,
+		conflictPath,
+		localSha256,
+		remote.canonical.epoch,
+	);
+	const winner = await readVerifiedRemoteVersion(deps, op.path);
+	if (
+		winner.canonical.epoch !== remote.canonical.epoch ||
+		winner.canonical.files[op.path]?.deleted ||
+		winner.sha256 !== remote.sha256
+	) {
+		throw new Error("Winner changed after preserving conflict copy");
+	}
+	await fileOperations.applyDownloadedContent(
+		deps.fileOperations,
+		op.path,
+		winner.snapshot.content,
+		{
+			remoteFingerprint:
+				getPhysicalResourceFingerprint(winner.snapshot.resource) ??
+				undefined,
+			serverMtime: new Date(winner.snapshot.resource.modified).getTime(),
+		},
+		localSha256,
+	);
+	logger.info(`Conflict resolved, copy retained: ${conflictPath}`);
 }
 
 /** Preserve a local version without overwriting a conflict copy edited since its canonical commit. */
@@ -480,21 +736,41 @@ export async function preserveLocalConflictCopy(
 	deps: Dependencies,
 	path: string,
 	content: ArrayBuffer,
-	preferredPath?: string,
 ): Promise<string> {
 	const sha256 = await computeSha256(content);
 	const canonical = await deps.indexManager.readCanonicalIndex();
-	const base =
-		preferredPath ??
-		deps.conflictResolver.generateConflictName(
-			path,
-			deps.settings.deviceId,
-		);
+	const key = await computeSha256(
+		new TextEncoder().encode(`${path}\0${sha256}`).buffer,
+	);
+	const base = deps.conflictResolver.generateConflictName(path, key);
 	const extension = getExtension(base);
 	const suffix = extension ? base.slice(-(extension.length + 1)) : "";
 	const stem = suffix ? base.slice(0, -suffix.length) : base;
 	for (let attempt = 0; attempt < 32; attempt++) {
 		const candidate = attempt === 0 ? base : `${stem}_${attempt}${suffix}`;
+		if (deps.vaultAdapter.folderExists(candidate)) {
+			continue;
+		}
+		const physical = await deps.yandexClient.getLogicalResource(
+			joinPath(deps.settings.remotePath, candidate),
+		);
+		if (physical?.type === "dir") {
+			continue;
+		}
+		if (physical) {
+			const verified = await deps.yandexClient.downloadStableLogicalFile(
+				joinPath(deps.settings.remotePath, candidate),
+				physical,
+			);
+			if (!verified) {
+				throw new Error(
+					"Conflict candidate changed while being reserved",
+				);
+			}
+			if ((await computeSha256(verified.content)) !== sha256) {
+				continue;
+			}
+		}
 		if (deps.vaultAdapter.fileExists(candidate)) {
 			if (
 				(await computeSha256(
@@ -518,6 +794,8 @@ export async function preserveLocalConflictCopy(
 		try {
 			await deps.vaultAdapter.writeFile(candidate, content, {
 				expectedSha256: null,
+				validateBeforeWrite: () =>
+					deps.indexManager.assertRemoteScope(),
 				beforeWrite: () => deps.expectWatcherEvent(candidate, "upload"),
 			});
 			return candidate;
@@ -538,30 +816,73 @@ export async function preserveLocalConflictCopy(
 	throw new Error("Could not reserve a free conflict path");
 }
 
-/** Upload a conflict copy as an explicit local causal mutation. */
+/** Confirm one retained version without replacing a competing physical copy. */
 export async function uploadCausalConflictCopy(
 	deps: Dependencies,
 	path: string,
 	content: ArrayBuffer,
-): Promise<PendingMutation> {
+): Promise<PendingMutation | null> {
 	const sha256 = await computeSha256(content);
-	const mutation = deps.indexManager.enqueueMutation("put", path, {
-		sha256,
-		baselineSha256: deps.indexManager.getLocalIndex().files[path]?.sha256,
-	});
-	await fileOperations.uploadFile(deps.fileOperations, path, false, true, {
-		content,
-		sha256,
-	});
-	const remote = deps.indexManager.getRemoteIndex().files[path];
-	if (remote) {
-		remote.mutationSeq = mutation.seq;
+	const canonical = await deps.indexManager.readCanonicalIndex();
+	const retained = canonical.files[path];
+	if (retained?.deleted || (retained && retained.sha256 !== sha256)) {
+		throw new Error(
+			"Conflict path is reserved by another canonical version",
+		);
 	}
-	const local = deps.indexManager.getLocalIndex().files[path];
-	if (local) {
-		local.mutationSeq = mutation.seq;
+	const remotePath = joinPath(deps.settings.remotePath, path);
+	let physical =
+		await deps.yandexClient.downloadStableLogicalFile(remotePath);
+	if (!physical) {
+		try {
+			await deps.yandexClient.uploadFileExclusive(remotePath, content);
+		} catch (error) {
+			physical =
+				await deps.yandexClient.downloadStableLogicalFile(remotePath);
+			if (!physical) {
+				throw error;
+			}
+		}
+		physical ??=
+			await deps.yandexClient.downloadStableLogicalFile(remotePath);
 	}
+	if (!physical || (await computeSha256(physical.content)) !== sha256) {
+		throw new Error("Conflict copy changed before confirmation");
+	}
+	const existing = deps.indexManager
+		.getPendingMutations()
+		.find(
+			(item) =>
+				item.type === "put" &&
+				item.path === path &&
+				item.sha256 === sha256,
+		);
+	if (retained && !existing) {
+		deps.indexManager.updateLocalFile(path, retained);
+		return null;
+	}
+	const mutation =
+		existing ?? deps.indexManager.enqueueMutation("put", path, { sha256 });
+	const metadata: FileMetadata = {
+		path,
+		sha256,
+		size: content.byteLength,
+		mtime: deps.vaultAdapter.getFileMtime(path) || Date.now(),
+		syncedAt: Date.now(),
+		remoteFingerprint:
+			getPhysicalResourceFingerprint(physical.resource) ?? undefined,
+		remoteMtime: new Date(physical.resource.modified).getTime(),
+		mutationSeq: mutation.seq,
+	};
+	deps.indexManager.updateLocalFile(path, metadata);
+	deps.indexManager.updateRemoteFile(path, {
+		...metadata,
+		baseRevision: mutation.baseRevision ?? canonical.revision,
+	});
 	deps.indexManager.stageMutation(mutation);
+	if (deps.indexSaveCallback) {
+		await deps.indexSaveCallback();
+	}
 	return mutation;
 }
 
@@ -864,13 +1185,18 @@ export function recordConfirmedBaselines(
 			continue;
 		}
 		const canonical = remoteIndex.files[path];
+		const previousBaseline = deps.indexManager.getLocalIndex().files[path];
 		const baseline = createConfirmedBaseline(
 			localMeta,
 			remoteMeta,
 			canonical,
 		);
 		deps.indexManager.updateLocalFile(path, baseline);
-		if (!canonical || canonical.deleted) {
+		if (
+			!canonical ||
+			canonical.deleted ||
+			canonical.sha256 !== baseline.sha256
+		) {
 			const existing = [...deps.indexManager.getPendingMutations()]
 				.reverse()
 				.find(
@@ -883,8 +1209,8 @@ export function recordConfirmedBaselines(
 				existing ??
 				deps.indexManager.enqueueMutation("put", path, {
 					sha256: baseline.sha256,
-					baselineSha256:
-						deps.indexManager.getLocalIndex().files[path]?.sha256,
+					baselineSha256: previousBaseline?.sha256,
+					baseRevision: remoteIndex.revision,
 				});
 			const causalBaseline = {
 				...baseline,

@@ -122,6 +122,20 @@
 	color: var(--text-muted);
 }
 
+.yandex-sync-mobile.sync-error .yandex-sync-mobile-detail {
+	white-space: normal;
+	overflow-wrap: anywhere;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+}
+
+.sync-status-error-details {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	user-select: text;
+}
+
 .yandex-sync-mobile.sync-migration-required {
 	color: var(--text-warning);
 }

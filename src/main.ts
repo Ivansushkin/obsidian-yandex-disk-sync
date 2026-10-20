@@ -1,3 +1,6 @@
+import { StorageBindingController } from "./sync/local/storage-binding";
+import { StorageScopeError } from "./sync/local/storage-scope";
+import { StorageBindingModal } from "./ui/storage-binding-modal";
 import {
 	prepareSettingsPatch,
 	type UserSettingsPatch,
@@ -63,7 +66,12 @@ import {
 } from "./backup/backup-snapshot";
 import { generateDeviceId, joinPath, toLocalPath } from "./utils/path-utils";
 import { computeSha256 } from "./utils/hash-utils";
-import { logger, shortenDiagnosticValue } from "./utils/logger";
+import {
+	logger,
+	sanitizeDiagnosticMessage,
+	shortenDiagnosticValue,
+} from "./utils/logger";
+import { formatSyncErrorSummary } from "./sync/errors";
 import { initI18n, t } from "./i18n/index";
 import {
 	createEncryptionCodec,
@@ -400,11 +408,40 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				},
 			);
 
+		this.storageBinding = new StorageBindingController({
+			client: this.yandexClient,
+			index: this.indexManager,
+			getSettings: () => this.settings,
+			hasPendingWork: () => this.hasDurableConfigurationWork(),
+			hasTransition: () => this.encryptionTransition !== null,
+			isUnloaded: () => this.unloaded,
+			persist: () => this.persistPluginData(),
+			confirm: (path, keep) =>
+				new Promise((resolve) =>
+					new StorageBindingModal(
+						this.app,
+						path,
+						keep,
+						resolve,
+					).open(),
+				),
+		});
+
 		// Set callback for saving local index after auto-sync operations
+		this.yandexClient.setWriteGuard(() =>
+			this.indexManager.assertRemoteScope(),
+		);
 		this.syncEngine.setIndexSaveCallback(async () => {
 			await this.persistPluginData();
 		});
 		this.syncEngine.setSyncGuardCallback(async (validationToken) => {
+			if (!(await this.ensureStorageBinding(false))) {
+				return {
+					blockReason: t("storage.blocked"),
+					blockCode: "local-state-blocked",
+					blockStatus: "error",
+				};
+			}
 			if (this.settingsPersistenceFailed || this.unloaded) {
 				return { blockReason: t("notice.remote_recheck_required") };
 			}
@@ -537,6 +574,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				const state = this.syncEngine.getState();
 				new SyncStatusModal(this.app, {
 					lastSyncTime: state.lastSyncTime,
+					errorMessage: state.errorMessage
+						? sanitizeDiagnosticMessage(state.errorMessage)
+						: undefined,
 					...this.lastSyncStats,
 				}).open();
 			},
@@ -594,7 +634,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.restoreLocalStateOnce();
 			this.registerSyncLifecycleOnce();
 			if (
-				(await this.refreshRemoteStartupState(false)) !== "ready" ||
+				(await this.refreshRemoteStartupState(true)) !== "ready" ||
 				this.unloaded
 			) {
 				return;
@@ -616,6 +656,35 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 
 		await this.startSync(true, true);
+	}
+
+	private async ensureStorageBinding(prompt: boolean): Promise<boolean> {
+		let ready = false;
+		try {
+			ready = await this.storageBinding.ensure(prompt);
+		} catch (error) {
+			if (!(error instanceof StorageScopeError)) {
+				throw error;
+			}
+			this.syncEngine.setExternalBlock(
+				"local-state",
+				t("storage.blocked"),
+			);
+			this.stopRegularSync();
+			this.showBlockingNotice("local-state", t("storage.blocked"));
+			return false;
+		}
+		this.syncEngine.setExternalBlock(
+			"local-state",
+			ready ? null : t("storage.blocked"),
+		);
+		if (!ready) {
+			this.stopRegularSync();
+			this.showBlockingNotice("local-state", t("storage.blocked"));
+		} else {
+			this.clearBlockingNotice("local-state");
+		}
+		return ready;
 	}
 
 	/** Restore persisted causal queues before token or remote checks. */
@@ -676,27 +745,29 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			logger.info("Token not configured, waiting for settings");
 			return "blocked";
 		}
-		if (this.remoteStateValidated) {
-			if (this.migrationBlockReason) {
-				// A different updated device may already have committed replacement.
-				this.remoteStateValidated = false;
-			} else {
-				if (
-					this.historicalBlockReason ||
-					this.authenticationBlockReason
-				) {
-					return "blocked";
-				}
-				if (!this.encryptionBlockReason) {
-					return "ready";
-				}
-				if (!prompt) {
-					return "blocked";
+		try {
+			if (!(await this.ensureStorageBinding(prompt))) {
+				return "blocked";
+			}
+			if (this.remoteStateValidated) {
+				if (this.migrationBlockReason) {
+					// A different updated device may already have committed replacement.
+					this.remoteStateValidated = false;
+				} else {
+					if (
+						this.historicalBlockReason ||
+						this.authenticationBlockReason
+					) {
+						return "blocked";
+					}
+					if (!this.encryptionBlockReason) {
+						return "ready";
+					}
+					if (!prompt) {
+						return "blocked";
+					}
 				}
 			}
-		}
-
-		try {
 			const manifest =
 				await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
@@ -872,9 +943,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 								? successful === 0
 									? t("notice.sync_no_changes")
 									: t("notice.sync_completed", { successful })
-								: t("notice.sync_error", {
-										errors: result.errors.length,
-									}),
+								: formatSyncErrorSummary(result.errors),
 						result.success ? 5000 : 10000,
 					);
 				}
@@ -1087,6 +1156,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				"ambiguous-index-lock",
 				"remote-maintenance",
 				"encryption-blocked",
+				"local-state-blocked",
 				"authentication",
 			].includes(error.code ?? ""),
 		);
@@ -1098,6 +1168,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.syncScheduler.stop();
 		this.regularSyncStarted = false;
 		const noticeKey = {
+			"local-state-blocked": "storage.blocked",
 			"unsupported-historical": "notice.unsupported_historical_data",
 			"legacy-index": "notice.legacy_index_blocked",
 			"migration-required": "notice.legacy_index_blocked",
@@ -1508,9 +1579,40 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			this.settings.remotePath = `${DEFAULT_SETTINGS.remotePath}/${vaultName}`;
 		}
-		this.settings.deviceId = this.getInstallationDeviceId();
+		this.settings.deviceId = this.getInstallationDeviceId(
+			data?.localState?.deviceId,
+		);
+		if (
+			data?.localState &&
+			data.localState.deviceId !== this.settings.deviceId
+		) {
+			if (
+				data.pendingMutations.length ||
+				data.pendingPhysicalActions.length ||
+				data.pendingWatcherEvents.length ||
+				data.encryptionTransition
+			) {
+				this.pluginDataLoaded = false;
+				throw new StorageScopeError(
+					"Unfinished state belongs to another installation",
+				);
+			}
+			data.localState = {
+				...data.localState,
+				deviceId: this.settings.deviceId,
+				nextMutationSeq: 1,
+			};
+		}
 		try {
 			await this.persistPluginData();
+			try {
+				globalThis.localStorage?.setItem(
+					`yandex-disk-sync:device-id:${this.getVaultStorageScope()}`,
+					this.settings.deviceId,
+				);
+			} catch {
+				// Plugin data remains the durable causal snapshot.
+			}
 		} catch (error) {
 			this.pluginDataLoaded = false;
 			throw error;
@@ -1522,18 +1624,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Desktop vaults use their absolute adapter path as a local-only namespace;
 	 * mobile adapters fall back to the vault name inside the app profile.
 	 */
-	private getInstallationDeviceId(): string {
+	private getInstallationDeviceId(persistedDeviceId?: string): string {
 		const key = `yandex-disk-sync:device-id:${this.getVaultStorageScope()}`;
 		try {
 			const existing = globalThis.localStorage?.getItem(key);
-			if (existing) {
+			if (existing && persistedDeviceId) {
 				return existing;
 			}
-			const created = generateDeviceId();
-			globalThis.localStorage?.setItem(key, created);
-			return created;
+			return persistedDeviceId ?? generateDeviceId();
 		} catch {
-			return generateDeviceId();
+			return persistedDeviceId ?? generateDeviceId();
 		}
 	}
 
@@ -1603,6 +1703,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private foregroundOperation: "encryption" | "backup" | null = null;
 	private unloaded = false;
 	private settingsPersistenceFailed = false;
+	private storageBinding!: StorageBindingController;
 
 	/** Save a validated draft before publishing it to live components. */
 	async applySettingsPatch(patch: UserSettingsPatch): Promise<void> {
@@ -1733,6 +1834,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.foregroundOperation = kind;
 		this.notifyManualActivity();
 		try {
+			if (!(await this.ensureStorageBinding(true))) {
+				throw new StorageScopeError(t("storage.blocked"));
+			}
 			return await operation();
 		} finally {
 			this.foregroundOperation = null;
