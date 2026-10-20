@@ -672,11 +672,13 @@ export async function handleConflict(
 	if (localSha256 !== op.localMeta.sha256) {
 		throw new Error("Local file changed after conflict classification");
 	}
+	logger.debug("Conflict stage", { stage: "read-remote-version" });
 	const remote = await readVerifiedRemoteVersion(deps, op.path);
 	if (remote.canonical.files[op.path]?.deleted) {
 		throw new Error("Canonical deletion superseded the conflict");
 	}
 	if (remote.sha256 === localSha256) {
+		logger.debug("Conflict stage", { stage: "apply-winner" });
 		await fileOperations.applyDownloadedContent(
 			deps.fileOperations,
 			op.path,
@@ -693,21 +695,26 @@ export async function handleConflict(
 		);
 		return;
 	}
+	logger.debug("Conflict stage", { stage: "preserve-local-copy" });
 	const conflictPath = await preserveLocalConflictCopy(
 		deps,
 		op.path,
 		localContent,
 	);
+	logger.debug("Conflict stage", { stage: "upload-copy" });
 	await uploadCausalConflictCopy(deps, conflictPath, localContent);
+	logger.debug("Conflict stage", { stage: "commit-copy" });
 	if (!(await saveRemoteIndexBestEffort(deps))) {
 		throw new Error("Conflict copy could not be committed");
 	}
+	logger.debug("Conflict stage", { stage: "verify-copy" });
 	await assertRetainedConflictCopy(
 		deps,
 		conflictPath,
 		localSha256,
 		remote.canonical.epoch,
 	);
+	logger.debug("Conflict stage", { stage: "reread-winner" });
 	const winner = await readVerifiedRemoteVersion(deps, op.path);
 	if (
 		winner.canonical.epoch !== remote.canonical.epoch ||
@@ -716,6 +723,7 @@ export async function handleConflict(
 	) {
 		throw new Error("Winner changed after preserving conflict copy");
 	}
+	logger.debug("Conflict stage", { stage: "apply-winner" });
 	await fileOperations.applyDownloadedContent(
 		deps.fileOperations,
 		op.path,

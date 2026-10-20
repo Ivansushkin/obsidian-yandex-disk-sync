@@ -354,7 +354,8 @@ Notice сохраняются без изменений.
 
 При первой ошибке transfer ещё во время пачки `SyncState.errorMessage` получает
 причину; progress считается по завершённым tasks, включая ошибки, и не увеличивается
-для пропущенных queued tasks. При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
+для пропущенных queued tasks. Conflict task увеличивает completed после завершения
+попытки, а не перед чтением winner или загрузкой copy. При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
 причину с operation/code и общим числом ошибок. Сообщение проходит существующую
 маскировку credentials. Команда показа статуса открывает полный selectable текст
 текущей ошибки; это диагностика, без изменений baseline, очередей или canonical.

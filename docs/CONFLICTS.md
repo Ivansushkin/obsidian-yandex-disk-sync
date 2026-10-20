@@ -134,3 +134,9 @@ FDEL, MOVE и SAFE в [каталоге](SYNC_USER_SCENARIOS.md), TC-04/05/06/09
 без исходного baseline нужна protective copy. Изменение файла во время неё оставляет
 действие pending и rename возвращает retry. Cleanup retargeted source требует live
 target; cleanup отклонённого destination требует exact canonical tombstone.
+
+Диагностика conflict classification различает наличие baseline, совпадение local
+SHA с baseline/canonical и epoch adoption. Эти признаки не заменяют guards и не
+меняют выбор winner. Этапы read/copy/upload/commit/verify/apply логируются без
+bytes; read timeout указывает API/transfer и сохраняет код ошибки. Progress
+подтверждает завершённые попытки, а не начало conflict flow.

@@ -903,11 +903,14 @@ export class YandexDiskClient {
 				timeoutMs: this.readTimeoutMs,
 			});
 			try {
-				response = await this.requestRead({
-					url: downloadLink.href,
-					method: "GET",
-					throw: false,
-				});
+				response = await this.requestRead(
+					{
+						url: downloadLink.href,
+						method: "GET",
+						throw: false,
+					},
+					"download transfer",
+				);
 			} catch (error) {
 				logger.warn("Download transfer failed", {
 					attempt: attempt + 1,
@@ -1116,7 +1119,10 @@ export class YandexDiskClient {
 
 				const response =
 					method === "GET"
-						? await this.requestRead(params)
+						? await this.requestRead(
+								params,
+								`API ${method} ${endpointName}`,
+							)
 						: await requestUrl(params);
 
 				// Successful statuses
@@ -1196,6 +1202,7 @@ export class YandexDiskClient {
 	/** Bound read waiting without retrying an unresolved native request or applying its late result. */
 	private async requestRead(
 		params: RequestUrlParam,
+		operation: string,
 	): Promise<RequestUrlResponse> {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
@@ -1205,7 +1212,10 @@ export class YandexDiskClient {
 					timer = setTimeout(
 						() =>
 							reject(
-								new RemoteReadTimeoutError(this.readTimeoutMs),
+								new RemoteReadTimeoutError(
+									this.readTimeoutMs,
+									operation,
+								),
 							),
 						this.readTimeoutMs,
 					);
@@ -1264,14 +1274,17 @@ export class YandexDiskClient {
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
 
 		for (let attempt = 0; attempt < 120; attempt++) {
-			const operationResponse = await this.requestRead({
-				url: operationUrl,
-				method: "GET",
-				headers: {
-					Authorization: `OAuth ${this.token}`,
+			const operationResponse = await this.requestRead(
+				{
+					url: operationUrl,
+					method: "GET",
+					headers: {
+						Authorization: `OAuth ${this.token}`,
+					},
+					throw: false,
 				},
-				throw: false,
-			});
+				"operation status",
+			);
 			if (
 				operationResponse.status < 200 ||
 				operationResponse.status >= 300
@@ -1336,8 +1349,10 @@ export class YandexApiError extends Error {
 
 /** A native read exceeded its deadline; its underlying transport may still be running. */
 export class RemoteReadTimeoutError extends Error {
-	constructor(timeoutMs: number) {
-		super(`Remote read timed out after ${timeoutMs / 1000}s`);
+	constructor(timeoutMs: number, operation: string) {
+		super(
+			`Remote read timed out after ${timeoutMs / 1000}s (${operation})`,
+		);
 		this.name = "RemoteReadTimeoutError";
 	}
 }

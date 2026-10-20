@@ -1,5 +1,6 @@
 import { YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
+import { classifySyncError } from "../errors";
 import type {
 	PendingMutation,
 	SyncError,
@@ -358,6 +359,30 @@ export async function reconcileFullSync(
 			return false;
 		});
 	}
+	for (const operation of operations) {
+		if (operation.action !== "conflict") {
+			continue;
+		}
+		const baseline = (adoption.adoptionSnapshot?.state.files ??
+			localIndex.files)[operation.path];
+		const canonical = remoteIndex.files[operation.path];
+		logger.warn("Conflict classification", {
+			path: operation.path,
+			reason: operation.reason,
+			epochAdoption: Boolean(adoption.adoptionSnapshot),
+			baselinePresent: Boolean(baseline),
+			baselineLive: Boolean(baseline && !baseline.deleted),
+			localMatchesBaseline: baseline
+				? operation.localMeta?.sha256 === baseline.sha256
+				: null,
+			canonicalMatchesBaseline: baseline
+				? canonical?.sha256 === baseline.sha256
+				: null,
+			localMatchesCanonical: canonical
+				? operation.localMeta?.sha256 === canonical.sha256
+				: null,
+		});
+	}
 	const pendingMutationsBeforeBaselines =
 		deps.indexManager.getPendingMutations().length;
 	operations = operations.map((operation) =>
@@ -694,7 +719,6 @@ async function resolveFullConflicts(
 			break;
 		}
 
-		processedOps++;
 		deps.setSyncPhase(
 			"applying",
 			t("status.op.conflict", { path: op.path }),
@@ -712,11 +736,15 @@ async function resolveFullConflicts(
 				path: op.path,
 				operation: op.action,
 				message: (e as Error).message,
+				code: e instanceof Error ? classifySyncError(e) : undefined,
 			};
 			result.errors.push(error);
 			logger.error(`Error resolving conflict for ${op.path}:`, {
 				error: e,
 			});
+		} finally {
+			processedOps++;
+			deps.reportProgress(processedOps, totalOps);
 		}
 	}
 }

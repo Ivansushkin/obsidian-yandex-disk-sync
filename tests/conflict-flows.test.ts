@@ -750,6 +750,7 @@ for (const encrypted of [false, true]) {
 			await a.full();
 			b.vault.put("note.md", bytes("local edit"));
 			const original = await b.client.getPhysicalPath("vault/note.md");
+			let progressDuringTransfer: number | undefined;
 			disk.beforeRequest = async (_method, endpoint, path) => {
 				if (
 					endpoint === "/download" &&
@@ -758,10 +759,17 @@ for (const encrypted of [false, true]) {
 						name.includes("_conflict_"),
 					)
 				) {
+					progressDuringTransfer =
+						b.engine.getState().progress?.completed;
 					throw new Error("synthetic interrupted winner download");
 				}
 			};
 			assert.equal((await b.engine.fullSync()).success, false);
+			assert.equal(
+				progressDuringTransfer,
+				0,
+				"Conflict is not complete while winner transfer is pending",
+			);
 			const copies = [...b.vault.files.keys()].filter((path) =>
 				path.includes("_conflict_"),
 			);
