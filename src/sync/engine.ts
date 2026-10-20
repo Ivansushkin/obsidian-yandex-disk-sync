@@ -621,6 +621,11 @@ export class SyncEngine {
 		}
 	}
 
+	/** Keep watcher work local until a new installation has received the cloud baseline. */
+	isInitialRemoteReceivePending(): boolean {
+		return this.indexManager.isInitialRemoteReceivePending?.() ?? false;
+	}
+
 	/**
 	 * Rewrite only the physical representation of every live canonical file
 	 * while preserving epoch, logical revisions, tombstones, moves, and

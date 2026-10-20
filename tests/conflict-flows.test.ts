@@ -94,8 +94,291 @@ test("explicit new storage creates its root without carrying previous history", 
 	}
 });
 
+test("initial receive respects excluded paths without blocking or overwriting local data", async () => {
+	for (const exists of [false, true]) {
+		const disk = new MemoryDisk();
+		const desktop = device(disk, "desktop", null);
+		const phone = device(disk, "phone", null);
+		try {
+			desktop.vault.put("private/note.md", bytes("private cloud"));
+			await desktop.full();
+			phone.settings.excludePatterns = ["private/**"];
+			if (exists) {
+				phone.vault.put("private/note.md", bytes("private local"));
+			}
+			const before = structuredClone([...disk.files]);
+			await phone.full();
+			assert.deepEqual(
+				phone.vault.files.get("private/note.md"),
+				exists ? bytes("private local") : undefined,
+			);
+			assert.deepEqual([...disk.files], before);
+		} finally {
+			await desktop.stop();
+			await phone.stop();
+		}
+	}
+});
+
+test("initial exact deletion resumes its durable action after restart", async () => {
+	const disk = new MemoryDisk();
+	const desktop = device(disk, "desktop", null);
+	const phone = device(disk, "phone", null);
+	let restarted: ReturnType<typeof device> | undefined;
+	try {
+		desktop.vault.put("deleted.md", bytes("old"));
+		await desktop.full();
+		desktop.vault.remove("deleted.md");
+		await desktop.full();
+		phone.vault.put("deleted.md", bytes("old"));
+		phone.adapter.deleteFile = async () => {
+			throw new Error("synthetic interrupted trash");
+		};
+		const before = structuredClone([...disk.files]);
+		assert.equal((await phone.engine.fullSync()).success, false);
+		const saved = await phone.saved();
+		assert.equal(saved.localState.lastSyncTime, 0);
+		assert.equal(saved.pendingPhysicalActions.length, 1);
+		assert.deepEqual(phone.vault.files.get("deleted.md"), bytes("old"));
+		await phone.stop();
+		restarted = device(disk, "phone", null, phone.vault, saved);
+		await restarted.full();
+		assert.equal(restarted.vault.files.has("deleted.md"), false);
+		assert.deepEqual(restarted.index.getPendingPhysicalActions(), []);
+		assert.deepEqual([...disk.files], before);
+		assert.ok(
+			[...phone.vault.files].some(
+				([path, content]) =>
+					path.includes("/overwritten/") &&
+					new TextDecoder().decode(content) === "old",
+			),
+		);
+	} finally {
+		await desktop.stop();
+		await phone.stop();
+		await restarted?.stop();
+	}
+});
+
 for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
+
+	test(`${mode} new device receives cloud versions before uploading local-only files`, async () => {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const desktop = device(disk, "desktop", codec);
+		const phone = device(disk, "phone", codec);
+		try {
+			desktop.vault.put("note.md", bytes("old copy"));
+			desktop.vault.put("deleted.md", bytes("deleted copy"));
+			desktop.vault.put("same.md", bytes("same"));
+			await desktop.full();
+			phone.vault.put("note.md", bytes("old copy"));
+			phone.vault.put("deleted.md", bytes("deleted copy"));
+			phone.vault.put("same.md", bytes("same"));
+			phone.vault.put("local.md", bytes("local only"));
+			desktop.vault.put("note.md", bytes("cloud update"));
+			desktop.vault.remove("deleted.md");
+			await desktop.full();
+			let localUploadAfterAdoption = false;
+			const samePath =
+				await phone.client.getPhysicalPath("vault/same.md");
+			let identicalTransfers = 0;
+			disk.beforeRequest = async (method, endpoint, path) => {
+				if (endpoint === "/download" && path === samePath) {
+					identicalTransfers++;
+				}
+				if (method === "PUT" && endpoint === "/upload") {
+					localUploadAfterAdoption =
+						phone.index.getLocalIndex().lastSyncTime > 0;
+				}
+			};
+			const result = await phone.full();
+			assert.equal(result.conflicts, 0);
+			assert.equal(identicalTransfers, 0);
+			assert.equal(localUploadAfterAdoption, true);
+			assert.equal(phone.vault.files.has("deleted.md"), false);
+			const protectedBytes = [...phone.vault.files]
+				.filter(([path]) => path.includes("/overwritten/"))
+				.map(([, content]) => new TextDecoder().decode(content))
+				.sort();
+			assert.deepEqual(protectedBytes, ["deleted copy", "old copy"]);
+			await phone.assertSettled({
+				"note.md": "cloud update",
+				"same.md": "same",
+				"local.md": "local only",
+			});
+		} finally {
+			disk.beforeRequest = undefined;
+			await desktop.stop();
+			await phone.stop();
+		}
+	});
+
+	test(`${mode} initial download failure resumes after restart without cloud writes`, async () => {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const desktop = device(disk, "desktop", codec);
+		const phone = device(disk, "phone", codec);
+		let restarted: ReturnType<typeof device> | undefined;
+		try {
+			desktop.vault.put("a.md", bytes("cloud a"));
+			desktop.vault.put("b.md", bytes("cloud b"));
+			await desktop.full();
+			phone.settings.maxConcurrency = 1;
+			phone.vault.put("a.md", bytes("old a"));
+			phone.vault.put("b.md", bytes("old b"));
+			phone.vault.put("local.md", bytes("local"));
+			const blocked = await phone.client.getPhysicalPath("vault/b.md");
+			const before = structuredClone([...disk.files]);
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (endpoint === "/download" && path === blocked) {
+					throw new Error("synthetic unavailable object");
+				}
+			};
+			assert.equal((await phone.engine.fullSync()).success, false);
+			assert.deepEqual([...disk.files], before);
+			assert.deepEqual(phone.vault.files.get("a.md"), bytes("cloud a"));
+			assert.deepEqual(phone.vault.files.get("b.md"), bytes("old b"));
+			const saved = await phone.saved();
+			assert.equal(saved.localState.lastSyncTime, 0);
+			assert.equal(saved.localState.observedRevision, 0);
+			assert.deepEqual(saved.pendingMutations, []);
+			await phone.stop();
+			disk.beforeRequest = undefined;
+			restarted = device(disk, "phone", codec, phone.vault, saved);
+			restarted.start();
+			restarted.vault.remove("a.md");
+			await restarted.drain();
+			assert.deepEqual(
+				[...disk.files],
+				before,
+				"Watcher must not publish a deletion during unfinished receive",
+			);
+			assert.equal((await restarted.full()).conflicts, 0);
+			await restarted.assertSettled({
+				"a.md": "cloud a",
+				"b.md": "cloud b",
+				"local.md": "local",
+			});
+		} finally {
+			disk.beforeRequest = undefined;
+			await desktop.stop();
+			await phone.stop();
+			await restarted?.stop();
+		}
+	});
+
+	test(`${mode} initial receive preserves bytes and unobserved state when authority or protection fails`, async () => {
+		for (const failure of [
+			"local-edit",
+			"backup",
+			"save",
+			"canonical",
+			"codec",
+			"root",
+		] as const) {
+			const disk = new MemoryDisk();
+			const codec = await codecFor(encrypted);
+			const desktop = device(disk, "desktop", codec);
+			const phone = device(disk, "phone", codec);
+			try {
+				desktop.vault.put("note.md", bytes("cloud"));
+				await desktop.full();
+				phone.vault.put("note.md", bytes("old"));
+				phone.index.getLocalIndex().remoteScope = {
+					remotePath: "vault",
+					rootResourceId: `${disk.identity}:vault`,
+				};
+				let changed = false;
+				phone.engine.setSyncGuardCallback(() => ({
+					blockReason:
+						failure === "codec" && changed
+							? "synthetic codec changed"
+							: null,
+				}));
+				const backup = phone.adapter.backupOverwrittenFile.bind(
+					phone.adapter,
+				);
+				phone.adapter.backupOverwrittenFile = async (...args) => {
+					if (failure === "backup") {
+						throw new Error("synthetic backup failure");
+					}
+					const path = await backup(...args);
+					if (failure === "local-edit") {
+						phone.vault.put("note.md", bytes("late edit"));
+					}
+					return path;
+				};
+				const persist = async () => {
+					if (
+						failure === "save" &&
+						phone.index.getLocalIndex().lastSyncTime > 0
+					) {
+						throw new Error("synthetic save failure");
+					}
+				};
+				phone.engine.setIndexSaveCallback(persist);
+				const physical =
+					await phone.client.getPhysicalPath("vault/note.md");
+				const canonical = await desktop.canonical();
+				const resource = disk.resource.bind(disk);
+				disk.resource = async (path) => {
+					const result = await resource(path);
+					return failure === "root" && changed && path === "vault"
+						? { ...result, resource_id: "other-root" }
+						: result;
+				};
+				disk.afterRequest = async (_method, endpoint, path) => {
+					if (
+						endpoint === "/download" &&
+						path === physical &&
+						!changed
+					) {
+						changed = true;
+						if (failure === "canonical") {
+							canonical.epoch = crypto.randomUUID();
+							const raw = bytes(JSON.stringify(canonical));
+							disk.files.set(
+								"vault/.obsidian-sync-index.json",
+								codec ? await codec.encrypt(raw) : raw,
+							);
+						}
+					}
+				};
+				assert.equal(
+					(await phone.engine.fullSync()).success,
+					false,
+					failure,
+				);
+				assert.deepEqual(
+					phone.vault.files.get("note.md"),
+					bytes(
+						failure === "save"
+							? "cloud"
+							: failure === "local-edit"
+								? "late edit"
+								: "old",
+					),
+				);
+				assert.equal(phone.index.getLocalIndex().lastSyncTime, 0);
+				assert.equal(phone.index.getObservedRevision(), 0);
+				assert.deepEqual(phone.index.getPendingMutations(), []);
+				if (failure === "canonical") {
+					disk.afterRequest = undefined;
+					await phone.full();
+					assert.deepEqual(
+						phone.vault.files.get("note.md"),
+						bytes("cloud"),
+					);
+				}
+			} finally {
+				disk.afterRequest = undefined;
+				await desktop.stop();
+				await phone.stop();
+			}
+		}
+	});
 
 	test(`${mode} download write guard preserves root and late local changes`, async () => {
 		for (const timing of ["download", "write", "local-edit"] as const) {
@@ -859,13 +1142,14 @@ for (const encrypted of [false, true]) {
 		}
 	});
 
-	test(`${mode} first-sync copy keeps its pending identity across restart`, async () => {
+	test(`${mode} untracked-file conflict copy keeps its pending identity across restart`, async () => {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);
 		const a = device(disk, "a", codec);
 		const b = device(disk, "b", codec);
 		let restarted: ReturnType<typeof device> | undefined;
 		try {
+			await b.full();
 			a.vault.put("note.md", bytes("remote edit"));
 			await a.full();
 			b.vault.put("note.md", bytes("local edit"));
@@ -882,8 +1166,15 @@ for (const encrypted of [false, true]) {
 			};
 			assert.equal((await b.engine.fullSync()).success, false);
 			const saved = await b.saved();
-			assert.equal(saved.pendingMutations.length, 1);
-			const copy = saved.pendingMutations[0]!.path;
+			const copy = saved.pendingMutations.find((mutation) =>
+				mutation.path.includes("_conflict_"),
+			)!.path;
+			assert.equal(
+				saved.pendingMutations.filter(
+					(mutation) => mutation.path === copy,
+				).length,
+				1,
+			);
 			await b.stop();
 			disk.beforeRequest = undefined;
 			restarted = device(disk, "b", codec, b.vault, saved);

@@ -30,6 +30,12 @@ export interface YandexClientConfig {
 	maxRetries?: number;
 	retryDelay?: number;
 	readTimeoutMs?: number;
+	downloadTimeoutMs?: number;
+}
+
+interface DownloadReadBudget {
+	deadline: number;
+	timeoutMs: number;
 }
 
 interface StableRawFileSnapshot {
@@ -51,6 +57,7 @@ export class YandexDiskClient {
 	private maxRetries: number;
 	private retryDelay: number;
 	private readonly readTimeoutMs: number;
+	private readonly downloadTimeoutMs: number;
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
@@ -73,6 +80,7 @@ export class YandexDiskClient {
 		this.maxRetries = config.maxRetries ?? 3;
 		this.retryDelay = config.retryDelay ?? 1000;
 		this.readTimeoutMs = config.readTimeoutMs ?? 60_000;
+		this.downloadTimeoutMs = config.downloadTimeoutMs ?? 60_000;
 	}
 
 	/**
@@ -169,10 +177,12 @@ export class YandexDiskClient {
 	async downloadStableRawFile(
 		path: string,
 		expectedResource?: YandexResource,
+		budget = this.createDownloadBudget(),
 	): Promise<StableRawFileSnapshot | null> {
 		const startedAt = Date.now();
 		const before =
-			expectedResource ?? (await this.getResource(path, 1, 0, true));
+			expectedResource ??
+			(await this.getResource(path, 1, 0, true, budget));
 		if (!before) {
 			return null;
 		}
@@ -182,8 +192,8 @@ export class YandexDiskClient {
 			);
 		}
 
-		const raw = await this.downloadFile(path, true);
-		const after = await this.getResource(path, 1, 0, true);
+		const raw = await this.downloadFile(path, true, budget);
+		const after = await this.getResource(path, 1, 0, true, budget);
 		if (!after) {
 			throw new Error("Remote service file disappeared while being read");
 		}
@@ -209,14 +219,15 @@ export class YandexDiskClient {
 	async downloadStableLogicalFile(
 		path: string,
 		expectedResource?: YandexResource,
+		budget = this.createDownloadBudget(),
 	): Promise<StableLogicalFileSnapshot | null> {
 		const before =
-			expectedResource ?? (await this.getLogicalResource(path));
+			expectedResource ?? (await this.getLogicalResource(path, budget));
 		if (!before || !this.getContentFingerprint(before)) {
 			return null;
 		}
-		const content = await this.downloadFile(path);
-		const after = await this.getLogicalResource(path);
+		const content = await this.downloadFile(path, false, budget);
+		const after = await this.getLogicalResource(path, budget);
 		if (!after) {
 			throw new Error("Remote user file disappeared while being read");
 		}
@@ -380,12 +391,16 @@ export class YandexDiskClient {
 		limit = 1000,
 		offset = 0,
 		raw = false,
+		budget?: DownloadReadBudget,
 	): Promise<YandexResource | null> {
 		try {
 			const encodedPath = encodePathForUrl(path);
 			const response = await this.request(
 				"GET",
 				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`,
+				undefined,
+				undefined,
+				budget,
 			);
 			const resource = response.json as YandexResource;
 			if (resource.type === "dir") {
@@ -407,9 +422,12 @@ export class YandexDiskClient {
 	/**
 	 * Get a resource addressed by its logical, unencrypted path.
 	 */
-	async getLogicalResource(path: string): Promise<YandexResource | null> {
+	async getLogicalResource(
+		path: string,
+		budget?: DownloadReadBudget,
+	): Promise<YandexResource | null> {
 		const target = await this.encryptFilePath(path);
-		return await this.getResource(target, 1000, 0, true);
+		return await this.getResource(target, 1000, 0, true, budget);
 	}
 
 	/**
@@ -878,12 +896,16 @@ export class YandexDiskClient {
 	async getDownloadLink(
 		path: string,
 		raw = false,
+		budget?: DownloadReadBudget,
 	): Promise<YandexDownloadLink> {
 		const targetPath = raw ? path : await this.encryptFilePath(path);
 		const encodedPath = encodePathForUrl(targetPath);
 		const response = await this.request(
 			"GET",
 			`/resources/download?path=${encodedPath}`,
+			undefined,
+			undefined,
+			budget,
 		);
 		return response.json as YandexDownloadLink;
 	}
@@ -893,9 +915,17 @@ export class YandexDiskClient {
 	 * Decode only after transfer success; codec failures are not network retries.
 	 * When `raw` is true, skip path and content decryption for service files.
 	 */
-	async downloadFile(remotePath: string, raw = false): Promise<ArrayBuffer> {
+	async downloadFile(
+		remotePath: string,
+		raw = false,
+		budget = this.createDownloadBudget(),
+	): Promise<ArrayBuffer> {
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-			const downloadLink = await this.getDownloadLink(remotePath, raw);
+			const downloadLink = await this.getDownloadLink(
+				remotePath,
+				raw,
+				budget,
+			);
 			let response: RequestUrlResponse | undefined;
 			const startedAt = Date.now();
 			logger.debug("Download transfer started", {
@@ -910,6 +940,7 @@ export class YandexDiskClient {
 						throw: false,
 					},
 					"download transfer",
+					budget,
 				);
 			} catch (error) {
 				logger.warn("Download transfer failed", {
@@ -917,6 +948,7 @@ export class YandexDiskClient {
 					durationMs: Date.now() - startedAt,
 					kind: isRemoteReadTimeout(error) ? "timeout" : "network",
 				});
+				this.remainingReadTime(budget, "download transfer");
 				if (isRemoteReadTimeout(error) || attempt === this.maxRetries) {
 					throw error;
 				}
@@ -932,6 +964,7 @@ export class YandexDiskClient {
 					const result = raw
 						? response.arrayBuffer
 						: await this.decryptContent(response.arrayBuffer);
+					this.remainingReadTime(budget, "download decode");
 					logger.debug(`Downloaded file: ${remotePath}`);
 					return result;
 				}
@@ -953,7 +986,7 @@ export class YandexDiskClient {
 				delay,
 				status: response?.status,
 			});
-			await this.sleep(delay);
+			await this.sleepBeforeReadRetry(delay, budget);
 		}
 		throw new Error("Download failed");
 	}
@@ -1081,6 +1114,7 @@ export class YandexDiskClient {
 		endpoint: string,
 		body?: unknown,
 		beforeAttempt?: () => Promise<void>,
+		budget?: DownloadReadBudget,
 	): Promise<RequestUrlResponse> {
 		const url = `${API_BASE_URL}${endpoint}`;
 		const endpointName = endpoint.split("?", 1)[0] ?? endpoint;
@@ -1122,6 +1156,7 @@ export class YandexDiskClient {
 						? await this.requestRead(
 								params,
 								`API ${method} ${endpointName}`,
+								budget,
 							)
 						: await requestUrl(params);
 
@@ -1157,7 +1192,7 @@ export class YandexDiskClient {
 					if (attempt < this.maxRetries) {
 						const delay = this.getRetryDelay(attempt);
 						logger.warn(`Retrying API request in ${delay}ms`);
-						await this.sleep(delay);
+						await this.sleepBeforeReadRetry(delay, budget);
 						continue;
 					}
 				}
@@ -1181,6 +1216,7 @@ export class YandexDiskClient {
 				if (e instanceof YandexApiError || isRemoteReadTimeout(e)) {
 					throw e;
 				}
+				this.remainingReadTime(budget, `API ${method} ${endpointName}`);
 				lastError = e as Error;
 
 				logger.error(`API request failed: ${method} ${endpointName}`, {
@@ -1191,7 +1227,7 @@ export class YandexDiskClient {
 				if (attempt < this.maxRetries) {
 					const delay = this.getRetryDelay(attempt);
 					logger.warn(`Network error, retry in ${delay}ms:`);
-					await this.sleep(delay);
+					await this.sleepBeforeReadRetry(delay, budget);
 				}
 			}
 		}
@@ -1203,27 +1239,66 @@ export class YandexDiskClient {
 	private async requestRead(
 		params: RequestUrlParam,
 		operation: string,
+		budget?: DownloadReadBudget,
 	): Promise<RequestUrlResponse> {
+		const timeoutMs = Math.min(
+			this.readTimeoutMs,
+			this.remainingReadTime(budget, operation),
+		);
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
-			return await Promise.race([
+			const response = await Promise.race([
 				requestUrl(params),
 				new Promise<never>((_, reject) => {
 					timer = setTimeout(
 						() =>
 							reject(
 								new RemoteReadTimeoutError(
-									this.readTimeoutMs,
+									timeoutMs,
 									operation,
 								),
 							),
-						this.readTimeoutMs,
+						timeoutMs,
 					);
 				}),
 			]);
+			this.remainingReadTime(budget, operation);
+			return response;
 		} finally {
 			clearTimeout(timer);
 		}
+	}
+
+	/** Share one wall-clock deadline across a stable snapshot and its retries. */
+	createDownloadBudget(): DownloadReadBudget {
+		return {
+			deadline: Date.now() + this.downloadTimeoutMs,
+			timeoutMs: this.downloadTimeoutMs,
+		};
+	}
+
+	private remainingReadTime(
+		budget: DownloadReadBudget | undefined,
+		operation: string,
+	): number {
+		if (!budget) {
+			return this.readTimeoutMs;
+		}
+		const remaining = budget.deadline - Date.now();
+		if (remaining <= 0) {
+			throw new RemoteReadTimeoutError(budget.timeoutMs, operation);
+		}
+		return remaining;
+	}
+
+	/** Backoff consumes the same budget, without starting another native read. */
+	private async sleepBeforeReadRetry(
+		delay: number,
+		budget?: DownloadReadBudget,
+	): Promise<void> {
+		const remaining = this.remainingReadTime(budget, "download retry");
+		await this.sleep(budget ? Math.min(delay, remaining) : delay);
+		this.remainingReadTime(budget, "download retry");
 	}
 
 	private recordApiRead(endpoint: string): void {

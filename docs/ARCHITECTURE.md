@@ -216,6 +216,16 @@ source mode остаётся авторитетным; после подтвер
 запрещён, migration block снимается, а fingerprint-guarded cleanup продолжает
 обычный full даже после потери инициатора.
 
+Первое подключение pristine device выполняет `workflows/initial-receive.ts` внутри
+full coordinator: сначала cloud live paths и exact tombstones, затем coherent
+local save, после него обычная загрузка unknown local-only. Разные local bytes
+сохраняются защитными копиями вне sync scope; conflict copy не создаётся.
+Eligibility использует существующие revision/time/sequence/queues; partial baselines
+не завершают подключение. Legacy baseline с неизвестным epoch и существующие
+causal mutations не переводятся в этот режим. Persist failure откатывает только
+неподтверждённое завершение; уже применённые bytes и partial baselines остаются.
+Новых persisted fields или изменений canonical/physical-action schema нет.
+
 ## Encryption profiles и migration
 
 Новые vault используют `hardened`: PBKDF2 600k выводит master key, HKDF
@@ -272,6 +282,8 @@ publication window; совпадения одного device ID недостат
 локальные bytes/baseline не подтверждаются; retry не изменяет правила конфликтов.
 
 GET к API, signed download link и operation status имеют deadline 60 s на запрос.
+Stable raw/logical snapshot и direct download дополнительно имеют общий бюджет
+60 s: metadata, fresh link, bytes, retries и backoff используют оставшееся время.
 Timeout не повторяет запрос: Obsidian API не предоставляет отмену native request.
 Поздний ответ проигравшего Promise не достигает apply. Очередь full/Force downloads
 после timeout не начинает новые tasks и дожидается уже начатых. При ошибке download

@@ -564,6 +564,58 @@ test("signed download 404 cannot classify a present encryption manifest as absen
 	}
 });
 
+test("download budget includes metadata, fresh links and completed network failures", async () => {
+	const originalNow = Date.now;
+	for (const kind of ["raw", "logical", "retries"] as const) {
+		let now = originalNow();
+		Date.now = () => now;
+		let transfers = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			now += 20;
+			if (params.url.includes("/resources/download?")) {
+				return response(200, {
+					href: "https://synthetic.invalid/content",
+				});
+			}
+			if (params.url.includes("/resources?")) {
+				return response(
+					200,
+					fileResource("vault/note.md", { sha256: "stable" }),
+				);
+			}
+			transfers++;
+			if (kind === "retries") {
+				throw new Error("synthetic completed network failure");
+			}
+			return response(200);
+		};
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				retryDelay: 0,
+				readTimeoutMs: 1000,
+				downloadTimeoutMs: 50,
+			});
+			await assert.rejects(
+				kind === "raw"
+					? client.downloadStableRawFile("vault/note.md")
+					: kind === "logical"
+						? client.downloadStableLogicalFile("vault/note.md")
+						: client.downloadFile("vault/note.md"),
+				/Remote read timed out/,
+			);
+			assert.equal(
+				transfers,
+				1,
+				"Budget exhaustion cannot start another transfer",
+			);
+		} finally {
+			Date.now = originalNow;
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
+
 test("stalled remote reads expire without retrying an unresolved native request", async () => {
 	for (const stage of ["link", "bytes", "metadata"] as const) {
 		let release!: () => void;

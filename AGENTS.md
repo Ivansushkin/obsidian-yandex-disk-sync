@@ -69,7 +69,8 @@
   requires a fresh canonical read and a matching expected physical fingerprint.
   A failed mandatory backup blocks local overwrite or deletion.
 - Exact delete beats a concurrent stale put. A new or modified descendant
-  survives folder delete. A file without baseline on first sync is new.
+  survives folder delete. Initial device connection receives canonical versions with protective copies;
+  after connection, a file without baseline is new.
 - Empty folders are not synchronized separately.
 
 ## Fingerprints and paths

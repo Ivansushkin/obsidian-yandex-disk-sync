@@ -162,7 +162,7 @@ On first launch, the plugin will check for files locally and on Yandex Disk:
 
 - **If local vault is empty and disk has files** — files will be downloaded
 - **If disk is empty and local has files** — files will be uploaded
-- **If files exist in both places** — the plugin will perform two-way merge synchronization
+- **When connecting a new device to existing cloud data** — cloud versions are received first. Different local versions are preserved under `.obsidian/plugins/yandex-disk-sync/overwritten/`. Cloud deletions are applied with protective copies; local-only files are kept and uploaded after the initial receive. Later synchronization uses the normal two-way rules.
 
 > **⚠️ Recommendation**  
 > Before the first synchronization, create a manual backup of your vault. When working with cloud data, there is always a risk of information loss.

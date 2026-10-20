@@ -20,6 +20,7 @@ import type {
 	SyncRunOptions,
 } from "../contracts";
 import * as syncReconciliation from "../reconciliation/commits";
+import { receiveInitialRemoteState } from "./initial-receive";
 export interface Dependencies {
 	indexManager: IndexManager;
 	settings: YandexDiskSyncSettings;
@@ -212,6 +213,26 @@ export async function reconcileFullSync(
 		throw new Error(
 			"Encryption preflight requires a stable canonical index",
 		);
+	}
+	const initialCanonical = deps.indexManager.getRemoteIndex();
+	if (
+		deps.indexManager.isInitialRemoteReceivePending?.() &&
+		!options?.skipEncryptionGuard &&
+		!options?.skipMaintenanceGuard &&
+		!initialCanonical.maintenance &&
+		!(initialCanonical.appliedMutationSeq[deps.settings.deviceId] ?? 0)
+	) {
+		if (
+			Object.values(initialCanonical.moves).some((move) => move.pending)
+		) {
+			throw new Error(
+				"Initial remote receive waits for pending canonical moves to finish",
+			);
+		}
+		await receiveInitialRemoteState(deps, result, validationToken);
+		if (result.errors.length > 0) {
+			return;
+		}
 	}
 	const localStateBeforeAdoption = deps.indexManager.getLocalIndex();
 	const canonicalEpoch = deps.indexManager.getRemoteIndex().epoch;

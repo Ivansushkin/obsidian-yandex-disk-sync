@@ -42,6 +42,12 @@ target; coalesced parent переносит оба пути зависимого
 промежуточной папки используется только для поглощения механических notifications
 её descendants и не переживает остановку watcher.
 
+До завершённого initial remote receive watcher хранит события локально и не
+публикует mutations. Full prepare не выполняет pre-drain destructive events;
+после успешного full сверяются filesystem и сохранённые signatures cutoff events.
+События, изменившиеся во время прохода, остаются для replay; failed full не
+подтверждает очередь. Обычный pre-drain после подключения работает по прежним правилам.
+
 Full prepare фиксирует cutoff событий до входа в очередь. Destructive/rename work
 завершается заранее, uploads покрываются full barrier. Upload receipt передаёт
 подтверждённую revision последующему rename внутри coordinator settlement. Неоднозначная

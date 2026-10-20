@@ -979,6 +979,24 @@ export class IndexManager {
 		return this.localState;
 	}
 
+	/** Identify an unfinished installation without reclassifying established or queued history. */
+	isInitialRemoteReceivePending(): boolean {
+		const state = this.localState;
+		return (
+			state.lastSyncTime === 0 &&
+			state.observedRevision === 0 &&
+			this.operationStore.getNextMutationSeq() === 1 &&
+			this.getPendingMutations().length === 0 &&
+			(state.observedEpoch !== null ||
+				Object.keys(state.files).length === 0) &&
+			this.getPendingPhysicalActions().every(
+				(action) =>
+					action.type === "delete-local" &&
+					action.origin === "exact-delete",
+			)
+		);
+	}
+
 	/**
 	 * Get remote index
 	 */

@@ -233,8 +233,10 @@ export async function applyDownloadedContent(
 		remoteFingerprint?: string;
 	},
 	expectedLocalSha?: string | null,
+	validateAuthority?: () => Promise<void>,
 ): Promise<void> {
 	await deps.indexManager.assertRemoteScope();
+	await validateAuthority?.();
 	const expected =
 		expectedLocalSha === undefined
 			? await readLocalDownloadIdentity(deps, path)
@@ -257,7 +259,10 @@ export async function applyDownloadedContent(
 	assertPortableLocalTree(deps, [path]);
 	await deps.vaultAdapter.writeFile(path, content, {
 		expectedSha256: expected,
-		validateBeforeWrite: () => deps.indexManager.assertRemoteScope(),
+		validateBeforeWrite: async () => {
+			await deps.indexManager.assertRemoteScope();
+			await validateAuthority?.();
+		},
 		beforeWrite: () => deps.expectWatcherEvent(path, "upload"),
 	});
 
@@ -423,6 +428,7 @@ export async function deleteRemoteFile(
 export async function deleteLocalFile(
 	deps: Dependencies,
 	path: string,
+	validateAuthority?: () => Promise<void>,
 ): Promise<PhysicalActionOutcome> {
 	const physicalAction = requirePhysicalAction(deps, "delete-local", path);
 	const actionContext = {
@@ -474,6 +480,7 @@ export async function deleteLocalFile(
 		deps.indexManager.completePhysicalAction(physicalAction.id);
 		return "cancelled";
 	}
+	await validateAuthority?.();
 	if ((await readLocalDownloadIdentity(deps, path)) !== expected) {
 		return "deferred";
 	}

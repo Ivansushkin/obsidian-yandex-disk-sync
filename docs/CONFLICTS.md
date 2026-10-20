@@ -6,16 +6,30 @@
 используется physical fingerprint, а при его отсутствии — server mtime относительно
 baseline. Клиентские часы не выбирают победителя.
 
-| Состояние                                            | Результат                                                                                      |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Разные изменения после общего baseline               | Одна версия сохраняется как conflict copy, canonical winner применяется к исходному пути       |
-| Файл без baseline и отличающийся remote того же пути | Локальный файл считается новым; обе версии сохраняются                                         |
-| Exact delete против stale edit                       | Delete побеждает; неподтверждённые локальные bytes требуют protective copy                     |
-| Causally-later put после delete                      | Путь восстанавливается                                                                         |
-| Folder delete против нового/изменённого descendant   | Descendant сохраняется                                                                         |
-| Folder move против отличающегося target              | Операция блокируется до mutations; частичный overwrite запрещён                                |
-| Последовательные edits одной установки               | Непрерывный mutation watermark предотвращает ложный конфликт                                   |
-| Replacement epoch и offline edit                     | Full сравнивает прежний baseline с filesystem и новым canonical; старые actions не replay-ятся |
+| Состояние                                                                           | Результат                                                                                      |
+| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Разные изменения после общего baseline                                              | Одна версия сохраняется как conflict copy, canonical winner применяется к исходному пути       |
+| Файл без baseline после завершённого подключения и отличающийся remote того же пути | Локальный файл считается новым; обе версии сохраняются                                         |
+| Exact delete против stale edit                                                      | Delete побеждает; неподтверждённые локальные bytes требуют protective copy                     |
+| Causally-later put после delete                                                     | Путь восстанавливается                                                                         |
+| Folder delete против нового/изменённого descendant                                  | Descendant сохраняется                                                                         |
+| Folder move против отличающегося target                                             | Операция блокируется до mutations; частичный overwrite запрещён                                |
+| Последовательные edits одной установки                                              | Непрерывный mutation watermark предотвращает ложный конфликт                                   |
+| Replacement epoch и offline edit                                                    | Full сравнивает прежний baseline с filesystem и новым canonical; старые actions не replay-ятся |
+
+## Первое подключение устройства
+
+При `lastSyncTime = observedRevision = 0`, первом sequence и отсутствии mutations
+full сначала принимает существующий canonical. Разные local bytes сохраняются
+в protective copy вне sync scope, затем применяется cloud; одинаковые файлы
+с matching physical fingerprint получают baseline без передачи. Exact tombstones
+требуют protective copy и guarded local delete; неизвестные local-only файлы
+остаются на месте. После проверки snapshot и coherent save обычный full загружает
+local-only. Это не Force и не replacement epoch.
+
+Partial baselines переживают restart; до полного получения observed revision/time
+не продвигаются и watcher work не публикуется. Legacy baseline с неизвестным epoch,
+существующие mutations и encryption recovery продолжают прежние workflows.
 
 ## Conflict copies
 
@@ -67,7 +81,7 @@ watermark текущего epoch; чужие pending IDs и FIFO gaps блоки
 Пустой/недоступный cache ID не заменяет сохранённый actor. При чистом первом sync
 наблюдаемый epoch сохраняется до создания durable work, без подтверждения baseline
 или продвижения observed revision; crash сохраняет идентичность copy put.
-Без baseline разные bytes остаются одним настоящим конфликтом. Local/server mtime
+После завершённого первого подключения без baseline разные bytes остаются конфликтом. Local/server mtime
 не доказывают, какую из неизвестных версий можно удалить.
 
 Неоднозначный ответ обычного или corrective PUT подтверждается только stable
@@ -83,7 +97,8 @@ FIFO остаются для restart. Corrective upload сохраняет пр�
 
 Сетевой обрыв передачи bytes запускает ограниченный retry с новой signed link.
 Исчерпание попыток оставляет download ошибкой без подтверждения baseline.
-Каждое remote чтение ограничено 60 s; timeout не повторяет неотменённый native
+Каждый GET ограничен 60 s; stable raw/logical snapshot и direct download также
+имеют общий бюджет 60 s на metadata, link, bytes и retry/backoff; timeout не повторяет неотменённый native
 request и запрещает применять его поздний ответ. Full выходит до последующих
 conflict/delete commits; уже начатые downloads завершаются с прежними guards. После
 restart неизменённый local файл с прежним baseline получает remote update без
