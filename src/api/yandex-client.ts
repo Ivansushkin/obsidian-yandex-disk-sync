@@ -969,7 +969,7 @@ export class YandexDiskClient {
 					return result;
 				}
 				if (
-					!this.isTransientStatus(response.status) ||
+					!this.isTransientReadStatus(response.status) ||
 					attempt === this.maxRetries
 				) {
 					const message = `Download HTTP ${response.status}`;
@@ -1172,7 +1172,11 @@ export class YandexDiskClient {
 				const errorData = response.json as YandexError;
 
 				// Errors that can be retried
-				if (this.isTransientStatus(response.status)) {
+				if (
+					method === "GET"
+						? this.isTransientReadStatus(response.status)
+						: this.isTransientStatus(response.status)
+				) {
 					lastError = new YandexApiError(
 						errorData?.description ||
 							"Rate limit or service unavailable",
@@ -1329,6 +1333,16 @@ export class YandexDiskClient {
 
 	private isTransientStatus(status: number): boolean {
 		return status === 423 || status === 429 || status === 503;
+	}
+
+	/** Retry completed server failures only for reads; write ambiguity keeps its own protocol. */
+	private isTransientReadStatus(status: number): boolean {
+		return (
+			this.isTransientStatus(status) ||
+			status === 500 ||
+			status === 502 ||
+			status === 504
+		);
 	}
 
 	/**

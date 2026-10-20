@@ -95,7 +95,9 @@ FIFO остаются для restart. Corrective upload сохраняет пр�
 
 ## Download и protective copies
 
-Сетевой обрыв передачи bytes запускает ограниченный retry с новой signed link.
+Сетевой обрыв либо HTTP 500/502/503/504 при передаче bytes запускает ограниченный
+retry с новой signed link. API GET также повторяет завершённые 500/502/504;
+это не расширяет правила неоднозначных PUT.
 Исчерпание попыток оставляет download ошибкой без подтверждения baseline.
 Каждый GET ограничен 60 s; stable raw/logical snapshot и direct download также
 имеют общий бюджет 60 s на metadata, link, bytes и retry/backoff; timeout не повторяет неотменённый native

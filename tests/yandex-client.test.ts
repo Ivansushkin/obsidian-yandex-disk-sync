@@ -4,6 +4,8 @@ import { YandexApiError, YandexDiskClient } from "../src/api/yandex-client";
 import { DEFAULT_SETTINGS, type YandexResource } from "../src/types";
 import { IndexManager } from "../src/sync/canonical/manager";
 import type { VaultAdapter } from "../src/api/vault-adapter";
+import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
+import { MemoryDisk, bytes } from "./helpers/sync-flow";
 
 interface TestRequestParams {
 	url: string;
@@ -20,6 +22,57 @@ interface TestResponse {
 const requestGlobal = globalThis as typeof globalThis & {
 	__obsidianRequestUrl?: (params: TestRequestParams) => Promise<TestResponse>;
 };
+
+test("remote snapshot retries server listing errors and preserves persistent failures", async () => {
+	for (const [status, failures] of [
+		[500, 1],
+		[502, 1],
+		[504, 1],
+		[500, 9],
+	] as const) {
+		const disk = new MemoryDisk();
+		disk.files.set("vault/note.md", bytes("remote bytes"));
+		let listings = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			if (params.url.includes("/resources?")) {
+				listings++;
+				if (listings <= failures) {
+					return response(status, {
+						error: "InternalServerError",
+						description: "synthetic server failure",
+					});
+				}
+			}
+			return await disk.request(params);
+		};
+		try {
+			const client = new YandexDiskClient({
+				token: "synthetic",
+				maxRetries: 2,
+				retryDelay: 0,
+			});
+			if (failures === 9) {
+				await assert.rejects(
+					captureRemoteRawSnapshot(client, "vault"),
+					(error) =>
+						error instanceof YandexApiError && error.status === 500,
+				);
+				assert.equal(listings, 3);
+			} else {
+				const snapshot = await captureRemoteRawSnapshot(
+					client,
+					"vault",
+				);
+				assert.deepEqual(snapshot.files, [
+					{ path: "note.md", content: bytes("remote bytes") },
+				]);
+				assert.equal(listings, 2);
+			}
+		} finally {
+			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
 
 function response(status: number, json: unknown = {}): TestResponse {
 	return {
@@ -463,7 +516,10 @@ test("direct download retries transient transfer failures with fresh links and s
 	const content = new TextEncoder().encode("complete download").buffer;
 	for (const kind of [
 		"network",
-		"service",
+		503,
+		500,
+		502,
+		504,
 		"exhausted",
 		"authentication",
 	] as const) {
@@ -492,8 +548,8 @@ test("direct download retries transient transfer failures with fresh links and s
 					"Request Failed. SocketException Software caused connection abort",
 				);
 			}
-			if (kind === "service" && transfers === 1) {
-				return response(503);
+			if (typeof kind === "number" && transfers === 1) {
+				return response(kind);
 			}
 			return { ...response(200), arrayBuffer: content };
 		};
