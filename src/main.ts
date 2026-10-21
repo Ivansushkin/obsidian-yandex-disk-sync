@@ -516,6 +516,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					sync: this.syncEngine.getState(),
 					force: this.forceSyncController?.getState() ?? null,
 					foreground: this.foregroundOperation,
+					fullSyncInProgress: this.isFullSyncInProgress(),
 				}),
 				Platform.isMobile ? "top" : "bottom",
 			),

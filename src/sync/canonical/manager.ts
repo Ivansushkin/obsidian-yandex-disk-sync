@@ -2469,6 +2469,12 @@ export class IndexManager {
 				);
 			}
 
+			if (attempt === 0) {
+				logger.info("Waiting for canonical index lock", {
+					lockCount: locks.length,
+					stableLeaseMs: INDEX_LOCK_STALE_MS,
+				});
+			}
 			await this.recoverStaleLock(locks);
 			await this.wait(INDEX_LOCK_RETRY_MS);
 		}
@@ -2510,6 +2516,12 @@ export class IndexManager {
 				throw new AmbiguousRemoteIndexLockError(
 					"Multiple remote index locks require an explicit force sync",
 				);
+			}
+			if (attempt === 0) {
+				logger.info("Waiting for canonical index lock", {
+					lockCount: locks.length,
+					stableLeaseMs: INDEX_LOCK_STALE_MS,
+				});
 			}
 			await this.recoverStaleLock(locks);
 			await this.wait(INDEX_LOCK_RETRY_MS);

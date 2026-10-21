@@ -12,6 +12,7 @@ interface SyncIndicatorContext {
 	sync: SyncState;
 	force: ForceFlowState | null;
 	foreground: "encryption" | "backup" | null;
+	fullSyncInProgress: boolean;
 }
 
 /** Shared collapsible status; native disclosure state belongs to this lifecycle only. */
@@ -150,7 +151,8 @@ export class SyncIndicator extends Component {
 			return;
 		}
 		this.ensureMounted();
-		const { sync, force, foreground } = this.readContext();
+		const { sync, force, foreground, fullSyncInProgress } =
+			this.readContext();
 		let state = sync;
 		let text: string;
 		let detail = "";
@@ -173,6 +175,12 @@ export class SyncIndicator extends Component {
 		} else if (foreground) {
 			state = { ...sync, status: "syncing" };
 			text = t(`status.mobile.${foreground}`);
+		} else if (
+			fullSyncInProgress &&
+			(sync.status === "idle" || sync.status === "initializing")
+		) {
+			state = { ...sync, status: "syncing" };
+			text = t("status.syncing");
 		} else if (sync.status === "idle") {
 			text = t("status.mobile.ready");
 			if (sync.lastSyncTime) {
