@@ -32,6 +32,8 @@ import {
 	isProtectedPath,
 	isLegacyPluginDataPath,
 	isLegacyServicePathCollision,
+	isRootIndexLockPath,
+	REMOTE_INDEX_LOCK_PREFIX,
 	joinPath,
 	normalizePath,
 	toLocalPath,
@@ -53,6 +55,7 @@ import {
 	IV_LENGTH,
 } from "../../crypto/encryption";
 import { UnsupportedHistoricalDataError } from "../../compatibility-errors";
+import { decideRecovery, OperationFailure } from "../../errors";
 import { parseStable1xIndex } from "../../compatibility/stable-1x";
 import type { EncryptionCodec } from "../../crypto/encryption";
 import {
@@ -90,12 +93,12 @@ import {
 	type CanonicalCommitProof,
 	type IndexCodec,
 	type IndexFileSnapshot,
+	type IndexLockObservation,
 	type IndexTransactionOutcome,
 	type IndexTransactionStage,
 } from "./transaction";
 
 const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
-const REMOTE_INDEX_LOCK_PREFIX = ".obsidian-sync-index.lock.";
 const INDEX_LOCK_STALE_MS = 2 * 60 * 1000;
 const INDEX_LOCK_RETRY_MS = 750;
 const INDEX_LOCK_ATTEMPTS =
@@ -127,8 +130,9 @@ export interface LocalCausalSnapshot {
 	physicalActions: PendingPhysicalAction[];
 }
 
-export type ForceCanonicalProof =
-	{ state: "absent" } | { state: "present"; rawSha256: string };
+export type ForceCanonicalProof = (
+	{ state: "absent" } | { state: "present"; rawSha256: string }
+) & { locks?: IndexLockObservation[] };
 
 export type RemoteCanonicalFormat = "absent" | "legacy" | "current";
 
@@ -688,6 +692,7 @@ export class IndexManager {
 	>();
 	private allowLegacyWriteOnce = false;
 	private replaceRemoteOnNextSave = false;
+	private forcePreflightCanonical: ForceCanonicalProof | null = null;
 	private operationStore: LocalOperationStore;
 	private completedMoveIds = new Set<string>();
 	private rejectedPuts: Array<{
@@ -789,14 +794,16 @@ export class IndexManager {
 	/** Classify and fingerprint canonical before a Force backup can be created. */
 	async captureForceCanonicalProof(): Promise<ForceCanonicalProof> {
 		const canonicalPath = this.getRemoteIndexPath();
-		const resource = await this.yandexClient.getResource(
-			canonicalPath,
-			1,
-			0,
-			true,
+		const { resources } = await this.getStableRootListing();
+		const observedLocks = this.observeIndexLocks(resources);
+		const locks = observedLocks.length > 0 ? { locks: observedLocks } : {};
+		const resource = resources.find(
+			(resource) =>
+				resource.type === "file" &&
+				resource.name === REMOTE_INDEX_FILENAME,
 		);
 		if (!resource) {
-			return { state: "absent" };
+			return { state: "absent", ...locks };
 		}
 		const allowPlaintextLegacy =
 			this.transitionIndexReadService === undefined &&
@@ -809,9 +816,16 @@ export class IndexManager {
 				"source",
 				resource,
 			);
+			if (snapshot.index.maintenance) {
+				throw new RemoteMaintenanceActiveError(
+					snapshot.index.maintenance.id,
+					snapshot.index.maintenance.initiatedBy,
+				);
+			}
 			return {
 				state: "present",
 				rawSha256: await computeSha256(snapshot.raw),
+				...locks,
 			};
 		} catch (error) {
 			if (
@@ -866,6 +880,12 @@ export class IndexManager {
 	 * hidden by current service-path filtering. No user object is downloaded.
 	 */
 	async assertLegacyMigrationPathsSafe(): Promise<void> {
+		if (this.yandexClient.hasEncryptionService()) {
+			const proof = await this.captureForceCanonicalProof();
+			if (proof.state === "present") {
+				return;
+			}
+		}
 		const format = await this.inspectRemoteCanonicalFormat();
 		if (format === "current") {
 			return;
@@ -901,6 +921,10 @@ export class IndexManager {
 			}
 			const knownStableService =
 				path === REMOTE_INDEX_FILENAME ||
+				(resource.type === "file" && isRootIndexLockPath(path)) ||
+				(resource.type === "file" &&
+					path === ENCRYPTION_MANIFEST_FILENAME &&
+					this.yandexClient.hasEncryptionService()) ||
 				path === ".backup" ||
 				path.startsWith(".backup/");
 			if (!knownStableService && isLegacyServicePathCollision(path)) {
@@ -919,6 +943,7 @@ export class IndexManager {
 				"Canonical changed after the Force backup was verified",
 			);
 		}
+		this.forcePreflightCanonical = actual;
 	}
 
 	clearIndexTransitionServices(): void {
@@ -1119,6 +1144,7 @@ export class IndexManager {
 	cancelForceBootstrap(): void {
 		this.allowLegacyWriteOnce = false;
 		this.replaceRemoteOnNextSave = false;
+		this.forcePreflightCanonical = null;
 	}
 
 	/**
@@ -1432,19 +1458,7 @@ export class IndexManager {
 			if (stableRootDiscovery && discovery.rootExists === false) {
 				await this.createRemotePath();
 			}
-			const initial = createEmptyIndex(this.settings.deviceId);
-			try {
-				await this.yandexClient.uploadFileExclusive(
-					this.getRemoteIndexPath(),
-					JSON.stringify(initial, null, 2),
-					false,
-					false,
-				);
-			} catch (error) {
-				if (!this.isLockContention(error)) {
-					throw error;
-				}
-			}
+			await this.initializeCanonicalIndex();
 			discovery = stableRootDiscovery
 				? await this.waitForCanonicalIndexFromStableRoot()
 				: { path: await this.waitForCanonicalIndex() };
@@ -1715,7 +1729,7 @@ export class IndexManager {
 		if (this.replaceRemoteOnNextSave) {
 			await this.assertForceSourceSupported();
 		}
-		await this.ensureCanonicalIndex();
+		const initializedIndex = await this.ensureCanonicalIndex();
 
 		let acquired = false;
 		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
@@ -1788,6 +1802,23 @@ export class IndexManager {
 			const latest = this.replaceRemoteOnNextSave
 				? this.createReplacementBaseline(originalSnapshot.index)
 				: originalSnapshot.index;
+			if (this.replaceRemoteOnNextSave) {
+				const expected = this.forcePreflightCanonical;
+				const matchesPreflight =
+					expected?.state === "present"
+						? (await computeSha256(originalSnapshot.raw)) ===
+							expected.rawSha256
+						: initializedIndex !== null &&
+							this.sameValue(
+								originalSnapshot.index,
+								initializedIndex,
+							);
+				if (!matchesPreflight) {
+					throw new ForceBackupStaleError(
+						"Acquired canonical differs from Force preflight",
+					);
+				}
+			}
 			logger.debug("Latest canonical state loaded from lock", {
 				...transactionContext,
 				latestRevision: latest.revision,
@@ -1807,6 +1838,9 @@ export class IndexManager {
 				this.assertMaintenanceCompatible(latest);
 			}
 			merged = this.mergeDesiredIndex(latest);
+			if (this.replaceRemoteOnNextSave) {
+				await this.assertForceLocksUnchanged(lockPath);
+			}
 			logger.debug("Canonical reducer completed", {
 				...transactionContext,
 				latestRevision: latest.revision,
@@ -1825,18 +1859,19 @@ export class IndexManager {
 				merged.format = CURRENT_INDEX_FORMAT;
 				merged.deviceId = this.settings.deviceId;
 				merged.lastSyncTime = Date.now();
+				const content = this.serializeCurrentIndex(merged);
 				let uploadError: unknown;
 				try {
 					if (this.transitionIndexWriteService !== undefined) {
 						await this.yandexClient.uploadFileWithEncryptionService(
 							lockPath,
-							JSON.stringify(merged, null, 2),
+							content,
 							this.transitionIndexWriteService,
 						);
 					} else {
 						await this.yandexClient.uploadFile(
 							lockPath,
-							JSON.stringify(merged, null, 2),
+							content,
 							true,
 							false,
 						);
@@ -1888,6 +1923,9 @@ export class IndexManager {
 				stage = "verified";
 			}
 			stage = "move-attempted";
+			if (this.replaceRemoteOnNextSave) {
+				await this.assertForceLocksUnchanged(lockPath);
+			}
 			try {
 				await this.yandexClient.moveResourceExclusive(
 					lockPath,
@@ -1930,7 +1968,7 @@ export class IndexManager {
 					canonicalProof.contentFingerprint,
 				),
 			});
-			await this.finalizeCommittedTransaction(merged);
+			await this.finalizeCommittedTransaction(merged, canonicalProof);
 			logger.info("Canonical index transaction committed", {
 				...transactionContext,
 				outcome: "committed",
@@ -1942,6 +1980,9 @@ export class IndexManager {
 			});
 			return canonicalProof;
 		} catch (e) {
+			if (stage === "committed") {
+				throw e;
+			}
 			if (
 				stage === "move-attempted" &&
 				merged &&
@@ -1959,7 +2000,7 @@ export class IndexManager {
 					merged,
 					writtenFingerprint,
 				);
-				await this.finalizeCommittedTransaction(merged);
+				await this.finalizeCommittedTransaction(merged, canonicalProof);
 				logger.warn(
 					"Canonical index commit was confirmed after an ambiguous response",
 					{
@@ -2034,7 +2075,35 @@ export class IndexManager {
 
 	/** Reject unsupported historical or malformed data before Force takes a lock. */
 	private async assertForceSourceSupported(): Promise<void> {
-		await this.captureForceCanonicalProof();
+		const actual = await this.captureForceCanonicalProof();
+		if (
+			this.forcePreflightCanonical !== null &&
+			!this.sameValue(this.forcePreflightCanonical, actual)
+		) {
+			throw new ForceBackupStaleError(
+				"Canonical or index locks changed after Force preflight",
+			);
+		}
+		this.forcePreflightCanonical = actual;
+	}
+
+	/** Another transaction cannot join the set that this Force is authorized to replace. */
+	private async assertForceLocksUnchanged(
+		ownedLockPath: string,
+	): Promise<void> {
+		const { resources } = await this.getStableRootListing();
+		const locks = this.observeIndexLocks(
+			resources.filter(
+				(resource) =>
+					joinPath(this.settings.remotePath, resource.name) !==
+					ownedLockPath,
+			),
+		);
+		if (!this.sameValue(locks, this.forcePreflightCanonical?.locks ?? [])) {
+			throw new ForceBackupStaleError(
+				"Index locks changed during Force replacement",
+			);
+		}
 	}
 
 	/**
@@ -2450,25 +2519,67 @@ export class IndexManager {
 		);
 	}
 
-	private async ensureCanonicalIndex(): Promise<void> {
+	private async ensureCanonicalIndex(): Promise<SyncIndex | null> {
 		const existing = await this.waitForCanonicalIndex();
 		if (existing) {
-			return;
+			return null;
 		}
 
-		const empty = createEmptyIndex("");
+		return await this.initializeCanonicalIndex();
+	}
+
+	/** Create a valid exclusive seed without adopting it into desired/local state. */
+	private async initializeCanonicalIndex(): Promise<SyncIndex | null> {
+		const initial = createEmptyIndex(this.settings.deviceId);
+		const content = this.serializeCurrentIndex(initial);
 		try {
 			await this.yandexClient.uploadFileExclusive(
 				this.getRemoteIndexPath(),
-				JSON.stringify(empty, null, 2),
+				content,
 				false,
 				false,
 			);
+			return initial;
 		} catch (e) {
-			if (!this.isLockContention(e)) {
-				throw e;
+			if (this.isLockContention(e)) {
+				return null;
 			}
+			const recovery = decideRecovery(
+				new OperationFailure(e, {
+					stage: "canonical-initialize",
+					action: "put",
+				}),
+				{ attemptsRemaining: 0, remainingMs: Infinity },
+			);
+			if (recovery.confirm) {
+				const resource = await this.yandexClient.getResource(
+					this.getRemoteIndexPath(),
+					1,
+					0,
+					true,
+				);
+				if (resource) {
+					const snapshot = await this.downloadIndexSnapshot(
+						this.getRemoteIndexPath(),
+						false,
+						undefined,
+						undefined,
+						resource,
+					);
+					return this.sameValue(snapshot.index, initial)
+						? initial
+						: null;
+				}
+			}
+			throw e;
 		}
+	}
+
+	/** Validate the exact JSON representation before publishing a current index. */
+	private serializeCurrentIndex(index: SyncIndex): string {
+		const content = JSON.stringify(index, null, 2);
+		this.normalizeParsedIndex(JSON.parse(content) as unknown, false, false);
+		return content;
 	}
 
 	private async downloadIndex(
@@ -3092,9 +3203,25 @@ export class IndexManager {
 	private selectIndexLocks(resources: YandexResource[]): YandexResource[] {
 		return resources.filter(
 			(resource) =>
-				resource.type === "file" &&
-				resource.name.startsWith(REMOTE_INDEX_LOCK_PREFIX),
+				resource.type === "file" && isRootIndexLockPath(resource.name),
 		);
+	}
+
+	/** Use service content identity, never resource_id, to pin the observed locks. */
+	private observeIndexLocks(
+		resources: YandexResource[],
+	): IndexLockObservation[] {
+		return this.selectIndexLocks(resources)
+			.map((resource) => {
+				const fingerprint = getStableContentFingerprint(resource);
+				if (!fingerprint) {
+					throw new AmbiguousRemoteIndexLockError(
+						"Index lock has no stable content identity",
+					);
+				}
+				return { name: resource.name, fingerprint };
+			})
+			.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
 	/**
@@ -3196,46 +3323,159 @@ export class IndexManager {
 		knownLocks?: YandexResource[],
 	): Promise<void> {
 		const locks = knownLocks ?? (await this.getIndexLocks());
-		if (locks.length > 1) {
+		const staleLocks = locks.filter((resource) =>
+			this.isObservedLockStale(resource),
+		);
+		if (locks.length > 1 && staleLocks.length !== locks.length) {
 			throw new AmbiguousRemoteIndexLockError(
 				"Multiple orphan index locks require an explicit force sync",
 			);
 		}
-		for (const resource of locks) {
-			if (!this.isObservedLockStale(resource)) {
-				continue;
-			}
-			const canonical = await this.downloadIndex(
-				this.getRemoteIndexPath(),
-				this.allowLegacyWriteOnce,
-			);
-			const orphan = await this.downloadIndex(
+		if (staleLocks.length === 0) {
+			return;
+		}
+		const canonical = await this.downloadIndex(
+			this.getRemoteIndexPath(),
+			false,
+		);
+		const obsolete: IndexLockObservation[] = [];
+		for (const resource of staleLocks) {
+			const snapshot = await this.yandexClient.downloadStableRawFile(
 				joinPath(this.settings.remotePath, resource.name),
-				this.allowLegacyWriteOnce,
+				resource,
 			);
-			if (isOrphanIndexAmbiguous(canonical, orphan)) {
+			if (!snapshot) {
 				throw new AmbiguousRemoteIndexLockError(
-					"An orphan lock conflicts with the canonical index",
+					"Orphan lock disappeared during recovery",
 				);
 			}
-			await this.yandexClient.deleteResource(
-				joinPath(this.settings.remotePath, resource.name),
-				false,
-				true,
-			);
-			this.observedLocks.delete(resource.name);
-			logger.warn(`Removed stale orphan index lock: ${resource.name}`);
+			try {
+				const orphan = await this.decodeIndexSnapshot(
+					snapshot.raw,
+					false,
+				);
+				if (
+					locks.length > 1 ||
+					isOrphanIndexAmbiguous(canonical, orphan.index)
+				) {
+					throw new AmbiguousRemoteIndexLockError(
+						"An orphan lock conflicts with the canonical index",
+					);
+				}
+			} catch (error) {
+				if (
+					!(error instanceof InvalidCurrentIndexError) ||
+					canonical.revision === 0 ||
+					canonical.maintenance
+				) {
+					throw error;
+				}
+				// Old bootstrap wrote exactly this empty shape; it contains no causal state.
+				const data = this.parseIndexJson(
+					await this.yandexClient.decodeServiceFileContent(
+						snapshot.raw,
+					),
+				);
+				if (
+					!isJsonRecord(data) ||
+					typeof data.epoch !== "string" ||
+					!data.epoch ||
+					!this.sameValue(data, createEmptyIndex("", data.epoch))
+				) {
+					throw error;
+				}
+			}
+			obsolete.push({
+				name: resource.name,
+				fingerprint: snapshot.fingerprint,
+			});
+		}
+		for (const lock of obsolete) {
+			await this.deleteObservedIndexLock(lock, canonical);
+			this.observedLocks.delete(lock.name);
+			logger.warn(`Removed stale orphan index lock: ${lock.name}`);
 		}
 	}
 
-	private async cleanupForceReplacedLocks(): Promise<void> {
-		for (const resource of await this.getIndexLocks()) {
-			await this.yandexClient.deleteResource(
-				joinPath(this.settings.remotePath, resource.name),
-				false,
-				true,
+	private async cleanupForceReplacedLocks(
+		proof: CanonicalCommitProof,
+	): Promise<void> {
+		for (const lock of this.forcePreflightCanonical?.locks ?? []) {
+			await this.deleteObservedIndexLock(lock, this.remoteIndex);
+		}
+		await this.assertForceCleanupComplete(proof);
+	}
+
+	/** A successful normal full alone does not prove that Force orphan cleanup finished. */
+	async assertForceCleanupComplete(
+		proof?: CanonicalCommitProof,
+	): Promise<void> {
+		const { resources } = await this.getStableRootListing();
+		const resource = resources.find(
+			(resource) =>
+				resource.type === "file" &&
+				resource.name === REMOTE_INDEX_FILENAME,
+		);
+		if (!resource || this.selectIndexLocks(resources).length > 0) {
+			throw new AmbiguousRemoteIndexLockError(
+				"Force replacement still has unresolved index locks",
 			);
 		}
+		if (
+			proof &&
+			isHashStableContentFingerprint(proof.contentFingerprint) &&
+			matchesStableContentFingerprint(proof.contentFingerprint, resource)
+		) {
+			return;
+		}
+		const snapshot = await this.downloadIndexSnapshot(
+			this.getRemoteIndexPath(),
+			false,
+			undefined,
+			undefined,
+			resource,
+		);
+		if (snapshot.index.maintenance) {
+			throw new RemoteMaintenanceActiveError(
+				snapshot.index.maintenance.id,
+				snapshot.index.maintenance.initiatedBy,
+			);
+		}
+	}
+
+	/** Revalidate canonical authority and exact lock content before every delete retry. */
+	private async deleteObservedIndexLock(
+		lock: IndexLockObservation,
+		expectedCanonical: SyncIndex,
+	): Promise<void> {
+		const path = joinPath(this.settings.remotePath, lock.name);
+		await this.yandexClient.deleteResource(path, false, true, async () => {
+			const canonical = await this.downloadIndex(
+				this.getRemoteIndexPath(),
+				false,
+			);
+			if (!this.sameValue(canonical, expectedCanonical)) {
+				throw new RemoteIndexConcurrentModificationError(
+					"Canonical changed before orphan lock cleanup",
+					"committed",
+					false,
+				);
+			}
+			const current = await this.yandexClient.getResource(
+				path,
+				1,
+				0,
+				true,
+			);
+			if (
+				current &&
+				!matchesStableContentFingerprint(lock.fingerprint, current)
+			) {
+				throw new AmbiguousRemoteIndexLockError(
+					"Index lock changed before cleanup",
+				);
+			}
+		});
 	}
 
 	private async wasLockAcquiredDespiteError(
@@ -3546,6 +3786,7 @@ export class IndexManager {
 
 	private async finalizeCommittedTransaction(
 		merged: SyncIndex,
+		proof: CanonicalCommitProof,
 	): Promise<void> {
 		this.remoteIndex = merged;
 		this.loadedRemoteIndex = this.cloneIndex(merged);
@@ -3559,11 +3800,18 @@ export class IndexManager {
 
 		this.finalizeForceEpoch(merged);
 		try {
-			await this.cleanupForceReplacedLocks();
+			await this.cleanupForceReplacedLocks(proof);
 		} catch (cleanupError) {
-			logger.warn("Could not remove locks superseded by force sync:", {
-				error: cleanupError,
-			});
+			throw new RemoteIndexTransactionError(
+				"Canonical index committed but orphan lock cleanup is incomplete",
+				"RemoteIndexCleanupError",
+				"committed",
+				"committed",
+				false,
+				cleanupError,
+			);
+		} finally {
+			this.forcePreflightCanonical = null;
 		}
 	}
 

@@ -84,8 +84,15 @@ baseline/base revision; одинаковый sequence с разным logical st
 `.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
 перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,
 обновляется и перемещается обратно с `overwrite=false`. Неизменившийся за две
-минуты единственный lock восстанавливается другим устройством. Несколько locks или несовместимые snapshots блокируют операции до устранения неоднозначности; Force не обходит эту защиту. Список lock читается с полной пагинацией;
+минуты единственный читаемый lock восстанавливается другим устройством. Несколько
+locks или несовместимые snapshots блокируют normal sync; подтверждённый Force
+заменяет только зафиксированный preflight набор locks. Список lock читается с полной пагинацией;
 транзакция требует два последовательных одинаковых снимка root listing.
+Отсутствующий canonical создаётся одним общим initialization-путём с непустым
+installation device ID и `overwrite=false`. Exact JSON seed и кандидата commit
+проверяется текущим валидатором до upload. Неоднозначный seed upload разрешается
+stable read-back; чужой seed можно принять normal read, но нельзя заменить Force
+на основании прежнего доказательства отсутствия canonical.
 Успешный commit возвращает временный `CanonicalCommitProof`. Он позволяет
 пропустить повторный index download только при совпавшем SHA-256/MD5 и
 отсутствующих locks. Proof не сохраняется и не разрешает physical write:
@@ -170,6 +177,32 @@ Force подтверждается выбором архива, продолже
 автоматического fallback/повторного архива. Source проверяется на transfers и перед
 replacement commit; после commit rollback запрещён. Старый `ForceBackupProof`
 поддерживается адаптером; одновременные proof запрещены.
+
+Force preflight не запускает normal orphan/transition recovery до подтверждения:
+он сохраняет authentication, historical и encryption guards. Proof включает
+отсортированные имена и stable content fingerprints root locks; прежний proof
+без locks допустим только при их отсутствии. Canonical проверяется повторно до
+захвата и по фактически захваченным raw bytes; locks — перед записью и финальным
+move. Root service locks не считаются legacy user-path collisions; вложенные
+protected paths и plugin data по-прежнему блокируют миграцию.
+Вложенная encryption readiness-проверка также запрещает implicit recovery,
+reconnect и auto-disable; активный canonical maintenance блокирует Force до
+завершения штатного transition recovery. После выбора архива эта проверка
+остаётся без recovery, чтобы новый transition не был неявно принят.
+
+Cleanup после replacement commit удаляет только наблюдавшиеся locks, заново
+читая canonical и проверяя fingerprint перед каждой попыткой DELETE. Ошибка
+возвращает `replacementCommitted: true` с неуспешным результатом и coherent save,
+без rollback нового epoch. После restart normal cleanup может удалить exact
+пустые bootstrap-locks старого дефекта: current shape с пустым `deviceId`,
+нулевыми revision/time и пустыми records, без maintenance. Требуются два
+неизменных наблюдения с интервалом stale lease и корректный canonical revision > 0
+без maintenance. Этот артефакт никогда не принимается как canonical; другие
+повреждённые locks и несколько state-bearing locks остаются заблокированными.
+Перед успешным engine/UI outcome повторно проверяются stable root и отсутствие
+locks/maintenance; успешный normal full сам по себе не доказывает очистку
+неистёкшего orphan lease. Same-session commit proof может пропустить download
+только при совпавшем hash и отсутствии locks; hashless metadata требует read-back.
 
 До backup metadata-only scan проверяет legacy canonical и physical tree. Любая
 копия `plugins/yandex-disk-sync`/`plugins/obsidian-yandex-disk-sync` блокирует

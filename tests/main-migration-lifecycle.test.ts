@@ -292,6 +292,7 @@ test("post-commit Force failure resumes cleanup without repeating migration", as
 	plugin.indexManager = {
 		getPendingPhysicalActions: () => [],
 		getMaintenance: () => undefined,
+		assertForceCleanupComplete: async () => {},
 	};
 	plugin.confirmForceSync = async () => "with-backup";
 	plugin.backupManager = {
