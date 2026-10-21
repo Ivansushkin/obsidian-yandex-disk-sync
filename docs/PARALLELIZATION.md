@@ -80,6 +80,8 @@ exclusive upload, exact read-back и target proof. Force повторно про
 source до replacement commit. Обычный deferred physical action не становится success
 из-за fulfilled Promise. Общий обработчик с флагами не подменяет эти контракты.
 
+Обычные независимые renames используют пачки до 32 root events без задержки накопления. Watcher помечает весь предложенный префикс submitted до ожидания coordinator; engine повторно проверяет применимость до первого allocation. Общие stage helpers обслуживают одиночный и пакетный путь. Physical tasks всех папок и файлов идут через один `runWithConcurrencySettled` с лимитом `min(maxConcurrency, 4)`. Fresh canonical/codec/fingerprint checks сохраняются для каждого действия; buffers после классификации не удерживаются. При обнаружении нового epoch автоматический и явный watcher replay замораживаются до успешного full adoption; новые события продолжают сохраняться. Completion публикуется для подтверждённых root events, а ошибки и отменённые по authority действия остаются durable для одиночного recovery. Общая очистка исходных ancestors не ослабляет проверки пустоты. Итоговый лог содержит counts, confirmed commits и duration; реальную latency из числа запросов не выводить.
+
 ## Папки, retry и memory
 
 Upload заранее создаёт нужные родительские папки. Remote-folder cache — наблюдение:

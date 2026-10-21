@@ -118,6 +118,8 @@ interface PluginData {
 interface EncryptionReadyOptions {
 	/** Whether the user can be prompted for a missing or rotated password. */
 	prompt: boolean;
+	/** Force admission checks authority without starting transition recovery or reconnect. */
+	allowRecovery?: boolean;
 }
 
 class LegacyTokenRotationRequiredError extends Error {
@@ -817,7 +819,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				return "blocked";
 			}
 			const ready = await this.ensureEncryptionReady(
-				{ prompt },
+				{ prompt, allowRecovery },
 				{
 					manifest: recovered
 						? await this.indexManager.downloadEncryptionManifest()
@@ -1242,7 +1244,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.showBlockingNotice("token-missing", t("notice.token_missing"));
 			return null;
 		}
-		const startupState = await this.refreshRemoteStartupState(true);
+		const startupState = await this.refreshRemoteStartupState(true, false);
 		if (startupState === "blocked") {
 			return null;
 		}
@@ -1324,7 +1326,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				readyForBackup: async (migration) =>
 					(!migration ||
 						(await this.recheckLegacyMigrationSafety())) &&
-					(await this.ensureEncryptionReady({ prompt: true })),
+					(await this.ensureEncryptionReady({
+						prompt: true,
+						allowRecovery: false,
+					})),
 				backup: (direction, progress) =>
 					direction === "from_local"
 						? this.backupManager.createRemoteSnapshotBackup(
@@ -1360,6 +1365,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						false,
 						true,
 					);
+					if (result?.success) {
+						await this.indexManager.assertForceCleanupComplete();
+					}
 					if (
 						result?.success &&
 						!this.unloaded &&
@@ -2720,6 +2728,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					: await this.indexManager.downloadEncryptionManifest();
 			if (!manifest) {
 				if (this.settings.enableEncryption) {
+					if (options.allowRecovery === false) {
+						this.setEncryptionBlock(
+							t("notice.encryption_remote_busy"),
+						);
+						return false;
+					}
 					const plaintextCanonical =
 						await this.indexManager.readCanonicalIndexWithCodecIfPresent(
 							null,
@@ -2764,7 +2778,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 			if (manifest.state !== "enabled") {
 				this.setEncryptionBlock(t("notice.encryption_remote_busy"));
-				if (!options.prompt) {
+				if (!options.prompt || options.allowRecovery === false) {
 					return false;
 				}
 				const recoveryKind =
@@ -2796,7 +2810,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					? t("notice.encryption_password_changed_remote")
 					: t("notice.encryption_password_required");
 				this.setEncryptionBlock(reason);
-				if (!options.prompt) {
+				if (!options.prompt || options.allowRecovery === false) {
 					return false;
 				}
 				return await this.promptForRemoteEncryptionPassword(
@@ -2818,7 +2832,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.setEncryptionBlock(
 						t("notice.encryption_password_changed_remote"),
 					);
-					if (!options.prompt) {
+					if (!options.prompt || options.allowRecovery === false) {
 						return false;
 					}
 					return await this.promptForRemoteEncryptionPassword(

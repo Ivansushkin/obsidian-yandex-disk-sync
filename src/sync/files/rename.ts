@@ -58,6 +58,73 @@ export interface Dependencies {
 	remoteMoves: remoteMoves.Dependencies;
 }
 
+/** Stage one causal file move; callers own persistence and canonical commits. */
+export function stageFileMove(
+	index: IndexManager,
+	oldPath: string,
+	newPath: string,
+	newMetadata: FileMetadata,
+	context: WatcherCausalContext,
+	canonicalSource: FileMetadata | undefined,
+	pendingMove?: PendingMutation,
+): { mutation: PendingMutation; physicalMove: PendingPhysicalAction } {
+	const oldLocalMeta = index.getLocalIndex().files[oldPath];
+	const mutation =
+		pendingMove ??
+		index.enqueueMutation("move", oldPath, {
+			targetPath: newPath,
+			resourceKind: "file",
+			epoch: context.epoch,
+			baseRevision: context.baseRevision,
+		});
+	index.recordMove(
+		mutation.id,
+		oldPath,
+		newPath,
+		"file",
+		mutation.baseRevision ?? index.getRemoteIndex().revision,
+		mutation.seq,
+	);
+	const physicalMove = index.enqueuePhysicalAction("move-remote", oldPath, {
+		targetPath: newPath,
+		canonicalRevision: index.getRemoteIndex().revision + 1,
+		expectedFingerprint:
+			canonicalSource?.remoteFingerprint ??
+			index.getRemoteIndex().files[oldPath]?.remoteFingerprint,
+		origin: "move",
+	});
+	if (oldLocalMeta) {
+		index.markLocalFileDeleted(oldPath, undefined, mutation.seq);
+	}
+	if (canonicalSource && !index.getRemoteIndex().files[oldPath]) {
+		index.updateRemoteFile(oldPath, {
+			...canonicalSource,
+		});
+	}
+	if (canonicalSource) {
+		index.markRemoteFileDeleted(
+			oldPath,
+			undefined,
+			mutation.baseRevision ?? 0,
+			mutation.seq,
+		);
+	}
+	index.updateLocalFile(newPath, {
+		...newMetadata,
+		mutationSeq: mutation.seq,
+	});
+	index.updateRemoteFile(newPath, {
+		...newMetadata,
+		mutationSeq: mutation.seq,
+	});
+	if (mutation.baseRevision !== null) {
+		index.getRemoteIndex().files[newPath]!.baseRevision =
+			mutation.baseRevision;
+	}
+	stageRenameMutation(index, mutation, newPath);
+	return { mutation, physicalMove };
+}
+
 /** Resolve a causal rename while retaining unfinished physical moves for recovery. */
 export async function renameFileNow(
 	deps: Dependencies,
@@ -455,73 +522,15 @@ export async function renameFileNow(
 			};
 		}
 
-		const mutation =
-			pendingMove ??
-			deps.indexManager.enqueueMutation("move", oldPath, {
-				targetPath: newPath,
-				resourceKind: "file",
-				epoch: context.epoch,
-				baseRevision: context.baseRevision,
-			});
-		deps.indexManager.recordMove(
-			mutation.id,
+		const { mutation, physicalMove } = stageFileMove(
+			deps.indexManager,
 			oldPath,
 			newPath,
-			"file",
-			mutation.baseRevision ??
-				deps.indexManager.getRemoteIndex().revision,
-			mutation.seq,
+			newMetadata,
+			context,
+			canonicalSource,
+			pendingMove,
 		);
-		const physicalMove = deps.indexManager.enqueuePhysicalAction(
-			"move-remote",
-			oldPath,
-			{
-				targetPath: newPath,
-				canonicalRevision:
-					deps.indexManager.getRemoteIndex().revision + 1,
-				expectedFingerprint:
-					canonicalSource?.remoteFingerprint ??
-					deps.indexManager.getRemoteIndex().files[oldPath]
-						?.remoteFingerprint,
-				origin: "move",
-			},
-		);
-		if (oldLocalMeta) {
-			deps.indexManager.markLocalFileDeleted(
-				oldPath,
-				undefined,
-				mutation.seq,
-			);
-		}
-		if (
-			canonicalSource &&
-			!deps.indexManager.getRemoteIndex().files[oldPath]
-		) {
-			deps.indexManager.updateRemoteFile(oldPath, {
-				...canonicalSource,
-			});
-		}
-		if (canonicalSource) {
-			deps.indexManager.markRemoteFileDeleted(
-				oldPath,
-				undefined,
-				mutation.baseRevision ?? 0,
-				mutation.seq,
-			);
-		}
-		deps.indexManager.updateLocalFile(newPath, {
-			...newMetadata,
-			mutationSeq: mutation.seq,
-		});
-		deps.indexManager.updateRemoteFile(newPath, {
-			...newMetadata,
-			mutationSeq: mutation.seq,
-		});
-		if (mutation.baseRevision !== null) {
-			deps.indexManager.getRemoteIndex().files[newPath]!.baseRevision =
-				mutation.baseRevision;
-		}
-		stageRenameMutation(deps.indexManager, mutation, newPath);
 		if (deps.indexSaveCallback) {
 			await deps.indexSaveCallback();
 		}

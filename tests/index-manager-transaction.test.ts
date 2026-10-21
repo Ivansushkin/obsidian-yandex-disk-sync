@@ -275,7 +275,7 @@ async function runLegacyForceCommit(
 	);
 	assert.equal(
 		client.stableReadCount,
-		faults.throwAfterFinalMove || faults.hashlessMetadata ? 4 : 3,
+		faults.hashlessMetadata ? 5 : faults.throwAfterFinalMove ? 4 : 3,
 	);
 	assert.deepEqual(
 		[...client.files.keys()].filter((path) => path.includes(".lock.")),

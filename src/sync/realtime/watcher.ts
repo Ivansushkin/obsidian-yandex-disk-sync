@@ -8,6 +8,10 @@ import type { SyncLifecycleContext, SyncLifecycleOutcome } from "../contracts";
 import type { SyncResult, YandexDiskSyncSettings } from "../../types";
 import { logger } from "../../utils/logger";
 import {
+	independentRenamePrefix,
+	MAX_RENAME_BATCH_EVENTS,
+} from "./rename-batch";
+import {
 	reduceQueuedFileRename,
 	reduceQueuedFolderRename,
 	reduceFolderChildRename,
@@ -15,6 +19,8 @@ import {
 	selectFolderRenameParent,
 	shouldRetainQueuedFileEvent,
 	type DurableFileRenameEvent,
+	type DurableRenameEvent,
+	type RenameBatchResult,
 	type FileRenameOutcome,
 	type FolderMutationOutcome,
 	type DurableFolderRenameEvent,
@@ -1181,11 +1187,81 @@ export class FileWatcher {
 		}
 	}
 
+	/** Submit adjacent independent events and persist their outcomes before releasing the session. */
+	private async replayRenameBatch(
+		events: DeferredWatcherEvent[],
+		start: number,
+		replayResult: RealtimeBatchResult,
+	): Promise<RenameBatchResult | null> {
+		if (!this.syncEngine.renameBatch) {
+			return null;
+		}
+		const adjacent: DurableRenameEvent[] = [];
+		let queueIndex = this.deferredEvents.indexOf(events[start]!);
+		for (
+			let i = start;
+			i < events.length && adjacent.length < MAX_RENAME_BATCH_EVENTS;
+			i++, queueIndex++
+		) {
+			const candidate = events[i]!;
+			if (
+				candidate !== this.deferredEvents[queueIndex] ||
+				candidate.action !== "rename" ||
+				!candidate.id ||
+				this.submittedWatcherEventIds.has(candidate.id)
+			) {
+				break;
+			}
+			adjacent.push(candidate as DurableRenameEvent);
+		}
+		const candidates = independentRenamePrefix(adjacent);
+		if (candidates.length < 2) {
+			return null;
+		}
+		const originals = new Map(
+			candidates.map((candidate) => [candidate.id, candidate]),
+		);
+		for (const candidate of candidates) {
+			this.submittedWatcherEventIds.add(candidate.id);
+		}
+		try {
+			return await this.syncEngine.renameBatch(
+				candidates,
+				async (outcomes, lifecycle) => {
+					for (const item of outcomes) {
+						const original = originals.get(item.eventId)!;
+						if (item.kind === "file") {
+							await this.settleRenameEvent(
+								original as DurableFileRenameEvent,
+								item.outcome,
+								lifecycle,
+								replayResult,
+							);
+						} else {
+							await this.settleFolderEvent(
+								original,
+								item.outcome,
+								replayResult,
+							);
+						}
+					}
+				},
+			);
+		} finally {
+			for (const candidate of candidates) {
+				this.submittedWatcherEventIds.delete(candidate.id);
+			}
+		}
+	}
+
 	private async flushDeferredEventsNow(
 		onlyIds?: ReadonlySet<string>,
 	): Promise<void> {
 		await this.waitForPersistence();
-		if (this.syncEngine.isInitialRemoteReceivePending?.()) {
+		if (
+			this.epochReplacementObserved ||
+			this.syncEngine.isInitialRemoteReceivePending?.()
+		) {
 			return;
 		}
 		const events = this.deferredEvents.filter((event) => {
@@ -1262,7 +1338,8 @@ export class FileWatcher {
 			}
 		};
 
-		for (const event of events) {
+		for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+			const event = events[eventIndex]!;
 			try {
 				logger.debug("Replaying watcher event", {
 					eventId: this.getEventId(event),
@@ -1281,6 +1358,22 @@ export class FileWatcher {
 					break;
 				}
 				if (event.action === "rename") {
+					const batch = await this.replayRenameBatch(
+						events,
+						eventIndex,
+						replayResult,
+					);
+					if (batch) {
+						eventIndex += batch.length - 1;
+						if (
+							batch.some(
+								(item) => item.outcome.status === "retry",
+							)
+						) {
+							break;
+						}
+						continue;
+					}
 					if (event.kind === "folder") {
 						if (event.id) {
 							this.submittedWatcherEventIds.add(event.id);
@@ -1962,6 +2055,7 @@ export class FileWatcher {
 
 	private isWatcherFrozen(): boolean {
 		return (
+			this.epochReplacementObserved ||
 			this.isPausedForSync ||
 			this.isPreparingFullSync ||
 			(this.syncEngine.isInitialRemoteReceivePending?.() ?? false)

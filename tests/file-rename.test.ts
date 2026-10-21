@@ -136,7 +136,6 @@ class RenameIndexFake extends MemoryIndex {
 		super();
 	}
 	remoteFileScans = 0;
-
 	async getRemoteFiles() {
 		this.remoteFileScans++;
 		const result = new Map<string, FileMetadata>();

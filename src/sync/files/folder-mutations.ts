@@ -1,4 +1,8 @@
-import type { PendingMutation, YandexDiskSyncSettings } from "../../types";
+import type {
+	PendingMutation,
+	SyncIndex,
+	YandexDiskSyncSettings,
+} from "../../types";
 import { logger } from "../../utils/logger";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import * as fileOperations from "./operations";
@@ -351,6 +355,129 @@ export async function deleteFolderNow(
 	};
 }
 
+/** Plan causal descendants without allocating mutations or changing either index. */
+export function planFolderMove(
+	canonical: SyncIndex,
+	deviceId: string,
+	oldPath: string,
+	newPath: string,
+	baseRevision: number,
+	mutationSeq: number,
+) {
+	const oldPrefix = `${oldPath.replace(/\/+$/, "")}/`;
+	const newPrefix = `${newPath.replace(/\/+$/, "")}/`;
+	const targetHashes = new Map<string, string>();
+	const plannedPairs: Array<{ fromPath: string; toPath: string }> = [];
+	let survivors = 0;
+	let conflicts = 0;
+	let ambiguous = 0;
+	for (const [filePath, meta] of Object.entries({
+		...canonical.files,
+	})) {
+		if (!filePath.startsWith(oldPrefix) || meta.deleted) {
+			continue;
+		}
+		const target = `${newPrefix}${filePath.slice(oldPrefix.length)}`;
+		if (
+			!canApplyDestructiveFolderMutation(
+				meta,
+				baseRevision,
+				deviceId,
+				mutationSeq,
+			)
+		) {
+			survivors++;
+			if (typeof meta.mutationSeq !== "number") {
+				ambiguous++;
+			}
+			continue;
+		}
+		const existingTarget = canonical.files[target];
+		if (
+			existingTarget &&
+			!existingTarget.deleted &&
+			existingTarget.sha256 !== meta.sha256
+		) {
+			conflicts++;
+			continue;
+		}
+		targetHashes.set(target, meta.sha256);
+		plannedPairs.push({ fromPath: filePath, toPath: target });
+	}
+	return { targetHashes, plannedPairs, survivors, conflicts, ambiguous };
+}
+
+/** Stage one planned folder move using its original causal snapshot. */
+export function stageFolderMove(
+	index: IndexManager,
+	canonical: SyncIndex,
+	oldPath: string,
+	newPath: string,
+	mutation: PendingMutation,
+	plannedPairs: ReturnType<typeof planFolderMove>["plannedPairs"],
+): void {
+	const localIndex = index.getLocalIndex();
+	const oldPrefix = `${oldPath.replace(/\/+$/, "")}/`;
+	const newPrefix = `${newPath.replace(/\/+$/, "")}/`;
+	index.recordMove(
+		mutation.id,
+		oldPath,
+		newPath,
+		"folder",
+		mutation.baseRevision ?? index.getRemoteIndex().revision,
+		mutation.seq,
+	);
+	index.markFolderDeleted(
+		oldPath,
+		mutation.createdAt,
+		mutation.baseRevision,
+		mutation.seq,
+	);
+	for (const { fromPath: filePath, toPath: target } of plannedPairs) {
+		const meta = canonical.files[filePath]!;
+		index.markRemoteFileDeleted(
+			filePath,
+			oldPath,
+			mutation.baseRevision ?? 0,
+			mutation.seq,
+		);
+		index.updateRemoteFile(target, {
+			...meta,
+			path: target,
+			deleted: false,
+			deletedAt: undefined,
+			deletedByFolder: undefined,
+			mutationSeq: mutation.seq,
+		});
+	}
+	const plannedSourcePaths = new Set(
+		plannedPairs.map((pair) => pair.fromPath),
+	);
+	for (const [filePath, meta] of Object.entries({
+		...localIndex.files,
+	})) {
+		if (!filePath.startsWith(oldPrefix) || meta.deleted) {
+			continue;
+		}
+		if (!plannedSourcePaths.has(filePath)) {
+			continue;
+		}
+		index.markLocalFileDeleted(filePath, oldPath, mutation.seq);
+		index.updateLocalFile(
+			`${newPrefix}${filePath.slice(oldPrefix.length)}`,
+			{
+				...meta,
+				path: `${newPrefix}${filePath.slice(oldPrefix.length)}`,
+				deleted: false,
+				deletedAt: undefined,
+				deletedByFolder: undefined,
+				mutationSeq: mutation.seq,
+			},
+		);
+	}
+	index.stageMutation(mutation);
+}
+
 /** Prepare one folder mutation and recover its descendant moves. */
 export async function renameFolderNow(
 	deps: Dependencies,
@@ -443,7 +570,6 @@ export async function renameFolderNow(
 	}
 	const id = mutation.id;
 	const oldPrefix = `${oldPath.replace(/\/+$/, "")}/`;
-	const newPrefix = `${newPath.replace(/\/+$/, "")}/`;
 	const remoteIndex = deps.indexManager.getRemoteIndex();
 	const localIndex = deps.indexManager.getLocalIndex();
 	const hasIndexedDescendants =
@@ -470,44 +596,15 @@ export async function renameFolderNow(
 		};
 	}
 
-	const targetHashes = new Map<string, string>();
-	const plannedPairs: Array<{ fromPath: string; toPath: string }> = [];
-	let survivors = 0;
-	let conflicts = 0;
-	let ambiguous = 0;
-	for (const [filePath, meta] of Object.entries({
-		...canonical.files,
-	})) {
-		if (!filePath.startsWith(oldPrefix) || meta.deleted) {
-			continue;
-		}
-		const target = `${newPrefix}${filePath.slice(oldPrefix.length)}`;
-		if (
-			!canApplyDestructiveFolderMutation(
-				meta,
-				mutation.baseRevision ?? 0,
-				deps.settings.deviceId,
-				mutation.seq,
-			)
-		) {
-			survivors++;
-			if (typeof meta.mutationSeq !== "number") {
-				ambiguous++;
-			}
-			continue;
-		}
-		const existingTarget = canonical.files[target];
-		if (
-			existingTarget &&
-			!existingTarget.deleted &&
-			existingTarget.sha256 !== meta.sha256
-		) {
-			conflicts++;
-			continue;
-		}
-		targetHashes.set(target, meta.sha256);
-		plannedPairs.push({ fromPath: filePath, toPath: target });
-	}
+	const { targetHashes, plannedPairs, survivors, conflicts, ambiguous } =
+		planFolderMove(
+			canonical,
+			deps.settings.deviceId,
+			oldPath,
+			newPath,
+			mutation.baseRevision ?? 0,
+			mutation.seq,
+		);
 	logger.info("Folder move causality classified", {
 		mutationId: mutation.id,
 		mutationSeq: mutation.seq,
@@ -537,63 +634,14 @@ export async function renameFolderNow(
 		};
 	}
 
-	deps.indexManager.recordMove(
-		id,
+	stageFolderMove(
+		deps.indexManager,
+		canonical,
 		oldPath,
 		newPath,
-		"folder",
-		mutation.baseRevision ?? deps.indexManager.getRemoteIndex().revision,
-		mutation.seq,
+		mutation,
+		plannedPairs,
 	);
-	deps.indexManager.markFolderDeleted(
-		oldPath,
-		mutation.createdAt,
-		mutation.baseRevision,
-		mutation.seq,
-	);
-	for (const { fromPath: filePath, toPath: target } of plannedPairs) {
-		const meta = canonical.files[filePath]!;
-		deps.indexManager.markRemoteFileDeleted(
-			filePath,
-			oldPath,
-			mutation.baseRevision ?? 0,
-			mutation.seq,
-		);
-		deps.indexManager.updateRemoteFile(target, {
-			...meta,
-			path: target,
-			deleted: false,
-			deletedAt: undefined,
-			deletedByFolder: undefined,
-			mutationSeq: mutation.seq,
-		});
-	}
-	const plannedSourcePaths = new Set(
-		plannedPairs.map((pair) => pair.fromPath),
-	);
-	for (const [filePath, meta] of Object.entries({
-		...localIndex.files,
-	})) {
-		if (!filePath.startsWith(oldPrefix) || meta.deleted) {
-			continue;
-		}
-		if (!plannedSourcePaths.has(filePath)) {
-			continue;
-		}
-		deps.indexManager.markLocalFileDeleted(filePath, oldPath, mutation.seq);
-		deps.indexManager.updateLocalFile(
-			`${newPrefix}${filePath.slice(oldPrefix.length)}`,
-			{
-				...meta,
-				path: `${newPrefix}${filePath.slice(oldPrefix.length)}`,
-				deleted: false,
-				deletedAt: undefined,
-				deletedByFolder: undefined,
-				mutationSeq: mutation.seq,
-			},
-		);
-	}
-	deps.indexManager.stageMutation(mutation);
 	if (
 		!(await syncReconciliation.saveRemoteIndexBestEffort(
 			deps.syncReconciliation,

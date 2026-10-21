@@ -102,6 +102,18 @@ Source проверяется на каждом transfer и ещё раз пер
 запрещены. Ошибка архива или drift завершает попытку, без fallback и повторного
 архива. Следующий запуск снова предлагает выбор.
 
+Canonical proof также фиксирует root locks по именам и stable content fingerprints.
+Изменение canonical или locks до replacement commit требует нового preflight;
+фактически захваченный canonical сверяется с proof. Старый proof без locks
+допустим только при их отсутствии. Root locks включаются в `remote-raw` архив,
+но не считаются пользовательской legacy path collision. Force preflight не
+запускает normal recovery и не меняет remote до подтверждения.
+При ошибке очистки уже подтверждённый replacement сохраняется локально, успех
+не объявляется и новый архив автоматически не создаётся. Финальный successful
+full дополняется явной проверкой root locks, поэтому ещё не stale orphan не
+превращает ошибку cleanup в успешный UI outcome. Encryption readiness до
+запуска Force не выполняет implicit transition recovery или reconnect.
+
 Encryption snapshot содержит обязательное `backupProof: EncryptionBackupProof | null`.
 Отсутствующее поле недопустимо. Claim проверяет исходную revision и fingerprints
 при любом выборе; заполненный proof дополнительно связывает архив с epoch/revision
