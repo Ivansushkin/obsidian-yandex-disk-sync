@@ -9,7 +9,8 @@ const PROTECTED_PATHS = [
 	".obsidian-encrypt.json",
 ];
 
-const PROTECTED_PATH_PREFIXES = [".obsidian-sync-index.lock."];
+export const REMOTE_INDEX_LOCK_PREFIX = ".obsidian-sync-index.lock.";
+const PROTECTED_PATH_PREFIXES = [REMOTE_INDEX_LOCK_PREFIX];
 const PLUGIN_DIRECTORY_NAMES = new Set([
 	"yandex-disk-sync",
 	"obsidian-yandex-disk-sync",
@@ -140,6 +141,16 @@ export function isLegacyPluginDataPath(path: string): boolean {
  */
 export function isLegacyServicePathCollision(path: string): boolean {
 	return isProtectedPath(path);
+}
+
+/** Only root files in the reserved namespace can be canonical transaction locks. */
+export function isRootIndexLockPath(path: string): boolean {
+	return (
+		path === normalizePath(path) &&
+		!path.includes("/") &&
+		path.startsWith(REMOTE_INDEX_LOCK_PREFIX) &&
+		path.length > REMOTE_INDEX_LOCK_PREFIX.length
+	);
 }
 
 /** Reject ambiguous portable trees without renaming logical paths. */

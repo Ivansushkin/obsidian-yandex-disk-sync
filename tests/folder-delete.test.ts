@@ -1,16 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
+import type { YandexDiskClient } from "../src/api/yandex-client";
 import { SyncEngine } from "../src/sync/engine";
-import type { IndexManager } from "../src/sync/canonical/manager";
-import {
-	createEmptyIndex,
-	DEFAULT_SETTINGS,
-	type FileMetadata,
-	type PendingMutation,
-	type PendingPhysicalAction,
-} from "../src/types";
+import { DEFAULT_SETTINGS, type FileMetadata } from "../src/types";
+import { fileMetadata, MemoryIndex } from "./helpers/realtime-fixtures";
 
 function metadata(
 	path: string,
@@ -22,39 +16,23 @@ function metadata(
 		mutationSeq?: number;
 	},
 ): FileMetadata {
-	return {
-		path,
-		sha256: `sha:${path}`,
-		size: 1,
-		mtime: 1,
-		syncedAt: 1,
+	return fileMetadata(path, `sha:${path}`, {
 		deleted: options?.deleted,
 		remoteFingerprint: options?.fingerprint,
 		changedRevision: options?.changedRevision,
 		lastModifiedBy: options?.lastModifiedBy ?? "device-test",
 		mutationSeq: options?.mutationSeq ?? 1,
-	};
+	});
 }
 
 /**
  * Minimal causal index used to exercise the folder-delete orchestration.
  */
-class FolderDeleteIndexFake {
-	readonly index = createEmptyIndex("device-test", "epoch-test");
-	readonly local = {
-		observedEpoch: "epoch-test",
-		observedRevision: 7,
-		files: {} as Record<string, FileMetadata>,
-		folderTombstones: {},
-		nextMutationSeq: 1,
-		lastSyncTime: 0,
-	};
-	readonly pendingActions: PendingPhysicalAction[] = [];
-	readonly pendingMutations: PendingMutation[] = [];
-	readonly commits: number[] = [];
-	beforeCanonicalRead?: () => void;
-
+class FolderDeleteIndexFake extends MemoryIndex {
 	constructor() {
+		super("device-test", "epoch-test");
+		this.index.appliedMutationSeq["device-test"] = 1;
+		this.store.loadMutations(undefined, 2);
 		this.index.revision = 7;
 		this.index.files["folder/Без названия.md"] = metadata(
 			"folder/Без названия.md",
@@ -66,160 +44,20 @@ class FolderDeleteIndexFake {
 		});
 		this.local.files = structuredClone(this.index.files);
 	}
-
-	getRemoteIndex() {
-		return this.index;
+	get pendingActions() {
+		return this.getPendingPhysicalActions();
 	}
 
-	getLocalIndex() {
-		return this.local;
+	get pendingMutations() {
+		return this.getPendingMutations();
 	}
 
-	getPendingPhysicalActions() {
-		return this.pendingActions.map((action) => ({ ...action }));
-	}
-
-	getPendingMutations() {
-		return this.pendingMutations;
-	}
-
-	getPendingPhysicalAction(type: string, path: string) {
-		return this.pendingActions.find(
-			(action) => action.type === type && action.path === path,
-		);
-	}
-
-	hasPendingPhysicalAction(type: string, path: string) {
-		return this.getPendingPhysicalAction(type, path) !== undefined;
-	}
-
-	enqueueMutation(
-		type: PendingMutation["type"],
-		path: string,
-		options?: Partial<PendingMutation>,
-	) {
-		const mutation: PendingMutation = {
-			id: "mutation-1",
-			seq: this.pendingMutations.length + 2,
-			epoch: this.index.epoch,
-			type,
-			baseRevision: options?.baseRevision ?? this.index.revision,
-			path,
-			createdAt: 1,
-		};
-		this.pendingMutations.push(mutation);
-		return mutation;
-	}
-
-	markFolderDeleted(
-		path: string,
-		deletedAt: number,
-		baseRevision: number | null,
-		mutationSeq?: number,
-	) {
-		this.index.folderTombstones[path] = {
-			path,
-			deletedAt,
-			changedRevision: this.index.revision,
-			baseRevision: baseRevision ?? 0,
-			lastModifiedBy: "device-test",
-			mutationSeq,
-		};
-	}
-
-	markRemoteFileDeleted(
-		path: string,
-		deletedByFolder?: string,
-		baseRevision?: number,
-		mutationSeq?: number,
-	) {
-		const current = this.index.files[path];
-		if (!current || current.deleted) {
-			return;
-		}
-		Object.assign(current, {
-			deleted: true,
-			deletedAt: 1,
-			deletedByFolder,
-			baseRevision,
-			mutationSeq,
-			lastModifiedBy: "device-test",
-		});
-	}
-
-	markLocalFileDeleted(path: string, deletedByFolder?: string) {
-		const current = this.local.files[path];
-		if (!current || current.deleted) {
-			return;
-		}
-		Object.assign(current, {
-			deleted: true,
-			deletedAt: 1,
-			deletedByFolder,
-		});
-	}
-
-	updateRemoteFile(path: string, value: FileMetadata) {
-		this.index.files[path] = { ...value, lastModifiedBy: "device-test" };
-	}
-
-	updateLocalFile(path: string, value: FileMetadata) {
-		this.local.files[path] = { ...value };
-	}
-
-	recordMove(
-		id: string,
-		fromPath: string,
-		toPath: string,
-		kind: "file" | "folder",
-		baseRevision: number,
-		mutationSeq?: number,
-	) {
-		this.index.moves[id] = {
-			id,
-			fromPath,
-			toPath,
-			kind,
-			baseRevision,
-			changedRevision: this.index.revision,
-			pending: true,
-			lastModifiedBy: "device-test",
-			mutationSeq,
-		};
-	}
-
-	completeMove(id: string) {
-		delete this.index.moves[id];
-	}
-
-	enqueuePhysicalAction(
-		type: PendingPhysicalAction["type"],
-		path: string,
-		options: Partial<PendingPhysicalAction>,
-	) {
-		const action: PendingPhysicalAction = {
-			id: `action-${this.pendingActions.length + 1}`,
-			type,
-			epoch: this.index.epoch,
-			origin: options.origin ?? "exact-delete",
-			path,
-			targetPath: options.targetPath,
-			parentMutationId: options.parentMutationId,
-			canonicalRevision: options.canonicalRevision ?? this.index.revision,
-			expectedFingerprint: options.expectedFingerprint,
-			createdAt: 1,
-		};
-		this.pendingActions.push(action);
-		return action;
-	}
-
-	stageMutation(mutation: PendingMutation) {
-		this.index.appliedMutationSeq["device-test"] = mutation.seq;
+	override async refreshCanonicalForMutation() {
+		return structuredClone(this.index);
 	}
 
 	async saveRemoteIndex() {
-		this.index.revision++;
-		this.commits.push(this.index.revision);
+		await super.saveRemoteIndex();
 		for (const current of Object.values(this.index.files)) {
 			if (current.deleted && current.deletedByFolder === "folder") {
 				current.changedRevision = this.index.revision;
@@ -239,42 +77,6 @@ class FolderDeleteIndexFake {
 			contentFingerprint: "md5:test",
 		};
 	}
-
-	consumeRejectedPuts() {
-		return [];
-	}
-
-	confirmMutation(id: string) {
-		const index = this.pendingMutations.findIndex(
-			(mutation) => mutation.id === id,
-		);
-		if (index >= 0) {
-			this.pendingMutations.splice(index, 1);
-		}
-	}
-
-	async readCanonicalIndex() {
-		this.beforeCanonicalRead?.();
-		this.beforeCanonicalRead = undefined;
-		return structuredClone(this.index);
-	}
-
-	async refreshCanonicalForMutation() {
-		return structuredClone(this.index);
-	}
-
-	completePhysicalAction(id: string) {
-		const index = this.pendingActions.findIndex(
-			(action) => action.id === id,
-		);
-		if (index >= 0) {
-			this.pendingActions.splice(index, 1);
-		}
-	}
-
-	beginPhysicalRewriteCommit() {}
-
-	cancelPhysicalRewriteCommit() {}
 }
 
 /**
@@ -332,20 +134,30 @@ class FolderDeleteYandexFake {
 	}
 }
 
+function createHarness(encrypted = false) {
+	const indexManager = new FolderDeleteIndexFake();
+	const yandexClient = new FolderDeleteYandexFake();
+	const engine = new SyncEngine(
+		yandexClient as unknown as YandexDiskClient,
+		{
+			fileExists: () => false,
+			getFileMtime: () => 1,
+		} as unknown as VaultAdapter,
+		indexManager,
+		{
+			...DEFAULT_SETTINGS,
+			deviceId: "device-test",
+			remotePath: "remote",
+			enableEncryption: encrypted,
+		},
+	);
+	return { indexManager, yandexClient, engine };
+}
+
 for (const mode of ["plaintext", "encrypted"] as const) {
 	test(`${mode} rename tombstone is skipped by folder delete`, async () => {
-		const indexManager = new FolderDeleteIndexFake();
-		const yandexClient = new FolderDeleteYandexFake();
-		const engine = new SyncEngine(
-			yandexClient as unknown as YandexDiskClient,
-			{} as VaultAdapter,
-			indexManager as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-test",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
+		const { indexManager, yandexClient, engine } = createHarness(
+			mode === "encrypted",
 		);
 
 		await engine.deleteFolder("folder");
@@ -370,7 +182,9 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 
 for (const mode of ["plaintext", "encrypted"] as const) {
 	test(`${mode} folder rename uses guarded file moves and two commits`, async () => {
-		const indexManager = new FolderDeleteIndexFake();
+		const { indexManager, yandexClient, engine } = createHarness(
+			mode === "encrypted",
+		);
 		indexManager.index.files = {
 			"A/deep/note.md": {
 				...metadata("A/deep/note.md", {
@@ -382,26 +196,11 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 			},
 		};
 		indexManager.local.files = structuredClone(indexManager.index.files);
-		const yandexClient = new FolderDeleteYandexFake();
+
 		yandexClient.resources.clear();
 		yandexClient.resources.set("remote/A/deep/note.md", {
 			sha256: "source-fingerprint",
 		});
-		const vault = {
-			fileExists: () => false,
-			getFileMtime: () => 1,
-		};
-		const engine = new SyncEngine(
-			yandexClient as unknown as YandexDiskClient,
-			vault as unknown as VaultAdapter,
-			indexManager as unknown as IndexManager,
-			{
-				...DEFAULT_SETTINGS,
-				deviceId: "device-test",
-				remotePath: "remote",
-				enableEncryption: mode === "encrypted",
-			},
-		);
 
 		const outcome = await engine.renameFolder("A", "B", {
 			epoch: "epoch-test",
@@ -432,7 +231,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 }
 
 test("restored folder source is never deleted without a target snapshot", async () => {
-	const indexManager = new FolderDeleteIndexFake();
+	const { indexManager, yandexClient, engine } = createHarness(false);
 	indexManager.index.files = {
 		"A/note.md": {
 			...metadata("A/note.md", {
@@ -454,24 +253,11 @@ test("restored folder source is never deleted without a target snapshot", async 
 			mutationSeq: 3,
 		};
 	};
-	const yandexClient = new FolderDeleteYandexFake();
+
 	yandexClient.resources.clear();
 	yandexClient.resources.set("remote/A/note.md", {
 		sha256: "restored-fingerprint",
 	});
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		{
-			fileExists: () => false,
-			getFileMtime: () => 1,
-		} as unknown as VaultAdapter,
-		indexManager as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-test",
-			remotePath: "remote",
-		},
-	);
 
 	const outcome = await engine.renameFolder("A", "B", {
 		epoch: "epoch-test",
@@ -486,7 +272,7 @@ test("restored folder source is never deleted without a target snapshot", async 
 });
 
 test("folder target conflict performs no canonical or physical writes", async () => {
-	const indexManager = new FolderDeleteIndexFake();
+	const { indexManager, yandexClient, engine } = createHarness(false);
 	indexManager.index.files = {
 		"A/note.md": {
 			...metadata("A/note.md", { changedRevision: 7 }),
@@ -503,22 +289,12 @@ test("folder target conflict performs no canonical or physical writes", async ()
 	indexManager.local.files = {
 		"A/note.md": structuredClone(indexManager.index.files["A/note.md"]!),
 	};
-	const yandexClient = new FolderDeleteYandexFake();
+
 	yandexClient.resources.clear();
 	yandexClient.resources.set("remote/A/note.md", { sha256: "hash" });
 	yandexClient.resources.set("remote/B/note.md", {
 		sha256: "different-target",
 	});
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		indexManager as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-test",
-			remotePath: "remote",
-		},
-	);
 
 	const before = structuredClone(indexManager.index);
 	const outcome = await engine.renameFolder("A", "B", {
@@ -536,133 +312,55 @@ test("folder target conflict performs no canonical or physical writes", async ()
 	assert.equal(indexManager.pendingMutations.length, 1);
 });
 
-test("missing expected fingerprint defers remote deletion", async () => {
-	const indexManager = new FolderDeleteIndexFake();
-	indexManager.pendingActions.push({
-		id: "legacy-action",
-		type: "delete-remote",
-		epoch: indexManager.index.epoch,
-		origin: "folder-delete",
-		path: "folder/Без названия.md",
-		canonicalRevision: 8,
-		createdAt: 1,
-	});
-	const yandexClient = new FolderDeleteYandexFake();
-	yandexClient.resources.set("remote/folder/Без названия.md", {
-		sha256: "new-fingerprint",
-	});
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		indexManager as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-test",
-			remotePath: "remote",
-		},
-	);
-
-	await engine.deleteRemoteFile("folder/Без названия.md");
-
-	assert.deepEqual(yandexClient.deletes, []);
-	assert.equal(indexManager.pendingActions.length, 1);
-});
-
-test("changed physical fingerprint defers remote deletion", async () => {
-	const indexManager = new FolderDeleteIndexFake();
-	indexManager.pendingActions.push({
-		id: "changed-action",
-		type: "delete-remote",
-		epoch: indexManager.index.epoch,
-		origin: "folder-delete",
-		path: "folder/Без названия.md",
-		canonicalRevision: 8,
+for (const scenario of [
+	{ name: "missing expected fingerprint defers remote deletion", pending: 1 },
+	{
+		name: "changed physical fingerprint defers remote deletion",
 		expectedFingerprint: "old-fingerprint",
-		createdAt: 1,
-	});
-	const yandexClient = new FolderDeleteYandexFake();
-	yandexClient.resources.set("remote/folder/Без названия.md", {
-		sha256: "new-fingerprint",
-	});
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		indexManager as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-test",
-			remotePath: "remote",
-		},
-	);
-
-	await engine.deleteRemoteFile("folder/Без названия.md");
-
-	assert.deepEqual(yandexClient.deletes, []);
-	assert.equal(indexManager.pendingActions.length, 1);
-});
-
-test("newer live canonical state cancels a legacy folder action", async () => {
-	const indexManager = new FolderDeleteIndexFake();
-	indexManager.index.files["folder/Без названия.md"] = metadata(
-		"folder/Без названия.md",
-		{ fingerprint: "new-fingerprint", changedRevision: 9 },
-	);
-	indexManager.pendingActions.push({
-		id: "obsolete-action",
-		type: "delete-remote",
-		epoch: indexManager.index.epoch,
-		origin: "folder-delete",
-		path: "folder/Без названия.md",
-		canonicalRevision: 8,
+		pending: 1,
+	},
+	{
+		name: "newer live canonical state cancels a legacy folder action",
 		expectedFingerprint: "old-fingerprint",
-		createdAt: 1,
+		restored: true,
+		pending: 0,
+	},
+	{
+		name: "absent physical file completes a legacy action without delete",
+		absent: true,
+		pending: 0,
+	},
+]) {
+	test(scenario.name, async () => {
+		const { indexManager, yandexClient, engine } = createHarness();
+		const path = "folder/Без названия.md";
+		if (scenario.restored) {
+			indexManager.index.files[path] = metadata(path, {
+				fingerprint: "new-fingerprint",
+				changedRevision: 9,
+			});
+		}
+		indexManager.loadPendingPhysicalActions([
+			{
+				id: "guarded-action",
+				type: "delete-remote",
+				epoch: indexManager.index.epoch,
+				origin: "folder-delete",
+				path,
+				canonicalRevision: 8,
+				createdAt: 1,
+				expectedFingerprint: scenario.expectedFingerprint,
+			},
+		]);
+		if (!scenario.absent) {
+			yandexClient.resources.set("remote/" + path, {
+				sha256: "new-fingerprint",
+			});
+		}
+
+		await engine.deleteRemoteFile(path);
+
+		assert.deepEqual(yandexClient.deletes, []);
+		assert.equal(indexManager.pendingActions.length, scenario.pending);
 	});
-	const yandexClient = new FolderDeleteYandexFake();
-	yandexClient.resources.set("remote/folder/Без названия.md", {
-		sha256: "new-fingerprint",
-	});
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		indexManager as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-test",
-			remotePath: "remote",
-		},
-	);
-
-	await engine.deleteRemoteFile("folder/Без названия.md");
-
-	assert.deepEqual(yandexClient.deletes, []);
-	assert.equal(indexManager.pendingActions.length, 0);
-});
-
-test("absent physical file completes a legacy action without delete", async () => {
-	const indexManager = new FolderDeleteIndexFake();
-	indexManager.pendingActions.push({
-		id: "legacy-action",
-		type: "delete-remote",
-		epoch: indexManager.index.epoch,
-		origin: "folder-delete",
-		path: "folder/Без названия.md",
-		canonicalRevision: 8,
-		createdAt: 1,
-	});
-	const yandexClient = new FolderDeleteYandexFake();
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		indexManager as unknown as IndexManager,
-		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-test",
-			remotePath: "remote",
-		},
-	);
-
-	await engine.deleteRemoteFile("folder/Без названия.md");
-
-	assert.deepEqual(yandexClient.deletes, []);
-	assert.equal(indexManager.pendingActions.length, 0);
-});
+}

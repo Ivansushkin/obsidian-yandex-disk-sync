@@ -1,3 +1,12 @@
+import { fileMetadata } from "./helpers/metadata";
+import { MemoryDisk } from "./helpers/sync-flow";
+import {
+	encryptionManifest,
+	transitionManifest,
+	encryptedMode,
+	plaintextMode,
+	maintenance as createMaintenance,
+} from "./helpers/crypto-fixtures";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -17,11 +26,10 @@ import {
 	createEmptyIndex,
 	DEFAULT_SETTINGS,
 	type YandexDiskSyncSettings,
-	type YandexResource,
 	type FileMetadata,
 } from "../src/types";
 import type { EncryptionCodec } from "../src/crypto/encryption";
-import type { YandexDiskClient } from "../src/api/yandex-client";
+import { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { logger } from "../src/utils/logger";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
@@ -29,25 +37,14 @@ import stableCanonicalFixture from "./fixtures/stable-1.1/canonical-v2.json";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
-class XorEncryptionService {
-	constructor(private readonly key: number) {}
-
-	async encrypt(content: ArrayBuffer): Promise<ArrayBuffer> {
-		return this.transform(content);
-	}
-
-	async decrypt(content: ArrayBuffer): Promise<ArrayBuffer> {
-		return this.transform(content);
-	}
-
-	private transform(content: ArrayBuffer): ArrayBuffer {
-		const source = new Uint8Array(content);
-		const result = new Uint8Array(source.length);
-		for (let index = 0; index < source.length; index++) {
-			result[index] = source[index]! ^ this.key;
-		}
-		return result.buffer;
-	}
+/** Reversible byte codec isolates index protocol tests from expensive KDF work. */
+function xorCodec(key: number): EncryptionCodec {
+	const transform = async (content: ArrayBuffer): Promise<ArrayBuffer> =>
+		Uint8Array.from(new Uint8Array(content), (byte) => byte ^ key).buffer;
+	return {
+		encrypt: transform,
+		decrypt: transform,
+	} as unknown as EncryptionCodec;
 }
 
 class RejectingEncryptionService {
@@ -62,213 +59,84 @@ class RejectingEncryptionService {
 	}
 }
 
-class FakeIndexYandex {
-	readonly files = new Map<string, ArrayBuffer>();
+/** Use production codec and stable-read behavior with synthetic HTTP faults. */
+class FakeIndexYandex extends YandexDiskClient {
+	readonly disk = new MemoryDisk();
+	readonly files = this.disk.files;
 	moveCount = 0;
 	stableReadCount = 0;
 	readonly downloadedPaths: string[] = [];
+	private corruptUpload = false;
 
 	constructor(
-		private readonly remotePath: string,
-		private readonly encryption: EncryptionCodec | null,
-		private readonly faults: {
+		remotePath: string,
+		encryption: EncryptionCodec | null,
+		faults: {
 			throwAfterFinalMove?: boolean;
 			corruptIndexUpload?: boolean;
 			hashlessMetadata?: boolean;
 		} = {},
-	) {}
-
-	hasEncryptionService(): boolean {
-		return this.encryption !== null;
+	) {
+		super({ token: "synthetic", maxRetries: 0, retryDelay: 0 });
+		this.setRemotePath(remotePath);
+		this.setEncryptionService(encryption);
+		const resource = this.disk.resource.bind(this.disk);
+		this.disk.resource = async (path) => {
+			const result = await resource(path);
+			if (result && faults.hashlessMetadata && this.files.has(path)) {
+				result.modified = `content-${String(result.sha256)}-${path}`;
+				delete result.sha256;
+			}
+			return result;
+		};
+		this.disk.beforeRequest = async (_method, endpoint, path) => {
+			for (const name of this.files.keys()) {
+				const parts = name.split("/");
+				for (let depth = 1; depth < parts.length; depth++) {
+					this.disk.folders.add(parts.slice(0, depth).join("/"));
+				}
+			}
+			if (endpoint === "/download") {
+				this.downloadedPaths.push(path);
+			}
+		};
+		this.disk.afterRequest = async (method, endpoint, path) => {
+			if (endpoint.endsWith("/resources/move")) {
+				this.moveCount++;
+				if (faults.throwAfterFinalMove && this.moveCount === 2) {
+					throw new Error("lost final move response");
+				}
+			}
+			if (
+				faults.corruptIndexUpload &&
+				this.corruptUpload &&
+				endpoint === "/upload" &&
+				method === "PUT" &&
+				path.includes(".obsidian-sync-index.lock.")
+			) {
+				const bytes = new Uint8Array(this.files.get(path)!);
+				bytes[0] = bytes[0]! ^ 0xff;
+			}
+		};
+		this.disk.install();
 	}
 
-	async decodeServiceFileContent(
-		raw: ArrayBuffer,
-		service?: EncryptionCodec | null,
-	): Promise<ArrayBuffer> {
-		const codec = service === undefined ? this.encryption : service;
-		return codec ? await codec.decrypt(raw) : raw;
-	}
-
-	async downloadFile(path: string, raw = false): Promise<ArrayBuffer> {
-		this.downloadedPaths.push(path);
-		const value = this.files.get(path);
-		if (!value) {
-			throw new Error(`Missing file: ${path}`);
+	override async uploadFile(
+		...args: Parameters<YandexDiskClient["uploadFile"]>
+	): Promise<void> {
+		this.corruptUpload = !args[3];
+		try {
+			await super.uploadFile(...args);
+		} finally {
+			this.corruptUpload = false;
 		}
-		const copy = value.slice(0);
-		return raw || !this.encryption
-			? copy
-			: await this.encryption.decrypt(copy);
 	}
 
-	async downloadStableRawFile(path: string): Promise<{
-		raw: ArrayBuffer;
-		resource: YandexResource;
-		fingerprint: string;
-	} | null> {
+	override async downloadStableRawFile(
+		...args: Parameters<YandexDiskClient["downloadStableRawFile"]>
+	): ReturnType<YandexDiskClient["downloadStableRawFile"]> {
 		this.stableReadCount++;
-		const resource = await this.getResource(path);
-		if (!resource) {
-			return null;
-		}
-		const raw = await this.downloadFile(path, true);
-		return {
-			raw,
-			resource,
-			fingerprint: this.getContentFingerprint(resource)!,
-		};
-	}
-
-	getContentFingerprint(resource: YandexResource | null): string | null {
-		if (!resource) {
-			return null;
-		}
-		if (resource.sha256) {
-			return `sha256:${resource.sha256}`;
-		}
-		if (resource.md5) {
-			return `md5:${resource.md5}`;
-		}
-		if (resource.modified) {
-			return `modified:${resource.modified}:size:${resource.size ?? -1}`;
-		}
-		return null;
-	}
-
-	async uploadFile(
-		path: string,
-		content: ArrayBuffer | string,
-		_skipFolderCheck = false,
-		raw = false,
-		overwrite = true,
-	): Promise<void> {
-		if (!overwrite && this.files.has(path)) {
-			throw new Error("target exists");
-		}
-		const plain =
-			typeof content === "string"
-				? new TextEncoder().encode(content).buffer
-				: content;
-		const stored =
-			raw || !this.encryption
-				? plain
-				: await this.encryption.encrypt(plain);
-		const storedCopy = stored.slice(0);
-		if (
-			this.faults.corruptIndexUpload &&
-			!raw &&
-			path.includes(".obsidian-sync-index.lock.")
-		) {
-			const bytes = new Uint8Array(storedCopy);
-			bytes[0] = (bytes[0] ?? 0) ^ 0xff;
-		}
-		this.files.set(path, storedCopy);
-	}
-
-	async uploadFileWithEncryptionService(
-		path: string,
-		content: string,
-		service: EncryptionCodec | null,
-		overwrite = true,
-	): Promise<void> {
-		const plain = new TextEncoder().encode(content).buffer;
-		const stored = service ? await service.encrypt(plain) : plain;
-		await this.uploadFile(path, stored, true, true, overwrite);
-	}
-
-	async uploadFileExclusive(
-		path: string,
-		content: string,
-		_rawPath = false,
-		rawContent = false,
-	): Promise<void> {
-		await this.uploadFile(path, content, true, rawContent, false);
-	}
-
-	async moveResourceExclusive(
-		fromPath: string,
-		toPath: string,
-	): Promise<void> {
-		if (this.files.has(toPath)) {
-			throw new Error("target exists");
-		}
-		const value = this.files.get(fromPath);
-		if (!value) {
-			throw new Error("source missing");
-		}
-		this.files.set(toPath, value);
-		this.files.delete(fromPath);
-		this.moveCount++;
-		if (this.faults.throwAfterFinalMove && this.moveCount === 2) {
-			throw new Error("lost final move response");
-		}
-	}
-
-	async deleteResource(path: string): Promise<void> {
-		this.files.delete(path);
-	}
-
-	async getResource(
-		path: string,
-		_limit = 1000,
-		_offset = 0,
-		_raw = false,
-	): Promise<YandexResource | null> {
-		if (path === this.remotePath) {
-			const items = [...this.files.entries()]
-				.filter(([filePath]) =>
-					filePath.startsWith(`${this.remotePath}/`),
-				)
-				.map(([filePath, content]) =>
-					this.createResource(filePath, content),
-				);
-			return {
-				name: this.remotePath,
-				path: this.remotePath,
-				type: "dir",
-				created: "2026-01-01T00:00:00Z",
-				modified: "2026-01-01T00:00:00Z",
-				_embedded: {
-					items,
-					total: items.length,
-					limit: 1000,
-					offset: 0,
-					path: this.remotePath,
-					sort: "",
-				},
-			};
-		}
-		const content = this.files.get(path);
-		return content ? this.createResource(path, content) : null;
-	}
-
-	async getResourcesRecursive(): Promise<YandexResource[]> {
-		return [...this.files.entries()].map(([path, content]) =>
-			this.createResource(path, content),
-		);
-	}
-
-	private createResource(path: string, content: ArrayBuffer): YandexResource {
-		const identity = this.fingerprint(content);
-		return {
-			name: path.split("/").pop() ?? path,
-			path,
-			type: "file",
-			created: "2026-01-01T00:00:00Z",
-			modified: this.faults.hashlessMetadata
-				? `content-${identity}-${path}`
-				: "2026-01-01T00:00:00Z",
-			size: content.byteLength,
-			md5: this.faults.hashlessMetadata ? undefined : identity,
-		};
-	}
-
-	private fingerprint(content: ArrayBuffer): string {
-		return [...new Uint8Array(content)]
-			.reduce((value, byte) => (value * 33 + byte) >>> 0, 5381)
-			.toString(16)
-			.padStart(8, "0");
+		return super.downloadStableRawFile(...args);
 	}
 }
 
@@ -278,6 +146,22 @@ function createSettings(deviceId: string): YandexDiskSyncSettings {
 		deviceId,
 		remotePath: "vault",
 	};
+}
+
+function indexManager(
+	client: FakeIndexYandex,
+	deviceId = "device-a",
+): IndexManager {
+	return new IndexManager(
+		client,
+		{} as VaultAdapter,
+		createSettings(deviceId),
+	);
+}
+
+/** Encode fixture JSON exactly as the service stores it. */
+function jsonBytes(value: unknown): ArrayBuffer {
+	return new TextEncoder().encode(JSON.stringify(value)).buffer;
 }
 
 function stable1xIndex(version: 1 | 2 = 2): Record<string, unknown> {
@@ -343,8 +227,6 @@ async function runLegacyForceCommit(
 ): Promise<{
 	client: FakeIndexYandex;
 	manager: IndexManager;
-	canonicalPath: string;
-	originalRaw: ArrayBuffer;
 }> {
 	const client = new FakeIndexYandex("vault", encryption, faults);
 	const canonicalPath = "vault/.obsidian-sync-index.json";
@@ -354,25 +236,17 @@ async function runLegacyForceCommit(
 		canonicalPath,
 		encryption ? await encryption.encrypt(legacyBytes) : legacyBytes,
 	);
-	const originalRaw = client.files.get(canonicalPath)!.slice(0);
-	const manager = new IndexManager(
-		client as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("new-device"),
-	);
+	const manager = indexManager(client, "new-device");
 	manager.beginForceBootstrap(true);
-	manager.updateRemoteFile("note.md", {
-		path: "note.md",
-		sha256: "hash",
-		size: 4,
-		mtime: 10.375,
-		syncedAt: 10,
-		remoteMtime: undefined,
-	});
-
-	if (faults.corruptIndexUpload) {
-		return { client, manager, canonicalPath, originalRaw };
-	}
+	manager.updateRemoteFile(
+		"note.md",
+		fileMetadata("note.md", {
+			size: 4,
+			mtime: 10.375,
+			syncedAt: 10,
+			remoteMtime: undefined,
+		}),
+	);
 
 	const proof = await manager.saveRemoteIndex();
 
@@ -397,27 +271,22 @@ async function runLegacyForceCommit(
 	assert.equal(proof.revision, canonical.revision);
 	assert.match(
 		proof.contentFingerprint,
-		faults.hashlessMetadata ? /^modified:/ : /^md5:/,
+		faults.hashlessMetadata ? /^modified:/ : /^sha256:/,
 	);
 	assert.equal(
 		client.stableReadCount,
-		faults.throwAfterFinalMove || faults.hashlessMetadata ? 4 : 3,
+		faults.hashlessMetadata ? 5 : faults.throwAfterFinalMove ? 4 : 3,
 	);
 	assert.deepEqual(
 		[...client.files.keys()].filter((path) => path.includes(".lock.")),
 		[],
 	);
-	return { client, manager, canonicalPath, originalRaw };
+	return { client, manager };
 }
 
 test("plaintext stable 1.0/1.1 Force commits and verifies current canonical", async () => {
 	for (const version of [1, 2] as const) {
-		await runLegacyForceCommit(null, {
-			version,
-			lastSyncTime: 1,
-			deviceId: "stable-device",
-			files: {},
-		});
+		await runLegacyForceCommit(null, stable1xIndex(version));
 	}
 	const fixtureResult = await runLegacyForceCommit(
 		null,
@@ -444,13 +313,12 @@ test("stable fractional mtime survives Force replacement and current canonical r
 test("Force replacement tombstones survive initiator loss", async () => {
 	const source = stable1xIndex();
 	const files = source.files as Record<string, unknown>;
-	files["removed.md"] = {
-		path: "removed.md",
+	files["removed.md"] = fileMetadata("removed.md", {
 		sha256: "removed-sha",
 		size: 7,
 		mtime: 8,
 		syncedAt: 9,
-	};
+	});
 	const { manager } = await runLegacyForceCommit(null, source);
 	const tombstone = manager.getRemoteIndex().files["removed.md"];
 	assert.equal(tombstone?.deleted, true);
@@ -462,13 +330,12 @@ test("legacy root __proto__ path survives conversion and Force", async () => {
 	const source = stable1xIndex();
 	const files = source.files as Record<string, unknown>;
 	Object.defineProperty(files, "__proto__", {
-		value: {
-			path: "__proto__",
+		value: fileMetadata("__proto__", {
 			sha256: "proto-sha",
 			size: 5,
 			mtime: 6,
 			syncedAt: 7,
-		},
+		}),
 		enumerable: true,
 		configurable: true,
 		writable: true,
@@ -503,9 +370,7 @@ test("versioned data outside the exact stable 1.x shape is rejected before Force
 });
 
 test("encrypted legacy index is rejected before Force acquires a lock", async () => {
-	const encryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0xa5);
 	const { manager, client } = await createIndexManagerWithContent(
 		stable1xIndex(),
 		encryption,
@@ -525,34 +390,9 @@ test("hashless canonical metadata falls back to semantic verification", async ()
 test("encryption manifest validation token detects unchanged and changed content", async () => {
 	const client = new FakeIndexYandex("vault", null);
 	const manifestPath = "vault/.obsidian-encrypt.json";
-	const manifest = {
-		format: "encryption-manifest",
-		profileId: "hardened",
-		state: "enabled",
-		revision: 1,
-		salt: "AAAAAAAAAAAAAAAAAAAAAA==",
-		verifier: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
-		kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600_000 },
-		keySchedule: { name: "HKDF", hash: "SHA-256" },
-		cipher: { name: "AES-GCM", keyLength: 256, ivLength: 12 },
-		filenameCipher: {
-			name: "AES-SIV",
-			keyLength: 512,
-			encoding: "base64url",
-			aad: "obsidian-yandex-disk-sync:filename",
-		},
-		updatedAt: 1,
-		updatedBy: "device-a",
-	};
-	client.files.set(
-		manifestPath,
-		new TextEncoder().encode(JSON.stringify(manifest)).buffer,
-	);
-	const manager = new IndexManager(
-		client as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
+	const manifest = encryptionManifest();
+	client.files.set(manifestPath, jsonBytes(manifest));
+	const manager = indexManager(client, "device-a");
 	const read = await manager.downloadEncryptionManifestForGuard();
 	assert.equal(
 		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
@@ -560,9 +400,7 @@ test("encryption manifest validation token detects unchanged and changed content
 	);
 	client.files.set(
 		manifestPath,
-		new TextEncoder().encode(
-			JSON.stringify({ ...manifest, salt: "AQEBAQEBAQEBAQEBAQEBAQ==" }),
-		).buffer,
+		jsonBytes({ ...manifest, salt: "AQEBAQEBAQEBAQEBAQEBAQ==" }),
 	);
 	assert.equal(
 		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
@@ -572,11 +410,7 @@ test("encryption manifest validation token detects unchanged and changed content
 
 test("absent manifest token detects a newly created manifest", async () => {
 	const client = new FakeIndexYandex("vault", null);
-	const manager = new IndexManager(
-		client as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
+	const manager = indexManager(client, "device-a");
 	const read = await manager.downloadEncryptionManifestForGuard();
 	assert.equal(read.validationToken, "absent");
 	assert.equal(
@@ -595,15 +429,8 @@ test("absent manifest token detects a newly created manifest", async () => {
 
 async function readEncryptionManifest(manifest: object) {
 	const client = new FakeIndexYandex("vault", null);
-	client.files.set(
-		"vault/.obsidian-encrypt.json",
-		new TextEncoder().encode(JSON.stringify(manifest)).buffer,
-	);
-	const manager = new IndexManager(
-		client as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
+	client.files.set("vault/.obsidian-encrypt.json", jsonBytes(manifest));
+	const manager = indexManager(client, "device-a");
 	return await manager.downloadEncryptionManifest();
 }
 
@@ -626,69 +453,44 @@ test("numeric historical manifests are rejected as unsupported data", async () =
 });
 
 test("strict semantic manifest accepts only the hardened profile", async () => {
-	const hardened = {
-		format: "encryption-manifest",
-		profileId: "hardened",
-		...manifestCommon,
-		kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600_000 },
-		keySchedule: { name: "HKDF", hash: "SHA-256" },
-		cipher: { name: "AES-GCM", keyLength: 256, ivLength: 12 },
-		filenameCipher: {
-			name: "AES-SIV",
-			keyLength: 512,
-			encoding: "base64url",
-			aad: "obsidian-yandex-disk-sync:filename",
-		},
-	};
+	const hardened = encryptionManifest();
 	const parsed = await readEncryptionManifest(hardened);
 	assert.equal(parsed?.format, "encryption-manifest");
 	assert.equal(parsed ? "version" in parsed : true, false);
-	await assert.rejects(
-		readEncryptionManifest({ ...hardened, version: 3 }),
-		/unsupported field version/,
-	);
-	await assert.rejects(
-		readEncryptionManifest({
-			...hardened,
-			filenameCipher: { ...hardened.filenameCipher, name: "AES-GCM" },
-		}),
-		/unsupported profile/,
-	);
-	await assert.rejects(
-		readEncryptionManifest({
-			...hardened,
-			kdf: { ...hardened.kdf, fallbackIterations: 100_000 },
-		}),
-		/unsupported field fallbackIterations/,
-	);
-	const rotating = {
-		...hardened,
-		state: "rotating",
-		revision: 2,
-		salt: "AQEBAQEBAQEBAQEBAQEBAQ==",
-		verifier: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==",
-		transition: {
-			id: "transition-a",
+	for (const [patch, error] of [
+		[{ version: 3 }, /unsupported field version/],
+		[
+			{ filenameCipher: { ...hardened.filenameCipher, name: "AES-GCM" } },
+			/unsupported profile/,
+		],
+		[
+			{ kdf: { ...hardened.kdf, fallbackIterations: 100_000 } },
+			/unsupported field fallbackIterations/,
+		],
+	] as const) {
+		await assert.rejects(
+			readEncryptionManifest({ ...hardened, ...patch }),
+			error,
+		);
+	}
+	const rotating = transitionManifest(
+		"rotating",
+		createMaintenance({
 			phase: "prepared",
 			sourceRevision: 1,
-			targetRevision: 2,
-			initiatedBy: "device-a",
-			source: {
-				enabled: true,
-				revision: 1,
-				salt: manifestCommon.salt,
-				verifier: manifestCommon.verifier,
-			},
-			target: {
-				enabled: true,
-				revision: 2,
-				salt: "AQEBAQEBAQEBAQEBAQEBAQ==",
-				verifier: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==",
-			},
-			sourceProfileId: "hardened",
-			targetProfileId: "hardened",
-		},
-	};
+			targetRevision: null,
+			source: encryptedMode(
+				1,
+				manifestCommon.salt,
+				manifestCommon.verifier,
+			),
+			target: encryptedMode(
+				2,
+				"AQEBAQEBAQEBAQEBAQEBAQ==",
+				"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==",
+			),
+		}),
+	);
 	assert.equal((await readEncryptionManifest(rotating))?.state, "rotating");
 	await assert.rejects(
 		readEncryptionManifest({
@@ -727,27 +529,12 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 		createSettings("target-device"),
 	);
 	const index = createEmptyIndex("source-device");
-	index.maintenance = {
-		id: "transition-a",
-		kind: "rotate",
-		phase: "index-committed",
+	index.maintenance = createMaintenance({
 		initiatedBy: "source-device",
 		sourceRevision: 1,
 		targetRevision: 2,
-		source: {
-			enabled: true,
-			revision: 1,
-			salt: "source-salt",
-			verifier: "source-verifier",
-		},
-		target: {
-			enabled: true,
-			revision: 2,
-			salt: "target-salt",
-			verifier: "target-verifier",
-		},
 		cleanup: [{ path: "old-raw", expectedFingerprint: "sha256:old" }],
-	};
+	});
 	const access = manager as unknown as {
 		assertMaintenanceCompatible(value: typeof index): void;
 	};
@@ -767,32 +554,17 @@ test("foreign post-commit maintenance is scoped to matching target recovery", as
 });
 
 test("plaintext target recovery reads committed disable canonical without source key", async () => {
-	const sourceEncryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const sourceEncryption = xorCodec(0xa5);
 	const index = createEmptyIndex("source-device", "epoch-disable");
 	index.revision = 2;
-	index.maintenance = {
+	index.maintenance = createMaintenance({
 		id: "transition-disable",
 		kind: "disable",
-		phase: "index-committed",
 		initiatedBy: "source-device",
 		sourceRevision: 1,
 		targetRevision: 2,
-		source: {
-			enabled: true,
-			revision: 1,
-			salt: "source-salt",
-			verifier: "source-verifier",
-		},
-		target: {
-			enabled: false,
-			revision: null,
-			salt: null,
-			verifier: null,
-		},
-		cleanup: [],
-	};
+		target: plaintextMode(),
+	});
 	const { manager } = await createIndexManagerWithContent(
 		index,
 		sourceEncryption,
@@ -848,7 +620,7 @@ test("plaintext target recovery reads committed disable canonical without source
 
 async function createIndexManagerWithContent(
 	content: object | string,
-	activeEncryption: EncryptionCodec | null,
+	activeEncryption: EncryptionCodec | null = null,
 	storageEncryption: EncryptionCodec | null = activeEncryption,
 	deviceId = "new-device",
 ): Promise<{
@@ -867,27 +639,20 @@ async function createIndexManagerWithContent(
 	);
 	return {
 		client,
-		manager: new IndexManager(
-			client as unknown as YandexDiskClient,
-			{} as VaultAdapter,
-			createSettings(deviceId),
-		),
+		manager: indexManager(client, deviceId),
 		canonicalPath,
 	};
 }
 
 test("plaintext stable 1.x startup preserves LegacyIndexFormatError", async () => {
-	const { manager } = await createIndexManagerWithContent(
-		stable1xIndex(),
-		null,
-	);
+	const { manager } = await createIndexManagerWithContent(stable1xIndex());
 	await assert.rejects(manager.loadRemoteIndex(), LegacyIndexFormatError);
 });
 
 test("legacy protected plugin data blocks migration without content download", async () => {
 	const source = stable1xIndex();
 	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(source, null);
+		await createIndexManagerWithContent(source);
 	client.files.set(
 		"vault/vault-config/plugins/yandex-disk-sync/data.json",
 		new TextEncoder().encode("must-not-be-read").buffer,
@@ -904,7 +669,7 @@ test("legacy protected plugin data blocks migration without content download", a
 
 test("missing legacy canonical cannot hide exposed plugin data", async () => {
 	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(stable1xIndex(), null);
+		await createIndexManagerWithContent(stable1xIndex());
 	client.files.delete(canonicalPath);
 	client.files.set(
 		"vault/vault-config/plugins/yandex-disk-sync/data.json",
@@ -920,17 +685,11 @@ test("missing legacy canonical cannot hide exposed plugin data", async () => {
 test("legacy service-name collision blocks migration before remote writes", async () => {
 	const source = stable1xIndex();
 	const files = source.files as Record<string, unknown>;
-	files["notes/.obsidian-encrypt.json"] = {
-		path: "notes/.obsidian-encrypt.json",
-		sha256: "collision",
-		size: 3,
-		mtime: 1,
-		syncedAt: 2,
-	};
-	const { manager, client } = await createIndexManagerWithContent(
-		source,
-		null,
+	files["notes/.obsidian-encrypt.json"] = fileMetadata(
+		"notes/.obsidian-encrypt.json",
+		{ sha256: "collision", size: 3, syncedAt: 2 },
 	);
+	const { manager, client } = await createIndexManagerWithContent(source);
 	await assert.rejects(
 		manager.assertLegacyMigrationPathsSafe(),
 		LegacyServicePathCollisionError,
@@ -941,17 +700,12 @@ test("legacy service-name collision blocks migration before remote writes", asyn
 test("legacy paths that current normalization would rewrite block migration", async () => {
 	const source = stable1xIndex();
 	const files = source.files as Record<string, unknown>;
-	files["notes\\name.md"] = {
-		path: "notes\\name.md",
+	files["notes\\name.md"] = fileMetadata("notes\\name.md", {
 		sha256: "legacy-path",
 		size: 3,
-		mtime: 1,
 		syncedAt: 2,
-	};
-	const { manager, client } = await createIndexManagerWithContent(
-		source,
-		null,
-	);
+	});
+	const { manager, client } = await createIndexManagerWithContent(source);
 	await assert.rejects(
 		manager.assertLegacyMigrationPathsSafe(),
 		LegacyServicePathCollisionError,
@@ -960,10 +714,8 @@ test("legacy paths that current normalization would rewrite block migration", as
 });
 
 test("legacy physical-only service collision is not silently filtered", async () => {
-	const { manager, client } = await createIndexManagerWithContent(
-		stable1xIndex(),
-		null,
-	);
+	const { manager, client } =
+		await createIndexManagerWithContent(stable1xIndex());
 	client.files.set(
 		"vault/notes/.obsidian-encrypt.json",
 		new TextEncoder().encode("user-content").buffer,
@@ -975,9 +727,7 @@ test("legacy physical-only service collision is not silently filtered", async ()
 });
 
 test("encrypted legacy startup is rejected as unsupported data", async () => {
-	const encryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0xa5);
 	const { manager, client, canonicalPath } =
 		await createIndexManagerWithContent(stable1xIndex(), encryption);
 	const originalRaw = client.files.get(canonicalPath)!.slice(0);
@@ -993,9 +743,7 @@ test("encrypted legacy startup is rejected as unsupported data", async () => {
 });
 
 test("plaintext legacy index never falls back from an active encryption codec", async () => {
-	const encryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0xa5);
 	const { manager } = await createIndexManagerWithContent(
 		stable1xIndex(),
 		encryption,
@@ -1005,9 +753,7 @@ test("plaintext legacy index never falls back from an active encryption codec", 
 });
 
 test("encrypted current index loads without plaintext fallback", async () => {
-	const encryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0xa5);
 	const { manager } = await createIndexManagerWithContent(
 		{
 			...createEmptyIndex("device-current", "epoch-current"),
@@ -1047,19 +793,16 @@ test("only full discovery may load a replacement current epoch", async () => {
 test("canonical file metadata preserves timestamp precision and validates causal counters", async () => {
 	const index = createEmptyIndex("device-current", "epoch-current");
 	index.revision = 4;
-	index.files["note.md"] = {
-		path: "note.md",
-		sha256: "hash",
+	index.files["note.md"] = fileMetadata("note.md", {
 		size: 4,
 		mtime: 1.375,
-		syncedAt: 1,
 		changedRevision: 4,
 		baseRevision: 3,
 		mutationSeq: 0,
 		lastModifiedBy: "device-current",
-	};
+	});
 	index.appliedMutationSeq["device-current"] = 1;
-	const { manager } = await createIndexManagerWithContent(index, null);
+	const { manager } = await createIndexManagerWithContent(index);
 	assert.equal(
 		(await manager.loadRemoteIndex()).files["note.md"]?.mtime,
 		1.375,
@@ -1076,10 +819,8 @@ test("canonical file metadata preserves timestamp precision and validates causal
 	]) {
 		const invalid = structuredClone(index);
 		Object.assign(invalid.files["note.md"]!, patch);
-		const { manager, client } = await createIndexManagerWithContent(
-			invalid,
-			null,
-		);
+		const { manager, client } =
+			await createIndexManagerWithContent(invalid);
 		await assert.rejects(
 			manager.loadRemoteIndex(),
 			InvalidCurrentIndexError,
@@ -1091,7 +832,7 @@ test("canonical file metadata preserves timestamp precision and validates causal
 test("malformed current canonical is rejected as a semantic index error", async () => {
 	const malformed = createEmptyIndex("device-current", "epoch-current");
 	(malformed as unknown as { files: unknown }).files = [];
-	const { manager } = await createIndexManagerWithContent(malformed, null);
+	const { manager } = await createIndexManagerWithContent(malformed);
 	await assert.rejects(
 		manager.loadRemoteIndex(),
 		(error: unknown) =>
@@ -1101,29 +842,16 @@ test("malformed current canonical is rejected as a semantic index error", async 
 });
 
 test("malformed maintenance is rejected before any remote write", async () => {
-	const source = {
-		enabled: true,
-		revision: 1,
-		salt: "source-salt",
-		verifier: "source-verifier",
-	};
-	const target = {
-		enabled: true,
-		revision: 2,
-		salt: "target-salt",
-		verifier: "target-verifier",
-	};
-	const valid = {
-		id: "transition-a",
+	const source = encryptedMode();
+	const target = encryptedMode(2, "target-salt", "target-verifier");
+	const valid = createMaintenance({
 		kind: "rotate" as const,
 		phase: "index-committed" as const,
-		initiatedBy: "device-a",
-		sourceRevision: 4,
 		targetRevision: 6,
 		source,
 		target,
 		cleanup: [{ path: "old-raw", expectedFingerprint: "sha256:old" }],
-	};
+	});
 	const variants: unknown[] = [
 		{ ...valid, extra: true },
 		{ ...valid, phase: "prepared", targetRevision: 6 },
@@ -1144,59 +872,29 @@ test("malformed maintenance is rejected before any remote write", async () => {
 			],
 		},
 	];
-	for (const maintenance of variants) {
-		const index = createEmptyIndex("device-current", "epoch-current");
-		index.maintenance = maintenance as typeof index.maintenance;
-		const { manager, client } = await createIndexManagerWithContent(
-			index,
-			null,
-		);
+	const cases = [
+		...variants.map((maintenance) => ({ revision: 0, maintenance })),
+		...[5, 7].map((targetRevision) => ({
+			revision: 6,
+			maintenance: { ...valid, targetRevision },
+		})),
+		{ revision: 8, maintenance: { ...valid, phase: "cleanup" } },
+		{ revision: 6, maintenance: { ...valid, phase: "stable" } },
+		{ revision: 6, maintenance: { ...valid, sourceRevision: 6 } },
+	];
+	for (const { revision, maintenance } of cases) {
+		const index = {
+			...createEmptyIndex("device-current", "epoch-current"),
+			revision,
+			maintenance,
+		};
+		const { manager, client } = await createIndexManagerWithContent(index);
 		await assert.rejects(
 			manager.loadRemoteIndex(),
 			InvalidCurrentIndexError,
 		);
 		assert.equal(client.moveCount, 0);
 	}
-	for (const targetRevision of [5, 7]) {
-		const index = createEmptyIndex("device-current", "epoch-current");
-		index.revision = 6;
-		index.maintenance = { ...valid, targetRevision };
-		const { manager, client } = await createIndexManagerWithContent(
-			index,
-			null,
-		);
-		await assert.rejects(
-			manager.loadRemoteIndex(),
-			InvalidCurrentIndexError,
-		);
-		assert.equal(client.moveCount, 0);
-	}
-	for (const [phase, revision] of [
-		["cleanup", 8],
-		["stable", 6],
-	] as const) {
-		const index = createEmptyIndex("device-current", "epoch-current");
-		index.revision = revision;
-		index.maintenance = { ...valid, phase };
-		const { manager, client } = await createIndexManagerWithContent(
-			index,
-			null,
-		);
-		await assert.rejects(
-			manager.loadRemoteIndex(),
-			InvalidCurrentIndexError,
-		);
-		assert.equal(client.moveCount, 0);
-	}
-	const staleSource = createEmptyIndex("device-current", "epoch-current");
-	staleSource.revision = 6;
-	staleSource.maintenance = { ...valid, sourceRevision: 6 };
-	const { manager, client } = await createIndexManagerWithContent(
-		staleSource,
-		null,
-	);
-	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
-	assert.equal(client.moveCount, 0);
 });
 
 test("current canonical rejects an extra numeric format marker", async () => {
@@ -1204,10 +902,7 @@ test("current canonical rejects an extra numeric format marker", async () => {
 		...createEmptyIndex("device-current", "epoch-current"),
 		version: 4,
 	};
-	const { manager, client } = await createIndexManagerWithContent(
-		current,
-		null,
-	);
+	const { manager, client } = await createIndexManagerWithContent(current);
 	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
 	assert.equal(client.moveCount, 0);
 });
@@ -1217,17 +912,14 @@ test("canonical transaction accepts causal continuation and rejects foreign edit
 		const foreign = author === "device-b";
 		const current = createEmptyIndex(author, "epoch-a");
 		current.revision = 36;
-		current.files["note.md"] = {
-			path: "note.md",
+		current.files["note.md"] = fileMetadata("note.md", {
 			sha256: "previous",
 			size: 8,
-			mtime: 1,
-			syncedAt: 1,
 			changedRevision: 36,
 			baseRevision: 35,
 			lastModifiedBy: author,
 			mutationSeq: foreign ? 3 : 7,
-		};
+		});
 		current.appliedMutationSeq = { "device-a": 7, "device-b": 3 };
 		const { manager, client, canonicalPath } =
 			await createIndexManagerWithContent(
@@ -1288,9 +980,7 @@ test("canonical transaction accepts causal continuation and rejects foreign edit
 test("wrong encrypted index key is classified as unreadable", async () => {
 	const currentEncryption =
 		new RejectingEncryptionService() as unknown as EncryptionCodec;
-	const storageEncryption = new XorEncryptionService(
-		0x5a,
-	) as unknown as EncryptionCodec;
+	const storageEncryption = xorCodec(0x5a);
 	const { manager } = await createIndexManagerWithContent(
 		{
 			...createEmptyIndex("device-current", "epoch-current"),
@@ -1315,14 +1005,12 @@ test("wrong encrypted index key is classified as unreadable", async () => {
 });
 
 test("invalid plaintext index is classified as unreadable", async () => {
-	const { manager } = await createIndexManagerWithContent("not-json", null);
+	const { manager } = await createIndexManagerWithContent("not-json");
 	await assert.rejects(manager.loadRemoteIndex(), UnreadableRemoteIndexError);
 });
 
 test("historical format errors are not masked by codec fallback", async () => {
-	const encryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0xa5);
 	const { manager } = await createIndexManagerWithContent(
 		{ version: 999, files: {} },
 		encryption,
@@ -1348,9 +1036,7 @@ test("numeric historical canonical formats are rejected during normal load", asy
 });
 
 test("explicit transition codec does not fall back to plaintext", async () => {
-	const encryption = new XorEncryptionService(
-		0xa5,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0xa5);
 	const { manager, client, canonicalPath } =
 		await createIndexManagerWithContent(
 			{
@@ -1382,27 +1068,18 @@ test("explicit transition codec does not fall back to plaintext", async () => {
 test("Force rejects numeric historical canonical before any remote move", async () => {
 	const client = new FakeIndexYandex("vault", null);
 	const canonicalPath = "vault/.obsidian-sync-index.json";
-	const source = new TextEncoder().encode(
-		JSON.stringify({
-			version: 4,
-			revision: 1,
-			files: {},
-		}),
-	).buffer;
-	client.files.set(canonicalPath, source.slice(0));
-	const manager = new IndexManager(
-		client as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
-	manager.beginForceBootstrap(true);
-	manager.updateRemoteFile("note.md", {
-		path: "note.md",
-		sha256: "hash",
-		size: 4,
-		mtime: 10,
-		syncedAt: 10,
+	const source = jsonBytes({
+		version: 4,
+		revision: 1,
+		files: {},
 	});
+	client.files.set(canonicalPath, source.slice(0));
+	const manager = indexManager(client, "device-a");
+	manager.beginForceBootstrap(true);
+	manager.updateRemoteFile(
+		"note.md",
+		fileMetadata("note.md", { size: 4, mtime: 10, syncedAt: 10 }),
+	);
 	await assert.rejects(
 		manager.saveRemoteIndex(),
 		UnsupportedHistoricalDataError,
@@ -1423,10 +1100,7 @@ test("Force canonical proof becomes stale before any replacement write", async (
 	const proof = await manager.captureForceCanonicalProof();
 	const changed = createEmptyIndex("device-b", "epoch-b");
 	changed.revision = 1;
-	client.files.set(
-		canonicalPath,
-		new TextEncoder().encode(JSON.stringify(changed)).buffer,
-	);
+	client.files.set(canonicalPath, jsonBytes(changed));
 	await assert.rejects(
 		manager.assertForceCanonicalProof(proof),
 		ForceBackupStaleError,
@@ -1442,38 +1116,33 @@ test("successful final move with a lost response still commits", async () => {
 });
 
 test("unverified modified lock restores the encrypted source bytes", async () => {
-	const encryption = new XorEncryptionService(
-		0x5a,
-	) as unknown as EncryptionCodec;
+	const encryption = xorCodec(0x5a);
 	const client = new FakeIndexYandex("vault", encryption, {
 		corruptIndexUpload: true,
 	});
 	const canonicalPath = "vault/.obsidian-sync-index.json";
 	const current = createEmptyIndex("device-a", "epoch-a");
-	const plain = new TextEncoder().encode(JSON.stringify(current)).buffer;
+	const plain = jsonBytes(current);
 	client.files.set(canonicalPath, await encryption.encrypt(plain));
 	const originalRaw = client.files.get(canonicalPath)!.slice(0);
-	const manager = new IndexManager(
-		client as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
+	const manager = indexManager(client, "device-a");
 	await manager.loadRemoteIndex();
 	const mutation = manager.enqueueMutation("put", "note.md", {
 		sha256: "hash",
 		baseRevision: 0,
 		epoch: "epoch-a",
 	});
-	manager.updateRemoteFile("note.md", {
-		path: "note.md",
-		sha256: "hash",
-		size: 4,
-		mtime: 10,
-		syncedAt: 10,
-		mutationSeq: mutation.seq,
-		lastModifiedBy: "device-a",
-		baseRevision: 0,
-	});
+	manager.updateRemoteFile(
+		"note.md",
+		fileMetadata("note.md", {
+			size: 4,
+			mtime: 10,
+			syncedAt: 10,
+			mutationSeq: mutation.seq,
+			lastModifiedBy: "device-a",
+			baseRevision: 0,
+		}),
+	);
 	manager.stageMutation(mutation);
 
 	await assert.rejects(manager.saveRemoteIndex(), RemoteIndexRolledBackError);
@@ -1522,17 +1191,14 @@ test("foreign target recovery survives restart at each persistent step without r
 		for (const crashAt of ["manifest", "canonical", "physical"] as const) {
 			const canonical = createEmptyIndex("A", "E2");
 			canonical.revision = 5;
-			canonical.files["note.md"] = {
-				path: "note.md",
+			canonical.files["note.md"] = fileMetadata("note.md", {
 				sha256: await computeSha256(bytes),
 				size: bytes.byteLength,
-				mtime: 1,
-				syncedAt: 1,
 				mutationSeq: 0,
 				changedRevision: 5,
 				baseRevision: 4,
 				lastModifiedBy: "A",
-			};
+			});
 			const target = {
 				enabled: targetCodec !== null,
 				revision: targetCodec ? 2 : null,
@@ -1543,30 +1209,16 @@ test("foreign target recovery survives restart at each persistent step without r
 					: null,
 				verifier: targetCodec ? verifier : null,
 			};
-			canonical.maintenance = {
+			canonical.maintenance = createMaintenance({
 				id: "transition-A",
 				kind,
-				phase: "index-committed",
 				initiatedBy: "A",
-				sourceRevision: 4,
-				targetRevision: 5,
 				source:
 					kind === "enable"
-						? {
-								enabled: false,
-								revision: null,
-								salt: null,
-								verifier: null,
-							}
-						: {
-								enabled: true,
-								revision: 1,
-								salt: "source-salt",
-								verifier: "source-verifier",
-							},
+						? plaintextMode()
+						: encryptedMode(1, "source-salt", "source-verifier"),
 				target,
-				cleanup: [],
-			};
+			});
 			const { client } = await createIndexManagerWithContent(
 				canonical,
 				targetCodec,
@@ -1581,7 +1233,10 @@ test("foreign target recovery survives restart at each persistent step without r
 					path: "old-object",
 					expectedFingerprint: (await client.getResource(
 						"vault/old-object",
-					))!.md5!,
+						1000,
+						0,
+						true,
+					))!.sha256!,
 				},
 			];
 			await client.uploadFile(
@@ -1591,11 +1246,7 @@ test("foreign target recovery survives restart at each persistent step without r
 			let stablePublished = false;
 			let interrupted = false;
 			const run = async () => {
-				const manager = new IndexManager(
-					client as unknown as YandexDiskClient,
-					{} as VaultAdapter,
-					createSettings("B"),
-				);
+				const manager = indexManager(client, "B");
 				manager.loadLocalIndexFromData({
 					observedEpoch: "E1",
 					observedRevision: 2,
@@ -1606,25 +1257,13 @@ test("foreign target recovery survives restart at each persistent step without r
 					sha256: "offline",
 				});
 				const saved = manager.captureLocalCausalState();
-				const cleanupClient = {
-					getResource: client.getResource.bind(client),
-					getPhysicalPath: async () => `vault/${rawTarget}`,
-					deleteResource: async (
-						path: string,
-						_permanent: boolean,
-						_raw: boolean,
-						guard: () => Promise<void>,
-					) => {
-						await guard();
-						await client.deleteResource(path);
-					},
-				} as unknown as YandexDiskClient;
+
 				const controller = new EncryptionTransitionController(
 					manager,
 					{} as never,
 					{} as never,
 					{
-						client: cleanupClient,
+						client,
 						getRemotePath: () => "vault",
 						completeAction: () => {},
 						persist: async () => {},

@@ -93,7 +93,7 @@ export async function executeGuardedRemoteMove(
 		deps.yandexClient.getLogicalResource(remoteFrom),
 		deps.yandexClient.getLogicalResource(remoteTo),
 	]);
-	if (move.kind === "folder" && !sourceRetainsMoveIntent) {
+	if (!sourceRetainsMoveIntent) {
 		if (target) {
 			if (
 				!(await remoteResourceMatchesCanonical(

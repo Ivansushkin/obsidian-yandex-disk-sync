@@ -23,6 +23,12 @@ export interface CanonicalCommitProof {
 	contentFingerprint: string;
 }
 
+/** Immutable service-file observation protected by a single Force preflight. */
+export interface IndexLockObservation {
+	name: string;
+	fingerprint: string;
+}
+
 export type IndexMoveRecoveryDecision =
 	"committed" | "retry-move" | "concurrent" | "ambiguous";
 

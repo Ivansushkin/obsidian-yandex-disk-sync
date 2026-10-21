@@ -1,27 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { App, PluginManifest } from "obsidian";
-import YandexDiskSyncPlugin from "../src/main";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
 import { logger } from "../src/utils/logger";
 import stableFixture from "./fixtures/stable-1.1/plugin-data-filled.json";
 import { DEFAULT_SETTINGS, createEmptyLocalState } from "../src/types";
+import { persistenceHarness as harness } from "./helpers/lifecycle-fixtures";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
-interface PersistenceAccess {
-	persistPluginData(): Promise<void>;
-	pluginDataPersistenceTail: Promise<void>;
-}
-
 test("user settings publish only after persistence and retain queues saved ahead of the draft", async () => {
 	const { plugin, persistence, writes } = harness();
-	plugin.loadData = async () => null;
 	await plugin.loadSettings();
 	plugin.settings = { ...plugin.settings, logToFile: false };
 	const old = plugin.settings;
 	let release = () => {};
-	persistence.pluginDataPersistenceTail = new Promise<void>((resolve) => {
+	persistence["pluginDataPersistenceTail"] = new Promise<void>((resolve) => {
 		release = resolve;
 	});
 	const draft = plugin.applySettingsPatch({ enableDebugLogging: true });
@@ -58,7 +51,6 @@ test("user settings publish only after persistence and retain queues saved ahead
 
 test("logging persistence does not replace an internal encryption update queued during the save", async () => {
 	const { plugin, persistence, writes } = harness();
-	plugin.loadData = async () => null;
 	await plugin.loadSettings();
 	plugin.settings = { ...plugin.settings, logToFile: false };
 	let release = () => {};
@@ -77,7 +69,7 @@ test("logging persistence does not replace an internal encryption update queued 
 	const draft = plugin.applySettingsPatch({ enableDebugLogging: true });
 	await waiting;
 	plugin.settings.enableEncryption = true;
-	const internal = persistence.persistPluginData();
+	const internal = persistence["persistPluginData"]();
 	release();
 	await Promise.all([draft, internal]);
 	assert.equal(plugin.settings.enableEncryption, true);
@@ -91,7 +83,6 @@ test("logging persistence does not replace an internal encryption update queued 
 test("accepted connection settings reconcile before automation and preserve a user pause", async () => {
 	for (let paused of [false, true]) {
 		const { plugin, writes } = harness();
-		plugin.loadData = async () => null;
 		await plugin.loadSettings();
 		plugin.settings = { ...plugin.settings, logToFile: false };
 		const order: string[] = [];
@@ -159,39 +150,11 @@ test("accepted connection settings reconcile before automation and preserve a us
 		}
 		assert.equal(plugin.isConfigurationBusy(), false);
 		if (paused) {
-			assert.equal(
-				await (
-					plugin as unknown as {
-						resumeSyncIfReady(): Promise<boolean>;
-					}
-				).resumeSyncIfReady(),
-				true,
-			);
+			assert.equal(await plugin["resumeSyncIfReady"](), true);
 			assert.ok(order.indexOf("full") < order.indexOf("watcher-start"));
 		}
 	}
 });
-
-function harness() {
-	const app = { vault: { getName: () => "test-vault" } } as unknown as App;
-	const manifest = { version: "2.0.0" } as PluginManifest;
-	const plugin = new YandexDiskSyncPlugin(app, manifest);
-	Object.assign(plugin, {
-		app,
-		manifest,
-		getInstallationDeviceId: () => "test-installation",
-	});
-	const writes: unknown[] = [];
-	plugin.saveData = async (value: unknown) => {
-		logger.configure({ consoleEnabled: false, fileEnabled: false });
-		writes.push(value);
-	};
-	return {
-		plugin,
-		persistence: plugin as unknown as PersistenceAccess,
-		writes,
-	};
-}
 
 test("failed plugin load never overwrites storage on save or unload", async () => {
 	const oldWindow = globalThis.window;
@@ -214,14 +177,14 @@ test("failed plugin load never overwrites storage on save or unload", async () =
 					: /storage read failed/,
 			);
 			plugin.onunload();
-			await persistence.pluginDataPersistenceTail;
+			await persistence["pluginDataPersistenceTail"];
 			assert.deepEqual(writes, []);
 			await assert.rejects(
 				plugin.saveSettings(),
 				/not successfully loaded/,
 			);
 			await assert.rejects(
-				persistence.persistPluginData(),
+				persistence["persistPluginData"](),
 				/not successfully loaded/,
 			);
 			assert.deepEqual(writes, []);
@@ -240,7 +203,7 @@ test("stable fractional timestamps survive immediate current migration and unloa
 	assert.equal(writes.length, 1);
 	await plugin.saveSettings();
 	plugin.onunload();
-	await persistence.pluginDataPersistenceTail;
+	await persistence["pluginDataPersistenceTail"];
 	assert.equal(writes.length, 3);
 	for (const written of writes) {
 		const current = written as {
@@ -253,41 +216,19 @@ test("stable fractional timestamps survive immediate current migration and unloa
 			source.localIndex.files["note.md"].mtime,
 		);
 	}
-});
-
-test("fresh nullish plugin storage permits persistence after successful load", async () => {
-	for (const source of [null, undefined]) {
-		const { plugin, writes } = harness();
-		plugin.loadData = async () => source;
-		await plugin.loadSettings();
-		assert.equal(writes.length, 1);
-		assert.equal((writes[0] as { format: string }).format, "plugin-data");
-	}
-});
-
-test("immediate stable migration writes current data accepted by restart", async () => {
-	const { plugin, writes } = harness();
-	const source = structuredClone(stableFixture);
-	source.localIndex.files["note.md"].mtime += 0.375;
-	plugin.loadData = async () => source;
-	await plugin.loadSettings();
-	assert.equal(writes.length, 1);
-	const current = JSON.parse(JSON.stringify(writes[0])) as Record<
+	const current = JSON.parse(JSON.stringify(writes.at(-1))) as Record<
 		string,
 		unknown
 	>;
-	assert.equal(current.format, "plugin-data");
-	const restarted = harness();
-	restarted.plugin.loadData = async () => current;
+	const restarted = harness(current);
 	await restarted.plugin.loadSettings();
-	await restarted.persistence.persistPluginData();
+	await restarted.persistence["persistPluginData"]();
 	assert.deepEqual(JSON.parse(JSON.stringify(restarted.writes[0])), current);
 });
 
 test("failed initial persistence cannot be retried by unload", async () => {
 	const { plugin, persistence } = harness();
 	let attempts = 0;
-	plugin.loadData = async () => null;
 	plugin.saveData = async () => {
 		logger.configure({ consoleEnabled: false, fileEnabled: false });
 		attempts++;
@@ -295,7 +236,7 @@ test("failed initial persistence cannot be retried by unload", async () => {
 	};
 	await assert.rejects(plugin.loadSettings(), /disk unavailable/);
 	plugin.onunload();
-	await persistence.pluginDataPersistenceTail;
+	await persistence["pluginDataPersistenceTail"];
 	assert.equal(attempts, 1);
 	await assert.rejects(plugin.saveSettings(), /not successfully loaded/);
 });
@@ -305,11 +246,11 @@ test("reload invalidates queued saves before reading storage", async () => {
 	plugin.loadData = async () => structuredClone(stableFixture);
 	await plugin.loadSettings();
 	let release = () => {};
-	persistence.pluginDataPersistenceTail = new Promise<void>((resolve) => {
+	persistence["pluginDataPersistenceTail"] = new Promise<void>((resolve) => {
 		release = resolve;
 	});
 	const staleSave = assert.rejects(
-		persistence.persistPluginData(),
+		persistence["persistPluginData"](),
 		/not successfully loaded|superseded/,
 	);
 	plugin.loadData = async () => ({ unsupported: true });
@@ -320,10 +261,10 @@ test("reload invalidates queued saves before reading storage", async () => {
 	release();
 	await Promise.all([staleSave, reload]);
 	plugin.onunload();
-	await persistence.pluginDataPersistenceTail;
+	await persistence["pluginDataPersistenceTail"];
 	assert.equal(writes.length, 1);
 	await assert.rejects(
-		persistence.persistPluginData(),
+		persistence["persistPluginData"](),
 		/not successfully loaded/,
 	);
 });

@@ -240,12 +240,21 @@ export async function saveRemoteIndexOrAbort(
 		if (!(e instanceof RemoteIndexTransactionError)) {
 			throw e;
 		}
-		logger.error("Canonical index transaction did not commit", {
-			outcome: e.outcome,
-			failedStage: e.stage,
-			retryable: e.retryable,
-			error: e,
-		});
+		if (e.outcome === "committed") {
+			result.replacementCommitted = true;
+			await deps.indexSaveCallback?.();
+		}
+		logger.error(
+			e.outcome === "committed"
+				? "Canonical index committed; cleanup incomplete"
+				: "Canonical index transaction did not commit",
+			{
+				outcome: e.outcome,
+				failedStage: e.stage,
+				retryable: e.retryable,
+				error: e,
+			},
+		);
 		result.errors.push(
 			syncErrors.createSyncError(e, "", "none", `canonical-${e.stage}`),
 		);
@@ -285,11 +294,16 @@ export async function saveRemoteIndexBestEffort(
 			) {
 				deps.epochReplacementPending = true;
 			}
-			logger.warn("Realtime canonical index transaction did not commit", {
-				outcome: e.outcome,
-				failedStage: e.stage,
-				error: e,
-			});
+			logger.warn(
+				e.outcome === "committed"
+					? "Realtime canonical index committed; cleanup incomplete"
+					: "Realtime canonical index transaction did not commit",
+				{
+					outcome: e.outcome,
+					failedStage: e.stage,
+					error: e,
+				},
+			);
 			return null;
 		}
 		throw e;

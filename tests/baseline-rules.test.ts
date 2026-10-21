@@ -1,3 +1,4 @@
+import { fileMetadata } from "./helpers/metadata";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { FileMetadata } from "../src/types";
@@ -7,13 +8,7 @@ import {
 } from "../src/sync/local/baseline-rules";
 
 function metadata(path: string, sha256: string): FileMetadata {
-	return {
-		path,
-		sha256,
-		size: 10,
-		mtime: 100,
-		syncedAt: 100,
-	};
+	return fileMetadata(path, { sha256, size: 10, mtime: 100, syncedAt: 100 });
 }
 
 test("empty-operation first sync still creates a complete local baseline", () => {

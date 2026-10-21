@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import { YandexApiError, YandexDiskClient } from "../src/api/yandex-client";
 import { DEFAULT_SETTINGS, type YandexResource } from "../src/types";
 import { IndexManager } from "../src/sync/canonical/manager";
@@ -7,21 +6,13 @@ import type { VaultAdapter } from "../src/api/vault-adapter";
 import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
 import { MemoryDisk, bytes } from "./helpers/sync-flow";
 
-interface TestRequestParams {
-	url: string;
-	method?: string;
-}
-
-interface TestResponse {
-	status: number;
-	json: unknown;
-	arrayBuffer: ArrayBuffer;
-	text: string;
-}
-
-const requestGlobal = globalThis as typeof globalThis & {
-	__obsidianRequestUrl?: (params: TestRequestParams) => Promise<TestResponse>;
-};
+import {
+	createClient,
+	fileResource,
+	httpTest as test,
+	requestGlobal,
+	response,
+} from "./helpers/client-fixtures";
 
 test("remote snapshot retries server listing errors and preserves persistent failures", async () => {
 	for (const [status, failures, invalidBody] of [
@@ -55,56 +46,36 @@ test("remote snapshot retries server listing errors and preserves persistent fai
 			}
 			return await disk.request(params);
 		};
-		try {
-			const client = new YandexDiskClient({
-				token: "synthetic",
-				maxRetries: 2,
-				retryDelay: 0,
-			});
-			if (failures === 9) {
-				await assert.rejects(
-					captureRemoteRawSnapshot(client, "vault"),
-					(error) =>
-						error instanceof YandexApiError && error.status === 500,
-				);
-				assert.equal(listings, 3);
-			} else {
-				const snapshot = await captureRemoteRawSnapshot(
-					client,
-					"vault",
-				);
-				assert.deepEqual(snapshot.files, [
-					{ path: "note.md", content: bytes("remote bytes") },
-				]);
-				assert.equal(listings, 2);
-			}
-		} finally {
-			delete requestGlobal.__obsidianRequestUrl;
+		const client = createClient({ maxRetries: 2 });
+		if (failures === 9) {
+			await assert.rejects(
+				captureRemoteRawSnapshot(client, "vault"),
+				(error) =>
+					error instanceof YandexApiError && error.status === 500,
+			);
+			assert.equal(listings, 3);
+		} else {
+			const snapshot = await captureRemoteRawSnapshot(client, "vault");
+			assert.deepEqual(snapshot.files, [
+				{ path: "note.md", content: bytes("remote bytes") },
+			]);
+			assert.equal(listings, 2);
 		}
 	}
 });
 
-function response(status: number, json: unknown = {}): TestResponse {
+function directory(path: string, items: YandexResource[] = []): YandexResource {
 	return {
-		status,
-		json,
-		arrayBuffer: new ArrayBuffer(0),
-		text: "",
-	};
-}
-
-function fileResource(
-	path: string,
-	identity: Partial<YandexResource> = {},
-): YandexResource {
-	return {
-		name: path.split("/").pop() ?? path,
-		path,
-		type: "file",
-		created: "2026-01-01T00:00:00Z",
-		modified: "2026-01-01T00:00:00Z",
-		size: 4,
-		...identity,
+		...fileResource(path),
+		type: "dir",
+		_embedded: {
+			items,
+			total: items.length,
+			limit: 1000,
+			offset: 0,
+			path,
+			sort: "",
+		},
 	};
 }
 
@@ -189,9 +160,9 @@ class TreeClient extends YandexDiskClient {
 		this.active--;
 		const children: Record<string, YandexResource[]> = {
 			vault: [
-				this.directory("vault/a"),
-				this.directory("vault/b"),
-				this.directory("vault/.backup"),
+				directory("vault/a"),
+				directory("vault/b"),
+				directory("vault/.backup"),
 			],
 			"vault/a": [fileResource("vault/a/a.md", { md5: "a" })],
 			"vault/b": [fileResource("vault/b/b.md", { md5: "b" })],
@@ -200,28 +171,7 @@ class TreeClient extends YandexDiskClient {
 		if (!items) {
 			return null;
 		}
-		return this.directory(path, items);
-	}
-
-	private directory(
-		path: string,
-		items: YandexResource[] = [],
-	): YandexResource {
-		return {
-			name: path.split("/").pop() ?? path,
-			path,
-			type: "dir",
-			created: "2026-01-01T00:00:00Z",
-			modified: "2026-01-01T00:00:00Z",
-			_embedded: {
-				items,
-				total: items.length,
-				limit: 1000,
-				offset: 0,
-				path,
-				sort: "",
-			},
-		};
+		return directory(path, items);
 	}
 }
 
@@ -236,108 +186,55 @@ test("remote tree uses bounded folder concurrency and skips backup", async () =>
 	assert.equal(client.maxActive, 2);
 });
 
-test("observed remote folders skip redundant mkdir", async () => {
-	const calls: string[] = [];
-	requestGlobal.__obsidianRequestUrl = async (params) => {
-		calls.push(`${params.method ?? "GET"} ${params.url}`);
-		return response(200, {
-			...fileResource("vault"),
-			type: "dir",
-			_embedded: { items: [], total: 0, limit: 1, offset: 0 },
-		});
-	};
-	try {
-		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
+const cacheCases = [
+	{
+		name: "observed remote folders skip redundant mkdir",
+		puts: 0,
+		invalidate: async () => {},
+	},
+	{
+		name: "confirmed delete and credential change invalidate folder observations",
+		puts: 2,
+		invalidate: async (client: YandexDiskClient) => {
+			await client.deleteResource("vault", false, true);
+			await client.createFolder("vault");
+			client.setToken("second");
+		},
+	},
+	{
+		name: "not-found delete invalidates a cached folder observation",
+		puts: 1,
+		deleteStatus: 404,
+		invalidate: async (client: YandexDiskClient) => {
+			await client.deleteResource("vault", false, true);
+		},
+	},
+	{
+		name: "encryption codec change invalidates folder observations",
+		puts: 1,
+		invalidate: async (client: YandexDiskClient) => {
+			client.setEncryptionService({} as never);
+		},
+	},
+];
+for (const scenario of cacheCases) {
+	test(scenario.name, async () => {
+		let puts = 0;
+		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
+			if (method === "PUT") {
+				puts++;
+			}
+			return method === "DELETE"
+				? response(scenario.deleteStatus ?? 204)
+				: response(method === "PUT" ? 201 : 200, directory("vault"));
+		};
+		const client = createClient();
 		await client.getResource("vault", 1, 0, true);
+		await scenario.invalidate(client);
 		await client.createFolderRecursive("vault");
-		assert.equal(calls.filter((call) => call.startsWith("PUT ")).length, 0);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
-});
-
-test("confirmed delete and credential change invalidate folder observations", async () => {
-	const methods: string[] = [];
-	requestGlobal.__obsidianRequestUrl = async (params) => {
-		const method = params.method ?? "GET";
-		methods.push(method);
-		if (method === "GET") {
-			return response(200, {
-				...fileResource("vault"),
-				type: "dir",
-				_embedded: { items: [], total: 0, limit: 1, offset: 0 },
-			});
-		}
-		return response(method === "DELETE" ? 204 : 201);
-	};
-	try {
-		const client = new YandexDiskClient({ token: "first", maxRetries: 0 });
-		await client.getResource("vault", 1, 0, true);
-		await client.deleteResource("vault", false, true);
-		await client.createFolder("vault");
-		client.setToken("second");
-		await client.createFolder("vault");
-		assert.equal(methods.filter((method) => method === "PUT").length, 2);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
-});
-
-test("not-found delete invalidates a cached folder observation", async () => {
-	let folderCreates = 0;
-	requestGlobal.__obsidianRequestUrl = async (params) => {
-		const method = params.method ?? "GET";
-		if (method === "DELETE") {
-			return response(404, {
-				error: "DiskNotFoundError",
-				description: "Resource is absent",
-			});
-		}
-		if (method === "PUT") {
-			folderCreates++;
-			return response(201);
-		}
-		return response(200, {
-			...fileResource("vault/folder"),
-			type: "dir",
-			_embedded: { items: [], total: 0, limit: 1, offset: 0 },
-		});
-	};
-	try {
-		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
-		await client.getResource("vault/folder", 1, 0, true);
-		await client.deleteResource("vault/folder", false, true);
-		await client.createFolder("vault/folder");
-		assert.equal(folderCreates, 1);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
-});
-
-test("encryption codec change invalidates folder observations", async () => {
-	const methods: string[] = [];
-	requestGlobal.__obsidianRequestUrl = async (params) => {
-		const method = params.method ?? "GET";
-		methods.push(method);
-		if (method === "GET") {
-			return response(200, {
-				...fileResource("vault"),
-				type: "dir",
-				_embedded: { items: [], total: 0, limit: 1, offset: 0 },
-			});
-		}
-		return response(201);
-	};
-	try {
-		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
-		await client.getResource("vault", 1, 0, true);
-		client.setEncryptionService({} as never);
-		await client.createFolder("vault");
-		assert.equal(methods.filter((method) => method === "PUT").length, 1);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
-});
+		assert.equal(puts, scenario.puts);
+	});
+}
 
 test("unknown folder conflict requires directory readback", async () => {
 	requestGlobal.__obsidianRequestUrl = async (params) => {
@@ -350,12 +247,8 @@ test("unknown folder conflict requires directory readback", async () => {
 		}
 		return response(200, fileResource("vault"));
 	};
-	try {
-		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
-		await assert.rejects(client.createFolder("vault"), /Path is occupied/);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
+	const client = createClient();
+	await assert.rejects(client.createFolder("vault"), /Path is occupied/);
 });
 
 test("exclusive upload conflict never retries through folder creation", async () => {
@@ -367,23 +260,19 @@ test("exclusive upload conflict never retries through folder creation", async ()
 			description: "Upload target exists",
 		});
 	};
-	try {
-		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
-		await assert.rejects(
-			client.uploadFile(
-				"vault/file.md",
-				new ArrayBuffer(0),
-				true,
-				true,
-				false,
-			),
-			/Upload target exists/,
-		);
-		assert.equal(calls.length, 1);
-		assert.equal(calls[0]?.includes("/resources/upload?"), true);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
+	const client = createClient();
+	await assert.rejects(
+		client.uploadFile(
+			"vault/file.md",
+			new ArrayBuffer(0),
+			true,
+			true,
+			false,
+		),
+		/Upload target exists/,
+	);
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0]?.includes("/resources/upload?"), true);
 });
 
 test("missing cached upload parent is recreated before retry", async () => {
@@ -409,27 +298,19 @@ test("missing cached upload parent is recreated before retry", async () => {
 			folderCreates++;
 			return response(201);
 		}
-		return response(200, {
-			...fileResource("vault/folder"),
-			type: "dir",
-			_embedded: { items: [], total: 0, limit: 1, offset: 0 },
-		});
+		return response(200, directory("vault/folder"));
 	};
-	try {
-		const client = new YandexDiskClient({ token: "test", maxRetries: 0 });
-		await client.getResource("vault/folder", 1, 0, true);
-		await client.uploadFile(
-			"vault/folder/file.md",
-			new ArrayBuffer(0),
-			true,
-			true,
-		);
-		assert.equal(uploadLinkAttempts, 2);
-		assert.equal(folderCreates, 1);
-		assert.equal(contentUploads, 1);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
+	const client = createClient();
+	await client.getResource("vault/folder", 1, 0, true);
+	await client.uploadFile(
+		"vault/folder/file.md",
+		new ArrayBuffer(0),
+		true,
+		true,
+	);
+	assert.equal(uploadLinkAttempts, 2);
+	assert.equal(folderCreates, 1);
+	assert.equal(contentUploads, 1);
 });
 
 test("DELETE retry revalidates revoked authority before sending another request", async () => {
@@ -446,80 +327,64 @@ test("DELETE retry revalidates revoked authority before sending another request"
 		remoteBytes = new ArrayBuffer(0);
 		return response(204);
 	};
-	try {
-		const client = new YandexDiskClient({
-			token: "synthetic",
-			maxRetries: 2,
-			retryDelay: 0,
-		});
-		await assert.rejects(
-			client.deleteResource("vault/note.md", false, true, async () => {
-				if (!authorized) {
-					throw new Error("cleanup authority revoked");
-				}
-			}),
-			/authority revoked/,
-		);
-		assert.equal(requests, 1);
-		assert.deepEqual(remoteBytes, original);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
+	const client = createClient({ maxRetries: 2 });
+	await assert.rejects(
+		client.deleteResource("vault/note.md", false, true, async () => {
+			if (!authorized) {
+				throw new Error("cleanup authority revoked");
+			}
+		}),
+		/authority revoked/,
+	);
+	assert.equal(requests, 1);
+	assert.deepEqual(remoteBytes, original);
 });
 
 test("DELETE guard failures are not treated as resource absence", async () => {
-	const client = new YandexDiskClient({
-		token: "synthetic",
-		maxRetries: 1,
-		retryDelay: 0,
-	});
-	try {
-		for (const priorAttempts of [0, 1]) {
-			for (const failure of [
-				new YandexApiError("canonical disappeared", 404),
-				new YandexApiError("authentication failed", 401),
-				new Error("decryption failed"),
-			]) {
-				let sent = 0;
-				requestGlobal.__obsidianRequestUrl = async () => {
-					sent++;
-					return response(503);
-				};
-				await assert.rejects(
-					client.deleteResource(
-						"vault/note.md",
-						false,
-						true,
-						async () => {
-							if (sent === priorAttempts) {
-								throw failure;
-							}
-						},
-					),
-					(error) => error === failure,
-				);
-				assert.equal(sent, priorAttempts);
-			}
+	const client = createClient({ maxRetries: 1 });
+	for (const priorAttempts of [0, 1]) {
+		for (const failure of [
+			new YandexApiError("canonical disappeared", 404),
+			new YandexApiError("authentication failed", 401),
+			new Error("decryption failed"),
+		]) {
+			let sent = 0;
+			requestGlobal.__obsidianRequestUrl = async () => {
+				sent++;
+				return response(503);
+			};
+			await assert.rejects(
+				client.deleteResource(
+					"vault/note.md",
+					false,
+					true,
+					async () => {
+						if (sent === priorAttempts) {
+							throw failure;
+						}
+					},
+				),
+				(error) => error === failure,
+			);
+			assert.equal(sent, priorAttempts);
 		}
-		let checked = false;
-		requestGlobal.__obsidianRequestUrl = async () => {
-			assert.equal(checked, true);
-			return response(404);
-		};
-		await client.deleteResource("vault/note.md", false, true, async () => {
-			checked = true;
-		});
-		requestGlobal.__obsidianRequestUrl = async (params) =>
-			params.method === "DELETE"
-				? response(202, { href: "https://synthetic.invalid/operation" })
-				: response(404);
-		await assert.rejects(
-			client.deleteResource("vault/note.md", false, true),
-			(error) => error instanceof YandexApiError && error.status === 404,
-		);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
 	}
+	let checked = false;
+	requestGlobal.__obsidianRequestUrl = async () => {
+		assert.equal(checked, true);
+		return response(404);
+	};
+	await client.deleteResource("vault/note.md", false, true, async () => {
+		checked = true;
+	});
+	requestGlobal.__obsidianRequestUrl = async (params) =>
+		params.method === "DELETE"
+			? response(202, { href: "https://synthetic.invalid/operation" })
+			: response(404);
+	await assert.rejects(
+		client.deleteResource("vault/note.md", false, true),
+		(error) => error instanceof YandexApiError && error.status === 404,
+	);
 });
 
 test("direct download retries transient transfer failures with fresh links and stops at final errors", async () => {
@@ -563,37 +428,29 @@ test("direct download retries transient transfer failures with fresh links and s
 			}
 			return { ...response(200), arrayBuffer: content };
 		};
-		try {
-			const client = new YandexDiskClient({
-				token: "synthetic",
-				maxRetries: 2,
-				retryDelay: 0,
-			});
-			if (kind === "exhausted") {
-				await assert.rejects(
-					client.downloadFile("vault/note.md"),
-					/connection abort/,
-				);
-			} else if (kind === "authentication") {
-				await assert.rejects(
-					client.downloadFile("vault/note.md"),
-					(error) =>
-						error instanceof YandexApiError && error.status === 401,
-				);
-			} else {
-				assert.deepEqual(
-					await client.downloadFile("vault/note.md"),
-					content,
-				);
-			}
-			assert.equal(
-				transfers,
-				kind === "exhausted" ? 3 : kind === "authentication" ? 1 : 2,
+		const client = createClient({ maxRetries: 2 });
+		if (kind === "exhausted") {
+			await assert.rejects(
+				client.downloadFile("vault/note.md"),
+				/connection abort/,
 			);
-			assert.equal(links, transfers);
-		} finally {
-			delete requestGlobal.__obsidianRequestUrl;
+		} else if (kind === "authentication") {
+			await assert.rejects(
+				client.downloadFile("vault/note.md"),
+				(error) =>
+					error instanceof YandexApiError && error.status === 401,
+			);
+		} else {
+			assert.deepEqual(
+				await client.downloadFile("vault/note.md"),
+				content,
+			);
 		}
+		assert.equal(
+			transfers,
+			kind === "exhausted" ? 3 : kind === "authentication" ? 1 : 2,
+		);
+		assert.equal(links, transfers);
 	}
 });
 
@@ -612,22 +469,15 @@ test("signed download 404 cannot classify a present encryption manifest as absen
 		}
 		return response(404);
 	};
-	try {
-		const client = new YandexDiskClient({
-			token: "synthetic",
-			maxRetries: 0,
-		});
-		const manager = new IndexManager(client, {} as VaultAdapter, {
-			...DEFAULT_SETTINGS,
-			remotePath: "vault",
-		});
-		await assert.rejects(
-			manager.downloadEncryptionManifestForGuard(),
-			/Download HTTP 404/,
-		);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
+	const client = createClient();
+	const manager = new IndexManager(client, {} as VaultAdapter, {
+		...DEFAULT_SETTINGS,
+		remotePath: "vault",
+	});
+	await assert.rejects(
+		manager.downloadEncryptionManifestForGuard(),
+		/Download HTTP 404/,
+	);
 });
 
 test("download budget includes metadata, fresh links and completed network failures", async () => {
@@ -747,18 +597,14 @@ test("unknown response decoding failure stops snapshot capture without transport
 			},
 		});
 	};
-	try {
-		const client = new YandexDiskClient({
-			token: "synthetic",
-			maxRetries: 3,
-			retryDelay: 0,
-		});
-		await assert.rejects(
-			captureRemoteRawSnapshot(client, "vault"),
-			(error) => error === cause,
-		);
-		assert.equal(requests, 1);
-	} finally {
-		delete requestGlobal.__obsidianRequestUrl;
-	}
+	const client = new YandexDiskClient({
+		token: "synthetic",
+		maxRetries: 3,
+		retryDelay: 0,
+	});
+	await assert.rejects(
+		captureRemoteRawSnapshot(client, "vault"),
+		(error) => error === cause,
+	);
+	assert.equal(requests, 1);
 });

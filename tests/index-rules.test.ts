@@ -1,3 +1,4 @@
+import { fileMetadata } from "./helpers/metadata";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { FileMetadata, FolderTombstone } from "../src/types";
@@ -15,30 +16,7 @@ import {
 	advanceMutationSequence,
 } from "../src/sync/canonical/mutation-rules";
 
-function file(
-	path: string,
-	options?: {
-		sha256?: string;
-		deleted?: boolean;
-		changedRevision?: number;
-		deletedByFolder?: string;
-		lastModifiedBy?: string;
-		mutationSeq?: number;
-	},
-): FileMetadata {
-	return {
-		path,
-		sha256: options?.sha256 ?? "hash",
-		size: 1,
-		mtime: 1,
-		syncedAt: 1,
-		deleted: options?.deleted,
-		changedRevision: options?.changedRevision,
-		deletedByFolder: options?.deletedByFolder,
-		lastModifiedBy: options?.lastModifiedBy,
-		mutationSeq: options?.mutationSeq,
-	};
-}
+const file = fileMetadata;
 
 function tombstone(path: string, changedRevision: number): FolderTombstone {
 	return {
@@ -349,184 +327,117 @@ test("accepted merge stamps base and changed revisions", () => {
 	assert.equal(merged?.mutationSeq, 9);
 });
 
+/** Build causally attributed versions without repeating unrelated file metadata. */
+function version(
+	sha256: string,
+	mutationSeq: number,
+	changedRevision?: number,
+	lastModifiedBy = "device-a",
+) {
+	return file("note.md", {
+		sha256,
+		mutationSeq,
+		changedRevision,
+		lastModifiedBy,
+	});
+}
+
+const latest = version("latest", 8, 37);
+const predecessor = version("previous", 7, 36);
+for (const {
+	name,
+	current,
+	incoming,
+	expected,
+	watermark = 8,
+	desired = 8,
+	base = 35,
+} of [
+	{
+		name: "same-device replay is idempotent or stale but never a conflict",
+		current: latest,
+		incoming: { ...latest },
+		expected: "idempotent",
+	},
+	{
+		name: "same-device stale delete cannot remove a newer put",
+		current: latest,
+		incoming: { ...version("old", 7), deleted: true },
+		expected: "stale-same-device",
+	},
+	{
+		name: "same-device put after its own exact delete restores the path",
+		current: { ...predecessor, deleted: true },
+		incoming: version("restored", 8),
+		watermark: 7,
+		expected: "apply",
+	},
+	{
+		name: "foreign edit keeps base-revision conflict rules",
+		current: version("device-b", 3, 36, "device-b"),
+		incoming: version("device-a", 8),
+		watermark: 7,
+		expected: "concurrent-foreign",
+	},
+	{
+		name: "force snapshot is followed by sequence one in the same epoch",
+		current: version("snapshot", 0, 1),
+		incoming: version("edited", 1),
+		watermark: 0,
+		desired: 1,
+		base: 1,
+		expected: "apply",
+	},
+]) {
+	test(name, () => {
+		assert.equal(
+			classifyFileMutation(current, incoming, base, {
+				currentWatermark: watermark,
+				desiredWatermark: desired,
+			}),
+			expected,
+		);
+		if (expected === "idempotent") {
+			assert.equal(
+				classifyFileMutation(current, version("old", 7), base, {
+					currentWatermark: 8,
+					desiredWatermark: 8,
+				}),
+				"stale-same-device",
+			);
+		}
+	});
+}
+
 test("continuous same-device edit ignores an older base revision", () => {
-	const current = file("note.md", {
-		sha256: "previous",
-		changedRevision: 36,
-		lastModifiedBy: "device-a",
-		mutationSeq: 7,
-	});
-	const incoming = file("note.md", {
-		sha256: "latest",
-		lastModifiedBy: "device-a",
-		mutationSeq: 8,
-	});
+	const incoming = version("latest", 8);
+	const sequence = { currentWatermark: 7, desiredWatermark: 8 };
 	assert.equal(
-		classifyFileMutation(current, incoming, 35, {
-			currentWatermark: 7,
-			desiredWatermark: 8,
-		}),
+		classifyFileMutation(predecessor, incoming, 35, sequence),
 		"apply",
 	);
 	assert.equal(
-		mergeFileMutation(current, incoming, 35, 37, "device-a", {
-			currentWatermark: 7,
-			desiredWatermark: 8,
-		})?.sha256,
+		mergeFileMutation(predecessor, incoming, 35, 37, "device-a", sequence)
+			?.sha256,
 		"latest",
 	);
 });
 
-test("same-device replay is idempotent or stale but never a conflict", () => {
-	const current = file("note.md", {
-		sha256: "latest",
-		changedRevision: 37,
-		lastModifiedBy: "device-a",
-		mutationSeq: 8,
-	});
-	assert.equal(
-		classifyFileMutation(current, { ...current }, 35, {
-			currentWatermark: 8,
-			desiredWatermark: 8,
-		}),
-		"idempotent",
-	);
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				sha256: "old",
-				lastModifiedBy: "device-a",
-				mutationSeq: 7,
-			}),
-			35,
-			{ currentWatermark: 8, desiredWatermark: 8 },
-		),
-		"stale-same-device",
-	);
-});
-
-test("same-device stale delete cannot remove a newer put", () => {
-	const current = file("note.md", {
-		sha256: "latest",
-		changedRevision: 37,
-		lastModifiedBy: "device-a",
-		mutationSeq: 8,
-	});
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				deleted: true,
-				lastModifiedBy: "device-a",
-				mutationSeq: 7,
-			}),
-			35,
-			{ currentWatermark: 8, desiredWatermark: 8 },
-		),
-		"stale-same-device",
-	);
-});
-
-test("same-device put after its own exact delete restores the path", () => {
-	const current = file("note.md", {
-		deleted: true,
-		changedRevision: 36,
-		lastModifiedBy: "device-a",
-		mutationSeq: 7,
-	});
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				sha256: "restored",
-				lastModifiedBy: "device-a",
-				mutationSeq: 8,
-			}),
-			35,
-			{ currentWatermark: 7, desiredWatermark: 8 },
-		),
-		"apply",
-	);
-});
-
 test("equal divergent sequence and FIFO gap fail closed", () => {
-	const current = file("note.md", {
-		sha256: "canonical",
-		changedRevision: 37,
-		lastModifiedBy: "device-a",
-		mutationSeq: 8,
-	});
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				sha256: "different",
-				lastModifiedBy: "device-a",
-				mutationSeq: 8,
-			}),
-			35,
-			{ currentWatermark: 8, desiredWatermark: 8 },
-		),
-		"invalid-sequence",
-	);
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				sha256: "future",
-				lastModifiedBy: "device-a",
-				mutationSeq: 10,
-			}),
-			35,
-			{ currentWatermark: 8, desiredWatermark: 8 },
-		),
-		"fifo-gap",
-	);
-});
-
-test("foreign edit keeps base-revision conflict rules", () => {
-	const current = file("note.md", {
-		sha256: "device-b",
-		changedRevision: 36,
-		lastModifiedBy: "device-b",
-		mutationSeq: 3,
-	});
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				sha256: "device-a",
-				lastModifiedBy: "device-a",
-				mutationSeq: 8,
-			}),
-			35,
-			{ currentWatermark: 7, desiredWatermark: 8 },
-		),
-		"concurrent-foreign",
-	);
-});
-
-test("force snapshot is followed by sequence one in the same epoch", () => {
-	const current = file("note.md", {
-		sha256: "snapshot",
-		changedRevision: 1,
-		lastModifiedBy: "device-a",
-		mutationSeq: 0,
-	});
-	assert.equal(
-		classifyFileMutation(
-			current,
-			file("note.md", {
-				sha256: "edited",
-				lastModifiedBy: "device-a",
-				mutationSeq: 1,
-			}),
-			1,
-			{ currentWatermark: 0, desiredWatermark: 1 },
-		),
-		"apply",
-	);
+	for (const [seq, sha, expected] of [
+		[8, "different", "invalid-sequence"],
+		[10, "future", "fifo-gap"],
+	] as const) {
+		assert.equal(
+			classifyFileMutation(
+				version("canonical", 8, 37),
+				version(sha, seq),
+				35,
+				{ currentWatermark: 8, desiredWatermark: 8 },
+			),
+			expected,
+		);
+	}
 });
 
 test("mutation watermark advances only through a contiguous FIFO sequence", () => {

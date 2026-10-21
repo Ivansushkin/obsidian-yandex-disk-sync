@@ -106,6 +106,14 @@ export interface DurableFolderRenameEvent extends DurableFolderEventBase {
 export type DurableFolderEvent =
 	DurableFolderDeleteEvent | DurableFolderRenameEvent;
 
+export type DurableRenameEvent =
+	DurableFileRenameEvent | DurableFolderRenameEvent;
+
+export type RenameBatchResult = Array<
+	| { eventId: string; kind: "file"; outcome: FileRenameOutcome }
+	| { eventId: string; kind: "folder"; outcome: FolderMutationOutcome }
+>;
+
 export interface FolderMutationOutcome {
 	status: "completed" | "superseded" | "retry";
 	canonicalRevision: number | null;
