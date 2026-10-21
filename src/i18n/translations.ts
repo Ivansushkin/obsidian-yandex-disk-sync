@@ -6,6 +6,8 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"status.mobile.expand": "Expand synchronization details",
+		"status.mobile.collapse": "Collapse synchronization details",
 		"failure.stage.upload-verification": "upload result verification",
 		"failure.stage.preflight": "preflight",
 		"failure.stage.confirming": "confirmation",
@@ -424,6 +426,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"status.mobile.expand": "Развернуть подробности синхронизации",
+		"status.mobile.collapse": "Свернуть подробности синхронизации",
 		"failure.stage.upload-verification": "проверка результата загрузки",
 		"failure.stage.preflight": "предварительная проверка",
 		"failure.stage.confirming": "подтверждение",

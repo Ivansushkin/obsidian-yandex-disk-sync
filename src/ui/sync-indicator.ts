@@ -8,15 +8,18 @@ import {
 	getSyncStatusText,
 } from "./sync-status-presentation";
 
-interface MobileSyncContext {
+interface SyncIndicatorContext {
 	sync: SyncState;
 	force: ForceFlowState | null;
 	foreground: "encryption" | "backup" | null;
 }
 
-/** Passive mobile counterpart of the desktop status bar, owned by the plugin lifecycle. */
-export class MobileSyncIndicator extends Component {
-	private element: HTMLElement | null = null;
+/** Shared collapsible status; native disclosure state belongs to this lifecycle only. */
+export class SyncIndicator extends Component {
+	private element: HTMLDetailsElement | null = null;
+	private summaryEl!: HTMLElement;
+	private loaderEl!: HTMLElement;
+	private accessibleStatus = "";
 	private iconEl!: HTMLElement;
 	private textEl!: HTMLElement;
 	private detailEl!: HTMLElement;
@@ -30,7 +33,8 @@ export class MobileSyncIndicator extends Component {
 
 	constructor(
 		private readonly app: App,
-		private readonly readContext: () => MobileSyncContext,
+		private readonly readContext: () => SyncIndicatorContext,
+		private readonly placement: "top" | "bottom",
 	) {
 		super();
 		this.win =
@@ -38,32 +42,51 @@ export class MobileSyncIndicator extends Component {
 	}
 
 	onload(): void {
-		this.element = this.app.workspace.containerEl.createDiv({
-			cls: "yandex-sync-mobile",
+		this.element = this.app.workspace.containerEl.createEl("details", {
+			cls: "yandex-sync-indicator",
+			attr: { "data-placement": this.placement },
+		});
+		this.summaryEl = this.element.createEl("summary", {
+			cls: "yandex-sync-indicator-summary",
+		});
+		this.summaryEl.createSpan({
+			cls: "yandex-sync-indicator-brand",
+			text: "YD",
+		});
+		this.loaderEl = this.summaryEl.createSpan({
+			cls: "yandex-sync-indicator-loader",
+			attr: { "aria-hidden": "true" },
+		});
+		setIcon(this.loaderEl, "loader-circle");
+		this.iconEl = this.summaryEl.createSpan({
+			cls: "yandex-sync-status-icon",
+			attr: { "aria-hidden": "true" },
+		});
+		const content = this.element.createDiv({
+			cls: "yandex-sync-indicator-content",
 			attr: {
 				role: "status",
 				"aria-live": "polite",
 				"aria-atomic": "true",
 			},
 		});
-		this.iconEl = this.element.createSpan({
-			cls: "yandex-sync-status-icon",
-			attr: { "aria-hidden": "true" },
-		});
-		const content = this.element.createDiv({
-			cls: "yandex-sync-mobile-content",
-		});
 		const heading = content.createDiv({
-			cls: "yandex-sync-mobile-heading",
+			cls: "yandex-sync-indicator-heading",
 		});
-		this.textEl = heading.createDiv({ cls: "yandex-sync-mobile-text" });
+		this.textEl = heading.createDiv({ cls: "yandex-sync-indicator-text" });
 		this.progressEl = heading.createSpan({
-			cls: "yandex-sync-mobile-progress",
+			cls: "yandex-sync-indicator-progress",
 		});
-		this.detailEl = content.createDiv({ cls: "yandex-sync-mobile-detail" });
+		this.detailEl = content.createDiv({
+			cls: "yandex-sync-indicator-detail",
+		});
 		this.insetProbe = this.element.createDiv({
-			cls: "yandex-sync-mobile-inset",
+			cls: "yandex-sync-indicator-inset",
 			attr: { "aria-hidden": "true" },
+		});
+		this.registerDomEvent(this.element, "toggle", () => {
+			this.updateDisclosureLabel();
+			this.schedulePosition();
 		});
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => this.update()),
@@ -132,7 +155,7 @@ export class MobileSyncIndicator extends Component {
 		let text: string;
 		let detail = "";
 		let progress = "";
-		let idleLabel = "";
+
 		if (force?.active) {
 			state = { ...sync, status: "syncing" };
 			text = t(`notice.force_phase_${force.phase}`);
@@ -151,8 +174,7 @@ export class MobileSyncIndicator extends Component {
 			state = { ...sync, status: "syncing" };
 			text = t(`status.mobile.${foreground}`);
 		} else if (sync.status === "idle") {
-			text = "YD";
-			idleLabel = t("status.mobile.ready");
+			text = t("status.mobile.ready");
 			if (sync.lastSyncTime) {
 				const time = new Date(sync.lastSyncTime).toLocaleTimeString(
 					[],
@@ -162,8 +184,7 @@ export class MobileSyncIndicator extends Component {
 						hour12: false,
 					},
 				);
-				text += ` · ${time}`;
-				idleLabel = `${t("status.mobile.last_sync")} ${time}`;
+				text = `${t("status.mobile.last_sync")} ${time}`;
 			}
 		} else {
 			text =
@@ -172,8 +193,20 @@ export class MobileSyncIndicator extends Component {
 					: getSyncStatusText(sync);
 			detail = sync.errorMessage ?? "";
 		}
-		this.element.className = `yandex-sync-mobile sync-${state.status}${idleLabel ? " is-compact" : ""}${detail && state.status === "syncing" ? " has-error" : ""}`;
-		const icon = getSyncStatusIcon(state.status);
+		this.element.className = `yandex-sync-indicator sync-${state.status}${detail && state.status === "syncing" ? " has-error" : ""}`;
+		const busy =
+			state.status === "syncing" || state.status === "initializing";
+		this.loaderEl.hidden = !busy;
+		let icon = busy ? "cloud" : getSyncStatusIcon(state.status);
+		if (busy && force?.active) {
+			icon = "replace";
+		}
+		if (busy && foreground) {
+			icon = foreground === "encryption" ? "lock-keyhole" : "archive";
+		}
+		if (busy && detail) {
+			icon = "triangle-alert";
+		}
 		if (this.iconEl.dataset.icon !== icon) {
 			setIcon(this.iconEl, icon);
 			this.iconEl.dataset.icon = icon;
@@ -187,11 +220,24 @@ export class MobileSyncIndicator extends Component {
 		this.detailEl.hidden = !detail;
 		this.progressEl.setText(progress);
 		this.progressEl.hidden = !progress;
-		this.element.setAttribute(
-			"aria-label",
-			`Yandex Disk Sync: ${idleLabel || text}${progress ? ` ${progress}` : ""}${detail ? ` ${detail}` : ""}`,
-		);
+		this.accessibleStatus = busy
+			? t("status.syncing")
+			: state.status === "idle"
+				? t("status.mobile.ready")
+				: getSyncStatusText(state);
+		if (busy && detail) {
+			this.accessibleStatus += ` · ${t("status.error")}`;
+		}
+		this.updateDisclosureLabel();
 		this.schedulePosition();
+	}
+
+	/** Keep the compact control understandable without putting details in its label. */
+	private updateDisclosureLabel(): void {
+		this.summaryEl.setAttribute(
+			"aria-label",
+			`Yandex Disk Sync: ${this.accessibleStatus} · ${t(this.element?.open ? "status.mobile.collapse" : "status.mobile.expand")}`,
+		);
 	}
 
 	/** Workspace restoration can remove plugin-owned nodes during a cold launch. */
@@ -218,7 +264,7 @@ export class MobileSyncIndicator extends Component {
 		});
 	}
 
-	/** Keep all dependence on Obsidian header DOM in this geometry adapter. */
+	/** Keep dependence on Obsidian chrome in this geometry adapter. */
 	private position(): void {
 		if (this.disposed || !this.element) {
 			return;
@@ -243,15 +289,28 @@ export class MobileSyncIndicator extends Component {
 			12,
 			Number.parseFloat(insetStyle.paddingRight) || 0,
 		);
-		// Full-screen content may start under system chrome and floating controls.
-		const reservedTop =
-			viewportTop + Math.max(safeInset, headerOffset) + headerHeight;
-		const view = workspace.getActiveViewOfType(ItemView);
-		const content = view?.contentEl;
+		this.element.style.setProperty(
+			"--yandex-sync-indicator-right",
+			`${this.win.innerWidth - viewportLeft - width + rightGap}px`,
+		);
+		this.element.style.setProperty(
+			"--yandex-sync-indicator-width",
+			`${Math.max(0, Math.min(360, width - leftGap - rightGap))}px`,
+		);
 		const targets = new Set<Element>([
 			workspace.containerEl,
 			this.insetProbe,
 		]);
+		if (this.placement === "bottom") {
+			this.positionAboveStatusBar(viewportTop, viewportBottom, targets);
+			this.observeTargets(targets);
+			return;
+		}
+		// Full-screen mobile content may start under system chrome and floating controls.
+		const reservedTop =
+			viewportTop + Math.max(safeInset, headerOffset) + headerHeight;
+		const view = workspace.getActiveViewOfType(ItemView);
+		const content = view?.contentEl;
 		const contentRect = content?.getBoundingClientRect();
 		let top = reservedTop;
 		if (
@@ -297,17 +356,55 @@ export class MobileSyncIndicator extends Component {
 			}
 		}
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-top",
+			"--yandex-sync-indicator-top",
 			`${top + 8}px`,
 		);
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-right",
-			`${this.win.innerWidth - viewportLeft - width + rightGap}px`,
+			"--yandex-sync-indicator-content-height",
+			`${Math.max(0, viewportBottom - top - 8 - this.summaryEl.getBoundingClientRect().height - 14)}px`,
+		);
+		this.observeTargets(targets);
+	}
+
+	/** Anchor to this window's visible status bar, falling back to the window edge. */
+	private positionAboveStatusBar(
+		viewportTop: number,
+		viewportBottom: number,
+		targets: Set<Element>,
+	): void {
+		if (!this.element) {
+			return;
+		}
+		let anchor = viewportBottom - 8;
+		for (const bar of Array.from(
+			this.win.document.querySelectorAll<HTMLElement>(".status-bar"),
+		)) {
+			targets.add(bar);
+			const rect = bar.getBoundingClientRect();
+			const style = this.win.getComputedStyle(bar);
+			if (
+				rect.width > 0 &&
+				rect.height > 0 &&
+				rect.top >= viewportTop &&
+				rect.top < viewportBottom &&
+				style.visibility !== "hidden" &&
+				style.opacity !== "0"
+			) {
+				anchor = Math.min(anchor, rect.top - 8);
+			}
+		}
+		this.element.style.setProperty(
+			"--yandex-sync-indicator-bottom",
+			`${this.win.innerHeight - anchor}px`,
 		);
 		this.element.style.setProperty(
-			"--yandex-sync-mobile-width",
-			`${Math.max(0, Math.min(360, width - leftGap - rightGap))}px`,
+			"--yandex-sync-indicator-content-height",
+			`${Math.max(0, anchor - this.summaryEl.getBoundingClientRect().height - viewportTop - 22)}px`,
 		);
+	}
+
+	/** Observe only geometry targets still used by the current layout. */
+	private observeTargets(targets: Set<Element>): void {
 		for (const old of this.observed) {
 			if (!targets.has(old)) {
 				this.observer?.unobserve(old);
