@@ -388,7 +388,8 @@
 	min-width: 0;
 }
 
-.force-sync-button-active::before {
+.force-sync-button-active::before,
+.sync-button-active::before {
 	content: "";
 	display: inline-block;
 	width: 0.8em;
@@ -403,7 +404,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.force-sync-button-active::before {
+	.force-sync-button-active::before,
+	.sync-button-active::before {
 		animation: none;
 	}
 }

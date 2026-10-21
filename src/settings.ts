@@ -34,6 +34,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
 	private backupStatusPromise: Promise<string> | null = null;
 	private activityUnsubscribers: (() => void)[] = [];
+	private syncButton: ButtonComponent | null = null;
 	private forceButtons: {
 		button: ButtonComponent;
 		direction: ForceDirection;
@@ -101,6 +102,15 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		if (this.controlsEl) {
 			this.controlsEl.disabled = busy;
 			this.controlsEl.setAttribute("aria-busy", String(busy));
+		}
+		if (this.syncButton) {
+			const active = this.plugin.isFullSyncInProgress();
+			this.syncButton.setDisabled(busy);
+			this.syncButton.setButtonText(
+				t(active ? "settings.syncing_button" : "settings.sync_button"),
+			);
+			this.syncButton.buttonEl.setAttribute("aria-busy", String(active));
+			this.syncButton.buttonEl.toggleClass("sync-button-active", active);
 		}
 		const state = this.plugin.getForceSyncController().getState();
 		const forceUnavailable = this.plugin.isForceSyncUnavailable();
@@ -241,6 +251,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 		this.detachActivity();
 		this.renderGeneration++;
+		this.syncButton = null;
 		this.forceButtons = [];
 		this.plugin.encryptionStateChangeCallback = () => {
 			this.renderSettings();
@@ -348,24 +359,20 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				await this.applyDraft({ yandexTokenSecret: value });
 			});
 
-		const syncButton = new ButtonComponent(controlEl)
+		this.syncButton = new ButtonComponent(controlEl)
 			.setButtonText(t("settings.sync_button"))
 			.setCta();
-		syncButton.onClick(async () => {
-			if (this.plugin.isForceSyncBusy()) {
+		this.syncButton.onClick(async () => {
+			if (this.plugin.isConfigurationBusy()) {
 				return;
 			}
-			syncButton.setDisabled(true);
-			syncButton.setButtonText(t("settings.syncing_button"));
 			try {
 				await this.plugin.runFullSync();
 			} catch {
 				// errors are surfaced via Notice inside runFullSync
-			} finally {
-				syncButton.setDisabled(false);
-				syncButton.setButtonText(t("settings.sync_button"));
 			}
 		});
+		this.updateActivity();
 
 		// Remote path
 		new Setting(containerEl)
