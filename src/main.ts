@@ -1839,6 +1839,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		);
 	}
 
+	/** Include full-sync validation and persistence as well as scheduled engine sessions. */
+	isFullSyncInProgress(): boolean {
+		return Boolean(
+			this.activeFullRuns ||
+			this.syncEngine?.getState().sessionKind === "full",
+		);
+	}
+
 	isConfigurationBusy(): boolean {
 		return Boolean(
 			this.configurationUpdatePending ||

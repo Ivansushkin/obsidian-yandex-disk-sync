@@ -367,6 +367,13 @@ Force и enable/disable/rotate предлагают with-backup, without-backup 
 progress Notice для них не создаётся. Существующие foreground и blocking
 Notice сохраняются без изменений.
 
+Кнопка синхронизации в настройках подписана на общую активность, поэтому loader
+и `aria-busy` отражают любой normal full: ручной, стартовый, после сохранения
+token и по расписанию. UI учитывает validation и persistence внешнего full,
+а также full-сессии scheduler в движке. Кнопка блокируется общим busy-guard;
+другие операции сами по себе не включают full-loader. Повторное открытие
+настроек сразу читает текущую активность; закрытие снимает подписки.
+
 При первой ошибке transfer ещё во время пачки `SyncState.errorMessage` получает
 причину; progress считается по завершённым tasks, включая ошибки, и не увеличивается
 для пропущенных queued tasks. Conflict task увеличивает completed после завершения
