@@ -22,6 +22,8 @@ import * as fullSync from "./workflows/full";
 import { IndexManager } from "./canonical/manager";
 import {
 	type DurableFileRenameEvent,
+	type DurableRenameEvent,
+	type RenameBatchResult,
 	type FileRenameOutcome,
 	type FolderMutationOutcome,
 	type RealtimeBatchResult,
@@ -29,6 +31,7 @@ import {
 	type WatcherCausalContext,
 } from "./realtime/rules";
 import * as realtimeSync from "./realtime/batch";
+import { renameBatchNow } from "./realtime/rename-batch";
 import * as remoteMoves from "./files/remote-moves";
 import type {
 	ExternalSyncBlock,
@@ -844,6 +847,40 @@ export class SyncEngine {
 			batchResult.requiresFullSync = "epoch-replaced";
 		}
 		return batchResult;
+	}
+
+	/** Run ordinary independent renames with shared commits and owned settlement. */
+	async renameBatch(
+		events: readonly DurableRenameEvent[],
+		settle: (
+			outcomes: RenameBatchResult,
+			lifecycle: SyncLifecycleContext,
+		) => void | Promise<void>,
+	): Promise<RenameBatchResult | null> {
+		return await this.coordinator
+			.run(
+				"realtime",
+				() => {
+					this.setSyncPhase("applying", t("status.op.renaming_file"));
+					return renameBatchNow(
+						this.fileRenameDependencies(),
+						events,
+					);
+				},
+				{
+					settle: async (result, session) => {
+						if (result.status === "fulfilled" && result.value) {
+							await settle(result.value, {
+								sessionId: session.id,
+								kind: session.kind,
+							});
+						}
+					},
+				},
+			)
+			.finally(() => {
+				this.realtimeGuardValidationToken = undefined;
+			});
 	}
 
 	/**

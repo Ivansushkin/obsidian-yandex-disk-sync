@@ -134,6 +134,8 @@ barrier не поглощает upload, на который ссылается r
 затронутые physical paths; полный remote-tree scan остаётся обязанностью full
 sync для external edit и orphan detection.
 
+Обычные независимые rename events могут исполняться пачкой до 32 root events внутри одной realtime coordinator-сессии: общий intent commit, плоская очередь guarded file moves с общим concurrency ≤ 4 и общий completion commit. Подготовка file/folder intent используется также одиночным путём; новых persisted records нет. Отбор не перескакивает через excluded/submitted events, upload/delete, зависимости или пересечения source/target. Только неизменённые snapshots с causal baseline входят в fast path; неподходящий префикс возвращается одиночной обработке без allocations. Ошибка либо obsolete physical result не подтверждает watcher event; существующий recovery завершает классификацию. Committed-cleanup error не означает rollback и не разрешает выделить новые sequences.
+
 File rename stages и сохраняет свой FIFO sequence до первого logical commit.
 Retry перечитывает canonical и использует исходную pending mutation; непрерывные
 target puts, поглощённые тем же snapshot, завершаются watermark-only no-op без

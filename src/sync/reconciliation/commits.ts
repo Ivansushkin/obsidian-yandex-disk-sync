@@ -294,11 +294,16 @@ export async function saveRemoteIndexBestEffort(
 			) {
 				deps.epochReplacementPending = true;
 			}
-			logger.warn("Realtime canonical index transaction did not commit", {
-				outcome: e.outcome,
-				failedStage: e.stage,
-				error: e,
-			});
+			logger.warn(
+				e.outcome === "committed"
+					? "Realtime canonical index committed; cleanup incomplete"
+					: "Realtime canonical index transaction did not commit",
+				{
+					outcome: e.outcome,
+					failedStage: e.stage,
+					error: e,
+				},
+			);
 			return null;
 		}
 		throw e;
