@@ -1,7 +1,10 @@
 import { logger } from "../utils/logger";
 import { createSyncFailure } from "../sync/errors";
 import type { YandexDiskClient } from "../api/yandex-client";
-import { matchesPhysicalResourceFingerprint } from "../utils/resource-fingerprint";
+import {
+	getPhysicalResourceFingerprint,
+	matchesPhysicalResourceFingerprint,
+} from "../utils/resource-fingerprint";
 import {
 	getAncestorDirectoriesDeepestFirst,
 	joinPath,
@@ -19,6 +22,7 @@ import type {
 import type { PhysicalRewriteUploadProof } from "../sync/engine";
 import { isProtectedPath, normalizePath } from "../utils/path-utils";
 import { protectRecord } from "../utils/record-utils";
+import { computeSha256 } from "../utils/hash-utils";
 
 export interface LocalEncryptionSnapshot {
 	enabled: boolean;
@@ -49,6 +53,81 @@ export interface LocalEncryptionTransition {
 	targetFingerprints: Record<string, string>;
 	sourceCanonicalRevision: number;
 	backupProof: EncryptionBackupProof | null;
+}
+
+/** Verify target bytes and persist the strict proof before returning a file stamp. */
+export async function verifyTransitionTargetObject(
+	io: {
+		client: YandexDiskClient;
+		remotePath: string;
+		persist(): Promise<void>;
+	},
+	transition: LocalEncryptionTransition,
+	logicalPath: string,
+	expectedSha256: string,
+	targetService: EncryptionCodec | null,
+	allowMissing: boolean,
+): Promise<PhysicalRewriteUploadProof | null> {
+	const rawPath = transition.targetRawByLogicalPath[logicalPath];
+	if (!rawPath) {
+		throw new Error(
+			`Transition target mapping is missing for ${logicalPath}`,
+		);
+	}
+	if (transition.target.enabled !== Boolean(targetService)) {
+		throw new Error("Transition target codec does not match its mode");
+	}
+	const snapshot = await io.client.downloadStableRawFile(
+		joinPath(io.remotePath, rawPath),
+	);
+	if (!snapshot) {
+		if (allowMissing) {
+			if (
+				Object.prototype.hasOwnProperty.call(
+					transition.targetFingerprints,
+					rawPath,
+				)
+			) {
+				delete transition.targetFingerprints[rawPath];
+				await io.persist();
+			}
+			return null;
+		}
+		throw new Error(`Transition target disappeared for ${logicalPath}`);
+	}
+	const decodedPath = await io.client.decodePhysicalUserPath(
+		rawPath,
+		targetService,
+	);
+	if (decodedPath !== logicalPath) {
+		throw new Error(
+			`Transition target decodes to a different logical path`,
+		);
+	}
+	const plaintext = targetService
+		? await targetService.decrypt(snapshot.raw)
+		: snapshot.raw;
+	if ((await computeSha256(plaintext)) !== expectedSha256) {
+		throw new Error(
+			`Transition target content does not match ${logicalPath}`,
+		);
+	}
+	const remoteFingerprint = getPhysicalResourceFingerprint(snapshot.resource);
+	if (!remoteFingerprint) {
+		throw new Error("Transition target has no physical fingerprint");
+	}
+	Object.defineProperty(transition.targetFingerprints, rawPath, {
+		value: snapshot.fingerprint,
+		writable: true,
+		enumerable: true,
+		configurable: true,
+	});
+	await io.persist();
+	const remoteMtime = new Date(snapshot.resource.modified).getTime();
+	return {
+		remoteFingerprint,
+		remoteMtime: Number.isFinite(remoteMtime) ? remoteMtime : undefined,
+	};
 }
 
 interface EncryptionTransitionLifecycle {

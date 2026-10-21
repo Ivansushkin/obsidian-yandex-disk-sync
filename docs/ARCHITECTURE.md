@@ -80,6 +80,14 @@ high-watermark `appliedMutationSeq`.
 ложный конфликт. Для другого device ID по-прежнему применяется сравнение с
 baseline/base revision; одинаковый sequence с разным logical state и FIFO gap
 блокируют commit как повреждённое причинное состояние.
+Проверенное обновление только `remoteFingerprint`/`remoteMtime` не является
+логической mutation, в том числе для существующей записи с `mutationSeq: 0`.
+Под canonical lock сравнивается вся исходная file entry: уже совпавшее target
+состояние идемпотентно, любое другое изменение этой entry отклоняет устаревший
+stamp. Изменения других entries не мешают commit. Все причинные поля, watermark,
+plaintext SHA и пользовательские bytes сохраняются; глобальная revision меняется
+только при фактическом обновлении canonical. Старые prefixed stamps исправляются
+после stable logical read-back, без Force и перенумерации очередей.
 Авторитетное состояние находится в одном файле
 `.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
 перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,

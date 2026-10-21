@@ -3,12 +3,16 @@ import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { YandexDiskClient as Client } from "../src/api/yandex-client";
+import { MemoryDisk, bytes, codecFor } from "./helpers/sync-flow";
 import {
 	decideEncryptionRecovery,
 	EncryptionTransitionController,
 	createRemoteTargetRecoveryPlan,
 	createTargetRawMapping,
 	hasPendingEncryptionCleanup,
+	verifyTransitionTargetObject,
 	type LocalEncryptionTransition,
 } from "../src/crypto/encryption-transition";
 import { IndexManager } from "../src/sync/canonical/manager";
@@ -138,6 +142,156 @@ test("transition target mapping rejects raw collisions before upload", () => {
 	assert.throws(() =>
 		createTargetRawMapping([["one.md", "target"]], [".backup/source"]),
 	);
+});
+
+test("target read-back separates physical file stamps from strict cleanup proofs", async () => {
+	const codec = await codecFor(true);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		disk.install();
+		const client = new Client({ token: "synthetic", maxRetries: 0 });
+		client.setRemotePath("vault");
+		client.setEncryptionService(encrypted ? codec : null);
+		const content = bytes("preserved target");
+		await client.uploadFile("vault/note.md", content);
+		const physicalPath = await client.getPhysicalPath("vault/note.md");
+		const rawPath = physicalPath.slice("vault/".length);
+		const sha = createHash("sha256")
+			.update(Buffer.from(disk.files.get(physicalPath)!))
+			.digest("hex");
+		const resource = disk.resource.bind(disk);
+		const modified = "2026-01-01T00:00:00Z";
+		for (const variant of [
+			{
+				metadata: { sha256: sha },
+				physical: sha,
+				strict: `sha256:${sha}`,
+			},
+			{
+				metadata: { sha256: undefined, md5: "server-md5" },
+				physical: "server-md5",
+				strict: "md5:server-md5",
+			},
+			{
+				metadata: { sha256: undefined, resource_id: "server-id" },
+				physical: "server-id",
+				strict: `modified:${modified}:size:${disk.files.get(physicalPath)!.byteLength}`,
+			},
+			{
+				metadata: { sha256: undefined, resource_id: undefined },
+				physical: modified,
+				strict: `modified:${modified}:size:${disk.files.get(physicalPath)!.byteLength}`,
+			},
+		]) {
+			disk.resource = async (path) => {
+				const result = await resource(path);
+				return result && path === physicalPath
+					? { ...result, ...variant.metadata }
+					: result;
+			};
+			const transition = createTransition();
+			transition.target.enabled = encrypted;
+			transition.targetRawByLogicalPath = { "note.md": rawPath };
+			let persisted: Record<string, string> = {};
+			const proof = await verifyTransitionTargetObject(
+				{
+					client,
+					remotePath: "vault",
+					persist: async () => {
+						persisted = structuredClone(
+							transition.targetFingerprints,
+						);
+					},
+				},
+				transition,
+				"note.md",
+				createHash("sha256").update(Buffer.from(content)).digest("hex"),
+				encrypted ? codec : null,
+				false,
+			);
+			assert.equal(proof?.remoteFingerprint, variant.physical);
+			assert.equal(proof?.remoteMtime, Date.parse(modified));
+			assert.equal(persisted[rawPath], variant.strict);
+		}
+	}
+});
+
+test("target read-back cannot return a stamp without matching bytes and durable proof", async () => {
+	const disk = new MemoryDisk();
+	disk.install();
+	const client = new Client({ token: "synthetic", maxRetries: 0 });
+	client.setRemotePath("vault");
+	const content = bytes("preserved target");
+	await client.uploadFile("vault/note.md", content);
+	const sha = createHash("sha256").update(Buffer.from(content)).digest("hex");
+	for (const failure of [
+		"content",
+		"path",
+		"mode",
+		"persist",
+		"missing",
+	] as const) {
+		const transition = createTransition();
+		transition.target.enabled = failure === "mode";
+		transition.targetRawByLogicalPath = {
+			"note.md": failure === "path" ? "other.md" : "note.md",
+		};
+		transition.targetFingerprints = { "note.md": "old-proof" };
+		if (failure === "path") {
+			await client.uploadFile("vault/other.md", content);
+		}
+		if (failure === "missing") {
+			disk.files.delete("vault/note.md");
+		}
+		let persisted: Record<string, string> | undefined;
+		const io = {
+			client,
+			remotePath: "vault",
+			persist: async () => {
+				if (failure === "persist") {
+					throw new Error("synthetic persistence failure");
+				}
+				persisted = structuredClone(transition.targetFingerprints);
+			},
+		};
+		if (failure === "missing") {
+			assert.equal(
+				await verifyTransitionTargetObject(
+					io,
+					transition,
+					"note.md",
+					sha,
+					null,
+					true,
+				),
+				null,
+			);
+			assert.deepEqual(persisted, {});
+			await assert.rejects(
+				verifyTransitionTargetObject(
+					io,
+					transition,
+					"note.md",
+					sha,
+					null,
+					false,
+				),
+				/disappeared/,
+			);
+		} else {
+			await assert.rejects(
+				verifyTransitionTargetObject(
+					io,
+					transition,
+					"note.md",
+					failure === "content" ? "wrong" : sha,
+					null,
+					false,
+				),
+			);
+			assert.equal(persisted, undefined);
+		}
+	}
 });
 
 function createTransition(): LocalEncryptionTransition {

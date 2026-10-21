@@ -144,14 +144,17 @@ export async function verifyRemoteContentCandidates(
 			!remote ||
 			canonical?.deleted ||
 			(local.sha256 === remote.sha256 &&
-				canonical?.sha256 === local.sha256)
+				canonical?.sha256 === local.sha256 &&
+				canonical.remoteFingerprint === remote.remoteFingerprint &&
+				canonical.remoteMtime === remote.remoteMtime)
 		) {
 			continue;
 		}
 		if (
 			canonical &&
 			remote.sha256 &&
-			canonical.remoteFingerprint === remote.sha256
+			canonical.remoteFingerprint === remote.sha256 &&
+			canonical.remoteMtime === remote.remoteMtime
 		) {
 			remoteFiles.set(path, { ...remote, sha256: canonical.sha256 });
 			continue;

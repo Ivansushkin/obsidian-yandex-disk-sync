@@ -64,6 +64,15 @@ plaintext и исходную codec authority до и после чтения; �
 подтверждению, смена authority запрещает успех. Corrective repair сохраняет
 accepted mutationSeq и обновляет ciphertext fingerprint как physical rewrite.
 
+`crypto/encryption-transition.ts` проверяет decoded target path и plaintext SHA,
+сохраняет proof до возврата результата и разделяет две identity: transition и
+cleanup получают строгий `snapshot.fingerprint`, а файловый `remoteFingerprint`
+получает `getPhysicalResourceFingerprint(snapshot.resource)`. Service fingerprint
+не ослабляется до resource ID. Правило едино для enable, disable, rotate и
+проверки target при recovery; строки отпечатков не преобразуются удалением
+префикса. После перехода full сверяет stamp даже при совпавших plaintext hashes,
+если fingerprint/mtime расходятся, и использует существующий stable read-back.
+
 Conflict reconciliation сравнивает plaintext SHA, подтверждая canonical SHA
 физическим content hash или stable logical download. Изменение ciphertext при
 тех же plaintext bytes не создаёт копию. Копия перед overwrite получает exclusive

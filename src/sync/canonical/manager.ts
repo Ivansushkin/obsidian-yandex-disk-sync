@@ -2830,6 +2830,33 @@ export class IndexManager {
 				changed = true;
 				continue;
 			}
+			if (
+				baseline &&
+				!baseline.deleted &&
+				this.sameValue(
+					{
+						...desired,
+						remoteFingerprint: baseline.remoteFingerprint,
+						remoteMtime: baseline.remoteMtime,
+					},
+					baseline,
+				)
+			) {
+				if (this.sameValue(current, desired)) {
+					continue;
+				}
+				const physical = this.sameValue(current, baseline)
+					? mergePhysicalMetadata(current, baseline, desired)
+					: null;
+				if (!physical) {
+					throw new RemoteIndexConcurrentModificationError(
+						"Canonical file changed before physical metadata refresh",
+					);
+				}
+				setRecordValue(merged.files, path, physical);
+				changed = true;
+				continue;
+			}
 			const logicalChange =
 				baseline === undefined ||
 				desired.sha256 !== baseline.sha256 ||
