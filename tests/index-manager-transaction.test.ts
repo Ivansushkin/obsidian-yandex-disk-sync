@@ -13,6 +13,7 @@ import {
 	IndexManager,
 	LegacyIndexFormatError,
 	RemoteIndexRolledBackError,
+	RemoteIndexConcurrentModificationError,
 	IndexEpochMismatchError,
 	InvalidCurrentIndexError,
 	UnreadableRemoteIndexError,
@@ -905,6 +906,152 @@ test("current canonical rejects an extra numeric format marker", async () => {
 	const { manager, client } = await createIndexManagerWithContent(current);
 	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
 	assert.equal(client.moveCount, 0);
+});
+
+test("physical metadata refresh preserves zero-sequence causality under canonical transactions", async () => {
+	for (const concurrent of [
+		"none",
+		"same",
+		"other",
+		"edit",
+		"delete",
+		"missing",
+		"rewrite",
+	] as const) {
+		const source = createEmptyIndex("device-a", "epoch-a");
+		source.revision = 4;
+		source.files["note.md"] = {
+			path: "note.md",
+			sha256: "plain",
+			size: 8,
+			mtime: 1,
+			syncedAt: 1,
+			changedRevision: 4,
+			baseRevision: 3,
+			lastModifiedBy: "device-a",
+			mutationSeq: 0,
+			remoteFingerprint: "sha256:cipher",
+			remoteMtime: 1,
+		};
+		const { manager, client, canonicalPath } =
+			await createIndexManagerWithContent(source, null);
+		await manager.loadRemoteIndex();
+		const desired = {
+			...source.files["note.md"],
+			remoteFingerprint: "cipher",
+			remoteMtime: 2,
+		};
+		manager.updateRemoteFile("note.md", desired);
+		const latest = structuredClone(source);
+		if (concurrent !== "none") {
+			latest.revision = 5;
+		}
+		if (concurrent === "same") {
+			latest.files["note.md"] = desired;
+		} else if (concurrent === "other") {
+			latest.files["other.md"] = {
+				...source.files["note.md"],
+				path: "other.md",
+			};
+		} else if (concurrent === "missing") {
+			delete latest.files["note.md"];
+		} else if (concurrent === "rewrite") {
+			latest.files["note.md"]!.remoteFingerprint = "new-cipher";
+		} else if (concurrent === "edit" || concurrent === "delete") {
+			Object.assign(latest.files["note.md"]!, {
+				sha256: concurrent === "edit" ? "foreign" : "plain",
+				deleted: concurrent === "delete",
+				changedRevision: 5,
+				lastModifiedBy: "device-b",
+				mutationSeq: 1,
+			});
+			latest.appliedMutationSeq["device-b"] = 1;
+		}
+		client.files.set(
+			canonicalPath,
+			new TextEncoder().encode(JSON.stringify(latest)).buffer,
+		);
+		const shouldCommit = ["none", "same", "other"].includes(concurrent);
+		if (shouldCommit) {
+			await manager.saveRemoteIndex();
+		} else {
+			await assert.rejects(
+				manager.saveRemoteIndex(),
+				(error: unknown) =>
+					error instanceof RemoteIndexRolledBackError &&
+					error.cause instanceof
+						RemoteIndexConcurrentModificationError,
+			);
+		}
+		const actual = JSON.parse(
+			new TextDecoder().decode(client.files.get(canonicalPath)),
+		) as typeof source;
+		assert.deepEqual(
+			actual.files,
+			shouldCommit
+				? { ...latest.files, "note.md": desired }
+				: latest.files,
+			concurrent,
+		);
+		assert.deepEqual(
+			actual.appliedMutationSeq,
+			latest.appliedMutationSeq,
+			concurrent,
+		);
+		assert.equal(
+			actual.revision,
+			latest.revision + (shouldCommit && concurrent !== "same" ? 1 : 0),
+			concurrent,
+		);
+		assert.deepEqual(manager.getPendingMutations(), []);
+		assert.equal(
+			[...client.files.keys()].some((path) => path.includes(".lock.")),
+			false,
+		);
+	}
+});
+
+test("physical metadata refresh cannot disguise invalid logical mutations", async () => {
+	for (const [sequence, watermark] of [
+		[0, 0],
+		[1, 1],
+		[3, 1],
+	]) {
+		const source = createEmptyIndex("device-a", "epoch-a");
+		source.revision = 4;
+		source.files["note.md"] = {
+			path: "note.md",
+			sha256: "plain",
+			size: 8,
+			mtime: 1,
+			syncedAt: 1,
+			changedRevision: 4,
+			baseRevision: 3,
+			lastModifiedBy: "device-a",
+			mutationSeq: watermark,
+			remoteFingerprint: "old",
+		};
+		source.appliedMutationSeq["device-a"] = watermark!;
+		const { manager, client, canonicalPath } =
+			await createIndexManagerWithContent(source, null);
+		await manager.loadRemoteIndex();
+		manager.updateRemoteFile("note.md", {
+			...source.files["note.md"],
+			sha256: "different",
+			mutationSeq: sequence,
+			remoteFingerprint: "new",
+		});
+		await assert.rejects(
+			manager.saveRemoteIndex(),
+			RemoteIndexRolledBackError,
+		);
+		assert.deepEqual(
+			JSON.parse(
+				new TextDecoder().decode(client.files.get(canonicalPath)),
+			),
+			source,
+		);
+	}
 });
 
 test("canonical transaction accepts causal continuation and rejects foreign edits", async () => {

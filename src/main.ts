@@ -39,7 +39,6 @@ import {
 import {
 	SyncEngine,
 	type ForceBackupProof,
-	type PhysicalRewriteUploadProof,
 	type SyncRunOptions,
 } from "./sync/engine";
 import { DeferredWatcherEvent, FileWatcher } from "./sync/realtime/watcher";
@@ -89,6 +88,7 @@ import {
 	createTargetRawMapping,
 	EncryptionTransitionController,
 	hasPendingEncryptionCleanup,
+	verifyTransitionTargetObject,
 	type EncryptionBackupProof,
 	type LocalEncryptionSnapshot,
 	type LocalEncryptionTransition,
@@ -342,7 +342,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						logicalPath,
 						sha256,
 					) => {
-						const proof = await this.verifyTransitionTargetObject(
+						const proof = await verifyTransitionTargetObject(
+							{
+								client: this.yandexClient,
+								remotePath: this.settings.remotePath,
+								persist: () => this.saveSettings(),
+							},
 							transition,
 							logicalPath,
 							sha256,
@@ -3320,72 +3325,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.saveSettings();
 	}
 
-	/** Read back one target object and persist its exact deletion proof. */
-	private async verifyTransitionTargetObject(
-		transition: LocalEncryptionTransition,
-		logicalPath: string,
-		expectedSha256: string,
-		targetService: EncryptionCodec | null,
-		allowMissing: boolean,
-	): Promise<PhysicalRewriteUploadProof | null> {
-		const rawPath = transition.targetRawByLogicalPath[logicalPath];
-		if (!rawPath) {
-			throw new Error(
-				`Transition target mapping is missing for ${logicalPath}`,
-			);
-		}
-		if (transition.target.enabled !== Boolean(targetService)) {
-			throw new Error("Transition target codec does not match its mode");
-		}
-		const snapshot = await this.yandexClient.downloadStableRawFile(
-			joinPath(this.settings.remotePath, rawPath),
-		);
-		if (!snapshot) {
-			if (allowMissing) {
-				if (
-					Object.prototype.hasOwnProperty.call(
-						transition.targetFingerprints,
-						rawPath,
-					)
-				) {
-					delete transition.targetFingerprints[rawPath];
-					await this.saveSettings();
-				}
-				return null;
-			}
-			throw new Error(`Transition target disappeared for ${logicalPath}`);
-		}
-		const decodedPath = await this.yandexClient.decodePhysicalUserPath(
-			rawPath,
-			targetService,
-		);
-		if (decodedPath !== logicalPath) {
-			throw new Error(
-				`Transition target decodes to a different logical path`,
-			);
-		}
-		const plaintext = targetService
-			? await targetService.decrypt(snapshot.raw)
-			: snapshot.raw;
-		if ((await computeSha256(plaintext)) !== expectedSha256) {
-			throw new Error(
-				`Transition target content does not match ${logicalPath}`,
-			);
-		}
-		Object.defineProperty(transition.targetFingerprints, rawPath, {
-			value: snapshot.fingerprint,
-			writable: true,
-			enumerable: true,
-			configurable: true,
-		});
-		await this.saveSettings();
-		const remoteMtime = new Date(snapshot.resource.modified).getTime();
-		return {
-			remoteFingerprint: snapshot.fingerprint,
-			remoteMtime: Number.isFinite(remoteMtime) ? remoteMtime : undefined,
-		};
-	}
-
 	private async assertTransitionSourceUnchanged(
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
@@ -3556,7 +3495,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						`Transition target has no authoritative logical metadata for ${logicalPath}`,
 					);
 				}
-				await this.verifyTransitionTargetObject(
+				await verifyTransitionTargetObject(
+					{
+						client: this.yandexClient,
+						remotePath: this.settings.remotePath,
+						persist: () => this.saveSettings(),
+					},
 					transition,
 					logicalPath,
 					metadata.sha256,
