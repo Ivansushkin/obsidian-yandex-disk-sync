@@ -60,10 +60,10 @@ export function parseScenarioEvidence(value) {
 	return { autoNames, manualCases, manualRequired, invalidFragments };
 }
 
-/** Collect literal node:test names, including this project's two-mode templates. */
+/** Collect literal, two-mode and statically declared table-driven test names. */
 export function collectNodeTestNames(sources) {
 	const names = new Set();
-	const declaration = /\btest\(\s*(["'`])([\s\S]*?)\1\s*,/g;
+	const declaration = /\b(?:test|httpTest)\(\s*(["'`])([\s\S]*?)\1\s*,/g;
 	for (const source of sources) {
 		for (const match of source.matchAll(declaration)) {
 			const name = match[2];
@@ -79,6 +79,109 @@ export function collectNodeTestNames(sources) {
 				names.add(name.replace("${mode}", "encrypted"));
 			}
 		}
+		const tree = ts.createSourceFile(
+			"tests.ts",
+			source,
+			ts.ScriptTarget.Latest,
+			true,
+		);
+		const visit = (node) => {
+			if (
+				ts.isCallExpression(node) &&
+				node.expression.getText(tree) === "test"
+			) {
+				const title = node.arguments[0];
+				const bindingName =
+					title && ts.isPropertyAccessExpression(title)
+						? title.expression.getText(tree)
+						: title?.getText(tree);
+				let loop = node.parent;
+				while (loop && !ts.isForOfStatement(loop)) {
+					loop = loop.parent;
+				}
+				if (loop && ts.isVariableDeclarationList(loop.initializer)) {
+					const binding = loop.initializer.declarations[0]?.name;
+					let field;
+					if (
+						binding &&
+						ts.isIdentifier(binding) &&
+						binding.text === bindingName &&
+						title &&
+						ts.isPropertyAccessExpression(title)
+					) {
+						field = title.name.text;
+					} else if (
+						binding &&
+						(ts.isObjectBindingPattern(binding) ||
+							ts.isArrayBindingPattern(binding))
+					) {
+						const index = binding.elements.findIndex(
+							(element) =>
+								element.name?.getText(tree) === bindingName,
+						);
+						if (index >= 0) {
+							field = ts.isArrayBindingPattern(binding)
+								? index
+								: (
+										binding.elements[index].propertyName ??
+										binding.elements[index].name
+									).getText(tree);
+						}
+					}
+					let values = loop.expression;
+					if (ts.isIdentifier(values)) {
+						const identifier = values.text;
+						let scope = loop.parent;
+						while (scope) {
+							const declaration = scope.statements
+								?.filter(ts.isVariableStatement)
+								.flatMap((statement) => [
+									...statement.declarationList.declarations,
+								])
+								.find(
+									(candidate) =>
+										candidate.name.getText(tree) ===
+											identifier &&
+										candidate.pos < loop.pos,
+								);
+							if (declaration) {
+								values = declaration.initializer;
+								break;
+							}
+							scope = scope.parent;
+						}
+					}
+					if (values && ts.isAsExpression(values)) {
+						values = values.expression;
+					}
+					if (
+						field !== undefined &&
+						values &&
+						ts.isArrayLiteralExpression(values)
+					) {
+						for (const row of values.elements) {
+							const value =
+								ts.isArrayLiteralExpression(row) &&
+								typeof field === "number"
+									? row.elements[field]
+									: ts.isObjectLiteralExpression(row)
+										? row.properties.find(
+												(property) =>
+													property.name?.getText(
+														tree,
+													) === field,
+											)?.initializer
+										: undefined;
+							if (value && ts.isStringLiteral(value)) {
+								names.add(value.text);
+							}
+						}
+					}
+				}
+			}
+			ts.forEachChild(node, visit);
+		};
+		visit(tree);
 	}
 	return names;
 }
@@ -158,3 +261,4 @@ export function validateScenarioCatalog(markdown, testSources, smokeTests) {
 	}
 	return errors;
 }
+import ts from "typescript";

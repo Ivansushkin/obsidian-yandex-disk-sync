@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { TestContext } from "node:test";
 import { App, TFile, TFolder, type RequestUrlParam } from "obsidian";
 import { YandexDiskClient } from "../../src/api/yandex-client";
 import { VaultAdapter } from "../../src/api/vault-adapter";
@@ -356,6 +357,22 @@ export interface SavedDevice {
 	pendingWatcherEvents: DeferredWatcherEvent[];
 }
 
+/** Keep test teardown attached to every device, including restarted instances. */
+export function managedDevices(context: TestContext): typeof device {
+	return (...args) => {
+		const current = device(...args);
+		const hooks = context as TestContext & {
+			after(cleanup: () => Promise<void>): void;
+		};
+		hooks.after(async () => {
+			args[0].beforeRequest = undefined;
+			args[0].afterRequest = undefined;
+			await current.stop();
+		});
+		return current;
+	};
+}
+
 export async function codecFor(
 	encrypted: boolean,
 ): Promise<EncryptionCodec | null> {
@@ -451,6 +468,12 @@ export function device(
 			return structuredClone(persisted);
 		},
 		lastSaved: () => structuredClone(persisted),
+		assertLocal(path: string, text?: string) {
+			assert.deepEqual(
+				vault.files.get(path),
+				text === undefined ? undefined : bytes(text),
+			);
+		},
 		async full() {
 			const result = await engine.fullSync();
 			assert.equal(result.success, true, JSON.stringify(result.errors));

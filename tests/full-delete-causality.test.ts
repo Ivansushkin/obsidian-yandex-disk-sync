@@ -1,150 +1,39 @@
-import * as syncReconciliation from "../src/sync/reconciliation/commits";
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
+import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { IndexManager } from "../src/sync/canonical/manager";
-import { LocalOperationStore } from "../src/sync/local/operation-store";
 import { SyncEngine } from "../src/sync/engine";
+import * as syncReconciliation from "../src/sync/reconciliation/commits";
 import {
-	createEmptyIndex,
-	createEmptyLocalState,
 	DEFAULT_SETTINGS,
 	type FileMetadata,
-	type PendingMutation,
 	type SyncOperation,
-	type SyncResult,
 } from "../src/types";
+import {
+	fileMetadata,
+	MemoryIndex,
+	reconciliationDependencies,
+	syncResult,
+} from "./helpers/realtime-fixtures";
 
 function metadata(path: string): FileMetadata {
-	return {
-		path,
-		sha256: "hash",
+	return fileMetadata(path, "hash", {
 		size: 4,
-		mtime: 1,
-		syncedAt: 1,
 		changedRevision: 7,
 		baseRevision: 6,
 		lastModifiedBy: "device-a",
 		mutationSeq: 1,
 		remoteFingerprint: "fingerprint",
-	};
+	});
 }
 
-class FullDeleteIndexFake {
-	readonly index = createEmptyIndex("device-a", "epoch-a");
-	readonly local = createEmptyLocalState("device-a");
-	readonly store = new LocalOperationStore("device-a");
-	physicalActions = 0;
-
+class FullDeleteIndexFake extends MemoryIndex {
 	constructor() {
-		this.index.revision = 7;
+		super();
 		this.index.appliedMutationSeq["device-a"] = 1;
-		this.local.observedEpoch = "epoch-a";
-		this.local.observedRevision = 7;
 		this.store.loadMutations(undefined, 2);
 	}
-
-	getRemoteIndex() {
-		return this.index;
-	}
-	getLocalIndex() {
-		return this.local;
-	}
-	getPendingMutations() {
-		return this.store.getMutations();
-	}
-
-	enqueueMutation(
-		type: "delete-file",
-		path: string,
-		options?: { baselineSha256?: string },
-	): PendingMutation {
-		return this.store.enqueueMutation(
-			type,
-			path,
-			this.local.observedEpoch,
-			this.local.observedRevision,
-			options,
-		);
-	}
-
-	stageMutation(mutation: PendingMutation) {
-		this.store.stageMutation(this.index.appliedMutationSeq, mutation);
-	}
-
-	stagePendingMutations() {
-		this.store.stagePendingMutations(this.index.appliedMutationSeq);
-	}
-
-	confirmAppliedMutations() {
-		this.store.confirmAppliedMutations(this.index.appliedMutationSeq);
-	}
-
-	markRemoteFileDeleted(
-		path: string,
-		_deletedByFolder: string | undefined,
-		baseRevision: number,
-		mutationSeq: number,
-	) {
-		this.index.files[path] = {
-			...this.index.files[path]!,
-			deleted: true,
-			baseRevision,
-			lastModifiedBy: "device-a",
-			mutationSeq,
-		};
-	}
-
-	markRemoteFileDeletedByCanonicalFolder() {
-		throw new Error("not expected");
-	}
-
-	markLocalFileDeleted(
-		path: string,
-		_folder: string | undefined,
-		mutationSeq: number,
-	) {
-		this.local.files[path] = {
-			...this.local.files[path]!,
-			deleted: true,
-			lastModifiedBy: "device-a",
-			mutationSeq,
-		};
-	}
-
-	enqueuePhysicalAction() {
-		this.physicalActions++;
-		return { id: `action-${this.physicalActions}` };
-	}
-
-	updateSyncTime() {}
-	consumeRejectedPuts() {
-		return [];
-	}
-
-	async saveRemoteIndex() {
-		this.index.revision++;
-		return {
-			epoch: this.index.epoch,
-			revision: this.index.revision,
-			index: structuredClone(this.index),
-			contentFingerprint: "md5:test",
-		};
-	}
-}
-
-function createResult(): SyncResult {
-	return {
-		success: true,
-		uploaded: 0,
-		downloaded: 0,
-		deleted: 0,
-		conflicts: 0,
-		errors: [],
-		startTime: 1,
-		endTime: 0,
-	};
 }
 
 function createEngine(index: FullDeleteIndexFake): SyncEngine {
@@ -167,17 +56,13 @@ test("full-discovered logical delete receives and confirms a FIFO sequence", asy
 		remoteMeta: metadata("note.md"),
 		causalOrigin: "new-local-operation",
 	};
-	const deps = (
-		createEngine(index) as unknown as {
-			syncReconciliationDependencies(): syncReconciliation.Dependencies;
-		}
-	).syncReconciliationDependencies();
+	const deps = reconciliationDependencies(createEngine(index));
 
 	assert.ok(
 		await syncReconciliation.commitDeletionIntents(
 			deps,
 			[operation],
-			createResult(),
+			syncResult(),
 		),
 	);
 	assert.equal(index.index.files["note.md"]?.deleted, true);
@@ -200,17 +85,13 @@ test("applying a canonical tombstone preserves foreign causal attribution", asyn
 		reason: "Exact-file remote deletion wins",
 		causalOrigin: "apply-canonical",
 	};
-	const deps = (
-		createEngine(index) as unknown as {
-			syncReconciliationDependencies(): syncReconciliation.Dependencies;
-		}
-	).syncReconciliationDependencies();
+	const deps = reconciliationDependencies(createEngine(index));
 
 	assert.ok(
 		await syncReconciliation.commitDeletionIntents(
 			deps,
 			[operation],
-			createResult(),
+			syncResult(),
 		),
 	);
 	assert.equal(index.index.files["note.md"]?.lastModifiedBy, "device-b");

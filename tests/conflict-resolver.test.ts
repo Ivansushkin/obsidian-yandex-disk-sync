@@ -1,3 +1,4 @@
+import { fileMetadata } from "./helpers/metadata";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { FileMetadata, FolderTombstone } from "../src/types";
@@ -6,24 +7,9 @@ import { ConflictResolver } from "../src/sync/reconciliation/conflicts";
 function file(
 	path: string,
 	sha256: string,
-	options?: {
-		deleted?: boolean;
-		changedRevision?: number;
-		remoteMtime?: number;
-		remoteFingerprint?: string;
-	},
+	options: Partial<FileMetadata> = {},
 ): FileMetadata {
-	return {
-		path,
-		sha256,
-		size: 1,
-		mtime: 1,
-		remoteMtime: options?.remoteMtime,
-		remoteFingerprint: options?.remoteFingerprint,
-		syncedAt: 1,
-		deleted: options?.deleted,
-		changedRevision: options?.changedRevision,
-	};
+	return fileMetadata(path, { sha256, ...options });
 }
 
 function folderDelete(
