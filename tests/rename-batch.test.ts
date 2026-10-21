@@ -236,6 +236,57 @@ for (const encrypted of [false, true]) {
 			await b.stop();
 		}
 	});
+	test(`${mode} a source restored after batch intent remains physically live`, async () => {
+		const { disk, a, b, drain } = await queuedRenames(encrypted);
+		let restored = false;
+		try {
+			disk.afterRequest = async (_method, endpoint, path) => {
+				if (
+					!restored &&
+					endpoint.endsWith("/resources/move") &&
+					path === "vault/.obsidian-sync-index.json"
+				) {
+					restored = true;
+					const canonical =
+						await b.index.refreshCanonicalForMutation();
+					const source = canonical.files["A.md"]!;
+					const mutation = b.index.enqueueMutation("put", "A.md", {
+						epoch: canonical.epoch,
+						baseRevision: canonical.revision,
+						sha256: source.sha256,
+					});
+					b.index.updateRemoteFile("A.md", {
+						...source,
+						deleted: false,
+						deletedAt: undefined,
+						deletedByFolder: undefined,
+						lastModifiedBy: b.settings.deviceId,
+						baseRevision: canonical.revision,
+						mutationSeq: mutation.seq,
+					});
+					b.index.stageMutation(mutation);
+					await b.index.saveRemoteIndex();
+				}
+			};
+			await drain();
+			assert.equal(restored, true);
+			assert.equal((await a.canonical()).files["A.md"]?.deleted, false);
+			assert.ok(
+				await a.client.getLogicalResource("vault/A.md"),
+				"Restored source must survive physical move",
+			);
+			disk.afterRequest = undefined;
+			await a.full();
+			await b.full();
+			const expected = { ...finalFiles, "A.md": "alpha" };
+			await a.assertSettled(expected);
+			await b.assertSettled(expected);
+		} finally {
+			disk.afterRequest = undefined;
+			await a.stop();
+			await b.stop();
+		}
+	});
 	test(`${mode} changed rename content uses the existing path without extra mutation sequences`, async () => {
 		const { a, b, drain } = await queuedRenames(encrypted);
 		try {

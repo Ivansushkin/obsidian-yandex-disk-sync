@@ -247,10 +247,19 @@ class RenameIndexFake {
 		}
 	}
 
-	markRemoteFileDeleted(path: string) {
+	markRemoteFileDeleted(
+		path: string,
+		deletedByFolder?: string,
+		baseRevision = this.index.revision,
+		mutationSeq?: number,
+	) {
 		const metadata = this.index.files[path];
 		if (metadata) {
 			metadata.deleted = true;
+			metadata.deletedByFolder = deletedByFolder;
+			metadata.baseRevision = baseRevision;
+			metadata.mutationSeq = mutationSeq;
+			metadata.lastModifiedBy = "device-a";
 		}
 	}
 
@@ -260,6 +269,7 @@ class RenameIndexFake {
 		toPath: string,
 		kind: "file" | "folder",
 		baseRevision: number,
+		mutationSeq?: number,
 	) {
 		this.index.moves[id] = {
 			id,
@@ -268,6 +278,7 @@ class RenameIndexFake {
 			kind,
 			baseRevision,
 			changedRevision: this.index.revision,
+			mutationSeq,
 			pending: true,
 			lastModifiedBy: "device-a",
 		};
