@@ -1,14 +1,5 @@
 /* Yandex Disk Sync Plugin Styles */
 
-/* Status bar */
-.yandex-sync-status {
-	cursor: pointer;
-	padding: 0 8px;
-	display: inline-flex;
-	align-items: center;
-	gap: 4px;
-}
-
 .yandex-sync-status-icon {
 	display: inline-flex;
 }
@@ -18,51 +9,42 @@
 	height: 14px;
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-syncing
-	.yandex-sync-status-icon
-	svg,
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-initializing
-	.yandex-sync-status-icon
-	svg {
-	animation: yandex-sync-spin 1.2s linear infinite;
-}
-
 @keyframes yandex-sync-spin {
 	to {
 		transform: rotate(360deg);
 	}
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-idle {
+.yandex-sync-indicator.sync-idle {
 	color: var(--text-muted);
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-syncing {
+.yandex-sync-indicator.sync-syncing {
 	color: var(--text-accent);
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-error {
+.yandex-sync-indicator.sync-error {
 	color: var(--text-error);
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-paused {
+.yandex-sync-indicator.sync-paused {
 	color: var(--text-faint);
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-offline {
+.yandex-sync-indicator.sync-offline {
 	color: var(--text-faint);
 }
 
-:is(.yandex-sync-status, .yandex-sync-mobile).sync-encryption-required {
+.yandex-sync-indicator.sync-encryption-required {
 	color: var(--text-warning);
 	font-weight: 600;
 }
 
-/* Passive mobile indicator: does not intercept editor or navigation touches. */
-.yandex-sync-mobile {
+/* Shared native disclosure intercepts only touches inside its own bounds. */
+.yandex-sync-indicator {
 	position: fixed;
 	top: var(
-		--yandex-sync-mobile-top,
+		--yandex-sync-indicator-top,
 		calc(
 			max(
 					env(safe-area-inset-top, 0px),
@@ -73,7 +55,7 @@
 		)
 	);
 	right: var(
-		--yandex-sync-mobile-right,
+		--yandex-sync-indicator-right,
 		max(
 			12px,
 			env(safe-area-inset-right, 0px),
@@ -81,13 +63,14 @@
 		)
 	);
 	z-index: var(--layer-status-bar, 15);
-	display: inline-flex;
-	align-items: center;
-	gap: 8px;
+	display: block;
 	box-sizing: border-box;
 	width: max-content;
-	max-width: var(--yandex-sync-mobile-width, min(360px, calc(100vw - 24px)));
-	padding: 6px 10px;
+	max-width: var(
+		--yandex-sync-indicator-width,
+		min(360px, calc(100vw - 24px))
+	);
+	padding: 0;
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 10px;
 	background: var(--background-primary);
@@ -95,57 +78,189 @@
 	box-shadow: var(--shadow-s);
 	font-size: var(--font-ui-small);
 	line-height: 1.35;
-	pointer-events: none;
+	pointer-events: auto;
 }
 
-.yandex-sync-mobile.is-compact {
-	gap: 4px;
-	padding: 4px 8px;
+.yandex-sync-indicator[data-placement="top"][open] {
+	width: var(--yandex-sync-indicator-width, min(360px, calc(100vw - 24px)));
 }
 
-.yandex-sync-mobile .yandex-sync-status-icon {
+.yandex-sync-indicator[data-placement="bottom"] {
+	display: flex;
+	flex-direction: column-reverse;
+	top: auto;
+	bottom: var(
+		--yandex-sync-indicator-bottom,
+		calc(var(--status-bar-height, 24px) + 8px)
+	);
+}
+
+.yandex-sync-indicator[data-placement="bottom"][open] {
+	width: var(--yandex-sync-indicator-width, min(360px, calc(100vw - 24px)));
+}
+
+.yandex-sync-indicator[data-placement="bottom"] .yandex-sync-indicator-summary {
+	align-self: flex-end;
+	width: max-content;
 	flex-shrink: 0;
 }
 
-.yandex-sync-mobile-content {
-	min-width: 0;
+.yandex-sync-indicator[data-placement="bottom"] .yandex-sync-indicator-content {
+	width: 100%;
+	border-top: 0;
+	border-bottom: 1px solid var(--background-modifier-border);
 }
 
-.yandex-sync-mobile-heading {
+.yandex-sync-indicator-summary {
 	display: flex;
-	align-items: baseline;
+	align-items: center;
+	gap: 8px;
+	min-height: 44px;
+	padding: 8px 12px;
+	box-sizing: border-box;
+	list-style: none;
+	cursor: pointer;
+	touch-action: manipulation;
+	user-select: none;
+	width: max-content;
+	margin-left: auto;
+}
+
+.yandex-sync-indicator[open] .yandex-sync-indicator-summary {
+	max-width: calc(100% - 100px);
+}
+
+.yandex-sync-indicator-actions {
+	position: absolute;
+	top: 0;
+	left: 6px;
+	display: flex;
+	gap: 2px;
+}
+
+.yandex-sync-indicator:not([open]) .yandex-sync-indicator-actions {
+	display: none;
+}
+
+.yandex-sync-indicator[data-placement="bottom"] .yandex-sync-indicator-actions {
+	top: auto;
+	bottom: 0;
+}
+
+.yandex-sync-indicator .yandex-sync-indicator-action {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 44px;
+	height: 44px;
+	min-width: 44px;
+	padding: 0;
+	border: 0;
+	border-radius: 6px;
+	box-shadow: none;
+	background: transparent;
+	color: var(--text-muted);
+	touch-action: manipulation;
+}
+
+.yandex-sync-indicator-action:hover:not(:disabled) {
+	background: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.yandex-sync-indicator-action:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: -2px;
+}
+
+.yandex-sync-indicator-action:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+
+.yandex-sync-indicator-summary::-webkit-details-marker {
+	display: none;
+}
+
+.yandex-sync-indicator-summary:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 2px;
+	border-radius: 10px;
+}
+
+.yandex-sync-indicator-brand {
+	font-weight: 600;
+}
+
+.yandex-sync-indicator-loader {
+	display: inline-flex;
+	flex-shrink: 0;
+}
+
+.yandex-sync-indicator-loader[hidden] {
+	display: none;
+}
+
+.yandex-sync-indicator-loader svg {
+	width: 14px;
+	height: 14px;
+	animation: yandex-sync-spin 1.2s linear infinite;
+}
+
+.yandex-sync-indicator .yandex-sync-status-icon svg {
+	animation: none;
+}
+
+.yandex-sync-indicator.has-error .yandex-sync-status-icon {
+	color: var(--text-error);
+}
+
+.yandex-sync-indicator .yandex-sync-status-icon {
+	flex-shrink: 0;
+}
+
+.yandex-sync-indicator-content {
+	min-width: 0;
+	max-height: min(
+		320px,
+		45vh,
+		var(--yandex-sync-indicator-content-height, 320px)
+	);
+	box-sizing: border-box;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	padding: 10px 12px;
+	border-top: 1px solid var(--background-modifier-border);
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.yandex-sync-indicator-heading {
+	display: flex;
+	align-items: flex-start;
 	gap: 8px;
 }
 
-.yandex-sync-mobile-text {
+.yandex-sync-indicator-text {
 	min-width: 0;
 	flex: 1;
 }
 
-.yandex-sync-mobile-progress {
+.yandex-sync-indicator-progress {
 	flex-shrink: 0;
 	white-space: nowrap;
 	font-variant-numeric: tabular-nums;
 }
 
-.yandex-sync-mobile-text,
-.yandex-sync-mobile-detail {
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-
-.yandex-sync-mobile-detail {
-	color: var(--text-muted);
-}
-
-.yandex-sync-mobile.sync-error .yandex-sync-mobile-detail,
-.yandex-sync-mobile.has-error .yandex-sync-mobile-detail {
-	white-space: normal;
+.yandex-sync-indicator-text,
+.yandex-sync-indicator-detail {
+	white-space: pre-wrap;
 	overflow-wrap: anywhere;
-	display: -webkit-box;
-	-webkit-line-clamp: 3;
-	-webkit-box-orient: vertical;
+}
+
+.yandex-sync-indicator-detail {
+	margin-top: 8px;
+	color: var(--text-muted);
 }
 
 .sync-status-error-details {
@@ -154,11 +269,11 @@
 	user-select: text;
 }
 
-.yandex-sync-mobile.sync-migration-required {
+.yandex-sync-indicator.sync-migration-required {
 	color: var(--text-warning);
 }
 
-.yandex-sync-mobile-inset {
+.yandex-sync-indicator-inset {
 	position: absolute;
 	width: 0;
 	height: var(--view-header-height, var(--header-height, 48px));
@@ -181,12 +296,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-	:is(.yandex-sync-status, .yandex-sync-mobile):is(
-			.sync-syncing,
-			.sync-initializing
-		)
-		.yandex-sync-status-icon
-		svg {
+	.yandex-sync-indicator-loader svg {
 		animation: none;
 	}
 }

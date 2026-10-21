@@ -6,6 +6,13 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"status.mobile.expand": "Expand synchronization details",
+		"status.mobile.collapse": "Collapse synchronization details",
+		"status.actions.copy_logs": "Copy logs",
+		"status.actions.logs_copied": "Logs copied to clipboard",
+		"status.actions.logs_empty": "No log entries to copy",
+		"status.actions.copy_failed": "Could not copy logs to clipboard",
+		"status.actions.sync_failed": "Could not start synchronization",
 		"failure.stage.upload-verification": "upload result verification",
 		"failure.stage.preflight": "preflight",
 		"failure.stage.confirming": "confirmation",
@@ -424,6 +431,14 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"status.mobile.expand": "Развернуть подробности синхронизации",
+		"status.mobile.collapse": "Свернуть подробности синхронизации",
+		"status.actions.copy_logs": "Копировать логи",
+		"status.actions.logs_copied": "Логи скопированы в буфер обмена",
+		"status.actions.logs_empty": "Нет записей для копирования",
+		"status.actions.copy_failed":
+			"Не удалось скопировать логи в буфер обмена",
+		"status.actions.sync_failed": "Не удалось запустить синхронизацию",
 		"failure.stage.upload-verification": "проверка результата загрузки",
 		"failure.stage.preflight": "предварительная проверка",
 		"failure.stage.confirming": "подтверждение",

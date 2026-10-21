@@ -13,6 +13,14 @@ truth — canonical index на Яндекс Диске; локальные basel
 `backup/` отвечает за snapshots, архивы, envelope и exact read-back;
 `crypto/` — за codecs, manifest и transition/recovery.
 
+`ui/sync-indicator.ts` — общая раскрывающаяся плашка: desktop справа снизу над
+status bar, mobile справа сверху под панелями и safe area. Строка управления
+сохраняет YD справа; кнопки sync и копирования логов слева видны при раскрытии.
+Компонент получает состояние и callbacks из `main.ts`: ручной запуск использует
+существующий full workflow и busy guards, копирование — текущий файловый лог
+после flush и маскировки, максимум последние 4000 символов. UI не владеет
+canonical, очередями или отдельным coordinator.
+
 В `sync/` папки отражают ответственность: `canonical/` — индекс и транзакции,
 `local/` — baseline и очередь устройства, `files/` — физические операции,
 `reconciliation/` — commit/recovery и конфликты, `workflows/` — полные и служебные
@@ -80,6 +88,7 @@ high-watermark `appliedMutationSeq`.
 ложный конфликт. Для другого device ID по-прежнему применяется сравнение с
 baseline/base revision; одинаковый sequence с разным logical state и FIFO gap
 блокируют commit как повреждённое причинное состояние.
+
 Авторитетное состояние находится в одном файле
 `.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
 перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,
@@ -360,62 +369,50 @@ Force и enable/disable/rotate предлагают with-backup, without-backup 
 удаляет прогресс предыдущей фазы, поэтому завершённая пачка не оставляет
 устаревший `N/M` во время записи canonical index или physical cleanup.
 
-`sync-status-presentation` содержит общее форматирование для desktop
-`SyncStatusBar`, мобильного `MobileSyncIndicator` и обновляемого `Notice`
-ручной full, Force и enable/disable/rotate. Startup, scheduler и realtime
-отражаются в status bar на desktop и в постоянной плашке на Android/iOS/iPadOS;
-progress Notice для них не создаётся. Существующие foreground и blocking
-Notice сохраняются без изменений.
+`sync-status-presentation` содержит общее форматирование для единого
+`SyncIndicator` на desktop/mobile и обновляемого `Notice` ручной full, Force
+и enable/disable/rotate. Startup, scheduler и realtime отражаются в постоянной
+плашке; progress Notice для них не создаётся. Foreground и blocking Notice
+сохраняют прежнее поведение.
 
-Кнопка синхронизации в настройках подписана на общую активность, поэтому loader
-и `aria-busy` отражают любой normal full: ручной, стартовый, после сохранения
-token и по расписанию. UI учитывает validation и persistence внешнего full,
-а также full-сессии scheduler в движке. Кнопка блокируется общим busy-guard;
-другие операции сами по себе не включают full-loader. Повторное открытие
-настроек сразу читает текущую активность; закрытие снимает подписки.
+Кнопки синхронизации в настройках и плашке используют общую активность:
+любой normal full, включая validation до engine-сессии и persistence после неё,
+блокирует повторный запуск. Другие busy-операции также блокируют запуск без
+full-loader. Плашка перечитывает актуальный контекст: active Force flow → active
+sync → foreground encryption/backup → normal full при idle/initializing →
+состояние движка. Состояния блокировки сохраняют приоритет; Force удерживает
+ownership между внутренними сессиями.
 
 При первой ошибке transfer ещё во время пачки `SyncState.errorMessage` получает
-причину; progress считается по завершённым tasks, включая ошибки, и не увеличивается
-для пропущенных queued tasks. Conflict task увеличивает completed после завершения
-попытки, а не перед чтением winner или загрузкой copy. При ошибках full sync `SyncState.errorMessage` и ручной Notice сохраняют первую
-причину с operation/code и общим числом ошибок. Сообщение проходит существующую
-маскировку credentials. Команда показа статуса открывает полный selectable текст
-текущей ошибки; это диагностика, без изменений baseline, очередей или canonical.
+причину; progress считается по завершённым tasks, включая ошибки, без пропущенных
+queued tasks. Conflict task увеличивает completed после завершения попытки.
+Плашка и ручной Notice сохраняют первую причину с operation/code и числом ошибок.
+Команда показа статуса открывает полный selectable текст с маскировкой credentials.
 
-Мобильная плашка находится справа сверху, на 8 px ниже видимых верхних
-панелей с учётом safe area. До двух строк в обычном состоянии; при ошибке —
-заголовок и до трёх строк причины. Ширина до 360 px и поля не менее
-12 px с учётом боковых safe area. N/M показан с начала этапа в отдельном несжимаемом элементе рядом с названием.
-Правый край закреплён; при изменении
-текста плашка расширяется влево. Она пропускает касания и располагается ниже модальных окон и меню.
-DOM-зависимое измерение верхних панелей изолировано внутри компонента;
-`ItemView.contentEl` не считается границей системного UI: в floating/fullscreen
-раскладке контент может начинаться с нулевой координаты под кнопками. Всегда
-резервируется высота верхней панели после максимума native safe area,
-Obsidian `--safe-area-inset-top` и `--view-header-top-offset`, без двойного
-сложения inset. Учитываются реальные нижние границы header и его плавающих
-контролов, даже когда они ниже начала контента; нижние split/tab панели
-исключены из верхней области измерения. Резерв остаётся при автоскрытии шапки.
-Layout, resize, visual viewport, scroll, завершение CSS transition и изменение
-размеров панелей/inset probe обновляют положение через один animation frame,
-без polling. Изменения class/style на body/html отслеживаются для смены
-мобильной раскладки и safe area. Plugin lifecycle снимает подписки и observers,
-отменяет frame и удаляет плашку. Reduced motion отключает вращение; состояние доступно
-скринридеру. Кнопок, настроек положения и переходов по нажатию нет.
+На desktop плашка справа снизу, на 8 px над видимым status bar или нижним краем
+окна; прежний YD в баре не создаётся. Подробности раскрываются вверх. На mobile
+плашка справа сверху, на 8 px ниже видимых панелей и safe area; подробности
+раскрываются вниз. Правый край закреплён, ширина раскрытия до 360 px с полями
+не менее 12 px. Измерения chrome изолированы в компоненте и относятся к документу
+владельца workspace. Mobile резервирует высоту панели после максимума system
+inset, Obsidian safe area и header offset, включая floating/fullscreen layout.
 
-Плашка перечитывает актуальный UI-контекст: active Force flow → active sync →
-foreground encryption/backup → состояние движка. Force сохраняет ownership
-между внутренними sync-сессиями. В покое остаётся компактная строка `YD`
-либо `YD · HH:mm`, если известно время последней успешной синхронизации;
-полная подпись готовности/времени доступна скринридеру. Это не обещание
-«всё синхронизировано»: `idle` не доказывает отсутствие deferred events.
-При cold startup Obsidian может удалить plugin-owned DOM во время
-восстановления workspace. `onLayoutReady` и layout events перечитывают
-состояние и повторно подключают тот же элемент к актуальному workspace;
-это не зависит от запуска sync. CSS задаёт безопасную начальную позицию
-без скрытия до первого animation frame. После unload восстановление запрещено. Подробности ошибки могут
-занимать вторую строку. UI-состояние не сохраняется в `data.json` и не
-участвует в causal merge, lock-транзакции или выборе encryption codec.
+Нативные `details`/`summary` начинают свёрнутыми: YD, отдельный loader и status
+icon. Шапка остаётся справа при раскрытии. Этап, имя файла, N/M, retry, время
+последнего успеха и полная причина доступны внутри раскрытия; длинный текст
+переносится и прокручивается в пределах видимой области. Нажатие на шапку и
+Enter/Space меняют раскрытие; обновления и remount его сохраняют. Кнопки sync
+и copy находятся слева в той же строке, вне `summary` и live status: их нажатие
+не сворачивает плашку. Touch targets не меньше 44 × 44 px, названия и подсказки
+локализованы. Копирование не меняет sync-state; при пустом логе буфер сохраняется,
+ошибка Clipboard API не даёт ложного успеха.
+
+`idle` не обещает отсутствие deferred events. UI-состояние не сохраняется в
+`data.json` и не участвует в causal merge или выборе codec. `onLayoutReady` и
+layout events восстанавливают тот же DOM после cold startup, независимо от sync.
+Unload снимает подписки/observers, отменяет frame и запрещает повторный mount.
+Снаружи плашки касания доступны; modal/menu располагаются выше неё. Reduced
+motion отключает вращение loader; status icon не вращается.
 
 `ForceSyncController` владеет полным пользовательским сценарием обоих
 направлений: read-only preflight → выбор архива → необязательный backup с exact read-back →

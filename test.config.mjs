@@ -56,6 +56,7 @@ const obsidianStubPlugin = {
 					export class TFile {}
 				export class TFolder {}
 					export function setIcon() {}
+					export function setTooltip() {}
 				`,
 			loader: "js",
 		}));

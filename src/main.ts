@@ -44,9 +44,8 @@ import {
 } from "./sync/engine";
 import { DeferredWatcherEvent, FileWatcher } from "./sync/realtime/watcher";
 import { SyncScheduler } from "./sync/scheduler";
-import { SyncStatusBar } from "./ui/status-bar";
 import { formatSyncActivity } from "./ui/sync-status-presentation";
-import { MobileSyncIndicator } from "./ui/mobile-sync-indicator";
+import { SyncIndicator } from "./ui/sync-indicator";
 import { SyncStatusModal } from "./ui/init-modal";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import {
@@ -140,8 +139,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private fileWatcher!: FileWatcher;
 	private syncScheduler!: SyncScheduler;
 	private backupManager!: BackupManager;
-	private statusBar: SyncStatusBar | null = null;
-	private mobileSyncIndicator: MobileSyncIndicator | null = null;
+	private syncIndicator: SyncIndicator | null = null;
 	private sidebarButton: HTMLElement | null = null;
 	private activeSyncNotice: Notice | null = null;
 	private syncNoticeUnsubscribe: (() => void) | null = null;
@@ -231,8 +229,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Register commands
 		this.registerCommands();
 
-		// Create status bar and sidebar button
-		this.createStatusBar();
+		// Create status disclosure and sidebar button
+		this.createSyncIndicator();
 		this.createSyncSidebarButton();
 
 		// Wait for layout ready to start synchronization
@@ -255,10 +253,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.syncScheduler) {
 			this.syncScheduler.stop();
 		}
-		if (this.statusBar) {
-			this.statusBar.destroy();
-		}
-		this.mobileSyncIndicator = null;
+		this.syncIndicator = null;
 		if (this.sidebarButton) {
 			this.sidebarButton.remove();
 			this.sidebarButton = null;
@@ -510,26 +505,34 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		);
 	}
 
-	/**
-	 * Create status bar
-	 */
-	private createStatusBar(): void {
-		if (Platform.isMobile) {
-			const indicator = this.addChild(
-				new MobileSyncIndicator(this.app, () => ({
+	/** Mount one shared disclosure with the existing manual sync and diagnostic actions. */
+	private createSyncIndicator(): void {
+		const indicator = this.addChild(
+			new SyncIndicator(
+				this.app,
+				() => ({
 					sync: this.syncEngine.getState(),
 					force: this.forceSyncController?.getState() ?? null,
 					foreground: this.foregroundOperation,
-				})),
-			);
-			this.mobileSyncIndicator = indicator;
-			this.register(
-				this.syncEngine.onStateChange(() => indicator.update()),
-			);
-			return;
-		}
-		const statusBarEl = this.addStatusBarItem();
-		this.statusBar = new SyncStatusBar(statusBarEl, this.syncEngine);
+					fullSyncInProgress: this.isFullSyncInProgress(),
+					syncUnavailable: this.isConfigurationBusy(),
+				}),
+				Platform.isMobile ? "top" : "bottom",
+				{
+					synchronize: async () => {
+						if (!this.isConfigurationBusy()) {
+							await this.runFullSync();
+						}
+					},
+					readLogs: async () =>
+						sanitizeDiagnosticMessage(
+							await logger.getLogContents(),
+						),
+				},
+			),
+		);
+		this.syncIndicator = indicator;
+		this.register(this.syncEngine.onStateChange(() => indicator.update()));
 	}
 
 	/**
@@ -1418,7 +1421,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private notifyManualActivity(): void {
-		this.mobileSyncIndicator?.update();
+		this.syncIndicator?.update();
 		for (const callback of this.manualActivityListeners ?? []) {
 			try {
 				callback();
@@ -1430,7 +1433,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Keep one foreground Notice across backup, Force, persistence and full reconciliation. */
 	private renderForceProgress(state: ForceFlowState): void {
-		this.mobileSyncIndicator?.update();
+		this.syncIndicator?.update();
 		if (state.active) {
 			if (state.outcome) {
 				return;
