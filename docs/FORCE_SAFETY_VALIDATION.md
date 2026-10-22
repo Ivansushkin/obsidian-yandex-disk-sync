@@ -2,8 +2,53 @@
 
 Investigation base: `5aeca24ba618302b150f203e35d96cb552cc432a`.
 Integration base: fresh `origin/master` at `b6f6829361e3e44b33d9f4ca1a0b1a40b8c8a99a`
-(the same source tree, with the merged branch history). Changes are prepared on
-`codex/sync-refactor-hardening`. No version bump or release.
+(the same source tree, with the merged branch history). The initial fixes were
+committed on local `master` as `1fad609`. No version bump or release.
+
+## Follow-up: reported payload HTTP 500 and contradictory recovery instructions
+
+The supplied Obsidian console trace identifies `writeForceRemoteTarget` beneath
+`downloadStableRawFile`: the failure occurs while downloading a newly uploaded
+temporary payload, with another download during cleanup. The operation remains
+in Force `applying` at canonical revision 2. The engine nevertheless marked it
+committed solely because the intent epoch matched, causing the contradictory
+normal-sync instruction while the local checkpoint blocked normal sync.
+
+The engine now requires a verified completion receipt, not an epoch match.
+Controller presentation reads the plugin's actual pending checkpoint and routes
+both pre-final and post-final failures to continuation, including a final-save
+failure. Normal-sync advice remains for finalization after checkpoint clearance.
+
+Known uploaded payload bytes are verified against server SHA-256 and size before
+MOVE. No payload download is needed if that proof matches. A mismatching SHA-256
+blocks transfer even if a content GET would return the selected bytes; absent
+SHA-256 retains mandatory stable download/hash verification. A failed verification
+leaves the unproved staging object for recovery instead of repeating the same
+failed GET and then deleting it. Canonical publication still requires read-back.
+
+RED reproductions failed on payload HTTP 500 and false `replacementCommitted`.
+Focused GREEN checks exercise plaintext/encrypted, zero bytes, missing SHA-256
+plus failed GET, mismatching server hash, successful hash-less read-back on
+continuation, and failed local clear after final commit. They assert canonical,
+local and physical outcomes plus retention of operation epoch/checkpoint.
+
+The first session in the supplied log separately reports a missing canonical
+that cannot be reconstructed from owned publication locks. The log does not
+establish why it disappeared. The HTTP 500 provider-side cause and metadata hash
+availability of that particular payload are also not present in the trace.
+These tests prove the reproduced transport boundary; they do not establish a
+successful live Obsidian/Yandex rerun or close the server-fencing release gates.
+
+Follow-up automated verification: **524/524** tests pass, including an ordinary
+full with no transfers after the hash-verified Force. `lint:fix`, `format`, lint,
+build, format-check and diff-check pass. A focused independent static safety
+review found no actionable issue in this delta; it did not perform a live run.
+The first full follow-up run was 523/524 because the existing changed-orphan
+scenario expected the old `cleanup-pending` classification. Its checks now prove
+that canonical is still Force intent, the local source and changed lock survive,
+and the correct outcome is pending recovery.
+The separate server-fencing gate was rerun after this correction: **0/6**,
+nonzero exit with the same six successor-preservation failures listed below.
 
 ## Regressions and scope
 

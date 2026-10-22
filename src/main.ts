@@ -1587,6 +1587,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					}
 					return result;
 				},
+				hasPendingRecovery: () => this.forceRecovery !== null,
 				hasPendingCleanup: () =>
 					this.indexManager.getPendingPhysicalActions().length > 0 ||
 					this.indexManager.getMaintenance() !== undefined,

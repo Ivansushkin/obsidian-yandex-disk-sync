@@ -917,7 +917,7 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 	}
 });
 
-test("Force UI never reports success while a changed orphan survives its final full", async () => {
+test("Force UI retains recovery when a pinned orphan changes after intent publication", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	const path = "vault/.obsidian-sync-index.lock.old.attempt";
@@ -938,7 +938,10 @@ test("Force UI never reports success while a changed orphan survives its final f
 		};
 		const controller = forceUi(a).getForceSyncController();
 		await controller.run("from_local");
-		assert.equal(controller.getState()?.outcome, "cleanup-pending");
+		assert.equal(controller.getState()?.outcome, "recovery-pending");
+		assert.equal((await a.canonical()).maintenance?.kind, "force");
+		a.assertLocal("Note.md", "kept");
+		assert.equal(disk.files.has("vault/Note.md"), false);
 		assert.deepEqual(disk.files.get(path), changed);
 		assert.equal(a.index.getObservedEpoch(), null);
 	} finally {

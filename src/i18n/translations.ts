@@ -120,6 +120,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Backup could not be verified. Force synchronization was not started.",
 		"notice.force_finalization_pending":
 			"The new snapshot is saved, but synchronization needs another check. Run normal synchronization; do not repeat Force.",
+		"notice.force_resume_pending":
+			"Force recovery is pending. After resolving the error, select the same Force direction and continue the saved operation. Normal synchronization is blocked until recovery finishes.",
 		"notice.force_flow_failed":
 			"Force synchronization was interrupted. Check the connection and plugin status before starting a new attempt. Files already transferred may have changed.",
 		// Commands
@@ -579,6 +581,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
 		"notice.force_finalization_pending":
 			"Новый снимок сохранён, но завершение синхронизации требует повторной проверки. Запустите обычную синхронизацию; повторять Force не нужно.",
+		"notice.force_resume_pending":
+			"Восстановление Force не завершено. После устранения ошибки выберите то же направление Force и продолжите сохранённую операцию. Обычная синхронизация заблокирована до завершения восстановления.",
 		"notice.force_flow_failed":
 			"Принудительная синхронизация прервана. Проверьте соединение и статус плагина перед новым запуском. Уже переданные файлы могли измениться.",
 		// Commands

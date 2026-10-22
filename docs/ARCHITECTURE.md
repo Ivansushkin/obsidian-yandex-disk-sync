@@ -785,6 +785,21 @@ response descriptions/body и не signed URLs. Provider error code проход
 
 ## Force completion и открытый server-fencing gate
 
+Force payload staging uses the uploaded resource's server SHA-256 and byte size
+to verify known raw bytes before exclusive MOVE. A mismatching hash fails closed;
+when SHA-256 is absent, a stable raw download and local SHA-256 remain mandatory.
+Signed-download availability is not an additional requirement when the server
+already proves the exact payload. Cleanup never repeats a failed verification
+download or deletes a payload whose content ownership was not proved. Canonical
+publication retains its separate verified read-back contract.
+
+An initial Force intent shares the replacement epoch but is not a final commit.
+The engine uses the verified completion receipt for failure classification.
+The controller obtains pending recovery from the plugin's actual checkpoint,
+including failure before mutation and after final commit. Pending recovery has
+its own outcome and directs the user to continue the saved operation; only an
+already cleared checkpoint permits the normal-sync finalization instruction.
+
 `ForceRecovery.completion` — durable `{epoch, revision, canonicalSha256}` либо null.
 Это receipt проверенного raw read-back final canonical, не `CanonicalCommitProof`
 и не authority для physical writes. Receipt сохраняется до local cutover/clear.

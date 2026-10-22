@@ -78,6 +78,7 @@ function harness(overrides: Partial<ForceSyncDependencies> = {}) {
 			return result();
 		},
 		hasPendingCleanup: () => false,
+		hasPendingRecovery: () => false,
 		reportError: () => {},
 		...overrides,
 	};

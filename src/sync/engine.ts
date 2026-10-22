@@ -1360,8 +1360,7 @@ export class SyncEngine {
 			if (
 				this.coordinator.getActiveKind() === "force" &&
 				options?.forceReplacement &&
-				this.indexManager.getRemoteIndex().epoch ===
-					options.forceReplacement.plan.recovery.epoch
+				options.forceReplacement.plan.recovery.completion !== null
 			) {
 				result.replacementCommitted = true;
 			}

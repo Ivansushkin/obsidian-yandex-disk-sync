@@ -1181,13 +1181,30 @@ async function writeForceRemoteTarget(
 		} catch (error) {
 			uploadError = error;
 		}
-		const stage = await deps.client.downloadStableRawFile(staging);
-		if (!stage || (await computeSha256(stage.raw)) !== hash) {
+		const uploaded = await deps.client.getResource(staging, 1, 0, true);
+		// A server SHA-256 proves the uploaded bytes without depending on signed-download availability.
+		if (uploaded?.sha256) {
+			if (
+				uploaded.type === "file" &&
+				uploaded.sha256 === hash &&
+				uploaded.size === content.byteLength
+			) {
+				fingerprint = getStableContentFingerprint(uploaded);
+			}
+		} else if (uploaded?.type === "file") {
+			const stage = await deps.client.downloadStableRawFile(
+				staging,
+				uploaded,
+			);
+			if (stage && (await computeSha256(stage.raw)) === hash) {
+				fingerprint = stage.fingerprint;
+			}
+		}
+		if (!fingerprint) {
 			throw uploadError instanceof Error
 				? uploadError
 				: new Error("Force staged upload was not verified");
 		}
-		fingerprint = stage.fingerprint;
 		await authority();
 		const previous = await deps.client.getResource(targetPath, 1, 0, true);
 		if (previous) {
@@ -1271,18 +1288,8 @@ async function writeForceRemoteTarget(
 	}
 	try {
 		const remaining = await deps.client.getResource(staging, 1, 0, true);
-		if (remaining) {
+		if (remaining && fingerprint) {
 			// The unique payload path belongs only to this run, even after its canonical authority was revoked.
-			if (!fingerprint) {
-				const snapshot =
-					await deps.client.downloadStableRawFile(staging);
-				if (!snapshot || (await computeSha256(snapshot.raw)) !== hash) {
-					throw new Error(
-						"Force staging collision is not owned by this operation",
-					);
-				}
-				fingerprint = snapshot.fingerprint;
-			}
 			await deps.client.deleteResource(staging, true, true, async () => {
 				const current = await deps.client.getResource(
 					staging,

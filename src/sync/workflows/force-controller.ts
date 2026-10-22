@@ -22,6 +22,7 @@ export type ForceOutcome =
 	| "blocked"
 	| "backup-failed"
 	| "failed"
+	| "recovery-pending"
 	| "cleanup-pending";
 
 export interface ForceFlowState {
@@ -73,6 +74,7 @@ export interface ForceSyncDependencies {
 		onActivity: (state: SyncState) => void,
 	): Promise<SyncResult | null>;
 	hasPendingCleanup(): boolean;
+	hasPendingRecovery(): boolean;
 	reportError(error: unknown): void;
 }
 
@@ -166,7 +168,9 @@ export class ForceSyncController {
 			});
 			this.deps.reportError(failure);
 			update({
-				outcome,
+				outcome: this.deps.hasPendingRecovery()
+					? "recovery-pending"
+					: outcome,
 				failure: failure.summary,
 				errorCode: failure.summary.code,
 			});

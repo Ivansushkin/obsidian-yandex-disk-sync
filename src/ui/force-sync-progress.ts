@@ -21,6 +21,12 @@ export function formatForceResult(state: ForceFlowState): string {
 				});
 	}
 	if (state.failure) {
+		if (state.outcome === "recovery-pending") {
+			return formatOperationFailure(
+				state.failure,
+				t("notice.force_resume_pending"),
+			);
+		}
 		const prefix =
 			state.outcome === "cleanup-pending"
 				? `${t("notice.force_finalization_pending")} `
@@ -32,6 +38,9 @@ export function formatForceResult(state: ForceFlowState): string {
 	}
 	if (state.outcome === "cleanup-pending") {
 		return t("notice.force_finalization_pending");
+	}
+	if (state.outcome === "recovery-pending") {
+		return t("notice.force_resume_pending");
 	}
 	if (state.errorCode === "force-backup-stale") {
 		return t("notice.force_backup_stale");

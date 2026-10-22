@@ -1,6 +1,7 @@
 import { computeSha256 } from "../src/utils/hash-utils";
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { SyncResult } from "../src/types";
 import {
 	applyForceReplacement,
 	prepareForceReplacement,
@@ -16,6 +17,212 @@ import {
 	managedDevices,
 	MemoryDisk,
 } from "./helpers/sync-flow";
+
+test("Force installs hash-verified payloads when their download endpoint returns HTTP 500", async (context) => {
+	const make = managedDevices(context);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const owner = make(disk, `payload-download-${encrypted}`, null);
+		owner.settings.enableEncryption = encrypted;
+		owner.settings.encryptionPassword = encrypted
+			? "synthetic-password"
+			: null;
+		owner.vault.put("note.md", bytes("selected source"));
+		owner.vault.put("empty.md", bytes(""));
+		const request = disk.request.bind(disk);
+		disk.request = async (params, accepted) => {
+			const url = new URL(params.url);
+			if (
+				url.pathname === "/download" &&
+				url.searchParams.get("path")?.includes(".payload.")
+			) {
+				return {
+					status: 500,
+					json: {},
+					arrayBuffer: new ArrayBuffer(0),
+					text: "",
+					headers: {},
+				};
+			}
+			return request(params, accepted);
+		};
+		let saved: ForceRecovery | null = null;
+		const deps = {
+			client: owner.client,
+			adapter: owner.adapter,
+			index: owner.index,
+			settings: owner.settings,
+			persist: async (state: ForceRecovery | null) => {
+				saved = structuredClone(state);
+			},
+			password: async () => null,
+		};
+		const plan = await prepareForceReplacement(deps, "from_local");
+		assert.ok(plan);
+		await applyForceReplacement(deps, plan, "without-backup");
+		assert.equal(saved, null);
+		assert.equal((await owner.canonical()).maintenance, undefined);
+		const followUp = await owner.full();
+		assert.deepEqual(
+			[followUp.uploaded, followUp.downloaded, followUp.deleted],
+			[0, 0, 0],
+		);
+		await owner.assertSettled({
+			"note.md": "selected source",
+			"empty.md": "",
+		});
+		assert.equal(
+			[...disk.files.keys()].some((path) => path.includes(".payload.")),
+			false,
+		);
+	}
+});
+
+test("Force payload verification failure preserves recovery and never claims an intent is final", async (context) => {
+	const { ForceSyncController } =
+		await import("../src/sync/workflows/force-controller");
+	const make = managedDevices(context);
+	for (const fingerprint of ["absent", "mismatch", "cutover"] as const) {
+		const disk = new MemoryDisk();
+		const owner = make(disk, `payload-proof-${fingerprint}`, null);
+		owner.vault.put("note.md", bytes("selected source"));
+		const resource = disk.resource.bind(disk);
+		let failing = true;
+		disk.resource = async (path) => {
+			const result = await resource(path);
+			if (
+				(fingerprint === "absent" ||
+					(failing && fingerprint === "mismatch")) &&
+				path.includes(".payload.") &&
+				result
+			) {
+				delete result.sha256;
+				if (fingerprint === "mismatch") {
+					result.sha256 = "0".repeat(64);
+				}
+			}
+			return result;
+		};
+		const request = disk.request.bind(disk);
+		let failedPayloadReads = 0;
+		disk.request = async (params, accepted) => {
+			const url = new URL(params.url);
+			if (
+				failing &&
+				fingerprint === "absent" &&
+				url.pathname === "/download" &&
+				url.searchParams.get("path")?.includes(".payload.")
+			) {
+				failedPayloadReads++;
+				return {
+					status: 500,
+					json: {},
+					arrayBuffer: new ArrayBuffer(0),
+					text: "",
+					headers: {},
+				};
+			}
+			return request(params, accepted);
+		};
+		let saved: ForceRecovery | null = null;
+		const deps = {
+			client: owner.client,
+			adapter: owner.adapter,
+			index: owner.index,
+			settings: owner.settings,
+			persist: async (state: ForceRecovery | null) => {
+				if (failing && fingerprint === "cutover" && state === null) {
+					throw new Error("synthetic final save failure");
+				}
+				saved = structuredClone(state);
+			},
+			password: async () => null,
+		};
+		const plan = await prepareForceReplacement(deps, "from_local");
+		assert.ok(plan);
+		owner.engine.setForceReplacementPorts(deps);
+		let reported: SyncResult | undefined;
+		const controller = new ForceSyncController({
+			isSyncBusy: () => false,
+			preflight: async () => ({
+				replacement: {
+					plan,
+					backupMode: "without-backup",
+					continuing: true,
+				},
+				canonical: { state: "absent" },
+				migration: false,
+			}),
+			confirm: async () => {
+				throw new Error("continuation cannot start a new operation");
+			},
+			readyForBackup: async () => true,
+			captureProtectedSnapshot: async () => {
+				throw new Error("unrequested archive");
+			},
+			backup: async () => {
+				throw new Error("unrequested archive");
+			},
+			beforeMutation: async () => {},
+			run: async (_, options) => {
+				reported = await owner.engine.forceSyncFromLocal(options);
+				return reported;
+			},
+			persist: async () => {},
+			replacementCommitted: () => {},
+			reconcile: async () => {
+				throw new Error(
+					"ordinary sync cannot complete pending replacement",
+				);
+			},
+			hasPendingCleanup: () => true,
+			hasPendingRecovery: () => saved !== null,
+			reportError: () => {},
+		});
+		await controller.run("from_local");
+		assert.equal(reported?.success, false);
+		assert.equal(
+			reported?.replacementCommitted === true,
+			fingerprint === "cutover",
+		);
+		assert.equal(controller.getState()?.outcome, "recovery-pending");
+		assert.equal(failedPayloadReads, fingerprint === "absent" ? 1 : 0);
+		assert.equal(
+			[...disk.files.keys()].some((path) => path.includes(".payload.")),
+			fingerprint !== "cutover",
+		);
+		assert.equal(
+			plan.recovery.completion !== null,
+			fingerprint === "cutover",
+		);
+		assert.ok(saved);
+		assert.equal(
+			(await owner.canonical()).maintenance?.id,
+			fingerprint === "cutover" ? undefined : plan.recovery.id,
+		);
+		assert.equal(
+			disk.files.has("vault/note.md"),
+			fingerprint === "cutover",
+		);
+		owner.assertLocal("note.md", "selected source");
+		failing = false;
+		const resumed = await resumeForceReplacement(deps, saved);
+		const completed = await owner.engine.forceSyncFromLocal({
+			forceReplacement: {
+				plan: resumed,
+				backupMode: "without-backup",
+				continuing: true,
+			},
+		});
+		assert.equal(completed.success, true, JSON.stringify(completed.errors));
+		assert.equal(saved, null);
+		assert.equal((await owner.canonical()).epoch, plan.recovery.epoch);
+		assert.deepEqual(
+			disk.files.get("vault/note.md"),
+			bytes("selected source"),
+		);
+	}
+});
 
 test("Force refuses ambiguous raw destination scope before publication and during recovery", async (context) => {
 	const make = managedDevices(context);
@@ -1150,6 +1357,7 @@ test("Force archive snapshot failure offers retry or explicit replacement withou
 				endTime: 2,
 			}),
 			hasPendingCleanup: () => false,
+			hasPendingRecovery: () => false,
 			reportError: () => {},
 		});
 		await controller.run("from_local");
@@ -1328,6 +1536,7 @@ test("manual Force continuation preserves identity and does not create another a
 		replacementCommitted: () => {},
 		reconcile: async () => result,
 		hasPendingCleanup: () => false,
+		hasPendingRecovery: () => false,
 		reportError: () => {},
 	});
 	await controller.run("from_local");
