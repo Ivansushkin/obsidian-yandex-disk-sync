@@ -690,7 +690,9 @@ Enter/Space меняют раскрытие; обновления и remount е�
 и copy находятся слева в той же строке, вне `summary` и live status: их нажатие
 не сворачивает плашку. Touch targets не меньше 44 × 44 px, названия и подсказки
 локализованы. Копирование не меняет sync-state; при пустом логе буфер сохраняется,
-ошибка Clipboard API не даёт ложного успеха.
+ошибка Clipboard API не даёт ложного успеха. Запись через `ClipboardItem` начинается
+в обработчике касания для WebKit; при её отказе используется `writeText()`,
+чтобы сохранить совместимость с текстовым clipboard bridge Obsidian.
 
 `idle` не обещает отсутствие deferred events. UI-состояние не сохраняется в
 `data.json` и не участвует в causal merge или выборе codec. `onLayoutReady` и

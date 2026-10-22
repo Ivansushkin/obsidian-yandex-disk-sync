@@ -305,7 +305,7 @@ export class SyncIndicator extends Component {
 		}
 	}
 
-	/** Start clipboard access during the tap; WebKit accepts deferred ClipboardItem data. */
+	/** Preserve WebKit tap activation, falling back to Obsidian's text clipboard bridge. */
 	private async copyLogs(): Promise<void> {
 		if (this.copyingLogs) {
 			return;
@@ -324,13 +324,20 @@ export class SyncIndicator extends Component {
 		try {
 			const clipboard = this.win.navigator.clipboard;
 			if (typeof ClipboardItem !== "undefined" && clipboard?.write) {
-				await clipboard.write([
-					new ClipboardItem({
-						"text/plain": content.then(
-							(text) => new Blob([text], { type: "text/plain" }),
-						),
-					}),
-				]);
+				const data = content.then(
+					(text) => new Blob([text], { type: "text/plain" }),
+				);
+				// A host may reject write before consuming the deferred data.
+				void data.catch(() => undefined);
+				try {
+					await clipboard.write([
+						new ClipboardItem({
+							"text/plain": data,
+						}),
+					]);
+				} catch {
+					await clipboard.writeText(await content);
+				}
 			} else {
 				await clipboard.writeText(await content);
 			}
