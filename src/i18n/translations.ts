@@ -21,6 +21,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.backup_failed_description":
 			"Retry, explicitly continue without any protective copies, or cancel.",
 		"force.retry": "Retry",
+		"force.continue_recovery": "Continue saved operation",
+		"force.new_replacement": "Prepare a new replacement",
+		"force.recovery_title": "Unfinished Force sync",
+		"force.recovery_choice":
+			"Continue the saved direction, encryption mode and backup choice, or confirm a new replacement separately. Cancel keeps recovery unchanged.",
 		"force.recovery_pending":
 			"Force recovery is unfinished. Resume it before normal synchronization.",
 		"force.confirm_details":
@@ -473,6 +478,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.backup_failed_description":
 			"Повторите попытку, явно продолжите без любых защитных копий или отмените операцию.",
 		"force.retry": "Повторить",
+		"force.continue_recovery": "Продолжить сохранённую операцию",
+		"force.new_replacement": "Подготовить новую замену",
+		"force.recovery_title": "Незавершённый Force sync",
+		"force.recovery_choice":
+			"Продолжить сохранённое направление, режим шифрования и выбор архива либо отдельно подтвердить новую замену. Отмена сохраняет recovery.",
 		"force.recovery_pending":
 			"Восстановление Force не завершено. Продолжите его перед обычной синхронизацией.",
 		"force.confirm_details":

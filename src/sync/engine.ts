@@ -1509,6 +1509,8 @@ export class SyncEngine {
 
 	private getExternalBlockCode(kind: ExternalSyncBlockKind): string {
 		switch (kind) {
+			case "force":
+				return "force-recovery-pending";
 			case "local-state":
 				return "local-state-blocked";
 			case "migration":
@@ -1539,6 +1541,7 @@ export class SyncEngine {
 	): ExternalSyncBlock | null {
 		for (const kind of [
 			"local-state",
+			"force",
 			"historical",
 			"authentication",
 			"encryption",

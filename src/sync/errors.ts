@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "./workflows/force-state";
 import {
 	OperationFailure,
 	type FailureContext,
@@ -117,6 +118,14 @@ export function classifySyncError(error: Error): string | undefined {
 }
 
 function classifyDomainError(error: Error): string | undefined {
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof ForceRecoveryPendingError,
+		)
+	) {
+		return "force-recovery-pending";
+	}
 	if (
 		findErrorCause(
 			error,

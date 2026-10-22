@@ -1,3 +1,4 @@
+import { confirmForceReplacementPlan } from "../src/sync/workflows/force-replacement";
 import { encryptionFlow } from "./helpers/encryption-flow";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -98,9 +99,7 @@ test("stale lock codec fallback reuses stable bytes and stops unresolved reads",
 	for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);
-		const a = device(disk, "device-a", codec, undefined, undefined, {
-			readTimeoutMs: 15,
-		});
+		const a = device(disk, "device-a", codec);
 		const recovery = (a.index as unknown as { recovery: CanonicalRecovery })
 			.recovery;
 		const lockPath = "vault/.obsidian-sync-index.lock.interrupted";
@@ -135,18 +134,37 @@ test("stale lock codec fallback reuses stable bytes and stops unresolved reads",
 					complete();
 				}
 			};
-			await assert.rejects(
-				recovery.recoverStaleLock([resource]),
-				(error) => {
-					const failure = new OperationFailure(error, {
-						stage: "stale-lock",
-						action: "read",
-					});
-					assert.equal(failure.summary.code, "remote-read-timeout");
-					assert.equal(failure.summary.requestState, "unresolved");
-					return isRemoteReadTimeout(error);
-				},
-			);
+			const readStable = a.client.downloadStableRawFile.bind(a.client);
+			a.client.downloadStableRawFile = (path, expected, budget) =>
+				readStable(
+					path,
+					expected,
+					path === lockPath
+						? { deadline: Date.now() + 15, timeoutMs: 15 }
+						: budget,
+				);
+			try {
+				await assert.rejects(
+					recovery.recoverStaleLock([resource]),
+					(error) => {
+						const failure = new OperationFailure(error, {
+							stage: "stale-lock",
+							action: "read",
+						});
+						assert.equal(
+							failure.summary.code,
+							"remote-read-timeout",
+						);
+						assert.equal(
+							failure.summary.requestState,
+							"unresolved",
+						);
+						return isRemoteReadTimeout(error);
+					},
+				);
+			} finally {
+				a.client.downloadStableRawFile = readStable;
+			}
 			assert.equal(downloads, 1);
 			release();
 			await lateReply;
@@ -888,6 +906,7 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 			(await captureRemoteRawSnapshot(a.client, "vault")).digest,
 			before.digest,
 		);
+		confirmForceReplacementPlan(prepared.replacement.plan);
 		const result = await a.engine.forceSyncFromLocal({
 			forceReplacement: prepared.replacement,
 		});

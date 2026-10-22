@@ -541,6 +541,8 @@ export class YandexDiskClient {
 		const files: YandexResource[] = [];
 		const directories: string[] = [];
 		let offset = 0;
+		let total: number | null = null;
+		const seen = new Set<string>();
 		const limit = 1000;
 		while (true) {
 			const resource = await this.getResource(path, limit, offset, true);
@@ -564,11 +566,24 @@ export class YandexDiskClient {
 				!Array.isArray(embedded.items) ||
 				!Number.isSafeInteger(embedded.total) ||
 				embedded.total < 0 ||
+				embedded.offset !== offset ||
+				!Number.isSafeInteger(embedded.limit) ||
+				embedded.limit < 1 ||
+				embedded.items.length > embedded.limit ||
+				offset + embedded.items.length > embedded.total ||
+				(total !== null && total !== embedded.total) ||
 				(embedded.items.length === 0 && offset < embedded.total)
 			) {
 				throw new Error("Remote directory listing is incomplete");
 			}
+			total = embedded.total;
 			for (const item of embedded.items) {
+				if (seen.has(item.path)) {
+					throw new Error(
+						"Remote directory listing contains duplicate paths",
+					);
+				}
+				seen.add(item.path);
 				if (item.type === "dir") {
 					this.rememberFolder(item.path.replace(/^disk:\//, ""));
 					if (!isProtectedPath(item.path)) {
@@ -741,7 +756,8 @@ export class YandexDiskClient {
 	 * When `raw` is true, skips content and path encryption (for metadata files).
 	 *
 	 * Preflight may be skipped for an already observed parent. In either mode,
-	 * a transport 404 recreates the parent and retries once. Guard and ambiguous
+	 * a transport 404 or a known missing-parent 409 permits a raw parent GET.
+	 * Only a confirmed parent 404 recreates it and retries once. Guard and ambiguous
 	 * verification failures never authorize parent recovery, regardless of status.
 	 */
 	async uploadFile(
@@ -792,7 +808,23 @@ export class YandexDiskClient {
 			logger.debug(`Uploaded file: ${remotePath}`);
 			return;
 		} catch (e) {
-			if (callbackFailed || !this.isNotFoundError(e)) {
+			if (
+				callbackFailed ||
+				!(
+					this.isNotFoundError(e) ||
+					(e instanceof YandexApiError &&
+						e.status === 409 &&
+						e.code === "DiskPathDoesntExistsError")
+				)
+			) {
+				throw e;
+			}
+			await beforeAttempt?.();
+			const parentPath = await this.getUploadParent(remotePath, raw);
+			if (
+				!parentPath ||
+				(await this.getResource(parentPath, 1, 0, true))
+			) {
 				throw e;
 			}
 			logger.info("Upload parent missing; recreating before one retry", {
@@ -850,7 +882,21 @@ export class YandexDiskClient {
 		if (!parentPath) {
 			return;
 		}
-		this.invalidateFolder(parentPath);
+		let candidate = parentPath;
+		while (candidate) {
+			const resource = await this.getResource(candidate, 1, 0, true);
+			if (resource) {
+				if (resource.type !== "dir") {
+					throw new Error("Upload parent is not a directory");
+				}
+				break;
+			}
+			this.invalidateFolder(candidate);
+			candidate = candidate.slice(
+				0,
+				Math.max(0, candidate.lastIndexOf("/")),
+			);
+		}
 		await this.createFolderRecursive(parentPath);
 	}
 
@@ -1168,7 +1214,13 @@ export class YandexDiskClient {
 			encryptedTo.lastIndexOf("/"),
 		);
 		if (parentPath) {
-			await this.createFolderRecursive(parentPath);
+			const parent = await this.getResource(parentPath, 1, 0, true);
+			if (!parent) {
+				await beforeAttempt?.();
+				await this.recreateUploadParent(encryptedTo, true);
+			} else if (parent.type !== "dir") {
+				throw new Error("Move destination parent is not a directory");
+			}
 		}
 
 		const response = await this.request(
@@ -1503,7 +1555,9 @@ export class YandexDiskClient {
 		}
 		const href = (response.json as { href?: unknown } | null)?.href;
 		if (typeof href !== "string" || !href) {
-			return;
+			throw new Error(
+				"Accepted async operation is missing its operation link; completion is unknown",
+			);
 		}
 		const operationUrl = href.startsWith("http")
 			? href

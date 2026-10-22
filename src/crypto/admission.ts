@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { t } from "../i18n/index";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
@@ -62,6 +63,9 @@ export class EncryptionAdmission {
 						return false;
 					}
 					if (plaintextCanonical.maintenance) {
+						if (plaintextCanonical.maintenance.kind === "force") {
+							throw new ForceRecoveryPendingError();
+						}
 						this.controller.createRemoteTargetRecoveryPlan(
 							null,
 							plaintextCanonical.maintenance,
@@ -158,6 +162,9 @@ export class EncryptionAdmission {
 			this.context.ui.setBlock(null);
 			return true;
 		} catch (e) {
+			if (e instanceof ForceRecoveryPendingError) {
+				throw e;
+			}
 			if (e instanceof UnsupportedHistoricalDataError) {
 				this.context.ui.setBlock(null, false);
 				this.context.ui.setHistoricalBlock(

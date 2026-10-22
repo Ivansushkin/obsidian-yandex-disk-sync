@@ -88,7 +88,7 @@ Force UI/архив принадлежат `ForceSyncController`, транзак
 | Directed Force            | `prepareForceReplacement` → source/plan/configuration proof → archive choice/revalidation → durable prepared checkpoint → canonical intent → guarded `replaceRemote`/`replaceLocal` → destination/manifest verification → final canonical → `finishForceReplacement`                                                                                                                                                                                    | Новый epoch после commit не откатывается; общий finish только после проверок соответствующей ветки. Cutoff IDs retirement до coherent clearing recovery; same ID/epoch после restart                                                    |
 | Internal compatible Force | Legacy `forceBackupProof` adapter либо current preflight proof → independent source identity → transfer → repeated source proof → replacement commit → cleanup                                                                                                                                                                                                                                                                                          | Adapter сохранён для существующих consumers/tests. Public directed replacement не получает второй набор сервисов через options                                                                                                          |
 
-`SyncRunOptions.forceReplacement` содержит только plan и выбранный backup mode.
+`SyncRunOptions.forceReplacement` содержит plan, выбранный backup mode и ephemeral continuing flag.
 `setForceReplacementPorts` подключает plugin-owned persistence/password/cutoff
 callbacks; engine подставляет свои существующие client/index/adapter и live settings.
 Main wiring читает текущие settings getter-ом; dependency objects не изменяются
@@ -719,8 +719,8 @@ configuration/foreground work. При обычной sync-сессии Force с�
 настроек читает текущее состояние; закрытие снимает подписки, но не отменяет Force.
 
 Успех показывается после подтверждённого replacement, persistence и собственного
-контроля canonical/manifest/bytes/cleanup. Обычный full не используется для
-возвращения перезаписанных destination-очередей. После ошибки остаётся durable
+контроля canonical/manifest/bytes/cleanup. После cutover обычный full согласует поздние изменения; прежние destination-очереди
+не возвращаются. После ошибки остаётся durable
 Force recovery; rollback нового epoch запрещён. Повторный клик наблюдает тот же
 Promise, а поздние callbacks предыдущего flow не меняют новый Notice.
 
@@ -782,3 +782,41 @@ HTTP/provider code и известный исход; частичный резу
 response descriptions/body и не signed URLs. Provider error code проходит
 ограничение формата. Реальная доступность Диска и работа двух Obsidian-профилей
 проверяются отдельно от автоматических алгоритмических тестов.
+
+## Force completion и открытый server-fencing gate
+
+`ForceRecovery.completion` — durable `{epoch, revision, canonicalSha256}` либо null.
+Это receipt проверенного raw read-back final canonical, не `CanonicalCommitProof`
+и не authority для physical writes. Receipt сохраняется до local cutover/clear.
+До final MOVE source проверяется повторно; после commit source snapshot больше
+не разрешает replacement. Same-epoch successor revisions идут в обычный full;
+существующие baseline/queues нового epoch не сбрасываются. При initial cutover
+baseline остаётся именно выбранным Force snapshot, даже если remote уже продвинулся.
+Отличающийся epoch либо несовпадающие revision/hash блокируют stale recovery.
+Отсутствующий receipt восстанавливается лишь из exact final Force state без
+maintenance/moves/tombstones/watermarks; changed canonical не угадывается.
+Поздняя encryption transition не откатывается к settings checkpoint.
+
+Current checkpoints без completion получают null в loader; coherent initial save
+сохраняет нормализацию до automation. Неизвестные/некорректные поля отклоняются.
+Маркеры formats, hardened, FIFO и physical-action schema не меняются. Старый build,
+не знающий completion, может отвергнуть новый checkpoint; downgrade при pending
+recovery не поддерживается. Credentials остаются только в local plugin data.
+
+Startup и обычный guard различают `force-recovery-pending` и encryption/auth blocks.
+Повторный клик выбирает продолжение checkpoint либо отдельно подтверждаемую новую
+замену; ID/epoch новой операции выделяются после destructive confirmation. Cancel
+сохраняет старый checkpoint. Continuation не создаёт архив и сохраняет backup choice.
+
+Один lifecycle helper запускает watcher/scheduler после durable reconciliation,
+cleanup и освобождения full/manual/settings/foreground/Force flags. Он не вызывает
+full. Pause, unload, failed save, layout-not-ready и startup blocks запрещают запуск.
+Concurrent full callers разделяют pending invocation. Settings и encryption flows
+вызывают helper после освобождения собственного reservation.
+
+Remote empty directories остаются: optional pruning выключен также при encryption
+cleanup. Remote directory-to-file replacement блокируется до удаления directory.
+Guard перед native request не защищает уже отправленный DELETE/PUT. Сохранение
+обычного видимого дерева оставляет открытыми P0 late DELETE, ordinary PUT и manifest
+PUT. Отдельный `npm run test:force-fencing` обязан стать зелёным до выпуска; обычная
+зелёная suite этого не доказывает. [Evidence/gates](FORCE_SAFETY_VALIDATION.md).

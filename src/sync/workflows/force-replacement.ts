@@ -1,4 +1,6 @@
+import { assertForceRecovery } from "./force-state";
 import type { VaultAdapter } from "../../api/vault-adapter";
+import { YandexApiError } from "../../api/yandex-client";
 import type { YandexDiskClient } from "../../api/yandex-client";
 import { type EncryptionCodec } from "../../crypto/encryption";
 import { EncryptionManager } from "../../crypto/encryption-manager";
@@ -13,7 +15,6 @@ import {
 } from "../../types";
 import { computeSha256, computeSha256FromString } from "../../utils/hash-utils";
 import {
-	getAncestorDirectoriesDeepestFirst,
 	hasPortablePathCollision,
 	isProtectedPath,
 	joinPath,
@@ -63,6 +64,14 @@ export interface PreparedForceReplacement {
 	password: string | null;
 	assertConfiguration(): Promise<void>;
 }
+/** Allocate replacement authority only after the destructive choice was confirmed. */
+export function confirmForceReplacementPlan(
+	plan: PreparedForceReplacement,
+): void {
+	plan.recovery.id ||= createSyncEpoch();
+	plan.recovery.epoch ||= createSyncEpoch();
+}
+
 const encryption = new EncryptionManager();
 const manifestName = ".obsidian-encrypt.json";
 class ForceDestinationChangedError extends Error {}
@@ -71,6 +80,7 @@ class ForceDestinationChangedError extends Error {}
 export async function prepareForceReplacement(
 	deps: ForceReplacementDependencies,
 	direction: ForceDirection,
+	deferIdentity = false,
 ): Promise<PreparedForceReplacement | null> {
 	const remotePath = deps.settings.remotePath;
 	const token = deps.settings.yandexTokenSecret;
@@ -121,7 +131,11 @@ export async function prepareForceReplacement(
 	} else {
 		const userResources = resources.filter(
 			(resource) =>
-				!isProtectedPath(toLocalPath(resource.path, remotePath)),
+				!isProtectedPath(toLocalPath(resource.path, remotePath)) &&
+				deps.adapter.shouldInspectRaw(
+					toLocalPath(resource.path, remotePath),
+					true,
+				),
 		);
 		// An empty readable source needs no historical manifest or password.
 		if (userResources.length === 0) {
@@ -290,13 +304,14 @@ export async function prepareForceReplacement(
 		true,
 	);
 	const recovery: ForceRecovery = {
+		completion: null,
 		password: codec ? password : null,
-		id: createSyncEpoch(),
+		id: deferIdentity ? "" : createSyncEpoch(),
 		direction,
 		phase: "prepared",
 		backupMode: "without-backup",
 		backupProof: null,
-		epoch: createSyncEpoch(),
+		epoch: deferIdentity ? "" : createSyncEpoch(),
 		remotePath,
 		rootResourceId,
 		originalCanonicalFingerprint:
@@ -315,7 +330,9 @@ export async function prepareForceReplacement(
 		sourceDigest: await digestSource(source),
 		source,
 		target: mode,
-		manifest,
+		manifest: manifest
+			? (JSON.parse(JSON.stringify(manifest)) as EncryptionManifest)
+			: null,
 		watcherCutoff: deps.watcherCutoff?.() ?? [],
 		cleanup: [],
 		targetHashes: createSafeRecord(),
@@ -353,21 +370,42 @@ export async function resumeForceReplacement(
 	if (recovery.remotePath !== deps.settings.remotePath) {
 		throw new Error("Force recovery belongs to another storage");
 	}
-	const password = recovery.target.enabled ? recovery.password : null;
-	if (recovery.target.enabled && (!password || !recovery.target.salt)) {
+	const currentManifest = recovery.completion
+		? await deps.index.downloadEncryptionManifest()
+		: null;
+	const modeChanged =
+		recovery.completion !== null &&
+		(currentManifest
+			? currentManifest.salt !== recovery.target.salt ||
+				currentManifest.revision !== recovery.target.revision
+			: recovery.target.enabled) &&
+		(currentManifest
+			? deps.settings.enableEncryption &&
+				deps.settings.encryptionSalt === currentManifest.salt &&
+				deps.settings.encryptionRevision === currentManifest.revision
+			: !deps.settings.enableEncryption);
+	const enabled = modeChanged
+		? deps.settings.enableEncryption
+		: recovery.target.enabled;
+	const salt = modeChanged
+		? deps.settings.encryptionSalt
+		: recovery.target.salt;
+	const password = enabled
+		? modeChanged
+			? deps.settings.encryptionPassword
+			: recovery.password
+		: null;
+	if (enabled && (!password || !salt)) {
 		throw new Error(
 			"Force recovery requires the stored encryption password and salt",
 		);
 	}
 	const codec = password
-		? await encryption.createCodec(
-				"hardened",
-				recovery.target.salt!,
-				password,
-			)
+		? await encryption.createCodec("hardened", salt!, password)
 		: null;
 	if (
 		codec &&
+		!modeChanged &&
 		!(await encryption.verifyCandidate(codec, recovery.target.verifier!))
 	) {
 		throw new Error("Force recovery password does not match target");
@@ -431,36 +469,78 @@ export async function applyForceReplacement(
 	choice: "with-backup" | "without-backup",
 ): Promise<void> {
 	const state = plan.recovery;
-	if (choice === "with-backup") {
-		const proof = state.backupProof;
-		if (!proof) {
-			throw new Error("Force requires its selected archive proof");
-		}
-		const backup = await deps.client.downloadStableRawFile(
-			joinPath(state.remotePath, ".backup", proof.name),
-		);
-		if (!backup || (await computeSha256(backup.raw)) !== proof.sha256) {
-			throw new Error("Force archive proof changed or is missing");
-		}
-	}
+	assertForceRecovery(state);
+	deps.client.clearFolderCache();
 	await plan.assertConfiguration();
-	await assertSource(deps, plan);
-	if (state.direction === "from_local" && state.phase === "prepared") {
-		await remoteDestinationFiles(deps, await rawFiles(deps), plan.codec);
+	const beforeCommit = async () => {
+		await plan.assertConfiguration();
+		await assertSource(deps, plan);
+	};
+	if (!state.rootResourceId) {
+		await assertSource(deps, plan);
+		await ensureForceRoot(deps, plan);
 	}
-	await ensureForceRoot(deps, plan);
-	state.backupMode = choice;
-	// Credentials are only ever serialized by the local plugin persistence callback.
-	state.watcherCutoff = [
-		...new Set([...state.watcherCutoff, ...(deps.watcherCutoff?.() ?? [])]),
-	];
-	await deps.persist(state);
 	await deps.index.withForceScope(state, async () => {
 		deps.client.setEncryptionService(plan.codec);
+		if (state.phase !== "prepared") {
+			const committed = await deps.index.recoverForcePublication(
+				state,
+				plan.codec,
+				beforeCommit,
+			);
+			if (committed && !committed.maintenance) {
+				await deps.persist(state);
+				if (committed.revision === state.completion?.revision) {
+					await verifyPublishedManifest(deps, state);
+				}
+				await deps.index.cleanupForceServiceLocks(
+					state,
+					plan.codec,
+					true,
+				);
+				await deps.index.assertForceCleanupComplete();
+				await finishForceReplacement(deps, plan, committed);
+				return;
+			}
+		}
+		if (choice !== state.backupMode && state.phase !== "prepared") {
+			throw new Error(
+				"Force continuation must preserve its backup choice",
+			);
+		}
+		if (choice === "with-backup") {
+			const proof = state.backupProof;
+			if (!proof) {
+				throw new Error("Force requires its selected archive proof");
+			}
+			const backup = await deps.client.downloadStableRawFile(
+				joinPath(state.remotePath, ".backup", proof.name),
+			);
+			if (!backup || (await computeSha256(backup.raw)) !== proof.sha256) {
+				throw new Error("Force archive proof changed or is missing");
+			}
+		}
+		await assertSource(deps, plan);
+		if (state.direction === "from_local" && state.phase === "prepared") {
+			await remoteDestinationFiles(
+				deps,
+				await rawFiles(deps),
+				plan.codec,
+			);
+		}
+		state.backupMode = choice;
+		state.watcherCutoff = [
+			...new Set([
+				...state.watcherCutoff,
+				...(deps.watcherCutoff?.() ?? []),
+			]),
+		];
+		await deps.persist(state);
 		if (state.phase === "prepared") {
 			const existing = await deps.index.recoverForcePublication(
 				state,
 				plan.codec,
+				beforeCommit,
 			);
 			if (!existing) {
 				await deps.index.publishForceCanonical(
@@ -471,22 +551,6 @@ export async function applyForceReplacement(
 			}
 			state.phase = "applying";
 			await deps.persist(state);
-		}
-		const alreadyCommitted = await deps.index.recoverForcePublication(
-			state,
-			plan.codec,
-		);
-		if (alreadyCommitted && !alreadyCommitted.maintenance) {
-			await verifyPublishedManifest(deps, state);
-			await deps.index.cleanupForceServiceLocks(state, plan.codec, true);
-			await deps.index.assertForceCleanupComplete();
-			if (!(await verifyDestination(deps, plan))) {
-				throw new Error(
-					"Completed Force destination changed before local recovery",
-				);
-			}
-			await finishForceReplacement(deps, plan, alreadyCommitted);
-			return;
 		}
 		const authority = async () => {
 			await plan.assertConfiguration();
@@ -508,6 +572,7 @@ export async function applyForceReplacement(
 				}
 			} catch (error) {
 				if (error instanceof ForceDestinationChangedError) {
+					deps.client.clearFolderCache();
 					continue;
 				}
 				throw error;
@@ -536,18 +601,28 @@ export async function applyForceReplacement(
 			await deps.persist(state);
 			const final = forceIndex(deps, state);
 			delete final.maintenance;
-			await deps.index.publishForceCanonical(final, plan.codec);
 			await assertSource(deps, plan);
+			state.completion = await deps.index.publishForceCanonical(
+				final,
+				plan.codec,
+				false,
+				async () => {
+					await plan.assertConfiguration();
+					await assertSource(deps, plan);
+				},
+			);
+			await deps.persist(state);
 			const committed = await deps.index.recoverForcePublication(
 				state,
 				plan.codec,
+				beforeCommit,
 			);
 			if (!committed || committed.maintenance) {
 				throw new Error("Force final canonical changed");
 			}
 			await verifyPublishedManifest(deps, state);
 			await deps.index.assertForceCleanupComplete();
-			await finishForceReplacement(deps, plan, final);
+			await finishForceReplacement(deps, plan, committed);
 			return;
 		}
 		throw new Error(
@@ -563,14 +638,23 @@ async function finishForceReplacement(
 	canonical: SyncIndex,
 ): Promise<void> {
 	const state = plan.recovery;
-	deps.index.finishForceReplacement(canonical, state.rootResourceId!);
-	deps.settings.enableEncryption = state.target.enabled;
-	deps.settings.encryptionPassword = plan.password;
-	deps.settings.encryptionSalt = state.target.salt;
-	deps.settings.encryptionRevision = state.target.revision;
-	deps.settings.encryptionProfileId = state.target.enabled
-		? "hardened"
-		: null;
+	const baseline = forceIndex(deps, state);
+	delete baseline.maintenance;
+	baseline.revision = state.completion!.revision;
+	deps.index.finishForceReplacement(
+		canonical,
+		state.rootResourceId!,
+		baseline,
+	);
+	if (canonical.revision === state.completion!.revision) {
+		deps.settings.enableEncryption = state.target.enabled;
+		deps.settings.encryptionPassword = plan.password;
+		deps.settings.encryptionSalt = state.target.salt;
+		deps.settings.encryptionRevision = state.target.revision;
+		deps.settings.encryptionProfileId = state.target.enabled
+			? "hardened"
+			: null;
+	}
 	await deps.retireWatcherEvents?.(state.watcherCutoff);
 	await deps.persist(null);
 }
@@ -749,6 +833,19 @@ async function replaceRemote(
 		await rawFiles(deps),
 		plan.codec,
 	);
+	for (const rawPath of wanted.keys()) {
+		const target = await deps.client.getResource(
+			joinPath(state.remotePath, rawPath),
+			1,
+			0,
+			true,
+		);
+		if (target?.type === "dir") {
+			throw new Error(
+				"Force remote file target is a directory; move the directory aside before continuing recovery",
+			);
+		}
+	}
 	state.cleanup = inventory
 		.filter((resource) => {
 			const path = toLocalPath(resource.path, state.remotePath);
@@ -786,23 +883,6 @@ async function replaceRemote(
 			throw new Error("Force remote deletion was not confirmed");
 		}
 	}
-	// Only empty ancestors are removed; protected/excluded descendants keep their directory.
-	for (const directory of getAncestorDirectoriesDeepestFirst(
-		state.cleanup.map((action) => action.path),
-	)) {
-		const path = joinPath(state.remotePath, directory);
-		await authority();
-		if (await deps.client.isRawFolderEmpty(path)) {
-			await deps.client.deleteResource(path, true, true, async () => {
-				await authority();
-				if (!(await deps.client.isRawFolderEmpty(path))) {
-					throw new ForceDestinationChangedError(
-						"Force folder gained new descendants",
-					);
-				}
-			});
-		}
-	}
 	for (const file of state.source) {
 		await authority();
 		const rawPath = toLocalPath(
@@ -814,60 +894,8 @@ async function replaceRemote(
 		const targetPath = joinPath(state.remotePath, rawPath);
 		const resource = await deps.client.getResource(targetPath, 1, 0, true);
 		if (resource?.type === "dir") {
-			const descendants = await deps.client.getResourcesRecursive(
-				targetPath,
-				true,
-				4,
-				true,
-			);
-			for (const directory of descendants
-				.filter((entry) => entry.type === "dir")
-				.sort(
-					(left, right) =>
-						right.path.split("/").length -
-						left.path.split("/").length,
-				)) {
-				const path = toLocalPath(directory.path, state.remotePath);
-				if (
-					canPruneForceDirectory(deps, path) &&
-					(await deps.client.isRawFolderEmpty(directory.path))
-				) {
-					await deps.client.deleteResource(
-						directory.path,
-						true,
-						true,
-						async () => {
-							await authority();
-							if (
-								!(await deps.client.isRawFolderEmpty(
-									directory.path,
-								))
-							) {
-								throw new ForceDestinationChangedError(
-									"Force folder gained descendants",
-								);
-							}
-						},
-					);
-				}
-			}
-			if (!(await deps.client.isRawFolderEmpty(targetPath))) {
-				throw new Error(
-					"Force file target contains protected or excluded descendants",
-				);
-			}
-			await deps.client.deleteResource(
-				targetPath,
-				true,
-				true,
-				async () => {
-					await authority();
-					if (!(await deps.client.isRawFolderEmpty(targetPath))) {
-						throw new ForceDestinationChangedError(
-							"Force target folder gained descendants",
-						);
-					}
-				},
+			throw new Error(
+				"Force remote file target is a directory; move the directory aside before continuing recovery",
 			);
 		}
 		const content = await deps.adapter.readFile(file.path);
@@ -879,15 +907,36 @@ async function replaceRemote(
 			: content;
 		const sha = await computeSha256(encoded);
 		setRecordValue(state.targetHashes, rawPath, sha);
-		await writeForceRemoteTarget(
-			deps,
-			plan,
-			file.path,
-			targetPath,
-			encoded,
-			sha,
-			authority,
-		);
+		try {
+			await writeForceRemoteTarget(
+				deps,
+				plan,
+				file.path,
+				targetPath,
+				encoded,
+				sha,
+				authority,
+			);
+		} catch (error) {
+			if (
+				error instanceof YandexApiError &&
+				(error.status === 404 ||
+					(error.status === 409 &&
+						error.code === "DiskPathDoesntExistsError"))
+			) {
+				await authority();
+				const parent = targetPath.slice(0, targetPath.lastIndexOf("/"));
+				if (
+					parent &&
+					!(await deps.client.getResource(parent, 1, 0, true))
+				) {
+					throw new ForceDestinationChangedError(
+						"Force parent disappeared; retry inventory",
+					);
+				}
+			}
+			throw error;
+		}
 		const actual = await deps.client.getResource(targetPath, 1, 0, true);
 		if (!actual || actual.sha256 !== sha) {
 			const readback =

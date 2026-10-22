@@ -9,9 +9,7 @@ import { InvalidCurrentIndexError } from "../src/sync/canonical/errors";
 
 test("encryption recovery only falls back after a canonical decode mismatch", async () => {
 	const disk = new MemoryDisk();
-	const a = device(disk, "device-a", null, undefined, undefined, {
-		readTimeoutMs: 15,
-	});
+	const a = device(disk, "device-a", null);
 	const ea = encryptionFlow(a);
 	const canonicalPath = "vault/.obsidian-sync-index.json";
 	let release!: () => void;
@@ -86,15 +84,35 @@ test("encryption recovery only falls back after a canonical decode mismatch", as
 			a.engine.runExclusiveMaintenance(() =>
 				ea.workflow.recovery.recoverEncryptionTransition(),
 			);
-		await assert.rejects(recover(), (error) => {
-			const failure = new OperationFailure(error, {
-				stage: "encryption-recovery",
-				action: "read",
+		const readStable = a.client.downloadStableRawFile.bind(a.client);
+		const expectedCanonical = await a.client.getResource(
+			canonicalPath,
+			1,
+			0,
+			true,
+		);
+		assert.ok(expectedCanonical);
+		a.client.downloadStableRawFile = (path, expected, budget) =>
+			readStable(
+				path,
+				path === canonicalPath ? expectedCanonical : expected,
+				path === canonicalPath
+					? { deadline: Date.now() + 15, timeoutMs: 15 }
+					: budget,
+			);
+		try {
+			await assert.rejects(recover(), (error) => {
+				const failure = new OperationFailure(error, {
+					stage: "encryption-recovery",
+					action: "read",
+				});
+				assert.equal(failure.summary.code, "remote-read-timeout");
+				assert.equal(failure.summary.requestState, "unresolved");
+				return isRemoteReadTimeout(error);
 			});
-			assert.equal(failure.summary.code, "remote-read-timeout");
-			assert.equal(failure.summary.requestState, "unresolved");
-			return isRemoteReadTimeout(error);
-		});
+		} finally {
+			a.client.downloadStableRawFile = readStable;
+		}
 		assert.equal(manifests, 1);
 		assert.equal(downloads, 1);
 		release();

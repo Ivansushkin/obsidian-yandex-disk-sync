@@ -129,6 +129,7 @@ test("accepted connection settings reconcile before automation and preserve a us
 			},
 			refreshRemoteStartupState: async () => {
 				order.push("recheck");
+				plugin["authenticationBlockReason"] = null;
 				return "ready";
 			},
 		});
@@ -411,4 +412,168 @@ test("reload rejects publication of an in-flight settings draft", async () => {
 	await Promise.all([rejected, reload]);
 	await persistence.idle();
 	assert.equal(plugin.settings.enableDebugLogging, false);
+});
+
+test("manual full retry restores automation after startup or settings failure", async () => {
+	for (const [entry, boundary] of [
+		["startup", "ready"],
+		["settings", "ready"],
+		["startup", "pause"],
+		["settings", "save"],
+		["startup", "unload"],
+		["settings", "overlap"],
+		["startup", "block-after-success"],
+	] as const) {
+		const { plugin } = harness();
+		await plugin.loadSettings();
+		plugin.settings = {
+			...plugin.settings,
+			yandexTokenSecret: entry === "settings" ? "" : "synthetic",
+			logToFile: false,
+		};
+		let calls = 0,
+			paused = false;
+		let entered!: () => void, release!: () => void;
+		const waiting = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const starts: string[] = [];
+		Object.assign(plugin, {
+			app: { ...plugin.app, workspace: { layoutReady: true } },
+			localStateRestored: true,
+			syncLifecycleRegistered: true,
+			fileWatcher: {
+				getDeferredEvents: () => [],
+				waitForPendingPersistence: async () => {},
+				start: () => starts.push("watcher"),
+				stop: () => {},
+				updateSettings: () => {},
+			},
+			syncScheduler: {
+				start: () => starts.push("scheduler"),
+				stop: () => {},
+				updateSettings: () => {},
+			},
+			indexManager: {
+				getPendingMutations: () => [],
+				getPendingPhysicalActions: () => [],
+				getMaintenance: () => undefined,
+				getLocalIndexData: () => null,
+				updateSettings: () => {},
+			},
+			syncEngine: {
+				setExternalBlock: () => {},
+				hasPendingWork: () => false,
+				isSyncPaused: () => paused,
+				updateSettings: () => {},
+				fullSync: async () => {
+					calls++;
+					if (
+						calls > 1 &&
+						(boundary === "unload" || boundary === "overlap")
+					) {
+						entered();
+						await gate;
+					}
+					return {
+						success: calls > 1,
+						errors:
+							calls > 1
+								? []
+								: [
+										{
+											path: "",
+											operation: "none",
+											message: "temporary failure",
+										},
+									],
+						uploaded: 0,
+						downloaded: 0,
+						deleted: 0,
+						conflicts: 0,
+						startTime: 1,
+						endTime: 2,
+					};
+				},
+			},
+			refreshRemoteStartupState: async () => {
+				plugin["authenticationBlockReason"] = null;
+				return "ready";
+			},
+		});
+		if (entry === "settings") {
+			await plugin.applySettingsPatch({ yandexTokenSecret: "synthetic" });
+		} else {
+			await plugin["startSync"](true, true);
+		}
+		assert.deepEqual(starts, []);
+		if (boundary === "pause") {
+			paused = true;
+		}
+		if (boundary === "save") {
+			plugin.saveData = async () => {
+				throw new Error("retry save failure");
+			};
+		}
+		const retry = plugin.runFullSync(undefined, false);
+		let concurrent: ReturnType<typeof plugin.runFullSync> | undefined;
+		if (boundary === "unload" || boundary === "overlap") {
+			await waiting;
+			if (boundary === "unload") {
+				plugin["unloaded"] = true;
+			} else {
+				concurrent = plugin.runFullSync(undefined, false);
+			}
+			release();
+		}
+		const result = await retry;
+		if (concurrent) {
+			await concurrent;
+			assert.equal(calls, 2);
+		}
+		if (
+			boundary === "pause" ||
+			boundary === "save" ||
+			boundary === "unload"
+		) {
+			assert.deepEqual(starts, []);
+			if (boundary === "save") {
+				assert.equal(result, null);
+				assert.equal(plugin["persistence"].failed, true);
+			}
+			continue;
+		}
+		assert.equal(result?.success, true);
+		assert.deepEqual(starts, ["watcher", "scheduler"]);
+		if (boundary === "block-after-success") {
+			Object.assign(plugin["syncEngine"], {
+				fullSync: async () => ({
+					success: false,
+					errors: [
+						{
+							path: "",
+							operation: "none",
+							message: "invalid remote index",
+							code: "invalid-index",
+						},
+					],
+					uploaded: 0,
+					downloaded: 0,
+					deleted: 0,
+					conflicts: 0,
+					startTime: 1,
+					endTime: 2,
+				}),
+			});
+			await plugin.runFullSync(undefined, false);
+			assert.equal(plugin["regularSyncStarted"], false);
+			assert.deepEqual(starts, ["watcher", "scheduler"]);
+			continue;
+		}
+		await plugin.runFullSync(undefined, false);
+		assert.deepEqual(starts, ["watcher", "scheduler"]);
+	}
 });

@@ -134,8 +134,8 @@ local transition, matching pre-commit canonical того же epoch и сохр�
 только target-объектов. Canonical cleanup остаётся пустым. Перед публикацией
 source manifest, каждым DELETE/retry и завершением maintenance повторно проверяются
 canonical ownership, manifest/source codec и local transition. Удаление дополнительно
-требует прежнего fingerprint и отсутствия live source по этому raw path; папки
-удаляются только пустыми. Уже сохранённый target proof не обновляется новым
+требует прежнего fingerprint и отсутствия live source по этому raw path; пустые папки
+сохраняются: recursive pruning не защищает позднего потомка. Уже сохранённый target proof не обновляется новым
 fingerprint даже при совпавшем plaintext SHA. Отсутствующий target сохраняет proof
 для идемпотентного завершения durable action после restart. Незавершённый rollback
 сохраняет тот же transition ID, source authority и блокировку automation; logical
@@ -255,3 +255,8 @@ failure; посторонние raw objects можно явно исключит
 Подробные backup, source/scope guards и restart phases описаны в
 [ARCHITECTURE.md](ARCHITECTURE.md). Два профиля Obsidian и реальный Диск проверяются
 отдельно; functional harness не является доказательством этого прогона.
+
+Force maintenance проверяется по kind до encryption recovery и даёт отдельный
+`force-recovery-pending`. Completion receipt Force не откатывает последующую
+enable/disable/rotate. Guard перед manifest PUT/DELETE не является server fencing;
+late manifest write остаётся P0 release blocker в [проверках Force](FORCE_SAFETY_VALIDATION.md).

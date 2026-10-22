@@ -22,6 +22,11 @@ export interface ForceSourceFile {
 
 /** Durable source identities and authority; credentials remain exclusively in local plugin data. */
 export interface ForceRecovery {
+	completion: {
+		epoch: string;
+		revision: number;
+		canonicalSha256: string;
+	} | null;
 	password: string | null;
 	id: string;
 	direction: ForceDirection;
@@ -59,6 +64,7 @@ export function assertForceRecovery(
 	}
 	const state = value as ForceRecovery;
 	const keys = [
+		"completion",
 		"password",
 		"id",
 		"direction",
@@ -116,6 +122,20 @@ export function assertForceRecovery(
 			!/^[a-f0-9]{64}$/.test(state.backupProof.snapshotDigest))
 	) {
 		throw new Error("Invalid Force archive proof");
+	}
+	if (
+		state.completion !== null &&
+		(!state.completion ||
+			typeof state.completion !== "object" ||
+			Array.isArray(state.completion) ||
+			Object.keys(state.completion).length !== 3 ||
+			state.completion.epoch !== state.epoch ||
+			!Number.isSafeInteger(state.completion.revision) ||
+			state.completion.revision < 1 ||
+			!/^[a-f0-9]{64}$/.test(state.completion.canonicalSha256) ||
+			state.phase !== "cleanup")
+	) {
+		throw new Error("Invalid Force completion receipt");
 	}
 	validateEncryptionModeDescriptor(state.target, "Force target");
 	assertForceManifest(state);
@@ -259,4 +279,15 @@ function matchesParameters(
 			([key, entry]) => (value as Record<string, unknown>)[key] === entry,
 		)
 	);
+}
+
+/** Uncertain Force state requires explicit recovery rather than encryption authentication. */
+export class ForceRecoveryPendingError extends Error {
+	readonly code = "force-recovery-pending";
+	constructor(
+		message = "Force recovery is pending; continue the saved operation or explicitly confirm a new replacement",
+	) {
+		super(message);
+		this.name = "ForceRecoveryPendingError";
+	}
 }

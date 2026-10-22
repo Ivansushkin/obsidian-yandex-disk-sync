@@ -1,4 +1,8 @@
 import {
+	ForceRecoveryPendingError,
+	type ForceRecovery,
+} from "../workflows/force-state";
+import {
 	getStableContentFingerprint,
 	matchesStableContentFingerprint,
 } from "../../utils/resource-fingerprint";
@@ -62,10 +66,17 @@ export class ForcePublication {
 		if (!snapshot) {
 			throw new Error("Force canonical authority is missing");
 		}
-		const content = codec
-			? await codec.decrypt(snapshot.raw)
-			: snapshot.raw;
-		const index: unknown = JSON.parse(new TextDecoder().decode(content));
+		let index: unknown;
+		try {
+			const content = codec
+				? await codec.decrypt(snapshot.raw)
+				: snapshot.raw;
+			index = JSON.parse(new TextDecoder().decode(content));
+		} catch {
+			throw new ForceRecoveryPendingError(
+				"Force canonical authority is unreadable or superseded",
+			);
+		}
 		if (!isJsonRecord(index)) {
 			throw new Error("Force authority is invalid");
 		}
@@ -87,7 +98,8 @@ export class ForcePublication {
 		desired: SyncIndex,
 		codec: EncryptionCodec | null,
 		initial = false,
-	): Promise<void> {
+		beforeCommit?: () => Promise<void>,
+	): Promise<NonNullable<ForceRecovery["completion"]>> {
 		if (!this.deps.isScoped()) {
 			throw new Error(
 				"Force replacement requires its scoped transaction",
@@ -268,6 +280,7 @@ export class ForcePublication {
 					await this.deps.client.moveResourceExclusive(
 						targetPath,
 						canonicalPath,
+						beforeCommit,
 					);
 				} catch (error) {
 					const [canonical, lock] = await Promise.all([
@@ -319,6 +332,11 @@ export class ForcePublication {
 						},
 					);
 				}
+				return {
+					epoch: desired.epoch,
+					revision: desired.revision,
+					canonicalSha256: hash,
+				};
 			} catch (error) {
 				// Never overwrite a canonical created by another operation during an ambiguous reply.
 				if (
@@ -484,9 +502,15 @@ export class ForcePublication {
 	async recoverForcePublication(
 		state: import("../workflows/force-state").ForceRecovery,
 		codec: EncryptionCodec | null,
+		beforeCommit?: () => Promise<void>,
 	): Promise<SyncIndex | null> {
 		const path = this.deps.getCanonicalPath();
 		let resource = await this.deps.client.getResource(path, 1, 0, true);
+		if (!resource && state.completion) {
+			throw new ForceRecoveryPendingError(
+				"Completed Force canonical is unavailable; refusing stale promotion",
+			);
+		}
 		const listing = await this.deps.getStableRootListing();
 		const ownedPrefix = `${REMOTE_INDEX_LOCK_PREFIX}${state.id}.`;
 		if (!resource) {
@@ -526,9 +550,15 @@ export class ForcePublication {
 				(left, right) => right.index.revision - left.index.revision,
 			);
 			if (candidates[0]) {
+				if (!beforeCommit) {
+					throw new ForceRecoveryPendingError(
+						"Staged Force publication requires source validation",
+					);
+				}
 				await this.deps.client.moveResourceExclusive(
 					candidates[0].path,
 					path,
+					beforeCommit,
 				);
 				resource = await this.deps.client.getResource(path, 1, 0, true);
 			}
@@ -544,9 +574,15 @@ export class ForcePublication {
 					),
 			);
 			if (displaced) {
+				if (!beforeCommit) {
+					throw new ForceRecoveryPendingError(
+						"Force rollback requires source validation",
+					);
+				}
 				await this.deps.client.moveResourceExclusive(
 					joinPath(state.remotePath, displaced.name),
 					path,
+					beforeCommit,
 				);
 				resource = await this.deps.client.getResource(path, 1, 0, true);
 			}
@@ -570,6 +606,31 @@ export class ForcePublication {
 			undefined,
 			resource,
 		);
+		if (state.completion) {
+			const receipt = state.completion;
+			if (snapshot.index.epoch !== receipt.epoch) {
+				throw new ForceRecoveryPendingError(
+					"Completed Force was superseded by another epoch; explicitly confirm a new operation",
+				);
+			}
+			if (
+				snapshot.index.revision < receipt.revision ||
+				(snapshot.index.revision === receipt.revision &&
+					(await computeSha256(snapshot.raw)) !==
+						receipt.canonicalSha256)
+			) {
+				throw new ForceRecoveryPendingError(
+					"Force completion receipt does not match canonical",
+				);
+			}
+			if (snapshot.index.maintenance) {
+				throw new ForceRecoveryPendingError(
+					"A successor maintenance must finish before local Force recovery",
+				);
+			}
+			this.deps.acceptPublishedIndex(snapshot.index);
+			return snapshot.index;
+		}
 		if (
 			snapshot.index.epoch !== state.epoch ||
 			(snapshot.index.maintenance &&
@@ -586,9 +647,17 @@ export class ForcePublication {
 				Object.keys(snapshot.index.appliedMutationSeq).length ||
 				snapshot.index.deviceId !== this.deps.getDeviceId())
 		) {
-			throw new Error(
+			throw new ForceRecoveryPendingError(
 				"Completed Force canonical changed before recovery",
 			);
+		}
+
+		if (!snapshot.index.maintenance) {
+			state.completion = {
+				epoch: snapshot.index.epoch,
+				revision: snapshot.index.revision,
+				canonicalSha256: await computeSha256(snapshot.raw),
+			};
 		}
 
 		this.deps.acceptPublishedIndex(snapshot.index);

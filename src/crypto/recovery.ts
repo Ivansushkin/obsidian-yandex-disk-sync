@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import { t } from "../i18n/index";
 import type { IndexMaintenance, RemoteEncryptionManifest } from "../types";
 import { logger } from "../utils/logger";
@@ -198,6 +199,9 @@ export class EncryptionRecovery {
 					);
 				if (!canonical?.maintenance) {
 					return false;
+				}
+				if (canonical.maintenance.kind === "force") {
+					throw new ForceRecoveryPendingError();
 				}
 				this.controller.createRemoteTargetRecoveryPlan(
 					null,

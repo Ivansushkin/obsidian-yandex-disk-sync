@@ -3,7 +3,6 @@ import type { StartupState } from "./plugin-startup";
 import type { SyncResult } from "./types";
 import type { SyncEngine } from "./sync/engine";
 import type { FileWatcher } from "./sync/realtime/watcher";
-import type { SyncScheduler } from "./sync/scheduler";
 import type { YandexDiskSyncSettings } from "./types";
 
 const USER_SETTING_KEYS = [
@@ -108,7 +107,7 @@ interface SettingsWorkflowPorts {
 	isLayoutReady(): boolean;
 	setUpdating(updating: boolean): void;
 	stopRegularSync(): void;
-	markRegularStarted(): void;
+	startAutomation(): void;
 	invalidateRemoteStateClassification(): void;
 	settingsSaveRejected(): void;
 	persistPluginData(patch: UserSettingsPatch): Promise<void>;
@@ -118,7 +117,6 @@ interface SettingsWorkflowPorts {
 	): Promise<StartupState>;
 	reconcile(): Promise<SyncResult | null>;
 	watcher?: Pick<FileWatcher, "waitForPendingPersistence" | "start">;
-	scheduler: Pick<SyncScheduler, "start">;
 	engine?: Pick<
 		SyncEngine,
 		"hasPendingWork" | "setExternalBlock" | "isSyncPaused"
@@ -160,6 +158,7 @@ export async function applyUserSettingsPatch(
 			t("notice.configuration_busy"),
 		);
 	}
+	let automationReady = false;
 	try {
 		if (changesScope) {
 			await deps.watcher?.waitForPendingPersistence();
@@ -189,11 +188,7 @@ export async function applyUserSettingsPatch(
 						return;
 					}
 				}
-				if (!deps.isUnloaded() && !deps.engine?.isSyncPaused()) {
-					deps.watcher?.start();
-					deps.scheduler.start();
-					deps.markRegularStarted();
-				}
+				automationReady = true;
 			}
 		}
 	} catch (error) {
@@ -204,6 +199,9 @@ export async function applyUserSettingsPatch(
 	} finally {
 		if (changesScope) {
 			deps.setUpdating(false);
+		}
+		if (automationReady) {
+			deps.startAutomation();
 		}
 	}
 }

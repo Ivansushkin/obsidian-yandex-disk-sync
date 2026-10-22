@@ -414,40 +414,30 @@ test("move source retry requires current move authority and an intact target", a
 	}
 });
 
-test("folder cleanup retry preserves new canonical and excluded descendants", async () => {
-	for (const excluded of [false, true]) {
-		const canonical = createEmptyIndex("device", "E");
-		let childExists = false;
-		let attempts = 0;
-		const client = createClient({ maxRetries: 1 });
-		client.isFolderEmpty = async () => !childExists;
-		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
-			assert.equal(method, "DELETE");
-			attempts++;
-			childExists = true;
-			if (!excluded) {
-				canonical.files["folder/new.md"] = fileMetadata(
-					"folder/new.md",
-					{ sha256: "new" },
-				);
-			}
-			return response(503);
-		};
-
-		await pruneRemoteFolders(
-			{
-				settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
-				yandexClient: client,
-				indexManager: {
-					getRemoteIndex: () => canonical,
-					readCanonicalIndex: async () => canonical,
-				},
-			} as unknown as Dependencies,
-			["folder/deleted.md"],
-		);
-		assert.equal(attempts, 1);
-		assert.equal(childExists, true);
-	}
+test("optional remote pruning retains an empty directory and a late protected descendant", async () => {
+	const { MemoryDisk, device, bytes } = await import("./helpers/sync-flow");
+	const disk = new MemoryDisk();
+	const owner = device(disk, "prune-owner", null);
+	disk.folders.add("vault/folder");
+	disk.beforeRequest = async (method, _endpoint, path) => {
+		if (method === "DELETE" && path === "vault/folder") {
+			disk.files.set(
+				"vault/folder/excluded.bin",
+				bytes("late protected bytes"),
+			);
+		}
+	};
+	await pruneRemoteFolders(
+		{
+			settings: owner.settings,
+			yandexClient: owner.client,
+			indexManager: owner.index,
+		} as unknown as Dependencies,
+		["folder/deleted.md"],
+	);
+	assert.ok(disk.folders.has("vault/folder"));
+	assert.equal(disk.trash.size, 0);
+	await owner.stop();
 });
 
 test("guarded local update does not recreate a file deleted during identity verification", async () => {

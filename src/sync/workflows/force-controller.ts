@@ -1,3 +1,4 @@
+import { confirmForceReplacementPlan } from "./force-replacement";
 import type { OperationBackupChoice } from "../../backup/operation-backup-choice";
 import type { BackupProgress, BackupResult } from "../../backup/backup-manager";
 import type { SyncResult, SyncState } from "../../types";
@@ -179,16 +180,22 @@ export class ForceSyncController {
 			}
 			update({ migration: prepared.migration });
 			phase("confirming");
-			let choice = await this.deps.confirm(
-				direction,
-				prepared.migration,
-				prepared.replacement,
-			);
+			let choice = prepared.replacement?.continuing
+				? prepared.replacement.backupMode
+				: await this.deps.confirm(
+						direction,
+						prepared.migration,
+						prepared.replacement,
+					);
 			if (choice === "cancel") {
 				update({ outcome: "cancelled" });
 				return;
 			}
+			if (prepared.replacement && !prepared.replacement.continuing) {
+				confirmForceReplacementPlan(prepared.replacement.plan);
+			}
 			if (
+				!prepared.replacement?.continuing &&
 				!(await this.deps.readyForBackup(
 					prepared.migration,
 					prepared.replacement,
@@ -204,7 +211,10 @@ export class ForceSyncController {
 					await this.deps.captureProtectedSnapshot(direction);
 			}
 			let backupProof: ForcePreflightProof["backup"] = null;
-			while (choice === "with-backup") {
+			while (
+				choice === "with-backup" &&
+				!prepared.replacement?.continuing
+			) {
 				let backup: BackupResult;
 				try {
 					if (prepared.replacement) {
@@ -264,7 +274,7 @@ export class ForceSyncController {
 				};
 				break;
 			}
-			if (prepared.replacement) {
+			if (prepared.replacement && !prepared.replacement.continuing) {
 				prepared.replacement.plan.recovery.backupProof = backupProof
 					? {
 							name: backupProof.backupName,
@@ -276,6 +286,7 @@ export class ForceSyncController {
 			phase("syncing");
 			if (
 				prepared.replacement &&
+				!prepared.replacement.continuing &&
 				choice === "with-backup" &&
 				snapshotDigest !==
 					(await this.deps.captureProtectedSnapshot(direction))

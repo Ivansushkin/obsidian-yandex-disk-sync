@@ -162,10 +162,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 
 		await engine.deleteFolder("folder");
 
-		assert.deepEqual(yandexClient.deletes, [
-			"remote/folder/Чо как.md",
-			"remote/folder",
-		]);
+		assert.deepEqual(yandexClient.deletes, ["remote/folder/Чо как.md"]);
 		assert.equal(indexManager.index.revision, 8);
 		assert.equal(indexManager.pendingMutations.length, 0);
 		assert.equal(indexManager.pendingActions.length, 0);

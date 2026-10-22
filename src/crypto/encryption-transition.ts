@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import type { PhysicalRewriteUploadProof, SyncEngine } from "../sync/engine";
 import { createSyncFailure } from "../sync/errors";
 import type {
@@ -12,7 +13,6 @@ import { computeSha256 } from "../utils/hash-utils";
 import { logger } from "../utils/logger";
 import {
 	getAncestorDirectories,
-	getAncestorDirectoriesDeepestFirst,
 	isProtectedPath,
 	joinPath,
 	normalizePath,
@@ -380,7 +380,7 @@ export class EncryptionTransitionController {
 		await rollback.validate();
 		await this.lifecycle.publishStable(transition.source);
 		await this.cleanupPaths(paths, targets, rollback);
-		await this.cleanupFolders(paths, rollback);
+
 		await rollback.validate();
 		if (!(await this.lifecycle.finishMaintenance(transition))) {
 			throw new Error("Encryption rollback cleanup is incomplete");
@@ -482,78 +482,8 @@ export class EncryptionTransitionController {
 		}
 	}
 
-	/** Empty folders still require the same live canonical cleanup ownership. */
-	async cleanupRawFolders(paths: string[]): Promise<void> {
-		await this.cleanupFolders(paths);
-	}
-
-	private async cleanupFolders(
-		paths: string[],
-		rollback?: SourceRollbackAuthority,
-	): Promise<void> {
-		const folders = getAncestorDirectoriesDeepestFirst(paths);
-		if (folders.length === 0) {
-			return;
-		}
-		const io = this.cleanupIO;
-		const authority = this.indexManager.getMaintenance();
-		const epoch = this.indexManager.getRemoteIndex().epoch;
-		if (!io || !authority) {
-			throw new Error("Encryption folder cleanup has no authority");
-		}
-		for (const folder of folders) {
-			if (isProtectedPath(folder)) {
-				continue;
-			}
-			const remotePath = joinPath(io.getRemotePath(), folder);
-			const validate = async (): Promise<void> => {
-				const current = await this.validateCleanupAuthority(
-					epoch,
-					authority,
-					rollback,
-				);
-				if (
-					!(rollback
-						? Object.keys(rollback.targets).some((path) =>
-								path.startsWith(`${folder}/`),
-							)
-						: current.maintenance?.cleanup.some((action) =>
-								action.path.startsWith(`${folder}/`),
-							))
-				) {
-					throw new Error(
-						"Encryption folder cleanup is no longer authorized",
-					);
-				}
-				await this.assertNotLiveRawTarget(
-					remotePath,
-					current.files,
-					true,
-				);
-				if (!(await io.client.isRawFolderEmpty(remotePath))) {
-					throw new Error("Cleanup folder is not empty");
-				}
-				const latest = await this.validateCleanupAuthority(
-					epoch,
-					authority,
-					rollback,
-				);
-				if (rollback) {
-					await this.assertNotLiveRawTarget(
-						remotePath,
-						latest.files,
-						true,
-					);
-				}
-			};
-			await validate();
-			await io.client.deleteResource(remotePath, false, true, validate);
-			await this.validateCleanupAuthority(epoch, authority, rollback);
-			if (await io.client.getResource(remotePath, 1, 0, true)) {
-				throw new Error("Folder cleanup is incomplete");
-			}
-		}
-	}
+	/** Optional recursive folder pruning is disabled until the server can fence late descendants. */
+	async cleanupRawFolders(_paths: string[]): Promise<void> {}
 
 	/** Keep source rollback proof separate from the committed canonical cleanup list. */
 	private async validateCleanupAuthority(
@@ -1029,6 +959,9 @@ export function createRemoteTargetRecoveryPlan(
 	manifest: RemoteEncryptionManifest | null,
 	maintenance: IndexMaintenance | undefined,
 ): RemoteTargetRecoveryPlan {
+	if (maintenance?.kind === "force") {
+		throw new ForceRecoveryPendingError();
+	}
 	if (
 		!maintenance ||
 		(maintenance.phase !== "index-committed" &&

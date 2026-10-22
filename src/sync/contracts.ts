@@ -20,6 +20,7 @@ export type SyncGuardCallback = (
 
 export type ExternalSyncBlockKind =
 	| "local-state"
+	| "force"
 	| "migration"
 	| "encryption"
 	| "historical"
@@ -43,6 +44,7 @@ export interface SyncRunOptions {
 	epochAdoption?: { epoch: string; decision: "accept" | "preserve" };
 	/** Direction-verified replacement, created before the destructive confirmation. */
 	forceReplacement?: {
+		continuing?: boolean;
 		plan: import("./workflows/force-replacement").PreparedForceReplacement;
 		backupMode: "with-backup" | "without-backup";
 	};

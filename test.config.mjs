@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 
 const outputDir = await mkdtemp(join(tmpdir(), "yandex-sync-tests-"));
-const testFiles = readdirSync("tests")
+const testRoot = process.argv.includes("--force-fencing")
+	? "tests/release-gates"
+	: "tests";
+const testFiles = readdirSync(testRoot)
 	.filter((name) => name.endsWith(".test.ts"))
 	.sort();
 const outputFiles = testFiles.map((name) =>
@@ -65,7 +68,7 @@ const obsidianStubPlugin = {
 
 try {
 	await build({
-		entryPoints: testFiles.map((name) => `tests/${name}`),
+		entryPoints: testFiles.map((name) => `${testRoot}/${name}`),
 		bundle: true,
 		platform: "node",
 		format: "esm",

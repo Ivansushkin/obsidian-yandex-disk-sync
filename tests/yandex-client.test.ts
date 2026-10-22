@@ -298,6 +298,12 @@ test("missing cached upload parent is recreated before retry", async () => {
 			folderCreates++;
 			return response(201);
 		}
+		if (
+			uploadLinkAttempts === 1 &&
+			new URL(params.url).searchParams.get("path") === "vault/folder"
+		) {
+			return response(404);
+		}
 		return response(200, directory("vault/folder"));
 	};
 	const client = createClient();
@@ -660,4 +666,39 @@ test("unknown response decoding failure stops snapshot capture without transport
 		(error) => error === cause,
 	);
 	assert.equal(requests, 1);
+});
+
+test("paginated inventory rejects a changing total instead of accepting a partial source", async () => {
+	const disk = new MemoryDisk();
+	for (let i = 0; i < 1001; i++) {
+		disk.files.set(
+			`vault/${String(i).padStart(4, "0")}.md`,
+			bytes("source"),
+		);
+	}
+	let changed = false;
+	disk.afterRequest = async (method, endpoint, path) => {
+		if (
+			!changed &&
+			method === "GET" &&
+			endpoint.endsWith("/resources") &&
+			path === "vault"
+		) {
+			changed = true;
+			disk.files.set("vault/late.md", bytes("late source"));
+		}
+	};
+	disk.install();
+	await assert.rejects(
+		createClient().getResourcesRecursive("vault", true),
+		/listing/,
+	);
+});
+
+test("accepted async deletion without an operation link is never reported complete", async () => {
+	requestGlobal.__obsidianRequestUrl = async () => response(202, {});
+	await assert.rejects(
+		createClient().deleteResource("vault/note.md", true, true),
+		/operation link/,
+	);
 });

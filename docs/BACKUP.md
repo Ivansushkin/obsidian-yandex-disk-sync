@@ -97,8 +97,9 @@ Force local архивирует raw remote snapshot, Force remote — logical l
 apply. Ошибка предлагает повтор, явное продолжение без любых копий или отмену;
 автоматического fallback нет. Архив остаётся в защищённой `.backup`.
 
-Проверенный proof и выбор сохраняются в `forceRecovery`. Recovery повторно
-проверяет существующий архив и не создаёт новый. Source проверяется независимо
+Проверенный proof и выбор сохраняются в `forceRecovery`. До final commit recovery повторно
+проверяет существующий архив и не создаёт новый. После verified final commit receipt
+завершает local cutover без нового архива или повторной проверки прежнего source. Source проверяется независимо
 от backup choice; source read/decrypt failure никогда не означает пустой source.
 Canonical назначения не декодируется для допуска Force: его raw replacement
 принадлежит эксклюзивной транзакции IndexManager. До destructive действий

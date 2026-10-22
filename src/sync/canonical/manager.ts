@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "../workflows/force-state";
 /**
  * Synchronization index manager
  */
@@ -295,11 +296,17 @@ export class IndexManager {
 		desired: SyncIndex,
 		codec: EncryptionCodec | null,
 		initial = false,
-	): Promise<void> {
+		beforeCommit?: () => Promise<void>,
+	): Promise<
+		NonNullable<
+			import("../workflows/force-state").ForceRecovery["completion"]
+		>
+	> {
 		return await this.forcePublication.publishForceCanonical(
 			desired,
 			codec,
 			initial,
+			beforeCommit,
 		);
 	}
 
@@ -307,10 +314,12 @@ export class IndexManager {
 	async recoverForcePublication(
 		state: import("../workflows/force-state").ForceRecovery,
 		codec: EncryptionCodec | null,
+		beforeCommit?: () => Promise<void>,
 	): Promise<SyncIndex | null> {
 		return await this.forcePublication.recoverForcePublication(
 			state,
 			codec,
+			beforeCommit,
 		);
 	}
 
@@ -328,13 +337,19 @@ export class IndexManager {
 	}
 
 	/** Accept only the verified replacement and retire queues from its old generation. */
-	finishForceReplacement(index: SyncIndex, rootResourceId: string): void {
+	finishForceReplacement(
+		index: SyncIndex,
+		rootResourceId: string,
+		baseline = index,
+	): void {
 		if (index.maintenance) {
 			throw new Error("Force cleanup is still active");
 		}
 		this.remoteIndex = cloneIndex(index);
 		this.loadedRemoteIndex = cloneIndex(index);
-		this.finalizeForceEpoch(index);
+		if (this.localState.observedEpoch !== index.epoch) {
+			this.finalizeForceEpoch(baseline);
+		}
 		this.localState.remoteScope = {
 			remotePath: this.settings.remotePath,
 			rootResourceId,
@@ -2160,10 +2175,7 @@ export class IndexManager {
 	private assertMaintenanceCompatible(index: SyncIndex): void {
 		const maintenance = index.maintenance;
 		if (maintenance?.kind === "force" && !this.forceScope) {
-			throw new RemoteMaintenanceActiveError(
-				maintenance.id,
-				maintenance.initiatedBy,
-			);
+			throw new ForceRecoveryPendingError();
 		}
 		const allowedTargetRecovery =
 			maintenance?.id === this.targetRecoveryMaintenanceId &&

@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "./sync/workflows/force-state";
 import type { ExternalSyncBlockKind } from "./sync/contracts";
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
 import type { EncryptionReadyOptions } from "./crypto/admission";
@@ -12,7 +13,10 @@ import { logger } from "./utils/logger";
 
 export type StartupState = "ready" | "migration" | "blocked";
 export type StartupBlockKind = Exclude<ExternalSyncBlockKind, "local-state">;
-export type StartupBlocks = Record<StartupBlockKind, string | null>;
+export type StartupBlocks = Record<
+	Exclude<StartupBlockKind, "force">,
+	string | null
+> & { force?: string | null };
 interface StartupPorts {
 	index: Pick<
 		IndexManager,
@@ -25,6 +29,7 @@ interface StartupPorts {
 	>;
 	getBlocks(): StartupBlocks;
 	hasTransition(): boolean;
+	hasForceRecovery?(): boolean;
 	isStopped(): boolean;
 	setBlock(
 		kind: StartupBlockKind,
@@ -55,6 +60,11 @@ export class PluginStartup {
 		if (deps.isStopped()) {
 			return "blocked";
 		}
+		if (deps.hasForceRecovery?.()) {
+			deps.setBlock("force", t("force.recovery_pending"));
+			return "blocked";
+		}
+		deps.setBlock("force", null, undefined, false);
 		if (!deps.getSettings().yandexTokenSecret) {
 			deps.setBlock("authentication", t("notice.token_missing"));
 			logger.info("Token not configured, waiting for settings");
@@ -168,6 +178,10 @@ export class PluginStartup {
 				return "blocked";
 			}
 			this.validated = false;
+			if (error instanceof ForceRecoveryPendingError) {
+				deps.setBlock("force", t("force.recovery_pending"));
+				return "blocked";
+			}
 			if (error instanceof LegacyIndexFormatError) {
 				deps.setBlock("authentication", null);
 				deps.setBlock("historical", null);

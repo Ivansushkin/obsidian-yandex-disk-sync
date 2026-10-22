@@ -33,7 +33,23 @@ const parent = (path: string) =>
 export class MemoryDisk {
 	readonly identity = crypto.randomUUID();
 	files = new Map<string, ArrayBuffer>();
+	trash = new Map<string, ArrayBuffer>();
 	folders = new Set(["", "vault"]);
+	asyncOperations?: (
+		method: string,
+		endpoint: string,
+		path: string,
+	) => boolean;
+	beforeOperation?: (
+		method: string,
+		endpoint: string,
+		path: string,
+	) => Promise<void>;
+	private operations = new Map<
+		string,
+		{ status: "in-progress" | "success" | "failed" }
+	>();
+
 	beforeRequest?: (
 		method: string,
 		endpoint: string,
@@ -60,7 +76,16 @@ export class MemoryDisk {
 			...(content ? { sha256: await computeSha256(content) } : {}),
 		};
 	}
-	async request(params: RequestUrlParam) {
+	async request(
+		params: RequestUrlParam,
+		accepted = false,
+	): Promise<{
+		status: number;
+		json: Record<string, unknown>;
+		arrayBuffer: ArrayBuffer;
+		text: string;
+		headers: Record<string, string>;
+	}> {
 		const url = new URL(params.url);
 		const path = (url.searchParams.get("path") ?? "").replace(
 			/^disk:\//,
@@ -68,8 +93,48 @@ export class MemoryDisk {
 		);
 		const endpoint = url.pathname;
 		const method = params.method ?? "GET";
-		await this.beforeRequest?.(method, endpoint, path);
+		if (method === "GET" && endpoint.includes("/operations/")) {
+			const operation = this.operations.get(endpoint.split("/").at(-1)!);
+			const json = operation ?? { status: "failed" };
+			return {
+				status: operation ? 200 : 404,
+				json,
+				arrayBuffer: new ArrayBuffer(0),
+				text: JSON.stringify(json),
+				headers: {},
+			};
+		}
+		if (!accepted) {
+			await this.beforeRequest?.(method, endpoint, path);
+		}
+		if (!accepted && this.asyncOperations?.(method, endpoint, path)) {
+			const id = crypto.randomUUID();
+			const operation = {
+				status: "in-progress" as "in-progress" | "success" | "failed",
+			};
+			this.operations.set(id, operation);
+			void (async () => {
+				await this.beforeOperation?.(method, endpoint, path);
+				const result = await this.request(params, true);
+				operation.status = result.status < 300 ? "success" : "failed";
+			})().catch(() => {
+				operation.status = "failed";
+			});
+			const json = {
+				href: `https://synthetic.invalid/operations/${id}`,
+				method: "GET",
+				templated: false,
+			};
+			return {
+				status: 202,
+				json,
+				arrayBuffer: new ArrayBuffer(0),
+				text: JSON.stringify(json),
+				headers: {},
+			};
+		}
 		let status = 200;
+		let errorCode: string | undefined;
 		let json: Record<string, unknown> = {};
 		let arrayBuffer = new ArrayBuffer(0);
 		if (endpoint === "/download") {
@@ -81,9 +146,10 @@ export class MemoryDisk {
 			}
 		} else if (endpoint === "/upload") {
 			if (!this.folders.has(parent(path))) {
-				status = 404;
+				status = 409;
+				errorCode = "DiskPathDoesntExistsError";
 			} else if (
-				this.files.has(path) &&
+				(this.files.has(path) || this.folders.has(path)) &&
 				url.searchParams.get("overwrite") !== "true"
 			) {
 				status = 409;
@@ -92,11 +158,16 @@ export class MemoryDisk {
 				status = 201;
 			}
 		} else if (endpoint.endsWith("/resources/upload")) {
-			json = {
-				href: `https://synthetic.invalid/upload?path=${encodeURIComponent(path)}&overwrite=${url.searchParams.get("overwrite")}`,
-				method: "PUT",
-				templated: false,
-			};
+			if (!this.folders.has(parent(path))) {
+				status = 409;
+				errorCode = "DiskPathDoesntExistsError";
+			} else {
+				json = {
+					href: `https://synthetic.invalid/upload?path=${encodeURIComponent(path)}&overwrite=${url.searchParams.get("overwrite")}`,
+					method: "PUT",
+					templated: false,
+				};
+			}
 		} else if (endpoint.endsWith("/resources/download")) {
 			if (!this.files.has(path)) {
 				status = 404;
@@ -111,6 +182,10 @@ export class MemoryDisk {
 			const from = url.searchParams.get("from")!;
 			if (!this.files.has(from) && !this.folders.has(from)) {
 				status = 404;
+				errorCode = "DiskNotFoundError";
+			} else if (!this.folders.has(parent(path))) {
+				status = 409;
+				errorCode = "DiskPathDoesntExistsError";
 			} else if (this.files.has(path) || this.folders.has(path)) {
 				status = 409;
 			} else {
@@ -143,6 +218,12 @@ export class MemoryDisk {
 			} else {
 				for (const name of [...this.files.keys()]) {
 					if (name === path || name.startsWith(`${path}/`)) {
+						if (url.searchParams.get("permanently") !== "true") {
+							this.trash.set(
+								name,
+								this.files.get(name)!.slice(0),
+							);
+						}
 						this.files.delete(name);
 					}
 				}
@@ -189,9 +270,10 @@ export class MemoryDisk {
 		if (status >= 400) {
 			json = {
 				error:
-					status === 404
+					errorCode ??
+					(status === 404
 						? "DiskNotFoundError"
-						: "DiskPathPointsToExistentDirectoryError",
+						: "DiskPathPointsToExistentDirectoryError"),
 				description: `Synthetic HTTP ${status}`,
 			};
 		}
@@ -392,7 +474,10 @@ export function device(
 	codec: EncryptionCodec | null,
 	vault = new MemoryVault(),
 	saved?: SavedDevice,
-	clientOptions: { readTimeoutMs?: number; maxRetries?: number } = {},
+	clientOptions: {
+		readTimeoutMs?: number;
+		maxRetries?: number;
+	} = {},
 ) {
 	disk.install();
 	logger.configure({ consoleEnabled: false, fileEnabled: false });

@@ -144,11 +144,13 @@ source до replacement commit. Обычный deferred physical action не с�
 ## Папки, retry и memory
 
 Upload заранее создаёт нужные родительские папки. Remote-folder cache — наблюдение:
-после delete/move и изменения token/path/codec он инвалидируется. Missing parent после
-404 допускает восстановление; exclusive 409 не означает отсутствующую папку.
+после delete/move и изменения token/path/codec он инвалидируется. Upload 404 или известный DiskPathDoesntExistsError 409 допускает raw parent GET;
+только подтверждённый GET 404 разрешает один восстановительный upload retry.
+Exclusive collision и неизвестный 409 не разрешают retry. Force очищает cache
+перед directed apply/recovery и ограничивает повторные inventory тремя проходами.
 
-Перед каждой попыткой DELETE повторяются canonical/identity checks. Для папок нужны
-свежие live descendants и фактическая пустота; исключённый файл также запрещает pruning.
+Перед каждой попыткой DELETE повторяются canonical/identity checks. Проверка пустоты не защищает от позднего потомка после guard. Optional remote
+pruning выключен в ordinary/Force/encryption; remote folder replacement блокируется.
 Move source не удаляется без доказанного target. Неоднозначный ответ требует read-back;
 неподтверждённое действие остаётся durable для recovery.
 

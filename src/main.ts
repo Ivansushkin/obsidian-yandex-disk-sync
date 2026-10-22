@@ -149,6 +149,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private migrationBlockReason: string | null = null;
 	private historicalBlockReason: string | null = null;
 	private authenticationBlockReason: string | null = null;
+	private forceBlockReason: string | null = null;
 	private legacyExposureRemediationPending = false;
 	private legacyExposedTokenInSession: string | null = null;
 
@@ -160,7 +161,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	};
 
 	private regularSyncStarted = false;
+	private automationReady = false;
 	private activeFullRuns = 0;
+	private activeFullPromise: Promise<SyncResult | null> | null = null;
 	private readonly encryptionManager = new EncryptionManager();
 	private encryptionService: EncryptionCodec | null = null;
 	private encryptionWorkflow!: EncryptionWorkflow;
@@ -622,14 +625,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			) {
 				return false;
 			}
-			this.regularSyncStarted = true;
-			this.fileWatcher.start();
-			this.syncScheduler.start();
+			this.automationReady = true;
+			this.startAutomationIfReady();
 			new Notice(t("notice.sync_resumed"));
 			return true;
 		} finally {
 			this.activeFullRuns--;
 			this.notifyManualActivity();
+			this.startAutomationIfReady();
 		}
 	}
 
@@ -662,6 +665,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						? await this.syncEngine.forceSyncFromLocal(options)
 						: await this.syncEngine.forceSyncFromRemote(options);
 				if (!result.success) {
+					this.forceBlockReason = t("force.recovery_pending");
+					this.presentStartupBlock("force", this.forceBlockReason);
 					this.stopRegularSync();
 					return;
 				}
@@ -683,9 +688,18 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					error,
 				});
 			}
+		} catch (error) {
+			this.stopRegularSync();
+			if (this.forceRecovery) {
+				this.forceBlockReason = t("force.recovery_pending");
+				this.presentStartupBlock("force", this.forceBlockReason);
+			}
+			logger.warn("Startup recovery remains pending", { error });
+			return;
 		} finally {
 			this.activeFullRuns--;
 			this.notifyManualActivity();
+			this.startAutomationIfReady();
 		}
 
 		await this.startSync(true, true);
@@ -818,15 +832,26 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				engine: this.syncEngine,
 				getSettings: () => this.settings,
 				getBlocks: () => ({
+					force: this.forceBlockReason,
 					migration: this.migrationBlockReason,
 					historical: this.historicalBlockReason,
 					authentication: this.authenticationBlockReason,
 					encryption: this.encryptionBlockReason,
 				}),
 				hasTransition: () => this.encryptionTransition !== null,
+				hasForceRecovery: () => this.forceRecovery !== null,
 				isStopped: () => this.unloaded || this.persistence.failed,
 				setBlock: (kind, reason, failure, showNotice) => {
 					switch (kind) {
+						case "force":
+							this.forceBlockReason = reason;
+							this.presentStartupBlock(
+								kind,
+								reason,
+								failure,
+								showNotice,
+							);
+							break;
 						case "migration":
 							this.setMigrationBlock(reason);
 							break;
@@ -883,6 +908,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			return null;
 		}
+		if (this.activeFullPromise) {
+			return await this.activeFullPromise;
+		}
 		if (showProgressNotice && this.activeManualFullPromise) {
 			return await this.activeManualFullPromise;
 		}
@@ -923,6 +951,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					return result;
 				}
 				if (result.success) {
+					this.automationReady = true;
 					this.clearBlockingNotice();
 				}
 				if (result.epochAdopted && !showProgressNotice) {
@@ -972,9 +1001,14 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		};
 
 		const promise = run().finally(() => {
+			if (this.activeFullPromise === promise) {
+				this.activeFullPromise = null;
+			}
 			this.activeFullRuns--;
 			this.notifyManualActivity();
+			this.startAutomationIfReady();
 		});
+		this.activeFullPromise = promise;
 		if (!showProgressNotice) {
 			return await promise;
 		}
@@ -982,6 +1016,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (this.activeManualFullPromise === trackedPromise) {
 				this.activeManualFullPromise = null;
 				this.notifyManualActivity();
+				this.startAutomationIfReady();
 			}
 		});
 		const trackedPromise = this.activeManualFullPromise;
@@ -1189,6 +1224,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				"invalid-index",
 				"ambiguous-index-lock",
 				"remote-maintenance",
+				"force-recovery-pending",
 				"encryption-blocked",
 				"local-state-blocked",
 				"authentication",
@@ -1198,10 +1234,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			return false;
 		}
 
-		this.fileWatcher.stop();
-		this.syncScheduler.stop();
-		this.regularSyncStarted = false;
+		this.stopRegularSync();
 		const noticeKey = {
+			"force-recovery-pending": "force.recovery_pending",
 			"local-state-blocked": "storage.blocked",
 			"unsupported-historical": "notice.unsupported_historical_data",
 			"legacy-index": "notice.legacy_index_blocked",
@@ -1269,6 +1304,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.encryptionTransition = previousTransition;
 					throw error;
 				}
+				this.forceBlockReason = state
+					? t("force.recovery_pending")
+					: null;
+				this.presentStartupBlock(
+					"force",
+					this.forceBlockReason,
+					undefined,
+					false,
+				);
 				if (!state) {
 					await this.initEncryption();
 				}
@@ -1333,7 +1377,35 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.restoreLocalStateOnce();
 		this.registerSyncLifecycleOnce();
 		const dependencies = this.forceReplacementDependencies();
-		const plan = await prepareForceReplacement(dependencies, direction);
+		if (this.forceRecovery) {
+			const action = await this.chooseForceRecoveryAction(direction);
+			if (action === "cancel") {
+				return null;
+			}
+			if (action === "continue") {
+				if (this.forceRecovery.direction !== direction) {
+					throw new Error("Force continuation direction changed");
+				}
+				const plan = await resumeForceReplacement(
+					dependencies,
+					this.forceRecovery,
+				);
+				return {
+					canonical: { state: "absent" },
+					migration: false,
+					replacement: {
+						plan,
+						backupMode: plan.recovery.backupMode,
+						continuing: true,
+					},
+				};
+			}
+		}
+		const plan = await prepareForceReplacement(
+			dependencies,
+			direction,
+			true,
+		);
 		return plan
 			? {
 					canonical: { state: "absent" },
@@ -1344,6 +1416,36 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					},
 				}
 			: null;
+	}
+
+	/** Continue saved authority by default; a different replacement requires an explicit decision. */
+	private chooseForceRecoveryAction(
+		direction: ForceDirection,
+	): Promise<"continue" | "new" | "cancel"> {
+		return new Promise((resolve) => {
+			const choices: {
+				label: string;
+				value: "continue" | "new" | "cancel";
+			}[] = [];
+			if (this.forceRecovery?.direction === direction) {
+				choices.push({
+					label: t("force.continue_recovery"),
+					value: "continue",
+				});
+			}
+			choices.push(
+				{ label: t("force.new_replacement"), value: "new" },
+				{ label: t("modal.cancel_button"), value: "cancel" },
+			);
+			new DecisionModal<"continue" | "new" | "cancel">(
+				this.app,
+				t("force.recovery_title"),
+				t("force.recovery_choice"),
+				choices,
+				"cancel",
+				resolve,
+			).open();
+		});
 	}
 
 	private async captureForceSnapshot(
@@ -1463,12 +1565,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.remoteStateValidated = false;
 				},
 				reconcile: async (onActivity) => {
-					if (replacementResult) {
-						if (!this.unloaded && !this.syncEngine.isSyncPaused()) {
-							this.regularSyncStarted = true;
-							this.fileWatcher.start();
-							this.syncScheduler.start();
-						}
+					if (replacementResult && this.syncEngine.isSyncPaused()) {
+						this.automationReady = true;
 						return replacementResult;
 					}
 					const result = await this.runFullSync(
@@ -1484,9 +1582,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						!this.unloaded &&
 						!this.syncEngine.isSyncPaused()
 					) {
-						this.regularSyncStarted = true;
-						this.fileWatcher.start();
-						this.syncScheduler.start();
+						this.automationReady = true;
+						this.startAutomationIfReady();
 					}
 					return result;
 				},
@@ -1496,9 +1593,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				reportError: (error) =>
 					logger.error("Force workflow failed", { error }),
 			});
-			this.forceSyncController.subscribe((state) =>
-				this.renderForceProgress(state),
-			);
+			this.forceSyncController.subscribe((state) => {
+				this.renderForceProgress(state);
+				this.startAutomationIfReady();
+			});
 		}
 		return this.forceSyncController;
 	}
@@ -1676,9 +1774,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			return;
 		}
-		this.fileWatcher.start();
-		this.syncScheduler.start();
-		this.regularSyncStarted = true;
+		this.automationReady = true;
+		this.startAutomationIfReady();
 		logger.info("[Main] Synchronization started");
 	}
 
@@ -1848,8 +1945,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.notifyManualActivity();
 				},
 				stopRegularSync: () => this.stopRegularSync(),
-				markRegularStarted: () => {
-					this.regularSyncStarted = true;
+				startAutomation: () => {
+					this.automationReady = true;
+					this.startAutomationIfReady();
 				},
 				invalidateRemoteStateClassification: () =>
 					this.invalidateRemoteStateClassification(),
@@ -1865,7 +1963,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				reconcile: () => this.runFullSync(undefined, false, true),
 				watcher: this.fileWatcher,
 				engine: this.syncEngine,
-				scheduler: this.syncScheduler,
 			},
 			patch,
 		);
@@ -1921,6 +2018,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		} finally {
 			this.foregroundOperation = null;
 			this.notifyManualActivity();
+			this.startAutomationIfReady();
 		}
 	}
 
@@ -2161,9 +2259,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			return;
 		}
-		this.fileWatcher.start();
-		this.syncScheduler.start();
-		this.regularSyncStarted = true;
+		this.automationReady = true;
+		this.startAutomationIfReady();
 	}
 
 	private async connectToRemoteEncryptionForSync(
@@ -2277,6 +2374,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	): void {
 		this.syncEngine?.setExternalBlock(kind, reason, failure);
 		const codes: Record<StartupBlockKind, string> = {
+			force: "force-recovery-pending",
 			encryption: "encryption-state",
 			migration: "migration-required",
 			historical: "unsupported-historical",
@@ -2293,7 +2391,41 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 	}
 
+	/** Start listeners only after durable reconciliation and all owning flows have settled. */
+	private startAutomationIfReady(): void {
+		if (
+			!this.automationReady ||
+			this.regularSyncStarted ||
+			this.unloaded ||
+			this.persistence.failed ||
+			this.isConfigurationBusy() ||
+			!this.app.workspace?.layoutReady ||
+			this.syncEngine.isSyncPaused() ||
+			this.forceRecovery ||
+			this.encryptionTransition ||
+			this.forceBlockReason ||
+			this.migrationBlockReason ||
+			this.historicalBlockReason ||
+			this.authenticationBlockReason ||
+			this.encryptionBlockReason
+		) {
+			return;
+		}
+		if (
+			this.indexManager?.getMaintenance() ||
+			this.indexManager
+				?.getPendingPhysicalActions()
+				.some((action) => action.type === "guarded-cleanup")
+		) {
+			return;
+		}
+		this.fileWatcher.start();
+		this.syncScheduler.start();
+		this.regularSyncStarted = true;
+	}
+
 	private stopRegularSync(): void {
+		this.automationReady = false;
 		this.fileWatcher?.stop();
 		this.syncScheduler?.stop();
 		this.regularSyncStarted = false;
