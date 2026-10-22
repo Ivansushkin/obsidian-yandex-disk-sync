@@ -8,8 +8,8 @@
 - Пользовательские пути шифруются посегментно ниже `remotePath`.
 - Формат content ciphertext не изменён:
   `[12-byte IV][AES-GCM ciphertext + 16-byte tag]`.
-- Пароль, OAuth token и производные ключи существуют только в локальном
-  `data.json`/памяти и никогда не журналируются.
+- Пароль и OAuth token сохраняются только в локальном `data.json`; производные
+  ключи остаются в памяти. Эти значения никогда не журналируются.
 - До canonical commit авторитетен source codec. После commit rollback запрещён,
   авторитетен target codec.
 
@@ -39,8 +39,9 @@ ciphertext или UTF-8 блокирует sync до обращения к Vault
 
 `.obsidian-encrypt.json` всегда читается и записывается raw.
 
-- Numeric и иные historical encryption formats не поддерживаются и всегда
-  блокируются отдельной ошибкой без попытки compatibility decode.
+- Numeric и иные historical encryption formats блокируют обычный sync и
+  чтение зашифрованного Force source. Подтверждённый Force local заменяет
+  destination metadata raw, без старого пароля и compatibility decode.
 - Current manifest обязан содержать semantic marker и полностью, точно
   объявлять `profileId`, KDF, HKDF, content cipher и filename cipher.
 - Unknown format/profile/algorithm блокирует watcher, scheduler, upload,
@@ -91,21 +92,17 @@ Unmarked `localState`, historical queues, transition без profile metadata,
 unmarked settings с encryption-полями и любой другой format блокируют plugin
 startup до создания компонентов синхронизации.
 
-Если initiator потерян после commit, target-capable устройство проверяет
-matching transition ID, source/target descriptors, profile combination и
-post-commit phase. Для enable/rotate оно аутентифицирует target verifier,
-явно читает target canonical новым codec, публикует stable manifest и
-продолжает canonical cleanup без source password. Для disable оно явно читает
-plaintext target canonical; transitional manifest проверяется, если ещё
-существует, но его отсутствие допустимо только для committed plaintext target.
-Explicit target read разрешён `IndexManager` только внутри matching recovery
-scope. Pre-commit foreign maintenance остаётся заблокированным.
+Post-commit recovery другого устройства описан в
+[разделе recovery](#архивы-и-завершение-другим-устройством). Pre-commit foreign
+maintenance остаётся заблокированным.
 
 Подключение нового устройства транзакционно: пароль создаёт candidate codec,
 который проверяет verifier и читает canonical до изменения active codec,
 settings, salt или revision. Wrong password, Cancel и любая coherence/canonical
 ошибка не сохраняют candidate credentials и не выполняют remote writes.
 Password prompt не запускается из guard уже активной coordinator-сессии.
+
+## Target proof, publication и rollback
 
 Перед re-encode строится полное injective
 `targetRawByLogicalPath`. Оно не может пересекаться с source raw tree или
@@ -132,6 +129,23 @@ maintenance verifier, но candidate codec обязан аутентифицир
 первого recovery write.
 Pre-commit rollback никогда не переводит source canonical в post-commit
 `cleanup` phase.
+Для rollback controller использует отдельную неперсистентную authority: собственный
+local transition, matching pre-commit canonical того же epoch и сохранённые proofs
+только target-объектов. Canonical cleanup остаётся пустым. Перед публикацией
+source manifest, каждым DELETE/retry и завершением maintenance повторно проверяются
+canonical ownership, manifest/source codec и local transition. Удаление дополнительно
+требует прежнего fingerprint и отсутствия live source по этому raw path; папки
+удаляются только пустыми. Уже сохранённый target proof не обновляется новым
+fingerprint даже при совпавшем plaintext SHA. Отсутствующий target сохраняет proof
+для идемпотентного завершения durable action после restart. Незавершённый rollback
+сохраняет тот же transition ID, source authority и блокировку automation; logical
+queues не подтверждаются и не очищаются. Persisted shapes и post-commit cleanup
+не изменяются.
+Если maintenance уже снята, а очистка local transition не сохранилась, recovery
+только завершает checkpoint: свежие source canonical/manifest того же observed epoch,
+точный прежний source physical snapshot и отсутствие всех targets обязательны.
+Этот путь не получает права DELETE; существующий target или незавершённое durable
+cleanup блокируют завершение. Failed final save возвращает transition в память.
 Own-device recovery не получает послабления только из-за совпавшего device ID:
 local transition, manifest и canonical maintenance должны совпасть по ID, kind,
 initiator, revisions и descriptors с учётом единственного разрешённого окна,
@@ -142,7 +156,7 @@ reconcile и только затем воспроизводит durable logical 
 physical actions применяются только при актуальном epoch/canonical/fingerprint
 proof.
 
-## Enable, rotate и disable
+## Orchestration и admission
 
 Все операции используют `EncryptionTransitionController` и одну схему recovery:
 
@@ -150,6 +164,22 @@ proof.
 - rotate создаёт новый `hardened` target и выбранный backup под new password;
 - disable создаёт выбранный backup под source password и target plaintext;
 - `clearIndexTransitionServices()` всегда выполняется через `finally`.
+
+Preparation и connect выполняет `crypto/workflow.ts`; claim, phase publication,
+snapshot application и guarded cleanup — `crypto/maintenance.ts`; recovery —
+`crypto/recovery.ts`. Все используют существующий controller и его `finally`
+очистки codec services. `EncryptionManager` создаёт codec, snapshot и manifest.
+Узкие context ports используют актуальные settings и один plugin snapshot;
+password/salt/transition не копируются в новый runtime и сохраняются прежней
+coherent очередью вместе с baseline и pending work.
+
+`crypto/admission.ts` сохраняет порядок manifest/verifier checks и единственный
+ожидающий password prompt. `allowRecovery: false` запрещает reconnect, mutating
+recovery и prompt. Ответ закрытого после unload диалога не подключает codec и
+не меняет credentials. UI и foreground reservation принадлежат `main.ts`;
+после подключения watcher/scheduler запускаются только после успешного full
+и повторных lifecycle/pause checks. Подтверждение нового пароля в Force modal
+сохраняет `confirmPassword`; recovery по-прежнему не создаёт новый архив.
 
 Публичные методы плагина сохранены:
 `enableEncryption`, `disableEncryption`, `rotateEncryptionPassword`,
@@ -175,6 +205,13 @@ Enable/disable/rotate предлагают архив, продолжение б
 Пароль архива: target для enable/rotate, source для disable. Recovery и connect
 не создают архив повторно; source drift завершает текущую попытку.
 
+При потере initiator target-capable устройство завершает post-commit recovery без
+source password. Оно сверяет ID, initiator, source/target
+descriptors, profile и post-commit phase. Для enable/rotate оно аутентифицирует
+verifier и явно читает target canonical новым codec; для disable — plaintext
+внутри matching IndexManager recovery scope. Отсутствующий manifest допустим
+только после commit plaintext target.
+
 Foreign target recovery сначала доказывает target canonical и matching descriptors,
 затем публикует stable target manifest или удаляет manifest для plaintext, переводит
 canonical в cleanup, выполняет guarded удаления и завершает maintenance. Старое окно
@@ -196,3 +233,25 @@ await и освобождают её через finally. Backup choice dialog н
 Настройки path/scope блокируются также сохранённым pending transition. Idle token repair
 разрешён для восстановления доступа, но не снимает encryption authority checks.
 Internal сохранение target snapshot и очередей не проходит пользовательский allowlist.
+
+## Направленный Force
+
+Force использует отдельный maintenance kind и recovery, сохраняя формат markers
+и профиль `hardened`. Он не выполняет enable/disable/rotate как фиктивный переход.
+Локальное → Диск создаёт свежую соль и согласованные target user objects,
+canonical и manifest; источник — фактические локальные plaintext bytes.
+Старый ключ назначения не нужен при полном raw scope. При ограниченных include
+patterns raw имя вне scope, похожее на ciphertext, требует доказанного target
+codec logical path; иначе Force блокируется до удаления, сохраняя возможный
+excluded plaintext. Явное raw exclusion снимает неоднозначность для посторонних
+объектов. Manifest сам по себе не доказывает формат каждого user object.
+Диск → локальное проверяет все source paths и decrypt до первого overwrite/delete.
+Неоднозначный mixed plaintext/ciphertext source также блокируется при decrypt
+failure; посторонние raw objects можно явно исключить до filename conversion.
+При потерянном manifest формат выбирается явно; сохранённые salt/profile допустимы
+только с успешной проверкой пути и bytes. Один пароль не заменяет потерянные salt/profile.
+Пустой remote сохраняет локальный mode и получает рабочие пустые metadata.
+
+Подробные backup, source/scope guards и restart phases описаны в
+[ARCHITECTURE.md](ARCHITECTURE.md). Два профиля Obsidian и реальный Диск проверяются
+отдельно; functional harness не является доказательством этого прогона.

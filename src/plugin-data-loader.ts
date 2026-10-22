@@ -1,3 +1,7 @@
+import {
+	assertForceRecovery,
+	type ForceRecovery,
+} from "./sync/workflows/force-state";
 import type {
 	FileMetadata,
 	LocalSyncState,
@@ -28,6 +32,7 @@ interface PersistedPluginData {
 	pendingPhysicalActions?: unknown;
 	pendingWatcherEvents?: unknown;
 	encryptionTransition?: LocalEncryptionTransition | null;
+	forceRecovery?: ForceRecovery | null;
 	lastSyncStats?: unknown;
 }
 
@@ -48,6 +53,7 @@ const CURRENT_PLUGIN_DATA_KEYS = new Set([
 	"pendingPhysicalActions",
 	"pendingWatcherEvents",
 	"encryptionTransition",
+	"forceRecovery",
 	"lastSyncStats",
 ]);
 
@@ -74,6 +80,16 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		);
 	}
 	if (data.format === PLUGIN_DATA_FORMAT) {
+		if (!("forceRecovery" in data)) {
+			data = { ...data, forceRecovery: null };
+		}
+		try {
+			assertForceRecovery(data.forceRecovery);
+		} catch {
+			throw new UnsupportedHistoricalDataError(
+				"Current Force recovery is invalid",
+			);
+		}
 		if (isRecord(data.localState) && !("remoteScope" in data.localState)) {
 			data = {
 				...data,
@@ -106,6 +122,7 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		pendingPhysicalActions: [],
 		pendingWatcherEvents: [],
 		encryptionTransition: null,
+		forceRecovery: null,
 		lastSyncStats: stable.lastSyncStats,
 	} as T & { format: typeof PLUGIN_DATA_FORMAT };
 	return {
@@ -155,8 +172,9 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 		(settings.encryptionProfileId !== "hardened" ||
 			typeof settings.encryptionSalt !== "string" ||
 			settings.encryptionSalt.length === 0 ||
-			typeof settings.encryptionPassword !== "string" ||
-			settings.encryptionPassword.length === 0 ||
+			(settings.encryptionPassword !== null &&
+				(typeof settings.encryptionPassword !== "string" ||
+					settings.encryptionPassword.length === 0)) ||
 			!Number.isSafeInteger(settings.encryptionRevision) ||
 			(settings.encryptionRevision ?? 0) <= 0);
 	const plaintextSettingsInvalid =

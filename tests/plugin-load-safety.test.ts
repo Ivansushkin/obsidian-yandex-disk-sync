@@ -9,14 +9,10 @@ import { persistenceHarness as harness } from "./helpers/lifecycle-fixtures";
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 
 test("user settings publish only after persistence and retain queues saved ahead of the draft", async () => {
-	const { plugin, persistence, writes } = harness();
+	const { plugin, writes } = harness();
 	await plugin.loadSettings();
 	plugin.settings = { ...plugin.settings, logToFile: false };
 	const old = plugin.settings;
-	let release = () => {};
-	persistence["pluginDataPersistenceTail"] = new Promise<void>((resolve) => {
-		release = resolve;
-	});
 	const draft = plugin.applySettingsPatch({ enableDebugLogging: true });
 	assert.equal(plugin.settings, old);
 	const mutation = { id: "synthetic-pending" };
@@ -28,7 +24,6 @@ test("user settings publish only after persistence and retain queues saved ahead
 			updateSettings: () => {},
 		},
 	});
-	release();
 	await draft;
 	assert.equal(plugin.settings.enableDebugLogging, true);
 	assert.deepEqual(
@@ -69,7 +64,7 @@ test("logging persistence does not replace an internal encryption update queued 
 	const draft = plugin.applySettingsPatch({ enableDebugLogging: true });
 	await waiting;
 	plugin.settings.enableEncryption = true;
-	const internal = persistence["persistPluginData"]();
+	const internal = persistence.persist();
 	release();
 	await Promise.all([draft, internal]);
 	assert.equal(plugin.settings.enableEncryption, true);
@@ -94,6 +89,8 @@ test("accepted connection settings reconcile before automation and preserve a us
 				stop: () => order.push("stop"),
 				updateSettings: () => {},
 				waitForPendingPersistence: async () => {
+					// Watcher persistence awaits the same queue as the settings draft.
+					await plugin.saveSettings();
 					order.push("watcher-saved");
 				},
 				getDeferredEvents: () => [],
@@ -177,14 +174,14 @@ test("failed plugin load never overwrites storage on save or unload", async () =
 					: /storage read failed/,
 			);
 			plugin.onunload();
-			await persistence["pluginDataPersistenceTail"];
+			await persistence.idle();
 			assert.deepEqual(writes, []);
 			await assert.rejects(
 				plugin.saveSettings(),
 				/not successfully loaded/,
 			);
 			await assert.rejects(
-				persistence["persistPluginData"](),
+				persistence.persist(),
 				/not successfully loaded/,
 			);
 			assert.deepEqual(writes, []);
@@ -203,7 +200,7 @@ test("stable fractional timestamps survive immediate current migration and unloa
 	assert.equal(writes.length, 1);
 	await plugin.saveSettings();
 	plugin.onunload();
-	await persistence["pluginDataPersistenceTail"];
+	await persistence.idle();
 	assert.equal(writes.length, 3);
 	for (const written of writes) {
 		const current = written as {
@@ -222,7 +219,7 @@ test("stable fractional timestamps survive immediate current migration and unloa
 	>;
 	const restarted = harness(current);
 	await restarted.plugin.loadSettings();
-	await restarted.persistence["persistPluginData"]();
+	await restarted.persistence.persist();
 	assert.deepEqual(JSON.parse(JSON.stringify(restarted.writes[0])), current);
 });
 
@@ -236,7 +233,7 @@ test("failed initial persistence cannot be retried by unload", async () => {
 	};
 	await assert.rejects(plugin.loadSettings(), /disk unavailable/);
 	plugin.onunload();
-	await persistence["pluginDataPersistenceTail"];
+	await persistence.idle();
 	assert.equal(attempts, 1);
 	await assert.rejects(plugin.saveSettings(), /not successfully loaded/);
 });
@@ -245,12 +242,8 @@ test("reload invalidates queued saves before reading storage", async () => {
 	const { plugin, persistence, writes } = harness();
 	plugin.loadData = async () => structuredClone(stableFixture);
 	await plugin.loadSettings();
-	let release = () => {};
-	persistence["pluginDataPersistenceTail"] = new Promise<void>((resolve) => {
-		release = resolve;
-	});
 	const staleSave = assert.rejects(
-		persistence["persistPluginData"](),
+		persistence.persist(),
 		/not successfully loaded|superseded/,
 	);
 	plugin.loadData = async () => ({ unsupported: true });
@@ -258,15 +251,11 @@ test("reload invalidates queued saves before reading storage", async () => {
 		plugin.loadSettings(),
 		UnsupportedHistoricalDataError,
 	);
-	release();
 	await Promise.all([staleSave, reload]);
 	plugin.onunload();
-	await persistence["pluginDataPersistenceTail"];
+	await persistence.idle();
 	assert.equal(writes.length, 1);
-	await assert.rejects(
-		persistence["persistPluginData"](),
-		/not successfully loaded/,
-	);
+	await assert.rejects(persistence.persist(), /not successfully loaded/);
 });
 
 test("persisted actor and queue survive missing installation cache but reject a known foreign owner", async () => {
@@ -277,7 +266,6 @@ test("persisted actor and queue survive missing installation cache but reject a 
 	try {
 		for (const cached of [null, "unavailable", "foreign"] as const) {
 			const { plugin, writes } = harness();
-			Reflect.deleteProperty(plugin, "getInstallationDeviceId");
 			Object.defineProperty(globalThis, "localStorage", {
 				configurable: true,
 				value: {
@@ -342,7 +330,6 @@ test("persisted actor and queue survive missing installation cache but reject a 
 			}
 		}
 		const fresh = harness();
-		Reflect.deleteProperty(fresh.plugin, "getInstallationDeviceId");
 		fresh.plugin.loadData = async () => null;
 		await fresh.plugin.loadSettings();
 		assert.notEqual(fresh.plugin.settings.deviceId, "foreign");
@@ -354,4 +341,74 @@ test("persisted actor and queue survive missing installation cache but reject a 
 			Reflect.deleteProperty(globalThis, "localStorage");
 		}
 	}
+});
+
+test("failed settings save is not retried by unload", async () => {
+	for (const unloadDuringSave of [false, true]) {
+		const { plugin, persistence } = harness();
+		await plugin.loadSettings();
+		let attempts = 0;
+		let release = () => {};
+		let entered = () => {};
+		const waiting = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		plugin.saveData = async () => {
+			attempts++;
+			entered();
+			await blocked;
+			throw new Error("synthetic failed save");
+		};
+		const rejected = assert.rejects(
+			plugin.applySettingsPatch({ enableDebugLogging: true }),
+			/synthetic failed save/,
+		);
+		await waiting;
+		if (unloadDuringSave) {
+			plugin.onunload();
+		}
+		release();
+		await rejected;
+		if (!unloadDuringSave) {
+			plugin.onunload();
+		}
+		await persistence.idle();
+		assert.equal(attempts, 1);
+		assert.equal(plugin.settings.enableDebugLogging, false);
+	}
+});
+
+test("reload rejects publication of an in-flight settings draft", async () => {
+	const { plugin, persistence } = harness();
+	await plugin.loadSettings();
+	let release = () => {};
+	let entered = () => {};
+	const waiting = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	plugin.saveData = async () => {
+		entered();
+		await blocked;
+	};
+	const draft = plugin.applySettingsPatch({ enableDebugLogging: true });
+	await waiting;
+	const rejected = assert.rejects(
+		draft,
+		/superseded|not successfully loaded/,
+	);
+	plugin.loadData = async () => ({ unsupported: true });
+	const reload = assert.rejects(
+		plugin.loadSettings(),
+		UnsupportedHistoricalDataError,
+	);
+	release();
+	await Promise.all([rejected, reload]);
+	await persistence.idle();
+	assert.equal(plugin.settings.enableDebugLogging, false);
 });

@@ -13,6 +13,7 @@ import type {
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
 import {
+	getAncestorDirectories,
 	getAncestorDirectoriesDeepestFirst,
 	getDirectory,
 	hasPortablePathCollision,
@@ -24,7 +25,8 @@ import {
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { createConfirmedBaseline } from "../local/baseline-rules";
-import { IndexManager, PortablePathCollisionError } from "../canonical/manager";
+import { IndexManager } from "../canonical/manager";
+import { PortablePathCollisionError } from "../canonical/errors";
 import {
 	classifyPhysicalDeleteResource,
 	isPhysicalDeleteAuthorized,
@@ -299,14 +301,7 @@ export async function applyDownloadedContent(
 		return;
 	}
 	const externalMutation =
-		[...deps.indexManager.getPendingMutations()]
-			.reverse()
-			.find(
-				(mutation) =>
-					mutation.type === "put" &&
-					mutation.path === path &&
-					mutation.sha256 === sha256,
-			) ??
+		deps.indexManager.findPendingMatchingPut(path, sha256, "last") ??
 		deps.indexManager.enqueueMutation("put", path, {
 			sha256,
 			baselineSha256: canonicalMetadata?.sha256,
@@ -592,12 +587,10 @@ export async function pruneRemoteFolders(
 
 	const expectedEpoch = deps.indexManager.getRemoteIndex().epoch;
 	const remoteFiles = deps.indexManager.getRemoteIndex().files;
-	const emptyDirs = candidates.filter((dir) => {
-		const prefix = dir + "/";
-		return !Object.keys(remoteFiles).some(
-			(fp) => !remoteFiles[fp]?.deleted && fp.startsWith(prefix),
-		);
-	});
+	const liveAncestors = getAncestorDirectories(
+		Object.keys(remoteFiles).filter((path) => !remoteFiles[path]?.deleted),
+	);
+	const emptyDirs = candidates.filter((dir) => !liveAncestors.has(dir));
 	if (emptyDirs.length === 0) {
 		return;
 	}

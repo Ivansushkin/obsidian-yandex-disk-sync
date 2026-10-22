@@ -2,11 +2,9 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
-Connection and sync-scope settings are accepted only after saving a coherent local
-snapshot. Active sync, archive creation, and encryption operations block competing
-changes. Pending recovery prevents moving unfinished work to another remote folder;
-a token can still be repaired while operations are idle. Failed saves keep sync blocked.
-Individual protective copies remain required even when a full archive is declined.
+Connection and scope changes take effect only after a coherent local save.
+Active operations and unfinished recovery can block changes. See the
+[documentation guide](docs/README.md) for architecture, scenarios and release checks.
 
 ## Upgrading from 1.1.0 to 2.0.0
 
@@ -31,8 +29,9 @@ Force remote also stops before local writes on NFC/case-insensitive path
 collisions.
 
 Encrypted legacy data and every other historical format are unsupported.
-Numeric manifests and canonical formats, unmarked queues/transitions, and
-incomplete current transition metadata block startup and all remote writes.
+Invalid local data blocks startup and mutating workflows. Unsupported remote
+formats block ordinary sync; confirmed Force local can replace destination
+metadata from a readable local source without decoding the old destination.
 Choose a clean remote path or reset the old data manually only after making an
 independent backup. Current data is accepted only with the semantic markers
 `sync-index`, `encryption-manifest`, and `plugin-data`; incompatible historical
@@ -43,35 +42,13 @@ canonical index or restore deleted files. If that happens, disable sync everywhe
 select the most complete local vault, inspect backup/conflict copies, and
 repeat Force local with an explicit archive choice.
 
-> **⚠️ IMPORTANT WARNINGS AND LIMITATIONS**
->
-> **Legal Liability**  
-> The author is not responsible for the safety and security of your data. Install and use the plugin at your own risk. All plugin code is open source, and you can independently verify its security.
->
-> **Data Security**  
-> The OAuth token is stored as plaintext in local Obsidian plugin data and is
-> not transmitted to third parties. Never share it with the developer or other
-> persons. Use a token with minimal permissions (`cloud_api:disk.app_folder`).
->
-> **Yandex Disk API Limitations (as of this document's writing)**
->
-> - **Maximum file size**: 50 GB (requires active Yandex 360 plan), for free version — 2 GB
-> - **Daily limit**: 750 GB of uploads per day per account
-> - **Free storage**: 5 GB (can be increased to 200 GB, 1 TB, or 3 TB with Yandex 360 plan)
->
-> **Synchronization Risks**
->
-> - Conflicts create a separate conflict copy; a local version displaced by a
->   deletion is preserved in backup
-> - Deleted files will be deleted on all devices during synchronization
-> - Automatic synchronization may lead to data loss with unstable internet connection
-> - Intensive API usage may lead to temporary account blocking by Yandex
->
-> **Account Requirements**  
-> To upload files larger than 2 GB, an active Yandex 360 plan is required. The free version has limitations on file size and total storage.
->
-> **Privacy**  
-> The plugin does not collect or transmit any of your data, file contents, or metadata to the developer. All operations occur locally on your device using the official Yandex Disk API.
+> **Data safety**
+> Use an independent backup for important vaults. Deletions propagate to other
+> devices. Force replaces the selected sync scope and offers an explicit backup
+> choice. OAuth tokens and encryption passwords are stored in plaintext in local
+> plugin data; never share that directory or diagnostic data containing secrets.
+> The plugin sends synchronized data to Yandex Disk and collects no telemetry.
+> Use it at your own risk; see [LICENSE](LICENSE).
 
 ## Features
 
@@ -84,7 +61,7 @@ repeat Force local with an explicit archive choice.
 - **Flexible filters** — configurable include/exclude file patterns
 - **Multi-device support** — work under one token on different devices
 - **Backup system** — create ZIP backups of vault stored on Yandex Disk
-- **Force synchronization** — unconditional one-way overwrite (local→remote or remote→local) for recovery or manual resync
+- **Force synchronization** — confirmed replacement of the selected sync scope from local or remote files
 - **End-to-end encryption** — AES-256-GCM content encryption and deterministic AES-SIV filenames with separated keys
 
 ## Installation
@@ -107,31 +84,28 @@ repeat Force local with an explicit archive choice.
 
 ### Getting OAuth Token
 
-> **⚠️ Important**  
-> To upload files larger than 2 GB, an active Yandex 360 plan is required. The free version of Yandex Disk provides only 5 GB of storage.
-
 1. Go to [Yandex OAuth](https://oauth.yandex.ru/)
-2. Create application with `cloud_api:disk.app_folder` (recommended) or `cloud_api:disk.read` + `cloud_api:disk.write` permissions
+2. Create an application with read and write access to the selected Yandex Disk storage; grant only the permissions needed for synchronization
 3. Get OAuth token
 4. Paste token in plugin settings
 
 ### Plugin Settings
 
-| Parameter                     | Description                                                    | Recommended Value       |
-| ----------------------------- | -------------------------------------------------------------- | ----------------------- |
-| **OAuth token**               | Token for Yandex Disk API access                               | Obtained in settings    |
-| **Remote path**               | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`) | `obsidian-sync`         |
-| **Real-time sync**            | Automatic synchronization when files are changed               | Enabled                 |
-| **Full sync interval**        | Full synchronization interval in minutes (0 = manual only)     | 5 minutes               |
-| **Sync delay**                | Delay before uploading file after change (debounce)            | 1000 ms                 |
-| **Max concurrent operations** | Bounded file-operation concurrency                             | 10                      |
-| **Sync config folder**        | Synchronize Obsidian settings folder                           | Disabled (by default)   |
-| **Include/Exclude patterns**  | Glob patterns for file filtering                               | `*.md`, `attachments/*` |
-| **Force Sync**                | Unconditional one-way overwrite (local→remote / remote→local)  | —                       |
-| **Backup**                    | Create ZIP backups of synchronized files                       | Disabled (by default)   |
-| **Encryption**                | Enable end-to-end AES-256-GCM encryption                       | Disabled (by default)   |
-| **Encryption info**           | Information about encryption and password storage              | —                       |
-| **Change password**           | Change encryption password (when encryption is enabled)        | —                       |
+| Parameter                     | Description                                                    | Recommended Value         |
+| ----------------------------- | -------------------------------------------------------------- | ------------------------- |
+| **OAuth token**               | Token for Yandex Disk API access                               | Obtained in settings      |
+| **Remote path**               | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`) | `obsidian-sync`           |
+| **Real-time sync**            | Automatic synchronization when files are changed               | Enabled                   |
+| **Full sync interval**        | Full synchronization interval in minutes (0 = manual only)     | 5 minutes                 |
+| **Sync delay**                | Delay before uploading file after change (debounce)            | 1000 ms                   |
+| **Max concurrent operations** | Bounded file-operation concurrency                             | 10                        |
+| **Sync config folder**        | Synchronize Obsidian settings folder                           | Disabled (by default)     |
+| **Include/Exclude patterns**  | Glob patterns for file filtering                               | `**` (all syncable files) |
+| **Force Sync**                | Replace selected sync scope from local or remote files         | —                         |
+| **Backup**                    | Create ZIP backups of synchronized files                       | Manual / per-run choice   |
+| **Encryption**                | Enable end-to-end AES-256-GCM encryption                       | Disabled (by default)     |
+| **Encryption info**           | Information about encryption and password storage              | —                         |
+| **Change password**           | Change encryption password (when encryption is enabled)        | —                         |
 
 ## Commands
 
@@ -168,7 +142,8 @@ On first launch, the plugin will check for files locally and on Yandex Disk:
 - **If disk is empty and local has files** — files will be uploaded
 - **When connecting a new device to existing cloud data** — cloud versions are received first. Different local versions are preserved under `.obsidian/plugins/yandex-disk-sync/overwritten/`. Cloud deletions are applied with protective copies; local-only files are kept and uploaded after the initial receive. Later synchronization uses the normal two-way rules.
 
-> **⚠️ Recommendation**  
+> **Recommendation**
+>
 > Before the first synchronization, create a manual backup of your vault. When working with cloud data, there is always a risk of information loss.
 
 ### Working on Multiple Devices
@@ -177,7 +152,8 @@ On first launch, the plugin will check for files locally and on Yandex Disk:
 2. On second device, install plugin with same token and path
 3. Plugin will automatically download files from Yandex Disk
 
-> **⚠️ Important**  
+> **Important**
+>
 > Use the same token on all devices. If you change the token, you will need to reconfigure synchronization on all devices.
 
 ### Conflict Resolution
@@ -190,7 +166,8 @@ An exact-file deletion wins over a concurrent edit, but displaced local content
 is first preserved in backup. A new or modified file inside a concurrently
 deleted folder survives.
 
-> **⚠️ Warning**  
+> **Warning**
+>
 > Deletions propagate to every device. Keep an independent backup for important
 > vaults, especially before Force sync.
 
@@ -212,26 +189,27 @@ Plugin includes built-in backup system for creating ZIP archives of your vault:
 
 ### Force Synchronization
 
-The plugin includes a **Force Sync** feature for cases when normal two-way sync is not sufficient:
+Choose the authoritative source in **Settings → Force Sync**:
 
-- **Sync from local → remote**: overwrites ALL files on Yandex Disk with local versions. Files not present locally are deleted from the remote.
-- **Sync from remote → local**: overwrites ALL local files with versions from Yandex Disk. Files not present on the remote are deleted locally.
+- **Local → remote** replaces syncable destination files with the local snapshot.
+- **Remote → local** replaces syncable local files with the authenticated remote snapshot.
 
-Force sync selects the authoritative side explicitly; snapshot, canonical and fingerprint guards still apply.
+Files absent from the source are removed only inside the selected sync scope.
+Protected/excluded paths, `.backup`, and this plugin's directory remain protected.
+An unreadable source never means an empty source. Ambiguous filename scope stops
+Force instead of deleting a possibly excluded file.
 
-> **⚠️ Warning**
-> Force sync is destructive. The overwritten side is fully replaced. The
-> plugin offers an optional full archive. Canonical, protected snapshot and
-> source are checked again before replacement commit. After that commit,
-> interrupted fingerprint-guarded cleanup is resumed by normal Full sync and
-> Force must not be repeated.
->
-> **Location**: Settings → Force Sync section.
+Each run offers **with backup**, **without backup**, or **cancel**. A chosen archive
+must pass exact verification; failure offers retry, explicit continuation without
+copies, or cancellation. **Without backup also skips per-file protective/conflict
+copies and the old destination-content snapshot.** Ordinary sync retains mandatory
+protective copies. Encryption transitions have their own archive choice.
 
-Full archives before both Force directions and enable/disable/rotate are optional
-per run. A selected archive failure or stale snapshot stops that attempt. Connecting
-to existing encryption and recovery do not create another archive. Individual file
-protection and conflict copies remain active regardless of archive choice.
+Force publishes a durable intent with a new epoch. After interruption, restart
+continues the same operation; do not repeat Force to repair unfinished cleanup.
+Another device with offline changes must choose to accept the remote generation,
+preserve its changes, or defer before uploading. Details: [architecture](docs/ARCHITECTURE.md)
+and [backup policy](docs/BACKUP.md).
 
 ## Encryption
 
@@ -266,7 +244,7 @@ or cleanup.
 
 **Password storage**: The password is stored in `data.json` (Obsidian plugin config) as a plaintext string. It is never sent to Yandex or any third party.
 
-> **⚠️ Warning**
+> **Warning**
 > Enabling encryption re-uploads every file in encrypted form. The old
 > plaintext set remains authoritative until the canonical commit and is then
 > deleted only by fingerprint-guarded cleanup. The resulting encrypted data
@@ -301,7 +279,7 @@ cp .env.example .env
 ```
 
 ```dotenv
-YANDEX_PLUGIN_PATH=/absolute/path/to/test-vault/.obsidian/plugins/obsidian-yandex-disk-sync
+YANDEX_PLUGIN_PATH=/absolute/path/to/test-vault/.obsidian/plugins/yandex-disk-sync
 ```
 
 ```bash
@@ -349,39 +327,35 @@ The normative catalogue of synchronization, multi-device, failure-recovery,
 and encryption scenarios is maintained in
 [`docs/SYNC_USER_SCENARIOS.md`](docs/SYNC_USER_SCENARIOS.md).
 
-Detailed description of architecture and approaches see in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Start with the [documentation guide](docs/README.md). The completed refactor and
+subsequent correctness fixes are summarized in [REFACTOR_REPORT.md](docs/REFACTOR_REPORT.md).
 
 ## Security
 
 - OAuth token is stored as plaintext in local plugin data because Obsidian
   mobile plugins do not provide a portable OS keychain API
 - Token is not logged and not transmitted to third parties
-- Recommended to use token with minimal necessary permissions (`cloud_api:disk.app_folder`)
-- When removing the plugin, the token is **not** automatically deleted — delete it manually from Obsidian settings
+- Grant only the OAuth permissions needed to read and write the selected storage
+- Removing local plugin data does not revoke the OAuth token; revoke unused tokens through Yandex OAuth
 - All network requests use HTTPS with certificate verification
 - User data is never collected or analyzed by the plugin developer
-- **End-to-end encryption**: file content and filenames are encrypted with AES-256-GCM before upload; the encryption key never leaves your device
+- **End-to-end encryption**: file content uses AES-256-GCM and filenames use AES-SIV; derived keys stay in device memory
 
 ## Limitations
 
-- **Maximum file size**: 50 GB (requires Yandex 360 plan), free version — 2 GB
-- **Free storage**: 5 GB (Yandex Disk limitation)
-- **Binary file synchronization** may be slower due to API limitations
-- **Symlinks synchronization is not supported** and special file attributes
-- **Daily traffic limit**: 750 GB of uploads per day per account (Yandex Disk limitation)
-- **Frequent API requests** may lead to temporary account blocking
+- Empty folders, symlinks and special file attributes are not synchronized separately.
+- Old and current plugin builds must not use the same remote storage concurrently.
+- Provider quotas, file-size limits and throttling depend on Yandex Disk; check your
+  current account limits. The plugin cannot raise them.
+- ZIP creation retains the archive's files in memory. Realtime windows reduce retained
+  content but do not impose a hard cap on device memory or an oversized file.
+- Network failures leave durable work for recovery; an idle indicator does not prove
+  that every device has converged. Real desktop/mobile release checks are separate
+  from automated tests.
 
 ## License
 
-MIT License
-
-Copyright (c) 2024-2026 Ivansushkin
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
@@ -392,7 +366,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ---
 
-**Last Updated**: August 27, 2026
+**Last Updated**: October 22, 2026
 
 **Version**: 2.0.0
 
@@ -400,5 +374,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 **Required Obsidian Version**: 1.0.0+
 
-> **ℹ️ Developer Note**  
+> **Developer Note**
+>
 > This plugin is created by the community for the community. It is not an official product of Obsidian or Yandex. All trademarks and copyrights belong to their respective owners.

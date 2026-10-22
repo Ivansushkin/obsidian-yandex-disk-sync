@@ -488,6 +488,7 @@ export class YandexDiskClient {
 		path: string,
 		raw = false,
 		concurrency = 4,
+		includeDirectories = false,
 	): Promise<YandexResource[]> {
 		const startedAt = Date.now();
 		const results: YandexResource[] = [];
@@ -505,7 +506,12 @@ export class YandexDiskClient {
 			const batches = await runWithConcurrency(
 				currentLevel.map(
 					(currentPath) => async () =>
-						await this.readDirectoryPageSet(currentPath, raw),
+						await this.readDirectoryPageSet(
+							currentPath,
+							raw,
+							currentPath === path,
+							includeDirectories,
+						),
 				),
 				limit,
 			);
@@ -529,6 +535,8 @@ export class YandexDiskClient {
 	private async readDirectoryPageSet(
 		path: string,
 		raw: boolean,
+		allowMissingRoot: boolean,
+		includeDirectories: boolean,
 	): Promise<{ files: YandexResource[]; directories: string[] }> {
 		const files: YandexResource[] = [];
 		const directories: string[] = [];
@@ -537,7 +545,12 @@ export class YandexDiskClient {
 		while (true) {
 			const resource = await this.getResource(path, limit, offset, true);
 			if (!resource) {
-				break;
+				if (allowMissingRoot && offset === 0) {
+					break;
+				}
+				throw new Error(
+					"Observed remote directory became unavailable during listing",
+				);
 			}
 			if (resource.type === "file") {
 				files.push(
@@ -546,14 +559,25 @@ export class YandexDiskClient {
 				break;
 			}
 			const embedded = resource._embedded;
-			if (!embedded) {
-				break;
+			if (
+				!embedded ||
+				!Array.isArray(embedded.items) ||
+				!Number.isSafeInteger(embedded.total) ||
+				embedded.total < 0 ||
+				(embedded.items.length === 0 && offset < embedded.total)
+			) {
+				throw new Error("Remote directory listing is incomplete");
 			}
 			for (const item of embedded.items) {
 				if (item.type === "dir") {
 					this.rememberFolder(item.path.replace(/^disk:\//, ""));
 					if (!isProtectedPath(item.path)) {
 						directories.push(item.path);
+						if (includeDirectories) {
+							files.push(
+								raw ? item : await this.decryptResource(item),
+							);
+						}
 					}
 				} else {
 					files.push(raw ? item : await this.decryptResource(item));
@@ -562,7 +586,7 @@ export class YandexDiskClient {
 			if (offset + embedded.items.length >= embedded.total) {
 				break;
 			}
-			offset += limit;
+			offset += embedded.items.length;
 		}
 		return { files, directories };
 	}
@@ -663,11 +687,7 @@ export class YandexDiskClient {
 	async isFolderEmpty(remotePath: string): Promise<boolean> {
 		const target = await this.encryptFilePath(remotePath);
 		const resource = await this.getResource(target, 1000, 0, true);
-		if (!resource) {
-			return true;
-		}
-		const items = resource._embedded?.items ?? [];
-		return items.length === 0;
+		return this.isListedFolderEmpty(resource);
 	}
 
 	/**
@@ -676,10 +696,27 @@ export class YandexDiskClient {
 	 */
 	async isRawFolderEmpty(remotePath: string): Promise<boolean> {
 		const resource = await this.getResource(remotePath, 1000, 0, true);
+		return this.isListedFolderEmpty(resource);
+	}
+
+	/** Missing or malformed directory children never authorize a destructive prune. */
+	private isListedFolderEmpty(resource: YandexResource | null): boolean {
 		if (!resource) {
 			return true;
 		}
-		return (resource._embedded?.items ?? []).length === 0;
+		if (resource.type !== "dir") {
+			return false;
+		}
+		const embedded = resource._embedded;
+		if (
+			!embedded ||
+			!Array.isArray(embedded.items) ||
+			!Number.isSafeInteger(embedded.total) ||
+			embedded.total < 0
+		) {
+			throw new Error("Remote directory listing is incomplete");
+		}
+		return embedded.total === 0 && embedded.items.length === 0;
 	}
 
 	/**
@@ -703,13 +740,9 @@ export class YandexDiskClient {
 	 * Upload file to Yandex Disk.
 	 * When `raw` is true, skips content and path encryption (for metadata files).
 	 *
-	 * When `skipFolderCheck` is true the caller asserts that the parent folder
-	 * already exists (preflight ensured it). If the upload then fails anyway —
-	 * most commonly because another concurrent sync pruned that folder in the
-	 * meantime — we recreate the parent folder and retry the upload once,
-	 * instead of failing the operation until the next full sync. Only a 404
-	 * triggers the retry; other failures (auth, quota, conflict, network, 5xx) are
-	 * re-thrown immediately so the real cause isn't masked as a missing folder.
+	 * Preflight may be skipped for an already observed parent. In either mode,
+	 * a transport 404 recreates the parent and retries once. Guard and ambiguous
+	 * verification failures never authorize parent recovery, regardless of status.
 	 */
 	async uploadFile(
 		remotePath: string,
@@ -726,6 +759,26 @@ export class YandexDiskClient {
 		if (!skipFolderCheck) {
 			await this.ensureUploadParent(remotePath, raw);
 		}
+		let callbackFailed = false;
+		const beforePut = async () => {
+			try {
+				await beforeAttempt?.();
+				await this.writeGuard?.();
+			} catch (error) {
+				callbackFailed = true;
+				throw error;
+			}
+		};
+		const confirmUpload = confirmAmbiguousResult
+			? async () => {
+					try {
+						return await confirmAmbiguousResult();
+					} catch (error) {
+						callbackFailed = true;
+						throw error;
+					}
+				}
+			: undefined;
 
 		try {
 			await this.putFile(
@@ -733,49 +786,18 @@ export class YandexDiskClient {
 				content,
 				raw,
 				overwrite,
-				beforeAttempt,
-				confirmAmbiguousResult,
+				beforePut,
+				confirmUpload,
 			);
 			logger.debug(`Uploaded file: ${remotePath}`);
 			return;
 		} catch (e) {
-			if (
-				!skipFolderCheck &&
-				e instanceof YandexApiError &&
-				e.status === 404
-			) {
-				await this.recreateUploadParent(remotePath, raw);
-				await this.putFile(
-					remotePath,
-					content,
-					raw,
-					overwrite,
-					beforeAttempt,
-					confirmAmbiguousResult,
-				);
-				logger.debug(
-					`Uploaded file after folder recovery: ${remotePath}`,
-				);
-				return;
-			}
-			if (!skipFolderCheck) {
+			if (callbackFailed || !this.isNotFoundError(e)) {
 				throw e;
 			}
-			// Only retry when the failure is consistent with a missing/vanished
-			// parent folder (404 not found). Other errors
-			// (auth, quota, network, 5xx) are not caused by a missing folder
-			// and would just waste an extra upload attempt while masking the
-			// real cause.
-			if (!(e instanceof YandexApiError) || e.status !== 404) {
-				throw e;
-			}
-			// The preflight-created parent may have been pruned between preflight
-			// and this upload (e.g. another device's fullSync removed the last
-			// file in that folder and pruned the empty folder). Recreate the
-			// parent and retry once.
 			logger.info("Upload parent missing; recreating before one retry", {
-				status: e.status,
-				skipFolderCheck: true,
+				status: 404,
+				skipFolderCheck,
 			});
 			await this.recreateUploadParent(remotePath, raw);
 			await this.putFile(
@@ -783,8 +805,8 @@ export class YandexDiskClient {
 				content,
 				raw,
 				overwrite,
-				beforeAttempt,
-				confirmAmbiguousResult,
+				beforePut,
+				confirmUpload,
 			);
 			logger.debug(`Uploaded file after folder retry: ${remotePath}`);
 		}
@@ -851,7 +873,7 @@ export class YandexDiskClient {
 		content: ArrayBuffer | string,
 		raw: boolean,
 		overwrite: boolean,
-		beforeAttempt?: () => Promise<void>,
+		beforeAttempt: () => Promise<void>,
 		confirmAmbiguousResult?: () => Promise<boolean>,
 	): Promise<void> {
 		const bytes =
@@ -868,8 +890,7 @@ export class YandexDiskClient {
 
 		let lastError: Error | null = null;
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-			await beforeAttempt?.();
-			await this.writeGuard?.();
+			await beforeAttempt();
 			const startedAt = Date.now();
 			try {
 				const response = await this.requestNative({
@@ -1133,7 +1154,9 @@ export class YandexDiskClient {
 		fromPath: string,
 		toPath: string,
 		overwrite = false,
+		beforeAttempt?: () => Promise<void>,
 	): Promise<void> {
+		await beforeAttempt?.();
 		const encryptedFrom = await this.encryptFilePath(fromPath);
 		const encryptedTo = await this.encryptFilePath(toPath);
 		const encodedFrom = encodePathForUrl(encryptedFrom);
@@ -1151,6 +1174,8 @@ export class YandexDiskClient {
 		const response = await this.request(
 			"POST",
 			`/resources/move?from=${encodedFrom}&path=${encodedTo}&overwrite=${overwrite}`,
+			undefined,
+			beforeAttempt,
 		);
 		await this.waitForAsyncOperation(response);
 		this.invalidateFolder(encryptedFrom);
@@ -1163,8 +1188,9 @@ export class YandexDiskClient {
 	async moveResourceExclusive(
 		fromPath: string,
 		toPath: string,
+		beforeAttempt?: () => Promise<void>,
 	): Promise<void> {
-		await this.moveResource(fromPath, toPath, false);
+		await this.moveResource(fromPath, toPath, false, beforeAttempt);
 	}
 
 	/**

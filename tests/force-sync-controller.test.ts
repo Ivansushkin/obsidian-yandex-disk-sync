@@ -112,9 +112,12 @@ test("Force owns busy state from first click through backup persistence and fina
 			const pending = h.controller.run(direction);
 			assert.equal(h.controller.isBusy(), true);
 			await entered.promise;
-			await h.controller.run(direction);
-			await h.controller.run(
-				direction === "from_local" ? "from_remote" : "from_local",
+			assert.equal(h.controller.run(direction), pending);
+			assert.equal(
+				h.controller.run(
+					direction === "from_local" ? "from_remote" : "from_local",
+				),
+				pending,
 			);
 			assert.equal(h.controller.isBusy(), true);
 			release.resolve();

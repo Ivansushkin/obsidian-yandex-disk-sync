@@ -157,31 +157,7 @@ export function reduceQueuedFolderRename(
 	incoming: DurableFolderRenameEvent,
 	runningIds: ReadonlySet<string>,
 ): FolderRenameReduction {
-	const predecessorIndex = existing.findIndex(
-		(event) =>
-			event.action === "rename" && event.targetPath === incoming.path,
-	);
-	if (predecessorIndex < 0) {
-		return { events: [...existing, incoming], disposition: "queued" };
-	}
-	const predecessor = existing[predecessorIndex]!;
-	if (runningIds.has(predecessor.id)) {
-		return {
-			events: [...existing, incoming],
-			disposition: "running",
-			predecessorId: predecessor.id,
-		};
-	}
-	const reduced = [...existing];
-	reduced[predecessorIndex] = {
-		...predecessor,
-		targetPath: incoming.targetPath,
-	};
-	return {
-		events: reduced,
-		disposition: "rebased",
-		predecessorId: predecessor.id,
-	};
+	return reduceRenameChain(existing, incoming, runningIds);
 }
 
 /**
@@ -283,6 +259,19 @@ export function reduceQueuedFileRename(
 	incoming: DurableFileRenameEvent,
 	runningIds: ReadonlySet<string>,
 ): RenameChainReduction {
+	return reduceRenameChain(existing, incoming, runningIds);
+}
+
+/** Coalesce one rename chain while preserving its original causal identity. */
+function reduceRenameChain<T extends DurableRenameEvent>(
+	existing: readonly T[],
+	incoming: T,
+	runningIds: ReadonlySet<string>,
+): {
+	events: T[];
+	disposition: "queued" | "rebased" | "running";
+	predecessorId?: string;
+} {
 	const predecessorIndex = existing.findIndex(
 		(event) => event.targetPath === incoming.path,
 	);
@@ -453,12 +442,47 @@ export function wasMutationApplied(
 	mutation: PendingMutation,
 	appliedMutationSeq: Record<string, number>,
 ): boolean {
-	const separator = mutation.id.lastIndexOf(":");
+	return isMutationIdentityApplied(
+		mutation.id,
+		mutation.seq,
+		appliedMutationSeq,
+	);
+}
+
+/** Check a complete identity against a canonical watermark; callers own epoch admission. */
+function isMutationIdentityApplied(
+	id: string | undefined,
+	seq: number | undefined,
+	appliedMutationSeq: Readonly<Record<string, number>>,
+): boolean {
+	if (!id || seq === undefined) {
+		return false;
+	}
+	const separator = id.lastIndexOf(":");
 	if (separator <= 0) {
 		return false;
 	}
-	const deviceId = mutation.id.slice(0, separator);
-	return (appliedMutationSeq[deviceId] ?? 0) >= mutation.seq;
+	return (appliedMutationSeq[id.slice(0, separator)] ?? 0) >= seq;
+}
+
+/** Check only the upload watermark, without granting epoch or content authority. */
+export function isUploadEventApplied(
+	event: Readonly<RealtimeFileEvent>,
+	appliedMutationSeq: Readonly<Record<string, number>>,
+): boolean {
+	return isMutationIdentityApplied(
+		event.mutationId,
+		event.mutationSeq,
+		appliedMutationSeq,
+	);
+}
+
+/** Match accepted upload content after the caller has checked epoch and watermark. */
+export function matchesUploadReceiptContent(
+	source: Readonly<FileMetadata> | undefined,
+	sha256: string | undefined,
+): boolean {
+	return source !== undefined && !source.deleted && source.sha256 === sha256;
 }
 
 /**

@@ -54,11 +54,11 @@ export function getDirectory(path: string): string {
 }
 
 /**
- * Collect unique ancestor directories for file paths, deepest directories first.
+ * Collect unique ancestor directories without sorting.
  */
-export function getAncestorDirectoriesDeepestFirst(
+export function getAncestorDirectories(
 	filePaths: Iterable<string>,
-): string[] {
+): Set<string> {
 	const directories = new Set<string>();
 	for (const filePath of filePaths) {
 		let directory = getDirectory(filePath);
@@ -67,7 +67,14 @@ export function getAncestorDirectoriesDeepestFirst(
 			directory = getDirectory(directory);
 		}
 	}
-	return [...directories].sort((left, right) => {
+	return directories;
+}
+
+/** Collect unique ancestors in deletion order, without changing path policy. */
+export function getAncestorDirectoriesDeepestFirst(
+	filePaths: Iterable<string>,
+): string[] {
+	return [...getAncestorDirectories(filePaths)].sort((left, right) => {
 		const depthDifference =
 			right.split("/").length - left.split("/").length;
 		return depthDifference || left.localeCompare(right);
@@ -271,6 +278,36 @@ export function shouldSyncFile(
 	return matchesPatterns(normalized, includePatterns);
 }
 
+/** Keep raw excluded plaintext objects outside codec conversion while validating possible ciphertext. */
+export function shouldInspectRawSyncPath(
+	path: string,
+	includePatterns: string[],
+	excludePatterns: string[],
+	syncDotObsidian: boolean,
+	configDir: string,
+	encrypted: boolean,
+): boolean {
+	if (
+		!shouldSyncFile(path, [], [], true, configDir) ||
+		matchesPatterns(path, excludePatterns)
+	) {
+		return false;
+	}
+	// AES-SIV adds a 16-byte tag to each non-empty filename before Base64URL encoding.
+	const mayBeEncoded = path
+		.split("/")
+		.every((segment) => /^[A-Za-z0-9_-]{23,}$/.test(segment));
+	return encrypted && mayBeEncoded
+		? true
+		: shouldSyncFile(
+				path,
+				includePatterns,
+				excludePatterns,
+				syncDotObsidian,
+				configDir,
+			);
+}
+
 /**
  * Encode path for URL
  */
@@ -292,4 +329,37 @@ export function generateDeviceId(): string {
 	const timestamp = Date.now().toString(36);
 	const random = Math.random().toString(36).substring(2, 10);
 	return `device_${timestamp}_${random}`;
+}
+
+/** Index literal slash prefixes, including exact paths, without caching metadata or authority. */
+export class PathAncestryIndex {
+	private readonly descendants = new Map<string, Set<string>>();
+
+	constructor(paths: Iterable<string>) {
+		for (const path of paths) {
+			this.add(path);
+		}
+	}
+
+	/** Include a newly materialized key while preserving descendant iteration order. */
+	add(path: string): void {
+		let ancestor = path;
+		while (true) {
+			let paths = this.descendants.get(ancestor);
+			if (!paths) {
+				paths = new Set();
+				this.descendants.set(ancestor, paths);
+			}
+			paths.add(path);
+			const separator = ancestor.lastIndexOf("/");
+			if (separator < 0) {
+				return;
+			}
+			ancestor = ancestor.slice(0, separator);
+		}
+	}
+
+	get(path: string): ReadonlySet<string> | undefined {
+		return this.descendants.get(path);
+	}
 }

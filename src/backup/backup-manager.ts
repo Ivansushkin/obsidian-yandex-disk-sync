@@ -20,6 +20,7 @@ import {
 } from "./backup-envelope";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import {
+	captureLogicalVaultDigest,
 	captureLogicalVaultSnapshot,
 	captureRemoteRawSnapshot,
 } from "./backup-snapshot";
@@ -84,8 +85,7 @@ export class BackupManager {
 		const { epoch, revision } = canonical;
 		const remotePath = this.settings.remotePath;
 		const generation = this.configurationGeneration;
-		const before = (await captureLogicalVaultSnapshot(this.vaultAdapter))
-			.digest;
+		const before = await captureLogicalVaultDigest(this.vaultAdapter);
 		this.assertConfigurationGeneration(generation);
 		const result = await this.createBackup(password);
 		if (
@@ -99,8 +99,7 @@ export class BackupManager {
 				new Error(result.error ?? "Selected encryption backup failed")
 			);
 		}
-		const after = (await captureLogicalVaultSnapshot(this.vaultAdapter))
-			.digest;
+		const after = await captureLogicalVaultDigest(this.vaultAdapter);
 		if (
 			before !== result.snapshotDigest ||
 			after !== result.snapshotDigest

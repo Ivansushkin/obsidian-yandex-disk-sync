@@ -1,4 +1,3 @@
-import { createSyncError } from "../errors";
 import { VaultAdapter } from "../../api/vault-adapter";
 import { YandexApiError, YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
@@ -14,10 +13,12 @@ import { logger } from "../../utils/logger";
 import { joinPath } from "../../utils/path-utils";
 import { setRecordValue } from "../../utils/record-utils";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
-import * as fileOperations from "../files/operations";
 import { IndexManager } from "../canonical/manager";
 import type { PhysicalRewriteUploadProof, SyncRunOptions } from "../contracts";
+import { createSyncError } from "../errors";
+import * as fileOperations from "../files/operations";
 import * as syncReconciliation from "../reconciliation/commits";
+import * as reconciliationContext from "../reconciliation/context";
 export interface Dependencies {
 	yandexClient: YandexDiskClient;
 	setSyncPhase: (
@@ -30,7 +31,7 @@ export interface Dependencies {
 	settings: YandexDiskSyncSettings;
 	reportProgress: (processedOps: number, totalOps: number) => void;
 	fileOperations: fileOperations.Dependencies;
-	syncReconciliation: syncReconciliation.Dependencies;
+	syncReconciliation: reconciliationContext.Dependencies;
 }
 
 /** Treat every upload response as untrusted until exact read-back succeeds. */

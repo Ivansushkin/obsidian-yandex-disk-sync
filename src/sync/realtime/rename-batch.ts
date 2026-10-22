@@ -4,13 +4,13 @@ import { logger } from "../../utils/logger";
 import { getAncestorDirectoriesDeepestFirst } from "../../utils/path-utils";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { isPathInsideFolder } from "../canonical/mutation-rules";
-import { stageFileMove, type Dependencies } from "../files/rename";
 import { planFolderMove, stageFolderMove } from "../files/folder-mutations";
-import { executeGuardedRemoteMove } from "../files/remote-moves";
 import { pruneRemoteFolders } from "../files/operations";
+import { executeGuardedRemoteMove } from "../files/remote-moves";
+import { stageFileMove, type Dependencies } from "../files/rename";
 import {
-	saveRemoteIndexBestEffort,
 	saveMoveCompletionBestEffort,
+	saveRemoteIndexBestEffort,
 } from "../reconciliation/commits";
 import {
 	wasRenameSourceCausallyLive,

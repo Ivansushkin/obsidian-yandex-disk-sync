@@ -107,10 +107,7 @@ export async function executeGuardedRemoteMove(
 					`Move target does not match canonical: ${toPath}`,
 				);
 			}
-			stampMovedTarget(deps, toPath, target, snapshot);
-			if (action) {
-				deps.indexManager.completePhysicalAction(action.id);
-			}
+			completeMovedTarget(deps, toPath, target, snapshot, action?.id);
 			return;
 		}
 		const repairSnapshot =
@@ -133,10 +130,13 @@ export async function executeGuardedRemoteMove(
 			repairSnapshot,
 			canonicalTarget,
 		);
-		stampMovedTarget(deps, toPath, writtenTarget, repairSnapshot);
-		if (action) {
-			deps.indexManager.completePhysicalAction(action.id);
-		}
+		completeMovedTarget(
+			deps,
+			toPath,
+			writtenTarget,
+			repairSnapshot,
+			action?.id,
+		);
 		return;
 	}
 	if (!source && target) {
@@ -159,10 +159,7 @@ export async function executeGuardedRemoteMove(
 				toPath,
 				canonical.files[toPath]?.sha256,
 			));
-		stampMovedTarget(deps, toPath, target, targetSnapshot);
-		if (action) {
-			deps.indexManager.completePhysicalAction(action.id);
-		}
+		completeMovedTarget(deps, toPath, target, targetSnapshot, action?.id);
 		logger.info("Guarded remote move already complete", actionContext);
 		return;
 	}
@@ -186,10 +183,13 @@ export async function executeGuardedRemoteMove(
 			repairSnapshot,
 			targetMetadata,
 		);
-		stampMovedTarget(deps, toPath, repairedTarget, repairSnapshot);
-		if (action) {
-			deps.indexManager.completePhysicalAction(action.id);
-		}
+		completeMovedTarget(
+			deps,
+			toPath,
+			repairedTarget,
+			repairSnapshot,
+			action?.id,
+		);
 		logger.info("Missing move source repaired from local target", {
 			...actionContext,
 			plan: "materialize-target",
@@ -217,10 +217,7 @@ export async function executeGuardedRemoteMove(
 			move,
 			canonical.epoch,
 		);
-		stampMovedTarget(deps, toPath, target, snapshot);
-		if (action) {
-			deps.indexManager.completePhysicalAction(action.id);
-		}
+		completeMovedTarget(deps, toPath, target, snapshot, action?.id);
 		logger.info(
 			"Materialized move source cleanup confirmed",
 			actionContext,
@@ -276,10 +273,13 @@ export async function executeGuardedRemoteMove(
 			move,
 			canonical.epoch,
 		);
-		stampMovedTarget(deps, toPath, writtenTarget, repairSnapshot);
-		if (action) {
-			deps.indexManager.completePhysicalAction(action.id);
-		}
+		completeMovedTarget(
+			deps,
+			toPath,
+			writtenTarget,
+			repairSnapshot,
+			action?.id,
+		);
 		logger.info("Changed move target materialized", {
 			...actionContext,
 			plan: "materialize-target",
@@ -317,10 +317,13 @@ export async function executeGuardedRemoteMove(
 		) {
 			throw error;
 		}
-		stampMovedTarget(deps, toPath, ambiguousTarget, snapshot);
-		if (action) {
-			deps.indexManager.completePhysicalAction(action.id);
-		}
+		completeMovedTarget(
+			deps,
+			toPath,
+			ambiguousTarget,
+			snapshot,
+			action?.id,
+		);
 		logger.info("Ambiguous remote move confirmed by final state", {
 			...actionContext,
 			targetFingerprint: shortenDiagnosticValue(
@@ -348,10 +351,7 @@ export async function executeGuardedRemoteMove(
 	) {
 		throw new Error(`Moved target does not match canonical: ${toPath}`);
 	}
-	stampMovedTarget(deps, toPath, writtenTarget, snapshot);
-	if (action) {
-		deps.indexManager.completePhysicalAction(action.id);
-	}
+	completeMovedTarget(deps, toPath, writtenTarget, snapshot, action?.id);
 	if (actionId && action?.id !== actionId) {
 		deps.indexManager.completePhysicalAction(actionId);
 	}
@@ -365,7 +365,7 @@ export async function executeGuardedRemoteMove(
 
 /** Read a local snapshot only when it still matches the canonical move hash. */
 export async function readMatchingLocalSnapshot(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "vaultAdapter">,
 	path: string,
 	expectedSha256: string | undefined,
 ): Promise<{ content: ArrayBuffer; sha256: string } | undefined> {
@@ -379,7 +379,7 @@ export async function readMatchingLocalSnapshot(
 
 /** Upload a missing move target exclusively and verify its logical content. */
 export async function materializeMoveTarget(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "yandexClient" | "settings">,
 	path: string,
 	snapshot: { content: ArrayBuffer; sha256: string },
 	metadata: FileMetadata,
@@ -424,7 +424,7 @@ export async function materializeMoveTarget(
 
 /** Compare a physical remote object with canonical metadata without trusting client clocks. */
 export async function remoteResourceMatchesCanonical(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "yandexClient" | "settings">,
 	path: string,
 	resource: YandexResource,
 	metadata: FileMetadata | undefined,
@@ -432,25 +432,12 @@ export async function remoteResourceMatchesCanonical(
 	if (!metadata || metadata.deleted) {
 		return false;
 	}
-	if (
-		metadata.remoteFingerprint &&
-		matchesPhysicalResourceFingerprint(metadata.remoteFingerprint, resource)
-	) {
-		return true;
-	}
-	try {
-		const content = await deps.yandexClient.downloadFile(
-			joinPath(deps.settings.remotePath, path),
-		);
-		return (await computeSha256(content)) === metadata.sha256;
-	} catch {
-		return false;
-	}
+	return remoteContentMatchesCanonical(deps, path, resource, metadata);
 }
 
 /** Verify a move source against retained logical content, including tombstones. */
 export async function remoteMoveSourceMatchesCanonical(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "yandexClient" | "settings">,
 	path: string,
 	resource: YandexResource,
 	metadata: FileMetadata | undefined,
@@ -458,6 +445,16 @@ export async function remoteMoveSourceMatchesCanonical(
 	if (!metadata) {
 		return false;
 	}
+	return remoteContentMatchesCanonical(deps, path, resource, metadata);
+}
+
+/** Compare retained content after the caller has admitted its live or tombstoned metadata. */
+async function remoteContentMatchesCanonical(
+	deps: Pick<Dependencies, "yandexClient" | "settings">,
+	path: string,
+	resource: YandexResource,
+	metadata: FileMetadata,
+): Promise<boolean> {
 	if (
 		metadata.remoteFingerprint &&
 		matchesPhysicalResourceFingerprint(metadata.remoteFingerprint, resource)
@@ -482,7 +479,7 @@ class MoveCleanupAuthorityError extends Error {
 
 /** Delete a move source only while its staged identity remains unchanged. */
 export async function deleteMoveSourceIfUnchanged(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "indexManager" | "yandexClient" | "settings">,
 	path: string,
 	resource: YandexResource,
 	action: ReturnType<IndexManager["getPendingPhysicalAction"]>,
@@ -581,7 +578,7 @@ export async function deleteMoveSourceIfUnchanged(
 
 /** Persist verified target identity into canonical and local baselines. */
 export function stampMovedTarget(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "indexManager" | "vaultAdapter">,
 	path: string,
 	resource: YandexResource,
 	localSnapshot?: { content: ArrayBuffer; sha256: string },
@@ -613,5 +610,19 @@ export function stampMovedTarget(
 			mtime: deps.vaultAdapter.getFileMtime(path) || stamped.mtime,
 			syncedAt: Date.now(),
 		});
+	}
+}
+
+/** Stamp a verified target before retiring its durable physical action. */
+function completeMovedTarget(
+	deps: Pick<Dependencies, "indexManager" | "vaultAdapter">,
+	path: string,
+	resource: YandexResource,
+	snapshot: { content: ArrayBuffer; sha256: string } | undefined,
+	actionId: string | undefined,
+): void {
+	stampMovedTarget(deps, path, resource, snapshot);
+	if (actionId) {
+		deps.indexManager.completePhysicalAction(actionId);
 	}
 }

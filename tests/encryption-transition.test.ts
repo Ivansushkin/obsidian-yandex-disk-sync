@@ -299,7 +299,10 @@ test("target read-back cannot return a stamp without matching bytes and durable 
 				),
 				null,
 			);
-			assert.deepEqual(persisted, {});
+			assert.equal(persisted, undefined);
+			assert.deepEqual(transition.targetFingerprints, {
+				"note.md": "old-proof",
+			});
 			await assert.rejects(
 				verifyTransitionTargetObject(
 					io,

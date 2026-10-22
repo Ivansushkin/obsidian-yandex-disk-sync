@@ -28,6 +28,7 @@ import {
 	DEFAULT_SETTINGS,
 	type YandexDiskSyncSettings,
 	type FileMetadata,
+	type SyncIndex,
 } from "../src/types";
 import type { EncryptionCodec } from "../src/crypto/encryption";
 import { YandexDiskClient } from "../src/api/yandex-client";
@@ -1260,6 +1261,59 @@ test("successful final move with a lost response still commits", async () => {
 		throwAfterFinalMove: true,
 	});
 	assert.equal(client.moveCount, 2);
+});
+
+test("resolved lost move retains commit proof when the network fails after read-back", async () => {
+	const codec = xorCodec(0x5a);
+	const client = new FakeIndexYandex("vault", codec, {
+		throwAfterFinalMove: true,
+	});
+	const canonicalPath = "vault/.obsidian-sync-index.json";
+	client.files.set(
+		canonicalPath,
+		await codec.encrypt(jsonBytes(createEmptyIndex("device-a", "epoch-a"))),
+	);
+	const manager = indexManager(client);
+	await manager.loadRemoteIndex();
+	const mutation = manager.enqueueMutation("put", "note.md", {
+		sha256: "hash",
+		baseRevision: 0,
+		epoch: "epoch-a",
+	});
+	manager.updateRemoteFile(
+		"note.md",
+		fileMetadata("note.md", {
+			sha256: "hash",
+			mutationSeq: mutation.seq,
+			lastModifiedBy: "device-a",
+			baseRevision: 0,
+		}),
+	);
+	manager.stageMutation(mutation);
+	const read = client.downloadStableRawFile.bind(client);
+	client.downloadStableRawFile = async (...args) => {
+		const snapshot = await read(...args);
+		if (client.moveCount === 2 && args[0] === canonicalPath) {
+			client.disk.beforeRequest = async () => {
+				throw new Error("offline after verified commit");
+			};
+		}
+		return snapshot;
+	};
+
+	const proof = await manager.saveRemoteIndex();
+	const canonical = JSON.parse(
+		new TextDecoder().decode(
+			await codec.decrypt(client.files.get(canonicalPath)!),
+		),
+	) as SyncIndex;
+	assert.equal(canonical.revision, 1);
+	assert.equal(canonical.files["note.md"]?.sha256, "hash");
+	assert.deepEqual(proof.index, canonical);
+	assert.deepEqual(manager.getRemoteIndex(), canonical);
+	assert.deepEqual(manager.getPendingMutations(), [mutation]);
+	assert.equal(manager.getObservedRevision(), 0);
+	assert.deepEqual([...client.files.keys()], [canonicalPath]);
 });
 
 test("unverified modified lock restores the encrypted source bytes", async () => {

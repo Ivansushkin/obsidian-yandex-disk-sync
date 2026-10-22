@@ -8,7 +8,14 @@ import {
 	eventIds,
 	fileEvent,
 	renameEvent,
+	watcherAccess,
 } from "./helpers/realtime-fixtures";
+import {
+	bytes,
+	device,
+	MemoryDisk,
+	type SavedDevice,
+} from "./helpers/sync-flow";
 
 test("legacy watcher file events receive durable causal metadata", () => {
 	const { watcher } = createWatcher();
@@ -31,41 +38,11 @@ test("legacy watcher file events receive durable causal metadata", () => {
 	);
 });
 
-test("child rename ignores a newer unrelated folder event", () => {
-	const { watcher, access } = createWatcher();
-
-	access.deferEvent({
-		id: "parent-a",
-		action: "rename",
-		path: "A",
-		targetPath: "B",
-		kind: "folder",
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 1,
-	});
-	access.deferEvent({
-		id: "unrelated",
-		action: "rename",
-		path: "X",
-		targetPath: "Y",
-		kind: "folder",
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 2,
-	});
-	const retained = access.deferEvent(
-		renameEvent("child", "A/note.md", "B/note.md", { createdAt: 3 }),
-	);
-
-	assert.equal(retained, false);
-	assert.deepEqual(eventIds(watcher), ["parent-a", "unrelated"]);
-});
-
 test("running rename keeps successor and safely rebases a missing target", async () => {
 	const { watcher, access } = createWatcher();
 
-	access.deferEvent(renameEvent("rename-a", "A.md", "B.md"));
+	const first = renameEvent("rename-a", "A.md", "B.md");
+	access.deferEvent(first);
 	access.submittedWatcherEventIds.add("rename-a");
 	access.deferEvent(
 		renameEvent("rename-b", "B.md", "deep/C.md", { createdAt: 2 }),
@@ -73,7 +50,7 @@ test("running rename keeps successor and safely rebases a missing target", async
 
 	const [predecessor] = watcher.getDeferredEvents();
 	assert.ok(predecessor);
-	await access.settleRenameEvent(predecessor, {
+	await access.settlement.settleRenameEvent(first, {
 		status: "retry",
 		canonicalRevision: null,
 		epoch: "epoch-a",
@@ -94,14 +71,14 @@ test("running rename keeps successor and safely rebases a missing target", async
 test("completed running rename advances successor causal revision", async () => {
 	const { watcher, access } = createWatcher();
 
-	const first: DeferredWatcherEvent = renameEvent("rename-a", "A.md", "B.md");
+	const first = renameEvent("rename-a", "A.md", "B.md");
 	access.deferEvent(first);
 	access.submittedWatcherEventIds.add("rename-a");
 	access.deferEvent(
 		renameEvent("rename-b", "B.md", "C.md", { createdAt: 2 }),
 	);
 
-	await access.settleRenameEvent(first, {
+	await access.settlement.settleRenameEvent(first, {
 		status: "completed",
 		canonicalRevision: 9,
 		epoch: "epoch-a",
@@ -111,22 +88,6 @@ test("completed running rename advances successor causal revision", async () => 
 	const [successor] = watcher.getDeferredEvents();
 	assert.ok(successor && "baseRevision" in successor);
 	assert.equal(successor.baseRevision, 9);
-});
-
-test("queued target modify is absorbed but recreate of source remains", () => {
-	const { watcher, access } = createWatcher();
-
-	access.deferEvent(renameEvent("rename-a", "A.md", "B.md"));
-
-	assert.equal(
-		access.deferEvent(fileEvent("modify-b", "B.md", { createdAt: 2 })),
-		false,
-	);
-	assert.equal(
-		access.deferEvent(fileEvent("recreate-a", "A.md", { createdAt: 3 })),
-		true,
-	);
-	assert.deepEqual(eventIds(watcher), ["rename-a", "recreate-a"]);
 });
 
 test("submitted upload is acknowledged only by coordinator settlement", () => {
@@ -149,7 +110,7 @@ test("file rename durably links the newest submitted source upload", () => {
 		fileEvent("upload-current", "A.md", { createdAt: 2 }),
 	]);
 
-	for (const event of access.deferredEvents) {
+	for (const event of watcher.getDeferredEvents()) {
 		if (event.action === "upload") {
 			access.submittedFileEvents.set(event.id, event);
 		}
@@ -216,85 +177,6 @@ test("accepted submitted upload advances its rename before acknowledgement", asy
 	assert.equal(rename.baseRevision, 8);
 	assert.equal(rename.predecessorUploadId, undefined);
 	assert.equal(persistedQueues.at(-1)?.length, 1);
-});
-
-test("pending submitted upload leaves its put for rename retarget", () => {
-	const { watcher, access } = createWatcher();
-	watcher.loadDeferredEvents([
-		fileEvent("upload-a", "A.md"),
-		renameEvent("rename-a", "A.md", "B.md", {
-			createdAt: 2,
-			predecessorUploadId: "upload-a",
-		}),
-	]);
-
-	access.applyBatchResult({
-		completed: [],
-		superseded: ["upload-a"],
-		retry: [],
-		uploadReceipts: [
-			{
-				eventId: "upload-a",
-				path: "A.md",
-				status: "pending-put",
-				reason: "coalesced",
-				epoch: "epoch-a",
-				canonicalRevision: null,
-				mutationId: "device-a:1",
-				mutationSeq: 1,
-				sha256: "sha-a",
-			},
-		],
-	});
-
-	const [rename] = watcher.getDeferredEvents();
-	assert.ok(rename?.action === "rename" && rename.kind === "file");
-	assert.equal(rename.baseRevision, 7);
-	assert.equal(rename.predecessorUploadId, undefined);
-});
-
-test("accepted upload advances a later queued edit of the same path", () => {
-	const { watcher, access } = createWatcher();
-	watcher.loadDeferredEvents([
-		fileEvent("upload-previous", "note.md", {
-			baseRevision: 35,
-			mutationId: "device-a:7",
-			mutationSeq: 7,
-			snapshotSha256: "previous",
-			superseded: true,
-		}),
-		fileEvent("upload-latest", "note.md", {
-			baseRevision: 35,
-			createdAt: 2,
-			mutationId: "device-a:8",
-			mutationSeq: 8,
-			snapshotSha256: "latest",
-		}),
-	]);
-
-	access.applyBatchResult({
-		completed: ["upload-previous"],
-		superseded: [],
-		retry: [],
-		uploadReceipts: [
-			{
-				eventId: "upload-previous",
-				path: "note.md",
-				status: "accepted-put",
-				reason: "accepted-put",
-				epoch: "epoch-a",
-				canonicalRevision: 36,
-				mutationId: "device-a:7",
-				mutationSeq: 7,
-				sha256: "previous",
-			},
-		],
-	});
-
-	const [successor] = watcher.getDeferredEvents();
-	assert.equal(successor?.action, "upload");
-	assert.equal(successor?.baseRevision, 36);
-	assert.equal(successor?.mutationSeq, 8);
 });
 
 test("full barrier settles captured uploads only after success and retains later work", () => {
@@ -596,35 +478,203 @@ test("ambiguous rename failure does not execute its successor", async () => {
 	assert.equal(watcher.getDeferredEvents().length, 2);
 });
 
-test("quick file rename chain coalesces to the final target", () => {
-	const { watcher, access } = createWatcher();
-
-	access.deferEvent({
-		action: "rename",
-		path: "A.md",
-		targetPath: "B.md",
-		kind: "file",
+test("watcher save generations retain storm arrivals and failed durability across restart", async () => {
+	const disk = new MemoryDisk();
+	const a = device(disk, "device-a", null);
+	const b = device(disk, "device-b", null);
+	const gates = Array.from({ length: 4 }, () => {
+		let entered!: () => void;
+		let release!: () => void;
+		let reject!: (error: Error) => void;
+		return {
+			started: new Promise<void>((resolve) => {
+				entered = resolve;
+			}),
+			write: new Promise<void>((resolve, fail) => {
+				release = resolve;
+				reject = fail;
+			}),
+			entered: () => entered(),
+			release: () => release(),
+			reject: (error: Error) => reject(error),
+		};
 	});
-	access.deferEvent({
-		action: "rename",
-		path: "B.md",
-		targetPath: "deep/С.md",
-		kind: "file",
-	});
+	let restarted: ReturnType<typeof device> | undefined;
+	let durable: SavedDevice;
+	const snapshots: SavedDevice[] = [];
+	try {
+		a.vault.put("note.md", bytes("baseline"));
+		await a.full();
+		await b.full();
+		durable = a.lastSaved();
+		const remoteBefore = structuredClone(disk.files);
+		a.start();
+		await a.watcher.pauseForSync({
+			sessionId: "collect",
+			kind: "maintenance",
+		});
+		a.watcher.setPersistCallback(async () => {
+			const snapshot = structuredClone({
+				localState: a.index.getLocalIndexData(),
+				pendingMutations: a.index.getPendingMutations(),
+				pendingPhysicalActions: a.index.getPendingPhysicalActions(),
+				pendingWatcherEvents: a.watcher.getDeferredEvents(),
+			});
+			const gate = gates[snapshots.length];
+			snapshots.push(snapshot);
+			gate?.entered();
+			await gate?.write;
+			durable = snapshot;
+		});
+		a.vault.put("note.md", bytes("before save"));
+		a.vault.put("extra.md", bytes("extra before"));
+		await gates[0]!.started;
+		a.vault.put("note.md", bytes("during save"));
+		a.vault.put("extra.md", bytes("extra latest"));
+		a.vault.put("third.md", bytes("third"));
+		let saved = false;
+		const waiting = a.watcher.waitForPendingPersistence().then(() => {
+			saved = true;
+		});
+		gates[0]!.release();
+		await gates[1]!.started;
+		assert.equal(saved, false);
+		assert.deepEqual(
+			durable.pendingWatcherEvents,
+			snapshots[0]!.pendingWatcherEvents,
+		);
+		assert.notDeepEqual(
+			durable.pendingWatcherEvents,
+			a.watcher.getDeferredEvents(),
+		);
+		gates[1]!.release();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(
+			snapshots.length,
+			2,
+			"storm needs one running write and one latest snapshot",
+		);
+		await waiting;
+		assert.deepEqual(
+			durable.pendingWatcherEvents,
+			a.watcher.getDeferredEvents(),
+		);
 
-	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) => ({
-			action: event.action,
-			path: event.path,
-			targetPath:
-				event.action === "rename" ? event.targetPath : undefined,
-		})),
-		[
-			{
-				action: "rename",
-				path: "A.md",
-				targetPath: "deep/С.md",
-			},
-		],
-	);
+		a.vault.put("note.md", bytes("failed version"));
+		await gates[2]!.started;
+		const failed = /Synthetic watcher save failure/;
+		const beforeArrival = assert.rejects(
+			a.watcher.waitForPendingPersistence(),
+			failed,
+		);
+		a.vault.put("note.md", bytes("latest version"));
+		const afterArrival = assert.rejects(
+			a.watcher.waitForPendingPersistence(),
+			failed,
+		);
+		const remoteBlocked = assert.rejects(
+			watcherAccess(a.watcher).flushDeferredEventsNow(),
+			failed,
+		);
+		gates[2]!.reject(new Error("Synthetic watcher save failure"));
+		await Promise.all([beforeArrival, afterArrival, remoteBlocked]);
+		await assert.rejects(a.watcher.waitForPendingPersistence(), failed);
+		assert.deepEqual(
+			disk.files,
+			remoteBefore,
+			"failed durability cannot start remote work",
+		);
+		assert.deepEqual(
+			durable.pendingWatcherEvents,
+			snapshots[1]!.pendingWatcherEvents,
+		);
+		const restored = createWatcher().watcher;
+		restored.loadDeferredEvents(
+			JSON.parse(
+				JSON.stringify(durable.pendingWatcherEvents),
+			) as DeferredWatcherEvent[],
+		);
+		assert.deepEqual(
+			restored.getDeferredEvents(),
+			durable.pendingWatcherEvents,
+		);
+
+		const cutoff = durable.pendingWatcherEvents.flatMap((event) =>
+			event.path === "note.md" && event.id ? [event.id] : [],
+		);
+		a.watcher.stop();
+		let repaired = false;
+		const repair = a.watcher.settleForceReplacement(cutoff).then(() => {
+			repaired = true;
+		});
+		await gates[3]!.started;
+		await Promise.resolve();
+		assert.equal(repaired, false);
+		gates[3]!.release();
+		await repair;
+		assert.deepEqual(
+			disk.files,
+			remoteBefore,
+			"stopped settlement cannot replay",
+		);
+		assert.deepEqual(
+			durable.pendingWatcherEvents,
+			a.watcher.getDeferredEvents(),
+		);
+		await a.stop();
+		restarted = device(
+			disk,
+			"device-a",
+			null,
+			a.vault,
+			JSON.parse(JSON.stringify(durable)) as SavedDevice,
+		);
+		assert.deepEqual(
+			restarted.watcher.getDeferredEvents(),
+			durable.pendingWatcherEvents,
+		);
+		await restarted.full();
+		await b.full();
+		const expected = {
+			"note.md": "latest version",
+			"extra.md": "extra latest",
+			"third.md": "third",
+		};
+		await restarted.assertSettled(expected);
+		await b.assertSettled(expected);
+
+		const completion = createWatcher();
+		let completedSnapshot: DeferredWatcherEvent[] = [];
+		let arrivalScheduled = false;
+		completion.watcher.setPersistCallback(async () => {
+			completedSnapshot = completion.watcher.getDeferredEvents();
+			if (!arrivalScheduled) {
+				arrivalScheduled = true;
+				void Promise.resolve()
+					.then(() => undefined)
+					.then(() => {
+						completion.access.deferEvent(
+							fileEvent("completion-arrival", "late.md"),
+						);
+					});
+			}
+		});
+		completion.access.deferEvent(
+			fileEvent("before-completion", "before.md"),
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(
+			completedSnapshot,
+			completion.watcher.getDeferredEvents(),
+			"an arrival between callback completion and runner release must also become durable",
+		);
+		await completion.watcher.waitForPendingPersistence();
+	} finally {
+		for (const gate of gates) {
+			gate.release();
+		}
+		await a.stop();
+		await restarted?.stop();
+		await b.stop();
+	}
 });

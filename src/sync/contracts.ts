@@ -39,6 +39,14 @@ export interface PhysicalRewriteUploadProof {
 }
 
 export interface SyncRunOptions {
+	/** One explicit, epoch-bound choice; never retained across replacement generations. */
+	epochAdoption?: { epoch: string; decision: "accept" | "preserve" };
+	/** Direction-verified replacement, created before the destructive confirmation. */
+	forceReplacement?: {
+		plan: import("./workflows/force-replacement").PreparedForceReplacement;
+		backupMode: "with-backup" | "without-backup";
+	};
+
 	/** Report only activity owned by this invocation, including queue preparation. */
 	onActivity?: (state: SyncState) => void;
 	/** Use the startup discovery path inside the regular full-sync session. */

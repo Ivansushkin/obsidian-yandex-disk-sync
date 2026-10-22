@@ -245,6 +245,7 @@ export class ConnectEncryptedVaultModal extends PasswordModal {
 		title: string,
 		description: string,
 		buttonText: string,
+		private readonly confirmPassword = false,
 	) {
 		super(app, resolve);
 		this.title = title;
@@ -262,7 +263,7 @@ export class ConnectEncryptedVaultModal extends PasswordModal {
 			text: t("modal.encryption_connect_privacy"),
 		});
 
-		this.renderPasswordFields(false);
+		this.renderPasswordFields(this.confirmPassword);
 		this.addSubmitButtons(this.buttonText, () => true);
 	}
 }

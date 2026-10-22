@@ -10,7 +10,12 @@ import {
 } from "../src/sync/canonical/manager";
 import { SyncEngine } from "../src/sync/engine";
 import { classifySyncError } from "../src/sync/errors";
-import { FileWatcher } from "../src/sync/realtime/watcher";
+import { logger } from "../src/utils/logger";
+import { findErrorCause } from "../src/utils/error-utils";
+import {
+	FileWatcher,
+	type DeferredWatcherEvent,
+} from "../src/sync/realtime/watcher";
 import {
 	DEFAULT_SETTINGS,
 	type FileMetadata,
@@ -278,7 +283,7 @@ test("historical and authentication blocks reject Force before backup work", asy
 	}
 });
 
-test("a full sync accepts a replacement epoch without Force ping-pong", async () => {
+test("an explicit epoch choice accepts replacement without Force ping-pong", async () => {
 	const { engine, index, watcher } = createHarness(false);
 	const baseline = fileMetadata("same.md", "same");
 	index.local.files[baseline.path] = { ...baseline };
@@ -291,7 +296,11 @@ test("a full sync accepts a replacement epoch without Force ping-pong", async ()
 		renameEvent("old-epoch-rename", "A.md", "B.md"),
 	]);
 
-	const result = await engine.fullSync();
+	const blocked = await engine.fullSync();
+	assert.equal(blocked.errors[0]?.code, "epoch-decision-required");
+	const result = await engine.fullSync({
+		epochAdoption: { epoch: "epoch-b", decision: "preserve" },
+	});
 
 	assert.equal(result.success, true);
 	assert.equal(result.epochAdopted, true);
@@ -443,4 +452,122 @@ test("full sync rejects an ambiguous remote tree before applying any file", asyn
 		assert.equal(index.remoteSaveCount, 0);
 		assert.deepEqual([...vaultFiles], []);
 	}
+});
+
+test("failed full upload acknowledgement cannot report success and remains replayable after restart", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	const original = fileEvent("covered-upload", "missing.md");
+	watcher.loadDeferredEvents([original]);
+	const loaded = watcher.getDeferredEvents();
+	const failure = new Error("Synthetic full ACK persistence failure");
+	let durable = watcher.getDeferredEvents();
+	watcher.setPersistCallback(async () => {
+		const events = watcher.getDeferredEvents();
+		if (events.length === 0) {
+			throw failure;
+		}
+		durable = JSON.parse(JSON.stringify(events)) as DeferredWatcherEvent[];
+	});
+	const successes: string[] = [];
+	const info = logger.info.bind(logger);
+	logger.info = (message, ...args) => {
+		if (message.startsWith("Full reconciliation completed:")) {
+			successes.push(message);
+		}
+		info(message, ...args);
+	};
+	let result;
+	try {
+		result = await engine.fullSync();
+	} finally {
+		logger.info = info;
+	}
+	assert.equal(result.success, false);
+	assert.equal(
+		findErrorCause(result.failureCause, (cause) => cause === failure),
+		failure,
+	);
+	assert.equal(engine.getState().status, "error");
+	assert.deepEqual(successes, []);
+	assert.deepEqual(durable, [original]);
+	assert.equal(index.remoteSaveCount, 0);
+	assert.deepEqual(index.getPendingMutations(), []);
+	const restarted = createHarness(false);
+	restarted.watcher.loadDeferredEvents(
+		JSON.parse(JSON.stringify(durable)) as DeferredWatcherEvent[],
+	);
+	assert.deepEqual(restarted.watcher.getDeferredEvents(), loaded);
+	assert.equal((await restarted.engine.fullSync()).success, true);
+	assert.deepEqual(restarted.watcher.getDeferredEvents(), []);
+	assert.equal(restarted.index.remoteSaveCount, 0);
+});
+
+test("failed pause durability blocks full reconciliation before canonical work", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	const event = fileEvent("covered-upload", "missing.md");
+	watcher.loadDeferredEvents([event]);
+	const loaded = watcher.getDeferredEvents();
+	const failure = new Error("Synthetic pause persistence failure");
+	engine.onSyncPause(async () => {
+		throw failure;
+	});
+	let scanned = false;
+	index.onBuildLocalIndex = () => {
+		scanned = true;
+	};
+	const result = await engine.fullSync();
+	assert.equal(result.success, false);
+	assert.equal(
+		findErrorCause(result.failureCause, (cause) => cause === failure),
+		failure,
+	);
+	assert.equal(scanned, false);
+	assert.deepEqual(watcher.getDeferredEvents(), loaded);
+	assert.equal(index.local.observedRevision, 7);
+	assert.equal(index.remoteSaveCount, 0);
+});
+
+test("failed epoch rebase save retains late watcher identity across restart without success", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	watcher.stop();
+	index.index.epoch = "epoch-b";
+	let inserted = false;
+	index.onBuildLocalIndex = () => {
+		if (!inserted) {
+			inserted = true;
+			watcher.loadDeferredEvents([fileEvent("late-upload", "late.md")]);
+		}
+	};
+	let durable: DeferredWatcherEvent[] = [];
+	const failure = new Error("Synthetic epoch rebase save failure");
+	watcher.setPersistCallback(async () => {
+		const events = watcher.getDeferredEvents();
+		if (events.some((event) => event.epoch === "epoch-b")) {
+			throw failure;
+		}
+		durable = JSON.parse(JSON.stringify(events)) as DeferredWatcherEvent[];
+	});
+
+	const result = await engine.fullSync({
+		epochAdoption: { epoch: "epoch-b", decision: "accept" },
+	});
+
+	assert.equal(result.success, false);
+	assert.equal(result.epochAdopted, false);
+	assert.equal(
+		findErrorCause(result.failureCause, (cause) => cause === failure),
+		failure,
+	);
+	assert.equal(index.getObservedEpoch(), "epoch-a");
+	assert.equal(index.remoteSaveCount, 0);
+	assert.deepEqual(durable, [fileEvent("late-upload", "late.md")]);
+	const restarted = createHarness(false);
+	restarted.index.index.epoch = "epoch-b";
+	restarted.watcher.loadDeferredEvents(
+		JSON.parse(JSON.stringify(durable)) as DeferredWatcherEvent[],
+	);
+	assert.equal(restarted.watcher.getDeferredEvents()[0]?.id, "late-upload");
+	assert.equal((await restarted.engine.fullSync()).success, true);
+	assert.deepEqual(restarted.watcher.getDeferredEvents(), []);
+	assert.equal(restarted.index.remoteSaveCount, 0);
 });

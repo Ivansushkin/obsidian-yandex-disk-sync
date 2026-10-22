@@ -2,8 +2,9 @@
 
 Практический release smoke для проверки наиболее опасных регрессий: возврата
 удалённых файлов, быстрых rename/move, folder delete, multi-device, Force-loop
-и шифрования. Полный последовательный прогон занимает примерно 45–60 минут;
-TC-01–TC-07 без расширенного шифрования — около 25 минут.
+и шифрования. TC-01–TC-09 проверяют алгоритмы и recovery; отдельные mobile,
+desktop и indicator cases — UI. Объём расширенного fault/load прогона учитывается
+отдельно: это не обещание короткой проверки всех release gates.
 
 Массовая генерация юнитов для этого списка запрещена. Компактная автоматика
 проверяет сложные алгоритмы по [AGENTS.md](../AGENTS.md#documentation-and-testing),
@@ -28,20 +29,21 @@ TC-01–TC-07 без расширенного шифрования — окол�
 
 ## Общий критерий успешности
 
-После каждого тест-кейса:
+После успешного завершения case либо предусмотренного им recovery:
 
 1. Выполнить full sync на обоих устройствах.
 2. Повторить full sync ещё раз.
 3. Второй full должен дать `0/0/0`, без conflict и index commit.
 4. Не должно быть старых, промежуточных и дублирующихся путей.
-5. В логах не должно оставаться:
-   - `pendingWatcherEvents`;
-   - `pendingMutations`;
-   - `pendingPhysicalActions`;
-   - незавершённых `moves`;
-   - lock-файлов;
-   - `completed with errors`;
-   - повторяющихся retry одного события.
+5. Подтвердить отсутствие pending watcher/mutations/physical actions, moves и
+   lock-файлов в разрешённой диагностике тестового профиля. Отсутствие сообщений
+   в логе само по себе не доказывает пустые очереди.
+6. Нет `completed with errors` и повторяющихся retry одного события.
+
+На ожидаемом отказе применяются постусловия конкретного сценария: durable work
+может оставаться для recovery, success запрещён. Для evidence сохранять безопасные
+ID/counts/hashes; не прикладывать plugin data, credentials, содержимое файлов или
+полные диагностические логи.
 
 ## TC-01. Чистая первичная синхронизация и UI
 
@@ -199,7 +201,7 @@ lock`; плашка не показывает готовность, не выд�
 - Следующие full не создают новые conflict copy.
 - Разница локальных часов не влияет на результат.
 
-Покрывает: `INIT-005`, `SYNC-006`, `SYNC-009`, `MULTI-004`, `MULTI-008`,
+Покрывает: `SYNC-006`, `SYNC-009`, `MULTI-004`, `MULTI-008`,
 `MULTI-017`.
 
 ## TC-05. Exact delete, stale edit и последующее восстановление
@@ -268,126 +270,91 @@ lock`; плашка не показывает готовность, не выд�
 - Повторный full — `0/0/0`.
 
 Покрывает: `FDEL-002`, `FDEL-003`, `FDEL-004`, `FDEL-005`, `FDEL-007`,
-`FDEL-016`, `MULTI-016`.
+`FDEL-016`, `MULTI-016`, `FDEL-019`.
 
-## TC-07. Force epoch adoption без бесконечного Force-loop
+Для `FDEL-019` сразу после sync удаления папки создать или переместить туда новый
+файл, дождаться upload и удалить его. Новый delete должен дойти до canonical и
+physical, несмотря на короткий интервал; запоздалое mechanical событие старого
+файла не удаляет новый объект. Повторить с offline return второго профиля.
 
-Время: 4 минуты.
+## TC-07. Направленный Force и принятие epoch без Force-loop
 
-Дополнительный прогон bootstrap (`FORCE-033`–`FORCE-035`) выполняется только в
-тестовой remote-папке, в plaintext и encrypted режимах:
+Использовать два независимых тестовых профиля и изолированную remote-папку.
+Повторить в plaintext и hardened; фактический прогон отмечать отдельно от unit
+и functional harness. Public directed Force отличается от legacy/internal
+compatibility API, которые сохраняют собственные format/proof guards.
 
-1. Синхронизировать два профиля, остановить automation и оставить offline edit
-   на Device 2. Удалить тестовые remote files и canonical, сохранив local state.
-   Для encrypted варианта сохранить действующий manifest, чтобы проверять
-   bootstrap без смены encryption authority.
-2. На Device 1 выполнить Force local с выбранным архивом или без него.
-   Проверить непустой `deviceId`, новый epoch, точные bytes и отсутствие locks.
-   Вернуть Device 2 обычным full: offline edit сохраняется; повторные full
-   обоих профилей дают `0/0/0`.
-3. Повторить с пустым authoritative source и обоими направлениями Force:
-   canonical остаётся читаемым, пустые папки отдельно не синхронизируются.
-4. С синтетическими данными воспроизвести оставшиеся старые bootstrap-locks,
-   перезапустить плагин и выполнить Force. Подтверждение и выбор архива доступны;
-   preflight сам ничего не восстанавливает и не меняет.
-5. Fault injection: отказать DELETE старого lock после replacement commit.
-   Проверить ошибку очистки, сохранённый новый epoch и отсутствие rollback.
-   Перезапустить и выполнить normal full; после двух неизменных наблюдений
-   с интервалом более двух минут exact пустые bootstrap-locks удаляются без
-   нового Force и автоматического архива. Изменённый или state-bearing lock
-   должен остаться и блокировать небезопасное восстановление.
+1. Синхронизировать A и B, остановить B и оставить в нём offline edit.
+2. На A выбрать фактический source и выполнить Force local; повторить Force remote
+   на восстановленной fixture. Для каждого направления проверить with-backup,
+   without-backup и cancel. Подтверждение показывает направление, папку, mode и
+   число source files; пустой source отдельно предупреждает об очистке.
+3. With-backup: архив подтверждён exact bytes/SHA до destructive apply.
+   Fault backup даёт retry / явное without-backup / cancel; автоматического
+   fallback нет. Retry заново фиксирует защищаемый snapshot.
+   Without-backup: нет ZIP, destination-content snapshot и per-file copies;
+   новые записанные bytes всё равно проверяются. Cancel не заменяет destination.
+4. Проверить canonical нового epoch, local baseline и exact physical/local bytes
+   выбранного source, отсутствие старых mutations/physical actions/покрытых
+   watcher events. Protected/excluded paths и .backup неизменны.
+5. Вернуть B обычным full. До решения accept/preserve/later никакого auto upload:
+   offline bytes, прежние baseline/queues и remote revision сохранены.
+   Later оставляет это состояние; preserve переносит offline delta через обычный
+   three-way merge; accept принимает cloud generation с обычной защитой
+   вытесняемых local bytes. Варианты запускать на независимых snapshots.
+6. После завершения A и B выполняют повторный full с результатом 0/0/0.
+   Новый Force на B не должен требовать ответный Force на A.
 
-Шаги:
+### Отсутствующий/corrupt destination и recovery
 
-1. Убедиться, что Device 1 содержит желаемое authoritative-состояние.
-2. Подтвердить в UI, что stable 1.1 остановлена на остальных devices.
-3. На Device 1 выполнить Force local с backup.
-4. Не выполнять Force на Device 2 и убедиться, что его Resume не запускает
-   watcher/scheduler при stale migration block.
-5. На Device 2 выполнить обычный Full. Проверить создание и exact read-back
-   собственного logical backup до изменения его `data.json`.
-6. Проверить, что Device 2 принял новый epoch.
-7. Теперь на Device 2 выполнить Force remote.
-8. На Device 1 выполнить обычный full.
+1. Удалить всю remote-папку при сохранённом baseline; отдельно испортить canonical,
+   manifest и оставить старые locks. Force local читает фактический local source,
+   не требует старый destination key и заменяет raw metadata под exclusive lock.
+   Force remote требует полностью читаемый physical source; missing manifest
+   вызывает явный выбор source format, ciphertext требует salt/profile/password.
+2. Повторить с подтверждённым пустым source: syncable destination очищается после
+   Force intent; excluded/protected descendants остаются. Source network/403/
+   decrypt failure никогда не означает empty и не очищает destination.
+3. Прервать prepared checkpoint, intent publication, transfer, cleanup и final
+   local save. После restart продолжить тот же operation ID/epoch без нового
+   автоматического архива; ordinary automation ждёт завершения Force recovery.
+   После intent rollback нового epoch запрещён. Потерянный initiator сам по себе
+   не разрешает другому профилю выдавать незавершённый Force за normal full.
+4. Изменить pinned lock или destination во время apply: изменившийся объект не
+   удаляется по старому fingerprint; максимум три inventories, затем partial
+   failure и durable recovery. После прекращения drift retry/restart сходится.
+5. Запустить новый Force во время задержанного upload прежнего: старый payload
+   не перезаписывает successor, operation authority отозвана, ложного success нет.
+6. На B явно подключить пересозданный root к проверенному completed epoch:
+   failed binding save восстанавливает прежние baseline/queues/codec; успешный
+   binding не обходит последующий epoch choice для offline delta.
 
-Проверка UI полного Force/migration flow на desktop и mobile (оба направления,
-включая отдельную копию exact stable 1.1 → 2.0):
+### UI, pause и диагностика
 
-1. После первого нажатия обе кнопки Force заблокированы, индикатор появляется
-   внутри кнопки выбранного направления, сохраняя её текст. Под кнопками нет
-   отдельного лоудера или строки прогресса. В migration flow
-   продолжение недоступно до обязательного подтверждения. Отмена кнопкой либо
-   закрытием окна не создаёт backup и возвращает доступность кнопок.
-2. После «Создать бекап и продолжить» окно закрывается, сразу виден persistent
-   Notice. На медленной сети проверить этапы создания, загрузки и read-back;
-   отсутствие файлового счётчика при неизвестном объёме нормально.
-3. Повторить клик/команду другого направления; второй backup/Force не создаётся.
-   Закрыть и открыть настройки: блокировка и индикатор выбранного направления сохраняются. Проверить,
-   что Full, encryption, backup, токен, remote path и фильтры недоступны.
-4. Дождаться окончания Force: кнопки всё ещё блокируются во время сохранения и
-   завершающей проверки. Успех миграции появляется только после полного успеха,
-   остаётся на 8 секунд; обычный Force не сообщает о миграции.
-5. Отключить сеть при backup: сообщение об ошибке остаётся видимым, Force не
-   запускается. Отдельно прервать cleanup после commit: сообщение предлагает
-   обычный full, не повторную миграцию. Если завершающий full исправил cleanup,
-   допустимо сообщение об успехе.
-6. Скрыть Notice во время работы: операция продолжается, индикатор в кнопке
-   остаётся до завершения flow; окончательный результат снова виден. Проверить отсутствие
-   дубликатов и преждевременного исчезновения нового Notice из-за старого таймера.
-7. После успеха, ошибки и отмены индикатор исчезает. При обычном full/realtime,
-   backup или encryption индикаторы внутри Force-кнопок не появляются;
-   существующая блокировка кнопок сохраняется. Проверить reduced motion.
+1. Повторный клик любого направления наблюдает тот же Promise. Оба контрола
+   заблокированы, loader находится в активной кнопке, Notice показывает фазу.
+   Закрытие/повторное открытие settings не отменяет Force и не теряет progress.
+2. Settings, manual full, encryption и backup не меняют configuration во время
+   Force. Explicit Force работает при paused automation, сохраняя pause.
+3. Success появляется только после bytes/canonical/manifest/baseline/cleanup и
+   coherent save. На partial failure видны причина и незавершённый recovery;
+   обычный full не используется для возврата старых destination queues.
+4. Поздние callbacks, старый таймер Notice и unload не меняют следующий flow.
+   UI прогон выполнить на desktop/mobile; reduced-motion и сохранение текста
+   кнопок проверяются вручную.
 
-Этот UI-прогон требует реального Obsidian/Yandex Disk; unit-тесты его не заменяют.
+Отдельно проверить load/save на synthetic stable 1.1 snapshot с дробным mtime:
+current conversion сохраняет precision до automation; failed initial save/unload
+не заменяет unreadable plugin data defaults. Реальные credentials не использовать.
 
-Отдельно на изолированной копии vault проверить загрузку local storage:
+Покрывает: INIT-014/019/028/030/031, INV-002/003/009, MULTI-012,
+FORCE-001…039, SAFE-002/004/009/013, MIG-004, UI-006.
+Подробный cross-mode прогон: TC-FORCE-REPLACE-01.
 
-1. Использовать plaintext stable 1.1 snapshot с дробным `mtime` и перезапустить
-   2.0.0. Проверить немедленное сохранение current shape и точности timestamp до
-   автоматизации, после settings save и unload. Restart принимает current data.
-2. Подготовить заведомо нераспознаваемый snapshot без реальных credentials.
-   После отказа startup и отключения плагина файл должен остаться неизменным;
-   в диагностике допустимо только имя фиксированной секции схемы.
-   Не использовать для этого реальные настройки или рабочий vault.
-
-Отдельно с fault injection проверить stale backup gate:
-
-1. Остановить Force после exact read-back backup, но до первой destructive
-   operation.
-2. Изменить защищаемый source snapshot либо canonical.
-3. Продолжить Force.
-4. Убедиться, что операция остановилась как stale до upload/delete/overwrite
-   и потребовала новый запуск с повторным выбором архива.
-
-Отдельными fault-прогонами:
-
-1. Изменить local source во время Force local и remote source во время Force
-   remote. Replacement commit не должен состояться.
-2. Прервать Force сразу после replacement commit, затем потерять initiator.
-   Другой current device обязан продолжить tombstone/fingerprint cleanup
-   обычным Full без повторного Force.
-3. Вернуть offline Device 2: unchanged-файл должен удалиться по replacement
-   tombstone, а offline edit — восстановиться причинным put.
-4. Подготовить remote/local имена, совпадающие после NFC или case-fold. Force
-   remote должен остановиться до первого local write/delete.
-
-Ожидание:
-
-- Backup подтверждён до начала каждого Force.
-- После Force local Device 2 не требует Force remote.
-- Device 2 принимает новый epoch обычным full.
-- После Force remote Device 1 также принимает новый epoch обычным full.
-- Нет ping-pong требований Force.
-- Локальные изменения не теряются молча.
-- Watcher и scheduler после Force работают без перезапуска Obsidian.
-- Ошибка после replacement commit сообщает pending cleanup, а не требует
-  повторной migration.
-- Повторный full обоих устройств — `0/0/0`.
-
-Покрывает: `INIT-022`, `FORCE-012`, `SAFE-009`, `FORCE-031`, `INIT-028`, `INIT-030`, `INIT-031`, `FORCE-001`, `FORCE-002`, `FORCE-003`, `FORCE-016`,
-`FORCE-017`, `FORCE-023`, `FORCE-024`, `FORCE-025`, `FORCE-026`,
-`FORCE-027`, `FORCE-028`, `FORCE-029`, `FORCE-030`,
-`MULTI-012`, `MIG-004`, `UI-006`.
+Для `FORCE-040` при include `*.md` добавить вне scope длинное plaintext имя из
+base64url/hex символов. Force local не удаляет его по форме имени: неоднозначность
+блокируется до intent без изменений. С явным exclusion посторонний файл сохранён;
+полный raw scope допускает replacement без старого destination key.
 
 ## TC-08. Шифрование: fresh hardened и unsupported historical data
 
@@ -408,27 +375,31 @@ conflict/backup-файлы, если они мешают проверке.
    остановлена. Resume не обходит legacy/historical/auth/encryption blocks.
 4. Выполнить Force local с архивом и без него на отдельных snapshots, затем
    Force remote в обоих вариантах. Получить current canonical с новым epoch.
-5. После каждого replacement второй профиль принимает epoch обычным full,
-   сохраняя offline edits по существующим conflict rules, без нового архива.
-6. Прервать Force до commit: новый запуск снова предлагает выбор архива. После
-   commit normal full завершает cleanup; повторный Force не требуется.
-7. С current canonical обычный full разрешён; с отсутствующим — initial sync;
-   с неподдерживаемым historical — все writes, включая Force, заблокированы.
+5. После replacement второй профиль принимает epoch обычным full без архива;
+   offline delta требует accept/preserve/later до любых её uploads.
+6. Прервать directed Force на checkpoint/intent/commit: restart сохраняет тот же
+   operation ID/epoch, выполняет собственный recovery и не создаёт архив повторно.
+7. Current canonical разрешает normal full; missing canonical — initial sync.
+   Historical destination блокирует normal sync, но public Force local может
+   заменить его raw из читаемого source. Historical encrypted source не читается
+   через compatibility decode.
 
 ### Stable config-directory exposure и paths
 
 1. При `syncDotObsidian=true` поместить на remote fixture metadata для
    `*/plugins/yandex-disk-sync/**`, не раскрывая содержимое.
-2. Убедиться, что migration блокируется без download этого object, полный path
-   не показывается и remote-raw backup не создаётся. Удалить remote plugin
-   directory, перезапустить plugin и убедиться, что non-secret remediation marker
-   по-прежнему блокирует Force со старым token; затем заменить OAuth token в
-   настройках и повторить read-only preflight.
+2. Normal legacy/internal migration и remote-raw backup блокируются по metadata
+   без download plugin data. Remediation требует удалить remote plugin directory
+   и заменить OAuth token вне agent context. Public directed Force without-backup
+   не читает/не удаляет protected directory и не создаёт destination snapshot;
+   это не разрешение читать или архивировать credentials.
 3. Отдельно проверить user path с current service name: требуется ручное
    переименование, silent skip запрещён. Повторить для legacy имени с `\`, которое
    current normalization преобразовало бы в другой logical path.
 4. Проверить корневой файл `__proto__`: он сохраняется при conversion/Force.
-5. Для Force remote проверить exact/NFC/case-fold collisions до local writes.
+5. Для Force remote source NFC/case-fold ambiguity блокирует apply. Destination
+   file/folder blockers удаляются только после intent и без удаления protected/
+   excluded descendants; ordinary sync сохраняет прежний collision guard.
 
 ### Unsupported historical formats
 
@@ -438,10 +409,11 @@ conflict/backup-файлы, если они мешают проверке.
 2. Для каждого формата подтвердить отдельную ошибку unsupported historical и
    инструкцию выбрать чистый remote path либо выполнить ручной reset после
    самостоятельного backup.
-3. Проверить, что normal sync, watcher, scheduler и оба направления Force не
-   создают lock/root directory/backup, не выполняют upload, delete, cleanup и
-   не изменяют Vault. Сообщение о backup не считается доказательством: на
-   remote не должно появиться нового файла.
+3. Invalid local plugin data блокирует startup и mutating workflows. Для invalid
+   remote metadata отдельно проверить normal sync/watcher/scheduler: user writes
+   отсутствуют. Public Force local на валидном local state заменяет historical
+   destination raw; Force remote не обходит validation/decrypt своего source.
+   Не переносить ожидания старого internal Force API на новый replacement flow.
 4. Скачать non-envelope `.enc.zip`, unknown `.zip` bytes и backup с encrypted
    legacy name: compatibility decrypt не должен вызываться, локальный
    повреждённый `.zip` не создаётся.
@@ -456,8 +428,9 @@ conflict/backup-файлы, если они мешают проверке.
 6. Убедиться, что неверный/отменённый candidate password не заменил прежние
    local credentials, sync заблокирована и remote не изменён.
 7. Ввести правильный пароль и выполнить full.
-8. Несовместимый старый клиент против current manifest должен только
-   заблокироваться и не изменить remote.
+8. На текущем клиенте проверить unknown profile/algorithm в отдельной remote
+   fixture: sync блокируется без user writes. Старые сборки к current storage
+   не подключать: совместная работа версий не поддерживается.
 
 ### Post-commit recovery без initiator
 
@@ -485,6 +458,15 @@ canonical commit, но до публикации stable manifest:
 9. Внести extra field, mismatched phase/ID/descriptors и cleanup без fingerprint
    по очереди в manifest/canonical/local transition. До lock/upload/delete не
    должно быть remote writes.
+
+### Pre-commit rollback
+
+Для `TRANS-039` прервать enable/rotate после verified target upload, но до canonical
+commit. После restart source остаётся авторитетным; rollback удаляет только pinned
+targets, не меняет logical FIFO и снимает блок только после полного завершения.
+Подмена target fingerprint даже при тех же plaintext bytes запрещает DELETE.
+Отдельно прервать final local save после снятия maintenance: повтор завершает
+checkpoint без нового права удаления и без post-commit cleanup у source.
 
 ### Offline device после encryption transition
 
@@ -541,7 +523,7 @@ canonical commit, но до публикации stable manifest:
 Покрывает: `ENC-001`, `ENC-002`, `ENC-005`, `ENC-010`, `TRANS-001`,
 `TRANS-002`, `TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`,
 `TRANS-028`, `TRANS-029`, `TRANS-030`, `TRANS-031`, `TRANS-032`,
-`TRANS-033`, `MULTI-015`, `INIT-029`, `MIG-004`, `FORCE-022`, `SAFE-004`,
+`TRANS-033`, `TRANS-039`, `MULTI-015`, `INIT-029`, `MIG-004`, `FORCE-022`, `SAFE-004`,
 `SAFE-013`, `UI-007`, `UI-008`.
 
 ## Расширенные обязательные release gates
@@ -556,7 +538,7 @@ canonical commit, но до публикации stable manifest:
 - 1 000–10 000 файлов;
 - 100 уровней вложенности;
 - mobile memory;
-- backup cleanup;
+- guarded cleanup после backup/Force, без удаления прежних архивов;
 - rename между excluded/config paths;
 - параллельные encryption transitions.
 
@@ -587,7 +569,7 @@ TC:
 Неожиданные файлы:
 Остаток очередей:
 Ошибки/предупреждения:
-Ссылка на логи:
+Безопасная диагностическая сводка:
 ```
 
 Если хотя бы в одном тесте появляются старый путь, лишний файл, повторный
@@ -596,7 +578,11 @@ conflict, Force-loop, неочищенная очередь или второй 
 
 ## TC-09. Конкурентные изменения и восстановление — PENDING
 
-Дополнительно на двух отдельных тестовых профилях повторить в plaintext и encrypted:
+Все подпункты остаются PENDING до реального прогона на двух независимых тестовых
+профилях с disposable remote root. Применимые варианты повторяются в plaintext
+и hardened; fault injection допускается только на тестовых fixtures.
+
+### Causality, binding и конфликтные операции
 
 - Одинаковые edits на обоих профилях, а также remote `A → X → A` против local
   `A → B`: нет conflict copies, итоговые bytes/canonical/queues согласованы.
@@ -629,11 +615,7 @@ conflict, Force-loop, неочищенная очередь или второй 
 - Переустановка с оставшимся localStorage ID и восстановление старого plugin
   snapshot не переиспользуют FIFO sequence и не сообщают success со старым index.
 
-Эти шаги не выполняются на пользовательских vaults; до ручного выполнения
-статус остаётся PENDING.
-
-Все пункты выполняются на реальном Yandex Disk с двумя независимыми профилями;
-применимые сценарии повторяются в plaintext и hardened encrypted режимах.
+### Maintenance, snapshots и UI
 
 1. Force local/remote и enable/disable/rotate: with-backup / without-backup /
    cancel; при отказе нет ZIP/upload/readback фаз, но stale source/canonical
@@ -663,13 +645,14 @@ conflict, Force-loop, неочищенная очередь или второй 
 
 Автоматические regression tests не переводят эти пункты в PASS.
 
-Покрывает: `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
+Покрывает: `SYNC-039`, `ERROR-007`, `INIT-037`, `SYNC-038`, `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
 
-Дополнительные шаги TC-09:
+### Local apply, settings и persistence
 
-- Во время mkdir перед download создать файл назначения; повторить Force remote без
-  полного архива для файла без baseline. Проверить bytes protective copy и отсутствие
-  ошибочного baseline/suppression после отказа записи.
+- В обычном sync во время mkdir перед download создать файл назначения:
+  проверить protective copy и отсутствие ошибочного baseline/suppression после
+  отказа записи. Directed Force remote without-backup проверить отдельно:
+  individual copies отсутствуют, source/operation authority остаётся обязательной.
 - Изменить уже существующую conflict copy, затем повторить rejected-put recovery и
   restart: обе версии сохранены, повтор не создаёт дополнительную копию.
 - После 503 перед повторным DELETE восстановить файл с другого профиля; отдельно
@@ -684,7 +667,18 @@ conflict, Force-loop, неочищенная очередь или второй 
   Архив получает исходный пароль/папку. Закрыть список backup либо изменить конфигурацию
   во время list/download/password prompt: устаревший результат не показывается.
 
-Новые смежные сценарии этого раздела также остаются PENDING до реального прогона.
+### Lifecycle durability
+
+Для `SYNC-038` вызвать контролируемый отказ сохранения на pause и отдельно
+при ACK captured upload в resume ordinary full на изолированном профиле.
+Pause failure не допускает remote work; ACK failure не показывает success и
+не откатывает уже принятые bytes/canonical. После restart durable event сохраняет
+свой ID, повторный full завершает его без лишнего remote write. При epoch adoption
+создать позднее событие и отдельно прервать save его нового epoch/baseRevision:
+до successful save нет success/replay, restart сохраняет прежний durable event ID. Не вызывать отказ
+на пользовательском vault. Этот пункт также PENDING.
+
+### Rename и offline return
 
 - Создать папку и вложенную папку, быстро скопировать несколько заметок, изменить и
   переименовать их; переместить папку A → B → C и снова переименовать дочернюю заметку.
@@ -702,6 +696,20 @@ conflict, Force-loop, неочищенная очередь или второй 
   baseline. Во время protective backup на A изменить target: late bytes остаются
   локально, операция показывает pending/retry. После restart/full late bytes доступны
   в проверенной protective copy, tombstones не отменяются и очереди завершаются.
+
+### Read failure и активный canonical lock
+
+- `SYNC-039`: на тестовой fixture сделать существующий syncable файл нечитаемым
+  при local scan. Full/initial receive/epoch adoption завершаются ошибкой; файл
+  не объявляется отсутствующим; его remote-копия не удаляется на основании failed
+  scan, очередь не получает ложный ACK.
+- `ERROR-007`: удержать native download lock/canonical до timeout. Другой codec
+  не начинает новый незавершённый read; исходная ошибка сохранена, поздние bytes
+  не применяются.
+- `INIT-037`: обновить единственный lock после истечения старой observation lease
+  до/после read, перед MOVE/retry и на серверной границе MOVE. Обновлённые bytes
+  не публикуются в canonical по старой lease. Проверить unique claim, lost reply,
+  restart и появление competing lock: bytes сохраняются, ложного success нет.
 
 ## TC-MOBILE-01. Постоянная мобильная плашка
 
@@ -824,3 +832,29 @@ Obsidian и тему; отсутствующие устройства остав
 
 Покрывает `UI-020`, `UI-021`. Зафиксировать устройство, ОС, Obsidian и тему;
 отсутствующие платформы оставить явно непроверенными.
+
+## TC-FORCE-REPLACE-01 — два профиля и реальный Диск
+
+Ручная приёмка обязательна отдельно от functional harness. Сохранить безопасные
+исходные fixtures и отметить фактическую сборку; не записывать пароли/tokens/content
+в диагностические логи.
+
+1. В профиле A включить encryption, выполнить full дважды и подключить B.
+2. В B оставить offline edit. В A выполнить оба направления Force с архивом/без;
+   проверить точные bytes, удаление лишних syncable paths и сохранность excluded/.backup.
+3. Повторить с plaintext и разными mode сторон; проверить stored/missing/wrong
+   password и Cancel. При lost manifest проверить явный выбор формата и missing salt/profile.
+4. Удалить всю remote-папку, затем отдельно manifest/canonical/user files. Force local
+   должен восстановить выбранный local source. Force remote от подтверждённого пустого
+   source должен очистить syncable local; network/access/decrypt error — сохранить их.
+5. Удалить все локальные syncable файлы и отдельно plugin data во втором профиле.
+   Проверить пустой source, новую installation identity и оба Force.
+6. Вернуть B: offline bytes не отправляются до решения accept/preserve/later.
+   Для пересозданного root сначала явно подключить проверенное новое поколение.
+7. Прервать каждый Force на transfer/commit/cleanup, перезапустить профиль и проверить
+   тот же ID/epoch, завершение recovery и отсутствие ложного success. Проверить
+   поздние события, collisions, pause и конкурирующий Force.
+8. Финальный normal full на обоих профилях должен стать no-op; проверить
+   canonical/manifest, отсутствие pending cleanup и согласованные causal counters.
+
+Автоматические проверки не являются свидетельством выполнения этого прогона.

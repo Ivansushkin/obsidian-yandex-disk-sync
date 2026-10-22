@@ -4,6 +4,7 @@ import {
 	BackupManager,
 	BackupPasswordRequiredError,
 } from "../src/backup/backup-manager";
+import { captureRemoteRawDigest } from "../src/backup/backup-snapshot";
 import { isBackupEnvelope } from "../src/backup/backup-envelope";
 import {
 	YandexApiError,
@@ -162,6 +163,10 @@ test("remote snapshot backup rejects legacy plugin data before download", async 
 		new TextEncoder().encode("do-not-read").buffer,
 	);
 
+	await assert.rejects(
+		captureRemoteRawDigest(client as unknown as YandexDiskClient, "vault"),
+		/Remote plugin data must be removed/,
+	);
 	const result = await manager.createRemoteSnapshotBackup();
 	assert.equal(result.success, false);
 	assert.deepEqual(client.downloadedPaths, []);

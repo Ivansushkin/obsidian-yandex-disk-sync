@@ -1,6 +1,6 @@
-import type { FailureSummary, RetryProgress } from "../errors";
 import { VaultAdapter } from "../api/vault-adapter";
 import { YandexDiskClient } from "../api/yandex-client";
+import type { FailureSummary, RetryProgress } from "../errors";
 import { t } from "../i18n";
 import type {
 	SyncPhase,
@@ -12,27 +12,7 @@ import type {
 } from "../types";
 import { INITIAL_SYNC_STATE } from "../types";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
-import { ConflictResolver } from "./reconciliation/conflicts";
-import * as encryptionRewrite from "./workflows/encryption-rewrite";
-import * as fileOperations from "./files/operations";
-import * as fileRename from "./files/rename";
-import * as folderMutations from "./files/folder-mutations";
-import * as forceSync from "./workflows/force";
-import * as fullSync from "./workflows/full";
 import { IndexManager } from "./canonical/manager";
-import {
-	type DurableFileRenameEvent,
-	type DurableRenameEvent,
-	type RenameBatchResult,
-	type FileRenameOutcome,
-	type FolderMutationOutcome,
-	type RealtimeBatchResult,
-	type RealtimeFileEvent,
-	type WatcherCausalContext,
-} from "./realtime/rules";
-import * as realtimeSync from "./realtime/batch";
-import { renameBatchNow } from "./realtime/rename-batch";
-import * as remoteMoves from "./files/remote-moves";
 import type {
 	ExternalSyncBlock,
 	ExternalSyncBlockKind,
@@ -50,7 +30,32 @@ import {
 	type QueuedSyncSession,
 } from "./coordinator";
 import * as syncErrors from "./errors";
-import * as syncReconciliation from "./reconciliation/commits";
+import * as folderMutations from "./files/folder-mutations";
+import * as fileOperations from "./files/operations";
+import * as remoteMoves from "./files/remote-moves";
+import * as fileRename from "./files/rename";
+import * as realtimeSync from "./realtime/batch";
+import { renameBatchNow } from "./realtime/rename-batch";
+import {
+	type DurableFileRenameEvent,
+	type DurableRenameEvent,
+	type FileRenameOutcome,
+	type FolderMutationOutcome,
+	type RealtimeBatchResult,
+	type RealtimeFileEvent,
+	type RenameBatchResult,
+	type WatcherCausalContext,
+} from "./realtime/rules";
+import { ConflictResolver } from "./reconciliation/conflicts";
+import * as reconciliationContext from "./reconciliation/context";
+import * as encryptionRewrite from "./workflows/encryption-rewrite";
+import * as forceSync from "./workflows/force";
+import {
+	applyForceReplacement,
+	type ForceReplacementDependencies,
+	type ForceReplacementPorts,
+} from "./workflows/force-replacement";
+import * as fullSync from "./workflows/full";
 export type {
 	ExternalSyncBlock,
 	ExternalSyncBlockKind,
@@ -144,6 +149,51 @@ export class SyncEngine {
 					: undefined;
 			},
 		});
+	}
+
+	private forceReplacementPorts: ForceReplacementPorts | null = null;
+
+	/** Wire plugin-owned Force callbacks separately from each verified run plan. */
+	setForceReplacementPorts(ports: ForceReplacementPorts): void {
+		this.forceReplacementPorts = ports;
+	}
+
+	private forceReplacementDependencies(): ForceReplacementDependencies {
+		const readPorts = () => {
+			if (!this.forceReplacementPorts) {
+				throw new Error("Force replacement ports are not configured");
+			}
+			return this.forceReplacementPorts;
+		};
+		readPorts();
+		const getSettings = () => this.settings;
+		return {
+			client: this.yandexClient,
+			adapter: this.vaultAdapter,
+			index: this.indexManager,
+			get settings() {
+				return getSettings();
+			},
+			get persist() {
+				return readPorts().persist;
+			},
+			get password() {
+				return readPorts().password;
+			},
+			get isCancelled() {
+				return readPorts().isCancelled;
+			},
+			get chooseSourceMode() {
+				return readPorts().chooseSourceMode;
+			},
+			get watcherCutoff() {
+				return readPorts().watcherCutoff;
+			},
+			get retireWatcherEvents() {
+				return readPorts().retireWatcherEvents;
+			},
+			expectWatcherEvent: this.workflowWatcherEvent,
+		};
 	}
 
 	/**
@@ -300,8 +350,8 @@ export class SyncEngine {
 		return await this.coordinator.run("maintenance", async () => {
 			const context = this.getSyncLifecycleContext();
 			let success = false;
-			await this.notifySyncPauseCallbacks(context);
 			try {
+				await this.notifySyncPauseCallbacks(context);
 				const result = await task();
 				success = true;
 				return result;
@@ -695,6 +745,18 @@ export class SyncEngine {
 			await this.runSyncSession(
 				options,
 				async (result, _startTime, validationToken) => {
+					if (options?.forceReplacement) {
+						await applyForceReplacement(
+							this.forceReplacementDependencies(),
+							options.forceReplacement.plan,
+							options.forceReplacement.backupMode,
+						);
+						result.replacementCommitted = true;
+						result.epochAdopted = true;
+						result.uploaded =
+							options.forceReplacement.plan.recovery.source.length;
+						return;
+					}
 					return await forceSync.reconcileForceLocal(
 						this.forceSyncDependencies(),
 						options,
@@ -724,6 +786,18 @@ export class SyncEngine {
 			await this.runSyncSession(
 				options,
 				async (result) => {
+					if (options?.forceReplacement) {
+						await applyForceReplacement(
+							this.forceReplacementDependencies(),
+							options.forceReplacement.plan,
+							options.forceReplacement.backupMode,
+						);
+						result.replacementCommitted = true;
+						result.epochAdopted = true;
+						result.downloaded =
+							options.forceReplacement.plan.recovery.source.length;
+						return;
+					}
 					return await forceSync.reconcileForceRemote(
 						this.forceSyncDependencies(),
 						options,
@@ -808,9 +882,10 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Apply a debounced realtime file batch with one canonical index commit.
+	 * Apply sequential file windows within one realtime coordinator session.
 	 *
-	 * @returns Per-event durable outcomes used to acknowledge only completed or
+	 * The settlement callback receives each window once, before the next read.
+	 * @returns Aggregate metadata used to acknowledge only completed or
 	 * causally superseded watcher work.
 	 */
 	async syncFileBatch(
@@ -820,18 +895,33 @@ export class SyncEngine {
 			context: SyncLifecycleContext,
 		) => void | Promise<void>,
 	): Promise<RealtimeBatchResult> {
+		let windowsSettled = false;
 		const batchResult = await this.coordinator
 			.run(
 				"realtime",
 				async () => {
+					const deps = this.realtimeSyncDependencies(
+						async (result) => {
+							if (this.epochReplacementPending) {
+								result.requiresFullSync = "epoch-replaced";
+							}
+							const session =
+								this.coordinator.getActiveSession()!;
+							await settle?.(result, {
+								sessionId: session.id,
+								kind: session.kind,
+							});
+							windowsSettled = true;
+						},
+					);
 					return await realtimeSync.reconcileRealtimeBatch(
-						this.realtimeSyncDependencies(),
+						deps,
 						events,
 					);
 				},
 				{
 					settle: async (outcome, session) => {
-						if (outcome.status === "fulfilled") {
+						if (outcome.status === "fulfilled" && !windowsSettled) {
 							await settle?.(outcome.value, {
 								sessionId: session.id,
 								kind: session.kind,
@@ -1057,11 +1147,7 @@ export class SyncEngine {
 		context: SyncLifecycleContext,
 	): Promise<void> {
 		for (const callback of this.syncPauseCallbacks) {
-			try {
-				await callback(context);
-			} catch (e) {
-				logger.error("Error in sync pause callback:", { error: e });
-			}
+			await callback(context);
 		}
 	}
 
@@ -1071,12 +1157,21 @@ export class SyncEngine {
 	private async notifySyncResumeCallbacks(
 		outcome: SyncLifecycleOutcome,
 	): Promise<void> {
+		let failure: { cause: unknown } | undefined;
 		for (const callback of this.syncResumeCallbacks) {
 			try {
-				await callback(outcome);
+				await callback({
+					...outcome,
+					success: outcome.success && !failure,
+					epochAdopted: outcome.epochAdopted && !failure,
+				});
 			} catch (e) {
+				failure ??= { cause: e };
 				logger.error("Error in sync resume callback:", { error: e });
 			}
+		}
+		if (failure && outcome.success) {
+			throw failure.cause;
 		}
 	}
 
@@ -1135,7 +1230,13 @@ export class SyncEngine {
 				"Encryption maintenance is in progress",
 			);
 		}
-		if (this.isPaused) {
+		if (
+			this.isPaused &&
+			!(
+				this.coordinator.getActiveKind() === "force" &&
+				options?.forceReplacement
+			)
+		) {
 			logger.warn("Synchronization is paused");
 			return this.createErrorResult("Synchronization is paused");
 		}
@@ -1145,19 +1246,30 @@ export class SyncEngine {
 		const lifecycleContext = this.getSyncLifecycleContext();
 		const apiReadsBefore = this.yandexClient.getApiReadMetrics?.();
 		this.isSyncing = true;
-		await this.notifySyncPauseCallbacks(lifecycleContext);
-		logger.info(
-			"Sync reconciliation started",
-			this.getDiagnosticSnapshot(),
-		);
+		let resumeAttempted = false;
 
 		try {
-			this.setSyncPhase("validating");
-			const guard = await this.getSyncGuardResult(
-				options?.skipEncryptionGuard,
-				undefined,
-				options?.validateThroughExternalEncryptionBlock,
+			await this.notifySyncPauseCallbacks(lifecycleContext);
+			logger.info(
+				"Sync reconciliation started",
+				this.getDiagnosticSnapshot(),
 			);
+			this.setSyncPhase("validating");
+			const guard =
+				this.coordinator.getActiveKind() === "force" &&
+				options?.forceReplacement
+					? {
+							blockReason: null,
+							validationToken: undefined,
+							blockCode: undefined,
+							failure: undefined,
+							blockStatus: undefined,
+						}
+					: await this.getSyncGuardResult(
+							options?.skipEncryptionGuard,
+							undefined,
+							options?.validateThroughExternalEncryptionBlock,
+						);
 			if (guard.blockReason) {
 				result.errors.push({
 					path: "",
@@ -1194,6 +1306,13 @@ export class SyncEngine {
 					await this.indexSaveCallback();
 				}
 			}
+			this.isSyncing = false;
+			resumeAttempted = true;
+			await this.notifySyncResumeCallbacks({
+				...lifecycleContext,
+				success: result.success,
+				epochAdopted: result.success && result.epochAdopted,
+			});
 			result.endTime = Date.now();
 			syncErrors.summarizeSyncFailure(result, this.state.phase ?? "sync");
 
@@ -1238,6 +1357,14 @@ export class SyncEngine {
 
 			return result;
 		} catch (e) {
+			if (
+				this.coordinator.getActiveKind() === "force" &&
+				options?.forceReplacement &&
+				this.indexManager.getRemoteIndex().epoch ===
+					options.forceReplacement.plan.recovery.epoch
+			) {
+				result.replacementCommitted = true;
+			}
 			result.success = false;
 			result.errors.push(
 				syncErrors.createSyncError(
@@ -1269,11 +1396,12 @@ export class SyncEngine {
 			return result;
 		} finally {
 			this.isSyncing = false;
-			await this.notifySyncResumeCallbacks({
-				...lifecycleContext,
-				success: result.success,
-				epochAdopted: result.success && result.epochAdopted,
-			});
+			if (!resumeAttempted) {
+				await this.notifySyncResumeCallbacks({
+					...lifecycleContext,
+					success: false,
+				});
+			}
 		}
 	}
 
@@ -1443,31 +1571,26 @@ export class SyncEngine {
 		});
 	}
 
+	private readonly workflowGuard = this.getSyncGuardResult.bind(this);
+	private readonly workflowBlocked = this.setBlockedState.bind(this);
+	private readonly workflowWatcherEvent = this.expectWatcherEvent.bind(this);
+	private readonly workflowPhase = this.setSyncPhase.bind(this);
+	private readonly workflowProgress = this.reportProgress.bind(this);
+
 	private fileOperationsDependencies(): fileOperations.Dependencies {
-		const getVaultAdapter = () => this.vaultAdapter;
-		const getYandexClient = () => this.yandexClient;
 		const getSettings = () => this.settings;
-		const getIndexManager = () => this.indexManager;
 		const getIsPaused = () => this.isPaused;
 		return {
 			getSyncGuardResult: (validationToken) =>
 				this.getSyncGuardResult(false, validationToken),
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
-			get yandexClient() {
-				return getYandexClient();
-			},
+			vaultAdapter: this.vaultAdapter,
+			yandexClient: this.yandexClient,
 			get settings() {
 				return getSettings();
 			},
-			get indexManager() {
-				return getIndexManager();
-			},
-			expectWatcherEvent: (path, action) =>
-				this.expectWatcherEvent(path, action),
-			setSyncPhase: (phase, currentOperation, progress) =>
-				this.setSyncPhase(phase, currentOperation, progress),
+			indexManager: this.indexManager,
+			expectWatcherEvent: this.workflowWatcherEvent,
+			setSyncPhase: this.workflowPhase,
 			onOperationError: (error) => {
 				if (!this.state.errorMessage) {
 					this.updateState({
@@ -1485,36 +1608,23 @@ export class SyncEngine {
 	}
 
 	private remoteMovesDependencies(): remoteMoves.Dependencies {
-		const getIndexManager = () => this.indexManager;
 		const getSettings = () => this.settings;
-		const getYandexClient = () => this.yandexClient;
-		const getVaultAdapter = () => this.vaultAdapter;
 		return {
-			get indexManager() {
-				return getIndexManager();
-			},
+			indexManager: this.indexManager,
 			get settings() {
 				return getSettings();
 			},
-			get yandexClient() {
-				return getYandexClient();
-			},
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
+			yandexClient: this.yandexClient,
+			vaultAdapter: this.vaultAdapter,
 		};
 	}
 
-	private syncReconciliationDependencies(): syncReconciliation.Dependencies {
-		const getIndexManager = () => this.indexManager;
+	private syncReconciliationDependencies(): reconciliationContext.Dependencies {
 		const getIndexSaveCallback = () => this.indexSaveCallback;
 		const getRealtimeGuardValidationToken = () =>
 			this.realtimeGuardValidationToken;
 		const getEpochReplacementPending = () => this.epochReplacementPending;
-		const getVaultAdapter = () => this.vaultAdapter;
 		const getSettings = () => this.settings;
-		const getYandexClient = () => this.yandexClient;
-		const getConflictResolver = () => this.conflictResolver;
 		const setRealtimeGuardValidationToken = (
 			value: typeof this.realtimeGuardValidationToken,
 		) => {
@@ -1526,9 +1636,7 @@ export class SyncEngine {
 			this.epochReplacementPending = value;
 		};
 		return {
-			get indexManager() {
-				return getIndexManager();
-			},
+			indexManager: this.indexManager,
 			get indexSaveCallback() {
 				return getIndexSaveCallback();
 			},
@@ -1538,66 +1646,48 @@ export class SyncEngine {
 			set realtimeGuardValidationToken(value) {
 				setRealtimeGuardValidationToken(value);
 			},
-			getSyncGuardResult: (
-				skipGuard,
-				validationToken,
-				validateThroughExternalBlock,
-			) =>
-				this.getSyncGuardResult(
-					skipGuard,
-					validationToken,
-					validateThroughExternalBlock,
-				),
-			setBlockedState: (reason, status) =>
-				this.setBlockedState(reason, status),
+			getSyncGuardResult: this.workflowGuard,
+			setBlockedState: this.workflowBlocked,
 			get epochReplacementPending() {
 				return getEpochReplacementPending();
 			},
 			set epochReplacementPending(value) {
 				setEpochReplacementPending(value);
 			},
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
+			vaultAdapter: this.vaultAdapter,
 			get settings() {
 				return getSettings();
 			},
-			get yandexClient() {
-				return getYandexClient();
-			},
-			get conflictResolver() {
-				return getConflictResolver();
-			},
-			expectWatcherEvent: (path, action) =>
-				this.expectWatcherEvent(path, action),
+			yandexClient: this.yandexClient,
+			conflictResolver: this.conflictResolver,
+			expectWatcherEvent: this.workflowWatcherEvent,
 			fileOperations: this.fileOperationsDependencies(),
 			remoteMoves: this.remoteMovesDependencies(),
 		};
 	}
 
+	/** Supply the explicit UI decision used before transferring old offline changes. */
+	setEpochAdoptionDecisionCallback(
+		callback: (epoch: string) => Promise<"accept" | "preserve" | null>,
+	): void {
+		this.epochAdoptionDecision = callback;
+	}
+
+	private epochAdoptionDecision:
+		((epoch: string) => Promise<"accept" | "preserve" | null>) | undefined;
+
 	private forceSyncDependencies(): forceSync.Dependencies {
-		const getYandexClient = () => this.yandexClient;
 		const getSettings = () => this.settings;
-		const getIndexManager = () => this.indexManager;
-		const getVaultAdapter = () => this.vaultAdapter;
 		const getIndexSaveCallback = () => this.indexSaveCallback;
 		return {
-			get yandexClient() {
-				return getYandexClient();
-			},
+			yandexClient: this.yandexClient,
 			get settings() {
 				return getSettings();
 			},
-			get indexManager() {
-				return getIndexManager();
-			},
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
-			setSyncPhase: (phase, currentOperation, progress) =>
-				this.setSyncPhase(phase, currentOperation, progress),
-			reportProgress: (processedOps, totalOps) =>
-				this.reportProgress(processedOps, totalOps),
+			indexManager: this.indexManager,
+			vaultAdapter: this.vaultAdapter,
+			setSyncPhase: this.workflowPhase,
+			reportProgress: this.workflowProgress,
 			get indexSaveCallback() {
 				return getIndexSaveCallback();
 			},
@@ -1607,84 +1697,55 @@ export class SyncEngine {
 	}
 
 	private encryptionRewriteDependencies(): encryptionRewrite.Dependencies {
-		const getYandexClient = () => this.yandexClient;
-		const getIndexManager = () => this.indexManager;
-		const getVaultAdapter = () => this.vaultAdapter;
 		const getSettings = () => this.settings;
 		return {
-			get yandexClient() {
-				return getYandexClient();
-			},
-			setSyncPhase: (phase, currentOperation, progress) =>
-				this.setSyncPhase(phase, currentOperation, progress),
-			get indexManager() {
-				return getIndexManager();
-			},
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
+			yandexClient: this.yandexClient,
+			setSyncPhase: this.workflowPhase,
+			indexManager: this.indexManager,
+			vaultAdapter: this.vaultAdapter,
 			get settings() {
 				return getSettings();
 			},
-			reportProgress: (processedOps, totalOps) =>
-				this.reportProgress(processedOps, totalOps),
+			reportProgress: this.workflowProgress,
 			fileOperations: this.fileOperationsDependencies(),
 			syncReconciliation: this.syncReconciliationDependencies(),
 		};
 	}
 
 	private fullSyncDependencies(): fullSync.Dependencies {
-		const getIndexManager = () => this.indexManager;
 		const getSettings = () => this.settings;
-		const getYandexClient = () => this.yandexClient;
 		const getIndexSaveCallback = () => this.indexSaveCallback;
-		const getConflictResolver = () => this.conflictResolver;
 		const getIsPaused = () => this.isPaused;
 		return {
-			get indexManager() {
-				return getIndexManager();
-			},
+			decideEpochAdoption: (epoch) =>
+				this.epochAdoptionDecision?.(epoch) ?? Promise.resolve(null),
+			indexManager: this.indexManager,
 			get settings() {
 				return getSettings();
 			},
-			setSyncPhase: (phase, currentOperation, progress) =>
-				this.setSyncPhase(phase, currentOperation, progress),
-			get yandexClient() {
-				return getYandexClient();
-			},
+			setSyncPhase: this.workflowPhase,
+			yandexClient: this.yandexClient,
 			get indexSaveCallback() {
 				return getIndexSaveCallback();
 			},
-			get conflictResolver() {
-				return getConflictResolver();
-			},
-			reportProgress: (processedOps, totalOps) =>
-				this.reportProgress(processedOps, totalOps),
+			conflictResolver: this.conflictResolver,
+			reportProgress: this.workflowProgress,
 			get isPaused() {
 				return getIsPaused();
 			},
-			getSyncGuardResult: (
-				skipGuard,
-				validationToken,
-				validateThroughExternalBlock,
-			) =>
-				this.getSyncGuardResult(
-					skipGuard,
-					validationToken,
-					validateThroughExternalBlock,
-				),
+			getSyncGuardResult: this.workflowGuard,
 			fileOperations: this.fileOperationsDependencies(),
 			syncReconciliation: this.syncReconciliationDependencies(),
 		};
 	}
 
-	private realtimeSyncDependencies(): realtimeSync.Dependencies {
-		const getIndexManager = () => this.indexManager;
+	private realtimeSyncDependencies(
+		settleWindow?: realtimeSync.Dependencies["settleWindow"],
+	): realtimeSync.Dependencies {
 		const getSettings = () => this.settings;
 		const getIsPaused = () => this.isPaused;
 		const getRealtimeGuardValidationToken = () =>
 			this.realtimeGuardValidationToken;
-		const getVaultAdapter = () => this.vaultAdapter;
 		const getIndexSaveCallback = () => this.indexSaveCallback;
 		const setRealtimeGuardValidationToken = (
 			value: typeof this.realtimeGuardValidationToken,
@@ -1692,38 +1753,24 @@ export class SyncEngine {
 			this.realtimeGuardValidationToken = value;
 		};
 		return {
-			get indexManager() {
-				return getIndexManager();
-			},
+			settleWindow,
+			indexManager: this.indexManager,
 			get settings() {
 				return getSettings();
 			},
-			getSyncGuardResult: (
-				skipGuard,
-				validationToken,
-				validateThroughExternalBlock,
-			) =>
-				this.getSyncGuardResult(
-					skipGuard,
-					validationToken,
-					validateThroughExternalBlock,
-				),
+			getSyncGuardResult: this.workflowGuard,
 			get isPaused() {
 				return getIsPaused();
 			},
-			setBlockedState: (reason, status) =>
-				this.setBlockedState(reason, status),
+			setBlockedState: this.workflowBlocked,
 			get realtimeGuardValidationToken() {
 				return getRealtimeGuardValidationToken();
 			},
 			set realtimeGuardValidationToken(value) {
 				setRealtimeGuardValidationToken(value);
 			},
-			setSyncPhase: (phase, currentOperation, progress) =>
-				this.setSyncPhase(phase, currentOperation, progress),
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
+			setSyncPhase: this.workflowPhase,
+			vaultAdapter: this.vaultAdapter,
 			get indexSaveCallback() {
 				return getIndexSaveCallback();
 			},
@@ -1733,14 +1780,11 @@ export class SyncEngine {
 	}
 
 	private fileRenameDependencies(): fileRename.Dependencies {
-		const getVaultAdapter = () => this.vaultAdapter;
 		const getRealtimeGuardValidationToken = () =>
 			this.realtimeGuardValidationToken;
-		const getIndexManager = () => this.indexManager;
 		const getEpochReplacementPending = () => this.epochReplacementPending;
 		const getIndexSaveCallback = () => this.indexSaveCallback;
 		const getSettings = () => this.settings;
-		const getYandexClient = () => this.yandexClient;
 		const setRealtimeGuardValidationToken = (
 			value: typeof this.realtimeGuardValidationToken,
 		) => {
@@ -1753,30 +1797,16 @@ export class SyncEngine {
 		};
 		return {
 			getWatcherCausalContext: () => this.getWatcherCausalContext(),
-			get vaultAdapter() {
-				return getVaultAdapter();
-			},
-			getSyncGuardResult: (
-				skipGuard,
-				validationToken,
-				validateThroughExternalBlock,
-			) =>
-				this.getSyncGuardResult(
-					skipGuard,
-					validationToken,
-					validateThroughExternalBlock,
-				),
-			setBlockedState: (reason, status) =>
-				this.setBlockedState(reason, status),
+			vaultAdapter: this.vaultAdapter,
+			getSyncGuardResult: this.workflowGuard,
+			setBlockedState: this.workflowBlocked,
 			get realtimeGuardValidationToken() {
 				return getRealtimeGuardValidationToken();
 			},
 			set realtimeGuardValidationToken(value) {
 				setRealtimeGuardValidationToken(value);
 			},
-			get indexManager() {
-				return getIndexManager();
-			},
+			indexManager: this.indexManager,
 			get epochReplacementPending() {
 				return getEpochReplacementPending();
 			},
@@ -1789,11 +1819,8 @@ export class SyncEngine {
 			get settings() {
 				return getSettings();
 			},
-			get yandexClient() {
-				return getYandexClient();
-			},
-			expectWatcherEvent: (path, action) =>
-				this.expectWatcherEvent(path, action),
+			yandexClient: this.yandexClient,
+			expectWatcherEvent: this.workflowWatcherEvent,
 			syncReconciliation: this.syncReconciliationDependencies(),
 			fileOperations: this.fileOperationsDependencies(),
 			remoteMoves: this.remoteMovesDependencies(),
@@ -1801,7 +1828,6 @@ export class SyncEngine {
 	}
 
 	private folderMutationsDependencies(): folderMutations.Dependencies {
-		const getIndexManager = () => this.indexManager;
 		const getRealtimeGuardValidationToken = () =>
 			this.realtimeGuardValidationToken;
 		const getSettings = () => this.settings;
@@ -1812,21 +1838,9 @@ export class SyncEngine {
 			this.realtimeGuardValidationToken = value;
 		};
 		return {
-			get indexManager() {
-				return getIndexManager();
-			},
-			getSyncGuardResult: (
-				skipGuard,
-				validationToken,
-				validateThroughExternalBlock,
-			) =>
-				this.getSyncGuardResult(
-					skipGuard,
-					validationToken,
-					validateThroughExternalBlock,
-				),
-			setBlockedState: (reason, status) =>
-				this.setBlockedState(reason, status),
+			indexManager: this.indexManager,
+			getSyncGuardResult: this.workflowGuard,
+			setBlockedState: this.workflowBlocked,
 			get realtimeGuardValidationToken() {
 				return getRealtimeGuardValidationToken();
 			},

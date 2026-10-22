@@ -4,7 +4,9 @@ import type { VaultAdapter } from "../src/api/vault-adapter";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { IndexManager } from "../src/sync/canonical/manager";
 import { SyncEngine } from "../src/sync/engine";
+import { prepareFullUploadMutations } from "../src/sync/workflows/full";
 import * as syncReconciliation from "../src/sync/reconciliation/commits";
+
 import {
 	DEFAULT_SETTINGS,
 	type FileMetadata,
@@ -97,4 +99,65 @@ test("applying a canonical tombstone preserves foreign causal attribution", asyn
 	assert.equal(index.index.files["note.md"]?.lastModifiedBy, "device-b");
 	assert.equal(index.index.files["note.md"]?.mutationSeq, 9);
 	assert.deepEqual(index.store.getMutations(), []);
+});
+
+test("full upload planning preserves latest matching FIFO identities across repeated paths", () => {
+	const index = new MemoryIndex();
+	const first = index.enqueueMutation("put", "__proto__", {
+		sha256: "same",
+		baselineSha256: "old",
+		epoch: "old-epoch",
+	});
+	const latestMatch = index.enqueueMutation("put", "__proto__", {
+		sha256: "same",
+		epoch: "epoch-a",
+	});
+	const different = index.enqueueMutation("put", "__proto__", {
+		sha256: "other",
+		baselineSha256: "different",
+		epoch: "epoch-a",
+	});
+	const missingSha = index.enqueueMutation("put", "constructor", {
+		epoch: "epoch-a",
+	});
+	const planned = prepareFullUploadMutations(
+		{ indexManager: index },
+		[
+			["__proto__", "same"],
+			["new/note.md", "fresh"],
+			["new/note.md", "fresh"],
+			["__proto__", "other"],
+		].map(([path, sha256]) => ({
+			action: "upload",
+			path: path!,
+			reason: "local content",
+			localMeta: { ...metadata(path!), sha256: sha256! },
+		})),
+	);
+	assert.deepEqual(
+		planned.map((mutation) => mutation.id),
+		[latestMatch.id, "device-a:5", "device-a:5", different.id],
+	);
+	assert.equal(planned[0]?.baselineSha256, undefined);
+	assert.equal(planned[0]?.epoch, "epoch-a");
+	assert.equal(index.getPendingMutations().length, 5);
+	assert.equal(
+		index.findPendingMatchingPut("__proto__", "same", "first")?.id,
+		first.id,
+	);
+	const observed = index.findPendingMatchingPut("__proto__", "same", "last")!;
+	assert.equal(observed.id, latestMatch.id);
+	observed.path = "changed-copy";
+	assert.equal(
+		index.findPendingMatchingPut("__proto__", "same", "last")?.id,
+		latestMatch.id,
+	);
+	assert.equal(
+		index.findPendingMatchingPut("constructor", undefined, "last")?.id,
+		missingSha.id,
+	);
+	assert.equal(
+		index.findPendingMatchingPut("missing", undefined, "last"),
+		undefined,
+	);
 });

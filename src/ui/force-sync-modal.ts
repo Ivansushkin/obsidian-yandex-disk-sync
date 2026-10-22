@@ -1,3 +1,4 @@
+import type { PreparedForceReplacement } from "../sync/workflows/force-replacement";
 import type { OperationBackupChoice } from "../backup/operation-backup-choice";
 import { App, Modal, Setting } from "obsidian";
 import { t } from "../i18n";
@@ -15,6 +16,7 @@ export class ForceSyncModal extends Modal {
 		direction: ForceSyncDirection,
 		onAction: (action: OperationBackupChoice) => void,
 		requireLegacyClientsStopped = false,
+		private readonly replacement?: PreparedForceReplacement,
 	) {
 		super(app);
 		this.direction = direction;
@@ -33,6 +35,30 @@ export class ForceSyncModal extends Modal {
 				: t("modal.force_sync_from_remote_text");
 
 		contentEl.createEl("p", { text });
+		if (this.replacement) {
+			const state = this.replacement.recovery;
+			contentEl.createEl("p", {
+				text: t("force.confirm_details", {
+					source:
+						state.direction === "from_local"
+							? this.app.vault.getName()
+							: state.remotePath,
+					target:
+						state.direction === "from_local"
+							? state.remotePath
+							: this.app.vault.getName(),
+					count: state.source.length,
+					mode: t(
+						state.target.enabled
+							? "force.encrypted"
+							: "force.plaintext",
+					),
+				}),
+			});
+			if (state.source.length === 0) {
+				contentEl.createEl("p", { text: t("force.empty_source") });
+			}
+		}
 
 		const warningEl = contentEl.createDiv({ cls: "force-sync-warning" });
 		warningEl.createEl("strong", { text: t("modal.force_sync_warning") });

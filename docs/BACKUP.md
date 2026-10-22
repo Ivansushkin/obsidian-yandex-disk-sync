@@ -87,32 +87,28 @@ Password policy:
   новое random имя; существующий объект не перезаписывается.
 
 Перед Force и enable/disable/rotate пользователь выбирает `with-backup`,
-`without-backup` или `cancel`. Выбор не сохраняется как настройка. При отказе от
-архива операции проходят те же проверки canonical, source snapshot, codec и
-fingerprints. Защитные копии отдельных перезаписываемых/удаляемых файлов и
-conflict copies остаются обязательными по прежним правилам.
+`without-backup` или `cancel` на один запуск. Обычный sync сохраняет обязательные
+protective copies; transition archive не заменяет его политику сохранности. Для Force явный
+`without-backup` отключает также per-file copies и старый destination snapshot;
+содержимое назначения не скачивается ради проверки старого canonical.
 
-Force выполняет read-only canonical preflight и фиксирует digest защищаемой
-стороны: remote-raw для Force local, logical-vault для Force remote. В coordinator
-передаётся `ForcePreflightProof` с raw canonical identity, snapshot digest и
-`backup: null` либо именем/SHA-256 выбранного архива. Перед первой mutation
-canonical и snapshot повторно проверяются; для архива проверяется также raw SHA.
-Source проверяется на каждом transfer и ещё раз перед replacement commit.
-Старый `ForceBackupProof` адаптируется к варианту с архивом; два proof одновременно
-запрещены. Ошибка архива или drift завершает попытку, без fallback и повторного
-архива. Следующий запуск снова предлагает выбор.
+Force local архивирует raw remote snapshot, Force remote — logical local snapshot.
+Выбранный архив проверяется по exact bytes/SHA и snapshot digest до destructive
+apply. Ошибка предлагает повтор, явное продолжение без любых копий или отмену;
+автоматического fallback нет. Архив остаётся в защищённой `.backup`.
 
-Canonical proof также фиксирует root locks по именам и stable content fingerprints.
-Изменение canonical или locks до replacement commit требует нового preflight;
-фактически захваченный canonical сверяется с proof. Старый proof без locks
-допустим только при их отсутствии. Root locks включаются в `remote-raw` архив,
-но не считаются пользовательской legacy path collision. Force preflight не
-запускает normal recovery и не меняет remote до подтверждения.
-При ошибке очистки уже подтверждённый replacement сохраняется локально, успех
-не объявляется и новый архив автоматически не создаётся. Финальный successful
-full дополняется явной проверкой root locks, поэтому ещё не stale orphan не
-превращает ошибку cleanup в успешный UI outcome. Encryption readiness до
-запуска Force не выполняет implicit transition recovery или reconnect.
+Проверенный proof и выбор сохраняются в `forceRecovery`. Recovery повторно
+проверяет существующий архив и не создаёт новый. Source проверяется независимо
+от backup choice; source read/decrypt failure никогда не означает пустой source.
+Canonical назначения не декодируется для допуска Force: его raw replacement
+принадлежит эксклюзивной транзакции IndexManager. До destructive действий
+публикуется Force intent; cleanup проверяет storage/operation/fingerprint.
+
+`crypto/workflow.ts` запрашивает выбранный transition archive через прежний
+`BackupManager` после source preflight; claim проверяется в `crypto/maintenance.ts`.
+`crypto/recovery.ts` возобновляет только сохранённый transition и не вызывает
+создание архива. UI выбора остаётся у plugin root; его persistence port
+делегирует coherent snapshot единственному `PluginPersistence`.
 
 Encryption snapshot содержит обязательное `backupProof: EncryptionBackupProof | null`.
 Отсутствующее поле недопустимо. Claim проверяет исходную revision и fingerprints
@@ -127,8 +123,10 @@ Metadata scan и remote-raw snapshot блокируют старую remote plug
 
 Stable local data необратимо преобразуется в current snapshot при загрузке, после
 installation identity и до автоматизации. Ни эта запись, ни foreign epoch adoption
-не создают архив. После подтверждённого replacement commit authoritative новый
-epoch; незавершённый cleanup продолжает normal full.
+не создают архив. После подтверждённого Force intent авторитетен новый epoch;
+незавершённый directed replacement продолжает отдельный Force recovery с теми же
+ID/epoch, а обычная автоматизация ждёт его завершения. Этот recovery не создаёт
+новый архив. Normal full принимает завершённое поколение по правилам epoch choice.
 
 ## Download
 
@@ -147,10 +145,26 @@ Non-envelope `.enc.zip` отклоняется без вызова compatibility
 
 ## Memory
 
+`captureLogicalVaultDigest` и `captureRemoteRawDigest` читают и хешируют по
+одному файлу, освобождая ссылку на content до следующего чтения. Они сохраняют
+только identities `{path,size,sha256}` и тот же SHA-256 от JSON `{kind,files}`.
+Для каждого source kind enumeration, localeCompare order и filtering общие с
+materialized snapshot: logical scope задаёт VaultAdapter, raw remote исключает
+`.backup` и отклоняет plugin data до первого download.
+
+Digest-only используют проверки до/после выбранного архива и encryption source
+freshness. Число content reads не сокращается; ошибки read/auth/decrypt и source
+drift по-прежнему блокируют proof. Изменён retained content volume, ускорение
+сети не заявляется. Canonical, local/physical bytes и durable queues не меняются.
+
 При выборе архива encryption transition создаёт один logical backup после
-source preflight; Force архивирует только защищаемую сторону. Без архива
-полный ZIP не создаётся. Это сохраняет прежний memory peak. Mobile PERF-006 остаётся
-обязательным release gate.
+source preflight; Force архивирует только защищаемую сторону. ZIP-пути сохраняют
+полные bytes через `captureLogicalVaultSnapshot`/`captureRemoteRawSnapshot`;
+уменьшение peak ZIP/envelope не доказано. Без архива public directed Force
+не создаёт destination-content snapshot и не вызывает digest traversal назначения.
+Проверка source и новых записанных bytes остаётся обязательной. Synthetic
+retention evidence описано в [отчёте о рефакторинге](REFACTOR_REPORT.md#что-измерено); реальный mobile heap — manual PERF-006,
+обязательный release gate.
 
 ## Проверки
 

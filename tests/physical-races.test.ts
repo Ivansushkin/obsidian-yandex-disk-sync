@@ -1,14 +1,8 @@
-import { fileMetadata } from "./helpers/metadata";
 import assert from "node:assert/strict";
-import {
-	httpTest as test,
-	createClient,
-	requestGlobal,
-	response,
-} from "./helpers/client-fixtures";
 import { TFile, type App } from "obsidian";
 import { VaultAdapter } from "../src/api/vault-adapter";
 import type { YandexDiskClient } from "../src/api/yandex-client";
+import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
 import {
 	applyDownloadedContent,
 	deleteLocalFile,
@@ -17,21 +11,25 @@ import {
 	type Dependencies,
 } from "../src/sync/files/operations";
 import {
+	deleteMoveSourceIfUnchanged,
+	type Dependencies as MoveDependencies,
+} from "../src/sync/files/remote-moves";
+import { preserveLocalConflictCopy } from "../src/sync/reconciliation/conflict-settlement";
+import { type Dependencies as ReconciliationDependencies } from "../src/sync/reconciliation/context";
+import {
 	DEFAULT_SETTINGS,
 	createEmptyIndex,
 	type PendingPhysicalAction,
 } from "../src/types";
+import { computeSha256 } from "../src/utils/hash-utils";
 import { logger } from "../src/utils/logger";
 import {
-	preserveLocalConflictCopy,
-	type Dependencies as ReconciliationDependencies,
-} from "../src/sync/reconciliation/commits";
-import { computeSha256 } from "../src/utils/hash-utils";
-import {
-	deleteMoveSourceIfUnchanged,
-	type Dependencies as MoveDependencies,
-} from "../src/sync/files/remote-moves";
-import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
+	createClient,
+	requestGlobal,
+	response,
+	httpTest as test,
+} from "./helpers/client-fixtures";
+import { fileMetadata } from "./helpers/metadata";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 const bytes = (text: string) => new TextEncoder().encode(text).buffer;

@@ -15,6 +15,7 @@ import { computeSha256 } from "../utils/hash-utils";
 import {
 	normalizePath,
 	shouldSyncFile,
+	shouldInspectRawSyncPath,
 	getDirectory,
 	hasPortablePathCollision,
 } from "../utils/path-utils";
@@ -112,6 +113,18 @@ export class VaultAdapter {
 			this.app.vault.configDir,
 		);
 		return result;
+	}
+
+	/** Apply shared raw-path protection before attempting filename decryption. */
+	shouldInspectRaw(path: string, encrypted: boolean): boolean {
+		return shouldInspectRawSyncPath(
+			path,
+			this.settings.syncPatterns,
+			this.settings.excludePatterns,
+			this.settings.syncDotObsidian,
+			this.app.vault.configDir,
+			encrypted,
+		);
 	}
 
 	/**
@@ -282,11 +295,14 @@ export class VaultAdapter {
 	 * remote folder pruning behavior so the local and remote
 	 * folder trees stay consistent after deletions.
 	 */
-	async pruneEmptyLocalAncestors(filePath: string): Promise<void> {
+	async pruneEmptyLocalAncestors(
+		filePath: string,
+		canPrune?: (path: string) => boolean,
+	): Promise<void> {
 		const configDir = this.app.vault.configDir;
 		let dir = getDirectory(normalizePath(filePath));
 		while (dir) {
-			if (dir === configDir) {
+			if (dir === configDir || (canPrune && !canPrune(dir))) {
 				break;
 			}
 			const folder = this.getFolder(dir);
@@ -430,9 +446,11 @@ export class VaultAdapter {
 	}
 
 	/**
-	 * Get metadata of all synchronizable files
+	 * Get metadata of synchronizable files; strict snapshots fail on any unreadable file.
 	 */
-	async getAllFileMetadata(): Promise<Map<string, FileMetadata>> {
+	async getAllFileMetadata(
+		failOnReadError = false,
+	): Promise<Map<string, FileMetadata>> {
 		const files = this.getAllSyncableFiles();
 		const metadata = new Map<string, FileMetadata>();
 
@@ -453,6 +471,9 @@ export class VaultAdapter {
 					},
 				};
 			} catch (e) {
+				if (failOnReadError) {
+					throw e;
+				}
 				logger.warn(`Failed to get file metadata: ${file.path}`, {
 					error: e,
 				});

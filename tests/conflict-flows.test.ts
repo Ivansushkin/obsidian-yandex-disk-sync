@@ -1,22 +1,20 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import { createHash } from "node:crypto";
+import test from "node:test";
+import {
+	StorageBindingController,
+	type StorageBindingChoice,
+} from "../src/sync/local/storage-binding";
+import { repairMissingAcceptedUploads } from "../src/sync/reconciliation/accepted-uploads";
+import { type Dependencies } from "../src/sync/reconciliation/context";
+import type { SyncIndex } from "../src/types";
+import { computeSha256 } from "../src/utils/hash-utils";
 import {
 	MemoryDisk,
 	bytes,
 	codecFor,
 	managedDevices,
 } from "./helpers/sync-flow";
-import { computeSha256 } from "../src/utils/hash-utils";
-import {
-	repairMissingAcceptedUploads,
-	type Dependencies,
-} from "../src/sync/reconciliation/commits";
-import type { SyncIndex } from "../src/types";
-import {
-	StorageBindingController,
-	type StorageBindingChoice,
-} from "../src/sync/local/storage-binding";
 
 test("storage confirmation preserves queued work and rolls back a failed save", async (t) => {
 	const device = managedDevices(t);

@@ -203,7 +203,7 @@ export interface IndexMaintenanceCleanupAction {
 	expectedFingerprint: string;
 }
 
-export interface IndexMaintenance {
+export interface EncryptionIndexMaintenance {
 	/** Globally unique transition identifier */
 	id: string;
 	/** Maintenance operation kind */
@@ -223,6 +223,20 @@ export interface IndexMaintenance {
 	/** Guarded cleanup work that any target-capable device may resume */
 	cleanup: IndexMaintenanceCleanupAction[];
 }
+
+/** Explicit replacement authority, independent from encryption transitions. */
+export interface ForceIndexMaintenance extends Omit<
+	EncryptionIndexMaintenance,
+	"kind" | "phase"
+> {
+	kind: "force";
+	phase: "prepared" | "applying" | "cleanup";
+	direction: "from_local" | "from_remote";
+	sourceDigest: string;
+}
+
+export type IndexMaintenance =
+	EncryptionIndexMaintenance | ForceIndexMaintenance;
 
 /**
  * Device-local causal baseline. It is deliberately not shaped as a canonical

@@ -65,9 +65,11 @@
 - Detect local changes by plaintext SHA-256. Detect remote drift by server
   fingerprint, then by server mtime relative to baseline when no fingerprint
   exists. Client clocks never decide a causal winner.
-- Commit a tombstone before physical deletion. A destructive remote action
-  requires a fresh canonical read and a matching expected physical fingerprint.
-  A failed mandatory backup blocks local overwrite or deletion.
+- Ordinary sync commits a tombstone before physical deletion. Confirmed Force
+  publishes its own durable intent before replacing the syncable destination.
+  A destructive remote action requires fresh canonical/operation authority
+  and a matching expected physical fingerprint.
+  A failed mandatory backup blocks ordinary-sync local overwrite or deletion. Confirmed Force uses its explicit per-run backup policy.
 - Exact delete beats a concurrent stale put. A new or modified descendant
   survives folder delete. Initial device connection receives canonical versions with protective copies;
   after connection, a file without baseline is new.
@@ -116,15 +118,20 @@
   A failed initial save blocks sync and unload must not retry it.
 - Full archives before Force and encryption transitions are explicit per-run choices:
   with-backup, without-backup, or cancel. Recovery and epoch adoption never create
-  an archive automatically. Canonical, source, codec and fingerprint guards always
-  apply. Mandatory protective copies of individual overwritten/deleted files remain.
-- Startup blocks are non-persisted and typed. Only `migration` may permit a
-  confirmed Force; encryption, historical, and authentication blocks may not.
+  an archive automatically. Ordinary sync retains mandatory protective copies.
+  Confirmed Force without-backup also skips individual protective copies and
+  destination-content snapshots; source, scope and operation authority remain mandatory.
+- Startup blocks are non-persisted and typed. Confirmed Force validates its
+  selected readable source independently of normal startup admission. Destination
+  encryption, historical metadata, baseline, tombstones and queues cannot choose
+  the winner. Source authentication/decryption/read failures must never imply empty.
   Load local state and register lifecycle callbacks before token/remote checks.
 - Do not change the `sync-index`, `encryption-manifest`, or `plugin-data`
   markers, profile `hardened`, epoch/revision, mutation FIFO, or the persisted
   physical-action schema without a separate migration design, scenarios, and
-  appropriate automated or manual verification.
+  appropriate automated or manual verification. Force recovery is an explicit
+  local checkpoint and a separate canonical maintenance kind; never impersonate
+  an encryption transition. Preserve its operation ID and epoch across recovery.
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
   translations, and migration messages.

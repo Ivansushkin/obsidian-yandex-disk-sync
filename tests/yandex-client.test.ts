@@ -313,6 +313,59 @@ test("missing cached upload parent is recreated before retry", async () => {
 	assert.equal(contentUploads, 1);
 });
 
+for (const stage of ["guard", "verification"] as const) {
+	test(`upload ${stage} 404 cannot trigger parent recovery or confirm a write`, async () => {
+		const original = bytes("current remote version");
+		let remoteBytes = original;
+		let puts = 0;
+		let mkdirs = 0;
+		let checks = 0;
+		const failure = new YandexApiError("authority read failed", 404);
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			if (params.url.includes("/resources/upload?")) {
+				return response(200, { href: "https://upload.test/file" });
+			}
+			if (params.url === "https://upload.test/file") {
+				puts++;
+				if (stage === "verification" && puts === 1) {
+					return response(503);
+				}
+				remoteBytes = params.body as ArrayBuffer;
+				return response(201);
+			}
+			if (params.method === "PUT") {
+				mkdirs++;
+				return response(201);
+			}
+			return response(200, directory("vault/folder"));
+		};
+		const client = createClient();
+		await client.getResource("vault/folder", 1, 0, true);
+		await assert.rejects(
+			client.uploadFile(
+				"vault/folder/file.md",
+				bytes("stale replacement"),
+				stage === "guard",
+				true,
+				true,
+				async () => {
+					checks++;
+					if (stage === "guard" && checks === 2) {
+						throw failure;
+					}
+				},
+				async () => {
+					throw failure;
+				},
+			),
+			(error) => error === failure,
+		);
+		assert.deepEqual(remoteBytes, original);
+		assert.equal(mkdirs, 0);
+		assert.equal(puts, stage === "guard" ? 0 : 1);
+	});
+}
+
 test("DELETE retry revalidates revoked authority before sending another request", async () => {
 	const original = new TextEncoder().encode("current plaintext").buffer;
 	let remoteBytes = original;

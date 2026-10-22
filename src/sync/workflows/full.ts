@@ -1,6 +1,5 @@
 import { YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
-import { createSyncError } from "../errors";
 import type {
 	PendingMutation,
 	SyncError,
@@ -11,17 +10,27 @@ import type {
 	YandexDiskSyncSettings,
 } from "../../types";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
-import { ConflictResolver } from "../reconciliation/conflicts";
-import * as fileOperations from "../files/operations";
+import { PendingPutLookup } from "../local/baseline-rules";
 import { IndexManager } from "../canonical/manager";
 import type {
 	IndexSaveCallback,
 	SyncGuardResult,
 	SyncRunOptions,
 } from "../contracts";
+import { createSyncError } from "../errors";
+import * as fileOperations from "../files/operations";
+import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
+import * as reconcileBaselines from "../reconciliation/baselines";
 import * as syncReconciliation from "../reconciliation/commits";
+import * as reconcileConflictSettlement from "../reconciliation/conflict-settlement";
+import { ConflictResolver } from "../reconciliation/conflicts";
+import * as reconciliationContext from "../reconciliation/context";
+import * as reconcilePhysicalRecovery from "../reconciliation/physical-recovery";
 import { receiveInitialRemoteState } from "./initial-receive";
 export interface Dependencies {
+	decideEpochAdoption?: (
+		epoch: string,
+	) => Promise<"accept" | "preserve" | null>;
 	indexManager: IndexManager;
 	settings: YandexDiskSyncSettings;
 	setSyncPhase: (
@@ -40,7 +49,7 @@ export interface Dependencies {
 		validateThroughExternalBlock?: boolean,
 	) => Promise<SyncGuardResult>;
 	fileOperations: fileOperations.Dependencies;
-	syncReconciliation: syncReconciliation.Dependencies;
+	syncReconciliation: reconciliationContext.Dependencies;
 }
 export interface FullSyncContext {
 	adoptionSnapshot: ReturnType<
@@ -50,7 +59,9 @@ export interface FullSyncContext {
 }
 
 /** Settle durable puts against the logical state selected by full sync.  Matching puts only need their device watermark. Puts superseded by the reconciled state become local no-ops so staging cannot alter canonical file metadata. */
-export function settleFullSyncPendingPuts(deps: Dependencies): {
+export function settleFullSyncPendingPuts(
+	deps: Pick<Dependencies, "indexManager">,
+): {
 	pendingWatermarks: number;
 	matchingPuts: number;
 	noopPuts: number;
@@ -102,23 +113,18 @@ export function settleFullSyncPendingPuts(deps: Dependencies): {
 
 /** Allocate causal identities for local uploads discovered by a full scan. */
 export function prepareFullUploadMutations(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "indexManager">,
 	uploads: SyncOperation[],
 ): PendingMutation[] {
-	const pending = deps.indexManager.getPendingMutations();
+	const pending = new PendingPutLookup(
+		deps.indexManager.getPendingMutations(),
+	);
 	return uploads.flatMap((operation) => {
 		const sha256 = operation.localMeta?.sha256;
 		if (!sha256) {
 			return [];
 		}
-		const existing = [...pending]
-			.reverse()
-			.find(
-				(mutation) =>
-					mutation.type === "put" &&
-					mutation.path === operation.path &&
-					mutation.sha256 === sha256,
-			);
+		const existing = pending.get(operation.path, sha256);
 		if (existing) {
 			return [existing];
 		}
@@ -132,14 +138,14 @@ export function prepareFullUploadMutations(
 						?.sha256,
 			},
 		);
-		pending.push(mutation);
+		pending.add(mutation);
 		return [mutation];
 	});
 }
 
 /** Stamp uploaded full-sync entries with their allocated device sequence. */
 export function stampFullUploadMutations(
-	deps: Dependencies,
+	deps: Pick<Dependencies, "indexManager" | "settings">,
 	mutations: PendingMutation[],
 ): void {
 	for (const mutation of mutations) {
@@ -199,6 +205,52 @@ export async function reconcileFullSync(
 	startTime: number,
 	validationToken?: string,
 ): Promise<void> {
+	if (!(await loadFullCanonical(deps, options, result, validationToken))) {
+		return;
+	}
+	const admission = await prepareFullReconciliation(
+		deps,
+		options,
+		adoption,
+		result,
+	);
+	if (!admission) {
+		return;
+	}
+	const plan = await scanFullReconciliation(
+		deps,
+		adoption,
+		admission,
+		startTime,
+	);
+	await applyFullReconciliation(
+		deps,
+		options,
+		result,
+		plan,
+		admission.hadPendingCausalWork,
+		validationToken,
+	);
+}
+
+interface FullAdmission {
+	adoptionDecision: "accept" | "preserve" | null;
+	hadPendingCausalWork: boolean;
+}
+
+interface FullPlan {
+	operations: SyncOperation[];
+	verifiedMetadataChanged: boolean;
+	baselinesChanged: boolean;
+}
+
+/** Discover canonical state and finish first-connection reception before adoption. */
+async function loadFullCanonical(
+	deps: Dependencies,
+	options: SyncRunOptions | undefined,
+	result: SyncResult,
+	validationToken?: string,
+): Promise<boolean> {
 	deps.yandexClient.clearFolderCache();
 	// 1. Ensure remote folder exists
 	deps.setSyncPhase("checking-remote");
@@ -231,9 +283,20 @@ export async function reconcileFullSync(
 		}
 		await receiveInitialRemoteState(deps, result, validationToken);
 		if (result.errors.length > 0) {
-			return;
+			return false;
 		}
 	}
+
+	return true;
+}
+
+/** Capture rollback state before epoch adoption, then resume durable causal work. */
+async function prepareFullReconciliation(
+	deps: Dependencies,
+	options: SyncRunOptions | undefined,
+	adoption: FullSyncContext,
+	result: SyncResult,
+): Promise<FullAdmission | null> {
 	const localStateBeforeAdoption = deps.indexManager.getLocalIndex();
 	const canonicalEpoch = deps.indexManager.getRemoteIndex().epoch;
 	const replacesObservedEpoch =
@@ -242,6 +305,37 @@ export async function reconcileFullSync(
 	const migratesLegacyBaseline =
 		localStateBeforeAdoption.observedEpoch === null &&
 		Object.keys(localStateBeforeAdoption.files).length > 0;
+	let adoptionDecision: "accept" | "preserve" | null = null;
+	if (replacesObservedEpoch) {
+		const actual = await deps.indexManager.buildLocalIndex();
+		const baseline = localStateBeforeAdoption.files;
+		const offlineChanges =
+			deps.indexManager.getPendingMutations().length > 0 ||
+			deps.indexManager.getPendingPhysicalActions().length > 0 ||
+			[...new Set([...actual.keys(), ...Object.keys(baseline)])].some(
+				(path) =>
+					(actual.get(path)?.sha256 ?? null) !==
+					(baseline[path]?.deleted
+						? null
+						: (baseline[path]?.sha256 ?? null)),
+			);
+		if (offlineChanges) {
+			adoptionDecision =
+				options?.epochAdoption?.epoch === canonicalEpoch
+					? options.epochAdoption.decision
+					: ((await deps.decideEpochAdoption?.(canonicalEpoch)) ??
+						null);
+			if (!adoptionDecision) {
+				result.errors.push({
+					path: "",
+					operation: "none",
+					code: "epoch-decision-required",
+					message: t("force.epoch_description"),
+				});
+				return null;
+			}
+		}
+	}
 	if (replacesObservedEpoch || migratesLegacyBaseline) {
 		adoption.adoptionSnapshot = deps.indexManager.captureLocalCausalState();
 		adoption.adoptedEpoch = canonicalEpoch;
@@ -288,22 +382,36 @@ export async function reconcileFullSync(
 			.filter(([, metadata]) => !metadata.deleted)
 			.map(([path]) => path),
 	);
-	if (syncReconciliation.hasPendingPhysicalWork(deps.syncReconciliation)) {
+	if (
+		reconcilePhysicalRecovery.hasPendingPhysicalWork(
+			deps.syncReconciliation,
+		)
+	) {
 		deps.setSyncPhase("cleanup");
 	}
-	await syncReconciliation.resumePendingMoves(
+	await reconcilePhysicalRecovery.resumePendingMoves(
 		deps.syncReconciliation,
 		result,
 		true,
 	);
-	await syncReconciliation.resumePendingPhysicalActions(
+	await reconcilePhysicalRecovery.resumePendingPhysicalActions(
 		deps.syncReconciliation,
 		result,
 	);
 	if (result.errors.length > 0) {
-		return;
+		return null;
 	}
 
+	return { adoptionDecision, hadPendingCausalWork };
+}
+
+/** Classify fresh local/remote observations without claiming lifecycle completion. */
+async function scanFullReconciliation(
+	deps: Dependencies,
+	adoption: FullSyncContext,
+	{ adoptionDecision, hadPendingCausalWork }: FullAdmission,
+	startTime: number,
+): Promise<FullPlan> {
 	// 3. Build local index
 	deps.setSyncPhase("scanning-local");
 	const localFiles = await deps.indexManager.buildLocalIndex();
@@ -312,7 +420,7 @@ export async function reconcileFullSync(
 	deps.setSyncPhase("scanning-remote");
 	const remoteFiles = await deps.indexManager.getRemoteFiles();
 	const verifiedMetadataChanged =
-		await syncReconciliation.verifyRemoteContentCandidates(
+		await reconcileBaselines.verifyRemoteContentCandidates(
 			deps.syncReconciliation,
 			localFiles,
 			remoteFiles,
@@ -322,7 +430,7 @@ export async function reconcileFullSync(
 		...remoteFiles.keys(),
 	]);
 	if (
-		syncReconciliation.reconcileCompletedPhysicalActions(
+		reconcilePhysicalRecovery.reconcileCompletedPhysicalActions(
 			deps.syncReconciliation,
 			localFiles,
 			remoteFiles,
@@ -341,7 +449,9 @@ export async function reconcileFullSync(
 		? deps.conflictResolver.determineEpochAdoptionOperations(
 				localFiles,
 				remoteFiles,
-				adoption.adoptionSnapshot.state.files,
+				adoptionDecision === "accept"
+					? Object.fromEntries(localFiles)
+					: adoption.adoptionSnapshot.state.files,
 				remoteIndex.files,
 			)
 		: deps.conflictResolver.determineOperations(
@@ -411,7 +521,7 @@ export async function reconcileFullSync(
 			? { ...operation, remoteMeta: remoteFiles.get(operation.path) }
 			: operation,
 	);
-	const baselinesChanged = syncReconciliation.recordConfirmedBaselines(
+	const baselinesChanged = reconcileBaselines.recordConfirmedBaselines(
 		deps.syncReconciliation,
 		localFiles,
 		remoteFiles,
@@ -427,6 +537,18 @@ export async function reconcileFullSync(
 
 	logger.info(`Determined ${operations.length} synchronization operations`);
 
+	return { operations, verifiedMetadataChanged, baselinesChanged };
+}
+
+/** Apply the classified groups and publish intent before destructive work. */
+async function applyFullReconciliation(
+	deps: Dependencies,
+	options: SyncRunOptions | undefined,
+	result: SyncResult,
+	{ operations, verifiedMetadataChanged, baselinesChanged }: FullPlan,
+	hadPendingCausalWork: boolean,
+	validationToken?: string,
+): Promise<void> {
 	// 6. Preflight: Create all necessary folders
 	await fileOperations.prepareOperationFolders(
 		deps.fileOperations,
@@ -516,7 +638,7 @@ export async function reconcileFullSync(
 		if (!deletionCommitProof) {
 			return;
 		}
-		await syncReconciliation.repairMissingAcceptedUploads(
+		await reconcileAcceptedUploads.repairMissingAcceptedUploads(
 			deps.syncReconciliation,
 			uploads.map((operation) => operation.path),
 			deletionCommitProof,
@@ -573,6 +695,52 @@ export async function reconcileFullSync(
 		);
 	}
 
+	await commitFullReconciliation(
+		deps,
+		options,
+		result,
+		{
+			uploads,
+			verifiedMetadataChanged,
+			baselinesChanged,
+			hadPendingCausalWork,
+			mtimeStamped,
+			pendingWatermarks: mutationSettlement.pendingWatermarks,
+			indexCommittedBeforeDeletes,
+			hasConflicts: conflicts.length > 0,
+		},
+		validationToken,
+	);
+}
+
+interface FullCommitState {
+	uploads: SyncOperation[];
+	verifiedMetadataChanged: boolean;
+	baselinesChanged: boolean;
+	hadPendingCausalWork: boolean;
+	mtimeStamped: boolean;
+	pendingWatermarks: number;
+	indexCommittedBeforeDeletes: boolean;
+	hasConflicts: boolean;
+}
+
+/** Revalidate the active codec before publishing transfers and resuming remaining cleanup. */
+async function commitFullReconciliation(
+	deps: Dependencies,
+	options: SyncRunOptions | undefined,
+	result: SyncResult,
+	{
+		uploads,
+		verifiedMetadataChanged,
+		baselinesChanged,
+		hadPendingCausalWork,
+		mtimeStamped,
+		pendingWatermarks,
+		indexCommittedBeforeDeletes,
+		hasConflicts,
+	}: FullCommitState,
+	validationToken?: string,
+): Promise<void> {
 	// 8. Save indexes
 	deps.setSyncPhase("saving-index");
 
@@ -597,7 +765,7 @@ export async function reconcileFullSync(
 		mtimeStamped ||
 		tombstonesRemoved ||
 		baselinesChanged ||
-		mutationSettlement.pendingWatermarks > 0;
+		pendingWatermarks > 0;
 	const strictNoOp = !indexDirty && !hadPendingCausalWork;
 	if (!strictNoOp) {
 		const guard = await deps.getSyncGuardResult(
@@ -629,37 +797,11 @@ export async function reconcileFullSync(
 		if (deps.indexSaveCallback) {
 			await deps.indexSaveCallback();
 		}
-		if (
-			syncReconciliation.hasPendingPhysicalWork(deps.syncReconciliation)
-		) {
-			deps.setSyncPhase("cleanup");
-		}
-		await syncReconciliation.resumePendingPhysicalActions(
-			deps.syncReconciliation,
-			result,
-		);
-		await syncReconciliation.resumePendingMoves(
-			deps.syncReconciliation,
-			result,
-			true,
-		);
+		await settleFullPhysicalWork(deps, result);
 		return;
 	}
-	if (indexCommittedBeforeDeletes && conflicts.length === 0) {
-		if (
-			syncReconciliation.hasPendingPhysicalWork(deps.syncReconciliation)
-		) {
-			deps.setSyncPhase("cleanup");
-		}
-		await syncReconciliation.resumePendingPhysicalActions(
-			deps.syncReconciliation,
-			result,
-		);
-		await syncReconciliation.resumePendingMoves(
-			deps.syncReconciliation,
-			result,
-			true,
-		);
+	if (indexCommittedBeforeDeletes && !hasConflicts) {
+		await settleFullPhysicalWork(deps, result);
 		return;
 	}
 
@@ -671,20 +813,32 @@ export async function reconcileFullSync(
 	if (!commitProof) {
 		return;
 	}
-	await syncReconciliation.repairMissingAcceptedUploads(
+	await reconcileAcceptedUploads.repairMissingAcceptedUploads(
 		deps.syncReconciliation,
 		uploads.map((operation) => operation.path),
 		commitProof,
 		validationToken,
 	);
-	if (syncReconciliation.hasPendingPhysicalWork(deps.syncReconciliation)) {
+	await settleFullPhysicalWork(deps, result);
+}
+
+/** Recheck physical actions and moves after final canonical publication. */
+async function settleFullPhysicalWork(
+	deps: Dependencies,
+	result: SyncResult,
+): Promise<void> {
+	if (
+		reconcilePhysicalRecovery.hasPendingPhysicalWork(
+			deps.syncReconciliation,
+		)
+	) {
 		deps.setSyncPhase("cleanup");
 	}
-	await syncReconciliation.resumePendingPhysicalActions(
+	await reconcilePhysicalRecovery.resumePendingPhysicalActions(
 		deps.syncReconciliation,
 		result,
 	);
-	await syncReconciliation.resumePendingMoves(
+	await reconcilePhysicalRecovery.resumePendingMoves(
 		deps.syncReconciliation,
 		result,
 		true,
@@ -747,7 +901,7 @@ async function resolveFullConflicts(
 		);
 
 		try {
-			await syncReconciliation.handleConflict(
+			await reconcileConflictSettlement.handleConflict(
 				deps.syncReconciliation,
 				op,
 			);

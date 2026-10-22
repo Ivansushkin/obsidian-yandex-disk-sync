@@ -1,6 +1,6 @@
 import type {
 	EncryptionModeDescriptor,
-	IndexMaintenance,
+	EncryptionIndexMaintenance,
 	RemoteEncryptionManifest,
 } from "../../src/types";
 import type {
@@ -21,8 +21,8 @@ export function plaintextMode(): EncryptionModeDescriptor {
 }
 
 export function maintenance(
-	overrides: Partial<IndexMaintenance> = {},
-): IndexMaintenance {
+	overrides: Partial<EncryptionIndexMaintenance> = {},
+): EncryptionIndexMaintenance {
 	return {
 		id: "transition-a",
 		kind: "rotate",
@@ -66,7 +66,7 @@ export function encryptionManifest(
 /** Pair the manifest key and transition descriptor with canonical authority. */
 export function transitionManifest(
 	state: "enabling" | "rotating" | "disabling",
-	authority: IndexMaintenance,
+	authority: EncryptionIndexMaintenance,
 ): RemoteEncryptionManifest {
 	const mode = state === "disabling" ? authority.source : authority.target;
 	return encryptionManifest({

@@ -1,3 +1,8 @@
+/** Recognize JSON object records while excluding null and arrays. */
+export function isJsonRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
  * Define an own enumerable data property without invoking Object.prototype's
  * legacy `__proto__` setter. Persisted path maps must use this helper whenever

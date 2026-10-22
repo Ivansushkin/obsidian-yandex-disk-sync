@@ -1,12 +1,12 @@
+import JSZip from "jszip";
 import assert from "node:assert/strict";
+import test from "node:test";
 import { BackupManager } from "../src/backup/backup-manager";
 import {
 	captureLogicalVaultSnapshot,
 	captureRemoteRawSnapshot,
 } from "../src/backup/backup-snapshot";
 import type { ForcePreflightProof } from "../src/sync/contracts";
-import JSZip from "jszip";
-import test from "node:test";
 import { computeSha256 } from "../src/utils/hash-utils";
 import {
 	MemoryDisk,
@@ -638,7 +638,14 @@ for (const encrypted of [false, true]) {
 								}
 							};
 							assert.equal(
-								(await b.engine.fullSync()).success,
+								(
+									await b.engine.fullSync({
+										epochAdoption: {
+											epoch: (await a.canonical()).epoch,
+											decision: "preserve",
+										},
+									})
+								).success,
 								false,
 							);
 							await b.stop();
@@ -664,7 +671,35 @@ for (const encrypted of [false, true]) {
 								failed,
 							);
 						}
-						await b.full();
+						const gated = await b.engine.fullSync();
+						assert.equal(
+							gated.errors[0]?.code,
+							"epoch-decision-required",
+						);
+						b.engine.setEpochAdoptionDecisionCallback(
+							async () => null,
+						);
+						disk.beforeRequest = async (
+							method,
+							_endpoint,
+							path,
+						) => {
+							if (
+								method === "GET" &&
+								path === "vault/.obsidian-sync-index.json"
+							) {
+								b.engine.setEpochAdoptionDecisionCallback(
+									async () => "preserve",
+								);
+							}
+						};
+						const accepted = await b.engine.fullSync();
+						disk.beforeRequest = undefined;
+						assert.equal(
+							accepted.success,
+							true,
+							JSON.stringify(accepted.errors),
+						);
 						await a.full();
 						await a.assertSettled({
 							"Authoritative.md": "force local",

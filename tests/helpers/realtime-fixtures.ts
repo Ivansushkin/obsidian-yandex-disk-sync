@@ -1,4 +1,3 @@
-import { fileMetadata as metadata } from "./metadata";
 import type { App, TFile } from "obsidian";
 import type { VaultAdapter } from "../../src/api/vault-adapter";
 import type { YandexDiskClient } from "../../src/api/yandex-client";
@@ -12,16 +11,16 @@ import type { LocalOperationStore } from "../../src/sync/local/operation-store";
 import type {
 	DurableFileRenameEvent,
 	DurableFolderRenameEvent,
-	FileRenameOutcome,
 	RealtimeBatchResult,
 	RealtimeFileEvent,
 	WatcherCausalContext,
 } from "../../src/sync/realtime/rules";
+import type { WatcherSettlement } from "../../src/sync/realtime/settlement";
 import {
 	FileWatcher,
 	type DeferredWatcherEvent,
 } from "../../src/sync/realtime/watcher";
-import type { Dependencies as ReconciliationDependencies } from "../../src/sync/reconciliation/commits";
+import type { Dependencies as ReconciliationDependencies } from "../../src/sync/reconciliation/context";
 import {
 	createEmptyIndex,
 	DEFAULT_SETTINGS,
@@ -30,6 +29,7 @@ import {
 	type SyncIndex,
 	type SyncResult,
 } from "../../src/types";
+import { fileMetadata as metadata } from "./metadata";
 
 export const causalContext: WatcherCausalContext = {
 	epoch: "epoch-a",
@@ -105,7 +105,6 @@ export function syncResult(): SyncResult {
 /** Keep private watcher access narrow while reusing the production event contracts. */
 export interface WatcherAccess {
 	isEnabled: boolean;
-	deferredEvents: DeferredWatcherEvent[];
 	submittedFileEvents: Map<string, RealtimeFileEvent>;
 	submittedWatcherEventIds: Set<string>;
 	deferEvent(event: DeferredWatcherEvent): boolean;
@@ -113,10 +112,7 @@ export interface WatcherAccess {
 	drainPendingFileEvents(): void;
 	flushDeferredEventsNow(): Promise<void>;
 	flushDeferredEvents(onlyIds?: ReadonlySet<string>): Promise<void>;
-	settleRenameEvent(
-		event: DeferredWatcherEvent,
-		outcome: FileRenameOutcome,
-	): Promise<void>;
+	settlement: Pick<WatcherSettlement, "settleRenameEvent">;
 	applyBatchResult(result: RealtimeBatchResult): void;
 	cancelPendingSync(path: string): void;
 	captureFullSyncBarrier(context: SyncLifecycleContext): void;

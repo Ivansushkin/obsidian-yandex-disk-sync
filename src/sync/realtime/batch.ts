@@ -10,18 +10,28 @@ import type {
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
-import * as fileOperations from "../files/operations";
 import { IndexManager } from "../canonical/manager";
+import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
+import * as fileOperations from "../files/operations";
+import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
+import * as syncReconciliation from "../reconciliation/commits";
+import * as reconciliationContext from "../reconciliation/context";
 import {
 	createRealtimeBatchResult,
 	isMissingUploadSuperseded,
+	isUploadEventApplied,
+	matchesUploadReceiptContent,
 	wasMutationApplied,
 	type RealtimeBatchResult,
 	type RealtimeFileEvent,
 	type UploadCausalReceipt,
 } from "./rules";
-import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
-import * as syncReconciliation from "../reconciliation/commits";
+export { isUploadEventApplied } from "./rules";
+
+// Internal retained-plaintext policy, not a whole-heap or single-file cap.
+const MAX_REALTIME_WINDOW_EVENTS = 32;
+const REALTIME_WINDOW_BYTES = 8 * 1024 * 1024;
+
 export interface Dependencies {
 	indexManager: IndexManager;
 	settings: YandexDiskSyncSettings;
@@ -44,7 +54,8 @@ export interface Dependencies {
 	vaultAdapter: VaultAdapter;
 	indexSaveCallback: IndexSaveCallback | null;
 	fileOperations: fileOperations.Dependencies;
-	syncReconciliation: syncReconciliation.Dependencies;
+	syncReconciliation: reconciliationContext.Dependencies;
+	settleWindow?: (result: RealtimeBatchResult) => Promise<void>;
 }
 interface PreparedRealtimeItem {
 	id: string;
@@ -126,8 +137,7 @@ export async function recoverUploadCausalReceipt(
 		applied &&
 		canonical.epoch === event.epoch &&
 		source &&
-		!source.deleted &&
-		source.sha256 === event.snapshotSha256
+		matchesUploadReceiptContent(source, event.snapshotSha256)
 	) {
 		deps.indexManager.updateLocalFile(event.path, {
 			...source,
@@ -209,9 +219,7 @@ export function createCommittedUploadReceipt(
 			canonical.appliedMutationSeq,
 		) &&
 		canonical.epoch === item.mutation.epoch &&
-		source !== undefined &&
-		!source.deleted &&
-		source.sha256 === item.snapshot?.sha256;
+		matchesUploadReceiptContent(source, item.snapshot?.sha256);
 	let reason: UploadCausalReceipt["reason"] = "unresolved";
 	if (accepted) {
 		reason = "accepted-put";
@@ -238,22 +246,6 @@ export function createCommittedUploadReceipt(
 		mutationSeq: item.mutation.seq,
 		sha256: item.snapshot?.sha256,
 	};
-}
-
-/** Match an event to the canonical device watermark and file receipt. */
-export function isUploadEventApplied(
-	event: RealtimeFileEvent,
-	appliedMutationSeq: Record<string, number>,
-): boolean {
-	if (!event.mutationId || event.mutationSeq === undefined) {
-		return false;
-	}
-	const separator = event.mutationId.lastIndexOf(":");
-	if (separator <= 0) {
-		return false;
-	}
-	const deviceId = event.mutationId.slice(0, separator);
-	return (appliedMutationSeq[deviceId] ?? 0) >= event.mutationSeq;
 }
 
 /** Recover terminal upload work from the current canonical watermark. */
@@ -283,7 +275,7 @@ export function classifyAppliedUploadEvent(
 	const source = canonical.files[event.path];
 	let status: UploadCausalReceipt["status"] = "rejected-put";
 	let reason: UploadCausalReceipt["reason"] = "unresolved";
-	if (source && !source.deleted && source.sha256 === event.snapshotSha256) {
+	if (source && matchesUploadReceiptContent(source, event.snapshotSha256)) {
 		status = "accepted-put";
 		reason = "idempotent";
 		deps.indexManager.updateLocalFile(event.path, source);
@@ -387,17 +379,86 @@ export async function reconcileRealtimeBatch(
 		total: events.length,
 	});
 
-	const prepared = await prepareRealtimeEvents(deps, events, batchResult);
-	if (prepared.length === 0) {
-		return batchResult;
+	let cursor = 0;
+	while (cursor < events.length) {
+		const result = createRealtimeBatchResult();
+		if (cursor > 0) {
+			const guard = await deps.getSyncGuardResult(false, validationToken);
+			if (guard.blockReason || deps.isPaused) {
+				if (guard.blockReason) {
+					deps.setBlockedState(guard.blockReason);
+				}
+				result.retry.push(
+					...events.slice(cursor).map((event) => event.id),
+				);
+				await deps.settleWindow?.(result);
+				batchResult.retry.push(...result.retry);
+				break;
+			}
+		}
+		const { prepared, consumed } = await prepareRealtimeEvents(
+			deps,
+			events.slice(cursor, cursor + MAX_REALTIME_WINDOW_EVENTS),
+			result,
+		);
+		try {
+			await applyPreparedRealtimeWindow(deps, prepared, result);
+			cursor += consumed;
+			if (result.retry.length > 0) {
+				result.retry.push(
+					...events.slice(cursor).map((event) => event.id),
+				);
+			}
+			await deps.settleWindow?.(result);
+			batchResult.completed.push(...result.completed);
+			batchResult.superseded.push(...result.superseded);
+			batchResult.retry.push(...result.retry);
+			batchResult.uploadReceipts.push(...result.uploadReceipts);
+			if (result.requiresFullSync) {
+				batchResult.requiresFullSync = result.requiresFullSync;
+			}
+		} finally {
+			// Repair and durable settlement have finished, or retry must recapture bytes.
+			for (const item of prepared) {
+				delete item.snapshot;
+			}
+			prepared.length = 0;
+		}
+		deps.setSyncPhase("applying", t("status.op.applying_realtime"), {
+			completed:
+				batchResult.completed.length + batchResult.superseded.length,
+			total: events.length,
+		});
+		if (result.retry.length > 0) {
+			break;
+		}
 	}
+	if (batchResult.retry.length > 0) {
+		logger.warn("Realtime file batch completed with retry events", {
+			completed: batchResult.completed.length,
+			superseded: batchResult.superseded.length,
+			retry: batchResult.retry.length,
+		});
+	}
+	return batchResult;
+}
+
+/** Commit and repair a bounded prefix before its snapshots can be released. */
+async function applyPreparedRealtimeWindow(
+	deps: Dependencies,
+	prepared: PreparedRealtimeItem[],
+	batchResult: RealtimeBatchResult,
+): Promise<RealtimeBatchResult> {
 	if (deps.indexSaveCallback) {
 		await deps.indexSaveCallback();
 	}
 
+	if (prepared.length === 0) {
+		return batchResult;
+	}
+
 	const ready: typeof prepared = [];
 	const accepted: typeof prepared = [];
-	let failedIndex = -1;
 	for (let index = 0; index < prepared.length; index++) {
 		const item = prepared[index]!;
 		try {
@@ -449,7 +510,6 @@ export async function reconcileRealtimeBatch(
 				eventId: item.id,
 				error: e,
 			});
-			failedIndex = index;
 			batchResult.retry.push(
 				...prepared.slice(index).map((event) => event.id),
 			);
@@ -493,7 +553,7 @@ export async function reconcileRealtimeBatch(
 		);
 		return batchResult;
 	}
-	await syncReconciliation.repairMissingAcceptedUploads(
+	await reconcileAcceptedUploads.repairMissingAcceptedUploads(
 		deps.syncReconciliation,
 		accepted
 			.filter((item) => item.action === "upload")
@@ -557,17 +617,7 @@ export async function reconcileRealtimeBatch(
 	if (deps.indexSaveCallback) {
 		await deps.indexSaveCallback();
 	}
-	deps.setSyncPhase("applying", t("status.op.applying_realtime"), {
-		completed: batchResult.completed.length + batchResult.superseded.length,
-		total: events.length,
-	});
-	if (failedIndex >= 0) {
-		logger.warn("Realtime file batch completed with retry events", {
-			completed: batchResult.completed.length,
-			superseded: batchResult.superseded.length,
-			retry: batchResult.retry.length,
-		});
-	}
+
 	return batchResult;
 }
 
@@ -576,9 +626,12 @@ async function prepareRealtimeEvents(
 	deps: Dependencies,
 	events: RealtimeFileEvent[],
 	batchResult: RealtimeBatchResult,
-): Promise<PreparedRealtimeItem[]> {
+): Promise<{ prepared: PreparedRealtimeItem[]; consumed: number }> {
 	const prepared: PreparedRealtimeItem[] = [];
+	let consumed = 0;
+	let retainedBytes = 0;
 	for (const event of events) {
+		consumed++;
 		if (!deps.vaultAdapter.shouldSync(event.path)) {
 			batchResult.completed.push(event.id);
 			continue;
@@ -593,6 +646,7 @@ async function prepareRealtimeEvents(
 					batchResult.superseded.push(event.id);
 				} else {
 					batchResult.retry.push(event.id);
+					break;
 				}
 				logger.info("Realtime upload recovered before physical write", {
 					eventId: event.id,
@@ -639,6 +693,7 @@ async function prepareRealtimeEvents(
 						receipt.status !== "pending-put")
 				) {
 					batchResult.retry.push(event.id);
+					break;
 				} else if (receipt.status === "accepted-put") {
 					batchResult.completed.push(event.id);
 				} else {
@@ -681,12 +736,34 @@ async function prepareRealtimeEvents(
 							baseRevision: event.baseRevision,
 						},
 					);
+					break;
 				}
 				continue;
 			}
 			try {
+				const estimate =
+					deps.vaultAdapter.getFile(event.path)?.stat.size ?? 0;
+				if (
+					consumed > 1 &&
+					(estimate > REALTIME_WINDOW_BYTES ||
+						retainedBytes + estimate > REALTIME_WINDOW_BYTES)
+				) {
+					consumed--;
+					break;
+				}
 				const content = await deps.vaultAdapter.readFile(event.path);
+				if (
+					consumed > 1 &&
+					(content.byteLength > REALTIME_WINDOW_BYTES ||
+						retainedBytes + content.byteLength >
+							REALTIME_WINDOW_BYTES)
+				) {
+					// Discard an underestimated read; the next window captures fresh bytes/SHA.
+					consumed--;
+					break;
+				}
 				const sha256 = await computeSha256(content);
+				retainedBytes += content.byteLength;
 				const mutation =
 					reusePendingFileMutation(deps, event, "put", sha256) ??
 					deps.indexManager.enqueueMutation("put", event.path, {
@@ -708,12 +785,16 @@ async function prepareRealtimeEvents(
 					snapshot: { content, sha256 },
 					event,
 				});
+				if (retainedBytes >= REALTIME_WINDOW_BYTES) {
+					break;
+				}
 			} catch (e) {
 				logger.warn(
 					`Could not prepare realtime upload ${event.path}:`,
 					{ eventId: event.id, error: e },
 				);
 				batchResult.retry.push(event.id);
+				break;
 			}
 			continue;
 		}
@@ -775,5 +856,5 @@ async function prepareRealtimeEvents(
 				}),
 		});
 	}
-	return prepared;
+	return { prepared, consumed };
 }

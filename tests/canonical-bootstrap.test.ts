@@ -1,3 +1,4 @@
+import { encryptionFlow } from "./helpers/encryption-flow";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -10,13 +11,19 @@ import type { ForcePreflightProof } from "../src/sync/contracts";
 import { MemoryDisk, bytes, codecFor, device } from "./helpers/sync-flow";
 import YandexDiskSyncPlugin from "../src/main";
 import type { ForceSyncController } from "../src/sync/workflows/force-controller";
+import type { CanonicalRecovery } from "../src/sync/canonical/recovery";
+import { isRemoteReadTimeout, OperationFailure } from "../src/errors";
+import { logger } from "../src/utils/logger";
 
 /** Keep plugin admission/controller wiring while replacing only presentation and host persistence. */
 function forceUi(a: ReturnType<typeof device>) {
+	const settings = { ...a.settings, yandexTokenSecret: "synthetic" };
+	const encryption = encryptionFlow(a, { getSettings: () => settings });
 	return Object.assign(
 		Object.create(YandexDiskSyncPlugin.prototype) as object,
 		{
-			settings: { ...a.settings, yandexTokenSecret: "synthetic" },
+			settings,
+			encryptionWorkflow: encryption.workflow,
 			indexManager: a.index,
 			yandexClient: a.client,
 			vaultAdapter: a.adapter,
@@ -26,6 +33,9 @@ function forceUi(a: ReturnType<typeof device>) {
 			storageBinding: { ensure: async () => true },
 			remoteStateValidated: false,
 			encryptionTransition: null,
+			forceRecovery: null,
+			localStateRestored: true,
+			syncLifecycleRegistered: true,
 			confirmForceSync: async () => "without-backup",
 			renderForceProgress: () => {},
 			isForceSyncUnavailable: () => false,
@@ -36,8 +46,11 @@ function forceUi(a: ReturnType<typeof device>) {
 		},
 	) as unknown as {
 		settings: typeof a.settings;
-		prepareForceSync(): Promise<{
+		prepareForceSync(direction: "from_local" | "from_remote"): Promise<{
 			canonical: ForcePreflightProof["canonical"];
+			replacement: NonNullable<
+				import("../src/sync/contracts").SyncRunOptions["forceReplacement"]
+			>;
 		} | null>;
 		getForceSyncController(): ForceSyncController;
 	};
@@ -81,6 +94,393 @@ async function forceProof(
 	return proof;
 }
 
+test("stale lock codec fallback reuses stable bytes and stops unresolved reads", async () => {
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "device-a", codec, undefined, undefined, {
+			readTimeoutMs: 15,
+		});
+		const recovery = (a.index as unknown as { recovery: CanonicalRecovery })
+			.recovery;
+		const lockPath = "vault/.obsidian-sync-index.lock.interrupted";
+		const canonicalPath = "vault/.obsidian-sync-index.json";
+		const content = bytes(JSON.stringify(createEmptyIndex("device-b")));
+		const raw = codec ? await codec.encrypt(content) : content;
+		disk.files.set(lockPath, raw);
+		const resource = await a.client.getResource(lockPath, 1, 0, true);
+		assert.ok(resource);
+		const local = a.index.captureLocalCausalState();
+		const originalNow = Date.now;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let complete!: () => void;
+		const lateReply = new Promise<void>((resolve) => {
+			complete = resolve;
+		});
+		let downloads = 0;
+		try {
+			await recovery.recoverStaleLock([resource]);
+			Date.now = () => originalNow() + 121000;
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (endpoint === "/download" && path === lockPath) {
+					downloads++;
+					await gate;
+				}
+			};
+			disk.afterRequest = async (_method, endpoint, path) => {
+				if (endpoint === "/download" && path === lockPath) {
+					complete();
+				}
+			};
+			await assert.rejects(
+				recovery.recoverStaleLock([resource]),
+				(error) => {
+					const failure = new OperationFailure(error, {
+						stage: "stale-lock",
+						action: "read",
+					});
+					assert.equal(failure.summary.code, "remote-read-timeout");
+					assert.equal(failure.summary.requestState, "unresolved");
+					return isRemoteReadTimeout(error);
+				},
+			);
+			assert.equal(downloads, 1);
+			release();
+			await lateReply;
+			assert.deepEqual(disk.files.get(lockPath), raw);
+			assert.equal(disk.files.has(canonicalPath), false);
+			assert.deepEqual(a.index.captureLocalCausalState(), local);
+			disk.afterRequest = undefined;
+			downloads = 0;
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (endpoint === "/download" && path === lockPath) {
+					downloads++;
+				}
+			};
+			// The other mode cannot decode these bytes; target must use the same raw read.
+			a.index.setIndexTransitionServices(
+				encrypted ? null : await codecFor(true),
+				codec,
+			);
+			await recovery.recoverStaleLock([resource]);
+			assert.equal(downloads, 1);
+			assert.deepEqual(disk.files.get(canonicalPath), raw);
+			assert.equal(disk.files.has(lockPath), false);
+			assert.deepEqual(a.index.captureLocalCausalState(), local);
+		} finally {
+			release();
+			Date.now = originalNow;
+			disk.beforeRequest = undefined;
+			disk.afterRequest = undefined;
+			await a.stop();
+		}
+	}
+});
+
+test("stale recovery resets renewed lock leases before read move and retry", async () => {
+	for (const boundary of ["before-read", "after-read", "retry"] as const) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(boundary === "after-read");
+		const a = device(disk, "reader", codec, undefined, undefined, {
+			maxRetries: 1,
+		});
+		const recovery = (a.index as unknown as { recovery: CanonicalRecovery })
+			.recovery;
+		const lockPath = "vault/.obsidian-sync-index.lock.owner.attempt";
+		const canonicalPath = "vault/.obsidian-sync-index.json";
+		const index = createEmptyIndex("owner");
+		const raw = bytes(JSON.stringify(index));
+		const next = bytes(JSON.stringify({ ...index, revision: 1 }));
+		const initial = codec ? await codec.encrypt(raw) : raw;
+		const renewed = codec ? await codec.encrypt(next) : next;
+		disk.files.set(lockPath, initial);
+		disk.files.set("vault/note.md", bytes("preserved"));
+		const local = a.index.captureLocalCausalState();
+		const resource = await a.client.getResource(lockPath, 1, 0, true);
+		assert.ok(resource);
+		const originalNow = Date.now;
+		const originalWarn = logger.warn.bind(logger);
+		let now = originalNow();
+		let downloaded = false;
+		let changed = false;
+		let recovered = false;
+		Date.now = () => now;
+		logger.warn = (message) => {
+			recovered ||= message.startsWith("Recovered stale index lock");
+		};
+		try {
+			await recovery.recoverStaleLock([resource]);
+			now += 121000;
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (
+					boundary === "before-read" &&
+					!changed &&
+					path === lockPath
+				) {
+					disk.files.set(lockPath, renewed);
+					changed = true;
+				}
+				if (endpoint === "/download" && path === lockPath) {
+					downloaded = true;
+				}
+			};
+			disk.afterRequest = async (_method, endpoint, path) => {
+				if (
+					boundary === "after-read" &&
+					!changed &&
+					downloaded &&
+					path === lockPath &&
+					endpoint.endsWith("/resources")
+				) {
+					disk.files.set(lockPath, renewed);
+					changed = true;
+				}
+			};
+			const request = disk.request.bind(disk);
+			disk.request = async (params) => {
+				if (
+					boundary === "retry" &&
+					!changed &&
+					new URL(params.url).pathname.endsWith("/resources/move")
+				) {
+					disk.files.set(lockPath, renewed);
+					changed = true;
+					return {
+						status: 503,
+						json: {},
+						text: "",
+						arrayBuffer: new ArrayBuffer(0),
+						headers: {},
+					};
+				}
+				return request(params);
+			};
+			await recovery.recoverStaleLock([resource]);
+			assert.equal(changed, true, boundary);
+			assert.equal(disk.files.has(canonicalPath), false, boundary);
+			assert.deepEqual(disk.files.get(lockPath), renewed, boundary);
+			assert.equal(recovered, false, boundary);
+			const fresh = await a.client.getResource(lockPath, 1, 0, true);
+			assert.ok(fresh);
+			now += 1000;
+			await recovery.recoverStaleLock([fresh]);
+			assert.equal(
+				disk.files.has(canonicalPath),
+				false,
+				"renewal needs its own full lease",
+			);
+			now += 120000;
+			await recovery.recoverStaleLock([fresh]);
+			assert.deepEqual(disk.files.get(canonicalPath), renewed);
+			assert.equal(disk.files.has(lockPath), false);
+			assert.deepEqual(
+				disk.files.get("vault/note.md"),
+				bytes("preserved"),
+			);
+			assert.deepEqual(a.index.captureLocalCausalState(), local);
+		} finally {
+			Date.now = originalNow;
+			logger.warn = originalWarn;
+			await a.stop();
+		}
+	}
+});
+
+test("stale recovery verifies lost move replies and rejects competing publication", async () => {
+	for (const outcome of [
+		"lost-reply",
+		"changed-canonical",
+		"second-lock",
+		"renewed-at-server",
+	] as const) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(outcome === "lost-reply");
+		const a = device(disk, "reader", codec);
+		a.index.setIndexTransitionServices(codec, null);
+		const recovery = (a.index as unknown as { recovery: CanonicalRecovery })
+			.recovery;
+		const lockPath = "vault/.obsidian-sync-index.lock.owner.attempt";
+		const otherPath = "vault/.obsidian-sync-index.lock.other.attempt";
+		const canonicalPath = "vault/.obsidian-sync-index.json";
+		const index = createEmptyIndex("owner");
+		const content = bytes(JSON.stringify(index));
+		const raw = codec ? await codec.encrypt(content) : content;
+		const foreign = bytes(
+			JSON.stringify(
+				outcome === "renewed-at-server"
+					? { ...index, revision: 1 }
+					: createEmptyIndex("other"),
+			),
+		);
+		if (outcome === "lost-reply") {
+			const resource = disk.resource.bind(disk);
+			disk.resource = async (path) => {
+				const metadata = await resource(path);
+				if (metadata) {
+					delete metadata.sha256;
+				}
+				return metadata;
+			};
+		}
+		disk.files.set(lockPath, raw);
+		const resource = await a.client.getResource(lockPath, 1, 0, true);
+		assert.ok(resource);
+		const originalNow = Date.now;
+		const originalWarn = logger.warn.bind(logger);
+		let recovered = false;
+		logger.warn = (message) => {
+			recovered ||= message.startsWith("Recovered stale index lock");
+		};
+		try {
+			await recovery.recoverStaleLock([resource]);
+			Date.now = () => originalNow() + 121000;
+			disk.beforeRequest = async (_method, endpoint) => {
+				if (
+					outcome === "renewed-at-server" &&
+					endpoint.endsWith("/resources/move") &&
+					disk.files.has(lockPath)
+				) {
+					disk.files.set(lockPath, foreign);
+				}
+			};
+			disk.afterRequest = async (_method, endpoint, path) => {
+				if (
+					outcome === "second-lock" &&
+					endpoint === "/download" &&
+					path === lockPath
+				) {
+					disk.files.set(otherPath, foreign);
+				}
+				if (endpoint.endsWith("/resources/move")) {
+					if (outcome === "renewed-at-server") {
+						return;
+					}
+					if (
+						outcome === "changed-canonical" &&
+						path === canonicalPath
+					) {
+						disk.files.set(canonicalPath, foreign);
+						return;
+					}
+					if (path === canonicalPath) {
+						throw new Error("synthetic lost move reply");
+					}
+				}
+			};
+			if (outcome === "renewed-at-server") {
+				await recovery.recoverStaleLock([resource]);
+				assert.equal(disk.files.has(canonicalPath), false);
+				assert.deepEqual(disk.files.get(lockPath), foreign);
+				assert.equal(disk.files.size, 1);
+				assert.equal(recovered, false);
+			} else if (outcome === "lost-reply") {
+				await recovery.recoverStaleLock([resource]);
+				assert.deepEqual(disk.files.get(canonicalPath), raw);
+				assert.equal(disk.files.has(lockPath), false);
+				assert.equal(recovered, true);
+			} else {
+				await assert.rejects(recovery.recoverStaleLock([resource]));
+				assert.equal(recovered, false);
+				assert.deepEqual(
+					disk.files.get(
+						outcome === "second-lock" ? lockPath : canonicalPath,
+					),
+					outcome === "second-lock" ? raw : foreign,
+				);
+				if (outcome === "second-lock") {
+					assert.deepEqual(disk.files.get(otherPath), foreign);
+					assert.equal(disk.files.has(canonicalPath), false);
+				}
+			}
+		} finally {
+			Date.now = originalNow;
+			logger.warn = originalWarn;
+			await a.stop();
+		}
+	}
+});
+
+test("stale recovery claims survive restart and preserve a resurrected owner lock", async () => {
+	for (const fault of ["restart", "resurrected-owner"] as const) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(true);
+		const a = device(disk, "reader", codec);
+		const recovery = (a.index as unknown as { recovery: CanonicalRecovery })
+			.recovery;
+		const lockPath = "vault/.obsidian-sync-index.lock.owner.attempt";
+		const canonicalPath = "vault/.obsidian-sync-index.json";
+		const index = createEmptyIndex("owner");
+		const raw = await codec!.encrypt(bytes(JSON.stringify(index)));
+		const renewed = await codec!.encrypt(
+			bytes(JSON.stringify({ ...index, revision: 1 })),
+		);
+		disk.files.set(lockPath, raw);
+		const resource = await a.client.getResource(lockPath, 1, 0, true);
+		assert.ok(resource);
+		const originalNow = Date.now;
+		let now = originalNow();
+		let claimPath = "";
+		Date.now = () => now;
+		try {
+			await recovery.recoverStaleLock([resource]);
+			now += 121000;
+			disk.beforeRequest = async (_method, endpoint, path) => {
+				if (
+					fault === "restart" &&
+					endpoint === "/download" &&
+					path !== lockPath
+				) {
+					throw new Error("synthetic interrupted claim read");
+				}
+			};
+			disk.afterRequest = async (_method, endpoint, path) => {
+				if (
+					endpoint.endsWith("/resources/move") &&
+					path !== canonicalPath
+				) {
+					claimPath = path;
+					if (fault === "resurrected-owner") {
+						disk.files.set(lockPath, renewed);
+					}
+				}
+			};
+			await assert.rejects(recovery.recoverStaleLock([resource]));
+			assert.equal(disk.files.has(canonicalPath), false);
+			assert.deepEqual(disk.files.get(claimPath), raw);
+			if (fault === "resurrected-owner") {
+				assert.deepEqual(disk.files.get(lockPath), renewed);
+				continue;
+			}
+			disk.beforeRequest = undefined;
+			disk.afterRequest = undefined;
+			const b = device(disk, "restarted-reader", codec);
+			try {
+				const restarted = (
+					b.index as unknown as { recovery: CanonicalRecovery }
+				).recovery;
+				await restarted.recoverStaleLock();
+				assert.equal(
+					disk.files.has(canonicalPath),
+					false,
+					"restart starts a fresh lease",
+				);
+				now += 121000;
+				await restarted.recoverStaleLock();
+				assert.deepEqual(disk.files.get(canonicalPath), raw);
+				assert.equal(disk.files.size, 1);
+			} finally {
+				await b.stop();
+			}
+		} finally {
+			Date.now = originalNow;
+			await a.stop();
+		}
+	}
+});
+
 test("Force local rebuilds a cleared disk and another device adopts it", async () => {
 	for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
@@ -108,7 +508,15 @@ test("Force local rebuilds a cleared disk and another device adopts it", async (
 			assert.equal(result.success, true, JSON.stringify(result.errors));
 			assert.notEqual((await a.canonical()).epoch, previousEpoch);
 			assert.equal((await a.canonical()).deviceId, "device-a");
-			await b.full();
+			const blocked = await b.engine.fullSync();
+			assert.equal(blocked.errors[0]?.code, "epoch-decision-required");
+			const adopted = await b.engine.fullSync({
+				epochAdoption: {
+					epoch: (await a.canonical()).epoch,
+					decision: "preserve",
+				},
+			});
+			assert.equal(adopted.success, true, JSON.stringify(adopted.errors));
 			await a.full();
 			await a.assertSettled({ "Note.md": "offline edit" });
 			await b.assertSettled({ "Note.md": "offline edit" });
@@ -474,15 +882,14 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 		}
 		const before = await captureRemoteRawSnapshot(a.client, "vault");
 		const plugin = forceUi(a);
-		const prepared = await plugin.prepareForceSync();
+		const prepared = await plugin.prepareForceSync("from_local");
 		assert.equal(prepared?.canonical.state, "absent");
 		assert.equal(
 			(await captureRemoteRawSnapshot(a.client, "vault")).digest,
 			before.digest,
 		);
-		const proof = await forceProof(a, "from_local");
 		const result = await a.engine.forceSyncFromLocal({
-			forcePreflightProof: { ...proof, canonical: prepared.canonical },
+			forceReplacement: prepared.replacement,
 		});
 		assert.equal(result.success, true, JSON.stringify(result.errors));
 		await a.assertSettled({});
@@ -514,17 +921,14 @@ test("Force UI never reports success while a changed orphan survives its final f
 		await controller.run("from_local");
 		assert.equal(controller.getState()?.outcome, "cleanup-pending");
 		assert.deepEqual(disk.files.get(path), changed);
-		assert.equal(
-			a.index.getObservedEpoch(),
-			a.index.getRemoteIndex().epoch,
-		);
+		assert.equal(a.index.getObservedEpoch(), null);
 	} finally {
 		disk.afterRequest = undefined;
 		await a.stop();
 	}
 });
 
-test("Force admission cannot start implicit encryption recovery or replace maintenance", async () => {
+test("directional Force admission ignores destination maintenance without implicit recovery", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	try {
@@ -555,13 +959,8 @@ test("Force admission cannot start implicit encryption recovery or replace maint
 		disk.files.set("vault/.obsidian-sync-index.json", raw);
 		const plugin = forceUi(a);
 		plugin.settings.enableEncryption = true;
-		Object.assign(plugin, {
-			encryptionTransitionController: {
-				createRemoteTargetRecoveryPlan: () => ({}),
-			},
-			recoverRemotePlaintextTargetTransition: async () => {},
-		});
-		assert.equal(await plugin.prepareForceSync(), null);
+		plugin.settings.encryptionPassword = "synthetic-password";
+		assert.ok(await plugin.prepareForceSync("from_local"));
 		assert.deepEqual(
 			disk.files.get("vault/.obsidian-sync-index.json"),
 			raw,

@@ -1,3 +1,9 @@
+import { t } from "./i18n/index";
+import type { StartupState } from "./plugin-startup";
+import type { SyncResult } from "./types";
+import type { SyncEngine } from "./sync/engine";
+import type { FileWatcher } from "./sync/realtime/watcher";
+import type { SyncScheduler } from "./sync/scheduler";
 import type { YandexDiskSyncSettings } from "./types";
 
 const USER_SETTING_KEYS = [
@@ -90,4 +96,114 @@ export function prepareSettingsPatch(
 				key === "clientId",
 		),
 	};
+}
+
+interface SettingsWorkflowPorts {
+	getSettings(): YandexDiskSyncSettings;
+	persistenceFailed(): boolean;
+	isConfigurationBusy(): boolean;
+	hasTransition(): boolean;
+	hasDurableConfigurationWork(): boolean;
+	isUnloaded(): boolean;
+	isLayoutReady(): boolean;
+	setUpdating(updating: boolean): void;
+	stopRegularSync(): void;
+	markRegularStarted(): void;
+	invalidateRemoteStateClassification(): void;
+	settingsSaveRejected(): void;
+	persistPluginData(patch: UserSettingsPatch): Promise<void>;
+	refreshRemoteStartupState(
+		prompt: boolean,
+		recovery: boolean,
+	): Promise<StartupState>;
+	reconcile(): Promise<SyncResult | null>;
+	watcher?: Pick<FileWatcher, "waitForPendingPersistence" | "start">;
+	scheduler: Pick<SyncScheduler, "start">;
+	engine?: Pick<
+		SyncEngine,
+		"hasPendingWork" | "setExternalBlock" | "isSyncPaused"
+	>;
+}
+
+/** Drain watcher work before enqueueing a draft; publish and reclassify after save. */
+export async function applyUserSettingsPatch(
+	deps: SettingsWorkflowPorts,
+	patch: UserSettingsPatch,
+): Promise<void> {
+	const draft = prepareSettingsPatch(deps.getSettings(), patch);
+	patch = {
+		...patch,
+		...(patch.syncPatterns
+			? { syncPatterns: [...patch.syncPatterns] }
+			: {}),
+		...(patch.excludePatterns
+			? { excludePatterns: [...patch.excludePatterns] }
+			: {}),
+	};
+	const recoveringPersistence = deps.persistenceFailed();
+	const changesScope = draft.changesScope || recoveringPersistence;
+	if (
+		changesScope &&
+		(deps.isConfigurationBusy() ||
+			(deps.hasTransition() && draft.changesTransitionScope))
+	) {
+		throw new Error(t("notice.configuration_busy"));
+	}
+	if (draft.changesDestination && deps.hasDurableConfigurationWork()) {
+		throw new Error(t("notice.configuration_busy"));
+	}
+	if (changesScope) {
+		deps.setUpdating(true);
+		deps.stopRegularSync();
+		deps.engine?.setExternalBlock(
+			"authentication",
+			t("notice.configuration_busy"),
+		);
+	}
+	try {
+		if (changesScope) {
+			await deps.watcher?.waitForPendingPersistence();
+			if (
+				deps.engine?.hasPendingWork() ||
+				(draft.changesDestination && deps.hasDurableConfigurationWork())
+			) {
+				throw new Error(t("notice.configuration_busy"));
+			}
+		}
+		await deps.persistPluginData(patch);
+		if (deps.isUnloaded()) {
+			return;
+		}
+		if (changesScope) {
+			deps.invalidateRemoteStateClassification();
+			const ready = await deps.refreshRemoteStartupState(false, false);
+			if (
+				ready === "ready" &&
+				!deps.isUnloaded() &&
+				deps.isLayoutReady() &&
+				!deps.engine?.isSyncPaused()
+			) {
+				if (draft.needsFull || recoveringPersistence) {
+					const result = await deps.reconcile();
+					if (!result?.success) {
+						return;
+					}
+				}
+				if (!deps.isUnloaded() && !deps.engine?.isSyncPaused()) {
+					deps.watcher?.start();
+					deps.scheduler.start();
+					deps.markRegularStarted();
+				}
+			}
+		}
+	} catch (error) {
+		if (changesScope || deps.persistenceFailed()) {
+			deps.settingsSaveRejected();
+		}
+		throw error;
+	} finally {
+		if (changesScope) {
+			deps.setUpdating(false);
+		}
+	}
 }

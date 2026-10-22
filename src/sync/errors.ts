@@ -26,7 +26,7 @@ import {
 	PortablePathCollisionError,
 	RemoteMaintenanceActiveError,
 	UnreadableRemoteIndexError,
-} from "./canonical/manager";
+} from "./canonical/errors";
 
 /** Format one sanitized failure for Notice, desktop, mobile and dialogs. */
 export function formatOperationFailure(failure: FailureSummary): string {

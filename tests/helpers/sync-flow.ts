@@ -23,6 +23,7 @@ import {
 } from "../../src/crypto/encryption";
 import { computeSha256 } from "../../src/utils/hash-utils";
 import { logger } from "../../src/utils/logger";
+import { isProtectedPath, toLocalPath } from "../../src/utils/path-utils";
 
 export const bytes = (value: string) => new TextEncoder().encode(value).buffer;
 const parent = (path: string) =>
@@ -391,7 +392,7 @@ export function device(
 	codec: EncryptionCodec | null,
 	vault = new MemoryVault(),
 	saved?: SavedDevice,
-	clientOptions: { readTimeoutMs?: number } = {},
+	clientOptions: { readTimeoutMs?: number; maxRetries?: number } = {},
 ) {
 	disk.install();
 	logger.configure({ consoleEnabled: false, fileEnabled: false });
@@ -413,9 +414,9 @@ export function device(
 	const adapter = new VaultAdapter(app, settings);
 	const client = new YandexDiskClient({
 		token: "synthetic",
-		...clientOptions,
 		retryDelay: 0,
 		maxRetries: 0,
+		...clientOptions,
 	});
 	client.setRemotePath("vault");
 	client.setEncryptionService(codec);
@@ -546,10 +547,7 @@ export function device(
 			assert.deepEqual(
 				[...disk.files.keys()]
 					.filter(
-						(path) =>
-							!path.startsWith("vault/.backup/") &&
-							!path.startsWith("vault/.obsidian-sync-index") &&
-							!path.endsWith("/.obsidian-sync-encryption.json"),
+						(path) => !isProtectedPath(toLocalPath(path, "vault")),
 					)
 					.sort(),
 				expectedPhysical.sort(),

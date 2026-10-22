@@ -596,7 +596,15 @@ for (const encrypted of [false, true]) {
 			assert.ok(a.watcher.getDeferredEvents().length > 0);
 			disk.beforeRequest = undefined;
 			disk.afterRequest = undefined;
-			await a.full();
+			const gated = await a.engine.fullSync();
+			assert.equal(gated.errors[0]?.code, "epoch-decision-required");
+			const adopted = await a.engine.fullSync({
+				epochAdoption: {
+					epoch: (await b.canonical()).epoch,
+					decision: "preserve",
+				},
+			});
+			assert.equal(adopted.success, true, JSON.stringify(adopted.errors));
 			assert.equal(
 				a.index.getObservedEpoch(),
 				(await b.canonical()).epoch,

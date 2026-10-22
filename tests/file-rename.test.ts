@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { App } from "obsidian";
+import { TFile, type App } from "obsidian";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { IndexManager } from "../src/sync/canonical/manager";
 import { SyncEngine } from "../src/sync/engine";
 import type { RealtimeFileEvent } from "../src/sync/realtime/rules";
 import { FileWatcher } from "../src/sync/realtime/watcher";
-import * as syncReconciliation from "../src/sync/reconciliation/commits";
+import * as reconcileAcceptedUploads from "../src/sync/reconciliation/accepted-uploads";
 import { ConflictResolver } from "../src/sync/reconciliation/conflicts";
+import * as reconcilePhysicalRecovery from "../src/sync/reconciliation/physical-recovery";
 import * as fullSync from "../src/sync/workflows/full";
 import { DEFAULT_SETTINGS, type FileMetadata } from "../src/types";
 import { computeSha256 } from "../src/utils/hash-utils";
@@ -39,6 +40,11 @@ class RenameVaultFake {
 			throw new Error(`Missing local file: ${path}`);
 		}
 		return content.slice(0);
+	}
+
+	getFile(path: string) {
+		const content = this.files.get(path);
+		return content ? { stat: { size: content.byteLength } } : null;
 	}
 
 	getFileMtime() {
@@ -251,7 +257,7 @@ test("foreign delete after commit cancels proof-based physical repair", async ()
 		};
 	};
 
-	await syncReconciliation.repairMissingAcceptedUploads(
+	await reconcileAcceptedUploads.repairMissingAcceptedUploads(
 		reconciliationDependencies(engine),
 		[{ path: "note.md", snapshot: { content: fileContent, sha256 } }],
 		proof,
@@ -287,7 +293,7 @@ test("encryption change blocks proof-based physical repair", async () => {
 	}));
 
 	await assert.rejects(
-		syncReconciliation.repairMissingAcceptedUploads(
+		reconcileAcceptedUploads.repairMissingAcceptedUploads(
 			reconciliationDependencies(engine),
 			[{ path: "note.md", snapshot: { content: fileContent, sha256 } }],
 			proof,
@@ -398,20 +404,15 @@ for (const mode of ["plaintext", "encrypted"] as const) {
 		const access = watcherAccess(watcher);
 		index.beforeSave = () => {
 			index.beforeSave = undefined;
-			const predecessor = access.deferredEvents.find(
-				(event) => event.id === "upload-a",
-			);
+			const predecessor = watcher
+				.getDeferredEvents()
+				.find((event) => event.id === "upload-a");
 			assert.ok(predecessor?.action === "upload");
-			predecessor.superseded = true;
-			predecessor.supersededByRenameId = "rename-a-c";
 			vault.files.delete("A.md");
 			vault.files.set("deep/C.md", targetContent);
-			access.deferEvent(
-				renameEvent("rename-a-c", "A.md", "deep/C.md", {
-					createdAt: 2,
-					predecessorUploadId: "upload-a",
-				}),
-			);
+			const target = new TFile();
+			target.path = "deep/C.md";
+			access.handleFileRename(target, "A.md");
 		};
 
 		await access.flushDeferredEventsNow();
@@ -725,7 +726,7 @@ test("missing move target is materialized and completed", async () => {
 
 	const recoveryResult = syncResult();
 
-	await syncReconciliation.resumePendingMoves(
+	await reconcilePhysicalRecovery.resumePendingMoves(
 		reconciliationDependencies(engine),
 		recoveryResult,
 		true,
@@ -923,7 +924,7 @@ test("unresolved final move recovery records a full-sync error", async () => {
 
 	const recoveryResult = syncResult();
 
-	await syncReconciliation.resumePendingMoves(
+	await reconcilePhysicalRecovery.resumePendingMoves(
 		reconciliationDependencies(engine),
 		recoveryResult,
 		true,

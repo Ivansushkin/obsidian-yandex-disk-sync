@@ -1,3 +1,6 @@
+import { PluginStartup, type StartupBlocks } from "../src/plugin-startup";
+import { EncryptionWorkflow } from "../src/crypto/workflow";
+import type { EncryptionContext } from "../src/crypto/context";
 import { NetworkRequestError, type FailureSummary } from "../src/errors";
 import type { App } from "obsidian";
 import { SyncCoordinator } from "../src/sync/coordinator";
@@ -19,18 +22,6 @@ function createBlockedLifecycleHarness(
 	plugin["localStateRestored"] = false;
 	plugin["syncLifecycleRegistered"] = false;
 	Object.assign(plugin, {
-		loadedPluginData: {
-			localState: null,
-			pendingMutations: [],
-			pendingPhysicalActions: [],
-			pendingWatcherEvents: [],
-			lastSyncStats: {
-				uploaded: 0,
-				downloaded: 0,
-				deleted: 0,
-				errors: 0,
-			},
-		},
 		indexManager: {
 			loadPendingMutations: () => restores.push("mutations"),
 			loadPendingPhysicalActions: () => restores.push("actions"),
@@ -193,43 +184,58 @@ test("storage admission classifies startup failures and recovers after connectio
 	}
 });
 
-test("foreign device revalidates a stale legacy migration block", async () => {
-	const plugin = createStartupPlugin();
+/** Run the startup oracle through its public ports, without plugin method patches. */
+function startupHarness(format: "current" | "legacy", encrypted = false) {
+	const settings = {
+		...DEFAULT_SETTINGS,
+		yandexTokenSecret: "configured-placeholder",
+		enableEncryption: encrypted,
+	};
+	const blocks: StartupBlocks = {
+		migration: null,
+		historical: null,
+		authentication: null,
+		encryption: null,
+	};
 	let canonicalReads = 0;
-	plugin["remoteStateValidated"] = true;
-	plugin["migrationBlockReason"] = "legacy migration required";
-	Object.assign(plugin, {
-		indexManager: {
+	const startup = new PluginStartup({
+		getSettings: () => settings,
+		getBlocks: () => blocks,
+		setBlock: (kind, reason) => {
+			blocks[kind] = reason;
+		},
+		hasTransition: () => false,
+		isStopped: () => false,
+		ensureStorageBinding: async () => true,
+		index: {
 			downloadEncryptionManifest: async () => null,
 			inspectRemoteCanonicalFormat: async () => {
 				canonicalReads++;
-				return "current";
+				return format;
 			},
 		},
+		engine: { runExclusiveMaintenance: async (task) => await task() },
+		recoverEncryptionTransition: async () => {},
+		tryRecoverRemoteTargetTransition: async () => false,
+		ensureEncryptionReady: async () => true,
 	});
-	assert.equal(await plugin["refreshRemoteStartupState"](false), "ready");
-	assert.equal(canonicalReads, 1);
-	assert.equal(plugin["migrationBlockReason"], null);
+	return { startup, blocks, reads: () => canonicalReads };
+}
+
+test("foreign device revalidates a stale legacy migration block", async () => {
+	const { startup, blocks, reads } = startupHarness("current");
+	startup.validated = true;
+	blocks.migration = "legacy migration required";
+	assert.equal(await startup.refresh(false), "ready");
+	assert.equal(reads(), 1);
+	assert.equal(blocks.migration, null);
 });
 
 test("encrypted current local state cannot Force a plaintext stable migration", async () => {
-	const plugin = createStartupPlugin();
-	Object.assign(plugin.settings, {
-		enableEncryption: true,
-		encryptionSalt: "current-salt",
-		encryptionPassword: "password-placeholder",
-		encryptionRevision: 1,
-		encryptionProfileId: "hardened",
-	});
-	Object.assign(plugin, {
-		indexManager: {
-			downloadEncryptionManifest: async () => null,
-			inspectRemoteCanonicalFormat: async () => "legacy",
-		},
-	});
-	assert.equal(await plugin["refreshRemoteStartupState"](false), "blocked");
-	assert.equal(plugin["migrationBlockReason"], null);
-	assert.notEqual(plugin["historicalBlockReason"], null);
+	const { startup, blocks } = startupHarness("legacy", true);
+	assert.equal(await startup.refresh(false), "blocked");
+	assert.equal(blocks.migration, null);
+	assert.notEqual(blocks.historical, null);
 });
 
 test("post-commit Force failure resumes cleanup without repeating migration", async () => {
@@ -317,7 +323,7 @@ test("post-commit Force failure resumes cleanup without repeating migration", as
 	);
 });
 
-test("full preflight prevents Force from stealing foreground operation ownership", async () => {
+test("Force remains available while ordinary full preflight is pending", async () => {
 	for (const visible of [true, false]) {
 		let release = () => {};
 		const pending = new Promise<void>((done) => {
@@ -341,10 +347,10 @@ test("full preflight prevents Force from stealing foreground operation ownership
 			return "blocked";
 		};
 		plugin["prepareForceSync"] = async () => {
-			throw new Error("Force must not start");
+			return null;
 		};
 		const full = plugin.runFullSync(undefined, visible);
-		assert.equal(plugin.isForceSyncUnavailable(), true);
+		assert.equal(plugin.isForceSyncUnavailable(), false);
 		await plugin.runForceSyncFromLocal();
 		release();
 		await full;
@@ -357,17 +363,20 @@ test("encrypted Force permits owned authentication but blocks independent encryp
 	let authenticated = 0;
 	let maintenance = 0;
 	plugin.isForceSyncBusy = () => true;
-	plugin["connectToRemoteEncryptionNow"] = async () => {
-		authenticated++;
-	};
-	Object.assign(plugin, {
-		syncEngine: {
+	const workflow = new EncryptionWorkflow({
+		index: {},
+		engine: {
 			runExclusiveMaintenance: async (task: () => Promise<void>) => {
 				maintenance++;
 				await task();
 			},
 		},
-	});
+		assertConnectionAllowed: () => {},
+	} as unknown as EncryptionContext);
+	plugin["encryptionWorkflow"] = workflow;
+	workflow.connectToRemoteEncryptionNow = async () => {
+		authenticated++;
+	};
 	await assert.rejects(
 		plugin.connectToRemoteEncryption("test-password"),
 		/already in progress/,

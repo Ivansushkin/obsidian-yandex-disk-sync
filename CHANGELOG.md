@@ -16,8 +16,9 @@ Changes since stable `1.1.0`.
   explicit Force sync with a per-run choice of a verified archive or no archive.
 - Encrypted legacy data, numeric historical manifests and canonical indexes,
   unmarked transition/queue data, and incomplete current metadata are
-  unsupported and fail closed before remote writes. All devices must be
-  updated before using the new format.
+  unsupported for reading/migration and block ordinary sync. Confirmed Force
+  local can replace raw destination metadata from a readable source; invalid
+  local state is never bypassed. Update all devices before using the new format.
 - Current entries without `mutationSeq` cannot authorize destructive folder
   operations.
 
@@ -35,8 +36,8 @@ Changes since stable `1.1.0`.
 - Added collision-resistant backup names, non-overwriting upload, and exact
   SHA-256 plus byte read-back after success, timeout, or an ambiguous response.
 - Added Force local and Force remote recovery with an optional verified archive,
-  a new epoch, canonical read-back verification, and automatic watcher and
-  scheduler restart.
+  a new epoch, source/scope verification, and resumable checkpoints. Other
+  devices with offline changes choose accept, preserve, or defer before replay.
 - Added persistent watcher events, per-device mutation FIFO, resumable physical
   actions, coordinated status UI, and sanitized correlated diagnostics.
 
@@ -65,6 +66,9 @@ Changes since stable `1.1.0`.
 - Browser runtime dependencies are pinned, Obsidian is a development-only
   dependency, and CI validates tests on Node 20 and 22, lint, build, audits,
   release evidence, exact assets, and downloaded asset hashes.
+- Separated canonical schema/merge/transactions, encryption workflows, plugin
+  persistence/startup, watcher rules/settlement, and reconciliation stages while
+  retaining one coordinator and coherent local persistence flow.
 
 ### Fixed
 
@@ -76,20 +80,33 @@ Changes since stable `1.1.0`.
   local observed revision.
 - Recovered successful uploads and canonical commits whose final response was
   lost or timed out without reporting false success for unverified operations.
-- Prevented hidden overwritten-file backups and destructive operations after a
-  failed mandatory backup.
+- Explicit Force without-backup skips individual copies and old destination
+  snapshots. Ordinary sync still blocks destructive changes after a failed
+  mandatory protective copy.
 - Rejected malformed canonical records, paths, watermarks, transitions,
   ciphertext, and unsupported formats before Vault API or remote mutation.
 - Revalidated canonical state and encryption immediately before corrective
   uploads so newer foreign state or maintenance blocks stale writes.
+- Incomplete local reads fail closed instead of producing remote deletions.
+- Force cannot infer deletion scope from a ciphertext-like filename alone.
+- Folder-delete suppression retains genuine deletes of recreated descendants.
+- Pre-commit encryption rollback preserves source authority and resumes after
+  interruption without publishing an invalid cleanup phase.
+- Codec fallback reuses downloaded bytes and preserves transport/semantic errors.
+- Stale-lock recovery verifies a unique raw claim before canonical publication,
+  preserving renewed locks across MOVE races, retries, and restart.
 
 ### Performance
 
 - Avoided canonical writes and redundant manifest checks on strict no-op sync.
 - Realtime verification uses targeted canonical and physical reads instead of a
   complete remote-tree traversal.
-- Folder planning uses path sets and maps, while remote traversal and file
-  operations retain bounded concurrency.
+- Pass-local FIFO/path indexes remove repeated scans without caching authority.
+- Digest-only traversal releases each file buffer after hashing; ZIP creation
+  still materializes content.
+- Realtime file batches use sequential windows of up to 32 events / target 8 MiB
+  plaintext, with per-window settlement. Extra windows require extra commits;
+  this is not a hard cap on whole-process memory or an oversized file.
 
 ## 1.1.0
 

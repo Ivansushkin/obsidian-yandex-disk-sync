@@ -100,6 +100,7 @@ function currentData<T extends Record<string, unknown>>(
 		pendingPhysicalActions: [],
 		pendingWatcherEvents: [],
 		encryptionTransition: currentTransition(),
+		forceRecovery: null,
 		lastSyncStats: {},
 	};
 	return { ...data, ...overrides } as Omit<typeof data, keyof T> & T;
@@ -150,6 +151,7 @@ test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty qu
 		pendingPhysicalActions: [],
 		pendingWatcherEvents: [],
 		encryptionTransition: null,
+		forceRecovery: null,
 		lastSyncStats: source.lastSyncStats,
 	});
 });

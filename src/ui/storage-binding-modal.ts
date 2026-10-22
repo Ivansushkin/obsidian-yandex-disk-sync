@@ -11,6 +11,7 @@ export class StorageBindingModal extends Modal {
 		private readonly path: string,
 		private readonly canKeepHistory: boolean,
 		private readonly resolve: (choice: StorageBindingChoice) => void,
+		private readonly canAdoptReplacement = false,
 	) {
 		super(app);
 	}
@@ -26,6 +27,16 @@ export class StorageBindingModal extends Modal {
 			),
 		});
 		const buttons = new Setting(this.contentEl);
+		if (this.canAdoptReplacement) {
+			this.contentEl.createEl("p", {
+				text: t("storage.replacement_description"),
+			});
+			buttons.addButton((button) =>
+				button
+					.setButtonText(t("storage.replacement"))
+					.onClick(() => this.finish("replacement")),
+			);
+		}
 		if (this.canKeepHistory) {
 			buttons.addButton((button) =>
 				button
