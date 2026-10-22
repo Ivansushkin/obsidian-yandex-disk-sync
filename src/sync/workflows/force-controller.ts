@@ -38,19 +38,28 @@ export interface ForceFlowState {
 
 export interface ForceSyncDependencies {
 	isSyncBusy(): boolean;
-	preflight(): Promise<{
+	preflight(direction: ForceDirection): Promise<{
+		replacement?: NonNullable<SyncRunOptions["forceReplacement"]>;
 		canonical: ForcePreflightProof["canonical"];
 		migration: boolean;
 	} | null>;
 	confirm(
 		direction: ForceDirection,
 		migration: boolean,
+		replacement?: SyncRunOptions["forceReplacement"],
 	): Promise<OperationBackupChoice>;
 	captureProtectedSnapshot(direction: ForceDirection): Promise<string>;
-	readyForBackup(migration: boolean): Promise<boolean>;
+	readyForBackup(
+		migration: boolean,
+		replacement?: SyncRunOptions["forceReplacement"],
+	): Promise<boolean>;
+	backupFailure?(
+		replacement?: SyncRunOptions["forceReplacement"],
+	): Promise<"retry" | "without-backup" | "cancel">;
 	backup(
 		direction: ForceDirection,
 		progress: (phase: BackupProgress) => void,
+		replacement?: SyncRunOptions["forceReplacement"],
 	): Promise<BackupResult>;
 	beforeMutation(migration: boolean): Promise<void>;
 	run(
@@ -70,6 +79,7 @@ export interface ForceSyncDependencies {
 export class ForceSyncController {
 	private state: ForceFlowState | null = null;
 	private sequence = 0;
+	private running: Promise<void> | null = null;
 	private listeners = new Set<(state: ForceFlowState) => void>();
 
 	constructor(private readonly deps: ForceSyncDependencies) {}
@@ -92,7 +102,17 @@ export class ForceSyncController {
 	}
 
 	/** Reserve synchronously so repeated calls cannot queue another destructive flow. */
-	async run(direction: ForceDirection): Promise<void> {
+	run(direction: ForceDirection): Promise<void> {
+		if (this.running) {
+			return this.running;
+		}
+		this.running = this.execute(direction).finally(() => {
+			this.running = null;
+		});
+		return this.running;
+	}
+
+	private async execute(direction: ForceDirection): Promise<void> {
 		if (this.isBusy() || this.deps.isSyncBusy()) {
 			return;
 		}
@@ -152,35 +172,63 @@ export class ForceSyncController {
 		};
 		try {
 			update({});
-			const prepared = await this.deps.preflight();
+			const prepared = await this.deps.preflight(direction);
 			if (!prepared) {
 				update({ outcome: "blocked" });
 				return;
 			}
 			update({ migration: prepared.migration });
 			phase("confirming");
-			const choice = await this.deps.confirm(
+			let choice = await this.deps.confirm(
 				direction,
 				prepared.migration,
+				prepared.replacement,
 			);
 			if (choice === "cancel") {
 				update({ outcome: "cancelled" });
 				return;
 			}
-			if (!(await this.deps.readyForBackup(prepared.migration))) {
+			if (
+				!(await this.deps.readyForBackup(
+					prepared.migration,
+					prepared.replacement,
+				))
+			) {
 				update({ outcome: "blocked" });
 				return;
 			}
-			phase("protected-snapshot");
-			const snapshotDigest =
-				await this.deps.captureProtectedSnapshot(direction);
+			let snapshotDigest = "";
+			if (!prepared.replacement) {
+				phase("protected-snapshot");
+				snapshotDigest =
+					await this.deps.captureProtectedSnapshot(direction);
+			}
 			let backupProof: ForcePreflightProof["backup"] = null;
-			if (choice === "with-backup") {
-				phase("creating-backup");
+			while (choice === "with-backup") {
 				let backup: BackupResult;
 				try {
-					backup = await this.deps.backup(direction, phase);
+					if (prepared.replacement) {
+						phase("protected-snapshot");
+						snapshotDigest =
+							await this.deps.captureProtectedSnapshot(direction);
+					}
+					phase("creating-backup");
+					backup = await this.deps.backup(
+						direction,
+						phase,
+						prepared.replacement,
+					);
 				} catch (error) {
+					const decision = await this.deps.backupFailure?.(
+						prepared.replacement,
+					);
+					if (decision === "retry") {
+						continue;
+					}
+					if (decision === "without-backup") {
+						choice = "without-backup";
+						break;
+					}
 					fail(error, "backup-failed");
 					return;
 				}
@@ -190,6 +238,16 @@ export class ForceSyncController {
 					!backup.sha256 ||
 					backup.snapshotDigest !== snapshotDigest
 				) {
+					const decision = await this.deps.backupFailure?.(
+						prepared.replacement,
+					);
+					if (decision === "retry") {
+						continue;
+					}
+					if (decision === "without-backup") {
+						choice = "without-backup";
+						break;
+					}
 					fail(
 						backup.failureCause ??
 							new Error(
@@ -204,9 +262,32 @@ export class ForceSyncController {
 					backupName: backup.backupName,
 					backupSha256: backup.sha256,
 				};
+				break;
+			}
+			if (prepared.replacement) {
+				prepared.replacement.plan.recovery.backupProof = backupProof
+					? {
+							name: backupProof.backupName,
+							sha256: backupProof.backupSha256,
+							snapshotDigest,
+						}
+					: null;
 			}
 			phase("syncing");
+			if (
+				prepared.replacement &&
+				choice === "with-backup" &&
+				snapshotDigest !==
+					(await this.deps.captureProtectedSnapshot(direction))
+			) {
+				throw new Error(
+					"Force destination changed after archive verification",
+				);
+			}
 			const result = await this.deps.run(direction, {
+				forceReplacement: prepared.replacement
+					? { ...prepared.replacement, backupMode: choice }
+					: undefined,
 				forcePreflightProof: {
 					direction,
 					canonical: prepared.canonical,
@@ -236,6 +317,17 @@ export class ForceSyncController {
 				if (first?.code) {
 					update({ errorCode: first.code });
 				}
+				return;
+			}
+			if (prepared.replacement && !result.success) {
+				fail(
+					result.errors[0]?.failureCause ??
+						new Error(
+							result.errors[0]?.message ??
+								"Force recovery is unfinished",
+						),
+					"cleanup-pending",
+				);
 				return;
 			}
 			phase("reconciling");

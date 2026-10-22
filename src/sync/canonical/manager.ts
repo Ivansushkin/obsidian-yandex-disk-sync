@@ -2,6 +2,10 @@
  * Synchronization index manager
  */
 
+import { CanonicalRecovery, REMOTE_INDEX_FILENAME } from "./recovery";
+import { commitCanonicalIndex } from "./commit";
+import { ForcePublication } from "./force-publication";
+
 import type {
 	SyncIndex,
 	LocalSyncState,
@@ -14,111 +18,113 @@ import type {
 	YandexDiskSyncSettings,
 	YandexResource,
 	EncryptionManifest,
-	EncryptionManifestState,
-	EncryptionTransitionDescriptor,
-	EncryptionModeDescriptor,
 	RemoteEncryptionManifest,
 	IndexMaintenance,
 } from "../../types";
-import {
-	CURRENT_INDEX_FORMAT,
-	ENCRYPTION_MANIFEST_FORMAT,
-	createEmptyIndex,
-	createEmptyLocalState,
-} from "../../types";
+import { createEmptyIndex, createEmptyLocalState } from "../../types";
 import { YandexApiError, YandexDiskClient } from "../../api/yandex-client";
 import { VaultAdapter } from "../../api/vault-adapter";
 import {
+	PathAncestryIndex,
 	isProtectedPath,
 	isLegacyPluginDataPath,
 	isLegacyServicePathCollision,
+	isRootIndexLockPath,
 	joinPath,
 	normalizePath,
 	toLocalPath,
 } from "../../utils/path-utils";
 import {
+	isJsonRecord,
 	createSafeRecord,
-	getRecordValue,
 	protectRecord,
 	setRecordValue,
 } from "../../utils/record-utils";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
-import { findErrorCause } from "../../utils/error-utils";
-import { isFileModificationTime } from "../../utils/timestamp-utils";
-import { computeSha256, computeSha256FromString } from "../../utils/hash-utils";
-import {
-	HARDENED_PBKDF2_ITERATIONS,
-	AES_KEY_LENGTH,
-	FILENAME_KEY_LENGTH,
-	IV_LENGTH,
-} from "../../crypto/encryption";
+import { computeSha256 } from "../../utils/hash-utils";
 import { UnsupportedHistoricalDataError } from "../../compatibility-errors";
+
 import { parseStable1xIndex } from "../../compatibility/stable-1x";
 import type { EncryptionCodec } from "../../crypto/encryption";
 import {
 	getPhysicalResourceFingerprint,
-	getStableContentFingerprint,
 	isHashStableContentFingerprint,
 	matchesStableContentFingerprint,
 } from "../../utils/resource-fingerprint";
 import {
 	canApplyDestructiveFolderMutation,
-	classifyFileMutation,
 	classifyIndexFormat,
-	isPathInsideFolder,
-	isStableLockStale,
-	mergeFileMutation,
-	shouldPreserveConcurrentFolderChild,
 } from "./mutation-rules";
 import { LocalOperationStore } from "../local/operation-store";
-import { mergePhysicalMetadata } from "../local/baseline-rules";
 import {
 	readRemoteStorageScope,
 	sameRemoteStorageScope,
 	StorageScopeError,
 } from "../local/storage-scope";
 import {
-	collectStablePaginatedItems,
-	didCanonicalChangeBeforeMaintenanceClaim,
-	isOrphanIndexAmbiguous,
-	stableSerialize,
+	cloneIndex,
+	isTargetRecoveryIndex,
+	sameIndexValue,
 } from "./transaction-rules";
 import {
-	classifyIndexMoveRecovery,
-	rollbackRawIndexSnapshot,
-	shouldRetryIndexTransaction,
 	type CanonicalCommitProof,
 	type IndexCodec,
 	type IndexFileSnapshot,
-	type IndexTransactionOutcome,
-	type IndexTransactionStage,
+	type IndexLockObservation,
 } from "./transaction";
 
-const REMOTE_INDEX_FILENAME = ".obsidian-sync-index.json";
-const REMOTE_INDEX_LOCK_PREFIX = ".obsidian-sync-index.lock.";
-const INDEX_LOCK_STALE_MS = 2 * 60 * 1000;
-const INDEX_LOCK_RETRY_MS = 750;
-const INDEX_LOCK_ATTEMPTS =
-	Math.ceil(INDEX_LOCK_STALE_MS / INDEX_LOCK_RETRY_MS) + 10;
+import {
+	RemoteIndexTransactionError,
+	RemoteIndexConcurrentModificationError,
+	ForceBackupStaleError,
+	PortablePathCollisionError,
+	LegacyPluginDataExposureError,
+	LegacyServicePathCollisionError,
+	LegacyIndexFormatError,
+	InvalidCurrentIndexError,
+	UnreadableRemoteIndexError,
+	AmbiguousRemoteIndexLockError,
+	IndexEpochMismatchError,
+	RemoteMaintenanceActiveError,
+	type IndexDecodeAttempt,
+} from "./errors";
+import {
+	validateCurrentIndexShape,
+	validateCurrentIndexCausality,
+} from "./schema";
+import {
+	mergeDesiredIndex,
+	type CanonicalMergeMode,
+	type RejectedCanonicalPut,
+} from "./merge";
+import { parseEncryptionManifest } from "../../crypto/manifest-schema";
+
+export {
+	RemoteIndexTransactionError,
+	RemoteIndexConcurrentModificationError,
+	ForceBackupStaleError,
+	ForceSourceChangedError,
+	PortablePathCollisionError,
+	LegacyPluginDataExposureError,
+	LegacyServicePathCollisionError,
+	RemoteIndexContentMismatchError,
+	RemoteIndexRolledBackError,
+	AmbiguousRemoteIndexStateError,
+	RemoteIndexLockedError,
+	LegacyIndexFormatError,
+	InvalidCurrentIndexError,
+	UnreadableRemoteIndexError,
+	AmbiguousRemoteIndexLockError,
+	IndexEpochMismatchError,
+	RemoteMaintenanceActiveError,
+	type IndexDecodeAttempt,
+} from "./errors";
+export { validateEncryptionModeDescriptor } from "./schema";
+
 const ENCRYPTION_MANIFEST_FILENAME = ".obsidian-encrypt.json";
-const ENCRYPTION_MANIFEST_STATES: EncryptionManifestState[] = [
-	"enabled",
-	"enabling",
-	"rotating",
-	"disabling",
-];
-
-type IndexDecodeStage = "decrypt" | "json";
-
 interface EncryptionManifestRead {
 	manifest: RemoteEncryptionManifest | null;
 	validationToken: string;
-}
-
-export interface IndexDecodeAttempt {
-	codec: IndexCodec;
-	stage: IndexDecodeStage;
-	errorName: string;
 }
 
 export interface LocalCausalSnapshot {
@@ -127,8 +133,9 @@ export interface LocalCausalSnapshot {
 	physicalActions: PendingPhysicalAction[];
 }
 
-export type ForceCanonicalProof =
-	{ state: "absent" } | { state: "present"; rawSha256: string };
+export type ForceCanonicalProof = (
+	{ state: "absent" } | { state: "present"; rawSha256: string }
+) & { locks?: IndexLockObservation[] };
 
 export type RemoteCanonicalFormat = "absent" | "legacy" | "current";
 
@@ -136,542 +143,6 @@ type IndexCodecAttemptResult =
 	{ data: unknown } | { attempt: IndexDecodeAttempt };
 
 type JsonRecord = Record<string, unknown>;
-
-function isJsonRecord(value: unknown): value is JsonRecord {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-	return Number.isInteger(value) && (value as number) >= 0;
-}
-
-function isOptionalNonNegativeInteger(value: unknown): boolean {
-	return value === undefined || isNonNegativeInteger(value);
-}
-
-function isOptionalString(value: unknown): boolean {
-	return value === undefined || typeof value === "string";
-}
-
-function isLogicalPath(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		!value.startsWith("/") &&
-		!value.endsWith("/") &&
-		!value.includes("\\") &&
-		!value.includes("\u0000") &&
-		value
-			.split("/")
-			.every(
-				(segment) =>
-					segment !== "" && segment !== "." && segment !== "..",
-			)
-	);
-}
-
-function assertIndexSection(
-	condition: boolean,
-	section: string,
-	reason: string,
-): asserts condition {
-	if (!condition) {
-		throw new InvalidCurrentIndexError(section, reason);
-	}
-}
-
-function validateEncryptionModeDescriptor(
-	value: unknown,
-	section: string,
-): asserts value is EncryptionModeDescriptor {
-	assertIndexSection(isJsonRecord(value), section, "must be an object");
-	assertIndexSection(
-		Object.keys(value).length === 4 &&
-			["enabled", "revision", "salt", "verifier"].every(
-				(key) => key in value,
-			),
-		section,
-		"fields do not match the current mode descriptor",
-	);
-	assertIndexSection(
-		typeof value.enabled === "boolean",
-		section,
-		"enabled must be boolean",
-	);
-	assertIndexSection(
-		value.revision === null || isNonNegativeInteger(value.revision),
-		section,
-		"revision must be null or a non-negative integer",
-	);
-	assertIndexSection(
-		value.salt === null || typeof value.salt === "string",
-		section,
-		"salt must be null or string",
-	);
-	assertIndexSection(
-		value.verifier === null || typeof value.verifier === "string",
-		section,
-		"verifier must be null or string",
-	);
-	if (value.enabled) {
-		assertIndexSection(
-			isNonNegativeInteger(value.revision) &&
-				value.revision > 0 &&
-				typeof value.salt === "string" &&
-				value.salt.length > 0 &&
-				typeof value.verifier === "string" &&
-				value.verifier.length > 0,
-			section,
-			"encrypted mode requires revision, salt, and verifier",
-		);
-	} else {
-		assertIndexSection(
-			value.revision === null &&
-				value.salt === null &&
-				value.verifier === null,
-			section,
-			"plaintext mode requires null encryption fields",
-		);
-	}
-}
-
-function validateCurrentIndexShape(
-	data: JsonRecord,
-): asserts data is JsonRecord & SyncIndex {
-	const requiredRootKeys = [
-		"format",
-		"epoch",
-		"revision",
-		"lastSyncTime",
-		"deviceId",
-		"files",
-		"folderTombstones",
-		"moves",
-		"appliedMutationSeq",
-	];
-	const allowedRootKeys = new Set([...requiredRootKeys, "maintenance"]);
-	assertIndexSection(
-		Object.keys(data).every((key) => allowedRootKeys.has(key)) &&
-			requiredRootKeys.every((key) => key in data),
-		"root",
-		"fields do not match the current canonical format",
-	);
-	assertIndexSection(
-		data.format === CURRENT_INDEX_FORMAT,
-		"root",
-		"format marker is invalid",
-	);
-	assertIndexSection(
-		typeof data.epoch === "string" && data.epoch.length > 0,
-		"root",
-		"epoch is required",
-	);
-	assertIndexSection(
-		isNonNegativeInteger(data.revision),
-		"root",
-		"revision must be a non-negative integer",
-	);
-	assertIndexSection(
-		isNonNegativeInteger(data.lastSyncTime),
-		"root",
-		"lastSyncTime must be a non-negative integer",
-	);
-	assertIndexSection(
-		typeof data.deviceId === "string" && data.deviceId.length > 0,
-		"root",
-		"deviceId is required",
-	);
-	assertIndexSection(isJsonRecord(data.files), "files", "must be an object");
-	for (const [path, raw] of Object.entries(data.files)) {
-		assertIndexSection(
-			isLogicalPath(path),
-			"files",
-			"contains an invalid path key",
-		);
-		assertIndexSection(
-			isJsonRecord(raw),
-			"files",
-			"metadata must be an object",
-		);
-		assertIndexSection(
-			raw.path === path,
-			"files",
-			"metadata path must match its key",
-		);
-		assertIndexSection(
-			typeof raw.sha256 === "string",
-			"files",
-			"sha256 must be a string",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.size),
-			"files",
-			"size must be a non-negative integer",
-		);
-		assertIndexSection(
-			isFileModificationTime(raw.mtime),
-			"files",
-			"mtime must be a finite non-negative timestamp",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.syncedAt),
-			"files",
-			"syncedAt must be a non-negative integer",
-		);
-		assertIndexSection(
-			isOptionalNonNegativeInteger(raw.remoteMtime),
-			"files",
-			"remoteMtime must be a non-negative integer",
-		);
-		assertIndexSection(
-			isOptionalString(raw.remoteFingerprint),
-			"files",
-			"remoteFingerprint must be a string",
-		);
-		assertIndexSection(
-			raw.deleted === undefined || typeof raw.deleted === "boolean",
-			"files",
-			"deleted must be boolean",
-		);
-		assertIndexSection(
-			isOptionalNonNegativeInteger(raw.deletedAt),
-			"files",
-			"deletedAt must be a non-negative integer",
-		);
-		assertIndexSection(
-			isOptionalString(raw.deletedByFolder),
-			"files",
-			"deletedByFolder must be a string",
-		);
-		assertIndexSection(
-			isOptionalString(raw.lastModifiedBy),
-			"files",
-			"lastModifiedBy must be a string",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.mutationSeq),
-			"files",
-			"mutationSeq must be a non-negative integer",
-		);
-		assertIndexSection(
-			isOptionalNonNegativeInteger(raw.changedRevision),
-			"files",
-			"changedRevision must be a non-negative integer",
-		);
-		assertIndexSection(
-			isOptionalNonNegativeInteger(raw.baseRevision),
-			"files",
-			"baseRevision must be a non-negative integer",
-		);
-	}
-	assertIndexSection(
-		isJsonRecord(data.folderTombstones),
-		"folderTombstones",
-		"must be an object",
-	);
-	for (const [path, raw] of Object.entries(data.folderTombstones)) {
-		assertIndexSection(
-			isLogicalPath(path),
-			"folderTombstones",
-			"contains an invalid path key",
-		);
-		assertIndexSection(
-			isJsonRecord(raw),
-			"folderTombstones",
-			"entry must be an object",
-		);
-		assertIndexSection(
-			raw.path === path,
-			"folderTombstones",
-			"path must match its key",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.deletedAt),
-			"folderTombstones",
-			"deletedAt must be a non-negative integer",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.changedRevision),
-			"folderTombstones",
-			"changedRevision must be a non-negative integer",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.baseRevision),
-			"folderTombstones",
-			"baseRevision must be a non-negative integer",
-		);
-		assertIndexSection(
-			typeof raw.lastModifiedBy === "string" &&
-				raw.lastModifiedBy.length > 0,
-			"folderTombstones",
-			"lastModifiedBy is required",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.mutationSeq),
-			"folderTombstones",
-			"mutationSeq must be a non-negative integer",
-		);
-	}
-	assertIndexSection(isJsonRecord(data.moves), "moves", "must be an object");
-	for (const [id, raw] of Object.entries(data.moves)) {
-		assertIndexSection(
-			id.length > 0 && isJsonRecord(raw),
-			"moves",
-			"entry must be an object",
-		);
-		assertIndexSection(raw.id === id, "moves", "id must match its key");
-		assertIndexSection(
-			isLogicalPath(raw.fromPath),
-			"moves",
-			"fromPath is invalid",
-		);
-		assertIndexSection(
-			isLogicalPath(raw.toPath),
-			"moves",
-			"toPath is invalid",
-		);
-		assertIndexSection(
-			raw.kind === "file" || raw.kind === "folder",
-			"moves",
-			"kind is invalid",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.baseRevision),
-			"moves",
-			"baseRevision must be a non-negative integer",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.changedRevision),
-			"moves",
-			"changedRevision must be a non-negative integer",
-		);
-		assertIndexSection(
-			typeof raw.pending === "boolean",
-			"moves",
-			"pending must be boolean",
-		);
-		assertIndexSection(
-			typeof raw.lastModifiedBy === "string" &&
-				raw.lastModifiedBy.length > 0,
-			"moves",
-			"lastModifiedBy is required",
-		);
-		assertIndexSection(
-			isNonNegativeInteger(raw.mutationSeq),
-			"moves",
-			"mutationSeq must be a non-negative integer",
-		);
-	}
-	assertIndexSection(
-		isJsonRecord(data.appliedMutationSeq),
-		"appliedMutationSeq",
-		"must be an object",
-	);
-	for (const [deviceId, sequence] of Object.entries(
-		data.appliedMutationSeq,
-	)) {
-		assertIndexSection(
-			deviceId.length > 0 && isNonNegativeInteger(sequence),
-			"appliedMutationSeq",
-			"contains an invalid watermark",
-		);
-	}
-	if (data.maintenance === undefined) {
-		return;
-	}
-	const maintenance = data.maintenance;
-	assertIndexSection(
-		isJsonRecord(maintenance),
-		"maintenance",
-		"must be an object",
-	);
-	const maintenanceKeys = [
-		"id",
-		"kind",
-		"phase",
-		"initiatedBy",
-		"sourceRevision",
-		"targetRevision",
-		"source",
-		"target",
-		"cleanup",
-	];
-	assertIndexSection(
-		Object.keys(maintenance).length === maintenanceKeys.length &&
-			maintenanceKeys.every((key) => key in maintenance),
-		"maintenance",
-		"fields do not match the current maintenance format",
-	);
-	assertIndexSection(
-		typeof maintenance.id === "string" && maintenance.id.length > 0,
-		"maintenance",
-		"id is required",
-	);
-	assertIndexSection(
-		maintenance.kind === "enable" ||
-			maintenance.kind === "disable" ||
-			maintenance.kind === "rotate",
-		"maintenance",
-		"kind is invalid",
-	);
-	assertIndexSection(
-		[
-			"prepared",
-			"files-copied",
-			"index-committed",
-			"stable",
-			"cleanup",
-		].includes(String(maintenance.phase)),
-		"maintenance",
-		"phase is invalid",
-	);
-	assertIndexSection(
-		typeof maintenance.initiatedBy === "string" &&
-			maintenance.initiatedBy.length > 0,
-		"maintenance",
-		"initiatedBy is required",
-	);
-	assertIndexSection(
-		isNonNegativeInteger(maintenance.sourceRevision),
-		"maintenance",
-		"sourceRevision must be a non-negative integer",
-	);
-	assertIndexSection(
-		maintenance.targetRevision === null ||
-			isNonNegativeInteger(maintenance.targetRevision),
-		"maintenance",
-		"targetRevision must be null or a non-negative integer",
-	);
-	assertIndexSection(
-		maintenance.sourceRevision < data.revision,
-		"maintenance.sourceRevision",
-		"must precede the current canonical revision",
-	);
-	const source = maintenance.source;
-	const target = maintenance.target;
-	validateEncryptionModeDescriptor(source, "maintenance.source");
-	validateEncryptionModeDescriptor(target, "maintenance.target");
-	const preCommit =
-		maintenance.phase === "prepared" ||
-		maintenance.phase === "files-copied";
-	assertIndexSection(
-		preCommit
-			? maintenance.targetRevision === null
-			: isNonNegativeInteger(maintenance.targetRevision),
-		"maintenance.targetRevision",
-		"must agree with the maintenance phase",
-	);
-	if (!preCommit) {
-		const targetRevision = maintenance.targetRevision;
-		assertIndexSection(
-			targetRevision !== null &&
-				targetRevision > maintenance.sourceRevision &&
-				targetRevision <= data.revision &&
-				(maintenance.phase !== "index-committed" ||
-					targetRevision === data.revision) &&
-				(maintenance.phase !== "cleanup" ||
-					targetRevision + 1 === data.revision) &&
-				(maintenance.phase !== "stable" ||
-					targetRevision < data.revision),
-			"maintenance.targetRevision",
-			"does not match the canonical commit revision",
-		);
-	}
-	const modeMismatch =
-		(maintenance.kind === "enable" &&
-			(source.enabled || !target.enabled)) ||
-		(maintenance.kind === "disable" &&
-			(!source.enabled || target.enabled)) ||
-		(maintenance.kind === "rotate" &&
-			(!source.enabled ||
-				!target.enabled ||
-				(target.revision ?? 0) <= (source.revision ?? 0) ||
-				target.salt === source.salt ||
-				target.verifier === source.verifier));
-	assertIndexSection(
-		!modeMismatch,
-		"maintenance",
-		"source and target modes do not match its kind",
-	);
-	assertIndexSection(
-		Array.isArray(maintenance.cleanup),
-		"maintenance.cleanup",
-		"must be an array",
-	);
-	assertIndexSection(
-		!preCommit || maintenance.cleanup.length === 0,
-		"maintenance.cleanup",
-		"pre-commit maintenance cannot authorize cleanup",
-	);
-	const cleanupPaths = new Set<string>();
-	for (const action of maintenance.cleanup) {
-		assertIndexSection(
-			isJsonRecord(action),
-			"maintenance.cleanup",
-			"entry must be an object",
-		);
-		assertIndexSection(
-			Object.keys(action).length === 2 &&
-				"path" in action &&
-				"expectedFingerprint" in action,
-			"maintenance.cleanup",
-			"entry fields are invalid",
-		);
-		assertIndexSection(
-			isLogicalPath(action.path) && !isProtectedPath(action.path),
-			"maintenance.cleanup",
-			"path is invalid or protected",
-		);
-		assertIndexSection(
-			!cleanupPaths.has(action.path),
-			"maintenance.cleanup",
-			"path is duplicated",
-		);
-		cleanupPaths.add(action.path);
-		assertIndexSection(
-			typeof action.expectedFingerprint === "string" &&
-				action.expectedFingerprint.length > 0,
-			"maintenance.cleanup",
-			"expectedFingerprint is required",
-		);
-	}
-}
-
-function validateCurrentIndexCausality(index: SyncIndex): void {
-	const validateEntry = (
-		section: string,
-		entry: Pick<FileMetadata, "lastModifiedBy" | "mutationSeq">,
-	): void => {
-		if (entry.mutationSeq === undefined) {
-			return;
-		}
-		if (entry.mutationSeq === 0) {
-			return;
-		}
-		assertIndexSection(
-			typeof entry.lastModifiedBy === "string" &&
-				entry.lastModifiedBy.length > 0,
-			section,
-			"positive mutationSeq requires lastModifiedBy",
-		);
-		assertIndexSection(
-			(index.appliedMutationSeq[entry.lastModifiedBy] ?? 0) >=
-				entry.mutationSeq,
-			section,
-			"mutationSeq exceeds its device watermark",
-		);
-	};
-
-	for (const metadata of Object.values(index.files)) {
-		validateEntry("files", metadata);
-	}
-	for (const tombstone of Object.values(index.folderTombstones)) {
-		validateEntry("folderTombstones", tombstone);
-	}
-	for (const move of Object.values(index.moves)) {
-		validateEntry("moves", move);
-	}
-}
 
 export class IndexManager {
 	private yandexClient: YandexDiskClient;
@@ -682,23 +153,22 @@ export class IndexManager {
 	private remoteIndex: SyncIndex;
 	private loadedRemoteIndex: SyncIndex;
 	private saveChain: Promise<void> = Promise.resolve();
-	private observedLocks = new Map<
-		string,
-		{ fingerprint: string; firstSeenAt: number }
-	>();
+
 	private allowLegacyWriteOnce = false;
 	private replaceRemoteOnNextSave = false;
+	private forcePreflightCanonical: ForceCanonicalProof | null = null;
+	private readonly recovery: CanonicalRecovery;
+	private readonly forcePublication: ForcePublication;
 	private operationStore: LocalOperationStore;
 	private completedMoveIds = new Set<string>();
-	private rejectedPuts: Array<{
-		path: string;
-		reason: "delete" | "conflict";
-		remoteFingerprint: string;
-		baselineSha256?: string;
-	}> = [];
+	private rejectedPuts: RejectedCanonicalPut[] = [];
 	private transitionIndexReadService: EncryptionCodec | null | undefined;
 	private transitionIndexWriteService: EncryptionCodec | null | undefined;
 	private physicalRewriteOnNextSave = false;
+	private forceScope: {
+		remotePath: string;
+		rootResourceId: string | null;
+	} | null = null;
 	private epochAdoptionTarget: string | null = null;
 	private targetRecoveryMaintenanceId: string | null = null;
 
@@ -714,6 +184,39 @@ export class IndexManager {
 		this.remoteIndex = createEmptyIndex("");
 		this.loadedRemoteIndex = createEmptyIndex("");
 		this.operationStore = new LocalOperationStore(settings.deviceId);
+		this.recovery = new CanonicalRecovery({
+			client: this.yandexClient,
+			getRemotePath: () => this.settings.remotePath,
+			getCanonicalPath: () => this.getRemoteIndexPath(),
+			getDeviceId: () => this.settings.deviceId,
+			getReadOptions: () => ({
+				allowLegacy: this.allowLegacyWriteOnce,
+				source: this.transitionIndexReadService,
+				target: this.transitionIndexWriteService,
+			}),
+			isReplacing: () => this.replaceRemoteOnNextSave,
+			readSnapshot: (...args) => this.downloadIndexSnapshot(...args),
+			decodeSnapshot: (...args) => this.decodeIndexSnapshot(...args),
+			serialize: (index) => this.serializeCurrentIndex(index),
+			isLockContention: (error) => this.isLockContention(error),
+		});
+		this.forcePublication = new ForcePublication({
+			client: this.yandexClient,
+			getRemotePath: () => this.settings.remotePath,
+			getCanonicalPath: () => this.getRemoteIndexPath(),
+			getDeviceId: () => this.settings.deviceId,
+			getCurrentIndex: () => this.remoteIndex,
+			isScoped: () => this.forceScope !== null,
+			assertRemoteScope: () => this.assertRemoteScope(),
+			getStableRootListing: () => this.recovery.getStableRootListing(),
+			readSnapshot: (...args) => this.downloadIndexSnapshot(...args),
+			serialize: (index) => this.serializeCurrentIndex(index),
+			createTransactionId: () => this.createTransactionId(),
+			acceptPublishedIndex: (index) => {
+				this.remoteIndex = cloneIndex(index);
+				this.loadedRemoteIndex = cloneIndex(index);
+			},
+		});
 	}
 
 	/**
@@ -726,6 +229,23 @@ export class IndexManager {
 
 	/** Bound history must never authorize work in another physical root. */
 	async assertRemoteScope(): Promise<void> {
+		if (this.forceScope) {
+			if (this.settings.remotePath !== this.forceScope.remotePath) {
+				throw new StorageScopeError("Force remote path changed");
+			}
+			const root = await this.yandexClient.getResource(
+				this.settings.remotePath,
+				1,
+				0,
+				true,
+			);
+			if (
+				(root?.resource_id ?? null) !== this.forceScope.rootResourceId
+			) {
+				throw new StorageScopeError("Force root identity changed");
+			}
+			return;
+		}
 		const expected = this.localState.remoteScope;
 		if (!expected) {
 			return;
@@ -739,6 +259,86 @@ export class IndexManager {
 				"Remote storage changed; confirm the connection before synchronization",
 			);
 		}
+	}
+
+	/** Scope a confirmed replacement to its selected physical root, ignoring destination history. */
+	async withForceScope<T>(
+		scope: { remotePath: string; rootResourceId: string | null },
+		body: () => Promise<T>,
+	): Promise<T> {
+		if (this.forceScope) {
+			throw new Error("Nested Force replacement is not allowed");
+		}
+		this.forceScope = scope;
+		try {
+			return await body();
+		} finally {
+			this.forceScope = null;
+		}
+	}
+
+	/** Require matching operation authority before every Force write and retry. */
+	async assertForceAuthority(
+		id: string,
+		epoch: string,
+		codec: EncryptionCodec | null,
+	): Promise<SyncIndex> {
+		return await this.forcePublication.assertForceAuthority(
+			id,
+			epoch,
+			codec,
+		);
+	}
+
+	/** Replace raw destination metadata under an exclusive lock without decoding its old content. */
+	async publishForceCanonical(
+		desired: SyncIndex,
+		codec: EncryptionCodec | null,
+		initial = false,
+	): Promise<void> {
+		return await this.forcePublication.publishForceCanonical(
+			desired,
+			codec,
+			initial,
+		);
+	}
+
+	/** Resolve own staged publications after restart, without reading displaced destination bytes. */
+	async recoverForcePublication(
+		state: import("../workflows/force-state").ForceRecovery,
+		codec: EncryptionCodec | null,
+	): Promise<SyncIndex | null> {
+		return await this.forcePublication.recoverForcePublication(
+			state,
+			codec,
+		);
+	}
+
+	/** Clear only pinned service leftovers after the new operation has published authority. */
+	async cleanupForceServiceLocks(
+		state: import("../workflows/force-state").ForceRecovery,
+		codec: EncryptionCodec | null,
+		completed = false,
+	): Promise<void> {
+		return await this.forcePublication.cleanupForceServiceLocks(
+			state,
+			codec,
+			completed,
+		);
+	}
+
+	/** Accept only the verified replacement and retire queues from its old generation. */
+	finishForceReplacement(index: SyncIndex, rootResourceId: string): void {
+		if (index.maintenance) {
+			throw new Error("Force cleanup is still active");
+		}
+		this.remoteIndex = cloneIndex(index);
+		this.loadedRemoteIndex = cloneIndex(index);
+		this.finalizeForceEpoch(index);
+		this.localState.remoteScope = {
+			remotePath: this.settings.remotePath,
+			rootResourceId,
+		};
 	}
 
 	/** Start a different storage only after all durable work has been settled. */
@@ -789,14 +389,16 @@ export class IndexManager {
 	/** Classify and fingerprint canonical before a Force backup can be created. */
 	async captureForceCanonicalProof(): Promise<ForceCanonicalProof> {
 		const canonicalPath = this.getRemoteIndexPath();
-		const resource = await this.yandexClient.getResource(
-			canonicalPath,
-			1,
-			0,
-			true,
+		const { resources } = await this.recovery.getStableRootListing();
+		const observedLocks = this.recovery.observeIndexLocks(resources);
+		const locks = observedLocks.length > 0 ? { locks: observedLocks } : {};
+		const resource = resources.find(
+			(resource) =>
+				resource.type === "file" &&
+				resource.name === REMOTE_INDEX_FILENAME,
 		);
 		if (!resource) {
-			return { state: "absent" };
+			return { state: "absent", ...locks };
 		}
 		const allowPlaintextLegacy =
 			this.transitionIndexReadService === undefined &&
@@ -809,9 +411,16 @@ export class IndexManager {
 				"source",
 				resource,
 			);
+			if (snapshot.index.maintenance) {
+				throw new RemoteMaintenanceActiveError(
+					snapshot.index.maintenance.id,
+					snapshot.index.maintenance.initiatedBy,
+				);
+			}
 			return {
 				state: "present",
 				rawSha256: await computeSha256(snapshot.raw),
+				...locks,
 			};
 		} catch (error) {
 			if (
@@ -866,6 +475,12 @@ export class IndexManager {
 	 * hidden by current service-path filtering. No user object is downloaded.
 	 */
 	async assertLegacyMigrationPathsSafe(): Promise<void> {
+		if (this.yandexClient.hasEncryptionService()) {
+			const proof = await this.captureForceCanonicalProof();
+			if (proof.state === "present") {
+				return;
+			}
+		}
 		const format = await this.inspectRemoteCanonicalFormat();
 		if (format === "current") {
 			return;
@@ -901,6 +516,10 @@ export class IndexManager {
 			}
 			const knownStableService =
 				path === REMOTE_INDEX_FILENAME ||
+				(resource.type === "file" && isRootIndexLockPath(path)) ||
+				(resource.type === "file" &&
+					path === ENCRYPTION_MANIFEST_FILENAME &&
+					this.yandexClient.hasEncryptionService()) ||
 				path === ".backup" ||
 				path.startsWith(".backup/");
 			if (!knownStableService && isLegacyServicePathCollision(path)) {
@@ -914,11 +533,12 @@ export class IndexManager {
 		expected: ForceCanonicalProof,
 	): Promise<void> {
 		const actual = await this.captureForceCanonicalProof();
-		if (stableSerialize(actual) !== stableSerialize(expected)) {
+		if (!sameIndexValue(actual, expected)) {
 			throw new ForceBackupStaleError(
 				"Canonical changed after the Force backup was verified",
 			);
 		}
+		this.forcePreflightCanonical = actual;
 	}
 
 	clearIndexTransitionServices(): void {
@@ -1119,6 +739,7 @@ export class IndexManager {
 	cancelForceBootstrap(): void {
 		this.allowLegacyWriteOnce = false;
 		this.replaceRemoteOnNextSave = false;
+		this.forcePreflightCanonical = null;
 	}
 
 	/**
@@ -1219,6 +840,15 @@ export class IndexManager {
 		this.operationStore.completePhysicalAction(id);
 	}
 
+	/** Observe a matching pending put at the caller's current temporal boundary. */
+	findPendingMatchingPut(
+		path: string,
+		sha256: string | undefined,
+		order: "first" | "last",
+	): PendingMutation | undefined {
+		return this.operationStore.findMatchingPut(path, sha256, order);
+	}
+
 	getPendingPutBaseRevision(path: string): number | null | undefined {
 		return this.operationStore.findLatestPutBaseRevision(path);
 	}
@@ -1271,6 +901,7 @@ export class IndexManager {
 	replayPendingMutations(): boolean {
 		const before = this.getPendingMutations().length;
 		this.confirmAppliedMutations();
+		let ancestry: PathAncestryIndex | undefined;
 		for (const mutation of this.getPendingMutations()) {
 			if (mutation.type === "delete-file") {
 				this.markLocalFileDeleted(
@@ -1278,6 +909,7 @@ export class IndexManager {
 					undefined,
 					mutation.seq,
 				);
+				ancestry?.add(mutation.path);
 				this.markRemoteFileDeleted(
 					mutation.path,
 					undefined,
@@ -1294,11 +926,13 @@ export class IndexManager {
 					mutation.seq,
 				);
 				const prefix = `${mutation.path.replace(/\/+$/, "")}/`;
-				const paths = new Set([
+				ancestry ??= new PathAncestryIndex([
 					...Object.keys(this.localState.files),
 					...Object.keys(this.remoteIndex.files),
 				]);
-				for (const path of paths) {
+				for (const path of ancestry.get(
+					mutation.path.replace(/\/+$/, ""),
+				) ?? []) {
 					if (!path.startsWith(prefix)) {
 						continue;
 					}
@@ -1403,11 +1037,11 @@ export class IndexManager {
 	}
 
 	/**
-	 * Build local files index
+	 * Build a complete local snapshot; unreadable files must never imply absence.
 	 */
 	async buildLocalIndex(): Promise<Map<string, FileMetadata>> {
 		logger.info("Building local index...");
-		const metadata = await this.vaultAdapter.getAllFileMetadata();
+		const metadata = await this.vaultAdapter.getAllFileMetadata(true);
 		logger.info(`Found ${metadata.size} files for synchronization`);
 		return metadata;
 	}
@@ -1426,28 +1060,16 @@ export class IndexManager {
 			resource?: YandexResource;
 			rootExists?: boolean;
 		} = stableRootDiscovery
-			? await this.waitForCanonicalIndexFromStableRoot()
-			: { path: await this.waitForCanonicalIndex() };
+			? await this.recovery.waitForCanonicalIndexFromStableRoot()
+			: { path: await this.recovery.waitForCanonicalIndex() };
 		if (!discovery.path) {
 			if (stableRootDiscovery && discovery.rootExists === false) {
 				await this.createRemotePath();
 			}
-			const initial = createEmptyIndex(this.settings.deviceId);
-			try {
-				await this.yandexClient.uploadFileExclusive(
-					this.getRemoteIndexPath(),
-					JSON.stringify(initial, null, 2),
-					false,
-					false,
-				);
-			} catch (error) {
-				if (!this.isLockContention(error)) {
-					throw error;
-				}
-			}
+			await this.recovery.initializeCanonicalIndex();
 			discovery = stableRootDiscovery
-				? await this.waitForCanonicalIndexFromStableRoot()
-				: { path: await this.waitForCanonicalIndex() };
+				? await this.recovery.waitForCanonicalIndexFromStableRoot()
+				: { path: await this.recovery.waitForCanonicalIndex() };
 			if (!discovery.path) {
 				throw new RemoteIndexConcurrentModificationError(
 					"Canonical index could not be initialized",
@@ -1465,7 +1087,7 @@ export class IndexManager {
 					discovery.resource,
 				)
 			).index;
-			this.loadedRemoteIndex = this.cloneIndex(this.remoteIndex);
+			this.loadedRemoteIndex = cloneIndex(this.remoteIndex);
 			if (
 				this.localState.observedEpoch === null ||
 				this.localState.observedEpoch === this.remoteIndex.epoch
@@ -1498,7 +1120,8 @@ export class IndexManager {
 	 */
 	async readCanonicalIndex(): Promise<SyncIndex> {
 		await this.assertRemoteScope();
-		const discovery = await this.waitForCanonicalIndexFromStableRoot();
+		const discovery =
+			await this.recovery.waitForCanonicalIndexFromStableRoot();
 		if (!discovery.path) {
 			throw new RemoteIndexConcurrentModificationError(
 				"Canonical index is missing",
@@ -1532,7 +1155,8 @@ export class IndexManager {
 	async readCanonicalIndexWithCodecIfPresent(
 		service: EncryptionCodec | null,
 	): Promise<SyncIndex | null> {
-		const discovery = await this.waitForCanonicalIndexFromStableRoot();
+		const discovery =
+			await this.recovery.waitForCanonicalIndexFromStableRoot();
 		if (!discovery.path) {
 			return null;
 		}
@@ -1557,13 +1181,13 @@ export class IndexManager {
 			);
 		}
 		const index = await this.readCanonicalIndexWithCodec(service);
-		if (!this.isTargetRecoveryIndex(index)) {
+		if (!isTargetRecoveryIndex(index, this.targetRecoveryMaintenanceId)) {
 			throw new Error("Target recovery authority changed");
 		}
 		this.assertEpochCompatible(index);
 		this.assertMaintenanceCompatible(index);
-		this.remoteIndex = this.cloneIndex(index);
-		this.loadedRemoteIndex = this.cloneIndex(index);
+		this.remoteIndex = cloneIndex(index);
+		this.loadedRemoteIndex = cloneIndex(index);
 		return this.remoteIndex;
 	}
 
@@ -1574,7 +1198,8 @@ export class IndexManager {
 	async readCanonicalIndexForRepair(
 		proof?: CanonicalCommitProof,
 	): Promise<SyncIndex> {
-		const discovery = await this.waitForCanonicalIndexFromStableRoot();
+		const discovery =
+			await this.recovery.waitForCanonicalIndexFromStableRoot();
 		if (!discovery.path || !discovery.resource) {
 			throw new RemoteIndexConcurrentModificationError(
 				"Canonical index is missing during physical repair",
@@ -1596,7 +1221,7 @@ export class IndexManager {
 					proof.contentFingerprint,
 				),
 			});
-			return this.cloneIndex(proof.index);
+			return cloneIndex(proof.index);
 		}
 		const snapshot = await this.downloadIndexSnapshot(
 			discovery.path,
@@ -1619,8 +1244,8 @@ export class IndexManager {
 	 */
 	async refreshCanonicalForMutation(): Promise<SyncIndex> {
 		const canonical = await this.readCanonicalIndex();
-		this.remoteIndex = this.cloneIndex(canonical);
-		this.loadedRemoteIndex = this.cloneIndex(canonical);
+		this.remoteIndex = cloneIndex(canonical);
+		this.loadedRemoteIndex = cloneIndex(canonical);
 		return canonical;
 	}
 
@@ -1662,379 +1287,164 @@ export class IndexManager {
 	}
 
 	private async saveRemoteIndexWithRetry(): Promise<CanonicalCommitProof> {
-		let lastError: Error | null = null;
-		for (let attempt = 0; attempt < 4; attempt++) {
-			try {
-				return await this.saveRemoteIndexLocked();
-			} catch (e) {
-				if (!(
-					e instanceof RemoteIndexTransactionError && e.retryable
-				)) {
-					throw e;
-				}
-				lastError = e;
-				logger.warn("Retrying canonical index transaction", {
-					attempt: attempt + 1,
-					maxAttempts: 4,
-					outcome: e.outcome,
-					failedStage: e.stage,
-					canonicalRevision: this.remoteIndex.revision,
-					epoch: shortenDiagnosticValue(this.remoteIndex.epoch),
-					error: e,
-				});
-				await this.wait(INDEX_LOCK_RETRY_MS + Math.random() * 500);
-			}
-		}
-		throw (
-			lastError ||
-			new RemoteIndexConcurrentModificationError(
-				"Remote index commit could not be retried",
-			)
-		);
+		return await commitCanonicalIndex({
+			client: this.yandexClient,
+			recovery: this.recovery,
+			assertRemoteScope: () => this.assertRemoteScope(),
+			getRemotePath: () => this.settings.remotePath,
+			getCanonicalPath: () => this.getRemoteIndexPath(),
+			getDeviceId: () => this.settings.deviceId,
+			createTransactionId: () => this.createTransactionId(),
+			getDesired: () => ({
+				revision: this.remoteIndex.revision,
+				epoch: this.remoteIndex.epoch,
+			}),
+			getLoadedRevision: () => this.loadedRemoteIndex.revision,
+			getPendingCounts: () => ({
+				mutations: this.getPendingMutations().length,
+				physicalActions: this.getPendingPhysicalActions().length,
+			}),
+			getCodecs: () => ({
+				source: this.transitionIndexReadService,
+				target: this.transitionIndexWriteService,
+			}),
+			isReplacing: () => this.replaceRemoteOnNextSave,
+			allowLegacyWrite: () => this.allowLegacyWriteOnce,
+			assertForceSourceSupported: () => this.assertForceSourceSupported(),
+			assertForceLocksUnchanged: (path) =>
+				this.assertForceLocksUnchanged(path),
+			isLockContention: (error) => this.isLockContention(error),
+			readSnapshot: (...args) => this.downloadIndexSnapshot(...args),
+			readUnparsedSnapshot: (path) =>
+				this.downloadUnparsedIndexSnapshot(path),
+			serialize: (index) => this.serializeCurrentIndex(index),
+			reduceLockedIndex: (...args) => this.reduceLockedIndex(...args),
+			acceptCommit: (index, proof) =>
+				this.finalizeCommittedTransaction(index, proof),
+		});
 	}
 
-	private async saveRemoteIndexLocked(): Promise<CanonicalCommitProof> {
-		await this.assertRemoteScope();
-		const canonicalPath = this.getRemoteIndexPath();
-		const transactionId = this.createTransactionId();
-		const lockPath = joinPath(
-			this.settings.remotePath,
-			`${REMOTE_INDEX_LOCK_PREFIX}${this.settings.deviceId}.${transactionId}`,
-		);
-		const transactionContext = {
-			indexTransactionId: transactionId,
-			lockName: lockPath.split("/").pop() ?? lockPath,
-			desiredRevision: this.remoteIndex.revision,
-			loadedRevision: this.loadedRemoteIndex.revision,
-			epoch: shortenDiagnosticValue(this.remoteIndex.epoch),
-			pendingMutations: this.getPendingMutations().length,
-			pendingPhysicalActions: this.getPendingPhysicalActions().length,
-		};
-		logger.info("Canonical index transaction started", transactionContext);
-
+	/** Snapshot causal inputs only after acquiring the canonical lock. */
+	private async reduceLockedIndex(
+		original: IndexFileSnapshot,
+		initializedIndex: SyncIndex | null,
+		lockPath: string,
+		transactionContext: Record<string, unknown>,
+	): Promise<{ latest: SyncIndex; merged: SyncIndex }> {
+		const latest = this.replaceRemoteOnNextSave
+			? this.createReplacementBaseline(original.index)
+			: original.index;
 		if (this.replaceRemoteOnNextSave) {
-			await this.assertForceSourceSupported();
-		}
-		await this.ensureCanonicalIndex();
-
-		let acquired = false;
-		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
-			try {
-				await this.yandexClient.moveResourceExclusive(
-					canonicalPath,
-					lockPath,
+			const expected = this.forcePreflightCanonical;
+			const matchesPreflight =
+				expected?.state === "present"
+					? (await computeSha256(original.raw)) === expected.rawSha256
+					: initializedIndex !== null &&
+						sameIndexValue(original.index, initializedIndex);
+			if (!matchesPreflight) {
+				throw new ForceBackupStaleError(
+					"Acquired canonical differs from Force preflight",
 				);
-				acquired = true;
-				logger.debug("Canonical index lock acquired", {
-					...transactionContext,
-					lockAttempt: attempt + 1,
-				});
-				break;
-			} catch (e) {
-				if (
-					await this.wasLockAcquiredDespiteError(
-						lockPath,
-						canonicalPath,
-					)
-				) {
-					acquired = true;
-					logger.warn(
-						"Canonical index lock acquisition was ambiguous but ownership was verified",
-						{
-							...transactionContext,
-							lockAttempt: attempt + 1,
-						},
-					);
-					break;
-				}
-				if (!this.isLockContention(e)) {
-					throw e;
-				}
-				if (attempt === 0 || (attempt + 1) % 10 === 0) {
-					logger.debug("Waiting for canonical index lock", {
-						...transactionContext,
-						lockAttempt: attempt + 1,
-						maxLockAttempts: INDEX_LOCK_ATTEMPTS,
-						error: e,
-					});
-				}
-				await this.wait(INDEX_LOCK_RETRY_MS + Math.random() * 300);
-				await this.recoverStaleLock();
 			}
 		}
-		if (!acquired) {
-			throw new RemoteIndexLockedError(
-				"Timed out waiting for the remote index transaction",
-			);
-		}
-
-		let stage: IndexTransactionStage = "acquired";
-		let originalSnapshot: IndexFileSnapshot | null = null;
-		let merged: SyncIndex | null = null;
-		let writtenFingerprint: string | null = null;
-		try {
-			try {
-				originalSnapshot = await this.downloadIndexSnapshot(
-					lockPath,
-					true,
-					this.transitionIndexReadService,
-					"source",
-				);
-			} catch (sourceReadError) {
-				originalSnapshot =
-					await this.downloadUnparsedIndexSnapshot(lockPath);
-				throw sourceReadError;
-			}
-			const latest = this.replaceRemoteOnNextSave
-				? this.createReplacementBaseline(originalSnapshot.index)
-				: originalSnapshot.index;
-			logger.debug("Latest canonical state loaded from lock", {
-				...transactionContext,
-				latestRevision: latest.revision,
-				latestEpoch: shortenDiagnosticValue(latest.epoch),
-				maintenance: latest.maintenance
-					? {
-							transitionId: shortenDiagnosticValue(
-								latest.maintenance.id,
-							),
-							kind: latest.maintenance.kind,
-							phase: latest.maintenance.phase,
-						}
-					: null,
-			});
-			if (!this.replaceRemoteOnNextSave) {
-				this.assertEpochCompatible(latest);
-				this.assertMaintenanceCompatible(latest);
-			}
-			merged = this.mergeDesiredIndex(latest);
-			logger.debug("Canonical reducer completed", {
-				...transactionContext,
-				latestRevision: latest.revision,
-				mergedRevision: merged.revision,
-				fileEntries: Object.keys(merged.files).length,
-				folderTombstones: Object.keys(merged.folderTombstones).length,
-				pendingMoves: Object.keys(merged.moves).length,
-			});
-			if (
-				this.allowLegacyWriteOnce &&
-				merged.revision === latest.revision
-			) {
-				merged.revision = latest.revision + 1;
-			}
-			if (merged.revision !== latest.revision) {
-				merged.format = CURRENT_INDEX_FORMAT;
-				merged.deviceId = this.settings.deviceId;
-				merged.lastSyncTime = Date.now();
-				let uploadError: unknown;
-				try {
-					if (this.transitionIndexWriteService !== undefined) {
-						await this.yandexClient.uploadFileWithEncryptionService(
-							lockPath,
-							JSON.stringify(merged, null, 2),
-							this.transitionIndexWriteService,
-						);
-					} else {
-						await this.yandexClient.uploadFile(
-							lockPath,
-							JSON.stringify(merged, null, 2),
-							true,
-							false,
-						);
+		logger.debug("Latest canonical state loaded from lock", {
+			...transactionContext,
+			latestRevision: latest.revision,
+			latestEpoch: shortenDiagnosticValue(latest.epoch),
+			maintenance: latest.maintenance
+				? {
+						transitionId: shortenDiagnosticValue(
+							latest.maintenance.id,
+						),
+						kind: latest.maintenance.kind,
+						phase: latest.maintenance.phase,
 					}
-				} catch (error) {
-					uploadError = error;
-				}
-				stage = "written";
-				const verifiedLock = await this.downloadIndexSnapshot(
-					lockPath,
-					this.allowLegacyWriteOnce,
-					this.transitionIndexWriteService,
-					"target",
-				);
-				if (!this.sameValue(verifiedLock.index, merged)) {
-					await this.logSemanticIndexMismatch(
-						merged,
-						verifiedLock.index,
-						transactionContext,
-					);
-					if (uploadError) {
-						throw uploadError instanceof Error
-							? uploadError
-							: new Error(
-									"Lock upload failed with a non-Error value",
-								);
-					}
-					throw new RemoteIndexContentMismatchError(
-						"Written lock revision or contents could not be verified",
-						stage,
-					);
-				}
-				writtenFingerprint = verifiedLock.fingerprint;
-				stage = "verified";
-				logger.debug("Written index lock verified", {
-					...transactionContext,
-					mergedRevision: merged.revision,
-					lockFingerprint: shortenDiagnosticValue(writtenFingerprint),
-				});
-			}
-			if (writtenFingerprint === null) {
-				const writtenLock = await this.yandexClient.getResource(
-					lockPath,
-					1,
-					0,
-					true,
-				);
-				writtenFingerprint = this.getResourceFingerprint(writtenLock);
-				stage = "verified";
-			}
-			stage = "move-attempted";
-			try {
-				await this.yandexClient.moveResourceExclusive(
-					lockPath,
-					canonicalPath,
-				);
-			} catch (error) {
-				const recovered = await this.recoverAmbiguousFinalMove(
-					lockPath,
-					canonicalPath,
-					merged,
-					writtenFingerprint,
-				);
-				if (recovered === "concurrent") {
-					throw new RemoteIndexConcurrentModificationError(
-						"Canonical index changed during the final move",
-						stage,
-						false,
-						error,
-					);
-				}
-				if (recovered !== "committed") {
-					throw new AmbiguousRemoteIndexStateError(
-						"Canonical index move could not be resolved safely",
-						stage,
-						error,
-					);
-				}
-			}
-			const canonicalProof = await this.verifyCanonicalCommit(
-				lockPath,
-				canonicalPath,
-				merged,
-				writtenFingerprint,
-			);
-			stage = "committed";
-			logger.debug("Canonical index fingerprint verified", {
-				...transactionContext,
-				committedRevision: merged.revision,
-				canonicalFingerprint: shortenDiagnosticValue(
-					canonicalProof.contentFingerprint,
-				),
-			});
-			await this.finalizeCommittedTransaction(merged);
-			logger.info("Canonical index transaction committed", {
-				...transactionContext,
-				outcome: "committed",
-				stage,
-				committedRevision: merged.revision,
-				canonicalFingerprint: shortenDiagnosticValue(
-					canonicalProof.contentFingerprint,
-				),
-			});
-			return canonicalProof;
-		} catch (e) {
-			if (
-				stage === "move-attempted" &&
-				merged &&
-				(await this.isExpectedCanonicalCommitted(
-					lockPath,
-					canonicalPath,
-					merged,
-					writtenFingerprint,
-				))
-			) {
-				stage = "committed";
-				const canonicalProof = await this.verifyCanonicalCommit(
-					lockPath,
-					canonicalPath,
-					merged,
-					writtenFingerprint,
-				);
-				await this.finalizeCommittedTransaction(merged);
-				logger.warn(
-					"Canonical index commit was confirmed after an ambiguous response",
-					{
-						...transactionContext,
-						outcome: "committed",
-						stage,
-						committedRevision: merged.revision,
-						error: e,
-					},
-				);
-				return canonicalProof;
-			}
-
-			const rollbackOutcome = originalSnapshot
-				? await this.rollbackOwnedLock(
-						lockPath,
-						canonicalPath,
-						originalSnapshot,
-						transactionContext,
-					)
-				: "ambiguous";
-			logger.error("Canonical index transaction failed", {
-				...transactionContext,
-				outcome: rollbackOutcome,
-				failedStage: stage,
-				expectedRevision: merged?.revision,
-				actualRevision:
-					rollbackOutcome === "rolled-back"
-						? originalSnapshot?.index.revision
-						: null,
-				expectedEpoch: shortenDiagnosticValue(merged?.epoch),
-				actualEpoch: shortenDiagnosticValue(
-					rollbackOutcome === "rolled-back"
-						? originalSnapshot?.index.epoch
-						: null,
-				),
-				expectedFingerprint: shortenDiagnosticValue(writtenFingerprint),
-				actualFingerprint: shortenDiagnosticValue(
-					rollbackOutcome === "rolled-back"
-						? originalSnapshot?.fingerprint
-						: null,
-				),
-				error: e,
-			});
-			if (rollbackOutcome === "rolled-back") {
-				if (e instanceof UnsupportedHistoricalDataError) {
-					throw e;
-				}
-				throw new RemoteIndexRolledBackError(
-					e instanceof Error
-						? e.message
-						: "Canonical index transaction failed",
-					stage,
-					e,
-				);
-			}
-			if (rollbackOutcome === "concurrent") {
-				throw new RemoteIndexConcurrentModificationError(
-					"Canonical index changed while the transaction was active",
-					stage,
-					false,
-					e,
-				);
-			}
-			throw new AmbiguousRemoteIndexStateError(
-				"Canonical index and lock require explicit recovery",
-				stage,
-				e,
-			);
+				: null,
+		});
+		if (!this.replaceRemoteOnNextSave) {
+			this.assertEpochCompatible(latest);
+			this.assertMaintenanceCompatible(latest);
 		}
+		this.rejectedPuts = [];
+		const mode: CanonicalMergeMode = this.replaceRemoteOnNextSave
+			? { kind: "replacement", replacementDeletedAt: Date.now() }
+			: this.targetRecoveryMaintenanceId !== null
+				? {
+						kind: "target-recovery",
+						maintenanceId: this.targetRecoveryMaintenanceId,
+					}
+				: this.physicalRewriteOnNextSave
+					? { kind: "physical-rewrite" }
+					: { kind: "normal" };
+		const result = mergeDesiredIndex({
+			latest,
+			loadedBase: this.loadedRemoteIndex,
+			desired: this.remoteIndex,
+			deviceId: this.settings.deviceId,
+			baseRevision: this.loadedRemoteIndex.revision,
+			mode,
+			completedMoveIds: new Set(this.completedMoveIds),
+			putBaselines: this.operationStore
+				.getMutations()
+				.map(({ type, path, baselineSha256 }) => ({
+					type,
+					path,
+					baselineSha256,
+				})),
+		});
+		const merged = result.index;
+		this.rejectedPuts = result.rejectedPuts;
+		for (const diagnostic of result.diagnostics) {
+			logger.debug("File mutation reduced without logical write", {
+				...diagnostic,
+				deviceId: shortenDiagnosticValue(diagnostic.deviceId),
+			});
+		}
+		if (this.replaceRemoteOnNextSave) {
+			await this.assertForceLocksUnchanged(lockPath);
+		}
+		logger.debug("Canonical reducer completed", {
+			...transactionContext,
+			latestRevision: latest.revision,
+			mergedRevision: merged.revision,
+			fileEntries: Object.keys(merged.files).length,
+			folderTombstones: Object.keys(merged.folderTombstones).length,
+			pendingMoves: Object.keys(merged.moves).length,
+		});
+		return { latest, merged };
 	}
 
 	/** Reject unsupported historical or malformed data before Force takes a lock. */
 	private async assertForceSourceSupported(): Promise<void> {
-		await this.captureForceCanonicalProof();
+		const actual = await this.captureForceCanonicalProof();
+		if (
+			this.forcePreflightCanonical !== null &&
+			!sameIndexValue(this.forcePreflightCanonical, actual)
+		) {
+			throw new ForceBackupStaleError(
+				"Canonical or index locks changed after Force preflight",
+			);
+		}
+		this.forcePreflightCanonical = actual;
+	}
+
+	/** Another transaction cannot join the set that this Force is authorized to replace. */
+	private async assertForceLocksUnchanged(
+		ownedLockPath: string,
+	): Promise<void> {
+		const { resources } = await this.recovery.getStableRootListing();
+		const locks = this.recovery.observeIndexLocks(
+			resources.filter(
+				(resource) =>
+					joinPath(this.settings.remotePath, resource.name) !==
+					ownedLockPath,
+			),
+		);
+		if (!sameIndexValue(locks, this.forcePreflightCanonical?.locks ?? [])) {
+			throw new ForceBackupStaleError(
+				"Index locks changed during Force replacement",
+			);
+		}
 	}
 
 	/**
@@ -2289,7 +1699,13 @@ export class IndexManager {
 				rawResource.path,
 				this.settings.remotePath,
 			);
-			if (cleanupPaths.has(normalizePath(rawLocalPath))) {
+			if (
+				cleanupPaths.has(normalizePath(rawLocalPath)) ||
+				this.vaultAdapter.shouldInspectRaw?.(
+					rawLocalPath,
+					this.yandexClient.hasEncryptionService(),
+				) === false
+			) {
 				continue;
 			}
 			const resource =
@@ -2371,114 +1787,11 @@ export class IndexManager {
 		return joinPath(this.settings.remotePath, REMOTE_INDEX_FILENAME);
 	}
 
-	private async waitForCanonicalIndex(): Promise<string | null> {
-		const canonicalPath = this.getRemoteIndexPath();
-		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
-			const canonical = await this.yandexClient.getResource(
-				canonicalPath,
-				1000,
-				0,
-				true,
-			);
-			if (canonical) {
-				if (!this.replaceRemoteOnNextSave) {
-					await this.cleanupStaleOrphanLocks();
-				}
-				return canonicalPath;
-			}
-
-			const locks = await this.getIndexLocks();
-			if (locks.length === 0) {
-				return null;
-			}
-			if (this.replaceRemoteOnNextSave) {
-				return null;
-			}
-			if (locks.length > 1) {
-				throw new AmbiguousRemoteIndexLockError(
-					"Multiple remote index locks require an explicit force sync",
-				);
-			}
-
-			await this.recoverStaleLock(locks);
-			await this.wait(INDEX_LOCK_RETRY_MS);
-		}
-		throw new RemoteIndexLockedError(
-			"Remote index is locked by another device",
-		);
-	}
-
-	private async waitForCanonicalIndexFromStableRoot(): Promise<{
-		path: string | null;
-		resource?: YandexResource;
-		rootExists: boolean;
-		locks: YandexResource[];
-	}> {
-		const canonicalPath = this.getRemoteIndexPath();
-		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
-			const { resources, rootExists } = await this.getStableRootListing();
-			const canonical = resources.find(
-				(resource) =>
-					resource.type === "file" &&
-					resource.name === REMOTE_INDEX_FILENAME,
-			);
-			const locks = this.selectIndexLocks(resources);
-			if (canonical) {
-				if (!this.replaceRemoteOnNextSave) {
-					await this.cleanupStaleOrphanLocks(locks);
-				}
-				return {
-					path: canonicalPath,
-					resource: canonical,
-					rootExists,
-					locks,
-				};
-			}
-			if (locks.length === 0 || this.replaceRemoteOnNextSave) {
-				return { path: null, rootExists, locks };
-			}
-			if (locks.length > 1) {
-				throw new AmbiguousRemoteIndexLockError(
-					"Multiple remote index locks require an explicit force sync",
-				);
-			}
-			await this.recoverStaleLock(locks);
-			await this.wait(INDEX_LOCK_RETRY_MS);
-		}
-		throw new RemoteIndexLockedError(
-			"Remote index is locked by another device",
-		);
-	}
-
-	private async ensureCanonicalIndex(): Promise<void> {
-		const existing = await this.waitForCanonicalIndex();
-		if (existing) {
-			return;
-		}
-
-		const empty = createEmptyIndex("");
-		try {
-			await this.yandexClient.uploadFileExclusive(
-				this.getRemoteIndexPath(),
-				JSON.stringify(empty, null, 2),
-				false,
-				false,
-			);
-		} catch (e) {
-			if (!this.isLockContention(e)) {
-				throw e;
-			}
-		}
-	}
-
-	private async downloadIndex(
-		path: string,
-		allowLegacy: boolean,
-		serviceOverride?: EncryptionCodec | null,
-	): Promise<SyncIndex> {
-		return (
-			await this.downloadIndexSnapshot(path, allowLegacy, serviceOverride)
-		).index;
+	/** Validate the exact JSON representation before publishing a current index. */
+	private serializeCurrentIndex(index: SyncIndex): string {
+		const content = JSON.stringify(index, null, 2);
+		this.normalizeParsedIndex(JSON.parse(content) as unknown, false, false);
+		return content;
 	}
 
 	private async downloadIndexSnapshot(
@@ -2650,7 +1963,7 @@ export class IndexManager {
 		}
 		validateCurrentIndexShape(data);
 		validateCurrentIndexCausality(data);
-		return this.cloneIndex(data);
+		return cloneIndex(data);
 	}
 
 	private async createUnreadableIndexError(
@@ -2716,839 +2029,58 @@ export class IndexManager {
 		return baseline;
 	}
 
-	private mergeDesiredIndex(latest: SyncIndex): SyncIndex {
-		this.rejectedPuts = [];
-		const nextRevision = latest.revision + 1;
-		if (this.replaceRemoteOnNextSave) {
-			const replacement = this.cloneIndex(this.remoteIndex);
-			replacement.revision = nextRevision;
-			for (const [path, previous] of Object.entries(latest.files)) {
-				if (getRecordValue(replacement.files, path) !== undefined) {
-					continue;
-				}
-				setRecordValue(replacement.files, path, {
-					...previous,
-					deleted: true,
-					deletedAt: previous.deletedAt ?? Date.now(),
-					deletedByFolder: undefined,
-				});
-			}
-			for (const meta of Object.values(replacement.files)) {
-				meta.changedRevision = nextRevision;
-				meta.baseRevision = latest.revision;
-				meta.lastModifiedBy = this.settings.deviceId;
-				meta.mutationSeq = 0;
-			}
-			for (const tombstone of Object.values(
-				replacement.folderTombstones,
-			)) {
-				tombstone.changedRevision = nextRevision;
-				tombstone.baseRevision = latest.revision;
-				tombstone.lastModifiedBy = this.settings.deviceId;
-				tombstone.mutationSeq = 0;
-			}
-			for (const move of Object.values(replacement.moves)) {
-				move.changedRevision = nextRevision;
-				move.baseRevision = latest.revision;
-				move.lastModifiedBy = this.settings.deviceId;
-				move.mutationSeq = 0;
-			}
-			return replacement;
+	private async cleanupForceReplacedLocks(
+		proof: CanonicalCommitProof,
+	): Promise<void> {
+		for (const lock of this.forcePreflightCanonical?.locks ?? []) {
+			await this.recovery.deleteObservedIndexLock(lock, this.remoteIndex);
 		}
-
-		const merged = this.cloneIndex(latest);
-		let changed = false;
-		const baseRevision = this.loadedRemoteIndex.revision;
-		const desiredMaintenance = this.remoteIndex.maintenance;
-		if (
-			this.loadedRemoteIndex.maintenance &&
-			!this.sameValue(
-				this.loadedRemoteIndex.maintenance,
-				latest.maintenance,
-			)
-		) {
-			throw new RemoteIndexConcurrentModificationError(
-				"Maintenance changed since it was observed",
-			);
-		}
-		if (this.targetRecoveryMaintenanceId !== null) {
-			if (
-				!this.isTargetRecoveryIndex(latest) ||
-				latest.epoch !== this.loadedRemoteIndex.epoch ||
-				(desiredMaintenance &&
-					desiredMaintenance.id !== this.targetRecoveryMaintenanceId)
-			) {
-				throw new RemoteIndexConcurrentModificationError(
-					"Target recovery authority changed before commit",
-				);
-			}
-			if (!this.sameValue(desiredMaintenance, latest.maintenance)) {
-				if (desiredMaintenance) {
-					merged.maintenance = this.cloneValue(desiredMaintenance);
-				} else {
-					delete merged.maintenance;
-				}
-				merged.revision = nextRevision;
-			}
-			return merged;
-		}
-		if (
-			desiredMaintenance?.phase === "prepared" &&
-			!this.sameValue(
-				desiredMaintenance,
-				this.loadedRemoteIndex.maintenance,
-			) &&
-			didCanonicalChangeBeforeMaintenanceClaim(
-				this.loadedRemoteIndex.revision,
-				latest.revision,
-			)
-		) {
-			throw new RemoteIndexConcurrentModificationError(
-				"Canonical revision changed before encryption maintenance ownership was acquired",
-			);
-		}
-
-		for (const [path, desired] of Object.entries(this.remoteIndex.files)) {
-			const baseline = this.loadedRemoteIndex.files[path];
-			if (this.sameValue(desired, baseline)) {
-				continue;
-			}
-
-			const current = merged.files[path];
-			if (this.physicalRewriteOnNextSave) {
-				const physical = mergePhysicalMetadata(
-					current,
-					baseline,
-					desired,
-				);
-				if (!physical) {
-					throw new RemoteIndexConcurrentModificationError(
-						`Logical state changed during physical rewrite: ${path}`,
-					);
-				}
-				setRecordValue(merged.files, path, physical);
-				changed = true;
-				continue;
-			}
-			const logicalChange =
-				baseline === undefined ||
-				desired.sha256 !== baseline.sha256 ||
-				desired.deleted !== baseline.deleted ||
-				desired.deletedByFolder !== baseline.deletedByFolder;
-			if (logicalChange && desired.mutationSeq === undefined) {
-				throw new InvalidCurrentIndexError(
-					"files",
-					"new logical state is missing mutationSeq",
-				);
-			}
-			if (logicalChange && desired.mutationSeq === 0) {
-				throw new InvalidCurrentIndexError(
-					"files",
-					"normal logical mutation must have mutationSeq greater than zero",
-				);
-			}
-			const mutationBase = desired.baseRevision ?? baseRevision;
-			const mutationDevice =
-				desired.lastModifiedBy ?? this.settings.deviceId;
-			const causalContext = {
-				baselineSha256:
-					this.operationStore.findLatestPutBaselineSha(path),
-				currentWatermark:
-					latest.appliedMutationSeq[mutationDevice] ?? 0,
-				desiredWatermark:
-					this.remoteIndex.appliedMutationSeq[mutationDevice] ?? 0,
-			};
-			const decision = classifyFileMutation(
-				current,
-				desired,
-				mutationBase,
-				causalContext,
-			);
-			if (decision === "fifo-gap" || decision === "invalid-sequence") {
-				throw new InvalidCurrentIndexError(
-					"files",
-					`causal mutation rejected: ${decision}`,
-				);
-			}
-			const next = mergeFileMutation(
-				current,
-				desired,
-				mutationBase,
-				nextRevision,
-				this.settings.deviceId,
-				causalContext,
-				decision,
-			);
-			if (next === current || !next) {
-				if (
-					decision === "concurrent-foreign" &&
-					desired.deletedByFolder &&
-					current &&
-					!current.deleted
-				) {
-					setRecordValue(merged.files, path, {
-						...current,
-						changedRevision: nextRevision,
-					});
-					changed = true;
-					continue;
-				}
-				if (
-					!desired.deleted &&
-					current &&
-					desired.remoteFingerprint &&
-					(decision === "concurrent-foreign" ||
-						decision === "rejected-by-delete")
-				) {
-					this.rejectedPuts.push({
-						path,
-						reason:
-							decision === "rejected-by-delete"
-								? "delete"
-								: "conflict",
-						remoteFingerprint: desired.remoteFingerprint,
-						baselineSha256:
-							this.operationStore.findLatestPutBaselineSha(path),
-					});
-				}
-				logger.debug("File mutation reduced without logical write", {
-					path,
-					decision,
-					baseRevision: mutationBase,
-					currentRevision: current?.changedRevision ?? null,
-					mutationSeq: desired.mutationSeq ?? null,
-					deviceId: shortenDiagnosticValue(mutationDevice),
-				});
-				continue;
-			}
-
-			setRecordValue(merged.files, path, next);
-			changed = true;
-		}
-
-		for (const [path, tombstone] of Object.entries(
-			this.remoteIndex.folderTombstones,
-		)) {
-			if (
-				this.sameValue(
-					tombstone,
-					this.loadedRemoteIndex.folderTombstones[path],
-				)
-			) {
-				continue;
-			}
-			if (
-				tombstone.mutationSeq === undefined ||
-				tombstone.mutationSeq === 0
-			) {
-				throw new InvalidCurrentIndexError(
-					"folderTombstones",
-					"new logical state requires mutationSeq greater than zero",
-				);
-			}
-			if (
-				(this.remoteIndex.appliedMutationSeq[
-					tombstone.lastModifiedBy
-				] ?? 0) < tombstone.mutationSeq
-			) {
-				throw new InvalidCurrentIndexError(
-					"folderTombstones",
-					"mutationSeq exceeds its staged device watermark",
-				);
-			}
-			setRecordValue(merged.folderTombstones, path, {
-				...tombstone,
-				baseRevision: tombstone.baseRevision ?? baseRevision,
-				changedRevision: nextRevision,
-				lastModifiedBy: this.settings.deviceId,
-				mutationSeq: tombstone.mutationSeq,
-			});
-			const mutationBase = tombstone.baseRevision ?? baseRevision;
-			for (const [filePath, current] of Object.entries(merged.files)) {
-				if (
-					!isPathInsideFolder(filePath, path) ||
-					!shouldPreserveConcurrentFolderChild(
-						current,
-						mutationBase,
-						tombstone.lastModifiedBy,
-						tombstone.mutationSeq,
-					)
-				) {
-					continue;
-				}
-				setRecordValue(merged.files, filePath, {
-					...current,
-					changedRevision: nextRevision,
-				});
-			}
-			changed = true;
-		}
-
-		for (const [id, move] of Object.entries(this.remoteIndex.moves)) {
-			if (this.sameValue(move, this.loadedRemoteIndex.moves[id])) {
-				continue;
-			}
-			if (move.mutationSeq === undefined || move.mutationSeq === 0) {
-				throw new InvalidCurrentIndexError(
-					"moves",
-					"new logical state requires mutationSeq greater than zero",
-				);
-			}
-			if (
-				(this.remoteIndex.appliedMutationSeq[move.lastModifiedBy] ??
-					0) < move.mutationSeq
-			) {
-				throw new InvalidCurrentIndexError(
-					"moves",
-					"mutationSeq exceeds its staged device watermark",
-				);
-			}
-			setRecordValue(merged.moves, id, {
-				...move,
-				changedRevision: nextRevision,
-				lastModifiedBy: this.settings.deviceId,
-				mutationSeq: move.mutationSeq,
-			});
-			changed = true;
-		}
-		for (const id of this.completedMoveIds) {
-			if (!merged.moves[id]) {
-				continue;
-			}
-			delete merged.moves[id];
-			changed = true;
-		}
-
-		for (const [deviceId, sequence] of Object.entries(
-			this.remoteIndex.appliedMutationSeq,
-		)) {
-			const current = merged.appliedMutationSeq[deviceId] || 0;
-			if (sequence <= current) {
-				continue;
-			}
-			setRecordValue(merged.appliedMutationSeq, deviceId, sequence);
-			changed = true;
-		}
-
-		if (
-			!this.sameValue(
-				this.remoteIndex.maintenance,
-				this.loadedRemoteIndex.maintenance,
-			)
-		) {
-			if (this.remoteIndex.maintenance) {
-				merged.maintenance = this.cloneValue(
-					this.remoteIndex.maintenance,
-				);
-			} else {
-				delete merged.maintenance;
-			}
-			changed = true;
-		}
-
-		merged.revision = changed ? nextRevision : latest.revision;
-		return merged;
+		await this.assertForceCleanupComplete(proof);
 	}
 
-	private async getIndexLocks(): Promise<YandexResource[]> {
-		return this.selectIndexLocks(
-			(await this.getStableRootListing()).resources,
-		);
-	}
-
-	private async getStableRootListing(): Promise<{
-		resources: YandexResource[];
-		rootExists: boolean;
-	}> {
-		let rootExists = false;
-		const resources = await collectStablePaginatedItems(
-			async (limit, offset) => {
-				const root = await this.yandexClient.getResource(
-					this.settings.remotePath,
-					limit,
-					offset,
-					true,
-				);
-				if (offset === 0) {
-					rootExists = root !== null;
-				}
-				return {
-					items: root?._embedded?.items ?? [],
-					total: root?._embedded?.total ?? 0,
-				};
-			},
-			(resource) => resource.path || resource.name,
-			(resource) =>
-				[
-					resource.resource_id || "",
-					getStableContentFingerprint(resource) || "",
-				].join(":"),
-			4,
-			() => (rootExists ? "exists" : "missing"),
-		);
-		return { resources, rootExists };
-	}
-
-	private selectIndexLocks(resources: YandexResource[]): YandexResource[] {
-		return resources.filter(
+	/** A successful normal full alone does not prove that Force orphan cleanup finished. */
+	async assertForceCleanupComplete(
+		proof?: CanonicalCommitProof,
+	): Promise<void> {
+		const { resources } = await this.recovery.getStableRootListing();
+		const resource = resources.find(
 			(resource) =>
 				resource.type === "file" &&
-				resource.name.startsWith(REMOTE_INDEX_LOCK_PREFIX),
+				resource.name === REMOTE_INDEX_FILENAME,
 		);
-	}
-
-	/**
-	 * Observe one lock lease using content identity that changes on overwrite.
-	 */
-	private isObservedLockStale(resource: YandexResource): boolean {
-		const fingerprint = getStableContentFingerprint(resource);
-		if (!fingerprint) {
+		if (!resource || this.recovery.selectIndexLocks(resources).length > 0) {
 			throw new AmbiguousRemoteIndexLockError(
-				"Index lock has no stable content identity",
+				"Force replacement still has unresolved index locks",
 			);
 		}
-		const now = Date.now();
-		const observed = this.observedLocks.get(resource.name);
-		if (!observed || observed.fingerprint !== fingerprint) {
-			this.observedLocks.set(resource.name, {
-				fingerprint,
-				firstSeenAt: now,
-			});
-			return false;
-		}
-		return isStableLockStale(
-			observed.firstSeenAt,
-			now,
-			INDEX_LOCK_STALE_MS,
-		);
-	}
-
-	private async recoverStaleLock(
-		knownLocks?: YandexResource[],
-	): Promise<void> {
-		const locks = knownLocks || (await this.getIndexLocks());
-		if (locks.length === 0) {
+		if (
+			proof &&
+			isHashStableContentFingerprint(proof.contentFingerprint) &&
+			matchesStableContentFingerprint(proof.contentFingerprint, resource)
+		) {
 			return;
 		}
-		if (locks.length > 1) {
-			throw new AmbiguousRemoteIndexLockError(
-				"Multiple remote index locks require an explicit force sync",
-			);
-		}
-
-		for (const resource of locks) {
-			if (!this.isObservedLockStale(resource)) {
-				continue;
-			}
-
-			const lockPath = joinPath(this.settings.remotePath, resource.name);
-			await this.assertStaleLockReadable(lockPath);
-			try {
-				await this.yandexClient.moveResourceExclusive(
-					lockPath,
-					this.getRemoteIndexPath(),
-				);
-				this.observedLocks.delete(resource.name);
-				logger.warn(`Recovered stale index lock: ${resource.name}`);
-				return;
-			} catch (e) {
-				if (!this.isLockContention(e)) {
-					throw e;
-				}
-			}
-		}
-	}
-
-	private async assertStaleLockReadable(lockPath: string): Promise<void> {
-		const candidates: Array<{
-			service: EncryptionCodec | null | undefined;
-			codec: IndexCodec;
-		}> = [
-			{
-				service: this.transitionIndexReadService,
-				codec: "source",
-			},
-			{
-				service: this.transitionIndexWriteService,
-				codec: "target",
-			},
-			{ service: undefined, codec: "current" },
-		];
-		for (const candidate of candidates) {
-			try {
-				await this.downloadIndexSnapshot(
-					lockPath,
-					true,
-					candidate.service,
-					candidate.codec,
-				);
-				return;
-			} catch {
-				// Continue with the other codec before blocking recovery.
-			}
-		}
-		throw new AmbiguousRemoteIndexLockError(
-			"Stale index lock is unreadable and cannot be published automatically",
+		const snapshot = await this.downloadIndexSnapshot(
+			this.getRemoteIndexPath(),
+			false,
+			undefined,
+			undefined,
+			resource,
 		);
-	}
-
-	private async cleanupStaleOrphanLocks(
-		knownLocks?: YandexResource[],
-	): Promise<void> {
-		const locks = knownLocks ?? (await this.getIndexLocks());
-		if (locks.length > 1) {
-			throw new AmbiguousRemoteIndexLockError(
-				"Multiple orphan index locks require an explicit force sync",
+		if (snapshot.index.maintenance) {
+			throw new RemoteMaintenanceActiveError(
+				snapshot.index.maintenance.id,
+				snapshot.index.maintenance.initiatedBy,
 			);
-		}
-		for (const resource of locks) {
-			if (!this.isObservedLockStale(resource)) {
-				continue;
-			}
-			const canonical = await this.downloadIndex(
-				this.getRemoteIndexPath(),
-				this.allowLegacyWriteOnce,
-			);
-			const orphan = await this.downloadIndex(
-				joinPath(this.settings.remotePath, resource.name),
-				this.allowLegacyWriteOnce,
-			);
-			if (isOrphanIndexAmbiguous(canonical, orphan)) {
-				throw new AmbiguousRemoteIndexLockError(
-					"An orphan lock conflicts with the canonical index",
-				);
-			}
-			await this.yandexClient.deleteResource(
-				joinPath(this.settings.remotePath, resource.name),
-				false,
-				true,
-			);
-			this.observedLocks.delete(resource.name);
-			logger.warn(`Removed stale orphan index lock: ${resource.name}`);
-		}
-	}
-
-	private async cleanupForceReplacedLocks(): Promise<void> {
-		for (const resource of await this.getIndexLocks()) {
-			await this.yandexClient.deleteResource(
-				joinPath(this.settings.remotePath, resource.name),
-				false,
-				true,
-			);
-		}
-	}
-
-	private async wasLockAcquiredDespiteError(
-		lockPath: string,
-		canonicalPath: string,
-	): Promise<boolean> {
-		try {
-			const [lock, canonical] = await Promise.all([
-				this.yandexClient.getResource(lockPath, 1, 0, true),
-				this.yandexClient.getResource(canonicalPath, 1, 0, true),
-			]);
-			return lock !== null && canonical === null;
-		} catch {
-			return false;
-		}
-	}
-
-	private async inspectExpectedIndex(
-		path: string,
-		expected: SyncIndex,
-		serviceOverride?: EncryptionCodec | null,
-		codecLabel?: IndexCodec,
-		expectedResource?: YandexResource,
-	): Promise<{
-		exists: boolean;
-		readable: boolean;
-		matches: boolean;
-		snapshot: IndexFileSnapshot | null;
-	}> {
-		const resource =
-			expectedResource ??
-			(await this.yandexClient.getResource(path, 1, 0, true));
-		if (!resource) {
-			return {
-				exists: false,
-				readable: false,
-				matches: false,
-				snapshot: null,
-			};
-		}
-		try {
-			const snapshot = await this.downloadIndexSnapshot(
-				path,
-				this.allowLegacyWriteOnce,
-				serviceOverride,
-				codecLabel,
-				resource,
-			);
-			return {
-				exists: true,
-				readable: true,
-				matches: this.sameValue(snapshot.index, expected),
-				snapshot,
-			};
-		} catch {
-			return {
-				exists: true,
-				readable: false,
-				matches: false,
-				snapshot: null,
-			};
-		}
-	}
-
-	private async recoverAmbiguousFinalMove(
-		lockPath: string,
-		canonicalPath: string,
-		expected: SyncIndex,
-		expectedFingerprint: string | null,
-	): Promise<IndexTransactionOutcome> {
-		const [canonical, lock] = await Promise.all([
-			this.inspectExpectedIndex(
-				canonicalPath,
-				expected,
-				this.transitionIndexWriteService,
-				"target",
-			),
-			this.inspectExpectedIndex(
-				lockPath,
-				expected,
-				this.transitionIndexWriteService,
-				"target",
-			),
-		]);
-		let decision = classifyIndexMoveRecovery({
-			canonicalExists: canonical.exists,
-			lockExists: lock.exists,
-			canonicalReadable: canonical.readable,
-			lockReadable: lock.readable,
-			canonicalMatchesExpected: canonical.matches,
-			lockMatchesExpected: lock.matches,
-		});
-		if (
-			decision === "committed" &&
-			isHashStableContentFingerprint(expectedFingerprint) &&
-			canonical.snapshot?.fingerprint !== expectedFingerprint
-		) {
-			decision = "ambiguous";
-		}
-		if (decision === "retry-move") {
-			try {
-				await this.yandexClient.moveResourceExclusive(
-					lockPath,
-					canonicalPath,
-				);
-			} catch {
-				// The read-back below is authoritative for an ambiguous API reply.
-			}
-			try {
-				await this.verifyCanonicalCommit(
-					lockPath,
-					canonicalPath,
-					expected,
-					expectedFingerprint,
-				);
-				return "committed";
-			} catch (error) {
-				if (error instanceof RemoteIndexConcurrentModificationError) {
-					return "concurrent";
-				}
-				return "ambiguous";
-			}
-		}
-		return decision === "committed" ? "committed" : decision;
-	}
-
-	private async verifyCanonicalCommit(
-		lockPath: string,
-		canonicalPath: string,
-		expected: SyncIndex,
-		expectedFingerprint: string | null,
-	): Promise<CanonicalCommitProof> {
-		const [canonicalResource, lock] = await Promise.all([
-			this.yandexClient.getResource(canonicalPath, 1, 0, true),
-			this.yandexClient.getResource(lockPath, 1, 0, true),
-		]);
-		if (
-			canonicalResource &&
-			!lock &&
-			isHashStableContentFingerprint(expectedFingerprint) &&
-			matchesStableContentFingerprint(
-				expectedFingerprint,
-				canonicalResource,
-			)
-		) {
-			logger.debug("Canonical commit verified from content hash", {
-				commitVerification: "hash-fast",
-				canonicalRevision: expected.revision,
-				canonicalFingerprint:
-					shortenDiagnosticValue(expectedFingerprint),
-			});
-			return this.createCanonicalCommitProof(
-				expected,
-				expectedFingerprint,
-			);
-		}
-
-		const canonical = canonicalResource
-			? await this.inspectExpectedIndex(
-					canonicalPath,
-					expected,
-					this.transitionIndexWriteService,
-					"target",
-					canonicalResource,
-				)
-			: {
-					exists: false,
-					readable: false,
-					matches: false,
-					snapshot: null,
-				};
-		if (
-			canonical.exists &&
-			canonical.readable &&
-			canonical.matches &&
-			!lock &&
-			(!isHashStableContentFingerprint(expectedFingerprint) ||
-				canonical.snapshot?.fingerprint === expectedFingerprint) &&
-			canonical.snapshot?.fingerprint
-		) {
-			logger.debug("Canonical commit verified semantically", {
-				commitVerification: "semantic-fallback",
-				canonicalRevision: expected.revision,
-				canonicalFingerprint: shortenDiagnosticValue(
-					canonical.snapshot.fingerprint,
-				),
-			});
-			return this.createCanonicalCommitProof(
-				expected,
-				canonical.snapshot.fingerprint,
-			);
-		}
-		if (
-			canonical.exists &&
-			canonical.readable &&
-			!canonical.matches &&
-			!lock
-		) {
-			throw new RemoteIndexConcurrentModificationError(
-				"Canonical index contains a different logical state",
-				"move-attempted",
-				false,
-			);
-		}
-		throw new AmbiguousRemoteIndexStateError(
-			"Canonical index commit could not be verified",
-			"move-attempted",
-		);
-	}
-
-	private createCanonicalCommitProof(
-		index: SyncIndex,
-		contentFingerprint: string,
-	): CanonicalCommitProof {
-		return {
-			epoch: index.epoch,
-			revision: index.revision,
-			index: this.cloneIndex(index),
-			contentFingerprint,
-		};
-	}
-
-	private async isExpectedCanonicalCommitted(
-		lockPath: string,
-		canonicalPath: string,
-		expected: SyncIndex,
-		expectedFingerprint: string | null,
-	): Promise<boolean> {
-		try {
-			await this.verifyCanonicalCommit(
-				lockPath,
-				canonicalPath,
-				expected,
-				expectedFingerprint,
-			);
-			return true;
-		} catch {
-			return false;
-		}
-	}
-
-	private async rollbackOwnedLock(
-		lockPath: string,
-		canonicalPath: string,
-		original: IndexFileSnapshot,
-		context: Record<string, unknown>,
-	): Promise<IndexTransactionOutcome> {
-		try {
-			const outcome = await rollbackRawIndexSnapshot(
-				{
-					exists: async (path) =>
-						(await this.yandexClient.getResource(
-							path,
-							1,
-							0,
-							true,
-						)) !== null,
-					readRaw: async (path) =>
-						await this.yandexClient.downloadFile(path, true),
-					writeRaw: async (path, raw) =>
-						await this.yandexClient.uploadFile(
-							path,
-							raw,
-							true,
-							true,
-							true,
-						),
-					moveExclusive: async (fromPath, toPath) =>
-						await this.yandexClient.moveResourceExclusive(
-							fromPath,
-							toPath,
-						),
-				},
-				lockPath,
-				canonicalPath,
-				original.raw,
-				async (raw) => {
-					await this.decodeIndexSnapshot(
-						raw,
-						true,
-						this.transitionIndexReadService,
-						"source",
-					);
-				},
-			);
-			if (outcome !== "rolled-back") {
-				return outcome;
-			}
-			logger.warn("Canonical index transaction rolled back", {
-				...context,
-				outcome: "rolled-back",
-				restoredRevision: original.index.revision,
-				restoredEpoch: shortenDiagnosticValue(original.index.epoch),
-				restoredFingerprint: shortenDiagnosticValue(
-					original.fingerprint,
-				),
-			});
-			return outcome;
-		} catch (rollbackError) {
-			logger.error("Canonical index rollback is ambiguous", {
-				...context,
-				outcome: "ambiguous",
-				error: rollbackError,
-			});
-			return "ambiguous";
 		}
 	}
 
 	private async finalizeCommittedTransaction(
 		merged: SyncIndex,
+		proof: CanonicalCommitProof,
 	): Promise<void> {
 		this.remoteIndex = merged;
-		this.loadedRemoteIndex = this.cloneIndex(merged);
+		this.loadedRemoteIndex = cloneIndex(merged);
 		this.completedMoveIds.clear();
 		this.allowLegacyWriteOnce = false;
 		const replacedRemote = this.replaceRemoteOnNextSave;
@@ -3559,89 +2091,29 @@ export class IndexManager {
 
 		this.finalizeForceEpoch(merged);
 		try {
-			await this.cleanupForceReplacedLocks();
+			await this.cleanupForceReplacedLocks(proof);
 		} catch (cleanupError) {
-			logger.warn("Could not remove locks superseded by force sync:", {
-				error: cleanupError,
-			});
-		}
-	}
-
-	private async logSemanticIndexMismatch(
-		expected: SyncIndex,
-		actual: SyncIndex,
-		context: Record<string, unknown>,
-	): Promise<void> {
-		const sections: Array<Record<string, unknown>> = [];
-		const keys = new Set([
-			...Object.keys(expected),
-			...Object.keys(actual),
-		]);
-		for (const key of keys) {
-			const expectedValue = stableSerialize(
-				(expected as unknown as Record<string, unknown>)[key],
+			throw new RemoteIndexTransactionError(
+				"Canonical index committed but orphan lock cleanup is incomplete",
+				"RemoteIndexCleanupError",
+				"committed",
+				"committed",
+				false,
+				cleanupError,
 			);
-			const actualValue = stableSerialize(
-				(actual as unknown as Record<string, unknown>)[key],
-			);
-			if (expectedValue === actualValue) {
-				continue;
-			}
-			const [expectedHash, actualHash] = await Promise.all([
-				computeSha256FromString(expectedValue),
-				computeSha256FromString(actualValue),
-			]);
-			sections.push({
-				section: key,
-				expectedSize: expectedValue.length,
-				actualSize: actualValue.length,
-				expectedSha256: expectedHash.slice(0, 12),
-				actualSha256: actualHash.slice(0, 12),
-			});
+		} finally {
+			this.forcePreflightCanonical = null;
 		}
-		logger.error("Written index differs after JSON roundtrip", {
-			...context,
-			sections,
-		});
-	}
-
-	private cloneIndex(index: SyncIndex): SyncIndex {
-		const clone = this.cloneValue(index);
-		clone.files = protectRecord(clone.files);
-		clone.folderTombstones = protectRecord(clone.folderTombstones);
-		clone.moves = protectRecord(clone.moves);
-		clone.appliedMutationSeq = protectRecord(clone.appliedMutationSeq);
-		return clone;
 	}
 
 	private cloneValue<T>(value: T): T {
 		return JSON.parse(JSON.stringify(value)) as T;
 	}
 
-	private sameValue(left: unknown, right: unknown): boolean {
-		return stableSerialize(left) === stableSerialize(right);
-	}
-
-	private getResourceFingerprint(
-		resource: YandexResource | null,
-	): string | null {
-		return this.yandexClient.getContentFingerprint(resource);
-	}
-
 	private createTransactionId(): string {
 		return `${Date.now().toString(36)}.${Math.random()
 			.toString(36)
 			.slice(2, 10)}`;
-	}
-
-	private isTargetRecoveryIndex(index: SyncIndex): boolean {
-		const maintenance = index.maintenance;
-		return (
-			this.targetRecoveryMaintenanceId !== null &&
-			maintenance?.id === this.targetRecoveryMaintenanceId &&
-			maintenance.targetRevision !== null &&
-			["index-committed", "cleanup", "stable"].includes(maintenance.phase)
-		);
 	}
 
 	/** Re-read cleanup ownership independently of physical content identity. */
@@ -3659,8 +2131,8 @@ export class IndexManager {
 			maintenance.initiatedBy !== expected.initiatedBy ||
 			maintenance.sourceRevision !== expected.sourceRevision ||
 			maintenance.targetRevision !== expected.targetRevision ||
-			!this.sameValue(maintenance.source, expected.source) ||
-			!this.sameValue(maintenance.target, expected.target) ||
+			!sameIndexValue(maintenance.source, expected.source) ||
+			!sameIndexValue(maintenance.target, expected.target) ||
 			maintenance.phase !== expected.phase
 		) {
 			throw new RemoteIndexConcurrentModificationError(
@@ -3671,7 +2143,7 @@ export class IndexManager {
 	}
 
 	private assertEpochCompatible(index: SyncIndex): void {
-		if (this.isTargetRecoveryIndex(index)) {
+		if (isTargetRecoveryIndex(index, this.targetRecoveryMaintenanceId)) {
 			return;
 		}
 		const observedEpoch = this.localState.observedEpoch;
@@ -3687,6 +2159,12 @@ export class IndexManager {
 
 	private assertMaintenanceCompatible(index: SyncIndex): void {
 		const maintenance = index.maintenance;
+		if (maintenance?.kind === "force" && !this.forceScope) {
+			throw new RemoteMaintenanceActiveError(
+				maintenance.id,
+				maintenance.initiatedBy,
+			);
+		}
 		const allowedTargetRecovery =
 			maintenance?.id === this.targetRecoveryMaintenanceId &&
 			(maintenance.phase === "index-committed" ||
@@ -3711,10 +2189,6 @@ export class IndexManager {
 				error.status === 409 ||
 				error.status === 423)
 		);
-	}
-
-	private wait(ms: number): Promise<void> {
-		return new Promise((resolve) => window.setTimeout(resolve, ms));
 	}
 
 	// ============================================================================
@@ -3762,7 +2236,7 @@ export class IndexManager {
 				new TextDecoder().decode(snapshot.raw),
 			) as Record<string, unknown>;
 			return {
-				manifest: this.parseEncryptionManifest(data),
+				manifest: parseEncryptionManifest(data),
 				validationToken: `present:${snapshot.fingerprint}`,
 			};
 		} catch (e) {
@@ -3853,647 +2327,7 @@ export class IndexManager {
 		return result;
 	}
 
-	private parseEncryptionManifest(
-		data: Record<string, unknown>,
-	): RemoteEncryptionManifest {
-		if (data.format !== ENCRYPTION_MANIFEST_FORMAT) {
-			throw new UnsupportedHistoricalDataError(
-				"Encryption manifest uses an unsupported historical format",
-			);
-		}
-		const salt = data.salt;
-		if (typeof salt !== "string" || !salt) {
-			throw new Error("Invalid encryption manifest: missing salt");
-		}
-		this.assertManifestBase64(salt, 16, 16, "salt");
-
-		const manifestKeys = [
-			"format",
-			"profileId",
-			"state",
-			"revision",
-			"salt",
-			"verifier",
-			"kdf",
-			"keySchedule",
-			"cipher",
-			"filenameCipher",
-			"updatedAt",
-			"updatedBy",
-			"transition",
-		] as const;
-		this.assertManifestKeys(
-			data,
-			manifestKeys,
-			manifestKeys.filter((key) => key !== "transition"),
-		);
-
-		const state = data.state;
-		const revision = data.revision;
-		const verifier = data.verifier;
-		const updatedAt = data.updatedAt;
-		const updatedBy = data.updatedBy;
-
-		if (
-			typeof state !== "string" ||
-			!this.isEncryptionManifestState(state)
-		) {
-			throw new Error("Invalid encryption manifest: unsupported state");
-		}
-		if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
-			throw new Error("Invalid encryption manifest: invalid revision");
-		}
-		if (typeof verifier !== "string" || !verifier) {
-			throw new Error("Invalid encryption manifest: missing verifier");
-		}
-		this.assertManifestBase64(verifier, 28, 4096, "verifier");
-		if (!Number.isSafeInteger(updatedAt) || (updatedAt as number) < 0) {
-			throw new Error("Invalid encryption manifest: invalid updatedAt");
-		}
-		if (typeof updatedBy !== "string" || !updatedBy) {
-			throw new Error("Invalid encryption manifest: invalid updatedBy");
-		}
-
-		const transition = this.parseEncryptionTransition(data.transition);
-		if (
-			(state === "enabled" && transition !== undefined) ||
-			(state !== "enabled" && transition === undefined)
-		) {
-			throw new Error(
-				"Invalid encryption manifest: transition/state mismatch",
-			);
-		}
-		if (transition) {
-			const invalidModes =
-				(state === "enabling" &&
-					(transition.source.enabled ||
-						!transition.target.enabled)) ||
-				(state === "disabling" &&
-					(!transition.source.enabled ||
-						transition.target.enabled)) ||
-				(state === "rotating" &&
-					(!transition.source.enabled ||
-						!transition.target.enabled ||
-						(transition.target.revision ?? 0) <=
-							(transition.source.revision ?? 0) ||
-						transition.target.salt === transition.source.salt ||
-						transition.target.verifier ===
-							transition.source.verifier));
-			const declared =
-				state === "disabling" ? transition.source : transition.target;
-			if (
-				invalidModes ||
-				updatedBy !== transition.initiatedBy ||
-				declared.revision !== revision ||
-				declared.salt !== salt ||
-				declared.verifier !== verifier
-			) {
-				throw new Error(
-					"Invalid encryption manifest: incoherent transition",
-				);
-			}
-		}
-		this.assertHardenedManifestAlgorithms(data);
-		return {
-			format: ENCRYPTION_MANIFEST_FORMAT,
-			profileId: "hardened",
-			state,
-			revision: revision as number,
-			salt,
-			verifier,
-			kdf: {
-				name: "PBKDF2",
-				hash: "SHA-256",
-				iterations: HARDENED_PBKDF2_ITERATIONS,
-			},
-			keySchedule: {
-				name: "HKDF",
-				hash: "SHA-256",
-			},
-			cipher: {
-				name: "AES-GCM",
-				keyLength: AES_KEY_LENGTH,
-				ivLength: IV_LENGTH,
-			},
-			filenameCipher: {
-				name: "AES-SIV",
-				keyLength: FILENAME_KEY_LENGTH,
-				encoding: "base64url",
-				aad: "obsidian-yandex-disk-sync:filename",
-			},
-			updatedAt: updatedAt as number,
-			updatedBy,
-			transition,
-		};
-	}
-
-	private assertManifestBase64(
-		value: string,
-		minimumBytes: number,
-		maximumBytes: number,
-		field: string,
-	): void {
-		try {
-			const binary = atob(value);
-			if (
-				binary.length < minimumBytes ||
-				binary.length > maximumBytes ||
-				btoa(binary) !== value
-			) {
-				throw new Error();
-			}
-		} catch {
-			throw new Error(`Invalid encryption manifest: invalid ${field}`);
-		}
-	}
-
-	private assertHardenedManifestAlgorithms(
-		data: Record<string, unknown>,
-	): void {
-		if (
-			!isJsonRecord(data.kdf) ||
-			!isJsonRecord(data.keySchedule) ||
-			!isJsonRecord(data.cipher) ||
-			!isJsonRecord(data.filenameCipher)
-		) {
-			throw new Error("Invalid encryption manifest: unsupported profile");
-		}
-		const kdf = data.kdf;
-		const schedule = data.keySchedule;
-		const cipher = data.cipher;
-		const filename = data.filenameCipher;
-		this.assertManifestKeys(kdf, ["name", "hash", "iterations"]);
-		this.assertManifestKeys(schedule, ["name", "hash"]);
-		this.assertManifestKeys(cipher, ["name", "keyLength", "ivLength"]);
-		this.assertManifestKeys(filename, [
-			"name",
-			"keyLength",
-			"encoding",
-			"aad",
-		]);
-		if (
-			data.profileId !== "hardened" ||
-			kdf?.name !== "PBKDF2" ||
-			kdf.hash !== "SHA-256" ||
-			kdf.iterations !== HARDENED_PBKDF2_ITERATIONS ||
-			schedule?.name !== "HKDF" ||
-			schedule.hash !== "SHA-256" ||
-			cipher?.name !== "AES-GCM" ||
-			cipher.keyLength !== AES_KEY_LENGTH ||
-			cipher.ivLength !== IV_LENGTH ||
-			filename?.name !== "AES-SIV" ||
-			filename.keyLength !== FILENAME_KEY_LENGTH ||
-			filename.encoding !== "base64url" ||
-			filename.aad !== "obsidian-yandex-disk-sync:filename"
-		) {
-			throw new Error("Invalid encryption manifest: unsupported profile");
-		}
-	}
-
-	private parseEncryptionTransition(
-		value: unknown,
-	): EncryptionTransitionDescriptor | undefined {
-		if (value === undefined) {
-			return undefined;
-		}
-		if (!value || typeof value !== "object") {
-			throw new Error("Invalid encryption manifest: invalid transition");
-		}
-		const data = value as Record<string, unknown>;
-		this.assertManifestKeys(data, [
-			"id",
-			"phase",
-			"sourceRevision",
-			"targetRevision",
-			"initiatedBy",
-			"source",
-			"target",
-			"sourceProfileId",
-			"targetProfileId",
-		]);
-		const phases = [
-			"prepared",
-			"files-copied",
-			"index-committed",
-			"stable",
-			"cleanup",
-		];
-		const validRevision = (revision: unknown): boolean =>
-			revision === null ||
-			(typeof revision === "number" &&
-				Number.isSafeInteger(revision) &&
-				revision >= 1);
-		if (
-			typeof data.id !== "string" ||
-			!data.id ||
-			typeof data.phase !== "string" ||
-			!phases.includes(data.phase) ||
-			!validRevision(data.sourceRevision) ||
-			!validRevision(data.targetRevision) ||
-			typeof data.initiatedBy !== "string" ||
-			!data.initiatedBy
-		) {
-			throw new Error("Invalid encryption manifest: invalid transition");
-		}
-		const source = this.parseEncryptionModeDescriptor(data.source);
-		const target = this.parseEncryptionModeDescriptor(data.target);
-		const sourceProfileId = this.parseEncryptionProfileId(
-			data.sourceProfileId,
-		);
-		const targetProfileId = this.parseEncryptionProfileId(
-			data.targetProfileId,
-		);
-		if (
-			(source.enabled && sourceProfileId === null) ||
-			(!source.enabled && sourceProfileId !== null) ||
-			(target.enabled && targetProfileId === null) ||
-			(!target.enabled && targetProfileId !== null) ||
-			source.revision !== data.sourceRevision ||
-			target.revision !== data.targetRevision
-		) {
-			throw new Error(
-				"Invalid encryption manifest: profile/mode mismatch",
-			);
-		}
-		return {
-			id: data.id,
-			phase: data.phase as EncryptionTransitionDescriptor["phase"],
-			sourceRevision: data.sourceRevision as number | null,
-			targetRevision: data.targetRevision as number | null,
-			initiatedBy: data.initiatedBy,
-			source,
-			target,
-			sourceProfileId,
-			targetProfileId,
-		};
-	}
-
-	private parseEncryptionProfileId(
-		value: unknown,
-	): EncryptionTransitionDescriptor["sourceProfileId"] {
-		if (value === null) {
-			return null;
-		}
-		if (value === "hardened") {
-			return value;
-		}
-		throw new Error("Invalid encryption manifest: invalid profile ID");
-	}
-
-	private parseEncryptionModeDescriptor(
-		value: unknown,
-	): EncryptionTransitionDescriptor["source"] {
-		if (!value || typeof value !== "object") {
-			throw new Error(
-				"Invalid encryption manifest: invalid mode descriptor",
-			);
-		}
-		const descriptor = value as Record<string, unknown>;
-		this.assertManifestKeys(descriptor, [
-			"enabled",
-			"revision",
-			"salt",
-			"verifier",
-		]);
-		if (
-			typeof descriptor.enabled !== "boolean" ||
-			!(
-				descriptor.revision === null ||
-				Number.isSafeInteger(descriptor.revision)
-			) ||
-			!(
-				descriptor.salt === null || typeof descriptor.salt === "string"
-			) ||
-			!(
-				descriptor.verifier === null ||
-				typeof descriptor.verifier === "string"
-			)
-		) {
-			throw new Error(
-				"Invalid encryption manifest: invalid mode descriptor",
-			);
-		}
-		if (descriptor.enabled) {
-			if (
-				!Number.isSafeInteger(descriptor.revision) ||
-				(descriptor.revision as number) < 1 ||
-				typeof descriptor.salt !== "string" ||
-				!descriptor.salt ||
-				typeof descriptor.verifier !== "string" ||
-				!descriptor.verifier
-			) {
-				throw new Error(
-					"Invalid encryption manifest: invalid encrypted mode descriptor",
-				);
-			}
-			this.assertManifestBase64(
-				descriptor.salt,
-				16,
-				16,
-				"transition salt",
-			);
-			this.assertManifestBase64(
-				descriptor.verifier,
-				28,
-				4096,
-				"transition verifier",
-			);
-		} else if (
-			descriptor.revision !== null ||
-			descriptor.salt !== null ||
-			descriptor.verifier !== null
-		) {
-			throw new Error(
-				"Invalid encryption manifest: invalid plaintext mode descriptor",
-			);
-		}
-		return {
-			enabled: descriptor.enabled,
-			revision: descriptor.revision as number | null,
-			salt: descriptor.salt,
-			verifier: descriptor.verifier,
-		};
-	}
-
-	private assertManifestKeys(
-		data: Record<string, unknown>,
-		allowed: readonly string[],
-		required: readonly string[] = allowed,
-	): void {
-		const keys = new Set(allowed);
-		for (const key of Object.keys(data)) {
-			if (!keys.has(key)) {
-				throw new Error(
-					`Invalid encryption manifest: unsupported field ${key}`,
-				);
-			}
-		}
-		for (const key of required) {
-			if (!(key in data)) {
-				throw new Error(
-					`Invalid encryption manifest: missing field ${key}`,
-				);
-			}
-		}
-	}
-
-	private isEncryptionManifestState(
-		value: string,
-	): value is EncryptionManifestState {
-		return ENCRYPTION_MANIFEST_STATES.includes(
-			value as EncryptionManifestState,
-		);
-	}
-
 	private isNotFoundError(e: unknown): boolean {
 		return e instanceof YandexApiError && e.status === 404;
-	}
-}
-
-function isTransientIndexCause(error: unknown): boolean {
-	const semantic = findErrorCause(
-		error,
-		(
-			candidate,
-		): candidate is
-			IndexEpochMismatchError | RemoteMaintenanceActiveError =>
-			candidate instanceof IndexEpochMismatchError ||
-			candidate instanceof RemoteMaintenanceActiveError,
-	);
-	if (semantic) {
-		return false;
-	}
-	const apiError = findErrorCause(
-		error,
-		(candidate): candidate is YandexApiError =>
-			candidate instanceof YandexApiError,
-	);
-	if (apiError) {
-		return [409, 423, 429, 503].includes(apiError.status);
-	}
-	return (
-		findErrorCause(
-			error,
-			(candidate) =>
-				candidate instanceof TypeError ||
-				candidate.name === "AbortError" ||
-				candidate.name === "TimeoutError" ||
-				/(?:network|fetch|timed? out|econn|socket)/i.test(
-					candidate.message,
-				),
-		) !== null
-	);
-}
-
-export class RemoteIndexTransactionError extends Error {
-	readonly retryable: boolean;
-	readonly cause?: unknown;
-
-	constructor(
-		message: string,
-		name: string,
-		readonly outcome: IndexTransactionOutcome,
-		readonly stage: IndexTransactionStage,
-		lockContention: boolean,
-		cause?: unknown,
-		retryableOverride?: boolean,
-	) {
-		super(message);
-		this.name = name;
-		this.retryable =
-			retryableOverride ??
-			shouldRetryIndexTransaction(outcome, lockContention);
-		this.cause = cause;
-	}
-}
-
-/**
- * Thrown when another writer conclusively changed canonical index state.
- */
-export class RemoteIndexConcurrentModificationError extends RemoteIndexTransactionError {
-	constructor(
-		message: string,
-		stage: IndexTransactionStage = "acquired",
-		lockContention = true,
-		cause?: unknown,
-	) {
-		super(
-			message,
-			"RemoteIndexConcurrentModificationError",
-			"concurrent",
-			stage,
-			lockContention,
-			cause,
-		);
-	}
-}
-
-export class ForceBackupStaleError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "ForceBackupStaleError";
-	}
-}
-
-export class ForceSourceChangedError extends Error {
-	constructor() {
-		super(
-			"Force source changed after verification; create a new backup and retry",
-		);
-		this.name = "ForceSourceChangedError";
-	}
-}
-
-export class PortablePathCollisionError extends Error {
-	constructor() {
-		super(
-			"Remote paths collide under Unicode normalization or case folding",
-		);
-		this.name = "PortablePathCollisionError";
-	}
-}
-
-export class LegacyPluginDataExposureError extends Error {
-	constructor() {
-		super(
-			"Stable 1.1 remote data may contain this plugin's local settings. Remove the remote plugin directory and replace the OAuth token before migration",
-		);
-		this.name = "LegacyPluginDataExposureError";
-	}
-}
-
-export class LegacyServicePathCollisionError extends Error {
-	constructor() {
-		super(
-			"A stable 1.1 user path conflicts with a current service name or path rule and must be renamed before migration",
-		);
-		this.name = "LegacyServicePathCollisionError";
-	}
-}
-
-export class RemoteIndexContentMismatchError extends RemoteIndexTransactionError {
-	constructor(message: string, stage: IndexTransactionStage) {
-		super(
-			message,
-			"RemoteIndexContentMismatchError",
-			"ambiguous",
-			stage,
-			false,
-		);
-	}
-}
-
-export class RemoteIndexRolledBackError extends RemoteIndexTransactionError {
-	constructor(
-		message: string,
-		stage: IndexTransactionStage,
-		cause?: unknown,
-	) {
-		super(
-			message,
-			"RemoteIndexRolledBackError",
-			"rolled-back",
-			stage,
-			false,
-			cause,
-			isTransientIndexCause(cause),
-		);
-	}
-}
-
-export class AmbiguousRemoteIndexStateError extends RemoteIndexTransactionError {
-	constructor(
-		message: string,
-		stage: IndexTransactionStage,
-		cause?: unknown,
-	) {
-		super(
-			message,
-			"AmbiguousRemoteIndexStateError",
-			"ambiguous",
-			stage,
-			false,
-			cause,
-		);
-	}
-}
-
-export class RemoteIndexLockedError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "RemoteIndexLockedError";
-	}
-}
-
-export class LegacyIndexFormatError extends Error {
-	constructor() {
-		super(
-			"A stable 1.x synchronization index requires one explicit Force sync with a verified backup.",
-		);
-		this.name = "LegacyIndexFormatError";
-	}
-}
-
-export class InvalidCurrentIndexError extends Error {
-	constructor(
-		readonly section: string,
-		reason: string,
-	) {
-		super(`Current remote sync index is invalid in ${section}: ${reason}.`);
-		this.name = "InvalidCurrentIndexError";
-	}
-}
-
-export class UnreadableRemoteIndexError extends Error {
-	readonly rawSize: number;
-	readonly fingerprint: string | null;
-	readonly rawSha256: string;
-	readonly attempts: IndexDecodeAttempt[];
-
-	constructor(details: {
-		rawSize: number;
-		fingerprint: string | null;
-		rawSha256: string;
-		attempts: IndexDecodeAttempt[];
-	}) {
-		super(
-			"Remote sync index could not be decoded with any permitted codec.",
-		);
-		this.name = "UnreadableRemoteIndexError";
-		this.rawSize = details.rawSize;
-		this.fingerprint = details.fingerprint;
-		this.rawSha256 = details.rawSha256;
-		this.attempts = details.attempts.map((attempt) => ({ ...attempt }));
-	}
-}
-
-export class AmbiguousRemoteIndexLockError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "AmbiguousRemoteIndexLockError";
-	}
-}
-
-export class IndexEpochMismatchError extends Error {
-	constructor(
-		readonly observedEpoch: string,
-		readonly canonicalEpoch: string,
-	) {
-		super(
-			"Canonical sync history changed and requires a full reconciliation.",
-		);
-		this.name = "IndexEpochMismatchError";
-	}
-}
-
-export class RemoteMaintenanceActiveError extends Error {
-	constructor(
-		public readonly transitionId: string,
-		public readonly initiatedBy: string,
-	) {
-		super(
-			`Remote encryption maintenance ${transitionId} is owned by ${initiatedBy}`,
-		);
-		this.name = "RemoteMaintenanceActiveError";
 	}
 }

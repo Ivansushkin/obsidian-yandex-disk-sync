@@ -2,8 +2,10 @@ import { VaultAdapter } from "../../api/vault-adapter";
 import { YandexDiskClient } from "../../api/yandex-client";
 import type {
 	FileMetadata,
+	IndexMove,
 	PendingMutation,
 	PendingPhysicalAction,
+	SyncIndex,
 	YandexDiskSyncSettings,
 } from "../../types";
 import { computeSha256 } from "../../utils/hash-utils";
@@ -14,10 +16,10 @@ import {
 	getPhysicalResourceFingerprint,
 	matchesPhysicalResourceFingerprint,
 } from "../../utils/resource-fingerprint";
-import { canApplyDestructiveFolderMutation } from "../canonical/mutation-rules";
-import { createConfirmedBaseline } from "../local/baseline-rules";
-import * as fileOperations from "./operations";
 import { IndexManager } from "../canonical/manager";
+import { canApplyDestructiveFolderMutation } from "../canonical/mutation-rules";
+import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
+import { createConfirmedBaseline } from "../local/baseline-rules";
 import {
 	classifyPostFullRename,
 	selectFileRenamePlan,
@@ -28,9 +30,11 @@ import {
 	type FileRenameOutcome,
 	type WatcherCausalContext,
 } from "../realtime/rules";
-import * as remoteMoves from "./remote-moves";
-import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
+import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
 import * as syncReconciliation from "../reconciliation/commits";
+import * as reconciliationContext from "../reconciliation/context";
+import * as fileOperations from "./operations";
+import * as remoteMoves from "./remote-moves";
 export interface Dependencies {
 	getWatcherCausalContext: () => WatcherCausalContext;
 	vaultAdapter: VaultAdapter;
@@ -53,9 +57,76 @@ export interface Dependencies {
 		path: string,
 		action: "upload" | "delete" | "rename",
 	) => void;
-	syncReconciliation: syncReconciliation.Dependencies;
+	syncReconciliation: reconciliationContext.Dependencies;
 	fileOperations: fileOperations.Dependencies;
 	remoteMoves: remoteMoves.Dependencies;
+}
+
+/** Stage one causal file move; callers own persistence and canonical commits. */
+export function stageFileMove(
+	index: IndexManager,
+	oldPath: string,
+	newPath: string,
+	newMetadata: FileMetadata,
+	context: WatcherCausalContext,
+	canonicalSource: FileMetadata | undefined,
+	pendingMove?: PendingMutation,
+): { mutation: PendingMutation; physicalMove: PendingPhysicalAction } {
+	const oldLocalMeta = index.getLocalIndex().files[oldPath];
+	const mutation =
+		pendingMove ??
+		index.enqueueMutation("move", oldPath, {
+			targetPath: newPath,
+			resourceKind: "file",
+			epoch: context.epoch,
+			baseRevision: context.baseRevision,
+		});
+	index.recordMove(
+		mutation.id,
+		oldPath,
+		newPath,
+		"file",
+		mutation.baseRevision ?? index.getRemoteIndex().revision,
+		mutation.seq,
+	);
+	const physicalMove = index.enqueuePhysicalAction("move-remote", oldPath, {
+		targetPath: newPath,
+		canonicalRevision: index.getRemoteIndex().revision + 1,
+		expectedFingerprint:
+			canonicalSource?.remoteFingerprint ??
+			index.getRemoteIndex().files[oldPath]?.remoteFingerprint,
+		origin: "move",
+	});
+	if (oldLocalMeta) {
+		index.markLocalFileDeleted(oldPath, undefined, mutation.seq);
+	}
+	if (canonicalSource && !index.getRemoteIndex().files[oldPath]) {
+		index.updateRemoteFile(oldPath, {
+			...canonicalSource,
+		});
+	}
+	if (canonicalSource) {
+		index.markRemoteFileDeleted(
+			oldPath,
+			undefined,
+			mutation.baseRevision ?? 0,
+			mutation.seq,
+		);
+	}
+	index.updateLocalFile(newPath, {
+		...newMetadata,
+		mutationSeq: mutation.seq,
+	});
+	index.updateRemoteFile(newPath, {
+		...newMetadata,
+		mutationSeq: mutation.seq,
+	});
+	if (mutation.baseRevision !== null) {
+		index.getRemoteIndex().files[newPath]!.baseRevision =
+			mutation.baseRevision;
+	}
+	stageRenameMutation(index, mutation, newPath);
+	return { mutation, physicalMove };
 }
 
 /** Resolve a causal rename while retaining unfinished physical moves for recovery. */
@@ -65,39 +136,14 @@ export async function renameFileNow(
 	newPath: string,
 	context: WatcherCausalContext = deps.getWatcherCausalContext(),
 ): Promise<FileRenameOutcome> {
-	let targetSnapshot:
-		{ content: ArrayBuffer; sha256: string; mtime: number } | undefined;
-	if (deps.vaultAdapter.shouldSync(newPath)) {
-		if (!deps.vaultAdapter.fileExists(newPath)) {
-			return {
-				status: "retry",
-				canonicalRevision: null,
-				epoch: context.epoch,
-				reason: "target-missing-before-remote",
-				remoteStarted: false,
-			};
-		}
-		try {
-			const content = await deps.vaultAdapter.readFile(newPath);
-			targetSnapshot = {
-				content,
-				sha256: await computeSha256(content),
-				mtime: deps.vaultAdapter.getFileMtime(newPath) || Date.now(),
-			};
-		} catch (error) {
-			logger.warn("File rename target snapshot is not available", {
-				oldPath,
-				newPath,
-				error,
-			});
-			return {
-				status: "retry",
-				canonicalRevision: null,
-				epoch: context.epoch,
-				reason: "target-read-failed-before-remote",
-				remoteStarted: false,
-			};
-		}
+	const targetSnapshot = await captureRenameTarget(
+		deps,
+		oldPath,
+		newPath,
+		context,
+	);
+	if (targetSnapshot && "status" in targetSnapshot) {
+		return targetSnapshot;
 	}
 	const { blockReason, validationToken } =
 		await deps.getSyncGuardResult(false);
@@ -115,75 +161,7 @@ export async function renameFileNow(
 	deps.realtimeGuardValidationToken = validationToken;
 
 	if (!deps.vaultAdapter.shouldSync(newPath)) {
-		if (deps.vaultAdapter.shouldSync(oldPath)) {
-			const mutation = deps.indexManager.enqueueMutation(
-				"delete-file",
-				oldPath,
-				context,
-			);
-			deps.indexManager.markRemoteFileDeleted(
-				oldPath,
-				undefined,
-				mutation.baseRevision ?? 0,
-				mutation.seq,
-			);
-			deps.indexManager.enqueuePhysicalAction("delete-remote", oldPath, {
-				expectedFingerprint:
-					deps.indexManager.getRemoteIndex().files[oldPath]
-						?.remoteFingerprint,
-				origin: "exact-delete",
-			});
-			deps.indexManager.stageMutation(mutation);
-			if (
-				!(await syncReconciliation.saveRemoteIndexBestEffort(
-					deps.syncReconciliation,
-				))
-			) {
-				return {
-					status: "retry",
-					plan: "delete-source",
-					canonicalRevision:
-						deps.indexManager.getRemoteIndex().revision,
-					epoch: deps.indexManager.getRemoteIndex().epoch,
-					reason: deps.epochReplacementPending
-						? "epoch-replaced"
-						: "canonical-commit-not-confirmed",
-					remoteStarted: true,
-					requiresFullSync: deps.epochReplacementPending
-						? "epoch-replaced"
-						: undefined,
-				};
-			}
-			const cleanup = await fileOperations.deleteRemoteFile(
-				deps.fileOperations,
-				oldPath,
-			);
-			if (cleanup === "deferred") {
-				if (deps.indexSaveCallback) {
-					await deps.indexSaveCallback();
-				}
-				return {
-					status: "retry",
-					plan: "delete-source",
-					canonicalRevision:
-						deps.indexManager.getRemoteIndex().revision,
-					epoch: deps.indexManager.getRemoteIndex().epoch,
-					reason: "physical-cleanup-pending",
-					remoteStarted: true,
-				};
-			}
-			deps.indexManager.confirmMutation(mutation.id);
-			if (deps.indexSaveCallback) {
-				await deps.indexSaveCallback();
-			}
-		}
-		return {
-			status: "completed",
-			plan: "delete-source",
-			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
-			epoch: deps.indexManager.getRemoteIndex().epoch,
-			remoteStarted: true,
-		};
+		return deleteExcludedRenameSource(deps, oldPath, context);
 	}
 
 	try {
@@ -277,88 +255,14 @@ export async function renameFileNow(
 			}
 		}
 		if (existingMove) {
-			setRecordValue(
-				deps.indexManager.getRemoteIndex().moves,
-				existingMove.id,
-				{
-					...existingMove,
-				},
-			);
-			for (const path of [oldPath, newPath]) {
-				const metadata = canonical.files[path];
-				if (metadata) {
-					setRecordValue(
-						deps.indexManager.getRemoteIndex().files,
-						path,
-						{
-							...metadata,
-						},
-					);
-				}
-			}
-			const physicalMove = deps.indexManager.enqueuePhysicalAction(
-				"move-remote",
-				oldPath,
-				{
-					targetPath: newPath,
-					canonicalRevision: canonical.revision,
-					expectedFingerprint: canonicalSource?.remoteFingerprint,
-					origin: "move",
-				},
-			);
-			await remoteMoves.executeGuardedRemoteMove(
-				deps.remoteMoves,
+			return await recoverFileRename(
+				deps,
 				oldPath,
 				newPath,
-				physicalMove.id,
+				canonical,
+				existingMove,
 				{ content, sha256 },
 			);
-			await fileOperations.pruneRemoteFolders(deps.fileOperations, [
-				oldPath,
-			]);
-			deps.indexManager.completeMove(existingMove.id);
-			const pendingMoveMutation = deps.indexManager
-				.getPendingMutations()
-				.find(
-					(mutation) =>
-						mutation.id === existingMove.id &&
-						mutation.type === "move",
-				);
-			if (pendingMoveMutation) {
-				deps.indexManager.stageMutation(pendingMoveMutation);
-			}
-			if (
-				!(await syncReconciliation.saveMoveCompletionBestEffort(
-					deps.syncReconciliation,
-				))
-			) {
-				throw new Error(
-					`Could not commit recovered rename: ${oldPath} -> ${newPath}`,
-				);
-			}
-			if (pendingMoveMutation) {
-				deps.indexManager.confirmMutation(pendingMoveMutation.id);
-			}
-			if (deps.indexSaveCallback) {
-				await deps.indexSaveCallback();
-			}
-			logger.info("Existing file move recovered", {
-				oldPath,
-				newPath,
-				moveId: existingMove.id,
-				plan: "materialize-target",
-				canonicalRevision: deps.indexManager.getRemoteIndex().revision,
-			});
-			return {
-				status: "completed",
-				plan: "materialize-target",
-				canonicalRevision: deps.indexManager.getRemoteIndex().revision,
-				epoch: deps.indexManager.getRemoteIndex().epoch,
-				remoteStarted: true,
-				requiresFullSync: deps.epochReplacementPending
-					? "epoch-replaced"
-					: undefined,
-			};
 		}
 		const pendingPut = [...deps.indexManager.getPendingMutations()]
 			.reverse()
@@ -455,186 +359,16 @@ export async function renameFileNow(
 			};
 		}
 
-		const mutation =
-			pendingMove ??
-			deps.indexManager.enqueueMutation("move", oldPath, {
-				targetPath: newPath,
-				resourceKind: "file",
-				epoch: context.epoch,
-				baseRevision: context.baseRevision,
-			});
-		deps.indexManager.recordMove(
-			mutation.id,
+		return await commitFileRename(deps, {
 			oldPath,
 			newPath,
-			"file",
-			mutation.baseRevision ??
-				deps.indexManager.getRemoteIndex().revision,
-			mutation.seq,
-		);
-		const physicalMove = deps.indexManager.enqueuePhysicalAction(
-			"move-remote",
-			oldPath,
-			{
-				targetPath: newPath,
-				canonicalRevision:
-					deps.indexManager.getRemoteIndex().revision + 1,
-				expectedFingerprint:
-					canonicalSource?.remoteFingerprint ??
-					deps.indexManager.getRemoteIndex().files[oldPath]
-						?.remoteFingerprint,
-				origin: "move",
-			},
-		);
-		if (oldLocalMeta) {
-			deps.indexManager.markLocalFileDeleted(
-				oldPath,
-				undefined,
-				mutation.seq,
-			);
-		}
-		if (
-			canonicalSource &&
-			!deps.indexManager.getRemoteIndex().files[oldPath]
-		) {
-			deps.indexManager.updateRemoteFile(oldPath, {
-				...canonicalSource,
-			});
-		}
-		if (canonicalSource) {
-			deps.indexManager.markRemoteFileDeleted(
-				oldPath,
-				undefined,
-				mutation.baseRevision ?? 0,
-				mutation.seq,
-			);
-		}
-		deps.indexManager.updateLocalFile(newPath, {
-			...newMetadata,
-			mutationSeq: mutation.seq,
-		});
-		deps.indexManager.updateRemoteFile(newPath, {
-			...newMetadata,
-			mutationSeq: mutation.seq,
-		});
-		if (mutation.baseRevision !== null) {
-			deps.indexManager.getRemoteIndex().files[newPath]!.baseRevision =
-				mutation.baseRevision;
-		}
-		stageRenameMutation(deps.indexManager, mutation, newPath);
-		if (deps.indexSaveCallback) {
-			await deps.indexSaveCallback();
-		}
-
-		if (
-			!(await syncReconciliation.saveRemoteIndexBestEffort(
-				deps.syncReconciliation,
-			))
-		) {
-			return {
-				status: "retry",
-				plan,
-				canonicalRevision: null,
-				epoch: context.epoch,
-				reason: deps.epochReplacementPending
-					? "epoch-replaced"
-					: "index-commit-not-confirmed",
-				remoteStarted: true,
-			};
-		}
-		if (
-			deps.indexManager.getRemoteIndex().files[newPath]?.sha256 !==
-			newMetadata.sha256
-		) {
-			throw new Error(`Move target changed concurrently: ${newPath}`);
-		}
-		if (deps.indexManager.getRemoteIndex().files[newPath]?.deleted) {
-			deps.indexManager.enqueuePhysicalAction("delete-local", newPath, {
-				origin: "rejected-upload",
-			});
-			if (deps.indexSaveCallback) {
-				await deps.indexSaveCallback();
-			}
-			const deletion = await fileOperations.deleteLocalFile(
-				deps.fileOperations,
-				newPath,
-			);
-			if (deletion !== "completed") {
-				if (deps.indexSaveCallback) {
-					await deps.indexSaveCallback();
-				}
-				return {
-					status: "retry",
-					plan,
-					canonicalRevision:
-						deps.indexManager.getRemoteIndex().revision,
-					epoch: deps.indexManager.getRemoteIndex().epoch,
-					reason: "rejected-rename-cleanup-unresolved",
-					remoteStarted: true,
-				};
-			}
-			deps.indexManager.markLocalFileDeleted(newPath);
-			deps.indexManager.completePhysicalAction(physicalMove.id);
-			deps.indexManager.completeMove(mutation.id);
-			deps.indexManager.stageMutation(mutation);
-			if (
-				await syncReconciliation.saveRemoteIndexBestEffort(
-					deps.syncReconciliation,
-				)
-			) {
-				deps.indexManager.confirmMutation(mutation.id);
-			}
-			if (deps.indexSaveCallback) {
-				await deps.indexSaveCallback();
-			}
-			return {
-				status: "superseded",
-				plan,
-				canonicalRevision: deps.indexManager.getRemoteIndex().revision,
-				epoch: deps.indexManager.getRemoteIndex().epoch,
-				reason: "target-deleted-concurrently",
-				remoteStarted: true,
-			};
-		}
-
-		await remoteMoves.executeGuardedRemoteMove(
-			deps.remoteMoves,
-			oldPath,
-			newPath,
-			physicalMove.id,
-			{ content, sha256 },
-		);
-
-		await fileOperations.pruneRemoteFolders(deps.fileOperations, [oldPath]);
-
-		deps.indexManager.completeMove(mutation.id);
-		deps.indexManager.stageMutation(mutation);
-		if (
-			!(await syncReconciliation.saveMoveCompletionBestEffort(
-				deps.syncReconciliation,
-			))
-		) {
-			throw new Error(
-				`Could not commit rename completion: ${oldPath} -> ${newPath}`,
-			);
-		}
-		deps.indexManager.confirmAppliedMutations();
-		if (deps.indexSaveCallback) {
-			await deps.indexSaveCallback();
-		}
-		logger.info("File rename completed", {
-			oldPath,
-			newPath,
+			newMetadata,
+			context,
+			canonicalSource,
+			pendingMove,
 			plan,
-			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+			snapshot: { content, sha256 },
 		});
-		return {
-			status: "completed",
-			plan,
-			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
-			epoch: deps.indexManager.getRemoteIndex().epoch,
-			remoteStarted: true,
-		};
 	} catch (e) {
 		if (deps.indexSaveCallback) {
 			await deps.indexSaveCallback();
@@ -642,6 +376,361 @@ export async function renameFileNow(
 		logger.error(`Error renaming file ${oldPath}:`, { error: e });
 		throw e;
 	}
+}
+
+interface RenameTargetSnapshot {
+	content: ArrayBuffer;
+	sha256: string;
+	mtime: number;
+}
+
+/** Capture local target bytes before guard or canonical reads. */
+async function captureRenameTarget(
+	deps: Pick<Dependencies, "vaultAdapter">,
+	oldPath: string,
+	newPath: string,
+	context: WatcherCausalContext,
+): Promise<RenameTargetSnapshot | FileRenameOutcome | undefined> {
+	let targetSnapshot: RenameTargetSnapshot | undefined;
+	if (deps.vaultAdapter.shouldSync(newPath)) {
+		if (!deps.vaultAdapter.fileExists(newPath)) {
+			return {
+				status: "retry",
+				canonicalRevision: null,
+				epoch: context.epoch,
+				reason: "target-missing-before-remote",
+				remoteStarted: false,
+			};
+		}
+		try {
+			const content = await deps.vaultAdapter.readFile(newPath);
+			targetSnapshot = {
+				content,
+				sha256: await computeSha256(content),
+				mtime: deps.vaultAdapter.getFileMtime(newPath) || Date.now(),
+			};
+		} catch (error) {
+			logger.warn("File rename target snapshot is not available", {
+				oldPath,
+				newPath,
+				error,
+			});
+			return {
+				status: "retry",
+				canonicalRevision: null,
+				epoch: context.epoch,
+				reason: "target-read-failed-before-remote",
+				remoteStarted: false,
+			};
+		}
+	}
+	return targetSnapshot;
+}
+
+/** Publish an exact source delete when the destination leaves the sync scope. */
+async function deleteExcludedRenameSource(
+	deps: Dependencies,
+	oldPath: string,
+	context: WatcherCausalContext,
+): Promise<FileRenameOutcome> {
+	if (deps.vaultAdapter.shouldSync(oldPath)) {
+		const mutation = deps.indexManager.enqueueMutation(
+			"delete-file",
+			oldPath,
+			context,
+		);
+		deps.indexManager.markRemoteFileDeleted(
+			oldPath,
+			undefined,
+			mutation.baseRevision ?? 0,
+			mutation.seq,
+		);
+		deps.indexManager.enqueuePhysicalAction("delete-remote", oldPath, {
+			expectedFingerprint:
+				deps.indexManager.getRemoteIndex().files[oldPath]
+					?.remoteFingerprint,
+			origin: "exact-delete",
+		});
+		deps.indexManager.stageMutation(mutation);
+		if (
+			!(await syncReconciliation.saveRemoteIndexBestEffort(
+				deps.syncReconciliation,
+			))
+		) {
+			return {
+				status: "retry",
+				plan: "delete-source",
+				canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+				epoch: deps.indexManager.getRemoteIndex().epoch,
+				reason: deps.epochReplacementPending
+					? "epoch-replaced"
+					: "canonical-commit-not-confirmed",
+				remoteStarted: true,
+				requiresFullSync: deps.epochReplacementPending
+					? "epoch-replaced"
+					: undefined,
+			};
+		}
+		const cleanup = await fileOperations.deleteRemoteFile(
+			deps.fileOperations,
+			oldPath,
+		);
+		if (cleanup === "deferred") {
+			if (deps.indexSaveCallback) {
+				await deps.indexSaveCallback();
+			}
+			return {
+				status: "retry",
+				plan: "delete-source",
+				canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+				epoch: deps.indexManager.getRemoteIndex().epoch,
+				reason: "physical-cleanup-pending",
+				remoteStarted: true,
+			};
+		}
+		deps.indexManager.confirmMutation(mutation.id);
+		if (deps.indexSaveCallback) {
+			await deps.indexSaveCallback();
+		}
+	}
+	return {
+		status: "completed",
+		plan: "delete-source",
+		canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+		epoch: deps.indexManager.getRemoteIndex().epoch,
+		remoteStarted: true,
+	};
+}
+
+/** Finish an existing canonical move without allocating another FIFO identity. */
+async function recoverFileRename(
+	deps: Dependencies,
+	oldPath: string,
+	newPath: string,
+	canonical: SyncIndex,
+	existingMove: IndexMove,
+	{ content, sha256 }: Pick<RenameTargetSnapshot, "content" | "sha256">,
+): Promise<FileRenameOutcome> {
+	const canonicalSource = canonical.files[oldPath];
+	setRecordValue(deps.indexManager.getRemoteIndex().moves, existingMove.id, {
+		...existingMove,
+	});
+	for (const path of [oldPath, newPath]) {
+		const metadata = canonical.files[path];
+		if (metadata) {
+			setRecordValue(deps.indexManager.getRemoteIndex().files, path, {
+				...metadata,
+			});
+		}
+	}
+	const physicalMove = deps.indexManager.enqueuePhysicalAction(
+		"move-remote",
+		oldPath,
+		{
+			targetPath: newPath,
+			canonicalRevision: canonical.revision,
+			expectedFingerprint: canonicalSource?.remoteFingerprint,
+			origin: "move",
+		},
+	);
+	await remoteMoves.executeGuardedRemoteMove(
+		deps.remoteMoves,
+		oldPath,
+		newPath,
+		physicalMove.id,
+		{ content, sha256 },
+	);
+	await fileOperations.pruneRemoteFolders(deps.fileOperations, [oldPath]);
+	deps.indexManager.completeMove(existingMove.id);
+	const pendingMoveMutation = deps.indexManager
+		.getPendingMutations()
+		.find(
+			(mutation) =>
+				mutation.id === existingMove.id && mutation.type === "move",
+		);
+	if (pendingMoveMutation) {
+		deps.indexManager.stageMutation(pendingMoveMutation);
+	}
+	if (
+		!(await syncReconciliation.saveMoveCompletionBestEffort(
+			deps.syncReconciliation,
+		))
+	) {
+		throw new Error(
+			`Could not commit recovered rename: ${oldPath} -> ${newPath}`,
+		);
+	}
+	if (pendingMoveMutation) {
+		deps.indexManager.confirmMutation(pendingMoveMutation.id);
+	}
+	if (deps.indexSaveCallback) {
+		await deps.indexSaveCallback();
+	}
+	logger.info("Existing file move recovered", {
+		oldPath,
+		newPath,
+		moveId: existingMove.id,
+		plan: "materialize-target",
+		canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+	});
+	return {
+		status: "completed",
+		plan: "materialize-target",
+		canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+		epoch: deps.indexManager.getRemoteIndex().epoch,
+		remoteStarted: true,
+		requiresFullSync: deps.epochReplacementPending
+			? "epoch-replaced"
+			: undefined,
+	};
+}
+
+interface FileRenameCommit {
+	oldPath: string;
+	newPath: string;
+	newMetadata: FileMetadata;
+	context: WatcherCausalContext;
+	canonicalSource: FileMetadata | undefined;
+	pendingMove: PendingMutation | undefined;
+	plan: ReturnType<typeof selectFileRenamePlan>;
+	snapshot: Pick<RenameTargetSnapshot, "content" | "sha256">;
+}
+
+/** Persist intent, materialize the accepted target, then confirm physical completion. */
+async function commitFileRename(
+	deps: Dependencies,
+	{
+		oldPath,
+		newPath,
+		newMetadata,
+		context,
+		canonicalSource,
+		pendingMove,
+		plan,
+		snapshot: { content, sha256 },
+	}: FileRenameCommit,
+): Promise<FileRenameOutcome> {
+	const { mutation, physicalMove } = stageFileMove(
+		deps.indexManager,
+		oldPath,
+		newPath,
+		newMetadata,
+		context,
+		canonicalSource,
+		pendingMove,
+	);
+	if (deps.indexSaveCallback) {
+		await deps.indexSaveCallback();
+	}
+
+	if (
+		!(await syncReconciliation.saveRemoteIndexBestEffort(
+			deps.syncReconciliation,
+		))
+	) {
+		return {
+			status: "retry",
+			plan,
+			canonicalRevision: null,
+			epoch: context.epoch,
+			reason: deps.epochReplacementPending
+				? "epoch-replaced"
+				: "index-commit-not-confirmed",
+			remoteStarted: true,
+		};
+	}
+	if (
+		deps.indexManager.getRemoteIndex().files[newPath]?.sha256 !==
+		newMetadata.sha256
+	) {
+		throw new Error(`Move target changed concurrently: ${newPath}`);
+	}
+	if (deps.indexManager.getRemoteIndex().files[newPath]?.deleted) {
+		deps.indexManager.enqueuePhysicalAction("delete-local", newPath, {
+			origin: "rejected-upload",
+		});
+		if (deps.indexSaveCallback) {
+			await deps.indexSaveCallback();
+		}
+		const deletion = await fileOperations.deleteLocalFile(
+			deps.fileOperations,
+			newPath,
+		);
+		if (deletion !== "completed") {
+			if (deps.indexSaveCallback) {
+				await deps.indexSaveCallback();
+			}
+			return {
+				status: "retry",
+				plan,
+				canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+				epoch: deps.indexManager.getRemoteIndex().epoch,
+				reason: "rejected-rename-cleanup-unresolved",
+				remoteStarted: true,
+			};
+		}
+		deps.indexManager.markLocalFileDeleted(newPath);
+		deps.indexManager.completePhysicalAction(physicalMove.id);
+		deps.indexManager.completeMove(mutation.id);
+		deps.indexManager.stageMutation(mutation);
+		if (
+			await syncReconciliation.saveRemoteIndexBestEffort(
+				deps.syncReconciliation,
+			)
+		) {
+			deps.indexManager.confirmMutation(mutation.id);
+		}
+		if (deps.indexSaveCallback) {
+			await deps.indexSaveCallback();
+		}
+		return {
+			status: "superseded",
+			plan,
+			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+			epoch: deps.indexManager.getRemoteIndex().epoch,
+			reason: "target-deleted-concurrently",
+			remoteStarted: true,
+		};
+	}
+
+	await remoteMoves.executeGuardedRemoteMove(
+		deps.remoteMoves,
+		oldPath,
+		newPath,
+		physicalMove.id,
+		{ content, sha256 },
+	);
+
+	await fileOperations.pruneRemoteFolders(deps.fileOperations, [oldPath]);
+
+	deps.indexManager.completeMove(mutation.id);
+	deps.indexManager.stageMutation(mutation);
+	if (
+		!(await syncReconciliation.saveMoveCompletionBestEffort(
+			deps.syncReconciliation,
+		))
+	) {
+		throw new Error(
+			`Could not commit rename completion: ${oldPath} -> ${newPath}`,
+		);
+	}
+	deps.indexManager.confirmAppliedMutations();
+	if (deps.indexSaveCallback) {
+		await deps.indexSaveCallback();
+	}
+	logger.info("File rename completed", {
+		oldPath,
+		newPath,
+		plan,
+		canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+	});
+	return {
+		status: "completed",
+		plan,
+		canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+		epoch: deps.indexManager.getRemoteIndex().epoch,
+		remoteStarted: true,
+	};
 }
 
 /** Stage this snapshot and consecutive target puts superseded by the same rename retry. */
@@ -740,7 +829,7 @@ export async function putRenamedUnsyncedFile(
 	if (!commitProof) {
 		return false;
 	}
-	await syncReconciliation.repairMissingAcceptedUploads(
+	await reconcileAcceptedUploads.repairMissingAcceptedUploads(
 		deps.syncReconciliation,
 		[newPath],
 		commitProof,

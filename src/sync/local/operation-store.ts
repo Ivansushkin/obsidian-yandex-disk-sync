@@ -5,6 +5,7 @@ import type {
 	PendingPhysicalActionOrigin,
 	PendingPhysicalActionType,
 } from "../../types";
+import { findLatestPutBaselineSha } from "./baseline-rules";
 import { advanceMutationSequence } from "../canonical/mutation-rules";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
 
@@ -163,18 +164,33 @@ export class LocalOperationStore {
 		return undefined;
 	}
 
-	findLatestPutBaselineSha(path: string): string | undefined {
+	/** Read one current matching put without cloning the entire FIFO. */
+	findMatchingPut(
+		path: string,
+		sha256: string | undefined,
+		order: "first" | "last",
+	): PendingMutation | undefined {
+		const step = order === "first" ? 1 : -1;
 		for (
-			let index = this.pendingMutations.length - 1;
-			index >= 0;
-			index--
+			let index =
+				order === "first" ? 0 : this.pendingMutations.length - 1;
+			index >= 0 && index < this.pendingMutations.length;
+			index += step
 		) {
-			const mutation = this.pendingMutations[index];
-			if (mutation?.type === "put" && mutation.path === path) {
-				return mutation.baselineSha256;
+			const mutation = this.pendingMutations[index]!;
+			if (
+				mutation.type === "put" &&
+				mutation.path === path &&
+				mutation.sha256 === sha256
+			) {
+				return { ...mutation };
 			}
 		}
 		return undefined;
+	}
+
+	findLatestPutBaselineSha(path: string): string | undefined {
+		return findLatestPutBaselineSha(this.pendingMutations, path);
 	}
 
 	/**

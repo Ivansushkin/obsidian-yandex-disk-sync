@@ -99,7 +99,6 @@ test("Force owns busy state from first click through backup persistence and fina
 			const entered = deferred();
 			const release = deferred();
 			const h = harness();
-			// Wrap the real harness dependency, retaining all boundary semantics.
 			const original = h.deps[boundary] as (
 				...args: unknown[]
 			) => Promise<unknown>;
@@ -113,9 +112,12 @@ test("Force owns busy state from first click through backup persistence and fina
 			const pending = h.controller.run(direction);
 			assert.equal(h.controller.isBusy(), true);
 			await entered.promise;
-			await h.controller.run(direction);
-			await h.controller.run(
-				direction === "from_local" ? "from_remote" : "from_local",
+			assert.equal(h.controller.run(direction), pending);
+			assert.equal(
+				h.controller.run(
+					direction === "from_local" ? "from_remote" : "from_local",
+				),
+				pending,
 			);
 			assert.equal(h.controller.isBusy(), true);
 			release.resolve();
@@ -167,32 +169,6 @@ test("Force backup failure or exception cannot start destructive synchronization
 		assert.equal(h.controller.getState()?.outcome, "backup-failed");
 		assert.equal(h.controller.isBusy(), false);
 		assert.ok(!h.calls.includes("force"));
-	}
-});
-
-test("Force releases busy state for exceptions at every asynchronous boundary", async () => {
-	for (const boundary of [
-		"preflight",
-		"confirm",
-		"readyForBackup",
-		"run",
-		"persist",
-		"reconcile",
-	] as const) {
-		const h = harness({
-			[boundary]: async () => {
-				throw new Error(boundary);
-			},
-		});
-		await h.controller.run("from_local");
-		assert.equal(h.controller.isBusy(), false);
-		assert.equal(
-			h.controller.getState()?.outcome,
-			boundary === "persist" || boundary === "reconcile"
-				? "cleanup-pending"
-				: "failed",
-		);
-		assert.notEqual(h.controller.getState()?.outcome, "success");
 	}
 });
 
@@ -270,16 +246,6 @@ test("Force late activity from a completed operation cannot overwrite its succes
 	await second;
 });
 
-test("Force presentation errors cannot interrupt commit or keep buttons busy", async () => {
-	const h = harness();
-	h.controller.subscribe(() => {
-		throw new Error("detached UI");
-	});
-	await h.controller.run("from_local");
-	assert.equal(h.controller.getState()?.outcome, "success");
-	assert.equal(h.controller.isBusy(), false);
-});
-
 test("Force without an archive retains preflight and owns final settlement", async () => {
 	for (const direction of ["from_local", "from_remote"] as const) {
 		const h = harness({
@@ -302,11 +268,14 @@ test("Force without an archive retains preflight and owns final settlement", asy
 });
 
 test("Force retains the failing boundary and committed outcome without starting preflight mutations", async () => {
-	for (const boundary of [
-		"preflight",
-		"captureProtectedSnapshot",
-		"persist",
-		"reconcile",
+	for (const [boundary, stage] of [
+		["preflight", "preflight"],
+		["confirm", "confirming"],
+		["readyForBackup", "confirming"],
+		["captureProtectedSnapshot", "protected-snapshot"],
+		["run", "syncing"],
+		["persist", "persisting"],
+		["reconcile", "reconciling"],
 	] as const) {
 		const cause = new Error("connection failed");
 		const h = harness({
@@ -316,6 +285,7 @@ test("Force retains the failing boundary and committed outcome without starting 
 		});
 		await h.controller.run("from_local");
 		const state = h.controller.getState()!;
+		assert.equal(h.controller.isBusy(), false);
 		assert.equal(
 			state.outcome,
 			boundary === "persist" || boundary === "reconcile"
@@ -323,16 +293,7 @@ test("Force retains the failing boundary and committed outcome without starting 
 				: "failed",
 		);
 		assert.equal(state.failure?.message, cause.message);
-		assert.equal(
-			state.failure?.stage,
-			boundary === "captureProtectedSnapshot"
-				? "protected-snapshot"
-				: boundary === "persist"
-					? "persisting"
-					: boundary === "reconcile"
-						? "reconciling"
-						: "preflight",
-		);
+		assert.equal(state.failure?.stage, stage);
 		if (
 			boundary === "preflight" ||
 			boundary === "captureProtectedSnapshot"
@@ -340,4 +301,14 @@ test("Force retains the failing boundary and committed outcome without starting 
 			assert.equal(h.calls.includes("force"), false);
 		}
 	}
+});
+
+test("Force presentation errors cannot interrupt commit or keep buttons busy", async () => {
+	const h = harness();
+	h.controller.subscribe(() => {
+		throw new Error("detached UI");
+	});
+	await h.controller.run("from_local");
+	assert.equal(h.controller.getState()?.outcome, "success");
+	assert.equal(h.controller.isBusy(), false);
 });

@@ -1,4 +1,5 @@
-import type { SyncIndex } from "../../types";
+import type { EncryptionCodec } from "../../crypto/encryption";
+import type { SyncIndex, YandexResource } from "../../types";
 
 export type IndexTransactionStage =
 	"acquired" | "written" | "verified" | "move-attempted" | "committed";
@@ -21,6 +22,12 @@ export interface CanonicalCommitProof {
 	revision: number;
 	index: SyncIndex;
 	contentFingerprint: string;
+}
+
+/** Immutable service-file observation protected by a single Force preflight. */
+export interface IndexLockObservation {
+	name: string;
+	fingerprint: string;
 }
 
 export type IndexMoveRecoveryDecision =
@@ -157,3 +164,26 @@ export async function rollbackRawIndexSnapshot(
 	await assertReadable(restoredCanonical);
 	return "rolled-back";
 }
+
+/** Resolution proof is valid only within the move attempt that produced it. */
+export type CanonicalMoveResolution =
+	| { outcome: "committed"; proof: CanonicalCommitProof }
+	| { outcome: Exclude<IndexTransactionOutcome, "committed"> };
+
+/** Stable schema/codec-aware read shared by commit, discovery and Force target recovery. */
+export type IndexSnapshotReader = (
+	path: string,
+	allowLegacy: boolean,
+	serviceOverride?: EncryptionCodec | null,
+	codecLabel?: IndexCodec,
+	expectedResource?: YandexResource,
+) => Promise<IndexFileSnapshot>;
+
+/** Decode captured bytes with explicit source/target authority, never a transport retry. */
+export type IndexSnapshotDecoder = (
+	raw: ArrayBuffer,
+	allowLegacy: boolean,
+	serviceOverride?: EncryptionCodec | null,
+	codecLabel?: IndexCodec,
+	fingerprint?: string | null,
+) => Promise<{ index: SyncIndex; codec: IndexCodec }>;

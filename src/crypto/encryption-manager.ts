@@ -21,6 +21,16 @@ import type {
 	LocalEncryptionTransition,
 } from "./encryption-transition";
 
+/** The only mutable settings fields owned by encryption snapshots. */
+export type LocalEncryptionSettings = Pick<
+	YandexDiskSyncSettings,
+	| "enableEncryption"
+	| "encryptionSalt"
+	| "encryptionPassword"
+	| "encryptionRevision"
+	| "encryptionProfileId"
+>;
+
 /** Owns profile selection and wire-shape creation outside the plugin root. */
 export class EncryptionManager {
 	/** Persist candidate credentials only after authentication and authority checks. */
@@ -33,20 +43,31 @@ export class EncryptionManager {
 		if (!options.service) {
 			return null;
 		}
-		let authenticated = false;
-		try {
-			authenticated = await options.service.verifyVerifier(
-				options.verifier,
-			);
-		} catch {
-			authenticated = false;
-		}
+		const authenticated = await this.verifyCandidate(
+			options.service,
+			options.verifier,
+		);
 		if (!authenticated) {
 			return null;
 		}
 		const authority = await options.validateAuthority();
 		await options.persist(authority);
 		return authority;
+	}
+
+	/** Treat failed authenticated decryption as an invalid candidate without exposing cryptographic errors. */
+	async verifyCandidate(
+		service: EncryptionCodec | null,
+		verifier: string,
+	): Promise<boolean> {
+		if (!service) {
+			return false;
+		}
+		try {
+			return await service.verifyVerifier(verifier);
+		} catch {
+			return false;
+		}
 	}
 
 	getManifestProfileId(manifest: EncryptionManifest): EncryptionProfileId {
@@ -83,7 +104,9 @@ export class EncryptionManager {
 		};
 	}
 
-	captureSnapshot(settings: YandexDiskSyncSettings): LocalEncryptionSnapshot {
+	captureSnapshot(
+		settings: LocalEncryptionSettings,
+	): LocalEncryptionSnapshot {
 		const profileId = settings.enableEncryption
 			? requireProfileId(settings.encryptionProfileId)
 			: null;
@@ -97,7 +120,7 @@ export class EncryptionManager {
 	}
 
 	async applySnapshot(
-		settings: YandexDiskSyncSettings,
+		settings: LocalEncryptionSettings,
 		snapshot: LocalEncryptionSnapshot,
 	): Promise<EncryptionCodec | null> {
 		const codec =
@@ -156,7 +179,10 @@ export class EncryptionManager {
 		if (service.profileId !== "hardened") {
 			throw new Error("Only hardened manifests can be written");
 		}
-		const maintenance = transition ? options.maintenance : undefined;
+		const maintenance =
+			transition && options.maintenance?.kind !== "force"
+				? options.maintenance
+				: undefined;
 		if (transition && !maintenance) {
 			throw new Error(
 				"Transition manifest requires canonical maintenance",

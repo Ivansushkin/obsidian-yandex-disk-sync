@@ -1,8 +1,8 @@
 import { VaultAdapter } from "../../api/vault-adapter";
 import { YandexDiskClient, isRemoteReadTimeout } from "../../api/yandex-client";
 import {
-	captureLogicalVaultSnapshot,
-	captureRemoteRawSnapshot,
+	captureLogicalVaultDigest,
+	captureRemoteRawDigest,
 } from "../../backup/backup-snapshot";
 import { t } from "../../i18n";
 import type {
@@ -24,19 +24,21 @@ import {
 	matchesPhysicalResourceFingerprint,
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
-import { createSyncError } from "../errors";
-import * as fileOperations from "../files/operations";
 import {
 	ForceBackupStaleError,
 	ForceSourceChangedError,
-	IndexManager,
-} from "../canonical/manager";
+} from "../canonical/errors";
+import { IndexManager } from "../canonical/manager";
 import type {
 	ForcePreflightProof,
 	IndexSaveCallback,
 	SyncRunOptions,
 } from "../contracts";
+import { createSyncError } from "../errors";
+import * as fileOperations from "../files/operations";
+import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
 import * as syncReconciliation from "../reconciliation/commits";
+import * as reconciliationContext from "../reconciliation/context";
 export interface Dependencies {
 	yandexClient: YandexDiskClient;
 	settings: YandexDiskSyncSettings;
@@ -50,7 +52,7 @@ export interface Dependencies {
 	reportProgress: (processedOps: number, totalOps: number) => void;
 	indexSaveCallback: IndexSaveCallback | null;
 	fileOperations: fileOperations.Dependencies;
-	syncReconciliation: syncReconciliation.Dependencies;
+	syncReconciliation: reconciliationContext.Dependencies;
 }
 export interface ForceRunContext {
 	bootstrapStarted: boolean;
@@ -110,14 +112,14 @@ export async function assertForcePreflightProof(
 		}
 	}
 	await deps.indexManager.assertForceCanonicalProof(proof.canonical);
-	const snapshot =
+	const digest =
 		direction === "from_local"
-			? await captureRemoteRawSnapshot(
+			? await captureRemoteRawDigest(
 					deps.yandexClient,
 					deps.settings.remotePath,
 				)
-			: await captureLogicalVaultSnapshot(deps.vaultAdapter);
-	if (snapshot.digest !== proof.snapshotDigest) {
+			: await captureLogicalVaultDigest(deps.vaultAdapter);
+	if (digest !== proof.snapshotDigest) {
 		throw new ForceBackupStaleError(
 			"Protected data changed after Force preflight",
 		);
@@ -497,7 +499,7 @@ export async function reconcileForceLocal(
 		return;
 	}
 	result.replacementCommitted = true;
-	await syncReconciliation.repairMissingAcceptedUploads(
+	await reconcileAcceptedUploads.repairMissingAcceptedUploads(
 		deps.syncReconciliation,
 		uploads.map((operation) => operation.path),
 		commitProof,

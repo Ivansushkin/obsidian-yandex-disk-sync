@@ -58,23 +58,17 @@ class FakeHiddenDataAdapter {
 
 	async stat(path: string): Promise<Stat | null> {
 		const content = this.files.get(path);
-		if (content) {
-			return {
-				type: "file",
-				ctime: Date.now(),
-				mtime: Date.now(),
-				size: content.byteLength + (this.failStatVerification ? 1 : 0),
-			};
+		if (!content && !this.directories.has(path)) {
+			return null;
 		}
-		if (this.directories.has(path)) {
-			return {
-				type: "folder",
-				ctime: Date.now(),
-				mtime: Date.now(),
-				size: 0,
-			};
-		}
-		return null;
+		return {
+			type: content ? "file" : "folder",
+			ctime: Date.now(),
+			mtime: Date.now(),
+			size: content
+				? content.byteLength + (this.failStatVerification ? 1 : 0)
+				: 0,
+		};
 	}
 
 	async list(path: string): Promise<{
@@ -110,10 +104,7 @@ class FakeHiddenDataAdapter {
 	}
 }
 
-function createVaultAdapter(dataAdapter = new FakeHiddenDataAdapter()): {
-	dataAdapter: FakeHiddenDataAdapter;
-	vaultAdapter: VaultAdapter;
-} {
+function createVaultAdapter(dataAdapter = new FakeHiddenDataAdapter()) {
 	const app = {
 		vault: {
 			configDir: TEST_CONFIG_DIR,
@@ -169,27 +160,21 @@ test("backup directory creation tolerates a concurrent mkdir", async () => {
 });
 
 test("backup rejects failed writes and failed verification", async () => {
-	const writeFailure = new FakeHiddenDataAdapter();
-	writeFailure.failWrite = true;
-	await assert.rejects(
-		createVaultAdapter(writeFailure).vaultAdapter.backupOverwrittenFile(
-			"note.md",
-			new Uint8Array([1]).buffer,
-		),
-		/write failed/,
-	);
-
-	const verificationFailure = new FakeHiddenDataAdapter();
-	verificationFailure.failStatVerification = true;
-	await assert.rejects(
-		createVaultAdapter(
-			verificationFailure,
-		).vaultAdapter.backupOverwrittenFile(
-			"note.md",
-			new Uint8Array([1]).buffer,
-		),
-		/could not be verified/,
-	);
+	for (const [flag, error] of [
+		["failWrite", /write failed/],
+		["failStatVerification", /could not be verified/],
+	] as const) {
+		const data = Object.assign(new FakeHiddenDataAdapter(), {
+			[flag]: true,
+		});
+		await assert.rejects(
+			createVaultAdapter(data).vaultAdapter.backupOverwrittenFile(
+				"note.md",
+				new Uint8Array([1]).buffer,
+			),
+			error,
+		);
+	}
 });
 
 test("backup cleanup uses system trash and never local vault trash", async () => {
@@ -231,47 +216,42 @@ test("unavailable system trash preserves stale backup", async () => {
 	assert.equal(dataAdapter.localTrashCalls, 0);
 });
 
-test("failed mandatory backup prevents a local overwrite", async () => {
-	const remoteContent = new TextEncoder().encode("remote").buffer;
-	const localContent = new TextEncoder().encode("local").buffer;
-	let writeCalled = false;
-	const vaultAdapter = {
-		fileExists: () => true,
-		readFile: async () => localContent,
-		backupOverwrittenFile: async () => {
-			throw new Error("backup unavailable");
-		},
-		writeFile: async () => {
-			writeCalled = true;
-		},
-	};
-	const indexManager = {
-		assertRemoteScope: async () => {},
-		getLocalIndex: () => ({
-			files: {
-				"note.md": {
-					path: "note.md",
-					sha256: "different-baseline",
-				},
-			},
-		}),
-	};
-	const yandexClient = {
-		downloadFile: async () => remoteContent,
-	};
-	const engine = new SyncEngine(
-		yandexClient as unknown as YandexDiskClient,
-		vaultAdapter as unknown as VaultAdapter,
-		indexManager as unknown as IndexManager,
+function downloadEngine(
+	vault: Partial<Omit<VaultAdapter, "backupOverwrittenFile">> & {
+		backupOverwrittenFile(): Promise<unknown>;
+	},
+	downloadFile: () => Promise<ArrayBuffer>,
+	files: Record<string, { sha256: string }> = {},
+) {
+	return new SyncEngine(
+		{ downloadFile } as unknown as YandexDiskClient,
+		vault as unknown as VaultAdapter,
 		{
-			...DEFAULT_SETTINGS,
-			deviceId: "device-backup-test",
-			remotePath: "vault",
-		},
+			assertRemoteScope: async () => {},
+			getLocalIndex: () => ({ files }),
+		} as unknown as IndexManager,
+		{ ...DEFAULT_SETTINGS, remotePath: "vault" },
 	);
+}
 
+test("failed mandatory backup prevents a local overwrite", async () => {
+	let written = false;
+	const engine = downloadEngine(
+		{
+			fileExists: () => true,
+			readFile: async () => new TextEncoder().encode("local").buffer,
+			backupOverwrittenFile: async () => {
+				throw new Error("backup unavailable");
+			},
+			writeFile: async () => {
+				written = true;
+			},
+		},
+		async () => new TextEncoder().encode("remote").buffer,
+		{ "note.md": { sha256: "different-baseline" } },
+	);
 	await assert.rejects(engine.downloadFile("note.md"), /backup unavailable/);
-	assert.equal(writeCalled, false);
+	assert.equal(written, false);
 });
 
 test("download preserves local changes during remote I/O and protective backup", async () => {
@@ -293,27 +273,17 @@ test("download preserves local changes during remote I/O and protective backup",
 					local = encode("late edit");
 				},
 			};
-			const index = {
-				assertRemoteScope: async () => {},
-				getLocalIndex: () => ({
-					files:
-						timing === "backup"
-							? { "note.md": { sha256: "baseline" } }
-							: {},
-				}),
-			};
-			const engine = new SyncEngine(
-				{
-					downloadFile: async () => {
-						if (timing !== "backup") {
-							local = encode("late edit");
-						}
-						return service ? await service.decrypt(stored) : stored;
-					},
-				} as unknown as YandexDiskClient,
-				vault as unknown as VaultAdapter,
-				index as unknown as IndexManager,
-				{ ...DEFAULT_SETTINGS },
+			const engine = downloadEngine(
+				vault,
+				async () => {
+					if (timing !== "backup") {
+						local = encode("late edit");
+					}
+					return service ? await service.decrypt(stored) : stored;
+				},
+				timing === "backup"
+					? { "note.md": { sha256: "baseline" } }
+					: {},
 			);
 			await assert.rejects(
 				engine.downloadFile("note.md"),

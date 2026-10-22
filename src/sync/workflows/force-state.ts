@@ -1,0 +1,262 @@
+import { validateEncryptionModeDescriptor } from "../canonical/schema";
+import { isRootIndexLockPath } from "../../utils/path-utils";
+import type {
+	EncryptionManifest,
+	EncryptionModeDescriptor,
+	FileMetadata,
+	IndexMaintenanceCleanupAction,
+} from "../../types";
+import { assertSafeTransitionPath } from "../../crypto/encryption-transition";
+
+export type ForceDirection = "from_local" | "from_remote";
+export type ForcePhase = "prepared" | "applying" | "cleanup";
+
+export interface ForceSourceFile {
+	path: string;
+	sha256: string;
+	size: number;
+	mtime: number;
+	rawPath: string;
+	fingerprint: string | null;
+}
+
+/** Durable source identities and authority; credentials remain exclusively in local plugin data. */
+export interface ForceRecovery {
+	password: string | null;
+	id: string;
+	direction: ForceDirection;
+	phase: ForcePhase;
+	backupMode: "with-backup" | "without-backup";
+	backupProof: {
+		name: string;
+		sha256: string;
+		snapshotDigest: string;
+	} | null;
+	epoch: string;
+	remotePath: string;
+	rootResourceId: string | null;
+	originalCanonicalFingerprint: string | null;
+	serviceCleanup: IndexMaintenanceCleanupAction[];
+	sourceDigest: string;
+	source: ForceSourceFile[];
+	target: EncryptionModeDescriptor;
+	manifest: EncryptionManifest | null;
+	watcherCutoff: string[];
+	cleanup: IndexMaintenanceCleanupAction[];
+	targetHashes: Record<string, string>;
+	files: Record<string, FileMetadata>;
+}
+
+/** Validate recovery before it can authorize any filesystem mutation. */
+export function assertForceRecovery(
+	value: unknown,
+): asserts value is ForceRecovery | null {
+	if (value === null) {
+		return;
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Invalid Force recovery");
+	}
+	const state = value as ForceRecovery;
+	const keys = [
+		"password",
+		"id",
+		"direction",
+		"phase",
+		"backupMode",
+		"backupProof",
+		"epoch",
+		"remotePath",
+		"rootResourceId",
+		"originalCanonicalFingerprint",
+		"serviceCleanup",
+		"sourceDigest",
+		"source",
+		"target",
+		"manifest",
+		"watcherCutoff",
+		"cleanup",
+		"targetHashes",
+		"files",
+	];
+	if (
+		Object.keys(value).length !== keys.length ||
+		!keys.every((key) => key in value) ||
+		!["from_local", "from_remote"].includes(state.direction) ||
+		!["prepared", "applying", "cleanup"].includes(state.phase) ||
+		!["with-backup", "without-backup"].includes(state.backupMode) ||
+		![state.id, state.epoch, state.remotePath, state.sourceDigest].every(
+			(s) => typeof s === "string" && s.length > 0,
+		) ||
+		!(
+			state.rootResourceId === null ||
+			typeof state.rootResourceId === "string"
+		) ||
+		!Array.isArray(state.serviceCleanup) ||
+		!Array.isArray(state.source) ||
+		!Array.isArray(state.cleanup) ||
+		!Array.isArray(state.watcherCutoff) ||
+		!state.watcherCutoff.every((id) => typeof id === "string") ||
+		!(state.password === null || typeof state.password === "string") ||
+		!state.target ||
+		typeof state.target.enabled !== "boolean" ||
+		!state.files ||
+		typeof state.files !== "object" ||
+		Array.isArray(state.files)
+	) {
+		throw new Error("Invalid Force recovery shape");
+	}
+	if (
+		state.backupMode === "with-backup" &&
+		(!state.backupProof ||
+			typeof state.backupProof.name !== "string" ||
+			state.backupProof.name.includes("/") ||
+			!state.backupProof.name ||
+			!/^[a-f0-9]{64}$/.test(state.backupProof.sha256) ||
+			!/^[a-f0-9]{64}$/.test(state.backupProof.snapshotDigest))
+	) {
+		throw new Error("Invalid Force archive proof");
+	}
+	validateEncryptionModeDescriptor(state.target, "Force target");
+	assertForceManifest(state);
+	if (
+		!/^[a-zA-Z0-9_-]{8,128}$/.test(state.id) ||
+		!/^[a-zA-Z0-9_-]{8,128}$/.test(state.epoch) ||
+		!/^[a-f0-9]{64}$/.test(state.sourceDigest) ||
+		!(
+			state.originalCanonicalFingerprint === null ||
+			typeof state.originalCanonicalFingerprint === "string"
+		)
+	) {
+		throw new Error("Invalid Force authority");
+	}
+	const rawPaths = new Set<string>();
+	const paths = new Set<string>();
+	for (const file of state.source) {
+		assertSafeTransitionPath(file.path, "Force source");
+		assertSafeTransitionPath(file.rawPath, "Force raw source");
+		if (
+			Object.keys(file).length !== 6 ||
+			paths.has(file.path) ||
+			rawPaths.has(file.rawPath) ||
+			!/^[a-f0-9]{64}$/.test(file.sha256) ||
+			!Number.isSafeInteger(file.size) ||
+			file.size < 0 ||
+			!Number.isFinite(file.mtime) ||
+			!(file.fingerprint === null || typeof file.fingerprint === "string")
+		) {
+			throw new Error("Invalid Force source manifest");
+		}
+		paths.add(file.path);
+		rawPaths.add(file.rawPath);
+	}
+	if (
+		!state.targetHashes ||
+		typeof state.targetHashes !== "object" ||
+		Array.isArray(state.targetHashes)
+	) {
+		throw new Error("Invalid Force target proofs");
+	}
+	for (const [path, hash] of Object.entries(state.targetHashes)) {
+		assertSafeTransitionPath(path, "Force target hash");
+		if (!/^[a-f0-9]{64}$/.test(hash)) {
+			throw new Error("Invalid Force target hash");
+		}
+	}
+	for (const [path, metadata] of Object.entries(state.files)) {
+		const source = state.source.find((file) => file.path === path);
+		if (
+			!source ||
+			!metadata ||
+			metadata.path !== path ||
+			metadata.sha256 !== source.sha256 ||
+			metadata.size !== source.size ||
+			metadata.mutationSeq !== 0 ||
+			metadata.deleted
+		) {
+			throw new Error("Invalid Force verified file");
+		}
+	}
+	for (const action of state.serviceCleanup) {
+		if (
+			!isRootIndexLockPath(action.path) ||
+			typeof action.expectedFingerprint !== "string" ||
+			!action.expectedFingerprint ||
+			Object.keys(action).length !== 2
+		) {
+			throw new Error("Invalid Force service cleanup proof");
+		}
+	}
+	for (const action of state.cleanup) {
+		assertSafeTransitionPath(action.path, "Force cleanup");
+		if (
+			typeof action.expectedFingerprint !== "string" ||
+			!action.expectedFingerprint
+		) {
+			throw new Error("Invalid Force cleanup proof");
+		}
+	}
+}
+
+/** Check nested wire parameters before local recovery can publish a manifest. */
+function assertForceManifest(state: ForceRecovery): void {
+	const manifest = state.manifest;
+	if (!state.target.enabled) {
+		if (manifest !== null || state.password !== null) {
+			throw new Error(
+				"Plaintext Force has encrypted recovery parameters",
+			);
+		}
+		return;
+	}
+	if (
+		!manifest ||
+		!state.password ||
+		manifest.format !== "encryption-manifest" ||
+		manifest.profileId !== "hardened" ||
+		manifest.state !== "enabled" ||
+		manifest.salt !== state.target.salt ||
+		manifest.verifier !== state.target.verifier ||
+		manifest.revision !== state.target.revision ||
+		!Number.isFinite(manifest.updatedAt) ||
+		typeof manifest.updatedBy !== "string" ||
+		!manifest.updatedBy ||
+		Object.keys(manifest).length !== 12 ||
+		!matchesParameters(manifest.kdf, {
+			name: "PBKDF2",
+			hash: "SHA-256",
+			iterations: 600000,
+		}) ||
+		!matchesParameters(manifest.keySchedule, {
+			name: "HKDF",
+			hash: "SHA-256",
+		}) ||
+		!matchesParameters(manifest.cipher, {
+			name: "AES-GCM",
+			keyLength: 256,
+			ivLength: 12,
+		}) ||
+		!matchesParameters(manifest.filenameCipher, {
+			name: "AES-SIV",
+			keyLength: 512,
+			encoding: "base64url",
+			aad: "obsidian-yandex-disk-sync:filename",
+		})
+	) {
+		throw new Error("Force manifest parameters are incoherent");
+	}
+}
+
+function matchesParameters(
+	value: unknown,
+	expected: Record<string, unknown>,
+): boolean {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		Object.keys(value).length === Object.keys(expected).length &&
+		Object.entries(expected).every(
+			([key, entry]) => (value as Record<string, unknown>)[key] === entry,
+		)
+	);
+}

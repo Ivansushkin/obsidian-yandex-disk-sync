@@ -7,49 +7,213 @@ truth — canonical index на Яндекс Диске; локальные basel
 
 ## Границы модулей
 
-`main.ts` соединяет компоненты и владеет plugin lifecycle, UI и persistence.
-`api/yandex-client.ts` выполняет транспортные запросы и codec conversion;
-`api/vault-adapter.ts` работает через Obsidian Vault/DataAdapter и FileManager.
-`backup/` отвечает за snapshots, архивы, envelope и exact read-back;
-`crypto/` — за codecs, manifest и transition/recovery.
+| Владелец                                       | Ответственность                                                                                                         |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `main.ts`                                      | Composition root, Obsidian lifecycle/UI, typed blocks, foreground reservation и wiring актуальных ports.                |
+| `plugin-persistence.ts`                        | Единственные `PluginData`, coherent tail queue, load generation и unload-save admission.                                |
+| `plugin-startup.ts`, `settings-workflow.ts`    | Read-only startup classification; admission, save и publication user drafts.                                            |
+| `api/yandex-client.ts`, `api/vault-adapter.ts` | Transport/codec conversion; Obsidian Vault/DataAdapter/FileManager.                                                     |
+| `backup/`, `crypto/`                           | Snapshots и exact archive proofs; codecs, manifest, transitions и recovery.                                             |
+| `SyncEngine`                                   | Публичные входы, один coordinator, lifecycle/session guards, state/UI listeners и expected watcher events.              |
+| `realtime/queue-rules.ts`                      | Pure queue/receipt transformations нормализованных readonly events и submitted ID sets.                                 |
+| `FileWatcher`                                  | Identity/time allocation, subscriptions, transient aliases, runtime references, один drain, barriers и save scheduling. |
+| `realtime/settlement.ts`                       | `WatcherSettlement` для single/batch file и folder outcomes; receipts, ACK и durability через watcher ports.            |
+| `ui/sync-indicator.ts`                         | Общая раскрывающаяся плашка desktop/mobile; только state и callbacks, без domain state.                                 |
 
-`ui/sync-indicator.ts` — общая раскрывающаяся плашка: desktop справа снизу над
-status bar, mobile справа сверху под панелями и safe area. Строка управления
-сохраняет YD справа; кнопки sync и копирования логов слева видны при раскрытии.
-Компонент получает состояние и callbacks из `main.ts`: ручной запуск использует
-существующий full workflow и busy guards, копирование — текущий файловый лог
-после flush и маскировки, максимум последние 4000 символов. UI не владеет
-canonical, очередями или отдельным coordinator.
+Settings/callbacks читаются через live getters; стабильные сервисы передаются
+узкими capabilities. Domain-модули не импортируют runtime-фасад или Obsidian UI
+и не создают второй coordinator, causal store или persistence queue. Encryption
+settings, active codec и transition имеют одного владельца в plugin snapshot;
+их orchestration описана в [E2E_ENCRYPTION.md](E2E_ENCRYPTION.md).
 
-В `sync/` папки отражают ответственность: `canonical/` — индекс и транзакции,
-`local/` — baseline и очередь устройства, `files/` — физические операции,
-`reconciliation/` — commit/recovery и конфликты, `workflows/` — полные и служебные
-проходы, `realtime/` — watcher и обработка событий. Имена дополняют контекст папки;
-префикс `sync-` не повторяется. Импорты ведут прямо к владельцу без barrel-модулей.
+В `sync/` папки отражают ответственность: `canonical/`, `local/`, `files/`,
+`reconciliation/`, `workflows/`, `realtime/`. Импорты ведут прямо к владельцу без
+barrel-модулей. Публичные compatibility re-exports сохраняют constructor identity.
 
-`SyncEngine` сохраняет публичные входы, один coordinator, session/lifecycle
-wrappers, guards, UI/listeners, pause/busy, expected watcher events и validation
-token. Изменяемые settings/callbacks читаются через актуальные getters.
-Неизменяемые сервисы передаются узкими зависимостями. Внутренние алгоритмы не
-импортируют runtime-фасад, не создают второй coordinator или persisted store.
-Watcher и scheduler используют его публичный API.
+Queue reducer не выполняет I/O, не выделяет ID/seq, не читает часы и не пишет логи.
+File/folder rename
+reducers используют общий typed chain algorithm; submitted snapshots не
+переписываются parent notifications. Receipt effects обновляют existing runtime
+references **до ACK**, чтобы текущий drain получил committed revision.
+`WatcherSettlement` не имеет очереди, timers или enabled-state. Stopped watcher
+завершает settlement принятой сессии без нового replay.
 
-| Модуль `src/sync`                              | Владелец алгоритма                                                              |
-| ---------------------------------------------- | ------------------------------------------------------------------------------- |
-| `contracts.ts`                                 | Публичные options, proofs, lifecycle и guards; engine сохраняет re-exports      |
-| `files/operations.ts`                          | Transfers, local writes, physical actions, folders и parallel execution         |
-| `files/remote-moves.ts`                        | Snapshot-matched moves, target materialization и guarded source deletion        |
-| `reconciliation/commits.ts`                    | Strict/best-effort commits, rejected puts, repairs, recovery, baselines/deletes |
-| `errors.ts`                                    | Классификация с прежним приоритетом cause                                       |
-| `workflows/force.ts`                           | Preflight, bootstrap, source snapshots, replacement и cleanup                   |
-| `workflows/encryption-rewrite.ts`              | Exclusive target upload, read-back, beforeIndexCommit и finally                 |
-| `workflows/full.ts`                            | Reconciliation, uploads, pending puts и epoch adoption                          |
-| `realtime/batch.ts`                            | Batch, receipts, prepared items, superseded/retry и handoff                     |
-| `files/rename.ts`, `files/folder-mutations.ts` | Rename/folder алгоритмы с прежним causal timing                                 |
+Watcher объединяет saves по неперсистентным dirty/saved revisions поверх прежнего
+`PluginPersistence`. Ошибка не становится скрытым успешным retry; durable wait
+повторно проверяет актуальную revision после await. Порядок prepare/pause/finalize/
+resume, completion-microtask и settings-save описан в
+[PARALLELIZATION.md](PARALLELIZATION.md).
+
+Общая upload classification в `rules.ts` ограничена watermark по ID/seq и
+live content/SHA predicate. `wasPendingPutAccepted` проверяет live source и
+watermark без требования matching upload snapshot; это отдельная семантика.
+`batch.ts` сохраняет fresh canonical reads, pending-put eligibility, epoch checks,
+receipt reasons и baseline effects. При just-committed receipt stale/foreign
+reason использует текущий device ID без обязательного applied watermark;
+recovered receipt требует watermark и actor из сохранённого ID. Эти политики
+не объединены. Watermark/content predicate сам не разрешает physical write.
+
+| Модуль `src/sync`                              | Владелец алгоритма                                                         |
+| ---------------------------------------------- | -------------------------------------------------------------------------- |
+| `contracts.ts`                                 | Публичные options, proofs, lifecycle и guards; engine сохраняет re-exports |
+| `files/operations.ts`                          | Transfers, local writes, physical actions, folders и parallel execution    |
+| `files/remote-moves.ts`                        | Snapshot-matched moves, target materialization и guarded source deletion   |
+| `reconciliation/commits.ts`                    | Strict/best-effort commits и публикация deletion intents                   |
+| `reconciliation/rejected-puts.ts`              | Settlement rejected puts и восстановление canonical winner                 |
+| `reconciliation/accepted-uploads.ts`           | Guarded repair принятого upload после commit                               |
+| `reconciliation/conflict-settlement.ts`        | Проверенная remote version, сохранение/публикация conflict copy            |
+| `reconciliation/physical-recovery.ts`          | Move/delete recovery и подтверждение выполненных physical actions          |
+| `reconciliation/baselines.ts`                  | Content verification и подтверждённые causal baselines                     |
+| `reconciliation/context.ts`                    | Только typed capability contract для существующих сервисов и live ports    |
+| `errors.ts`                                    | Классификация с прежним приоритетом cause                                  |
+| `workflows/force.ts`                           | Preflight, bootstrap, source snapshots, replacement и cleanup              |
+| `workflows/encryption-rewrite.ts`              | Exclusive target upload, read-back, beforeIndexCommit и finally            |
+| `workflows/full.ts`                            | Reconciliation, uploads, pending puts и epoch adoption                     |
+| `realtime/batch.ts`                            | Batch, receipts, prepared items, superseded/retry и handoff                |
+| `files/rename.ts`, `files/folder-mutations.ts` | Rename/folder алгоритмы с прежним causal timing                            |
 
 Upload и публикация metadata остаются раздельными. Watcher finalization предшествует
 `markRemoteObserved`; settlement и очистка validation token остаются в фасаде.
 Force UI/архив принадлежат `ForceSyncController`, транзакции — `IndexManager`.
+
+### Стадии workflows и передаваемые данные
+
+| Workflow                  | Стадии и explicit data flow                                                                                                                                                                                                                                                                                                                                                                                                                             | Граница подтверждения                                                                                                                                                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Full                      | `loadFullCanonical` принимает initial receive; `prepareFullReconciliation` возвращает `FullAdmission` (decision + pending work) и сохраняет rollback snapshot в `FullSyncContext`; `scanFullReconciliation` возвращает `FullPlan` (operations + metadata/baseline flags); `applyFullReconciliation` передаёт результаты групп в `FullCommitState`; `commitFullReconciliation` проверяет codec, публикует canonical и вызывает final physical settlement | Engine сохраняет rollback при failed adoption; accept/preserve/later не заменены default. Finalize watcher/initial/epoch предшествует `markRemoteObserved`, ordinary upload ACK/save остаётся в resume до coordinator release           |
+| File rename               | `captureRenameTarget` возвращает bytes/SHA/mtime либо typed retry до remote; excluded destination публикует exact delete; fresh canonical classification выбирает already-applied / recovery / put / move; `stageFileMove` готовит общий single/batch intent; `commitFileRename` публикует intent, выполняет guarded move и completion                                                                                                                  | Recovery использует существующий move ID/sequence; исходный outer catch сохраняет незавершённую работу. Prepared snapshot не заменяет fresh authority                                                                                   |
+| Folder rename             | Guard + fresh canonical; `getOrCreateFolderMutation` сохраняет retry identity; общий single/batch `planFolderMove` возвращает pairs/hashes/survivors/conflicts; `stageFolderMove` публикует logical intent; `materializeFolderRename` возвращает committed pairs/unresolved; отдельный recovery продолжает исходный move                                                                                                                                | Prepared callback/save до intent; completion commit и coherent save до возвращения completed. Descendant admission и concurrency policy прежние                                                                                         |
+| Remote move               | Fresh canonical admission → physical source/target observations → existing/materialized/moved target → `completeMovedTarget` (stamp, затем retire action)                                                                                                                                                                                                                                                                                               | Live target требует `metadata && !deleted`, source допускает retained tombstone. Только content comparison общий; fingerprint/hash и fresh cleanup authority остаются в прежних местах. Final explicit action ID retirement сохраняется |
+| Commits                   | Strict/best-effort canonical publication → rejected-put settlement; accepted upload repair отдельно перечитывает canonical/codec/physical; conflict copy проверяется перед corrective write; recovery/baselines имеют отдельных владельцев                                                                                                                                                                                                              | `CanonicalCommitProof` ускоряет лишь безопасное чтение. Он не разрешает overwrite/delete; physical guards и сохранение protective copies не объединены с commit                                                                         |
+| Directed Force            | `prepareForceReplacement` → source/plan/configuration proof → archive choice/revalidation → durable prepared checkpoint → canonical intent → guarded `replaceRemote`/`replaceLocal` → destination/manifest verification → final canonical → `finishForceReplacement`                                                                                                                                                                                    | Новый epoch после commit не откатывается; общий finish только после проверок соответствующей ветки. Cutoff IDs retirement до coherent clearing recovery; same ID/epoch после restart                                                    |
+| Internal compatible Force | Legacy `forceBackupProof` adapter либо current preflight proof → independent source identity → transfer → repeated source proof → replacement commit → cleanup                                                                                                                                                                                                                                                                                          | Adapter сохранён для существующих consumers/tests. Public directed replacement не получает второй набор сервисов через options                                                                                                          |
+
+`SyncRunOptions.forceReplacement` содержит только plan и выбранный backup mode.
+`setForceReplacementPorts` подключает plugin-owned persistence/password/cutoff
+callbacks; engine подставляет свои существующие client/index/adapter и live settings.
+Main wiring читает текущие settings getter-ом; dependency objects не изменяются
+для установки watcher callback. Стабильные bound guard/UI capabilities читают
+текущие engine callbacks/state/token при вызове. Epoch decision также вызывается
+через live port, поэтому замена callback во время canonical load видна этой сессии.
+
+Оставшаяся связность явная: conflict/rejected settlement может повторно вызвать
+best-effort commit для retained copy; accepted repair использует эти же функции.
+Общий typed contract включает транзитивные capabilities этой группы, а baseline
+и snapshot helpers требуют только используемые ports. Engine по-прежнему собирает
+nested transfer/reconciliation dependencies; это wiring одного набора сервисов,
+а не дополнительный store или mutable Runtime. Lookup оптимизирован временными
+индексами прохода, описанными ниже. Digest-only traversal и realtime content windows
+имеют отдельные границы владения bytes. Safety reads разных времён остаются раздельными.
+
+### Canonical schema и reducer
+
+`canonical/schema.ts` владеет чистой проверкой current canonical shape,
+causality и mode descriptors, включая отдельный Force maintenance.
+`crypto/manifest-schema.ts` независимо разбирает current hardened manifest:
+exact keys, canonical Base64, safe integers и согласованность transition.
+Canonical mode validator сохраняет прежнюю менее строгую политику строк и
+целых чисел; эти accepted domains не объединяются. Общий object-record guard
+находится в `utils/record-utils.ts` и не меняет protected path records.
+`IndexManager` вызывает validators, сохраняя transport/read/write и прежний
+публичный фасад. Force recovery и plugin loader не загружают runtime manager
+ради чистой валидации.
+
+`canonical/merge.ts` владеет чистым `mergeDesiredIndex(input)`:
+`CanonicalMergeInput` явно передаёт `latest` (snapshot под lock), `loadedBase`,
+`desired`, `deviceId`, `baseRevision`, readonly `completedMoveIds` и упорядоченный snapshot `putBaselines`
+(только `type`, `path`, optional `baselineSha256` из pending mutations).
+`CanonicalMergeMode` — discriminated union `normal / physical-rewrite /
+replacement / target-recovery`; replacement получает timestamp для tombstones,
+recovery — конкретный maintenance ID. Приоритет прежних scopes сохраняется:
+replacement, затем target recovery, затем physical rewrite, затем normal.
+Mode описывает уже выбранную транзакцию и не заменяет guards manager.
+
+`CanonicalMergeResult` возвращает новый `index`, `rejectedPuts` прежней shape
+(`path`, `reason`, `remoteFingerprint`, optional `baselineSha256`) и metadata-only
+`diagnostics`. Manager снимает snapshots причинного контекста, применяет result
+в прежней under-lock точке, сокращает device ID при логировании и владеет
+transport, persistence, error/rollback и acknowledgement. Reducer не меняет
+inputs, не читает store, сеть или часы и не выполняет save/logging.
+`transaction-rules.ts` содержит общий `cloneIndex` (deep JSON copy с повторным
+`protectRecord` всех четырёх records) и прежний predicate
+`isTargetRecoveryIndex(index, maintenanceId)`, используемые manager и reducer.
+
+Порядок reduction сохраняется: replacement; observed maintenance и target
+recovery; prepared-claim guard; files (physical stamp перед logical mutation);
+folder tombstones и surviving descendants; moves и completed move IDs;
+watermarks; maintenance; revision только при изменении. Watermark-only no-op
+по-прежнему публикует revision, а physical-only stamp сохраняет mutationSeq 0.
+Последний put baseline индексируется в Map один раз за merge snapshot: каждый
+последующий put по path заменяет предыдущий, включая отсутствующий SHA.
+Отсутствие path и значение undefined не дают fallback к более старому baseline.
+Store сохраняет direct reverse lookup `findLatestPutBaselineSha` для единичных reads.
+Target recovery меняет только maintenance; epoch, post-commit phase и ID
+проверяются до раннего возврата.
+
+### Временные lookup и ancestry индексы
+
+`local/baseline-rules.PendingPutLookup` индексирует последний matching put по
+(path, SHA) для синхронных baseline/full-upload проходов. Enqueue сразу добавляется
+в lookup; более поздний put с другим SHA не скрывает последний matching put.
+Epoch не фильтруется там, где его не фильтровал прежний алгоритм. Map keys
+сохраняют `__proto__`, `constructor` и undefined SHA без объединения значений.
+После await download и rejected-put conflict settlement используют актуальный
+`LocalOperationStore.findMatchingPut` через manager: download выбирает последний,
+conflict-copy — первый matching put. Возвращается копия только найденного элемента;
+`getPendingMutations` по-прежнему возвращает defensive copy всего FIFO. Realtime
+eligibility с event ID/epoch/watermark и rename lookup не подменяются этим predicate.
+
+`utils/path-utils.PathAncestryIndex` хранит membership snapshot для merge/replay,
+включая exact path и literal slash prefixes без повторной нормализации. Это
+сохраняет прежний более широкий local replay domain (включая backslash);
+canonical path validation не меняется. Merge строит его после file reduction; surviving descendant
+metadata читается из текущего merged index на каждом tombstone в прежнем порядке.
+Replay строит его лениво из union local/remote keys; delete-file добавляет вновь
+материализованный key. Exact folder path исключается прежним prefix predicate;
+каждый descendant заново проходит causal guard. Индексы не переживают проход,
+не сохраняются и не подтверждают physical authority. При перекрывающихся папках
+повторные visits их descendants остаются необходимыми для causal order.
+
+Prune собирает Set ancestors живых canonical files один раз до candidate filter,
+без сортировки живого дерева. Deepest-first порядок candidates прежний. Каждая
+DELETE/retry независимо перечитывает canonical epoch/maintenance/live descendants
+и фактическую пустоту; file deletes сохраняют свежие fingerprint guards.
+
+### Transaction owners и commit proof
+
+`canonical/commit.ts` владеет обычным exclusive acquire/write/read-back/final move,
+исходной bounded retry policy и irreversible committed boundary. Под lock он
+получает результат чистого reducer через `reduceLockedIndex`; causal snapshots,
+rejected puts и принятие подтверждённого index остаются у фасада. Дочерним
+модулям передаются узкие transport/read/accept ports и актуальные getters,
+без доступа к store, mutable settings или полному состоянию manager.
+
+`canonical/recovery.ts` содержит `CanonicalRecovery`: два совпавших root listings
+с полной пагинацией, наблюдения lease по strict content identity, stale/orphan
+recovery, общий exclusive seed, hash/semantic commit verification и raw rollback.
+Его единственное собственное состояние — временные observations locks.
+Source/target codecs и legacy/replacement admission читаются через getters;
+rollback восстанавливает исходные raw bytes и проверяет их прежним source codec.
+`transaction.ts` сохраняет transport-independent классификацию и raw rollback,
+а также общие `IndexSnapshotReader`/`IndexSnapshotDecoder` contracts.
+
+`canonical/force-publication.ts` содержит отдельный `ForcePublication`:
+raw destination replacement, operation authority, lease/previous/target locks,
+restart и pinned service cleanup. Он использует тот же HTTP client, stable
+listing, snapshot reader и schema validation новых target bytes; старый
+canonical назначения не проходит normal-format admission/decode. Public
+`publishForceCanonical`, `recoverForcePublication`, `withForceScope` и proof types
+фасада сохраняют сигнатуры. Force intent/checkpoints и local persistence
+по-прежнему принадлежат существующему workflow и coordinator.
+
+`CanonicalMoveResolution` — union committed с `CanonicalCommitProof` либо
+неуспешного outcome без proof. `recoverAmbiguousFinalMove` возвращает proof
+проверенного snapshot или verification после exclusive retry move;
+`isExpectedCanonicalCommitted` возвращает уже полученный proof либо null.
+Commit потребляет его внутри той же resolution без немедленного повторного
+verify. Proof не переживает новую physical operation/retry и не сериализуется.
+Подтверждённый commit устанавливает stage до local acceptance/cleanup: их отказ
+не разрешает rollback, а committed-cleanup error сохраняет прежний outcome.
 
 ## Canonical, baseline и причинность
 
@@ -74,7 +238,9 @@ watermark того же epoch. Чужие очереди не переподпи
 local state; известный чужой cache ID не присваивает себе pending work.
 При чистом первом sync epoch фиксируется до enqueue/persist, без продвижения
 `observedRevision` и подтверждения baseline. Legacy baseline и replacement adoption
-сохраняют отдельные правила rollback. `local-state` — неперсистентный startup block без Force bypass.
+сохраняют отдельные правила rollback. `local-state` блокирует normal startup;
+подтверждённый Force проверяет собственный source и scoped root независимо
+от старого destination baseline. Ошибка load/persistence не обходится.
 
 `LocalSyncState`, FIFO-очередь мутаций, durable watcher events и очередь
 незавершённых физических действий хранятся атомарно в `data.json`. Чтение
@@ -89,12 +255,45 @@ high-watermark `appliedMutationSeq`.
 baseline/base revision; одинаковый sequence с разным logical state и FIFO gap
 блокируют commit как повреждённое причинное состояние.
 
+Проверенное обновление только `remoteFingerprint`/`remoteMtime` не является
+логической mutation, в том числе для существующей записи с `mutationSeq: 0`.
+Под canonical lock сравнивается вся исходная file entry: уже совпавшее target
+состояние идемпотентно, любое другое изменение этой entry отклоняет устаревший
+stamp. Изменения других entries не мешают commit. Все причинные поля, watermark,
+plaintext SHA и пользовательские bytes сохраняются; глобальная revision меняется
+только при фактическом обновлении canonical. Старые prefixed stamps исправляются
+после stable logical read-back, без Force и перенумерации очередей.
+
 Авторитетное состояние находится в одном файле
 `.obsidian-sync-index.json` на Яндекс Диске. Для записи файл атомарно
 перемещается в уникальное `.obsidian-sync-index.lock.<transactionId>`,
 обновляется и перемещается обратно с `overwrite=false`. Неизменившийся за две
-минуты единственный lock восстанавливается другим устройством. Несколько locks или несовместимые snapshots блокируют операции до устранения неоднозначности; Force не обходит эту защиту. Список lock читается с полной пагинацией;
+минуты единственный читаемый lock восстанавливается другим устройством. Несколько
+locks или несовместимые snapshots блокируют normal sync; подтверждённый Force
+заменяет только зафиксированный preflight набор locks. Список lock читается с полной пагинацией;
 транзакция требует два последовательных одинаковых снимка root listing.
+Recovery привязывает единственный stable raw snapshot к исходному strict
+fingerprint наблюдения, затем эксклюзивно переносит исходный lock в уникальный
+raw lock того же reserved namespace. Claim получает stable raw read-back и должен
+точно совпасть с исходными bytes до отдельного MOVE в canonical. Каждая попытка
+claim, publication или возврата требует свежего stable root listing с единственным
+pinned source и отсутствующим canonical. Codec fallback использует одни bytes;
+transport/semantic failures не дают права на другое codec-чтение или публикацию.
+Renewal до claim начинает новую двухминутную lease. Renewal на server boundary
+claim не публикуется: fresh bytes возвращаются на исходное имя только exclusive
+MOVE с теми же guards; иначе остаются raw locks для explicit recovery, без overwrite.
+Resurrected original или competing lock блокирует publication. Lost MOVE reply
+разрешается exact raw read-back и проверкой единственности восстановленного имени;
+success-log появляется только после подтверждённого canonical без locks.
+Crash оставляет обычный raw claim lock: новый recovery заново наблюдает полную lease.
+Path-based API не поддерживает atomic source precondition: наблюдения и MOVE не
+атомарны. Уникальный claim отделяет publication от пути прежнего владельца;
+обнаруженный drift после final guard остаётся fail-closed без corrective overwrite.
+Отсутствующий canonical создаётся одним общим initialization-путём с непустым
+installation device ID и `overwrite=false`. Exact JSON seed и кандидата commit
+проверяется текущим валидатором до upload. Неоднозначный seed upload разрешается
+stable read-back; чужой seed можно принять normal read, но нельзя заменить Force
+на основании прежнего доказательства отсутствия canonical.
 Успешный commit возвращает временный `CanonicalCommitProof`. Он позволяет
 пропустить повторный index download только при совпавшем SHA-256/MD5 и
 отсутствующих locks. Proof не сохраняется и не разрешает physical write:
@@ -105,6 +304,13 @@ corrective upload заново проверяет canonical и encryption manife
 Проверка после download остаётся обязательной. Наблюдение живёт только внутри
 одного чтения: оно не кешируется между операциями и не разрешает physical write.
 
+`IndexManager.buildLocalIndex()` требует полного local snapshot внутри прежнего
+sync scope. Ошибка чтения или hashing любого syncable файла пробрасывается с
+исходной cause вместо частичной Map: unreadable не означает missing. Это общий
+контракт для full planning, initial receive, epoch adoption, Force и re-encode;
+неполный scan не разрешает новые delete intents или causal confirmations.
+Protected/excluded файлы по-прежнему отфильтровываются до чтения.
+
 Full без adoption, maintenance и начатой ранее causal/physical работы не создаёт
 delete action для tombstone, когда оба scan подтверждают отсутствие объекта и
 VaultAdapter повторно подтверждает отсутствие файла и папки. Такой путь не
@@ -113,28 +319,21 @@ VaultAdapter повторно подтверждает отсутствие фа
 через обычное успешное завершение full. Появившийся после scan локальный объект
 или ошибка чтения существующего файла требуют повторного reconciliation.
 
-`SyncCoordinator` последовательно выполняет full, Force, realtime batch и
-encryption maintenance. Повторные full-запросы объединяются в один запуск.
-Watcher использует один durable drain для upload, delete, rename и folder
-events. Перед постановкой full sync в очередь локальный `prepare`-этап
-замораживает новые realtime-сессии и завершает destructive/rename events,
-существовавшие на cutoff. Upload-события cutoff покрывает full barrier.
-Acknowledgement и causal rebase выполняются в `settle` до освобождения
-coordinator-сессии и сохраняются в `data.json`. Missing-target rename без
-remote side effects может быть отложен до конца full: уже подтверждённый или
-логически вытесненный путь поглощается по свежему local/canonical состоянию,
-а неоднозначный causal source оставляет full неуспешной. После resume
-автоматически запускаются только события, созданные либо изменённые во время
-паузы; неуспешная сессия ничего не подтверждает и не replay-ит.
+`SyncCoordinator` сериализует full, Force, realtime и encryption maintenance.
+Watcher сохраняет одну durable queue и один drain. Full prepare фиксирует cutoff,
+settlement/ACK/save завершаются до coordinator release; failed session не
+подтверждает queue и не запускает replay. Initial receive, stopped watcher,
+rename handoff и late-event rebase имеют отдельные durability boundaries в
+[PARALLELIZATION.md](PARALLELIZATION.md#watcher-и-persistence).
 
-Если rename появляется во время уже submitted upload, watcher сохраняет
-локальную связь между ID событий и mutation sequence. Upload, принятый
-canonical, передаёт rename подтверждённую revision внутри coordinator
-settlement; upload до commit retarget-ится с сохранением FIFO sequence. Full
-barrier не поглощает upload, на который ссылается rename: вся причинная цепочка
-должна завершиться до reconciliation. После realtime upload проверяются только
-затронутые physical paths; полный remote-tree scan остаётся обязанностью full
-sync для external edit и orphan detection.
+Realtime upload/delete series исполняется внутри одной сессии последовательными
+окнами до 32 events / целевые 8 MiB plaintext. Каждое окно завершает commit,
+repair, cleanup и receipts/ACK/save до освобождения snapshots и следующего prepare.
+Result содержит metadata без content. Overflow recapture, oversized files и
+дополнительные commits описаны в
+[PARALLELIZATION.md](PARALLELIZATION.md#папки-retry-и-memory).
+
+Обычные независимые rename events могут исполняться пачкой до 32 root events внутри одной realtime coordinator-сессии: общий intent commit, плоская очередь guarded file moves с общим concurrency ≤ 4 и общий completion commit. Подготовка file/folder intent используется также одиночным путём; новых persisted records нет. Отбор не перескакивает через excluded/submitted events, upload/delete, зависимости или пересечения source/target. Только неизменённые snapshots с causal baseline входят в fast path; неподходящий префикс возвращается одиночной обработке без allocations. Ошибка либо obsolete physical result не подтверждает watcher event; существующий recovery завершает классификацию. Committed-cleanup error не означает rollback и не разрешает выделить новые sequences.
 
 File rename stages и сохраняет свой FIFO sequence до первого logical commit.
 Retry перечитывает canonical и использует исходную pending mutation; непрерывные
@@ -148,9 +347,12 @@ rename с running upload. Переименовываются оба пути е�
 До remote classification startup загружает local baseline/очереди и один раз
 регистрирует lifecycle callbacks. Это выполняется даже без token и при 401/403.
 Неперсистентные typed-блоки `migration`, `encryption`, `historical` и
-`authentication` останавливают normal full, realtime, watcher и scheduler;
-только `migration` пропускает подтверждённый Force. Resume сначала выполняет
-read-only recheck и не может скрыть активный блок статусом `idle`.
+`authentication` останавливают normal full, realtime, watcher и scheduler.
+Подтверждённый directed Force выполняет собственный readable-source и scoped-root
+admission независимо от destination historical/encryption/authentication/local-state
+blocks; failed local load/persistence не обходится. Internal compatible Force
+сохраняет прежний guard, допускающий только migration block. Resume сначала
+выполняет read-only recheck и не может скрыть активный блок статусом `idle`.
 Persisted watcher events загружаются в память, но watcher и scheduler
 запускаются после строгой проверки manifest/canonical и успешного full reconciliation.
 Resume также выполняет full перед replay накопленных событий; неуспешная
@@ -169,27 +371,79 @@ identity, до автоматизации. Ошибка load/save блокиру
 непрочитанные данные. Lifecycle регистрируется до token/remote checks. Current
 canonical допускает normal full adoption, отсутствующий — initial sync. Автоматического
 архива при conversion или foreign adoption нет. Resume не снимает typed blocks;
-encrypted legacy и неподдерживаемые historical formats запрещают также Force.
+encrypted legacy и неподдерживаемые historical formats блокируют обычный sync.
+Force local может заменить такие metadata назначения без их декодирования.
 
-Force подтверждается выбором архива, продолжения без архива или отмены. В coordinator
-всегда передаётся `ForcePreflightProof`: canonical identity, protected snapshot digest
-и nullable archive proof. Canonical, protected snapshot, source и пути проверяются
-в обоих вариантах; raw SHA архива — только когда архив выбран. Drift либо ошибка
-архива останавливает попытку. Новый запуск требует нового подтверждения, без
-автоматического fallback/повторного архива. Source проверяется на transfers и перед
-replacement commit; после commit rollback запрещён. Старый `ForceBackupProof`
-поддерживается адаптером; одновременные proof запрещены.
+Force — направленная полная замена синхронизируемого назначения фактическим
+источником. `ForceSyncController` получает направление до подготовки;
+`workflows/force-replacement.ts` проверяет читаемый source, codec и storage identity
+без обычного startup admission и без логического чтения destination canonical.
+Старые baseline, tombstones, queues, corrupt/historical metadata назначения
+не выбирают победителя. `.backup`, служебные файлы, собственный plugin directory
+и исключённые пути защищены общими `path-utils`/VaultAdapter filters.
 
-До backup metadata-only scan проверяет legacy canonical и physical tree. Любая
-копия `plugins/yandex-disk-sync`/`plugins/obsidian-yandex-disk-sync` блокирует
-migration без content download и требует удалить remote directory и заменить
-OAuth token. Обнаружение сохраняет только non-secret local remediation marker:
-даже после удаления remote directory Force остаётся заблокированным до смены
-token в настройках. Remote-raw snapshot также проверяет metadata до первого
-download и не архивирует plugin data. User paths, конфликтующие с current
-service names или меняющиеся при current normalization, требуют ручного
-переименования. Path records нейтрализуют prototype accessor, поэтому корневой
-`__proto__` остаётся обычным пользовательским ключом.
+Raw filename shape разрешает только проверку возможного ciphertext, но не
+удаление за пределами include scope. Force local применяет один classifier при
+подготовке, перед intent, инвентаризации cleanup и проверке результата: объект
+должен входить в raw scope либо иметь аутентифицированный target codec logical
+path в scope. Явные raw exclusions сохраняются. Если raw path вне scope похож
+на ciphertext, но target codec не доказывает logical path, Force останавливается
+с scope ambiguity; до intent canonical/local state и physical bytes не меняются,
+после intent сохраняется recovery того же ID/epoch без ложного success.
+Это относится и к plaintext с длинными base64url/hex именами. Для продолжения
+нужно явно исключить посторонние объекты или устранить неоднозначность scope.
+При ограниченных include patterns неизвестный старый ciphertext также может
+блокировать Force: ни manifest, ни синтаксис имени не разрешают удалить
+возможный excluded plaintext. При полном raw scope замена encrypted/corrupt
+destination по-прежнему не требует старого пароля, включая target plaintext.
+
+Локальное → Диск использует фактические локальные SHA/paths. Локальная настройка
+задаёт target mode; encrypted target получает свежую соль `hardened` и сохранённый
+либо запрошенный пароль. Старый пароль назначения не требуется. Диск → локальное
+сначала читает и аутентифицирует все физические source-файлы; повреждение, 403,
+сеть и decrypt failure не превращаются в пустой source. Без manifest формат
+выбирается явно; ciphertext требует исходных salt/profile и правильного пароля.
+Неоднозначный raw source вне include scope также должен пройти filename
+authentication: decrypt failure блокирует подготовку, а не пропускает возможный
+повреждённый ciphertext. Явные raw exclusions применяются до decrypt.
+Пустой подтверждённый source очищает синхронизируемое назначение; пустой remote
+сохраняет локальный режим шифрования и получает соответствующие metadata.
+
+Подтверждение показывает путь, направление, mode и количество файлов, отдельно
+предупреждая об очистке при пустом source. Архив — явный выбор на запуск. При
+ошибке доступны повтор, явное продолжение без копий и отмена. Без архива Force
+не читает содержимое старого назначения ради snapshot/canonical validation,
+не создаёт per-file protective или conflict copies. Обычная синхронизация
+сохраняет прежнюю обязательную защиту файлов.
+
+`forceRecovery` сохраняется coherent со settings, baseline и очередями: ID,
+направление, source manifest/digest, новый epoch, target codec parameters,
+локальный пароль, backup proof/mode, watcher cutoff, проверенные файлы и cleanup.
+Пароль существует только в локальном plugin data; canonical/manifest его не
+содержат. Старый current snapshot получает `forceRecovery: null` и сохраняется
+до автоматизации. Канонический `maintenance.kind: "force"` имеет самостоятельный
+валидируемый формат и фазы `prepared / applying / cleanup`.
+
+`IndexManager.publishForceCanonical` через `ForcePublication` захватывает raw canonical эксклюзивным move,
+пишет отдельный target lock, проверяет новые bytes и публикует их эксклюзивно.
+Активный Force lease обновляется каждые 30 секунд, останавливается и очищается
+через transaction finally; обычный stale-lock recovery не принимает Force maintenance.
+Старые bytes назначения не расшифровываются. До удаления/перезаписи user objects
+публикуется Force intent. Каждый retry проверяет root identity и ID/epoch
+операции; новый подтверждённый Force отзывает полномочия прежнего. Удаление
+старых пользовательских и service objects проверяет pinned strict fingerprint.
+Сохранённые target locks и read-back разрешают неоднозначные ответы после restart.
+Пользовательские uploads также идут через уникальный payload staging и exclusive
+move: поздний старый PUT не перезаписывает уже опубликованный successor.
+
+Recovery идёт вперёд с теми же ID/epoch, без автоматического нового архива.
+До завершения обычная автоматизация заблокирована. Source drift останавливает
+проход; destination drift приводит к повторной инвентаризации, максимум три
+попытки. File/folder blockers удаляются после intent; protected descendants
+не удаляются ради освобождения пути. Успех требует совпадения bytes, canonical,
+manifest, baseline и завершённого cleanup. Очереди старого epoch и покрытые
+watcher events снимаются при cutover; последующие события относятся к новому epoch.
+
 Current canonical хранит `mutationSeq` в file metadata, folder tombstones и moves. Folder move
 фиксирует logical intent одной revision, а физически выполняется как
 ограниченная пачка guarded file moves; folder-level move API не используется.
@@ -205,25 +459,18 @@ tombstone применяется физически без изменения `l
 `mutationSeq`. Current file entry без sequence не даёт causal proof для
 destructive folder operation и не получает baseline fallback; само наличие
 такой записи не включает historical recovery.
-Force создаёт новый `epoch` только на авторитетном устройстве. Остальные
-обновлённые устройства принимают этот epoch обычной full sync: до успеха они
-сохраняют прежний baseline, сравнивают с ним текущий filesystem и новый
-canonical, затем атомарно продвигают `observedEpoch`. Старые mutations и
-physical actions не воспроизводятся; локальные изменения оформляются как новые
-операции с epoch и base revision принятого canonical snapshot, не старого baseline.
-Новая live revision после подтверждённого удаления скачивается: отсутствие файла
-под старым deletion baseline не является новым пользовательским delete.
-Смена epoch во время realtime не повторяет index
-transaction, а оставляет событие durable и ставит один coalesced full.
-Replacement canonical содержит live entries выбранной стороны и tombstones с
-`mutationSeq: 0` для отсутствующих canonical/physical paths. Transfer принимает
-только bytes исходного source snapshot: Force local проверяет SHA каждого
-upload и повторный local scan, Force remote использует
-`metadata → download → metadata` и повторный remote-tree scan. До первого
-local write Force remote блокирует exact/NFC/case-fold collisions. До commit
-source mode остаётся авторитетным; после подтверждённого commit rollback
-запрещён, migration block снимается, а fingerprint-guarded cleanup продолжает
-обычный full даже после потери инициатора.
+Force создаёт один новый `epoch`. Другое устройство с offline delta или durable
+work сначала показывает выбор: принять remote state, разрешить перенос своих
+правок либо отложить. До выбора baseline/очереди и локальные bytes сохраняются,
+старые изменения не отправляются. Выбор привязан к конкретному epoch; ещё одна
+замена требует нового выбора. Без offline delta допустим обычный full adoption.
+Принятие remote использует обычные protective copies; перенос правок — прежний
+three-way reducer с новыми причинными counters. Это не повторный Force.
+
+Смена epoch во время realtime замораживает старые intents и запрашивает один
+coalesced full. Force replacement содержит только выбранные live entries с
+`mutationSeq: 0`; старые causal receipts не переносятся. Обычные logical mutations
+по-прежнему проходят строгие FIFO/sequence guards.
 
 Первое подключение pristine device выполняет `workflows/initial-receive.ts` внутри
 full coordinator: сначала cloud live paths и exact tombstones, затем coherent
@@ -237,50 +484,41 @@ causal mutations не переводятся в этот режим. Persist fai
 
 ## Encryption profiles и migration
 
-Новые vault используют `hardened`: PBKDF2 600k выводит master key, HKDF
-разделяет AES-GCM content key и AES-SIV filename key. Других codecs в текущей
-версии нет. Numeric manifest, encrypted legacy index и другие historical
-formats fail closed без чтения или migration; current manifest имеет marker
-`encryption-manifest`, строго объявляет все алгоритмы, а unknown
-format/profile блокирует любые remote mutations.
+Единственный codec — `hardened`: PBKDF2-HMAC-SHA256 600 000 и HKDF-separated
+AES-GCM content / AES-SIV filename keys. Numeric/unknown historical encryption
+formats блокируют normal sync и чтение encrypted source; Force local имеет
+отдельные правила raw destination replacement.
 
-Fresh enable, rotate и disable используют один crash-safe transition. До
-commit canonical читается source codec, после commit — только target codec.
-Cleanup paths и source fingerprints фиксируются атомарно с target canonical,
-поэтому другое target-capable устройство может завершить post-commit cleanup
-без source password. `IndexManager` разрешает это только matching transition ID
-и post-commit phase. Для enable/rotate target canonical читается только после
-проверки transitional manifest, target descriptors и verifier. Для disable
-target canonical явно читается plaintext внутри того же recovery scope;
-удалённый после commit manifest допустим только для matching plaintext target.
+Enable/disable/rotate используют существующий `EncryptionTransitionController`.
+До canonical commit авторитетен source; после commit — target, rollback запрещён.
+Injective target mapping и exact read-back создают pinned target proofs до commit
+или cleanup. Pre-commit rollback имеет отдельную ephemeral authority и не публикует
+post-commit cleanup. Завершение checkpoint после failed final save не получает
+права DELETE. Foreign target recovery требует matching ID/descriptors/phase,
+а совпадения device ID недостаточно.
 
-До первого target upload строится полное injective отображение
-`logicalPath -> targetRawPath`, не пересекающее source и protected paths. Каждый
-upload подтверждается stable raw read-back: target path декодируется обратно в
-ожидаемый logical path, а расшифрованные bytes сравниваются по plaintext
-SHA-256. Fingerprint сохраняется сразу после proof. После crash пропущенный
-fingerprint восстанавливается только тем же read-back; без proof canonical
-commit и cleanup запрещены.
-Success, 409, timeout и остальные ответы upload не считаются доказательством
-сами по себе. Raw source object без стабильного server fingerprint блокирует
-transition до claim, потому что его последующее удаление нельзя доказать.
-
-Transition manifest для следующей canonical phase публикуется до canonical
-commit. Поэтому crash до commit даёт только fail-closed рассогласование, а
-сразу после commit remote уже содержит matching authority для foreign
-recovery. После target commit stable manifest (либо его удаление при disable)
-публикуется до перевода canonical maintenance в `cleanup`. Stable manifest с
-matching `index-committed` maintenance является безопасным resume-состоянием.
-Pre-commit rollback не публикует post-commit `cleanup`: он оставляет source
-авторитетным, удаляет только доказанные target-объекты и затем снимает
-maintenance. Неполный guarded cleanup сохраняет local transition и блокировку.
-Local recovery дополнительно связывает local snapshot с canonical и manifest по
-transition ID, kind, initiator, source revision, descriptors и допустимому
-publication window; совпадения одного device ID недостаточно.
-Подробный wire и recovery contract описан в
-[E2E_ENCRYPTION.md](./E2E_ENCRYPTION.md).
+Wire formats, manifest publication windows, candidate credentials, guards каждого
+DELETE/retry и restart описаны один раз в
+[E2E_ENCRYPTION.md](E2E_ENCRYPTION.md). `clearIndexTransitionServices()` всегда
+выполняется через `finally`; recovery/connect не создают новый архив.
 
 ## Локальное применение и физический cleanup
+
+`uploadFile` использует один missing-parent recovery tail независимо от
+`skipFolderCheck`: initial parent preflight сохраняется, transport 404 сбрасывает
+folder observation, пересоздаёт parent и допускает один повтор `putFile`.
+Повторный 404 выходит ошибкой; exclusive 409 не запускает recovery/overwrite.
+Перед каждым фактическим PUT, включая retry и parent recovery, выполняются
+актуальные `beforeAttempt` и storage write guard. Ошибка любого guard либо
+ambiguous read-back, включая 404, возвращается с исходной identity и не считается
+ответом upload transport. Она не разрешает mkdir, новый PUT или ложный успех.
+Move сохраняет `beforeAttempt` перед каждой POST-попыткой; DELETE и его polling
+сохраняют отдельную классификацию отсутствия объекта.
+
+Encryption mapping использует общий `getAncestorDirectories` после строгой
+валидации source/target paths; Set нужен только для membership. Raw/logical reads,
+live target/retained source и service/physical fingerprints имеют разные
+accepted domains и остаются отдельными контрактами.
 
 Прямой GET bytes использует ограниченные `maxRetries` и backoff клиента при
 сетевом исключении или retryable HTTP-ответе (423/429/500/502/503/504). Каждая новая попытка
@@ -293,15 +531,17 @@ API GET также повторяет завершённые HTTP 500/502/504 в
 До полного download и успешных apply guards
 локальные bytes/baseline не подтверждаются; retry не изменяет правила конфликтов.
 
-GET к API, signed download link и operation status имеют deadline 60 s на запрос.
-Stable raw/logical snapshot и direct download дополнительно имеют общий бюджет
-60 s: metadata, fresh link, bytes, retries и backoff используют оставшееся время.
-Timeout не повторяет запрос: Obsidian API не предоставляет отмену native request.
-Поздний ответ проигравшего Promise не достигает apply. Очередь full/Force downloads
-после timeout не начинает новые tasks и дожидается уже начатых. При ошибке download
-full сохраняет coherent snapshot и выходит до settlement, deletes и conflicts.
-Best-effort metadata stamp после применённого файла сохраняет прежний fallback;
-он не является authority guard. PUT и подтверждение неоднозначных writes не меняются.
+GET к API, signed download link и operation status имеют deadline 60 s.
+Stable raw/logical read и direct download используют общий 60 s budget на
+metadata/link/bytes/retry/backoff. Незавершённый native request не повторяется,
+поздний ответ не применяется; queued downloads после timeout не запускаются,
+уже начатые tasks дожидаются settlement. Full выходит до новых conflict/delete
+commits, сохраняя durable work.
+
+Stale-lock recovery декодирует один stable raw snapshot разными codecs;
+только `UnreadableRemoteIndexError` разрешает fallback. Encryption recovery
+тоже не превращает transport/persistence/semantic failure в выбор другого codec.
+Подробные local apply и conflict правила: [CONFLICTS.md](CONFLICTS.md).
 
 Download фиксирует отсутствие файла или его plaintext SHA до remote I/O.
 `VaultAdapter.writeFile` принимает необязательный guard: после подготовки папок
@@ -313,10 +553,20 @@ Download фиксирует отсутствие файла или его plaint
 
 Конфликтная копия переиспользуется только по фактическим bytes. Её локальная
 правка сохраняется отдельно; новое имя создаётся с условием отсутствия.
-Exact/NFC/case-fold collisions сегментов, файл на месте папки или предка
-блокируют применение. Exact update, Unicode и `__proto__` допустимы.
+В обычном sync exact/NFC/case-fold collisions сегментов, файл на месте папки
+или предка блокируют применение. В Force source ambiguity также блокируется,
+но destination blockers могут быть устранены после intent с сохранением
+protected/excluded descendants. Exact update, Unicode и `__proto__` допустимы.
+Полный collision preflight и final scan всего загруженного дерева после await
+сохранены: `getAbstractFileByPath` не доказывает отсутствие NFC/case sibling
+или несовместимого предка. Стоимость final scans пропорциональна числу download
+и размеру дерева; уменьшение требует проверенного Vault observation lifecycle.
+Политики не дублируются: `hasPortablePathCollision` и
+`shouldInspectRawSyncPath` остаются общими path-utils владельцами.
 
-Физическое удаление требует durable action и свежего canonical. Каждая сетевая
+Физическое удаление в обычном sync требует durable action и свежего canonical.
+Направленный Force использует свой coherent checkpoint и canonical intent,
+сохраняя свежие operation/scope/fingerprint guards. Каждая сетевая
 попытка, включая retry, повторяет authority и fingerprint checks. Move cleanup
 проверяет также актуальный move и физически доступный target. Папка удаляется
 только при отсутствии live descendants в свежем canonical и фактической пустоте.
@@ -328,6 +578,28 @@ FileManager отправляет файл в trash. Изменившийся sna
 счётчик удалённых файлов и не подтверждает baseline. HTTP success/202 сам по себе
 не доказывает отсутствие объекта. Эти проверки не дают атомарной защиты от
 произвольной внешней записи между последним чтением и mutation.
+
+## Startup и остановка
+
+| Состояние/событие                      | Переход и разрешённая работа                                                                                                                                                                                                      |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Load/read/format failure               | Persistence закрыта; save/unload не заменяют исходные данные defaults.                                                                                                                                                            |
+| Identity и stable migration            | Сначала installation identity и один coherent current save; его failure закрывает startup и unload retry.                                                                                                                         |
+| Компоненты созданы                     | Baseline, mutations, physical actions и watcher events восстановлены, lifecycle callbacks зарегистрированы до layout/token checks.                                                                                                |
+| Layout ещё не готов                    | Remote automation не запускается; поздний callback после unload игнорируется.                                                                                                                                                     |
+| Pending Force recovery                 | Layout возобновляет тот же checkpoint/operation ID через существующий Force workflow; normal startup ждёт подтверждённого результата.                                                                                             |
+| Нет token / root admission отклонён    | Typed authentication/local-state block; local queues сохраняются. Token repair повторно классифицирует storage, не переносит work в чужой root.                                                                                   |
+| History / migration / encryption block | Разные typed blocks сохраняют приоритеты `SyncEngine`; startup не объявляет их ready. Foreign migration decision перечитывается.                                                                                                  |
+| Read-only classification ready         | Только успешный full допускает watcher/scheduler. Явная пауза сохраняется, settings её не снимают.                                                                                                                                |
+| Save failure                           | Непринятый draft не публикуется; normal automation остановлена до успешного user save и повторного startup/full. Internal recovery пользуется той же очередью.                                                                    |
+| Новая load generation                  | Очередь дренируется; старые queued saves отклонены до write, in-flight save не публикует draft после supersession. Уже начатый storage write не отменяется.                                                                       |
+| Unload                                 | Watcher/scheduler и Notice timers/subscriptions остановлены; unload-save проверяет loaded/failed state в момент исполнения. Lifecycle subscriptions снимаются после settlement уже принятой сессии, без новой maintenance-сессии. |
+
+Новый persistence snapshot строится при исполнении задачи и отделён от live references
+на время `saveData`. Encryption settings/transition и Force checkpoint сохраняются
+через эту же очередь; отдельного password/snapshot канала нет. UI setters только
+передают typed block движку и показывают его причину, не снимают pause и не решают
+порядок admission. Поздние Notice/epoch callbacks после unload не создают новую работу.
 
 ## Настройки и автоматизация
 
@@ -349,17 +621,27 @@ realtime. Остановленный watcher участвует в full settleme
 Автоматизация учитывает layout readiness, typed startup blocks, явную паузу и unload.
 Подробности очередей и параллелизма: [PARALLELIZATION.md](PARALLELIZATION.md).
 
+Engine трактует lifecycle callbacks как durability boundary. Отказ pause прерывает
+body до reconciliation. Resume исполняется до итогового result/status/success-log
+и до освобождения coordinator; отказ successful resume делает сессию неуспешной
+с исходной cause. Остальные resume callbacks получают failure и не допускают replay;
+ошибка cleanup failed session не скрывает её исходный отказ. Подтверждённые
+physical/canonical изменения не откатываются из-за ACK/save failure. Late watcher
+events при epoch adoption также сохраняют новый causal context до возврата
+resume; failure не подтверждает adoption и сохраняет прежний durable ID для restart.
+
 ## Архивы и пользовательские операции
 
-Force и enable/disable/rotate предлагают with-backup, without-backup и cancel на
-один запуск. Обязательные source/canonical/codec/fingerprint guards действуют всегда.
-Полный архив не заменяет отдельные protective/conflict copies. Ручной backup проходит
-через существующий coordinator; папка, режим и пароль фиксируются до чтения файлов.
-Настройки и другие foreground operations заблокированы до завершения.
+Force и enable/disable/rotate предлагают with-backup, without-backup и cancel
+на один запуск. Source/scope/operation guards обязательны всегда. Force без
+backup также пропускает per-file copies и destination-content snapshot;
+обычный sync сохраняет обязательные protective copies.
 
-Список/скачивание архивов учитывают поколение конфигурации и закрытие UI. Архив может
-открываться собственным паролем после смены vault codec. Формат, limits, password policy
-и совместимость описаны в [BACKUP.md](BACKUP.md).
+Ручной backup использует существующий coordinator и фиксирует path/mode/password
+до чтения файлов. Список/download учитывают configuration generation и закрытие UI.
+Materialized ZIP и digest-only имеют общую exact identity, но разное владение bytes.
+Формат envelope, password policy, freshness и пределы памяти:
+[BACKUP.md](BACKUP.md).
 
 ## Состояние синхронизации и уведомления
 
@@ -382,6 +664,9 @@ full-loader. Плашка перечитывает актуальный конт
 sync → foreground encryption/backup → normal full при idle/initializing →
 состояние движка. Состояния блокировки сохраняют приоритет; Force удерживает
 ownership между внутренними сессиями.
+Ожидание canonical lock при startup отражается активной плашкой и однократным
+INFO-сообщением с длительностью защитного lease; ожидание не сокращает lease
+и не разрешает обходить canonical recovery.
 
 При первой ошибке transfer ещё во время пачки `SyncState.errorMessage` получает
 причину; progress считается по завершённым tasks, включая ошибки, без пропущенных
@@ -405,7 +690,9 @@ Enter/Space меняют раскрытие; обновления и remount е�
 и copy находятся слева в той же строке, вне `summary` и live status: их нажатие
 не сворачивает плашку. Touch targets не меньше 44 × 44 px, названия и подсказки
 локализованы. Копирование не меняет sync-state; при пустом логе буфер сохраняется,
-ошибка Clipboard API не даёт ложного успеха.
+ошибка Clipboard API не даёт ложного успеха. Запись через `ClipboardItem` начинается
+в обработчике касания для WebKit; при её отказе используется `writeText()`,
+чтобы сохранить совместимость с текстовым clipboard bridge Obsidian.
 
 `idle` не обещает отсутствие deferred events. UI-состояние не сохраняется в
 `data.json` и не участвует в causal merge или выборе codec. `onLayoutReady` и
@@ -416,7 +703,7 @@ motion отключает вращение loader; status icon не вращае
 
 `ForceSyncController` владеет полным пользовательским сценарием обоих
 направлений: read-only preflight → выбор архива → необязательный backup с exact read-back →
-Force через существующий coordinator → persistence → завершающий normal full.
+Force через существующий coordinator → собственная проверка назначения → coherent persistence.
 Он резервирует busy-состояние до первого await, не создаёт очередь и не
 позволяет повторному клику запустить второй backup или отложенный Force.
 `main.ts` подключает зависимости и Obsidian UI. `SyncRunOptions.onActivity`
@@ -427,16 +714,15 @@ Force через существующий coordinator → persistence → зав
 тот же неперсистентный flow-state: индикатор внутри кнопки выбранного направления
 работает только при active Force, сохраняя текст кнопки. Отдельной строки прогресса
 под кнопками нет; этапы остаются в Notice. Оба Force-контрола блокируются также при
-другой активной sync-сессии, но без индикатора. Во время Force настройки и ручные mutating-действия
+configuration/foreground work. При обычной sync-сессии Force сериализуется тем же coordinator. Во время Force настройки и ручные mutating-действия
 недоступны, включая промежутки между coordinator-сессиями. Повторное открытие
 настроек читает текущее состояние; закрытие снимает подписки, но не отменяет Force.
 
-Успех миграции показывается на 8 секунд только после replacement commit,
-persistence, успешного итогового full и отсутствия pending cleanup. Если full
-восстановил прерванный cleanup, допустим успех. Иначе после commit остаётся
-постоянное сообщение о необходимости normal full; rollback и повторная
-миграция не предлагаются. Ошибка backup не запускает Force. Поздние события
-предыдущего flow и таймеры не меняют новое уведомление.
+Успех показывается после подтверждённого replacement, persistence и собственного
+контроля canonical/manifest/bytes/cleanup. Обычный full не используется для
+возвращения перезаписанных destination-очередей. После ошибки остаётся durable
+Force recovery; rollback нового epoch запрещён. Повторный клик наблюдает тот же
+Promise, а поздние callbacks предыдущего flow не меняют новый Notice.
 
 ## Проверки
 
@@ -445,11 +731,17 @@ persistence, успешного итогового full и отсутствия 
 а не только вызовы mocks. Wire types определены в `src/types.ts`; строгие loaders
 не допускают неявного расширения исторических форматов.
 
-`npm test`, lint, изолированный build, bundle check и scenario validator дополняются
-[SMOKE_TESTS.md](SMOKE_TESTS.md). Build читает optional root `.env` для deployment;
-агент проверяет сборку в разрешённой копии без `.env` и рабочего vault. Реальный
-двухпрофильный прогон обязателен для release. Статус manual evidence хранится отдельно
-в `docs/release-evidence/`; успех автоматических проверок его не меняет.
+Test/lint/build/format/bundle checks дополняются [SMOKE_TESTS.md](SMOKE_TESTS.md).
+Штатный build может читать optional root `.env` и копировать assets в тестовый vault;
+его потенциально чувствительный вывод подавляется до capture, содержимое `.env`
+агент не читает. Build/copy не доказывает работу Obsidian или Yandex API.
+
+Exact auto references сверяются с фактически исполняемыми Node test names. Перед
+использованием статического scenario validator проверяется поддержка templates и
+evidence grammar; его ограничения не являются дефектом валидного сценария.
+Реальный двухпрофильный прогон обязателен для release. Статус хранится в
+[release evidence](release-evidence/2.0.0.json); автоматические checks его не меняют.
+Историческая приёмка и измерения — [REFACTOR_REPORT.md](REFACTOR_REPORT.md).
 
 ## Единый контракт ошибок
 
@@ -460,6 +752,10 @@ persistence, успешного итогового full и отсутствия 
 отдельную identity: 404 signed link не доказывает отсутствие API resource.
 `sync/errors.ts` адаптирует domain exceptions; root, canonical, local identity
 и обязательный backup имеют приоритет над вложенной сетью или authentication.
+`sync/canonical/errors.ts` — единственный владелец canonical/transaction и
+format error constructors, decode-attempt types и прежней retry classification.
+Runtime consumers импортируют их напрямую; `canonical/manager.ts` сохраняет
+совместимые re-exports с той же constructor identity, cause и stage.
 
 Политика разрешает попытку, но не выполняет её. Счётчики, backoff и deadlines
 остаются в клиенте; GET сохраняет 423/429/500/502/503/504, writes — 423/429/503,

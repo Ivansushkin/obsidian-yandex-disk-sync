@@ -7,7 +7,7 @@ import {
 	StorageScopeError,
 } from "./storage-scope";
 
-export type StorageBindingChoice = "same" | "new" | "cancel";
+export type StorageBindingChoice = "same" | "new" | "replacement" | "cancel";
 
 interface Dependencies {
 	client: YandexDiskClient;
@@ -17,9 +17,15 @@ interface Dependencies {
 	hasTransition: () => boolean;
 	isUnloaded: () => boolean;
 	persist: () => Promise<void>;
+	verifyReplacement?: () => Promise<{
+		epoch: string;
+		apply(): Promise<void>;
+		rollback(): Promise<void>;
+	}>;
 	confirm: (
 		path: string,
 		canKeepHistory: boolean,
+		canAdoptReplacement?: boolean,
 	) => Promise<StorageBindingChoice>;
 }
 
@@ -57,6 +63,12 @@ export class StorageBindingController {
 			Object.keys(state.files).length > 0 ||
 			deps.hasPendingWork() ||
 			deps.hasTransition();
+		const canAdoptReplacement =
+			!!state.remoteScope &&
+			!!observed &&
+			state.remoteScope.remotePath === path &&
+			state.observedEpoch !== null &&
+			!deps.hasTransition();
 		let choice: StorageBindingChoice = "new";
 		if (hasHistory) {
 			if (!prompt) {
@@ -65,6 +77,7 @@ export class StorageBindingController {
 			choice = await deps.confirm(
 				path,
 				state.remoteScope === null && observed !== null,
+				canAdoptReplacement,
 			);
 		}
 		if (choice === "cancel") {
@@ -77,6 +90,27 @@ export class StorageBindingController {
 		) {
 			throw new StorageScopeError(
 				"Connection changed while storage confirmation was open",
+			);
+		}
+		const replacement =
+			choice === "replacement" && canAdoptReplacement
+				? await deps.verifyReplacement?.()
+				: undefined;
+		if (
+			choice === "replacement" &&
+			(!replacement || replacement.epoch === state.observedEpoch)
+		) {
+			throw new StorageScopeError(
+				"A completed replacement generation must be verified before keeping offline history",
+			);
+		}
+		if (
+			deps.isUnloaded() ||
+			deps.getSettings().remotePath !== path ||
+			deps.getSettings().yandexTokenSecret !== token
+		) {
+			throw new StorageScopeError(
+				"Connection changed during replacement verification",
 			);
 		}
 		const fresh = await readRemoteStorageScope(deps.client, path);
@@ -103,6 +137,7 @@ export class StorageBindingController {
 		}
 		const previous = deps.index.captureLocalCausalState();
 		try {
+			await replacement?.apply();
 			if (choice === "new") {
 				deps.index.resetLocalStorageHistory();
 			}
@@ -125,6 +160,7 @@ export class StorageBindingController {
 			}
 		} catch (error) {
 			deps.index.restoreLocalCausalState(previous);
+			await replacement?.rollback();
 			throw error;
 		}
 		return true;

@@ -1,19 +1,42 @@
+import { fileMetadata } from "./helpers/metadata";
+import {
+	encryptedMode,
+	plaintextMode,
+	localTransition,
+	maintenance as createMaintenance,
+	transitionManifest,
+} from "./helpers/crypto-fixtures";
 import { DEFAULT_SETTINGS, createEmptyIndex } from "../src/types";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { YandexDiskClient as Client } from "../src/api/yandex-client";
+import { MemoryDisk, bytes, codecFor } from "./helpers/sync-flow";
 import {
 	decideEncryptionRecovery,
 	EncryptionTransitionController,
 	createRemoteTargetRecoveryPlan,
 	createTargetRawMapping,
 	hasPendingEncryptionCleanup,
+	verifyTransitionTargetObject,
 	type LocalEncryptionTransition,
 } from "../src/crypto/encryption-transition";
 import { IndexManager } from "../src/sync/canonical/manager";
 import type { SyncEngine } from "../src/sync/engine";
 import type { IndexMaintenance, RemoteEncryptionManifest } from "../src/types";
+
+const rewriteSuccess = {
+	success: true,
+	uploaded: 1,
+	downloaded: 0,
+	deleted: 0,
+	errors: [],
+};
+type RewriteOptions = NonNullable<
+	Parameters<SyncEngine["reencodeRemoteFiles"]>[0]
+>;
 
 type TransitionLifecycle = ConstructorParameters<
 	typeof EncryptionTransitionController
@@ -43,6 +66,30 @@ function createLifecycle(
 		createSyncFailure: () => new Error("sync failed"),
 		...overrides,
 	};
+}
+
+/** Keep phase hooks explicit while sharing the inert controller boundaries. */
+function createController(
+	lifecycle: Partial<TransitionLifecycle> = {},
+	engine: Partial<SyncEngine> = {},
+	index: Partial<IndexManager> = {},
+): EncryptionTransitionController {
+	return new EncryptionTransitionController(
+		{
+			setIndexTransitionServices: () => undefined,
+			clearIndexTransitionServices: () => undefined,
+			...index,
+		} as IndexManager,
+		{
+			showMaintenanceCleanupPhase: () => undefined,
+			reencodeRemoteFiles: async (options) => {
+				await options?.beforeIndexCommit?.();
+				return rewriteSuccess;
+			},
+			...engine,
+		} as SyncEngine,
+		createLifecycle(lifecycle),
+	);
 }
 
 test("encryption recovery follows canonical authority across the commit boundary", () => {
@@ -105,75 +152,183 @@ test("transition target mapping rejects raw collisions before upload", () => {
 			["__proto__", "raw-prototype"],
 		]),
 	);
-	assert.throws(() =>
-		createTargetRawMapping(
+	const collisions: Array<[Array<[string, string]>, string[]]> = [
+		[
 			[
 				["one.md", "same"],
 				["two.md", "same"],
 			],
 			[],
-		),
-	);
-	assert.throws(() =>
-		createTargetRawMapping([["one.md", "source-one"]], ["source-one"]),
-	);
-	assert.throws(() =>
-		createTargetRawMapping(
-			[["one.md", "source-one/child"]],
-			["source-one"],
-		),
-	);
-	assert.throws(() =>
-		createTargetRawMapping(
+		],
+		[[["one.md", "source-one"]], ["source-one"]],
+		[[["one.md", "source-one/child"]], ["source-one"]],
+		[
 			[
 				["one.md", "target"],
 				["two.md", "target/child"],
 			],
 			[],
-		),
-	);
-	assert.throws(() =>
-		createTargetRawMapping([["one.md", ".backup/object"]], []),
-	);
-	assert.throws(() =>
-		createTargetRawMapping([["one.md", "target"]], [".backup/source"]),
-	);
+		],
+		[[["one.md", ".backup/object"]], []],
+		[[["one.md", "target"]], [".backup/source"]],
+	];
+	for (const [targets, sources] of collisions) {
+		assert.throws(() => createTargetRawMapping(targets, sources));
+	}
 });
 
-function createTransition(): LocalEncryptionTransition {
-	return {
-		id: "device:rotate:1",
-		kind: "rotate",
-		phase: "prepared",
-		source: {
-			enabled: true,
-			salt: "old-salt",
-			password: "old-password",
-			revision: 1,
-			profileId: "hardened",
-		},
-		target: {
-			enabled: true,
-			salt: "new-salt",
-			password: "new-password",
-			revision: 2,
-			profileId: "hardened",
-		},
-		sourceRawPaths: ["old-file"],
-		targetRawByLogicalPath: {},
-		sourceFingerprints: { "old-file": "old-fingerprint" },
-		targetFingerprints: {},
-		sourceCanonicalRevision: 4,
-		backupProof: {
-			path: ".backup/transition.enc.zip",
-			sha256: "backup-sha",
-			epoch: "epoch-a",
-			canonicalRevision: 4,
-			localSnapshotDigest: "snapshot-sha",
-			createdAt: 1,
-		},
-	};
-}
+test("target read-back separates physical file stamps from strict cleanup proofs", async () => {
+	const codec = await codecFor(true);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		disk.install();
+		const client = new Client({ token: "synthetic", maxRetries: 0 });
+		client.setRemotePath("vault");
+		client.setEncryptionService(encrypted ? codec : null);
+		const content = bytes("preserved target");
+		await client.uploadFile("vault/note.md", content);
+		const physicalPath = await client.getPhysicalPath("vault/note.md");
+		const rawPath = physicalPath.slice("vault/".length);
+		const sha = createHash("sha256")
+			.update(Buffer.from(disk.files.get(physicalPath)!))
+			.digest("hex");
+		const resource = disk.resource.bind(disk);
+		const modified = "2026-01-01T00:00:00Z";
+		for (const variant of [
+			{
+				metadata: { sha256: sha },
+				physical: sha,
+				strict: `sha256:${sha}`,
+			},
+			{
+				metadata: { sha256: undefined, md5: "server-md5" },
+				physical: "server-md5",
+				strict: "md5:server-md5",
+			},
+			{
+				metadata: { sha256: undefined, resource_id: "server-id" },
+				physical: "server-id",
+				strict: `modified:${modified}:size:${disk.files.get(physicalPath)!.byteLength}`,
+			},
+			{
+				metadata: { sha256: undefined, resource_id: undefined },
+				physical: modified,
+				strict: `modified:${modified}:size:${disk.files.get(physicalPath)!.byteLength}`,
+			},
+		]) {
+			disk.resource = async (path) => {
+				const result = await resource(path);
+				return result && path === physicalPath
+					? { ...result, ...variant.metadata }
+					: result;
+			};
+			const transition = localTransition();
+			transition.target.enabled = encrypted;
+			transition.targetRawByLogicalPath = { "note.md": rawPath };
+			let persisted: Record<string, string> = {};
+			const proof = await verifyTransitionTargetObject(
+				{
+					client,
+					remotePath: "vault",
+					persist: async () => {
+						persisted = structuredClone(
+							transition.targetFingerprints,
+						);
+					},
+				},
+				transition,
+				"note.md",
+				createHash("sha256").update(Buffer.from(content)).digest("hex"),
+				encrypted ? codec : null,
+				false,
+			);
+			assert.equal(proof?.remoteFingerprint, variant.physical);
+			assert.equal(proof?.remoteMtime, Date.parse(modified));
+			assert.equal(persisted[rawPath], variant.strict);
+		}
+	}
+});
+
+test("target read-back cannot return a stamp without matching bytes and durable proof", async () => {
+	const disk = new MemoryDisk();
+	disk.install();
+	const client = new Client({ token: "synthetic", maxRetries: 0 });
+	client.setRemotePath("vault");
+	const content = bytes("preserved target");
+	await client.uploadFile("vault/note.md", content);
+	const sha = createHash("sha256").update(Buffer.from(content)).digest("hex");
+	for (const failure of [
+		"content",
+		"path",
+		"mode",
+		"persist",
+		"missing",
+	] as const) {
+		const transition = localTransition();
+		transition.target.enabled = failure === "mode";
+		transition.targetRawByLogicalPath = {
+			"note.md": failure === "path" ? "other.md" : "note.md",
+		};
+		transition.targetFingerprints = { "note.md": "old-proof" };
+		if (failure === "path") {
+			await client.uploadFile("vault/other.md", content);
+		}
+		if (failure === "missing") {
+			disk.files.delete("vault/note.md");
+		}
+		let persisted: Record<string, string> | undefined;
+		const io = {
+			client,
+			remotePath: "vault",
+			persist: async () => {
+				if (failure === "persist") {
+					throw new Error("synthetic persistence failure");
+				}
+				persisted = structuredClone(transition.targetFingerprints);
+			},
+		};
+		if (failure === "missing") {
+			assert.equal(
+				await verifyTransitionTargetObject(
+					io,
+					transition,
+					"note.md",
+					sha,
+					null,
+					true,
+				),
+				null,
+			);
+			assert.equal(persisted, undefined);
+			assert.deepEqual(transition.targetFingerprints, {
+				"note.md": "old-proof",
+			});
+			await assert.rejects(
+				verifyTransitionTargetObject(
+					io,
+					transition,
+					"note.md",
+					sha,
+					null,
+					false,
+				),
+				/disappeared/,
+			);
+		} else {
+			await assert.rejects(
+				verifyTransitionTargetObject(
+					io,
+					transition,
+					"note.md",
+					failure === "content" ? "wrong" : sha,
+					null,
+					false,
+				),
+			);
+			assert.equal(persisted, undefined);
+		}
+	}
+});
 
 test("target manifest is published after claim and before target writes", async () => {
 	const calls: string[] = [];
@@ -183,18 +338,10 @@ test("target manifest is published after claim and before target writes", async 
 	} as unknown as IndexManager;
 	const syncEngine = {
 		showMaintenanceCleanupPhase: () => undefined,
-		reencodeRemoteFiles: async (options: {
-			beforeIndexCommit(): Promise<void>;
-		}) => {
+		reencodeRemoteFiles: async (options: RewriteOptions) => {
 			calls.push("copy-target");
-			await options.beforeIndexCommit();
-			return {
-				success: true,
-				uploaded: 1,
-				downloaded: 0,
-				deleted: 0,
-				errors: [],
-			};
+			await options.beforeIndexCommit!();
+			return rewriteSuccess;
 		},
 	} as unknown as SyncEngine;
 	const lifecycle = createLifecycle({
@@ -209,13 +356,9 @@ test("target manifest is published after claim and before target writes", async 
 			calls.push("resolve-target");
 		},
 	});
-	const controller = new EncryptionTransitionController(
-		indexManager,
-		syncEngine,
-		lifecycle,
-	);
+	const controller = createController(lifecycle, syncEngine, indexManager);
 	await controller.execute({
-		transition: createTransition(),
+		transition: localTransition(),
 		sourceService: null,
 		beforeApplyTarget: async () => {
 			calls.push("publish-target-manifest");
@@ -232,30 +375,11 @@ test("target manifest is published after claim and before target writes", async 
 });
 
 test("cleanup proof is committed atomically with target canonical state", async () => {
-	const transition = createTransition();
+	const transition = localTransition();
 	let stagedCleanup: Array<{
 		path: string;
 		expectedFingerprint: string;
 	}> = [];
-	const indexManager = {
-		setIndexTransitionServices: () => undefined,
-		clearIndexTransitionServices: () => undefined,
-	} as unknown as IndexManager;
-	const syncEngine = {
-		showMaintenanceCleanupPhase: () => undefined,
-		reencodeRemoteFiles: async (options: {
-			beforeIndexCommit(): Promise<void>;
-		}) => {
-			await options.beforeIndexCommit();
-			return {
-				success: true,
-				uploaded: 1,
-				downloaded: 0,
-				deleted: 0,
-				errors: [],
-			};
-		},
-	} as unknown as SyncEngine;
 	const lifecycle = createLifecycle({
 		stageMaintenance: async (
 			_unusedTransition: LocalEncryptionTransition,
@@ -267,31 +391,24 @@ test("cleanup proof is committed atomically with target canonical state", async 
 			}
 		},
 	});
-	await new EncryptionTransitionController(
-		indexManager,
-		syncEngine,
-		lifecycle,
-	).execute({ transition, sourceService: null });
+	await createController(lifecycle).execute({
+		transition,
+		sourceService: null,
+	});
 	assert.deepEqual(stagedCleanup, [
 		{ path: "old-file", expectedFingerprint: "old-fingerprint" },
 	]);
 });
 
 test("missing source fingerprint blocks transition before canonical commit", async () => {
-	const transition = createTransition();
+	const transition = localTransition();
 	transition.sourceRawPaths = ["constructor"];
 	transition.sourceFingerprints = {};
 	let canonicalCommitted = false;
-	const indexManager = {
-		setIndexTransitionServices: () => undefined,
-		clearIndexTransitionServices: () => undefined,
-	} as unknown as IndexManager;
 	const syncEngine = {
 		showMaintenanceCleanupPhase: () => undefined,
-		reencodeRemoteFiles: async (options: {
-			beforeIndexCommit(): Promise<void>;
-		}) => {
-			await options.beforeIndexCommit();
+		reencodeRemoteFiles: async (options: RewriteOptions) => {
+			await options.beforeIndexCommit!();
 			canonicalCommitted = true;
 			throw new Error("unexpected commit");
 		},
@@ -299,11 +416,10 @@ test("missing source fingerprint blocks transition before canonical commit", asy
 	const lifecycle = createLifecycle();
 
 	await assert.rejects(
-		new EncryptionTransitionController(
-			indexManager,
-			syncEngine,
-			lifecycle,
-		).execute({ transition, sourceService: null }),
+		createController(lifecycle, syncEngine).execute({
+			transition,
+			sourceService: null,
+		}),
 		/Missing cleanup fingerprint/,
 	);
 	assert.equal(canonicalCommitted, false);
@@ -311,33 +427,17 @@ test("missing source fingerprint blocks transition before canonical commit", asy
 
 test("each rewritten target is proven before the canonical commit", async () => {
 	const calls: string[] = [];
-	const transition = createTransition();
+	const transition = localTransition();
 	transition.targetRawByLogicalPath = { "note.md": "new-file" };
-	const indexManager = {
-		setIndexTransitionServices: () => undefined,
-		clearIndexTransitionServices: () => undefined,
-	} as unknown as IndexManager;
 	const syncEngine = {
 		showMaintenanceCleanupPhase: () => undefined,
-		reencodeRemoteFiles: async (options: {
-			verifyPhysicalRewriteUpload(
-				path: string,
-				sha256: string,
-			): Promise<{ remoteFingerprint: string }>;
-			beforeIndexCommit(): Promise<void>;
-		}) => {
+		reencodeRemoteFiles: async (options: RewriteOptions) => {
 			calls.push("upload");
-			await options.verifyPhysicalRewriteUpload("note.md", "plain-sha");
+			await options.verifyPhysicalRewriteUpload!("note.md", "plain-sha");
 			calls.push("proof-returned");
-			await options.beforeIndexCommit();
+			await options.beforeIndexCommit!();
 			calls.push("canonical-commit");
-			return {
-				success: true,
-				uploaded: 1,
-				downloaded: 0,
-				deleted: 0,
-				errors: [],
-			};
+			return rewriteSuccess;
 		},
 	} as unknown as SyncEngine;
 	const lifecycle = createLifecycle({
@@ -352,11 +452,10 @@ test("each rewritten target is proven before the canonical commit", async () => 
 			return { remoteFingerprint: "sha256:target" };
 		},
 	});
-	await new EncryptionTransitionController(
-		indexManager,
-		syncEngine,
-		lifecycle,
-	).execute({ transition, sourceService: null });
+	await createController(lifecycle, syncEngine).execute({
+		transition,
+		sourceService: null,
+	});
 	assert.ok(
 		calls.indexOf("stable-readback-proof") <
 			calls.indexOf("canonical-commit"),
@@ -385,18 +484,10 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 		} as unknown as IndexManager;
 		const syncEngine = {
 			showMaintenanceCleanupPhase: () => undefined,
-			reencodeRemoteFiles: async (options: {
-				beforeIndexCommit(): Promise<void>;
-			}) => {
+			reencodeRemoteFiles: async (options: RewriteOptions) => {
 				failAt("copy-target");
-				await options.beforeIndexCommit();
-				return {
-					success: true,
-					uploaded: 1,
-					downloaded: 0,
-					deleted: 0,
-					errors: [],
-				};
+				await options.beforeIndexCommit!();
+				return rewriteSuccess;
 			},
 		} as unknown as SyncEngine;
 		const lifecycle = createLifecycle({
@@ -411,14 +502,14 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 				calls.push("recover");
 			},
 		});
-		const controller = new EncryptionTransitionController(
-			indexManager,
-			syncEngine,
+		const controller = createController(
 			lifecycle,
+			syncEngine,
+			indexManager,
 		);
 		await assert.rejects(
 			controller.execute({
-				transition: createTransition(),
+				transition: localTransition(),
 				sourceService: null,
 				beforeApplyTarget: async () => failAt("manifest"),
 				publishIndexCommitted: async () => failAt("after-commit"),
@@ -443,26 +534,10 @@ test("transition fault matrix always invokes deterministic recovery", async () =
 test("all rewrite modes use the same post-commit cleanup", async () => {
 	for (const kind of ["enable", "disable", "rotate"] as const) {
 		const calls: string[] = [];
-		const transition = createTransition();
+		const transition = localTransition();
 		transition.kind = kind;
-		const indexManager = {
-			setIndexTransitionServices: () => undefined,
-			clearIndexTransitionServices: () => undefined,
-		} as unknown as IndexManager;
 		const syncEngine = {
 			showMaintenanceCleanupPhase: () => calls.push("cleanup-phase"),
-			reencodeRemoteFiles: async (options: {
-				beforeIndexCommit(): Promise<void>;
-			}) => {
-				await options.beforeIndexCommit();
-				return {
-					success: true,
-					uploaded: 1,
-					downloaded: 0,
-					deleted: 0,
-					errors: [],
-				};
-			},
 		} as unknown as SyncEngine;
 		const lifecycle = createLifecycle({
 			commitMaintenance: async () => {
@@ -492,11 +567,7 @@ test("all rewrite modes use the same post-commit cleanup", async () => {
 			},
 			clearBlock: () => calls.push("clear-block"),
 		});
-		const controller = new EncryptionTransitionController(
-			indexManager,
-			syncEngine,
-			lifecycle,
-		);
+		const controller = createController(lifecycle, syncEngine);
 
 		await controller.execute({ transition, sourceService: null });
 		assert.deepEqual(calls, [
@@ -516,10 +587,6 @@ test("all rewrite modes use the same post-commit cleanup", async () => {
 test("incomplete cleanup keeps the transition blocked and local state durable", async () => {
 	let clearedLocal = false;
 	let clearedBlock = false;
-	const indexManager = {} as IndexManager;
-	const syncEngine = {
-		showMaintenanceCleanupPhase: () => undefined,
-	} as unknown as SyncEngine;
 	const lifecycle = createLifecycle({
 		finishMaintenance: async () => false,
 		clearLocalTransition: async () => {
@@ -531,11 +598,7 @@ test("incomplete cleanup keeps the transition blocked and local state durable", 
 	});
 
 	await assert.rejects(
-		new EncryptionTransitionController(
-			indexManager,
-			syncEngine,
-			lifecycle,
-		).completeTarget(createTransition()),
+		createController(lifecycle).completeTarget(localTransition()),
 		/cleanup is incomplete/,
 	);
 	assert.equal(clearedLocal, false);
@@ -544,33 +607,15 @@ test("incomplete cleanup keeps the transition blocked and local state durable", 
 
 test("foreign encrypted target recovery requires one matching committed authority", () => {
 	for (const kind of ["enable", "rotate"] as const) {
-		const source =
-			kind === "enable"
-				? { enabled: false, revision: null, salt: null, verifier: null }
-				: {
-						enabled: true,
-						revision: 1,
-						salt: "source-salt",
-						verifier: "source-verifier",
-					};
-		const target = {
-			enabled: true,
-			revision: 2,
-			salt: "target-salt",
-			verifier: "target-verifier",
-		};
-		const maintenance: IndexMaintenance = {
+		const source = kind === "enable" ? plaintextMode() : encryptedMode();
+		const target = encryptedMode(2, "target-salt", "target-verifier");
+		const maintenance: IndexMaintenance = createMaintenance({
 			id: `${kind}-transition`,
 			kind,
-			phase: "index-committed",
-			initiatedBy: "device-a",
-			sourceRevision: 4,
-			targetRevision: 5,
 			source,
 			target,
-			cleanup: [],
-		};
-		const manifest = createTransitionManifest(
+		});
+		const manifest = transitionManifest(
 			kind === "enable" ? "enabling" : "rotating",
 			maintenance,
 		);
@@ -619,25 +664,16 @@ test("foreign encrypted target recovery requires one matching committed authorit
 });
 
 test("foreign disable recovery verifies source but adopts plaintext target", () => {
-	const maintenance: IndexMaintenance = {
+	const maintenance: IndexMaintenance = createMaintenance({
 		id: "disable-transition",
 		kind: "disable",
 		phase: "cleanup",
-		initiatedBy: "device-a",
-		sourceRevision: 4,
-		targetRevision: 5,
-		source: {
-			enabled: true,
-			revision: 2,
-			salt: "source-salt",
-			verifier: "source-verifier",
-		},
-		target: { enabled: false, revision: null, salt: null, verifier: null },
-		cleanup: [],
-	};
+		source: encryptedMode(2, "source-salt", "source-verifier"),
+		target: plaintextMode(),
+	});
 	assert.equal(
 		createRemoteTargetRecoveryPlan(
-			createTransitionManifest("disabling", maintenance),
+			transitionManifest("disabling", maintenance),
 			maintenance,
 		).passwordMode,
 		"source",
@@ -656,56 +692,36 @@ test("foreign disable recovery verifies source but adopts plaintext target", () 
 });
 
 test("local recovery requires matching manifest canonical and transition authority", async () => {
-	const controller = new EncryptionTransitionController(
-		{} as IndexManager,
-		{} as SyncEngine,
-		{} as never,
-	);
-	const transition = createTransition();
-	const maintenance: IndexMaintenance = {
+	const controller = createController();
+	const transition = localTransition();
+	const maintenance: IndexMaintenance = createMaintenance({
 		id: transition.id,
-		kind: "rotate",
 		phase: "prepared",
-		initiatedBy: "device-a",
 		sourceRevision: transition.sourceCanonicalRevision,
 		targetRevision: null,
-		source: {
-			enabled: true,
-			revision: 1,
-			salt: "old-salt",
-			verifier: "source-verifier",
-		},
-		target: {
-			enabled: true,
-			revision: 2,
-			salt: "new-salt",
-			verifier: "target-verifier",
-		},
-		cleanup: [],
-	};
-	const manifest = createTransitionManifest("rotating", maintenance);
+		source: encryptedMode(1, "old-salt", "source-verifier"),
+		target: encryptedMode(2, "new-salt", "target-verifier"),
+	});
+	const manifest = transitionManifest("rotating", maintenance);
 	const sourceService = {
 		verifyVerifier: async (verifier: string) =>
 			verifier === "source-verifier",
 	} as never;
+	const recovery = {
+		transition,
+		manifest,
+		maintenance,
+		deviceId: "device-a",
+		authority: "source" as const,
+		authoritativeService: sourceService,
+	};
 	await assert.doesNotReject(
-		controller.assertLocalRecoveryCoherence({
-			transition,
-			manifest,
-			maintenance,
-			deviceId: "device-a",
-			authority: "source",
-			authoritativeService: sourceService,
-		}),
+		controller.assertLocalRecoveryCoherence(recovery),
 	);
 	await assert.rejects(
 		controller.assertLocalRecoveryCoherence({
-			transition,
-			manifest,
+			...recovery,
 			maintenance: { ...maintenance, id: "different-transition" },
-			deviceId: "device-a",
-			authority: "source",
-			authoritativeService: sourceService,
 		}),
 		/does not match canonical maintenance/,
 	);
@@ -720,20 +736,15 @@ test("local recovery requires matching manifest canonical and transition authori
 	};
 	await assert.doesNotReject(
 		controller.assertLocalRecoveryCoherence({
-			transition,
+			...recovery,
 			manifest: aheadManifest,
-			maintenance,
-			deviceId: "device-a",
-			authority: "source",
-			authoritativeService: sourceService,
 		}),
 	);
 	await assert.rejects(
 		controller.assertLocalRecoveryCoherence({
-			transition,
+			...recovery,
 			manifest: null,
 			maintenance: undefined,
-			deviceId: "device-a",
 			authority: "target",
 			authoritativeService: null,
 		}),
@@ -741,11 +752,8 @@ test("local recovery requires matching manifest canonical and transition authori
 	);
 	await assert.rejects(
 		controller.assertLocalRecoveryCoherence({
+			...recovery,
 			transition: { ...transition, phase: "prepared" },
-			manifest,
-			maintenance,
-			deviceId: "device-a",
-			authority: "source",
 			authoritativeService: {
 				verifyVerifier: async () => false,
 			} as never,
@@ -755,35 +763,14 @@ test("local recovery requires matching manifest canonical and transition authori
 });
 
 test("stable manifest coherence accepts a fresh authenticated verifier IV", async () => {
-	const controller = new EncryptionTransitionController(
-		{} as IndexManager,
-		{} as SyncEngine,
-		{} as never,
-	);
-	const target = {
-		enabled: true,
-		revision: 2,
-		salt: "target-salt",
-		verifier: "maintenance-verifier",
-	};
-	const maintenance: IndexMaintenance = {
+	const controller = createController();
+	const target = encryptedMode(2, "target-salt", "maintenance-verifier");
+	const maintenance: IndexMaintenance = createMaintenance({
 		id: "rotate-transition",
-		kind: "rotate",
-		phase: "index-committed",
-		initiatedBy: "device-a",
-		sourceRevision: 4,
-		targetRevision: 5,
-		source: {
-			enabled: true,
-			revision: 1,
-			salt: "source-salt",
-			verifier: "source-verifier",
-		},
 		target,
-		cleanup: [],
-	};
+	});
 	const stableManifest: RemoteEncryptionManifest = {
-		...createTransitionManifest("rotating", maintenance),
+		...transitionManifest("rotating", maintenance),
 		state: "enabled",
 		verifier: "fresh-randomized-verifier",
 		transition: undefined,
@@ -814,44 +801,6 @@ test("stable manifest coherence accepts a fresh authenticated verifier IV", asyn
 	);
 });
 
-function createTransitionManifest(
-	state: "enabling" | "rotating" | "disabling",
-	maintenance: IndexMaintenance,
-): RemoteEncryptionManifest {
-	const manifestMode =
-		state === "disabling" ? maintenance.source : maintenance.target;
-	return {
-		format: "encryption-manifest",
-		profileId: "hardened",
-		state,
-		revision: manifestMode.revision!,
-		salt: manifestMode.salt!,
-		verifier: manifestMode.verifier!,
-		kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600_000 },
-		keySchedule: { name: "HKDF", hash: "SHA-256" },
-		cipher: { name: "AES-GCM", keyLength: 256, ivLength: 12 },
-		filenameCipher: {
-			name: "AES-SIV",
-			keyLength: 512,
-			encoding: "base64url",
-			aad: "obsidian-yandex-disk-sync:filename",
-		},
-		updatedAt: 1,
-		updatedBy: "device-a",
-		transition: {
-			id: maintenance.id,
-			phase: maintenance.phase,
-			sourceRevision: maintenance.source.revision,
-			targetRevision: maintenance.target.revision,
-			initiatedBy: maintenance.initiatedBy,
-			source: maintenance.source,
-			target: maintenance.target,
-			sourceProfileId: maintenance.source.enabled ? "hardened" : null,
-			targetProfileId: maintenance.target.enabled ? "hardened" : null,
-		},
-	};
-}
-
 test("cleanup rechecks canonical ownership and retains ambiguous deletion for recovery", async () => {
 	for (const mode of [
 		"revoked",
@@ -867,27 +816,21 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 		);
 		const index = manager.getRemoteIndex();
 		index.epoch = "E1";
-		index.maintenance = {
-			id: "enable-A",
-			kind: "enable",
-			phase: "cleanup",
-			initiatedBy: "A",
-			sourceRevision: 1,
-			targetRevision: 2,
-			source: {
-				enabled: false,
-				revision: null,
-				salt: null,
-				verifier: null,
-			},
-			target: {
-				enabled: true,
-				revision: 1,
-				salt: "salt",
-				verifier: "verifier",
-			},
-			cleanup: [{ path: "note.md", expectedFingerprint: "unchanged" }],
-		};
+		index.maintenance = createMaintenance(
+			createMaintenance({
+				id: "enable-A",
+				kind: "enable",
+				phase: "cleanup",
+				initiatedBy: "A",
+				sourceRevision: 1,
+				targetRevision: 2,
+				source: plaintextMode(),
+				target: encryptedMode(1, "salt", "verifier"),
+				cleanup: [
+					{ path: "note.md", expectedFingerprint: "unchanged" },
+				],
+			}),
+		);
 		let canonical = structuredClone(index);
 		manager.readCanonicalIndex = async () => structuredClone(canonical);
 		let present = true;
@@ -898,13 +841,9 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 			getResource: async () => {
 				if (mode === "revoked") {
 					canonical = createEmptyIndex("B", "E1");
-					canonical.files["note.md"] = {
-						path: "note.md",
+					canonical.files["note.md"] = fileMetadata("note.md", {
 						sha256: "unchanged",
-						size: 1,
-						mtime: 1,
-						syncedAt: 1,
-					};
+					});
 				}
 				return present
 					? { sha256: mode === "changed" ? "new bytes" : "unchanged" }

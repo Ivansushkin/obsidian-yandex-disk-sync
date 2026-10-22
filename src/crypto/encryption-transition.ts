@@ -1,24 +1,34 @@
-import { logger } from "../utils/logger";
+import type { PhysicalRewriteUploadProof, SyncEngine } from "../sync/engine";
 import { createSyncFailure } from "../sync/errors";
-import type { YandexDiskClient } from "../api/yandex-client";
-import { matchesPhysicalResourceFingerprint } from "../utils/resource-fingerprint";
-import {
-	getAncestorDirectoriesDeepestFirst,
-	joinPath,
-} from "../utils/path-utils";
-import type { EncryptionCodec, EncryptionProfileId } from "./encryption";
-import type { IndexManager } from "../sync/canonical/manager";
-import type { SyncEngine } from "../sync/engine";
 import type {
-	EncryptionTransitionPhase,
 	EncryptionModeDescriptor,
+	EncryptionTransitionPhase,
 	IndexMaintenance,
 	PendingPhysicalAction,
 	RemoteEncryptionManifest,
+	SyncIndex,
 } from "../types";
-import type { PhysicalRewriteUploadProof } from "../sync/engine";
-import { isProtectedPath, normalizePath } from "../utils/path-utils";
+import { computeSha256 } from "../utils/hash-utils";
+import { logger } from "../utils/logger";
+import {
+	getAncestorDirectories,
+	getAncestorDirectoriesDeepestFirst,
+	isProtectedPath,
+	joinPath,
+	normalizePath,
+} from "../utils/path-utils";
 import { protectRecord } from "../utils/record-utils";
+import {
+	getPhysicalResourceFingerprint,
+	matchesPhysicalResourceFingerprint,
+	matchesStableContentFingerprint,
+} from "../utils/resource-fingerprint";
+import type {
+	EncryptionClient,
+	EncryptionEngine,
+	EncryptionIndex,
+} from "./context";
+import type { EncryptionCodec, EncryptionProfileId } from "./encryption";
 
 export interface LocalEncryptionSnapshot {
 	enabled: boolean;
@@ -49,6 +59,82 @@ export interface LocalEncryptionTransition {
 	targetFingerprints: Record<string, string>;
 	sourceCanonicalRevision: number;
 	backupProof: EncryptionBackupProof | null;
+}
+
+/** Verify target bytes and persist the strict proof before returning a file stamp. */
+export async function verifyTransitionTargetObject(
+	io: {
+		client: EncryptionClient;
+		remotePath: string;
+		persist(): Promise<void>;
+	},
+	transition: LocalEncryptionTransition,
+	logicalPath: string,
+	expectedSha256: string,
+	targetService: EncryptionCodec | null,
+	allowMissing: boolean,
+): Promise<PhysicalRewriteUploadProof | null> {
+	const rawPath = transition.targetRawByLogicalPath[logicalPath];
+	if (!rawPath) {
+		throw new Error(
+			`Transition target mapping is missing for ${logicalPath}`,
+		);
+	}
+	if (transition.target.enabled !== Boolean(targetService)) {
+		throw new Error("Transition target codec does not match its mode");
+	}
+	const snapshot = await io.client.downloadStableRawFile(
+		joinPath(io.remotePath, rawPath),
+	);
+	if (!snapshot) {
+		if (allowMissing) {
+			return null;
+		}
+		throw new Error(`Transition target disappeared for ${logicalPath}`);
+	}
+	const pinnedFingerprint = transition.targetFingerprints[rawPath];
+	if (
+		allowMissing &&
+		pinnedFingerprint &&
+		pinnedFingerprint !== snapshot.fingerprint
+	) {
+		throw new Error(
+			"Transition target fingerprint changed before rollback",
+		);
+	}
+	const decodedPath = await io.client.decodePhysicalUserPath(
+		rawPath,
+		targetService,
+	);
+	if (decodedPath !== logicalPath) {
+		throw new Error(
+			`Transition target decodes to a different logical path`,
+		);
+	}
+	const plaintext = targetService
+		? await targetService.decrypt(snapshot.raw)
+		: snapshot.raw;
+	if ((await computeSha256(plaintext)) !== expectedSha256) {
+		throw new Error(
+			`Transition target content does not match ${logicalPath}`,
+		);
+	}
+	const remoteFingerprint = getPhysicalResourceFingerprint(snapshot.resource);
+	if (!remoteFingerprint) {
+		throw new Error("Transition target has no physical fingerprint");
+	}
+	Object.defineProperty(transition.targetFingerprints, rawPath, {
+		value: snapshot.fingerprint,
+		writable: true,
+		enumerable: true,
+		configurable: true,
+	});
+	await io.persist();
+	const remoteMtime = new Date(snapshot.resource.modified).getTime();
+	return {
+		remoteFingerprint,
+		remoteMtime: Number.isFinite(remoteMtime) ? remoteMtime : undefined,
+	};
 }
 
 interface EncryptionTransitionLifecycle {
@@ -101,10 +187,15 @@ export interface EncryptionRewriteOptions {
 }
 
 interface EncryptionCleanupIO {
-	client: YandexDiskClient;
+	client: EncryptionClient;
 	getRemotePath(): string;
 	completeAction(path: string): void;
 	persist(): Promise<void>;
+}
+
+interface SourceRollbackAuthority {
+	targets: Readonly<Record<string, string>>;
+	validate(): Promise<SyncIndex>;
 }
 
 /**
@@ -113,8 +204,8 @@ interface EncryptionCleanupIO {
  */
 export class EncryptionTransitionController {
 	constructor(
-		private readonly indexManager: IndexManager,
-		private readonly syncEngine: SyncEngine,
+		private readonly indexManager: EncryptionIndex,
+		private readonly syncEngine: EncryptionEngine,
 		private readonly lifecycle: EncryptionTransitionLifecycle,
 		private readonly cleanupIO?: EncryptionCleanupIO,
 	) {}
@@ -213,10 +304,101 @@ export class EncryptionTransitionController {
 		this.lifecycle.clearBlock();
 	}
 
+	/** Roll back proven targets while the same source canonical still owns the transition. */
+	async rollbackSourceTargets(
+		transition: LocalEncryptionTransition,
+		options: {
+			deviceId: string;
+			service: EncryptionCodec | null;
+			getTransition(): LocalEncryptionTransition | null;
+		},
+	): Promise<void> {
+		const authority = this.indexManager.getMaintenance();
+		const epoch = this.indexManager.getRemoteIndex().epoch;
+		if (!authority || authority.kind === "force") {
+			throw new Error("Rollback cleanup has no canonical authority");
+		}
+		const mapping = { ...transition.targetRawByLogicalPath };
+		const targets = protectRecord(
+			Object.fromEntries(
+				Object.values(mapping)
+					.filter((path) =>
+						Boolean(transition.targetFingerprints[path]),
+					)
+					.map((path) => [
+						path,
+						transition.targetFingerprints[path]!,
+					]),
+			),
+		);
+		const assertLocal = () => {
+			if (
+				options.getTransition() !== transition ||
+				Object.keys(transition.targetRawByLogicalPath).length !==
+					Object.keys(mapping).length ||
+				Object.entries(mapping).some(
+					([logical, raw]) =>
+						transition.targetRawByLogicalPath[logical] !== raw ||
+						(targets[raw] &&
+							transition.targetFingerprints[raw] !==
+								targets[raw]),
+				)
+			) {
+				throw new Error("Local rollback authority changed");
+			}
+		};
+		const rollback: SourceRollbackAuthority = {
+			targets,
+			validate: async () => {
+				assertLocal();
+				const current =
+					await this.indexManager.assertMaintenanceAuthority(
+						epoch,
+						authority,
+					);
+				await this.assertLocalRecoveryCoherence({
+					transition,
+					manifest:
+						await this.indexManager.downloadEncryptionManifest(),
+					maintenance: current.maintenance,
+					deviceId: options.deviceId,
+					authority: "source",
+					authoritativeService: options.service,
+				});
+				const latest =
+					await this.indexManager.assertMaintenanceAuthority(
+						epoch,
+						authority,
+					);
+				assertLocal();
+				return latest;
+			},
+		};
+		const paths = Object.keys(targets);
+		await rollback.validate();
+		await this.lifecycle.prepareCleanup(paths, targets);
+		await rollback.validate();
+		await this.lifecycle.publishStable(transition.source);
+		await this.cleanupPaths(paths, targets, rollback);
+		await this.cleanupFolders(paths, rollback);
+		await rollback.validate();
+		if (!(await this.lifecycle.finishMaintenance(transition))) {
+			throw new Error("Encryption rollback cleanup is incomplete");
+		}
+	}
+
 	/** Every retry revalidates authority and content; absence alone completes an action. */
 	async cleanupRawPaths(
 		paths: string[],
 		fingerprints: Record<string, string>,
+	): Promise<void> {
+		await this.cleanupPaths(paths, fingerprints);
+	}
+
+	private async cleanupPaths(
+		paths: string[],
+		fingerprints: Record<string, string>,
+		rollback?: SourceRollbackAuthority,
 	): Promise<void> {
 		if (paths.length === 0) {
 			return;
@@ -231,18 +413,20 @@ export class EncryptionTransitionController {
 			const expected = fingerprints[path];
 			const remotePath = joinPath(io.getRemotePath(), path);
 			const validate = async (): Promise<void> => {
-				const current =
-					await this.indexManager.assertMaintenanceAuthority(
-						epoch,
-						authority,
-					);
+				const current = await this.validateCleanupAuthority(
+					epoch,
+					authority,
+					rollback,
+				);
 				if (
 					!expected ||
-					!current.maintenance?.cleanup.some(
-						(action) =>
-							action.path === path &&
-							action.expectedFingerprint === expected,
-					)
+					!(rollback
+						? rollback.targets[path] === expected
+						: current.maintenance?.cleanup.some(
+								(action) =>
+									action.path === path &&
+									action.expectedFingerprint === expected,
+							))
 				) {
 					throw new Error(
 						"Encryption cleanup action is no longer authorized",
@@ -257,14 +441,23 @@ export class EncryptionTransitionController {
 				);
 				if (
 					resource &&
-					!matchesPhysicalResourceFingerprint(expected, resource)
+					!(rollback
+						? matchesStableContentFingerprint(expected, resource)
+						: matchesPhysicalResourceFingerprint(
+								expected,
+								resource,
+							))
 				) {
 					throw new Error("Encryption cleanup target changed");
 				}
-				await this.indexManager.assertMaintenanceAuthority(
+				const latest = await this.validateCleanupAuthority(
 					epoch,
 					authority,
+					rollback,
 				);
+				if (rollback) {
+					await this.assertNotLiveRawTarget(remotePath, latest.files);
+				}
 			};
 			await validate();
 			let deletionError: unknown;
@@ -278,10 +471,7 @@ export class EncryptionTransitionController {
 			} catch (error) {
 				deletionError = error;
 			}
-			await this.indexManager.assertMaintenanceAuthority(
-				epoch,
-				authority,
-			);
+			await this.validateCleanupAuthority(epoch, authority, rollback);
 			if (await io.client.getResource(remotePath, 1, 0, true)) {
 				throw deletionError instanceof Error
 					? deletionError
@@ -294,6 +484,13 @@ export class EncryptionTransitionController {
 
 	/** Empty folders still require the same live canonical cleanup ownership. */
 	async cleanupRawFolders(paths: string[]): Promise<void> {
+		await this.cleanupFolders(paths);
+	}
+
+	private async cleanupFolders(
+		paths: string[],
+		rollback?: SourceRollbackAuthority,
+	): Promise<void> {
 		const folders = getAncestorDirectoriesDeepestFirst(paths);
 		if (folders.length === 0) {
 			return;
@@ -310,15 +507,19 @@ export class EncryptionTransitionController {
 			}
 			const remotePath = joinPath(io.getRemotePath(), folder);
 			const validate = async (): Promise<void> => {
-				const current =
-					await this.indexManager.assertMaintenanceAuthority(
-						epoch,
-						authority,
-					);
+				const current = await this.validateCleanupAuthority(
+					epoch,
+					authority,
+					rollback,
+				);
 				if (
-					!current.maintenance?.cleanup.some((action) =>
-						action.path.startsWith(`${folder}/`),
-					)
+					!(rollback
+						? Object.keys(rollback.targets).some((path) =>
+								path.startsWith(`${folder}/`),
+							)
+						: current.maintenance?.cleanup.some((action) =>
+								action.path.startsWith(`${folder}/`),
+							))
 				) {
 					throw new Error(
 						"Encryption folder cleanup is no longer authorized",
@@ -332,21 +533,40 @@ export class EncryptionTransitionController {
 				if (!(await io.client.isRawFolderEmpty(remotePath))) {
 					throw new Error("Cleanup folder is not empty");
 				}
-				await this.indexManager.assertMaintenanceAuthority(
+				const latest = await this.validateCleanupAuthority(
 					epoch,
 					authority,
+					rollback,
 				);
+				if (rollback) {
+					await this.assertNotLiveRawTarget(
+						remotePath,
+						latest.files,
+						true,
+					);
+				}
 			};
 			await validate();
 			await io.client.deleteResource(remotePath, false, true, validate);
-			await this.indexManager.assertMaintenanceAuthority(
-				epoch,
-				authority,
-			);
+			await this.validateCleanupAuthority(epoch, authority, rollback);
 			if (await io.client.getResource(remotePath, 1, 0, true)) {
 				throw new Error("Folder cleanup is incomplete");
 			}
 		}
+	}
+
+	/** Keep source rollback proof separate from the committed canonical cleanup list. */
+	private async validateCleanupAuthority(
+		epoch: string,
+		maintenance: IndexMaintenance,
+		rollback?: SourceRollbackAuthority,
+	): Promise<SyncIndex> {
+		return rollback
+			? await rollback.validate()
+			: await this.indexManager.assertMaintenanceAuthority(
+					epoch,
+					maintenance,
+				);
 	}
 
 	private async assertNotLiveRawTarget(
@@ -714,7 +934,7 @@ export function createTargetRawMapping(
 		assertSafeTransitionPath(sourcePath, "physical source");
 		source.add(sourcePath);
 	}
-	const sourceAncestors = collectPathAncestors(source);
+	const sourceAncestors = getAncestorDirectories(source);
 	const logicalByRaw = new Map<string, string>();
 	const targetPaths = new Set<string>();
 	const targetAncestors = new Set<string>();
@@ -748,25 +968,12 @@ export function createTargetRawMapping(
 		}
 		logicalByRaw.set(rawPath, logicalPath);
 		targetPaths.add(rawPath);
-		for (const ancestor of collectPathAncestors([rawPath])) {
+		for (const ancestor of getAncestorDirectories([rawPath])) {
 			targetAncestors.add(ancestor);
 		}
 		rawByLogical.set(logicalPath, rawPath);
 	}
 	return protectRecord(Object.fromEntries(rawByLogical));
-}
-
-function collectPathAncestors(paths: Iterable<string>): Set<string> {
-	const result = new Set<string>();
-	for (const path of paths) {
-		const segments = path.split("/");
-		let ancestor = segments[0] ?? "";
-		for (let index = 1; index < segments.length; index++) {
-			result.add(ancestor);
-			ancestor = `${ancestor}/${segments[index]}`;
-		}
-	}
-	return result;
 }
 
 function hasPathAncestor(

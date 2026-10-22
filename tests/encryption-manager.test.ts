@@ -1,3 +1,10 @@
+import {
+	encryptedMode,
+	plaintextMode,
+	localSnapshot,
+	localTransition,
+	maintenance as createMaintenance,
+} from "./helpers/crypto-fixtures";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { EncryptionManager } from "../src/crypto/encryption-manager";
@@ -9,63 +16,40 @@ const salt = EncryptionService.bytesToBase64(new Uint8Array(16).fill(7));
 
 test("candidate encryption credentials persist only after authentication and coherence", async () => {
 	const calls: string[] = [];
-	const accepted = await manager.acceptCandidate({
+	const candidate = {
 		service: { verifyVerifier: async () => true } as never,
 		verifier: "verifier",
 		validateAuthority: async () => {
 			calls.push("authority");
 			return "canonical";
 		},
-		persist: async (authority) => {
+		persist: async (authority: string) => {
 			calls.push(`persist:${authority}`);
 		},
-	});
-	assert.equal(accepted, "canonical");
+	};
+	assert.equal(await manager.acceptCandidate(candidate), "canonical");
 	assert.deepEqual(calls, ["authority", "persist:canonical"]);
-
 	calls.length = 0;
-	assert.equal(
-		await manager.acceptCandidate({
-			service: { verifyVerifier: async () => false } as never,
-			verifier: "verifier",
-			validateAuthority: async () => {
-				calls.push("authority");
-				return "canonical";
-			},
-			persist: async () => {
-				calls.push("persist");
-			},
-		}),
+	for (const service of [
 		null,
-	);
-	assert.equal(calls.length, 0);
-
+		{ verifyVerifier: async () => false } as never,
+	]) {
+		assert.equal(
+			await manager.acceptCandidate({ ...candidate, service }),
+			null,
+		);
+		assert.deepEqual(calls, []);
+	}
 	await assert.rejects(
 		manager.acceptCandidate({
-			service: { verifyVerifier: async () => true } as never,
-			verifier: "verifier",
+			...candidate,
 			validateAuthority: async () => {
 				throw new Error("incoherent authority");
-			},
-			persist: async () => {
-				calls.push("persist");
 			},
 		}),
 		/incoherent authority/,
 	);
-	assert.equal(calls.length, 0);
-	assert.equal(
-		await manager.acceptCandidate({
-			service: null,
-			verifier: "verifier",
-			validateAuthority: async () => "canonical",
-			persist: async () => {
-				calls.push("persist");
-			},
-		}),
-		null,
-	);
-	assert.equal(calls.length, 0);
+	assert.deepEqual(calls, []);
 });
 
 test("encryption manager requires explicit current profile metadata", () => {
@@ -85,67 +69,37 @@ test("encryption manager requires explicit current profile metadata", () => {
 test("encryption manager emits strict semantic hardened manifest descriptors", async () => {
 	const codec = await manager.createCodec("hardened", salt, "password");
 	const targetVerifier = await codec.createVerifier();
-	const source = {
-		enabled: true,
-		revision: 4,
-		salt: EncryptionService.bytesToBase64(new Uint8Array(16).fill(6)),
-		verifier: "source-verifier",
-	};
-	const target = {
-		enabled: true,
-		revision: 5,
-		salt,
-		verifier: targetVerifier,
-	};
+	const source = encryptedMode(
+		4,
+		EncryptionService.bytesToBase64(new Uint8Array(16).fill(6)),
+		"source-verifier",
+	);
+	const target = encryptedMode(5, salt, targetVerifier);
 	const manifest = await manager.createManifest({
 		service: codec,
 		salt,
 		state: "rotating",
 		revision: 5,
 		deviceId: "device-a",
-		transition: {
+		transition: localTransition({
 			id: "transition-a",
-			kind: "rotate",
-			phase: "prepared",
-			source: {
-				enabled: true,
-				salt: source.salt,
-				password: "source-password",
-				revision: 4,
-				profileId: "hardened",
-			},
-			target: {
-				enabled: true,
-				salt,
-				password: "password",
-				revision: 5,
-				profileId: "hardened",
-			},
+			source: localSnapshot(source.salt, "source-password", 4),
+			target: localSnapshot(salt, "password", 5),
 			sourceRawPaths: [],
-			targetRawByLogicalPath: {},
 			sourceFingerprints: {},
-			targetFingerprints: {},
 			sourceCanonicalRevision: 11,
 			backupProof: {
-				path: ".backup/transition.enc.zip",
-				sha256: "backup-sha",
-				epoch: "epoch-a",
+				...localTransition().backupProof!,
 				canonicalRevision: 11,
-				localSnapshotDigest: "snapshot-sha",
-				createdAt: 1,
 			},
-		},
-		maintenance: {
-			id: "transition-a",
-			kind: "rotate",
+		}),
+		maintenance: createMaintenance({
 			phase: "prepared",
-			initiatedBy: "device-a",
 			sourceRevision: 11,
 			targetRevision: null,
 			source,
 			target,
-			cleanup: [],
-		},
+		}),
 	});
 	assert.equal(manifest.format, "encryption-manifest");
 	assert.equal("version" in manifest, false);
@@ -169,60 +123,23 @@ test("transition manifest reuses the verifier for its declared key", async () =>
 		"wrong-password",
 	);
 	const targetVerifier = await targetCodec.createVerifier();
-	const target = {
-		enabled: true,
-		revision: 1,
-		salt,
-		verifier: targetVerifier,
-	};
-	const transition = {
+	const target = encryptedMode(1, salt, targetVerifier);
+	const transition = localTransition({
 		id: "enable-transition",
-		kind: "enable" as const,
-		phase: "prepared" as const,
-		source: {
-			enabled: false,
-			salt: null,
-			password: null,
-			revision: null,
-			profileId: null,
-		},
-		target: {
-			enabled: true,
-			salt,
-			password: "target-password",
-			revision: 1,
-			profileId: "hardened" as const,
-		},
+		kind: "enable",
+		source: localSnapshot(null, null, null),
+		target: localSnapshot(salt, "target-password", 1),
 		sourceRawPaths: [],
-		targetRawByLogicalPath: {},
 		sourceFingerprints: {},
-		targetFingerprints: {},
-		sourceCanonicalRevision: 4,
-		backupProof: {
-			path: ".backup/transition.enc.zip",
-			sha256: "backup-sha",
-			epoch: "epoch-a",
-			canonicalRevision: 4,
-			localSnapshotDigest: "snapshot-sha",
-			createdAt: 1,
-		},
-	};
-	const maintenance = {
+	});
+	const maintenance = createMaintenance({
 		id: transition.id,
 		kind: transition.kind,
 		phase: transition.phase,
-		initiatedBy: "device-a",
-		sourceRevision: 4,
 		targetRevision: null,
-		source: {
-			enabled: false,
-			revision: null,
-			salt: null,
-			verifier: null,
-		},
+		source: plaintextMode(),
 		target,
-		cleanup: [],
-	};
+	});
 	const options = {
 		service: targetCodec,
 		salt,

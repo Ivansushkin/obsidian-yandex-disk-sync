@@ -6,6 +6,33 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"storage.replacement": "Connect the recreated Force storage",
+		"storage.replacement_description":
+			"The folder at this path was recreated. A verified new canonical generation can be connected while preserving offline edits; transferring them requires a separate explicit choice.",
+		"force.password_create": "Create encrypted destination",
+		"force.password_description":
+			"Enter the password for the selected Force operation. Cancel leaves the destination unchanged.",
+		"force.source_mode_title": "Select remote source format",
+		"force.source_mode_description":
+			"The manifest is missing. Choose how to read the source. Encrypted reading requires the original salt/profile and a valid password; all source files are verified before replacement.",
+		"force.plaintext": "Plaintext",
+		"force.encrypted": "Encrypted",
+		"force.backup_failed_title": "The archive could not be verified",
+		"force.backup_failed_description":
+			"Retry, explicitly continue without any protective copies, or cancel.",
+		"force.retry": "Retry",
+		"force.recovery_pending":
+			"Force recovery is unfinished. Resume it before normal synchronization.",
+		"force.confirm_details":
+			"Source: {source}. Destination: {target}. Source files: {count}. Resulting mode: {mode}.",
+		"force.empty_source":
+			"The source is empty. All synchronized files in the destination will be deleted.",
+		"force.epoch_title": "The remote storage was replaced",
+		"force.epoch_description":
+			"Your offline edits are preserved. Choose whether to accept the new remote state, transfer your edits, or decide later. Nothing is uploaded before this choice.",
+		"force.epoch_accept": "Accept remote state",
+		"force.epoch_preserve": "Transfer my edits",
+		"force.epoch_later": "Decide later",
 		"status.mobile.expand": "Expand synchronization details",
 		"status.mobile.collapse": "Collapse synchronization details",
 		"status.actions.copy_logs": "Copy logs",
@@ -431,6 +458,33 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"storage.replacement": "Подключить пересозданное Force-хранилище",
+		"storage.replacement_description":
+			"Папка по этому пути пересоздана. Проверенное новое поколение можно подключить с сохранением офлайн-правок; их отправка потребует отдельного явного выбора.",
+		"force.password_create": "Создание зашифрованного назначения",
+		"force.password_description":
+			"Введите пароль для выбранной операции Force. Отмена сохраняет назначение без изменений.",
+		"force.source_mode_title": "Выберите формат источника на Диске",
+		"force.source_mode_description":
+			"Manifest отсутствует. Укажите формат чтения источника. Для шифрования нужны исходные salt/profile и верный пароль; все файлы проверяются до замены назначения.",
+		"force.plaintext": "Без шифрования",
+		"force.encrypted": "С шифрованием",
+		"force.backup_failed_title": "Архив не прошёл проверку",
+		"force.backup_failed_description":
+			"Повторите попытку, явно продолжите без любых защитных копий или отмените операцию.",
+		"force.retry": "Повторить",
+		"force.recovery_pending":
+			"Восстановление Force не завершено. Продолжите его перед обычной синхронизацией.",
+		"force.confirm_details":
+			"Источник: {source}. Назначение: {target}. Файлов в источнике: {count}. Итоговый режим: {mode}.",
+		"force.empty_source":
+			"Источник пуст. Все синхронизируемые файлы назначения будут удалены.",
+		"force.epoch_title": "Хранилище на Диске заменено",
+		"force.epoch_description":
+			"Ваши офлайн-правки сохранены. Выберите: принять новое состояние Диска, перенести свои правки или решить позже. До выбора ничего не отправляется.",
+		"force.epoch_accept": "Принять состояние Диска",
+		"force.epoch_preserve": "Перенести мои правки",
+		"force.epoch_later": "Решить позже",
 		"status.mobile.expand": "Развернуть подробности синхронизации",
 		"status.mobile.collapse": "Свернуть подробности синхронизации",
 		"status.actions.copy_logs": "Копировать логи",

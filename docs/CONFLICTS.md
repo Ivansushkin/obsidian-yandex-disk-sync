@@ -6,16 +6,16 @@
 используется physical fingerprint, а при его отсутствии — server mtime относительно
 baseline. Клиентские часы не выбирают победителя.
 
-| Состояние                                                                           | Результат                                                                                      |
-| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Разные изменения после общего baseline                                              | Одна версия сохраняется как conflict copy, canonical winner применяется к исходному пути       |
-| Файл без baseline после завершённого подключения и отличающийся remote того же пути | Локальный файл считается новым; обе версии сохраняются                                         |
-| Exact delete против stale edit                                                      | Delete побеждает; неподтверждённые локальные bytes требуют protective copy                     |
-| Causally-later put после delete                                                     | Путь восстанавливается                                                                         |
-| Folder delete против нового/изменённого descendant                                  | Descendant сохраняется                                                                         |
-| Folder move против отличающегося target                                             | Операция блокируется до mutations; частичный overwrite запрещён                                |
-| Последовательные edits одной установки                                              | Непрерывный mutation watermark предотвращает ложный конфликт                                   |
-| Replacement epoch и offline edit                                                    | Full сравнивает прежний baseline с filesystem и новым canonical; старые actions не replay-ятся |
+| Состояние                                                                           | Результат                                                                                                 |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Разные изменения после общего baseline                                              | Одна версия сохраняется как conflict copy, canonical winner применяется к исходному пути                  |
+| Файл без baseline после завершённого подключения и отличающийся remote того же пути | Локальный файл считается новым; обе версии сохраняются                                                    |
+| Exact delete против stale edit                                                      | Delete побеждает; неподтверждённые локальные bytes требуют protective copy                                |
+| Causally-later put после delete                                                     | Путь восстанавливается                                                                                    |
+| Folder delete против нового/изменённого descendant                                  | Descendant сохраняется                                                                                    |
+| Folder move против отличающегося target                                             | Операция блокируется до mutations; частичный overwrite запрещён                                           |
+| Последовательные edits одной установки                                              | Непрерывный mutation watermark предотвращает ложный конфликт                                              |
+| Replacement epoch и offline edit                                                    | До явного выбора accept/preserve/later старые изменения не отправляются; local bytes и queues сохраняются |
 
 ## Первое подключение устройства
 
@@ -112,6 +112,10 @@ restart неизменённый local файл с прежним baseline по�
 чтения не разрешают локальную запись. Между отдельными HTTP и filesystem operations
 атомарной гарантии нет.
 
+Полный local scan требует читаемых bytes всех syncable файлов: read/hash failure
+не означает отсутствие и не разрешает tombstone, overwrite или acknowledgement
+(`SYNC-039`). Protected/excluded paths фильтруются до чтения.
+
 До remote I/O фиксируется local absence либо SHA. Проверка повторяется после protective
 backup и после подготовки parent folders в VaultAdapter. Late create/edit останавливает
 устаревшую запись без подтверждения baseline/download/watcher suppression. Следующий
@@ -119,14 +123,22 @@ reconciliation снова применяет причинные правила �
 
 Существующие неподтверждённые bytes, отличающиеся от download, архивируются отдельно,
 включая отсутствие baseline. Ошибка protective copy запрещает overwrite. Для Force
-remote разрешена замена подтверждённого snapshot; последующий drift блокирует её.
-Выбор without-backup отключает только полный архив.
+remote выбранный читаемый источник заменяет destination независимо от старого
+baseline и очередей. Явный without-backup отключает также per-file copies;
+source drift останавливает проход, destination drift повторяет инвентаризацию
+с ограничением три попытки. Обычный sync сохраняет прежнюю защиту.
 
-Local delete подтверждает canonical и SHA после protective backup. Новая правка
+Обычный local delete подтверждает canonical и SHA после protective backup. Новая правка
 откладывает действие; фактическое удаление использует Obsidian FileManager trash.
 Remote delete и source cleanup проверяют authority/fingerprint на каждом retry и
 подтверждаются отсутствием объекта. Read-before-delete не является атомарной блокировкой
 против внешней записи.
+
+Отклонённый rename использует тот же guarded local delete, что rejected upload.
+Спекулятивный local stamp upload не доказывает наличие подтверждённого baseline:
+без исходного baseline нужна protective copy. Изменение файла во время неё оставляет
+действие pending и rename возвращает retry. Cleanup retargeted source требует live
+target; cleanup отклонённого destination требует exact canonical tombstone.
 
 ## Пути и события
 
@@ -145,12 +157,6 @@ NFC/case-fold collisions родителей, file/directory/ancestor collisions 
 число вызовов backup само по себе не доказывает сохранность. См. сценарии SYNC, DEL,
 FDEL, MOVE и SAFE в [каталоге](SYNC_USER_SCENARIOS.md), TC-04/05/06/09 в
 [smoke tests](SMOKE_TESTS.md). Реальный двухпрофильный прогон остаётся отдельной проверкой.
-
-Отклонённый rename использует тот же guarded local delete, что rejected upload.
-Спекулятивный local stamp upload не доказывает наличие подтверждённого baseline:
-без исходного baseline нужна protective copy. Изменение файла во время неё оставляет
-действие pending и rename возвращает retry. Cleanup retargeted source требует live
-target; cleanup отклонённого destination требует exact canonical tombstone.
 
 Диагностика conflict classification различает наличие baseline, совпадение local
 SHA с baseline/canonical и epoch adoption. Эти признаки не заменяют guards и не

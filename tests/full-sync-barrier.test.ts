@@ -1,109 +1,53 @@
-import { classifySyncError } from "../src/sync/errors";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { App } from "obsidian";
-import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
-import {
-	FileWatcher,
-	type DeferredWatcherEvent,
-} from "../src/sync/realtime/watcher";
+import type { YandexDiskClient } from "../src/api/yandex-client";
 import {
 	IndexEpochMismatchError,
 	RemoteIndexRolledBackError,
 	type IndexManager,
 } from "../src/sync/canonical/manager";
-import { LocalOperationStore } from "../src/sync/local/operation-store";
 import { SyncEngine } from "../src/sync/engine";
+import { classifySyncError } from "../src/sync/errors";
+import { logger } from "../src/utils/logger";
+import { findErrorCause } from "../src/utils/error-utils";
 import {
-	createEmptyIndex,
-	createEmptyLocalState,
+	FileWatcher,
+	type DeferredWatcherEvent,
+} from "../src/sync/realtime/watcher";
+import {
 	DEFAULT_SETTINGS,
 	type FileMetadata,
 	type IndexMaintenance,
 	type PendingMutation,
 } from "../src/types";
+import {
+	fileEvent,
+	fileMetadata,
+	MemoryIndex,
+	renameEvent,
+} from "./helpers/realtime-fixtures";
 
-class FullSyncIndexFake {
-	readonly index = createEmptyIndex("device-a", "epoch-a");
-	readonly local = createEmptyLocalState("device-a");
-	readonly store = new LocalOperationStore("device-a");
+class FullSyncIndexFake extends MemoryIndex {
 	readonly localFiles = new Map<string, FileMetadata>();
-	readonly remoteFiles = new Map<string, FileMetadata>();
-	remoteSaveCount = 0;
-	onBuildLocalIndex: (() => void) | null = null;
-	maintenance: IndexMaintenance | undefined = undefined;
 
-	constructor() {
-		this.index.revision = 7;
-		this.local.observedEpoch = "epoch-a";
-		this.local.observedRevision = 7;
-		this.store.loadMutations(undefined, 1);
-	}
+	readonly remoteFiles = new Map<string, FileMetadata>();
+
+	onBuildLocalIndex: (() => void) | null = null;
+
+	maintenance: IndexMaintenance | undefined = undefined;
 
 	async remotePathExists() {
 		return true;
 	}
 
-	async loadRemoteIndex() {}
-	async assertCanonicalEpoch(epoch: string) {
-		assert.equal(this.index.epoch, epoch);
-	}
-
-	captureLocalCausalState() {
-		return {
-			state: structuredClone(this.local),
-			mutations: this.store.getMutations(),
-			physicalActions: this.store.getPhysicalActions(),
-		};
-	}
-
-	beginEpochAdoption(epoch: string) {
-		this.store.resetForEpoch(epoch);
-		this.local.nextMutationSeq = 1;
-	}
-
-	endEpochAdoption() {}
-
-	restoreLocalCausalState(
-		snapshot: ReturnType<FullSyncIndexFake["captureLocalCausalState"]>,
-	) {
-		Object.assign(this.local, structuredClone(snapshot.state));
-		this.store.loadMutations(
-			snapshot.mutations,
-			snapshot.state.nextMutationSeq,
-		);
-		this.store.loadPhysicalActions(snapshot.physicalActions);
-	}
-
-	replayPendingMutations() {
-		const before = this.store.getMutations().length;
-		this.store.confirmAppliedMutations(this.index.appliedMutationSeq);
-		return before !== this.store.getMutations().length;
-	}
-
-	getRemoteIndex() {
-		return this.index;
-	}
-
-	getLocalIndex() {
-		return this.local;
+	async loadRemoteIndex() {
+		return structuredClone(this.index);
 	}
 
 	getMaintenance() {
 		return this.maintenance;
-	}
-
-	getPendingMutations() {
-		return this.store.getMutations();
-	}
-
-	getPendingPhysicalActions() {
-		return [];
-	}
-
-	getPendingLocalDeletePaths() {
-		return new Set<string>();
 	}
 
 	async buildLocalIndex() {
@@ -113,26 +57,6 @@ class FullSyncIndexFake {
 
 	async getRemoteFiles() {
 		return new Map(this.remoteFiles);
-	}
-
-	updateLocalFile(path: string, metadata: FileMetadata) {
-		this.local.files[path] = { ...metadata };
-	}
-
-	updateRemoteFile(path: string, metadata: FileMetadata) {
-		this.index.files[path] = { ...metadata };
-	}
-
-	replacePendingPutWithNoop(id: string) {
-		return this.store.replacePutWithNoop(id);
-	}
-
-	stagePendingMutations() {
-		this.store.stagePendingMutations(this.index.appliedMutationSeq);
-	}
-
-	confirmAppliedMutations() {
-		this.store.confirmAppliedMutations(this.index.appliedMutationSeq);
 	}
 
 	enqueuePut(path: string, sha256: string): PendingMutation {
@@ -145,32 +69,8 @@ class FullSyncIndexFake {
 		);
 	}
 
-	async saveRemoteIndex() {
-		this.remoteSaveCount++;
-		this.index.revision++;
-		return {
-			epoch: this.index.epoch,
-			revision: this.index.revision,
-			index: structuredClone(this.index),
-			contentFingerprint: "md5:test",
-		};
-	}
-
-	consumeRejectedPuts() {
-		return [];
-	}
-
 	cleanupDeletedFiles() {
 		return false;
-	}
-
-	updateSyncTime() {
-		this.index.lastSyncTime = Date.now();
-	}
-
-	markRemoteObserved() {
-		this.local.observedEpoch = this.index.epoch;
-		this.local.observedRevision = this.index.revision;
 	}
 }
 
@@ -224,37 +124,13 @@ function createHarness(encrypted: boolean) {
 	};
 }
 
-function renameEvent(id: string): DeferredWatcherEvent {
-	return {
-		id,
-		action: "rename",
-		path: "A.md",
-		targetPath: "B.md",
-		kind: "file",
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 1,
-	};
-}
-
-function uploadEvent(id: string, path: string): DeferredWatcherEvent {
-	return {
-		id,
-		action: "upload",
-		path,
-		epoch: "epoch-a",
-		baseRevision: 7,
-		createdAt: 1,
-	};
-}
-
 for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
 
 	test(`${mode} no-op full consumes a stale watcher upload without remote write`, async () => {
 		const { engine, index, watcher, getFolderCacheClearCount } =
 			createHarness(encrypted);
-		watcher.loadDeferredEvents([uploadEvent("stale-upload", "missing.md")]);
+		watcher.loadDeferredEvents([fileEvent("stale-upload", "missing.md")]);
 
 		const result = await engine.fullSync();
 
@@ -282,7 +158,9 @@ for (const encrypted of [false, true]) {
 
 	test(`${mode} full supersedes a stale rename after both paths settle`, async () => {
 		const { engine, index, watcher } = createHarness(encrypted);
-		watcher.loadDeferredEvents([renameEvent("stale-rename")]);
+		watcher.loadDeferredEvents([
+			renameEvent("stale-rename", "A.md", "B.md"),
+		]);
 
 		const result = await engine.fullSync();
 
@@ -405,29 +283,31 @@ test("historical and authentication blocks reject Force before backup work", asy
 	}
 });
 
-test("a full sync accepts a replacement epoch without Force ping-pong", async () => {
-	const { engine, index } = createHarness(false);
-	const baseline = {
-		path: "same.md",
-		sha256: "same",
-		size: 1,
-		mtime: 1,
-		syncedAt: 1,
-	};
+test("an explicit epoch choice accepts replacement without Force ping-pong", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	const baseline = fileMetadata("same.md", "same");
 	index.local.files[baseline.path] = { ...baseline };
 	index.localFiles.set(baseline.path, { ...baseline });
 	index.remoteFiles.set(baseline.path, { ...baseline });
 	index.index.files[baseline.path] = { ...baseline };
 	index.enqueuePut("obsolete.md", "obsolete");
 	index.index.epoch = "epoch-b";
+	watcher.loadDeferredEvents([
+		renameEvent("old-epoch-rename", "A.md", "B.md"),
+	]);
 
-	const result = await engine.fullSync();
+	const blocked = await engine.fullSync();
+	assert.equal(blocked.errors[0]?.code, "epoch-decision-required");
+	const result = await engine.fullSync({
+		epochAdoption: { epoch: "epoch-b", decision: "preserve" },
+	});
 
 	assert.equal(result.success, true);
 	assert.equal(result.epochAdopted, true);
 	assert.equal(index.local.observedEpoch, "epoch-b");
 	assert.deepEqual(index.store.getMutations(), []);
 	assert.equal(index.remoteSaveCount, 0);
+	assert.deepEqual(watcher.getDeferredEvents(), []);
 });
 
 test("recursive transaction cause keeps the epoch replacement classification", () => {
@@ -441,20 +321,15 @@ test("recursive transaction cause keeps the epoch replacement classification", (
 
 test("full leaves an ambiguous causal rename durable and reports an error", async () => {
 	const { engine, index, watcher, vaultFiles } = createHarness(false);
-	const source = {
-		path: "A.md",
-		sha256: "source-sha",
-		size: 1,
-		mtime: 1,
-		syncedAt: 1,
-		changedRevision: 7,
-	};
+	const source = fileMetadata("A.md", "source-sha", { changedRevision: 7 });
 	index.index.files["A.md"] = { ...source };
 	index.local.files["A.md"] = { ...source };
 	index.localFiles.set("A.md", { ...source });
 	index.remoteFiles.set("A.md", { ...source });
 	vaultFiles.add("A.md");
-	watcher.loadDeferredEvents([renameEvent("ambiguous-rename")]);
+	watcher.loadDeferredEvents([
+		renameEvent("ambiguous-rename", "A.md", "B.md"),
+	]);
 
 	const result = await engine.fullSync();
 
@@ -471,21 +346,16 @@ test("full leaves an ambiguous causal rename durable and reports an error", asyn
 
 test("full acknowledges an already applied rename target without remote write", async () => {
 	const { engine, index, watcher, vaultFiles } = createHarness(false);
-	const target = {
-		path: "B.md",
-		sha256: "target-sha",
-		size: 1,
-		mtime: 1,
-		syncedAt: 1,
+	const target = fileMetadata("B.md", "target-sha", {
 		changedRevision: 7,
 		remoteFingerprint: "target-fingerprint",
-	};
+	});
 	index.index.files["B.md"] = { ...target };
 	index.local.files["B.md"] = { ...target };
 	index.localFiles.set("B.md", { ...target });
 	index.remoteFiles.set("B.md", { ...target });
 	index.onBuildLocalIndex = () => vaultFiles.add("B.md");
-	watcher.loadDeferredEvents([renameEvent("applied-rename")]);
+	watcher.loadDeferredEvents([renameEvent("applied-rename", "A.md", "B.md")]);
 
 	const result = await engine.fullSync();
 
@@ -507,7 +377,7 @@ test("post-full rename acknowledgement persists before observed revision advance
 			observedRevision: index.local.observedRevision,
 		});
 	});
-	watcher.loadDeferredEvents([renameEvent("stale-rename")]);
+	watcher.loadDeferredEvents([renameEvent("stale-rename", "A.md", "B.md")]);
 
 	const result = await engine.fullSync();
 
@@ -569,13 +439,7 @@ test("full sync rejects an ambiguous remote tree before applying any file", asyn
 	]) {
 		const { engine, index, vaultFiles } = createHarness(false);
 		for (const path of paths) {
-			index.remoteFiles.set(path, {
-				path,
-				sha256: "remote",
-				mtime: 1,
-				size: 1,
-				syncedAt: 1,
-			});
+			index.remoteFiles.set(path, fileMetadata(path, "remote"));
 		}
 		const baseline = structuredClone(index.local);
 		const canonical = structuredClone(index.index);
@@ -588,4 +452,122 @@ test("full sync rejects an ambiguous remote tree before applying any file", asyn
 		assert.equal(index.remoteSaveCount, 0);
 		assert.deepEqual([...vaultFiles], []);
 	}
+});
+
+test("failed full upload acknowledgement cannot report success and remains replayable after restart", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	const original = fileEvent("covered-upload", "missing.md");
+	watcher.loadDeferredEvents([original]);
+	const loaded = watcher.getDeferredEvents();
+	const failure = new Error("Synthetic full ACK persistence failure");
+	let durable = watcher.getDeferredEvents();
+	watcher.setPersistCallback(async () => {
+		const events = watcher.getDeferredEvents();
+		if (events.length === 0) {
+			throw failure;
+		}
+		durable = JSON.parse(JSON.stringify(events)) as DeferredWatcherEvent[];
+	});
+	const successes: string[] = [];
+	const info = logger.info.bind(logger);
+	logger.info = (message, ...args) => {
+		if (message.startsWith("Full reconciliation completed:")) {
+			successes.push(message);
+		}
+		info(message, ...args);
+	};
+	let result;
+	try {
+		result = await engine.fullSync();
+	} finally {
+		logger.info = info;
+	}
+	assert.equal(result.success, false);
+	assert.equal(
+		findErrorCause(result.failureCause, (cause) => cause === failure),
+		failure,
+	);
+	assert.equal(engine.getState().status, "error");
+	assert.deepEqual(successes, []);
+	assert.deepEqual(durable, [original]);
+	assert.equal(index.remoteSaveCount, 0);
+	assert.deepEqual(index.getPendingMutations(), []);
+	const restarted = createHarness(false);
+	restarted.watcher.loadDeferredEvents(
+		JSON.parse(JSON.stringify(durable)) as DeferredWatcherEvent[],
+	);
+	assert.deepEqual(restarted.watcher.getDeferredEvents(), loaded);
+	assert.equal((await restarted.engine.fullSync()).success, true);
+	assert.deepEqual(restarted.watcher.getDeferredEvents(), []);
+	assert.equal(restarted.index.remoteSaveCount, 0);
+});
+
+test("failed pause durability blocks full reconciliation before canonical work", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	const event = fileEvent("covered-upload", "missing.md");
+	watcher.loadDeferredEvents([event]);
+	const loaded = watcher.getDeferredEvents();
+	const failure = new Error("Synthetic pause persistence failure");
+	engine.onSyncPause(async () => {
+		throw failure;
+	});
+	let scanned = false;
+	index.onBuildLocalIndex = () => {
+		scanned = true;
+	};
+	const result = await engine.fullSync();
+	assert.equal(result.success, false);
+	assert.equal(
+		findErrorCause(result.failureCause, (cause) => cause === failure),
+		failure,
+	);
+	assert.equal(scanned, false);
+	assert.deepEqual(watcher.getDeferredEvents(), loaded);
+	assert.equal(index.local.observedRevision, 7);
+	assert.equal(index.remoteSaveCount, 0);
+});
+
+test("failed epoch rebase save retains late watcher identity across restart without success", async () => {
+	const { engine, index, watcher } = createHarness(false);
+	watcher.stop();
+	index.index.epoch = "epoch-b";
+	let inserted = false;
+	index.onBuildLocalIndex = () => {
+		if (!inserted) {
+			inserted = true;
+			watcher.loadDeferredEvents([fileEvent("late-upload", "late.md")]);
+		}
+	};
+	let durable: DeferredWatcherEvent[] = [];
+	const failure = new Error("Synthetic epoch rebase save failure");
+	watcher.setPersistCallback(async () => {
+		const events = watcher.getDeferredEvents();
+		if (events.some((event) => event.epoch === "epoch-b")) {
+			throw failure;
+		}
+		durable = JSON.parse(JSON.stringify(events)) as DeferredWatcherEvent[];
+	});
+
+	const result = await engine.fullSync({
+		epochAdoption: { epoch: "epoch-b", decision: "accept" },
+	});
+
+	assert.equal(result.success, false);
+	assert.equal(result.epochAdopted, false);
+	assert.equal(
+		findErrorCause(result.failureCause, (cause) => cause === failure),
+		failure,
+	);
+	assert.equal(index.getObservedEpoch(), "epoch-a");
+	assert.equal(index.remoteSaveCount, 0);
+	assert.deepEqual(durable, [fileEvent("late-upload", "late.md")]);
+	const restarted = createHarness(false);
+	restarted.index.index.epoch = "epoch-b";
+	restarted.watcher.loadDeferredEvents(
+		JSON.parse(JSON.stringify(durable)) as DeferredWatcherEvent[],
+	);
+	assert.equal(restarted.watcher.getDeferredEvents()[0]?.id, "late-upload");
+	assert.equal((await restarted.engine.fullSync()).success, true);
+	assert.deepEqual(restarted.watcher.getDeferredEvents(), []);
+	assert.equal(restarted.index.remoteSaveCount, 0);
 });

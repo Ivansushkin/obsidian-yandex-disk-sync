@@ -1,4 +1,20 @@
 import type { SyncIndex } from "../../types";
+import { protectRecord } from "../../utils/record-utils";
+
+/** Deep-clone canonical JSON and restore protection for persisted path records. */
+export function cloneIndex(index: Readonly<SyncIndex>): SyncIndex {
+	const clone = JSON.parse(JSON.stringify(index)) as SyncIndex;
+	clone.files = protectRecord(clone.files);
+	clone.folderTombstones = protectRecord(clone.folderTombstones);
+	clone.moves = protectRecord(clone.moves);
+	clone.appliedMutationSeq = protectRecord(clone.appliedMutationSeq);
+	return clone;
+}
+
+/** Compare canonical JSON without depending on object insertion order. */
+export function sameIndexValue(left: unknown, right: unknown): boolean {
+	return stableSerialize(left) === stableSerialize(right);
+}
 
 export interface Page<T> {
 	items: T[];
@@ -107,4 +123,18 @@ export class UnstablePaginationError extends Error {
 		super(message);
 		this.name = "UnstablePaginationError";
 	}
+}
+
+/** Match post-commit target recovery authority without granting other writes. */
+export function isTargetRecoveryIndex(
+	index: Readonly<SyncIndex>,
+	maintenanceId: string | null,
+): boolean {
+	const maintenance = index.maintenance;
+	return (
+		maintenanceId !== null &&
+		maintenance?.id === maintenanceId &&
+		maintenance.targetRevision !== null &&
+		["index-committed", "cleanup", "stable"].includes(maintenance.phase)
+	);
 }

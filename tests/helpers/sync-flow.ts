@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { TestContext } from "node:test";
 import { App, TFile, TFolder, type RequestUrlParam } from "obsidian";
 import { YandexDiskClient } from "../../src/api/yandex-client";
 import { VaultAdapter } from "../../src/api/vault-adapter";
@@ -22,6 +23,7 @@ import {
 } from "../../src/crypto/encryption";
 import { computeSha256 } from "../../src/utils/hash-utils";
 import { logger } from "../../src/utils/logger";
+import { isProtectedPath, toLocalPath } from "../../src/utils/path-utils";
 
 export const bytes = (value: string) => new TextEncoder().encode(value).buffer;
 const parent = (path: string) =>
@@ -356,6 +358,22 @@ export interface SavedDevice {
 	pendingWatcherEvents: DeferredWatcherEvent[];
 }
 
+/** Keep test teardown attached to every device, including restarted instances. */
+export function managedDevices(context: TestContext): typeof device {
+	return (...args) => {
+		const current = device(...args);
+		const hooks = context as TestContext & {
+			after(cleanup: () => Promise<void>): void;
+		};
+		hooks.after(async () => {
+			args[0].beforeRequest = undefined;
+			args[0].afterRequest = undefined;
+			await current.stop();
+		});
+		return current;
+	};
+}
+
 export async function codecFor(
 	encrypted: boolean,
 ): Promise<EncryptionCodec | null> {
@@ -374,7 +392,7 @@ export function device(
 	codec: EncryptionCodec | null,
 	vault = new MemoryVault(),
 	saved?: SavedDevice,
-	clientOptions: { readTimeoutMs?: number } = {},
+	clientOptions: { readTimeoutMs?: number; maxRetries?: number } = {},
 ) {
 	disk.install();
 	logger.configure({ consoleEnabled: false, fileEnabled: false });
@@ -396,9 +414,9 @@ export function device(
 	const adapter = new VaultAdapter(app, settings);
 	const client = new YandexDiskClient({
 		token: "synthetic",
-		...clientOptions,
 		retryDelay: 0,
 		maxRetries: 0,
+		...clientOptions,
 	});
 	client.setRemotePath("vault");
 	client.setEncryptionService(codec);
@@ -451,6 +469,12 @@ export function device(
 			return structuredClone(persisted);
 		},
 		lastSaved: () => structuredClone(persisted),
+		assertLocal(path: string, text?: string) {
+			assert.deepEqual(
+				vault.files.get(path),
+				text === undefined ? undefined : bytes(text),
+			);
+		},
 		async full() {
 			const result = await engine.fullSync();
 			assert.equal(result.success, true, JSON.stringify(result.errors));
@@ -523,10 +547,7 @@ export function device(
 			assert.deepEqual(
 				[...disk.files.keys()]
 					.filter(
-						(path) =>
-							!path.startsWith("vault/.backup/") &&
-							!path.startsWith("vault/.obsidian-sync-index") &&
-							!path.endsWith("/.obsidian-sync-encryption.json"),
+						(path) => !isProtectedPath(toLocalPath(path, "vault")),
 					)
 					.sort(),
 				expectedPhysical.sort(),

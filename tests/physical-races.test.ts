@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import { TFile, type App } from "obsidian";
 import { VaultAdapter } from "../src/api/vault-adapter";
-import { YandexDiskClient } from "../src/api/yandex-client";
+import type { YandexDiskClient } from "../src/api/yandex-client";
+import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
 import {
 	applyDownloadedContent,
 	deleteLocalFile,
@@ -11,21 +11,25 @@ import {
 	type Dependencies,
 } from "../src/sync/files/operations";
 import {
+	deleteMoveSourceIfUnchanged,
+	type Dependencies as MoveDependencies,
+} from "../src/sync/files/remote-moves";
+import { preserveLocalConflictCopy } from "../src/sync/reconciliation/conflict-settlement";
+import { type Dependencies as ReconciliationDependencies } from "../src/sync/reconciliation/context";
+import {
 	DEFAULT_SETTINGS,
 	createEmptyIndex,
 	type PendingPhysicalAction,
 } from "../src/types";
+import { computeSha256 } from "../src/utils/hash-utils";
 import { logger } from "../src/utils/logger";
 import {
-	preserveLocalConflictCopy,
-	type Dependencies as ReconciliationDependencies,
-} from "../src/sync/reconciliation/commits";
-import { computeSha256 } from "../src/utils/hash-utils";
-import {
-	deleteMoveSourceIfUnchanged,
-	type Dependencies as MoveDependencies,
-} from "../src/sync/files/remote-moves";
-import { EncryptionService, SALT_LENGTH } from "../src/crypto/encryption";
+	createClient,
+	requestGlobal,
+	response,
+	httpTest as test,
+} from "./helpers/client-fixtures";
+import { fileMetadata } from "./helpers/metadata";
 
 logger.configure({ consoleEnabled: false, fileEnabled: false });
 const bytes = (text: string) => new TextEncoder().encode(text).buffer;
@@ -36,13 +40,9 @@ test("conflict preservation retains edited copies and reuses its own bytes after
 		const preferred = "note_conflict_existing.md";
 		const files = new Map([[preferred, bytes("offline conflict edit")]]);
 		const canonical = createEmptyIndex("device", "E");
-		canonical.files[preferred] = {
-			path: preferred,
+		canonical.files[preferred] = fileMetadata(preferred, {
 			sha256: await computeSha256(bytes("losing version")),
-			size: 1,
-			mtime: 1,
-			syncedAt: 1,
-		};
+		});
 		const vault = {
 			getAbstractFileByPath: (path: string) =>
 				files.has(path) ? Object.assign(new TFile(), { path }) : null,
@@ -220,33 +220,21 @@ test("physical delete retry preserves a foreign restored file", async () => {
 			canonicalRevision: 1,
 			createdAt: 1,
 		};
-		const client = new YandexDiskClient({
-			token: "synthetic",
-			maxRetries: 1,
-			retryDelay: 0,
-		});
+		const client = createClient({ maxRetries: 1 });
 		client.setRemotePath("vault");
 		client.setEncryptionService(service);
 		client.getLogicalResource = async () =>
 			resource as Awaited<
 				ReturnType<YandexDiskClient["getLogicalResource"]>
 			>;
-		const runtime = globalThis as typeof globalThis & {
-			__obsidianRequestUrl?: (params: {
-				method?: string;
-			}) => Promise<unknown>;
-		};
-		runtime.__obsidianRequestUrl = async ({ method }) => {
+		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
 			assert.equal(method, "DELETE");
 			attempts++;
 			if (attempts === 1) {
-				canonical.files["note.md"] = {
-					path: "note.md",
+				canonical.files["note.md"] = fileMetadata("note.md", {
 					sha256: "new",
-					mtime: 1,
 					size: 3,
-					syncedAt: 1,
-				};
+				});
 				physicalBytes = service
 					? await service.encrypt(bytes("new"))
 					: bytes("new");
@@ -259,44 +247,33 @@ test("physical delete retry preserves a foreign restored file", async () => {
 				resource = null;
 				physicalBytes = null;
 			}
-			return {
-				status: attempts === 1 ? 503 : 204,
-				json: {},
-				text: "",
-				headers: {},
-				arrayBuffer: new ArrayBuffer(0),
-			};
+			return response(attempts === 1 ? 503 : 204);
 		};
-		try {
-			await deleteRemoteFile(
-				{
-					settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
-					yandexClient: client,
-					indexManager: {
-						getPendingPhysicalAction: () => action,
-						readCanonicalIndex: async () => canonical,
-						completePhysicalAction: () => {
-							completed = true;
-						},
+
+		await deleteRemoteFile(
+			{
+				settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
+				yandexClient: client,
+				indexManager: {
+					getPendingPhysicalAction: () => action,
+					readCanonicalIndex: async () => canonical,
+					completePhysicalAction: () => {
+						completed = true;
 					},
-				} as unknown as Dependencies,
-				"note.md",
-			);
-			assert.notEqual(physicalBytes, null);
-			assert.equal(
-				new TextDecoder().decode(
-					service
-						? await service.decrypt(physicalBytes)
-						: physicalBytes,
-				),
-				"new",
-			);
-			assert.equal(canonical.files["note.md"]?.sha256, "new");
-			assert.equal(attempts, 1);
-			assert.equal(completed, true);
-		} finally {
-			delete runtime.__obsidianRequestUrl;
-		}
+				},
+			} as unknown as Dependencies,
+			"note.md",
+		);
+		assert.notEqual(physicalBytes, null);
+		assert.equal(
+			new TextDecoder().decode(
+				service ? await service.decrypt(physicalBytes) : physicalBytes,
+			),
+			"new",
+		);
+		assert.equal(canonical.files["note.md"]?.sha256, "new");
+		assert.equal(attempts, 1);
+		assert.equal(completed, true);
 	}
 });
 
@@ -357,15 +334,11 @@ test("move source retry requires current move authority and an intact target", a
 			mutationSeq: 1,
 		};
 		canonical.moves[move.id] = move;
-		const metadata = {
-			path: "old.md",
+		const metadata = fileMetadata("old.md", {
 			deleted: true,
 			sha256: "content",
-			size: 1,
-			mtime: 1,
-			syncedAt: 1,
 			changedRevision: 2,
-		};
+		});
 		canonical.files["old.md"] = metadata;
 		canonical.files["new.md"] = {
 			...metadata,
@@ -390,19 +363,10 @@ test("move source retry requires current move authority and an intact target", a
 		};
 		let targetExists = true;
 		let attempts = 0;
-		const client = new YandexDiskClient({
-			token: "synthetic",
-			maxRetries: 1,
-			retryDelay: 0,
-		});
+		const client = createClient({ maxRetries: 1 });
 		client.getLogicalResource = async (path) =>
 			path.endsWith("old.md") ? source : targetExists ? target : null;
-		const runtime = globalThis as typeof globalThis & {
-			__obsidianRequestUrl?: (params: {
-				method?: string;
-			}) => Promise<unknown>;
-		};
-		runtime.__obsidianRequestUrl = async ({ method }) => {
+		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
 			assert.equal(method, "DELETE");
 			attempts++;
 			if (change === "move") {
@@ -414,51 +378,39 @@ test("move source retry requires current move authority and an intact target", a
 			if (change === "fingerprint") {
 				source.sha256 = "changed-source";
 			}
-			return {
-				status: 503,
-				json: {},
-				text: "",
-				headers: {},
-				arrayBuffer: new ArrayBuffer(0),
-			};
+			return response(503);
 		};
-		try {
-			await assert.rejects(
-				deleteMoveSourceIfUnchanged(
-					{
-						settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
-						yandexClient: client,
-						indexManager: {
-							readCanonicalIndex: async () => canonical,
-						},
-					} as unknown as MoveDependencies,
-					"old.md",
-					source,
-					{
-						id: "cleanup",
-						type: "move-remote",
-						path: "old.md",
-						epoch: "E",
-						origin: "move",
-						expectedFingerprint: "source-fingerprint",
-						canonicalRevision: 2,
-						createdAt: 1,
+
+		await assert.rejects(
+			deleteMoveSourceIfUnchanged(
+				{
+					settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
+					yandexClient: client,
+					indexManager: {
+						readCanonicalIndex: async () => canonical,
 					},
-					metadata,
-					"new.md",
-					move,
-					"E",
-				),
-				/authority or physical snapshot changed/,
-			);
-			assert.equal(attempts, 1);
-			assert.equal(
-				await client.getLogicalResource("vault/old.md"),
+				} as unknown as MoveDependencies,
+				"old.md",
 				source,
-			);
-		} finally {
-			delete runtime.__obsidianRequestUrl;
-		}
+				{
+					id: "cleanup",
+					type: "move-remote",
+					path: "old.md",
+					epoch: "E",
+					origin: "move",
+					expectedFingerprint: "source-fingerprint",
+					canonicalRevision: 2,
+					createdAt: 1,
+				},
+				metadata,
+				"new.md",
+				move,
+				"E",
+			),
+			/authority or physical snapshot changed/,
+		);
+		assert.equal(attempts, 1);
+		assert.equal(await client.getLogicalResource("vault/old.md"), source);
 	}
 });
 
@@ -467,55 +419,34 @@ test("folder cleanup retry preserves new canonical and excluded descendants", as
 		const canonical = createEmptyIndex("device", "E");
 		let childExists = false;
 		let attempts = 0;
-		const client = new YandexDiskClient({
-			token: "synthetic",
-			maxRetries: 1,
-			retryDelay: 0,
-		});
+		const client = createClient({ maxRetries: 1 });
 		client.isFolderEmpty = async () => !childExists;
-		const runtime = globalThis as typeof globalThis & {
-			__obsidianRequestUrl?: (params: {
-				method?: string;
-			}) => Promise<unknown>;
-		};
-		runtime.__obsidianRequestUrl = async ({ method }) => {
+		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
 			assert.equal(method, "DELETE");
 			attempts++;
 			childExists = true;
 			if (!excluded) {
-				canonical.files["folder/new.md"] = {
-					path: "folder/new.md",
-					sha256: "new",
-					size: 1,
-					mtime: 1,
-					syncedAt: 1,
-				};
+				canonical.files["folder/new.md"] = fileMetadata(
+					"folder/new.md",
+					{ sha256: "new" },
+				);
 			}
-			return {
-				status: 503,
-				json: {},
-				text: "",
-				headers: {},
-				arrayBuffer: new ArrayBuffer(0),
-			};
+			return response(503);
 		};
-		try {
-			await pruneRemoteFolders(
-				{
-					settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
-					yandexClient: client,
-					indexManager: {
-						getRemoteIndex: () => canonical,
-						readCanonicalIndex: async () => canonical,
-					},
-				} as unknown as Dependencies,
-				["folder/deleted.md"],
-			);
-			assert.equal(attempts, 1);
-			assert.equal(childExists, true);
-		} finally {
-			delete runtime.__obsidianRequestUrl;
-		}
+
+		await pruneRemoteFolders(
+			{
+				settings: { ...DEFAULT_SETTINGS, remotePath: "vault" },
+				yandexClient: client,
+				indexManager: {
+					getRemoteIndex: () => canonical,
+					readCanonicalIndex: async () => canonical,
+				},
+			} as unknown as Dependencies,
+			["folder/deleted.md"],
+		);
+		assert.equal(attempts, 1);
+		assert.equal(childExists, true);
 	}
 });
 

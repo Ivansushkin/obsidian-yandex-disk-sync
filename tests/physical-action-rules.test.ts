@@ -1,3 +1,4 @@
+import { fileMetadata } from "./helpers/metadata";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -29,28 +30,22 @@ function action(
 
 test("a newer live canonical state cancels an old physical delete", () => {
 	const canonical = createEmptyIndex("device", "epoch");
-	canonical.files["note.md"] = {
-		path: "note.md",
+	canonical.files["note.md"] = fileMetadata("note.md", {
 		sha256: "new",
 		size: 3,
-		mtime: 1,
-		syncedAt: 1,
 		changedRevision: 3,
-	};
+	});
 	assert.equal(isPhysicalDeleteAuthorized(action("epoch"), canonical), false);
 });
 
 test("canonical tombstone authorizes exact and folder physical deletion", () => {
 	const canonical = createEmptyIndex("device", "epoch");
-	canonical.files["note.md"] = {
-		path: "note.md",
+	canonical.files["note.md"] = fileMetadata("note.md", {
 		sha256: "old",
 		size: 3,
-		mtime: 1,
-		syncedAt: 1,
 		deleted: true,
 		changedRevision: 3,
-	};
+	});
 	assert.equal(isPhysicalDeleteAuthorized(action("epoch"), canonical), true);
 	assert.equal(
 		isPhysicalDeleteAuthorized(action("epoch", "folder-delete"), canonical),
@@ -106,14 +101,11 @@ test("Force replacement cleanup remains authorized after initiator loss", () => 
 		),
 		true,
 	);
-	canonical.files["note.md"] = {
-		path: "note.md",
+	canonical.files["note.md"] = fileMetadata("note.md", {
 		sha256: "old",
 		size: 3,
-		mtime: 1,
-		syncedAt: 1,
 		deleted: true,
-	};
+	});
 	assert.equal(
 		isPhysicalDeleteAuthorized(
 			action("new-epoch", "force-reset"),
@@ -139,24 +131,18 @@ test("retargeted upload cleanup requires the accepted target put", () => {
 	};
 	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), false);
 
-	canonical.files["renamed.md"] = {
-		path: "renamed.md",
+	canonical.files["renamed.md"] = fileMetadata("renamed.md", {
 		sha256: "target",
 		size: 3,
-		mtime: 1,
-		syncedAt: 1,
 		changedRevision: 3,
-	};
+	});
 	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), true);
 
-	canonical.files["note.md"] = {
-		path: "note.md",
+	canonical.files["note.md"] = fileMetadata("note.md", {
 		sha256: "concurrent",
 		size: 3,
-		mtime: 1,
-		syncedAt: 1,
 		changedRevision: 4,
-	};
+	});
 	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), false);
 });
 

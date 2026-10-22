@@ -1,4 +1,4 @@
-import type { FileMetadata } from "../../types";
+import type { FileMetadata, PendingMutation } from "../../types";
 
 /**
  * Compare local plaintext content with the last confirmed device baseline.
@@ -96,4 +96,51 @@ export function mergePhysicalMetadata(
 		remoteMtime: desired.remoteMtime,
 		remoteFingerprint: desired.remoteFingerprint,
 	};
+}
+
+/** Read the last pending put baseline, including an explicitly absent SHA. */
+export function findLatestPutBaselineSha(
+	mutations: readonly Pick<
+		PendingMutation,
+		"type" | "path" | "baselineSha256"
+	>[],
+	path: string,
+): string | undefined {
+	for (let index = mutations.length - 1; index >= 0; index--) {
+		const mutation = mutations[index];
+		if (mutation?.type === "put" && mutation.path === path) {
+			return mutation.baselineSha256;
+		}
+	}
+	return undefined;
+}
+
+/** Index latest matching puts for one synchronous pass; add each new enqueue before reuse. */
+export class PendingPutLookup {
+	private readonly byPath = new Map<
+		string,
+		Map<string | undefined, PendingMutation>
+	>();
+
+	constructor(mutations: readonly PendingMutation[]) {
+		for (const mutation of mutations) {
+			this.add(mutation);
+		}
+	}
+
+	add(mutation: PendingMutation): void {
+		if (mutation.type !== "put") {
+			return;
+		}
+		let bySha = this.byPath.get(mutation.path);
+		if (!bySha) {
+			bySha = new Map();
+			this.byPath.set(mutation.path, bySha);
+		}
+		bySha.set(mutation.sha256, mutation);
+	}
+
+	get(path: string, sha256: string | undefined): PendingMutation | undefined {
+		return this.byPath.get(path)?.get(sha256);
+	}
 }
