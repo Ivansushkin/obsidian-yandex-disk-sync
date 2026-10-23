@@ -33,6 +33,11 @@ export type LocalEncryptionSettings = Pick<
 
 /** Owns profile selection and wire-shape creation outside the plugin root. */
 export class EncryptionManager {
+	private readonly preparedCodecs = new WeakMap<
+		EncryptionCodec,
+		{ profileId: EncryptionProfileId; salt: string; password: string }
+	>();
+
 	/** Persist candidate credentials only after authentication and authority checks. */
 	async acceptCandidate<T>(options: {
 		service: EncryptionCodec | null;
@@ -84,6 +89,11 @@ export class EncryptionManager {
 			EncryptionService.base64ToBytes(saltBase64),
 		);
 		await codec.initializeKey(password);
+		this.preparedCodecs.set(codec, {
+			profileId,
+			salt: saltBase64,
+			password,
+		});
 		return codec;
 	}
 
@@ -122,15 +132,28 @@ export class EncryptionManager {
 	async applySnapshot(
 		settings: LocalEncryptionSettings,
 		snapshot: LocalEncryptionSnapshot,
+		candidate?: EncryptionCodec | null,
+		assertCurrent: () => void = () => {},
 	): Promise<EncryptionCodec | null> {
+		const prepared = candidate
+			? this.preparedCodecs.get(candidate)
+			: undefined;
+		const matches =
+			prepared &&
+			prepared.profileId === snapshot.profileId &&
+			prepared.salt === snapshot.salt &&
+			prepared.password === snapshot.password;
 		const codec =
 			snapshot.enabled && snapshot.salt && snapshot.password
-				? await this.createCodec(
-						requireProfileId(snapshot.profileId),
-						snapshot.salt,
-						snapshot.password,
-					)
+				? matches
+					? candidate!
+					: await this.createCodec(
+							requireProfileId(snapshot.profileId),
+							snapshot.salt,
+							snapshot.password,
+						)
 				: null;
+		assertCurrent();
 		settings.enableEncryption = snapshot.enabled;
 		settings.encryptionSalt = snapshot.salt;
 		settings.encryptionPassword = snapshot.password;

@@ -127,6 +127,17 @@ test("backup retains its destination and encryption password across a settings u
 	const path = client.uploadedPaths[0]!;
 	assert.ok(path.startsWith("vault/.backup/"));
 	assert.equal(isBackupEnvelope(client.files.get(path)!), true);
+	for (const encryptionPassword of [null, "new-vault-password"]) {
+		manager.updateSettings({
+			...settings,
+			remotePath: "other",
+			encryptionPassword,
+		});
+		await assert.rejects(
+			manager.downloadBackup(path),
+			BackupPasswordRequiredError,
+		);
+	}
 	const opened = await manager.downloadBackup(path, "backup-password");
 	assert.equal(new Uint8Array(opened)[0], 0x50);
 });
@@ -173,122 +184,78 @@ test("remote snapshot backup rejects legacy plugin data before download", async 
 	assert.deepEqual(client.uploadedPaths, []);
 });
 
-test("verified backup accepts an upload whose response was lost", async () => {
-	const { client, manager } = createManager({ storeThenTimeout: true });
-	const result = await manager.createBackup();
-	assert.equal(result.success, true);
-	assert.equal(client.uploadedPaths.length, 1);
-	assert.ok(result.backupName?.endsWith(".enc.zip"));
-	assert.equal(
-		isBackupEnvelope(client.files.get(client.uploadedPaths[0]!)!),
-		true,
-	);
-});
-
-for (const [name, flag, damaged] of [
-	[
-		"byte mismatch never overwrites and retries with a unique name",
-		"corruptFirstUpload",
-		[1, 2, 3],
-	],
-	[
-		"exclusive 409 collision is read back and retried under a new name",
-		"conflictFirstUpload",
-		[9, 9, 9],
-	],
-] as const) {
-	test(name, async () => {
+test("backup verification accepts committed timeouts and retries collisions without overwriting", async () => {
+	for (const [label, flag, damaged] of [
+		["byte mismatch", "corruptFirstUpload", [1, 2, 3]],
+		["exclusive collision", "conflictFirstUpload", [9, 9, 9]],
+		["lost response", "storeThenTimeout", null],
+	] as const) {
 		const { client, manager } = createManager({ [flag]: true });
-		assert.equal((await manager.createBackup()).success, true);
-		assert.equal(client.uploadedPaths.length, 2);
-		assert.notEqual(client.uploadedPaths[0], client.uploadedPaths[1]);
-		assert.deepEqual(
-			new Uint8Array(client.files.get(client.uploadedPaths[0]!)!),
-			new Uint8Array(damaged),
+		assert.equal((await manager.createBackup()).success, true, label);
+		assert.equal(client.uploadedPaths.length, damaged ? 2 : 1, label);
+		const verifiedPath =
+			client.uploadedPaths[client.uploadedPaths.length - 1]!;
+		assert.ok(verifiedPath.endsWith(".enc.zip"), label);
+		assert.equal(
+			isBackupEnvelope(client.files.get(verifiedPath)!),
+			true,
+			label,
 		);
-	});
-}
-
-test("self-contained backup opens with its own password after vault state changes", async () => {
-	const { manager, settings } = createManager();
-	const result = await manager.createBackup();
-	assert.equal(result.success, true);
-	const path = `vault/.backup/${result.backupName}`;
-	settings.encryptionPassword = "new-vault-password";
-	await assert.rejects(
-		manager.downloadBackup(path),
-		BackupPasswordRequiredError,
-	);
-	const zip = await manager.downloadBackup(path, "backup-password");
-	assert.equal(new Uint8Array(zip).slice(0, 2).toString(), "80,75");
+		if (damaged) {
+			assert.notEqual(client.uploadedPaths[0], verifiedPath, label);
+			assert.deepEqual(
+				new Uint8Array(client.files.get(client.uploadedPaths[0]!)!),
+				new Uint8Array(damaged),
+				label,
+			);
+		}
+	}
 });
 
-test("invalid envelope header is reported as corruption, not a password prompt", async () => {
+test("backup formats accept plaintext ZIP and reject corrupt or historical encryption without fallback", async () => {
 	const { client, manager } = createManager();
 	const invalid = new Uint8Array(12);
 	invalid.set(new TextEncoder().encode("OYDSBKP!"));
 	new DataView(invalid.buffer).setUint32(8, 16 * 1024 + 1, false);
-	client.files.set("vault/.backup/corrupt.enc.zip", invalid.buffer);
-	await assert.rejects(
-		manager.downloadBackup("vault/.backup/corrupt.enc.zip", "password"),
-		(error: unknown) =>
-			error instanceof Error &&
-			!(error instanceof BackupPasswordRequiredError) &&
-			/header length/.test(error.message),
-	);
-});
-
-test("numbered historical envelope is rejected without invoking decryption", async () => {
-	const { client, manager } = createManager();
-	client.files.set(
-		"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
-		new TextEncoder().encode("OYDSBKP2historical-envelope").buffer,
-	);
-	await assert.rejects(
-		manager.downloadBackup(
-			"vault/.backup/backup_2026-08-20_10-00-00.enc.zip",
-		),
-		UnsupportedHistoricalDataError,
-	);
-	assert.equal(client.decodeCalls, 0);
-});
-
-test("encrypted legacy backup names are ignored without compatibility decoding", async () => {
-	const { client, manager } = createManager();
-	const physicalName = "unrecognized-encrypted-name";
-	client.resources = [
-		fileResource(`disk:/vault/.backup/${physicalName}`, { size: 100 }),
-	];
-	const backups = await manager.listBackups();
-	assert.deepEqual(backups, []);
-});
-
-test("historical plaintext zip is returned without codec fallback", async () => {
-	const { client, manager } = createManager();
 	const zip = new TextEncoder().encode("PK\u0003\u0004 plaintext ZIP").buffer;
-	client.files.set("vault/.backup/backup_2026-08-20_10-00-00.zip", zip);
-	assert.deepEqual(
-		new Uint8Array(
-			await manager.downloadBackup(
-				"vault/.backup/backup_2026-08-20_10-00-00.zip",
-			),
-		),
-		new Uint8Array(zip),
-	);
-	assert.equal(client.decodeCalls, 0);
-});
-
-test("unknown historical zip bytes fail closed without decryption fallback", async () => {
-	const { client, manager } = createManager();
-	client.files.set(
-		"vault/.backup/backup_2026-08-20_10-00-00.zip",
-		new Uint8Array([1, 2, 3, 4]).buffer,
-	);
-	await assert.rejects(
-		manager.downloadBackup("vault/.backup/backup_2026-08-20_10-00-00.zip"),
-		UnsupportedHistoricalDataError,
-	);
-	assert.equal(client.decodeCalls, 0);
+	const historical = new TextEncoder().encode(
+		"OYDSBKP2historical-envelope",
+	).buffer;
+	for (const [label, suffix, content, error] of [
+		["plaintext ZIP", ".zip", zip, null],
+		["corrupt header", ".enc.zip", invalid.buffer, /header length/],
+		[
+			"historical envelope",
+			".enc.zip",
+			historical,
+			UnsupportedHistoricalDataError,
+		],
+		[
+			"unknown ZIP bytes",
+			".zip",
+			new Uint8Array([1, 2, 3, 4]).buffer,
+			UnsupportedHistoricalDataError,
+		],
+	] as const) {
+		const path = `vault/.backup/backup_2026-08-20_10-00-00${suffix}`;
+		client.files.set(path, content);
+		if (error) {
+			await assert.rejects(
+				manager.downloadBackup(path, "password"),
+				error,
+				label,
+			);
+		} else {
+			assert.deepEqual(await manager.downloadBackup(path), zip, label);
+		}
+		assert.equal(client.decodeCalls, 0, label);
+	}
+	client.resources = [
+		fileResource("disk:/vault/.backup/unrecognized-encrypted-name", {
+			size: 100,
+		}),
+	];
+	assert.deepEqual(await manager.listBackups(), []);
 });
 
 test("optional transition archive retains exact bytes and fails closed on source drift", async () => {

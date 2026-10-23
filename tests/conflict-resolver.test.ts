@@ -5,346 +5,239 @@ import type { FileMetadata, FolderTombstone } from "../src/types";
 import { ConflictResolver } from "../src/sync/reconciliation/conflicts";
 
 function file(
-	path: string,
 	sha256: string,
 	options: Partial<FileMetadata> = {},
 ): FileMetadata {
-	return fileMetadata(path, { sha256, ...options });
+	return fileMetadata("folder/note.md", { sha256, ...options });
 }
 
-function folderDelete(
-	path: string,
-	changedRevision: number,
-): Record<string, FolderTombstone> {
-	return {
-		[path]: {
-			path,
+const path = "folder/note.md";
+const baseline = file("base", {
+	changedRevision: 3,
+	remoteFingerprint: "old",
+	remoteMtime: 10_000,
+});
+const deleted = { ...baseline, deleted: true, changedRevision: 5 };
+
+test("folder tombstones delete only unchanged known descendants", () => {
+	const folder: Record<string, FolderTombstone> = {
+		folder: {
+			path: "folder",
 			deletedAt: 1,
-			changedRevision,
-			baseRevision: changedRevision - 1,
+			changedRevision: 4,
+			baseRevision: 3,
 			lastModifiedBy: "device-a",
 		},
 	};
-}
-
-test("first-sync local descendant survives a folder tombstone", () => {
-	const resolver = new ConflictResolver();
-	const operations = resolver.determineOperations(
-		new Map([["deep/folder/new.md", file("deep/folder/new.md", "new")]]),
-		new Map(),
-		{},
-		{},
-		1,
-		folderDelete("deep", 4),
-	);
-	assert.equal(operations[0]?.action, "upload");
-});
-
-test("unchanged descendant is deleted by a folder tombstone", () => {
-	const resolver = new ConflictResolver();
-	const baseline = file("deep/folder/note.md", "same", {
-		changedRevision: 3,
-	});
-	const operations = resolver.determineOperations(
-		new Map([["deep/folder/note.md", { ...baseline }]]),
-		new Map(),
-		{ "deep/folder/note.md": { ...baseline } },
-		{ "deep/folder/note.md": { ...baseline } },
-		1,
-		folderDelete("deep", 4),
-	);
-	assert.equal(operations[0]?.action, "delete_local");
-});
-
-test("new remote descendant survives a folder tombstone", () => {
-	const resolver = new ConflictResolver();
-	const remote = file("deep/new.md", "remote", {
-		remoteMtime: 10,
-	});
-	const operations = resolver.determineOperations(
-		new Map(),
-		new Map([["deep/new.md", remote]]),
-		{},
-		{},
-		1,
-		folderDelete("deep", 4),
-	);
-	assert.equal(operations[0]?.action, "download");
-});
-
-test("remote fingerprint change survives a folder tombstone", () => {
-	const resolver = new ConflictResolver();
-	const baseline = file("deep/note.md", "plain", {
-		changedRevision: 3,
-		remoteMtime: 10,
-		remoteFingerprint: "old",
-	});
-	const remote = {
-		...baseline,
-		remoteFingerprint: "new",
-	};
-	const operations = resolver.determineOperations(
-		new Map(),
-		new Map([["deep/note.md", remote]]),
-		{},
-		{ "deep/note.md": baseline },
-		1,
-		folderDelete("deep", 4),
-	);
-	assert.equal(operations[0]?.action, "download");
-});
-
-test("exact remote deletion wins over a local edit and retains remote cleanup", () => {
-	const resolver = new ConflictResolver();
-	const local = file("note.md", "edited");
-	const baseline = file("note.md", "old");
-	const remotePhysical = file("note.md", "stale", {
-		remoteMtime: 20,
-	});
-	const remoteDelete = {
-		...baseline,
-		deleted: true,
-		changedRevision: 5,
-	};
-	const operation = resolver.resolveAction(
-		"note.md",
-		local,
-		remotePhysical,
-		baseline,
-		remoteDelete,
-	);
-	assert.equal(operation.action, "delete_local");
-	assert.equal(operation.remoteMeta, remotePhysical);
-});
-
-test("stale local deletion without a pending mutation cannot delete canonical state", () => {
-	const resolver = new ConflictResolver();
-	const localDelete = {
-		...file("note.md", "old"),
-		deleted: true,
-		changedRevision: 2,
-	};
-	const operation = resolver.resolveAction(
-		"note.md",
-		null,
-		null,
-		localDelete,
-		file("note.md", "old"),
-	);
-	assert.equal(operation.action, "none");
-});
-
-test("pending physical local deletion is resumed instead of restored", () => {
-	const resolver = new ConflictResolver();
-	const deleted = {
-		...file("note.md", "same"),
-		deleted: true,
-		changedRevision: 5,
-	};
-	const operation = resolver.resolveAction(
-		"note.md",
-		file("note.md", "same"),
-		null,
-		deleted,
-		deleted,
-		undefined,
-		true,
-	);
-	assert.equal(operation.action, "delete_local");
-});
-
-test("fingerprint detects a remote edit inside the old mtime tolerance", () => {
-	const resolver = new ConflictResolver();
-	const baseline = file("note.md", "local", {
-		remoteMtime: 10_000,
-		remoteFingerprint: "old",
-	});
-	const operation = resolver.resolveAction(
-		"note.md",
-		file("note.md", "local"),
-		file("note.md", "encrypted", {
-			remoteMtime: 10_001,
-			remoteFingerprint: "new",
-		}),
-		baseline,
-		baseline,
-	);
-	assert.equal(operation.action, "download");
-});
-
-test("two devices editing from the same baseline produce a conflict", () => {
-	const resolver = new ConflictResolver();
-	const baseline = file("note.md", "base", {
-		changedRevision: 3,
-		remoteFingerprint: "base-physical",
-	});
-	const canonical = file("note.md", "remote-edit", {
-		changedRevision: 4,
-		remoteFingerprint: "remote-physical",
-	});
-	const operation = resolver.resolveAction(
-		"note.md",
-		file("note.md", "local-edit"),
-		file("note.md", "remote-ciphertext", {
-			remoteFingerprint: "remote-physical",
-		}),
-		baseline,
-		canonical,
-	);
-	assert.equal(operation.action, "conflict");
-});
-
-test("first sync with different content at the same path produces a conflict", () => {
-	const resolver = new ConflictResolver();
-	const operation = resolver.resolveAction(
-		"note.md",
-		file("note.md", "local"),
-		file("note.md", "remote", {
-			remoteFingerprint: "remote",
-		}),
-		null,
-		file("note.md", "remote", {
-			changedRevision: 1,
-			remoteFingerprint: "remote",
-		}),
-	);
-	assert.equal(operation.action, "conflict");
-});
-
-test("same plaintext hash on encrypted first sync creates a baseline without upload", () => {
-	const resolver = new ConflictResolver();
-	const operation = resolver.resolveAction(
-		"note.md",
-		file("note.md", "plain"),
-		file("note.md", "ciphertext", {
-			remoteFingerprint: "ciphertext",
-		}),
-		null,
-		file("note.md", "plain", {
-			changedRevision: 1,
-			remoteFingerprint: "ciphertext",
-		}),
-	);
-	assert.equal(operation.action, "none");
-});
-
-test("epoch adoption reapplies local changes and accepts remote-only changes", () => {
-	const resolver = new ConflictResolver();
-	const baseline = {
-		"local-edit.md": file("local-edit.md", "base"),
-		"remote-edit.md": file("remote-edit.md", "base"),
-		"local-delete.md": file("local-delete.md", "base"),
-		"remote-delete.md": file("remote-delete.md", "base"),
-	};
-	const canonical = {
-		"local-edit.md": file("local-edit.md", "base"),
-		"remote-edit.md": file("remote-edit.md", "remote"),
-		"local-delete.md": file("local-delete.md", "base"),
-	};
-	const remote = new Map(
-		Object.entries(canonical).map(([path, metadata]) => [path, metadata]),
-	);
-	const operations = resolver.determineEpochAdoptionOperations(
-		new Map([
-			["local-edit.md", file("local-edit.md", "local")],
-			["remote-edit.md", file("remote-edit.md", "base")],
-			["remote-delete.md", file("remote-delete.md", "base")],
-		]),
-		remote,
-		baseline,
-		canonical,
-	);
-	assert.deepEqual(
-		Object.fromEntries(
-			operations.map((operation) => [operation.path, operation.action]),
-		),
+	for (const { label, local, remote, known, expected } of [
 		{
-			"local-edit.md": "upload",
-			"remote-edit.md": "download",
-			"local-delete.md": "delete_remote",
-			"remote-delete.md": "delete_local",
+			label: "first-sync local child",
+			local: file("new"),
+			expected: "upload",
 		},
-	);
+		{
+			label: "unchanged known child",
+			local: baseline,
+			known: baseline,
+			expected: "delete_local",
+		},
+		{
+			label: "new remote child",
+			remote: file("remote", { remoteMtime: 10 }),
+			expected: "download",
+		},
+		{
+			label: "external remote edit",
+			remote: { ...baseline, remoteFingerprint: "new" },
+			known: baseline,
+			expected: "download",
+		},
+	]) {
+		const operations = new ConflictResolver().determineOperations(
+			new Map(local ? [[path, local]] : []),
+			new Map(remote ? [[path, remote]] : []),
+			local && known ? { [path]: known } : {},
+			known ? { [path]: known } : {},
+			1,
+			folder,
+		);
+		assert.deepEqual(
+			operations.map(({ action }) => action),
+			[expected],
+			label,
+		);
+	}
 });
 
-test("epoch adoption restores a remote deletion and conflicts on two live edits", () => {
-	const resolver = new ConflictResolver();
-	const baseline = {
-		"restore.md": file("restore.md", "base"),
-		"conflict.md": file("conflict.md", "base"),
+test("file reconciliation preserves exact deletions and detects logical or physical conflicts", () => {
+	type Case = {
+		label: string;
+		local?: FileMetadata;
+		remote?: FileMetadata;
+		previous?: FileMetadata;
+		canonical?: FileMetadata;
+		pendingDelete?: boolean;
+		expected: string;
 	};
-	const canonical = {
-		"conflict.md": file("conflict.md", "remote"),
-	};
-	const operations = resolver.determineEpochAdoptionOperations(
-		new Map([
-			["restore.md", file("restore.md", "local")],
-			["conflict.md", file("conflict.md", "local")],
-		]),
-		new Map([["conflict.md", canonical["conflict.md"]]]),
-		baseline,
+	const physical = file("stale", { remoteMtime: 20 });
+	const cases: Case[] = [
+		{
+			label: "exact deletion beats local edit",
+			local: file("edited"),
+			remote: physical,
+			previous: baseline,
+			canonical: deleted,
+			expected: "delete_local",
+		},
+		{
+			label: "stale local deletion has no authority",
+			previous: { ...deleted, changedRevision: 2 },
+			canonical: baseline,
+			expected: "none",
+		},
+		{
+			label: "pending physical deletion resumes",
+			local: baseline,
+			previous: deleted,
+			canonical: deleted,
+			pendingDelete: true,
+			expected: "delete_local",
+		},
+		{
+			label: "fingerprint detects edit within old mtime tolerance",
+			local: baseline,
+			remote: file("ciphertext", {
+				remoteMtime: 10_001,
+				remoteFingerprint: "new",
+			}),
+			previous: baseline,
+			canonical: baseline,
+			expected: "download",
+		},
+		{
+			label: "two devices edit a shared baseline",
+			local: file("local-edit"),
+			remote: file("ciphertext", { remoteFingerprint: "new" }),
+			previous: baseline,
+			canonical: file("remote-edit", {
+				changedRevision: 4,
+				remoteFingerprint: "new",
+			}),
+			expected: "conflict",
+		},
+		{
+			label: "first sync has different plaintext",
+			local: file("local"),
+			remote: file("remote", { remoteFingerprint: "remote" }),
+			canonical: file("remote", {
+				changedRevision: 1,
+				remoteFingerprint: "remote",
+			}),
+			expected: "conflict",
+		},
+		{
+			label: "encrypted first sync has equal plaintext",
+			local: file("plain"),
+			remote: file("ciphertext", { remoteFingerprint: "ciphertext" }),
+			canonical: file("plain", {
+				changedRevision: 1,
+				remoteFingerprint: "ciphertext",
+			}),
+			expected: "none",
+		},
+	];
+	for (const {
+		label,
+		local,
+		remote,
+		previous,
 		canonical,
-	);
-	assert.deepEqual(
-		Object.fromEntries(
-			operations.map((operation) => [operation.path, operation.action]),
-		),
-		{ "restore.md": "upload", "conflict.md": "conflict" },
-	);
+		pendingDelete,
+		expected,
+	} of cases) {
+		const operation = new ConflictResolver().resolveAction(
+			path,
+			local ?? null,
+			remote ?? null,
+			previous ?? null,
+			canonical ?? null,
+			undefined,
+			pendingDelete,
+		);
+		assert.equal(operation.action, expected, label);
+		if (remote === physical) {
+			assert.equal(operation.remoteMeta, physical, label);
+		}
+	}
 });
 
-test("unknown remote child survives an old device folder deletion", () => {
-	const resolver = new ConflictResolver();
-	const child = file("folder/new-child.md", "remote");
-	const operations = resolver.determineEpochAdoptionOperations(
-		new Map(),
-		new Map([[child.path, child]]),
-		{},
-		{ [child.path]: child },
-	);
-	assert.equal(operations[0]?.action, "download");
-});
-
-test("epoch adoption still detects external physical remote edits", () => {
-	const resolver = new ConflictResolver();
-	const baseline = file("note.md", "base", {
-		remoteFingerprint: "old-physical",
-	});
-	const canonical = { ...baseline };
-	const physical = file("note.md", "ciphertext", {
-		remoteFingerprint: "new-physical",
-	});
-	const operations = resolver.determineEpochAdoptionOperations(
-		new Map([["note.md", { ...baseline }]]),
-		new Map([["note.md", physical]]),
-		{ "note.md": baseline },
-		{ "note.md": canonical },
-	);
-	assert.equal(operations[0]?.action, "download");
-});
-
-test("offline device does not resurrect a Force-removed file", () => {
-	const resolver = new ConflictResolver();
-	const baseline = file("removed.md", "base");
-	const tombstone = {
+test("epoch adoption reapplies offline edits while preserving canonical and physical changes", () => {
+	type Case = [
+		label: string,
+		local: FileMetadata | null,
+		canonical: FileMetadata | null,
+		expected: string,
+		previous?: FileMetadata | null,
+		physical?: FileMetadata,
+	];
+	const forceRemoved = {
 		...baseline,
 		deleted: true,
 		mutationSeq: 0,
 		changedRevision: 1,
 	};
-	const unchanged = resolver.determineEpochAdoptionOperations(
-		new Map([[baseline.path, baseline]]),
-		new Map([[baseline.path, baseline]]),
-		{ [baseline.path]: baseline },
-		{ [baseline.path]: tombstone },
-	);
-	assert.equal(unchanged[0]?.action, "delete_local");
-
-	const changed = resolver.determineEpochAdoptionOperations(
-		new Map([[baseline.path, file(baseline.path, "offline-edit")]]),
-		new Map([[baseline.path, baseline]]),
-		{ [baseline.path]: baseline },
-		{ [baseline.path]: tombstone },
-	);
-	assert.equal(changed[0]?.action, "upload");
+	const cases: Case[] = [
+		["local edit", file("local"), baseline, "upload"],
+		["remote-only edit", baseline, file("remote"), "download"],
+		["local delete", null, baseline, "delete_remote"],
+		["remote delete", baseline, null, "delete_local"],
+		["edit restores remote deletion", file("local"), null, "upload"],
+		["two live edits", file("local"), file("remote"), "conflict"],
+		["unknown remote child", null, file("remote"), "download", null],
+		[
+			"external physical edit",
+			baseline,
+			baseline,
+			"download",
+			baseline,
+			file("ciphertext", { remoteFingerprint: "new" }),
+		],
+		[
+			"unchanged Force-removed file",
+			baseline,
+			forceRemoved,
+			"delete_local",
+			baseline,
+			baseline,
+		],
+		[
+			"offline edit after Force removal",
+			file("offline-edit"),
+			forceRemoved,
+			"upload",
+			baseline,
+			baseline,
+		],
+	];
+	for (const [
+		label,
+		local,
+		canonical,
+		expected,
+		previous = baseline,
+		physical = canonical,
+	] of cases) {
+		const operations =
+			new ConflictResolver().determineEpochAdoptionOperations(
+				new Map(local ? [[path, local]] : []),
+				new Map(physical ? [[path, physical]] : []),
+				previous ? { [path]: previous } : {},
+				canonical ? { [path]: canonical } : {},
+			);
+		assert.deepEqual(
+			operations.map(({ action }) => action),
+			[expected],
+			label,
+		);
+	}
 });

@@ -17,6 +17,7 @@ export type EncryptionIndex = Pick<
 	IndexManager,
 	| "assertMaintenanceAuthority"
 	| "clearIndexTransitionServices"
+	| "createStartupReadSession"
 	| "clearMaintenance"
 	| "completePhysicalAction"
 	| "deleteEncryptionManifest"
@@ -42,6 +43,7 @@ export type EncryptionIndex = Pick<
 export type EncryptionEngine = Pick<
 	SyncEngine,
 	| "fullSync"
+	| "createReadLifetimeGuard"
 	| "reencodeRemoteFiles"
 	| "runExclusiveMaintenance"
 	| "showMaintenanceCleanupPhase"

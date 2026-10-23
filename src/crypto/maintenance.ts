@@ -71,15 +71,28 @@ export class EncryptionMaintenance {
 
 	async applyEncryptionSnapshot(
 		snapshot: LocalEncryptionSnapshot,
+		candidate: EncryptionCodec | null = this.context.getService(),
 	): Promise<EncryptionCodec | null> {
-		const service = await this.context.manager.applySnapshot(
-			this.context.getSettings(),
-			snapshot,
-		);
-		this.context.setService(service);
-		this.context.client.setEncryptionService(service);
-		await this.context.persist();
-		return service;
+		const assertLifetime = this.context.engine.createReadLifetimeGuard();
+		const reads = this.context.index.createStartupReadSession(() => {
+			assertLifetime();
+			this.context.assertConnectionAllowed();
+		});
+		try {
+			const service = await this.context.manager.applySnapshot(
+				this.context.getSettings(),
+				snapshot,
+				candidate,
+				() => reads.assertCurrent(),
+			);
+			this.context.setService(service);
+			this.context.client.setEncryptionService(service);
+			await this.context.persist();
+			this.context.assertConnectionAllowed();
+			return service;
+		} finally {
+			reads.close();
+		}
 	}
 
 	async beginEncryptionTransition(

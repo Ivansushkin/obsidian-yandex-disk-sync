@@ -1,7 +1,11 @@
 import type { YandexDiskClient } from "../api/yandex-client";
 import type { VaultAdapter } from "../api/vault-adapter";
 import { computeSha256, computeSha256FromString } from "../utils/hash-utils";
-import { isLegacyPluginDataPath, toLocalPath } from "../utils/path-utils";
+import {
+	isForcePluginPath,
+	isLegacyPluginDataPath,
+	toLocalPath,
+} from "../utils/path-utils";
 
 export interface BackupSnapshotFile {
 	path: string;
@@ -17,28 +21,37 @@ export interface BackupSnapshot {
 /** Capture the exact logical bytes that a local-vault backup protects. */
 export async function captureLogicalVaultSnapshot(
 	vaultAdapter: VaultAdapter,
+	fullForce = false,
 ): Promise<BackupSnapshot> {
-	return await captureLogicalVault(vaultAdapter, []);
+	return await captureLogicalVault(vaultAdapter, [], fullForce);
 }
 
 /** Hash the logical backup scope without retaining file contents. */
 export async function captureLogicalVaultDigest(
 	vaultAdapter: VaultAdapter,
+	fullForce = false,
 ): Promise<string> {
-	return (await captureLogicalVault(vaultAdapter)).digest;
+	return (await captureLogicalVault(vaultAdapter, undefined, fullForce))
+		.digest;
 }
 
 async function captureLogicalVault(
 	vaultAdapter: VaultAdapter,
 	files?: BackupSnapshotFile[],
+	fullForce = false,
 ): Promise<BackupSnapshot> {
-	const paths = [...vaultAdapter.getAllSyncableFiles()]
-		.sort((left, right) => left.path.localeCompare(right.path))
-		.map((file) => file.path);
+	const paths = fullForce
+		? (await vaultAdapter.getForceTree(true)).files
+		: [...vaultAdapter.getAllSyncableFiles()]
+				.sort((left, right) => left.path.localeCompare(right.path))
+				.map((file) => file.path);
 	return await captureSnapshot(
 		"logical-vault",
 		paths,
-		(path) => vaultAdapter.readFile(path),
+		(path) =>
+			fullForce
+				? vaultAdapter.readForceFile(path)
+				: vaultAdapter.readFile(path),
 		files,
 	);
 }
@@ -47,16 +60,25 @@ async function captureLogicalVault(
 export async function captureRemoteRawSnapshot(
 	yandexClient: YandexDiskClient,
 	remotePath: string,
+	forceConfigDir?: string,
 ): Promise<BackupSnapshot> {
-	return await captureRemoteRaw(yandexClient, remotePath, []);
+	return await captureRemoteRaw(yandexClient, remotePath, [], forceConfigDir);
 }
 
 /** Hash raw remote backup bytes without retaining file contents. */
 export async function captureRemoteRawDigest(
 	yandexClient: YandexDiskClient,
 	remotePath: string,
+	forceConfigDir?: string,
 ): Promise<string> {
-	return (await captureRemoteRaw(yandexClient, remotePath)).digest;
+	return (
+		await captureRemoteRaw(
+			yandexClient,
+			remotePath,
+			undefined,
+			forceConfigDir,
+		)
+	).digest;
 }
 
 /** Reject exposed plugin storage before reading either remote snapshot form. */
@@ -64,12 +86,27 @@ async function captureRemoteRaw(
 	yandexClient: YandexDiskClient,
 	remotePath: string,
 	files?: BackupSnapshotFile[],
+	forceConfigDir?: string,
 ): Promise<BackupSnapshot> {
 	const resources = await yandexClient.getResourcesRecursive(
 		remotePath,
 		true,
+		4,
+		false,
+		forceConfigDir
+			? (path) => {
+					const relative = toLocalPath(path, remotePath);
+					return (
+						relative !== ".backup" &&
+						!relative.startsWith(".backup/") &&
+						!isLegacyPluginDataPath(relative) &&
+						!isForcePluginPath(relative, forceConfigDir)
+					);
+				}
+			: undefined,
 	);
 	if (
+		!forceConfigDir &&
 		resources.some((resource) =>
 			isLegacyPluginDataPath(toLocalPath(resource.path, remotePath)),
 		)

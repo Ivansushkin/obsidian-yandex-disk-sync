@@ -66,52 +66,7 @@ test("encryption manager requires explicit current profile metadata", () => {
 	);
 });
 
-test("encryption manager emits strict semantic hardened manifest descriptors", async () => {
-	const codec = await manager.createCodec("hardened", salt, "password");
-	const targetVerifier = await codec.createVerifier();
-	const source = encryptedMode(
-		4,
-		EncryptionService.bytesToBase64(new Uint8Array(16).fill(6)),
-		"source-verifier",
-	);
-	const target = encryptedMode(5, salt, targetVerifier);
-	const manifest = await manager.createManifest({
-		service: codec,
-		salt,
-		state: "rotating",
-		revision: 5,
-		deviceId: "device-a",
-		transition: localTransition({
-			id: "transition-a",
-			source: localSnapshot(source.salt, "source-password", 4),
-			target: localSnapshot(salt, "password", 5),
-			sourceRawPaths: [],
-			sourceFingerprints: {},
-			sourceCanonicalRevision: 11,
-			backupProof: {
-				...localTransition().backupProof!,
-				canonicalRevision: 11,
-			},
-		}),
-		maintenance: createMaintenance({
-			phase: "prepared",
-			sourceRevision: 11,
-			targetRevision: null,
-			source,
-			target,
-		}),
-	});
-	assert.equal(manifest.format, "encryption-manifest");
-	assert.equal("version" in manifest, false);
-	assert.equal(manifest.profileId, "hardened");
-	assert.equal(manifest.kdf.iterations, 600_000);
-	assert.equal(manifest.filenameCipher.name, "AES-SIV");
-	assert.equal(manifest.verifier, targetVerifier);
-	assert.equal(manifest.transition?.sourceProfileId, "hardened");
-	assert.equal(manifest.transition?.targetProfileId, "hardened");
-});
-
-test("transition manifest reuses the verifier for its declared key", async () => {
+test("transition manifests preserve semantic descriptors and authenticate their declared key", async () => {
 	const targetCodec = await manager.createCodec(
 		"hardened",
 		salt,
@@ -122,51 +77,77 @@ test("transition manifest reuses the verifier for its declared key", async () =>
 		salt,
 		"wrong-password",
 	);
-	const targetVerifier = await targetCodec.createVerifier();
-	const target = encryptedMode(1, salt, targetVerifier);
-	const transition = localTransition({
-		id: "enable-transition",
-		kind: "enable",
-		source: localSnapshot(null, null, null),
-		target: localSnapshot(salt, "target-password", 1),
-		sourceRawPaths: [],
-		sourceFingerprints: {},
-	});
-	const maintenance = createMaintenance({
-		id: transition.id,
-		kind: transition.kind,
-		phase: transition.phase,
-		targetRevision: null,
-		source: plaintextMode(),
-		target,
-	});
-	const options = {
-		service: targetCodec,
-		salt,
-		state: "enabling" as const,
-		revision: 1,
-		deviceId: "device-a",
-		transition,
-		maintenance,
-	};
-	const manifest = await manager.createManifest(options);
-	assert.equal(manifest.verifier, targetVerifier);
-	const staged = await manager.createManifest({
-		...options,
-		transition: { ...transition, phase: "files-copied" },
-		maintenance: {
-			...maintenance,
-			phase: "index-committed",
-			targetRevision: 5,
-		},
-	});
-	assert.equal(staged.transition?.phase, "index-committed");
-	await assert.rejects(
-		manager.createManifest({ ...options, service: wrongCodec }),
-		/does not match its declared mode/,
+	const verifier = await targetCodec.createVerifier();
+	const sourceSalt = EncryptionService.bytesToBase64(
+		new Uint8Array(16).fill(6),
 	);
-	await assert.rejects(
-		manager.createManifest({ ...options, state: "rotating" }),
-		/metadata is incoherent/,
-	);
+	for (const kind of ["enable", "rotate"] as const) {
+		const transition = localTransition({
+			id: `${kind}-transition`,
+			kind,
+			source:
+				kind === "enable"
+					? localSnapshot(null, null, null)
+					: localSnapshot(sourceSalt, "source-password", 4),
+			target: localSnapshot(salt, "target-password", 5),
+			sourceRawPaths: [],
+			sourceFingerprints: {},
+		});
+		const maintenance = createMaintenance({
+			id: transition.id,
+			kind,
+			phase: transition.phase,
+			targetRevision: null,
+			source:
+				kind === "enable"
+					? plaintextMode()
+					: encryptedMode(4, sourceSalt, "source-verifier"),
+			target: encryptedMode(5, salt, verifier),
+		});
+		const options = {
+			service: targetCodec,
+			salt,
+			state:
+				kind === "enable"
+					? ("enabling" as const)
+					: ("rotating" as const),
+			revision: 5,
+			deviceId: "device-a",
+			transition,
+			maintenance,
+		};
+		const manifest = await manager.createManifest(options);
+		assert.equal(manifest.format, "encryption-manifest", kind);
+		assert.equal("version" in manifest, false, kind);
+		assert.equal(manifest.profileId, "hardened", kind);
+		assert.equal(manifest.kdf.iterations, 600_000, kind);
+		assert.equal(manifest.filenameCipher.name, "AES-SIV", kind);
+		assert.equal(manifest.verifier, verifier, kind);
+		assert.equal(
+			manifest.transition?.sourceProfileId,
+			kind === "enable" ? null : "hardened",
+			kind,
+		);
+		assert.equal(manifest.transition?.targetProfileId, "hardened", kind);
+		const staged = await manager.createManifest({
+			...options,
+			transition: { ...transition, phase: "files-copied" },
+			maintenance: {
+				...maintenance,
+				phase: "index-committed",
+				targetRevision: 5,
+			},
+		});
+		assert.equal(staged.transition?.phase, "index-committed", kind);
+		await assert.rejects(
+			manager.createManifest({ ...options, service: wrongCodec }),
+			/does not match its declared mode/,
+			kind,
+		);
+		await assert.rejects(
+			manager.createManifest({ ...options, state: "disabling" }),
+			/metadata is incoherent/,
+			kind,
+		);
+	}
 });

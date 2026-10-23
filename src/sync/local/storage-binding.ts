@@ -1,5 +1,8 @@
 import type { YandexDiskClient } from "../../api/yandex-client";
-import type { IndexManager } from "../canonical/manager";
+import type {
+	IndexManager,
+	RemoteAuthorityObservation,
+} from "../canonical/manager";
 import type { YandexDiskSyncSettings } from "../../types";
 import {
 	readRemoteStorageScope,
@@ -35,7 +38,19 @@ export class StorageBindingController {
 
 	constructor(private readonly deps: Dependencies) {}
 
-	ensure(prompt: boolean): Promise<boolean> {
+	ensure(
+		prompt: boolean,
+		observation?: RemoteAuthorityObservation,
+	): Promise<boolean> {
+		if (
+			!prompt &&
+			observation &&
+			this.deps.index.getLocalIndex().remoteScope
+		) {
+			return this.deps.index
+				.assertRemoteScope(observation)
+				.then(() => true);
+		}
 		if (!this.pending) {
 			this.pending = this.ensureNow(prompt).finally(() => {
 				this.pending = null;

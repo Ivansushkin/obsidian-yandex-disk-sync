@@ -452,7 +452,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.setDesc(t("settings.max_concurrency_desc"))
 			.addSlider((slider) =>
 				slider
-					.setLimits(1, 20, 1)
+					.setLimits(1, 40, 1)
 					.setValue(this.plugin.settings.maxConcurrency)
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()

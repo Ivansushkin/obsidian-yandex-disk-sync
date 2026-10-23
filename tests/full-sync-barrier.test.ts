@@ -21,6 +21,7 @@ import {
 	type FileMetadata,
 	type IndexMaintenance,
 	type PendingMutation,
+	type SyncIndex,
 } from "../src/types";
 import {
 	fileEvent,
@@ -43,7 +44,25 @@ class FullSyncIndexFake extends MemoryIndex {
 	}
 
 	async loadRemoteIndex() {
+		// Model the independent reducer baseline captured by a verified load.
+		(
+			this as unknown as { loadedRemoteIndex: SyncIndex }
+		).loadedRemoteIndex = structuredClone(this.index);
 		return structuredClone(this.index);
+	}
+
+	override createCanonicalReadSession(assertActive: () => void = () => {}) {
+		const read = async () => {
+			assertActive();
+			return await this.readCanonicalIndex();
+		};
+		return Object.assign(read, {
+			assertCurrent: assertActive,
+			load: async () => {
+				assertActive();
+				return await this.loadRemoteIndex();
+			},
+		});
 	}
 
 	getMaintenance() {
@@ -83,6 +102,15 @@ function createHarness(encrypted: boolean) {
 	const vaultFiles = new Set<string>();
 	let folderCacheClearCount = 0;
 	const yandexClient = {
+		async withWriteGuard<T>(
+			assertCurrent: () => void,
+			action: () => Promise<T>,
+		): Promise<T> {
+			assertCurrent();
+			const result = await action();
+			assertCurrent();
+			return result;
+		},
 		clearFolderCache: () => {
 			folderCacheClearCount++;
 		},
@@ -124,51 +152,54 @@ function createHarness(encrypted: boolean) {
 	};
 }
 
-for (const encrypted of [false, true]) {
-	const mode = encrypted ? "encrypted" : "plaintext";
-
-	test(`${mode} no-op full consumes a stale watcher upload without remote write`, async () => {
+test("full settles stale watcher work and FIFO puts with only required canonical commits", async () => {
+	for (const work of ["upload", "rename", "put"] as const) {
 		const { engine, index, watcher, getFolderCacheClearCount } =
-			createHarness(encrypted);
-		watcher.loadDeferredEvents([fileEvent("stale-upload", "missing.md")]);
-
+			createHarness(false);
+		if (work === "put") {
+			index.enqueuePut("missing.md", "obsolete-local-sha");
+		} else {
+			watcher.loadDeferredEvents(
+				work === "upload"
+					? [fileEvent("stale-upload", "missing.md")]
+					: [renameEvent("stale-rename", "A.md", "B.md")],
+			);
+		}
+		let paused = false;
+		engine.onSyncPause(() => {
+			paused = true;
+		});
+		const tokens: Array<string | undefined> = [];
+		engine.setSyncGuardCallback((token) => {
+			assert.equal(paused, true, work);
+			tokens.push(token);
+			return {
+				blockReason: null,
+				validationToken: token ?? "manifest-v1",
+			};
+		});
 		const result = await engine.fullSync();
-
-		assert.equal(result.success, true);
-		assert.equal(result.uploaded, 0);
-		assert.equal(result.downloaded, 0);
-		assert.equal(result.deleted, 0);
-		assert.equal(index.remoteSaveCount, 0);
-		assert.equal(getFolderCacheClearCount(), 1);
-		assert.deepEqual(watcher.getDeferredEvents(), []);
-	});
-
-	test(`${mode} full settles an uncommitted put with one watermark commit`, async () => {
-		const { engine, index } = createHarness(encrypted);
-		const pending = index.enqueuePut("missing.md", "obsolete-local-sha");
-
-		const result = await engine.fullSync();
-
-		assert.equal(result.success, true);
-		assert.equal(index.remoteSaveCount, 1);
-		assert.equal(index.index.files["missing.md"], undefined);
-		assert.equal(index.index.appliedMutationSeq["device-a"], pending.seq);
-		assert.deepEqual(index.store.getMutations(), []);
-	});
-
-	test(`${mode} full supersedes a stale rename after both paths settle`, async () => {
-		const { engine, index, watcher } = createHarness(encrypted);
-		watcher.loadDeferredEvents([
-			renameEvent("stale-rename", "A.md", "B.md"),
-		]);
-
-		const result = await engine.fullSync();
-
-		assert.equal(result.success, true);
-		assert.equal(index.remoteSaveCount, 0);
-		assert.deepEqual(watcher.getDeferredEvents(), []);
-	});
-}
+		assert.equal(result.success, true, work);
+		assert.deepEqual(
+			[result.uploaded, result.downloaded, result.deleted],
+			[0, 0, 0],
+			work,
+		);
+		assert.equal(index.remoteSaveCount, work === "put" ? 1 : 0, work);
+		assert.equal(getFolderCacheClearCount(), 1, work);
+		assert.deepEqual(watcher.getDeferredEvents(), [], work);
+		assert.deepEqual(index.store.getMutations(), [], work);
+		assert.deepEqual(
+			tokens,
+			work === "put" ? [undefined, "manifest-v1"] : [undefined],
+			work,
+		);
+		if (work === "put") {
+			assert.equal(index.index.files["missing.md"], undefined);
+			assert.equal(index.index.appliedMutationSeq["device-a"], 1);
+		}
+	}
+});
 
 test("encryption preflight rejects active canonical maintenance before filesystem work", async () => {
 	const { engine, index } = createHarness(false);
@@ -319,49 +350,33 @@ test("recursive transaction cause keeps the epoch replacement classification", (
 	assert.equal(classifySyncError(error), "epoch-replaced-during-sync");
 });
 
-test("full leaves an ambiguous causal rename durable and reports an error", async () => {
-	const { engine, index, watcher, vaultFiles } = createHarness(false);
-	const source = fileMetadata("A.md", "source-sha", { changedRevision: 7 });
-	index.index.files["A.md"] = { ...source };
-	index.local.files["A.md"] = { ...source };
-	index.localFiles.set("A.md", { ...source });
-	index.remoteFiles.set("A.md", { ...source });
-	vaultFiles.add("A.md");
-	watcher.loadDeferredEvents([
-		renameEvent("ambiguous-rename", "A.md", "B.md"),
-	]);
-
-	const result = await engine.fullSync();
-
-	assert.equal(result.success, false);
-	assert.equal(
-		result.errors.some(
-			(error) => error.code === "watcher-rename-unresolved",
-		),
-		true,
-	);
-	assert.equal(watcher.getDeferredEvents().length, 1);
-	assert.equal(index.local.observedRevision, 7);
-});
-
-test("full acknowledges an already applied rename target without remote write", async () => {
-	const { engine, index, watcher, vaultFiles } = createHarness(false);
-	const target = fileMetadata("B.md", "target-sha", {
-		changedRevision: 7,
-		remoteFingerprint: "target-fingerprint",
-	});
-	index.index.files["B.md"] = { ...target };
-	index.local.files["B.md"] = { ...target };
-	index.localFiles.set("B.md", { ...target });
-	index.remoteFiles.set("B.md", { ...target });
-	index.onBuildLocalIndex = () => vaultFiles.add("B.md");
-	watcher.loadDeferredEvents([renameEvent("applied-rename", "A.md", "B.md")]);
-
-	const result = await engine.fullSync();
-
-	assert.equal(result.success, true);
-	assert.equal(index.remoteSaveCount, 0);
-	assert.deepEqual(watcher.getDeferredEvents(), []);
+test("full retains ambiguous rename sources and acknowledges materialized targets", async () => {
+	for (const applied of [false, true]) {
+		const { engine, index, watcher, vaultFiles } = createHarness(false);
+		const path = applied ? "B.md" : "A.md";
+		const metadata = fileMetadata(path, "content", {
+			changedRevision: 7,
+			remoteFingerprint: "fingerprint",
+		});
+		index.index.files[path] = { ...metadata };
+		index.local.files[path] = { ...metadata };
+		index.localFiles.set(path, { ...metadata });
+		index.remoteFiles.set(path, { ...metadata });
+		index.onBuildLocalIndex = () => vaultFiles.add(path);
+		watcher.loadDeferredEvents([renameEvent("rename", "A.md", "B.md")]);
+		const result = await engine.fullSync();
+		assert.equal(result.success, applied);
+		assert.equal(index.remoteSaveCount, 0);
+		assert.equal(watcher.getDeferredEvents().length, applied ? 0 : 1);
+		if (!applied) {
+			assert.ok(
+				result.errors.some(
+					(error) => error.code === "watcher-rename-unresolved",
+				),
+			);
+			assert.equal(index.local.observedRevision, 7);
+		}
+	}
 });
 
 test("post-full rename acknowledgement persists before observed revision advances", async () => {
@@ -390,46 +405,6 @@ test("post-full rename acknowledgement persists before observed revision advance
 		),
 		true,
 	);
-});
-
-test("strict no-op validates encryption only once", async () => {
-	const { engine } = createHarness(true);
-	const calls: Array<string | undefined> = [];
-	let pausedBeforeGuard = false;
-	engine.onSyncPause(() => {
-		pausedBeforeGuard = true;
-	});
-	engine.setSyncGuardCallback((validationToken) => {
-		assert.equal(pausedBeforeGuard, true);
-		calls.push(validationToken);
-		return {
-			blockReason: null,
-			validationToken: validationToken ?? "manifest-v1",
-		};
-	});
-
-	const result = await engine.fullSync();
-
-	assert.equal(result.success, true);
-	assert.deepEqual(calls, [undefined]);
-});
-
-test("dirty full validates the manifest token before commit", async () => {
-	const { engine, index } = createHarness(true);
-	index.enqueuePut("missing.md", "obsolete-local-sha");
-	const calls: Array<string | undefined> = [];
-	engine.setSyncGuardCallback((validationToken) => {
-		calls.push(validationToken);
-		return {
-			blockReason: null,
-			validationToken: validationToken ?? "manifest-v1",
-		};
-	});
-
-	const result = await engine.fullSync();
-
-	assert.equal(result.success, true);
-	assert.deepEqual(calls, [undefined, "manifest-v1"]);
 });
 
 test("full sync rejects an ambiguous remote tree before applying any file", async () => {

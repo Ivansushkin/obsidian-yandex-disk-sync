@@ -64,7 +64,7 @@ export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	syncDotObsidian: false,
 	deviceId: "",
 	debounceDelay: 1000,
-	maxConcurrency: 10,
+	maxConcurrency: 20,
 	enableDebugLogging: false,
 	logToFile: true,
 	enableEncryption: false,

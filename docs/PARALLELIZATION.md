@@ -127,15 +127,72 @@ Lifecycle callbacks уже принятой сессии сохраняются 
 
 `utils/semaphore.ts` ограничивает параллельные независимые задачи.
 `runWithConcurrencySettled` сохраняет отдельные результаты, чтобы ошибка одного transfer
-не скрывала остальные. Лимит файлов задаёт `maxConcurrency`; каталог папок также обходится
-с ограниченной параллельностью. Параллелизм не переносится на canonical transactions.
+не скрывала остальные. Лимит файлов и независимых чтений каталогов обычного sync задаёт
+`maxConcurrency`: целое число 1–40, по умолчанию 20 при отсутствии настройки;
+сохранённое значение не заменяется. Скрытого ограничения обхода до 4 нет. Страницы
+одного каталога и зависимые authority checks сохраняют порядок. Dynamic queue
+запускает обнаруженного потомка при освобождении слота, без барьера уровня.
+Каждый raw каталог посещается один раз; результат сортируется. Первая ошибка
+останавливает новые directory tasks; уже начатые завершаются до отказа без
+частичного success. Полная pagination и фильтры сохраняются. Параллелизм не
+переносится на canonical transactions и persistence. Direct Force и отдельные
+rename/recovery ограничения сохраняют свои контракты.
+
+Одна initial/full authority evaluation передаёт scope/manifest/canonical validators
+opaque observation из одной новой пары fully paginated root listings. Root identity
+проверяется на каждой странице, service metadata — между проходами. Observation
+живёт только внутри validation callback; следующая pre-write/retry evaluation
+обязана получить новую пару. Standalone client writeGuard не использует observation.
+Сериализация остаётся локальной read session; независимые file/tree операции
+сохраняют прежний лимит. Нет общего mutex или guard на всю пачку (`SYNC-043`).
+
+Startup classification/recovery/admission и следующий full могут разделять одну
+явную invocation-owned service session (`SYNC-047`). Standalone refresh закрывает её;
+новый manual/scheduled/token/layout invocation не получает старые observations.
+Recovery закрывает прежнюю session, full добавляет coordinator/pause-generation
+guards; codec/config ABA и late result отклоняются до publication.
+Обычный full передаёт invocation-owned canonical read session и admission manifest
+token через file-operation dependencies. Первый verified load seed-ит приватный
+snapshot; guards сериализуют только fresh canonical observations внутри этой сессии,
+чтобы параллельные uploads не дублировали transfer. Scope/root/locks/hash проверяются
+заново на каждом read; matching SHA-256/MD5 позволяет использовать bytes, но не
+пропустить pre-write/retry или physical checks. Сессии не делят snapshot, rejected
+observation блокирует её очередь. Pause/resume ABA, config/transition ABA, host
+stop/unload и закрытие coordinator invocation запрещают позднее применение.
+Настройка 1–40/default20, FIFO, transactions и coherent persistence прежние.
+Ordinary full может закончить baseline-only reception без canonical lock/MOVE только
+при неизменном desired-vs-loaded JSON и отсутствии unpublished causal/maintenance
+work. Coherent partial save сохраняет очереди и baseline до fresh final evaluation;
+watcher settlement и observed revision/time следуют только после её успеха.
+Imported physical metadata, conflicts, move completions и pending FIFO watermarks
+сохраняют существующие transactions (`SYNC-045/046`).
+
+Initial receive использует положительные file metadata из свежей stable root pair
+своей evaluation для read-only identical admission. Копия metadata не продлевает
+opaque observation и не разрешает запись. Для остальных paths общий collector
+с post-upload stamping группирует immediate parents: known page count дешевле числа
+нужных файлов — полностью paginated listing; неизвестная стоимость или равенство —
+individual GET. Отсутствие в listing не доказывает отсутствие файла: нужен GET.
+Частичный/непоследовательный listing, включая directory→file между страницами,
+отклоняется целиком; disk:/ aliases не обходятся повторно (`SYNC-044`).
+Независимые metadata reads
+перекрываются по `maxConcurrency`, а общие authority checks стоят до и после группы.
+Количество root/manifest checks этой группы не растёт с числом совпавших файлов.
+Baselines публикуются одним save; наблюдение не разрешает physical write. Не совпавший
+fingerprint сразу запускает защищённый download fallback с исходными metadata/budget
+внутри той же bounded task; чужие metadata не расходуют его deadline.
+Перезапись, backup и tombstone сохраняют свежие per-action guards; финальные checks
+и durable подтверждение completion сохраняют порядок.
 
 Физический upload и публикация metadata разделены: realtime проверяет актуальность
-события между ними. Bulk upload может получать stamps общим повторным listing;
-нельзя заменять это отдельным metadata запросом для каждого файла при переносе кода.
+события между ними. После bulk collector обновляет только live canonical entries
+без remoteMtime, включая старые пропуски stamps. Оценки страниц принадлежат
+первоначальному полному inventory invocation; незатронутые ветки повторно не
+обходятся. Первоначальный inventory для foreign edits сохраняется. Ошибка optional
+stamping оставляет fallback metadata; старый listing не заменяет pre-write fingerprint.
 
 Force, rewrite и обычные transfers имеют разные правила результата. Rewrite требует
-exclusive upload, exact read-back и target proof. Force повторно проверяет выбранный
+exclusive upload, exact read-back и target proof. Direct Force предварительно читает выбранный
 source до replacement commit. Обычный deferred physical action не становится success
 из-за fulfilled Promise. Общий обработчик с флагами не подменяет эти контракты.
 
@@ -147,10 +204,10 @@ Upload заранее создаёт нужные родительские па�
 после delete/move и изменения token/path/codec он инвалидируется. Upload 404 или известный DiskPathDoesntExistsError 409 допускает raw parent GET;
 только подтверждённый GET 404 разрешает один восстановительный upload retry.
 Exclusive collision и неизвестный 409 не разрешают retry. Force очищает cache
-перед directed apply/recovery и ограничивает повторные inventory тремя проходами.
+перед direct apply/recovery; инвентаризация purge сохраняется один раз.
 
-Перед каждой попыткой DELETE повторяются canonical/identity checks. Проверка пустоты не защищает от позднего потомка после guard. Optional remote
-pruning выключен в ordinary/Force/encryption; remote folder replacement блокируется.
+В ordinary/encryption перед каждой попыткой DELETE повторяются canonical/identity checks; direct Force намеренно их не использует. Проверка пустоты не защищает от позднего потомка после guard. Optional remote
+pruning выключен в ordinary/encryption. Direct Force удаляет каталоги назначения рекурсивно без fingerprint admission.
 Move source не удаляется без доказанного target. Неоднозначный ответ требует read-back;
 неподтверждённое действие остаётся durable для recovery.
 
@@ -163,6 +220,25 @@ Move source не удаляется без доказанного target. Нео
 Realtime uploads остаются последовательными; `maxConcurrency` не распараллеливает
 их подготовку и передачу. Сокращение повторных чтений canonical и исключение
 отсутствующих tombstone paths из full не меняют FIFO, receipts и rename handoff.
+Диагностика `npm run check:sync-efficiency -- --realtime-boundaries --out <fresh.json>`
+отдельна от исходных 38 сравнительных строк: actual watcher timers, repeated edits,
+late successor, new-source handoff, rename после ACK, offline/JSON restart и no-op.
+Счётчики включают bytes, baseline/queues/FIFO/receipt assertions; CPU/decrypt counts
+дополнительных healthy realtime строк не являются измерением mobile heap/latency.
+Tracked-source handoff (`SYNC-049`) сохраняет put до его canonical commit/receipt,
+затем выполняет rename. После restart source put подтверждается stable plaintext
+SHA и исходным ID/seq; если user PUT не передал bytes, fresh canonical/manifest и
+physical guards разрешают rematerialization frozen target snapshot с тем же put.
+Read-back, source commit и accepted repair обязательны до move; foreign source не
+перезаписывается. Подтверждённый accepted actor/seq/hash допускает новую base revision.
+Lifetime `assertCurrent` existing read session и engine pause/host guard охватывают
+await/retry/recursive continuation, без body cache и замены fresh remote authority.
+`YandexDiskClient.withWriteGuard` привязывает synchronous lifetime к file batch,
+single rename и rename batch до возврата invocation и снимает callback в `finally`.
+Проверка выполняется после awaited remote writeGuard непосредственно перед native
+PUT/API write, включая retry и canonical recovery; context drift не разрешает
+rollback write старого invocation. Fresh standalone scope/canonical/manifest и
+physical guards сохраняются. Force/full вне этих scopes сохраняют прежний путь.
 HTTP-счётчик `apiReads` учитывает GET через API wrapper, но не прямые transfers,
 записи и polling; для сравнения полной стоимости считать также эти обращения.
 Он не измеряет latency: одинаковый счётчик не означает одинаковое время или
@@ -222,14 +298,17 @@ Native request не отменяется; лимит ожидания не до�
 
 ## Force replacement и epoch decision
 
-Force работает через тот же coordinator даже при paused automation. Повторный
-клик наблюдает активный Promise. Подготовка получает направление и проверяет
-читаемый source; stale destination metadata не запускают ordinary recovery.
-После intent durable `forceRecovery` запрещает обычную автоматизацию до
-подтверждённых bytes/canonical/manifest/baseline и cleanup. Старые receipts и
-покрытые watcher events снимаются coherent при cutover, поздние события получают
-новый causal context. Destination drift ограничен тремя инвентаризациями;
-source drift не создаёт смешанный успешный snapshot.
+Полный контракт: [FORCE_SYNC.md](FORCE_SYNC.md). Force использует тот же coordinator,
+игнорирует обычные фильтры и stale destination authority. До purge источник читается
+целиком, затем удаление и прямые transfers выполняются без временных файлов.
+Ошибки не прерывают остальные независимые действия. Direct-v1 checkpoint сохраняет
+остаток; ordinary manual/startup/scheduled full подхватывает его до normal merge.
+Повторный полный purge при continuation запрещён. Failed subtree delete сначала
+возвращает затрагиваемые copies в pending, чтобы retry не удалил уже записанные bytes.
 
-Foreign epoch с offline delta сначала требует явного epoch-bound решения.
-Отложенный выбор сохраняет local bytes/queues и не разрешает auto upload.
+Старые pending queues снимаются при coherent cutover; поздние watcher events
+сохраняются. Ordinary full снова применяет свои фильтры без ложных удалений вне scope.
+Возврат другого устройства сохраняет прежний epoch-bound accept/preserve/later.
+Force не ждёт чужих leases/запросов и не гарантирует server fencing: поздний
+DELETE/PUT может изменить уже завершённый результат. Это отдельная диагностика,
+а не обязательная гарантия direct Force.

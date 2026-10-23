@@ -1,4 +1,9 @@
-import type { PendingMutation, SyncOperation, SyncResult } from "../../types";
+import type {
+	PendingMutation,
+	SyncIndex,
+	SyncOperation,
+	SyncResult,
+} from "../../types";
 import { findErrorCause } from "../../utils/error-utils";
 import { logger } from "../../utils/logger";
 import {
@@ -75,6 +80,7 @@ export async function saveRemoteIndexOrAbort(
 /** Save the remote index from a single-file (real-time) flow. Unlike the bulk sync path, a concurrent modification here is not surfaced as an error: the file transfer already succeeded, and the next full sync will reload the newer remote index and reconcile. We only log a warning so real-time editing stays non-disruptive. */
 export async function saveRemoteIndexBestEffort(
 	deps: Dependencies,
+	assertLatest?: (index: Readonly<SyncIndex>) => void,
 ): Promise<CanonicalCommitProof | null> {
 	try {
 		if (deps.realtimeGuardValidationToken !== undefined) {
@@ -90,7 +96,7 @@ export async function saveRemoteIndexBestEffort(
 				return null;
 			}
 		}
-		const proof = await deps.indexManager.saveRemoteIndex();
+		const proof = await deps.indexManager.saveRemoteIndex(assertLatest);
 		await cleanupRejectedUploads(deps);
 		return proof;
 	} catch (e) {

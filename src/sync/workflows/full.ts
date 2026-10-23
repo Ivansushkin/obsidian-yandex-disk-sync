@@ -11,13 +11,19 @@ import type {
 } from "../../types";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
 import { PendingPutLookup } from "../local/baseline-rules";
-import { IndexManager } from "../canonical/manager";
+import {
+	IndexManager,
+	type CanonicalReadSession,
+	type RemoteAuthorityObservation,
+} from "../canonical/manager";
 import type {
 	IndexSaveCallback,
 	SyncGuardResult,
 	SyncRunOptions,
 } from "../contracts";
 import { createSyncError } from "../errors";
+import { RemoteIndexConcurrentModificationError } from "../canonical/errors";
+import { sameIndexValue } from "../canonical/transaction-rules";
 import * as fileOperations from "../files/operations";
 import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
 import * as reconcileBaselines from "../reconciliation/baselines";
@@ -28,6 +34,7 @@ import * as reconciliationContext from "../reconciliation/context";
 import * as reconcilePhysicalRecovery from "../reconciliation/physical-recovery";
 import { receiveInitialRemoteState } from "./initial-receive";
 export interface Dependencies {
+	canonicalReadSession?: CanonicalReadSession;
 	decideEpochAdoption?: (
 		epoch: string,
 	) => Promise<"accept" | "preserve" | null>;
@@ -47,6 +54,7 @@ export interface Dependencies {
 		skipGuard?: boolean,
 		validationToken?: string,
 		validateThroughExternalBlock?: boolean,
+		observation?: RemoteAuthorityObservation,
 	) => Promise<SyncGuardResult>;
 	fileOperations: fileOperations.Dependencies;
 	syncReconciliation: reconciliationContext.Dependencies;
@@ -163,13 +171,14 @@ export function stampFullUploadMutations(
 	}
 }
 
-/** Execute bulk uploads and stamp server-owned metadata with one tree read. */
+/** Execute bulk uploads and refresh only missing server-owned metadata. */
 export async function executeBulkUploads(
 	deps: Dependencies,
 	uploads: SyncOperation[],
 	result: SyncResult,
 	onProgress: (completed: number) => void,
 	failureMessage: string,
+	directoryPages: ReadonlyMap<string, number> = new Map(),
 ): Promise<boolean> {
 	if (uploads.length === 0) {
 		return false;
@@ -186,7 +195,12 @@ export async function executeBulkUploads(
 		return false;
 	}
 	try {
-		const liveRemote = await deps.indexManager.getRemoteFiles();
+		const liveRemote = await deps.indexManager.refreshMissingServerMetadata(
+			directoryPages,
+			() => {
+				deps.canonicalReadSession?.assertCurrent();
+			},
+		);
 		return deps.indexManager.applyServerMtimes(liveRemote);
 	} catch (error) {
 		logger.warn(`${failureMessage}; entries keep fallback metadata`, {
@@ -223,6 +237,7 @@ export async function reconcileFullSync(
 		admission,
 		startTime,
 	);
+	deps.canonicalReadSession?.assertCurrent();
 	await applyFullReconciliation(
 		deps,
 		options,
@@ -231,6 +246,7 @@ export async function reconcileFullSync(
 		admission.hadPendingCausalWork,
 		validationToken,
 	);
+	deps.canonicalReadSession?.assertCurrent();
 }
 
 interface FullAdmission {
@@ -239,6 +255,7 @@ interface FullAdmission {
 }
 
 interface FullPlan {
+	directoryPages: Map<string, number>;
 	operations: SyncOperation[];
 	verifiedMetadataChanged: boolean;
 	baselinesChanged: boolean;
@@ -260,7 +277,11 @@ async function loadFullCanonical(
 
 	// 2. Load remote index
 	deps.setSyncPhase("loading-index");
-	await deps.indexManager.loadRemoteIndex(false, options?.startup, true);
+	if (deps.canonicalReadSession) {
+		await deps.canonicalReadSession.load(true);
+	} else {
+		await deps.indexManager.loadRemoteIndex(false, options?.startup, true);
+	}
 	if (options?.requireStableCanonical && deps.indexManager.getMaintenance()) {
 		throw new Error(
 			"Encryption preflight requires a stable canonical index",
@@ -418,7 +439,8 @@ async function scanFullReconciliation(
 
 	// 4. Get remote files list
 	deps.setSyncPhase("scanning-remote");
-	const remoteFiles = await deps.indexManager.getRemoteFiles();
+	const directoryPages = new Map<string, number>();
+	const remoteFiles = await deps.indexManager.getRemoteFiles(directoryPages);
 	const verifiedMetadataChanged =
 		await reconcileBaselines.verifyRemoteContentCandidates(
 			deps.syncReconciliation,
@@ -463,6 +485,9 @@ async function scanFullReconciliation(
 				remoteIndex.folderTombstones,
 				deps.indexManager.getPendingLocalDeletePaths(),
 			);
+	operations = operations.filter((operation) =>
+		deps.syncReconciliation.vaultAdapter.shouldSync(operation.path),
+	);
 	if (
 		!adoption.adoptionSnapshot &&
 		!hadPendingCausalWork &&
@@ -537,7 +562,12 @@ async function scanFullReconciliation(
 
 	logger.info(`Determined ${operations.length} synchronization operations`);
 
-	return { operations, verifiedMetadataChanged, baselinesChanged };
+	return {
+		operations,
+		verifiedMetadataChanged,
+		baselinesChanged,
+		directoryPages,
+	};
 }
 
 /** Apply the classified groups and publish intent before destructive work. */
@@ -545,7 +575,12 @@ async function applyFullReconciliation(
 	deps: Dependencies,
 	options: SyncRunOptions | undefined,
 	result: SyncResult,
-	{ operations, verifiedMetadataChanged, baselinesChanged }: FullPlan,
+	{
+		operations,
+		verifiedMetadataChanged,
+		baselinesChanged,
+		directoryPages,
+	}: FullPlan,
 	hadPendingCausalWork: boolean,
 	validationToken?: string,
 ): Promise<void> {
@@ -592,6 +627,7 @@ async function applyFullReconciliation(
 			deps.reportProgress(processedOps, totalOps);
 		},
 		"Batch server metadata re-read after uploads failed",
+		directoryPages,
 	);
 	stampFullUploadMutations(deps, fullUploadMutations);
 	if (result.errors.length > 0) {
@@ -753,20 +789,58 @@ async function commitFullReconciliation(
 		result.conflicts > 0;
 	const tombstonesRemoved = deps.indexManager.cleanupDeletedFiles();
 
-	// Skip the remote index write when nothing changed during this
-	// sync: no file operations, no batch mtime stamping, and no
-	// tombstone changes. This avoids unnecessary API calls, 409
-	// "folder exists" noise, and reduces the window for concurrent-
-	// index conflicts between devices. The local index is still
-	// persisted by the caller via indexSaveCallback.
-	const indexDirty =
-		verifiedMetadataChanged ||
-		hadOperations ||
-		mtimeStamped ||
-		tombstonesRemoved ||
-		baselinesChanged ||
-		pendingWatermarks > 0;
-	const strictNoOp = !indexDirty && !hadPendingCausalWork;
+	// Ordinary full compares canonical state, not transfer counters or local baselines.
+	// Other workflows retain their existing commit/guard contract.
+	const indexDirty = deps.canonicalReadSession
+		? deps.indexManager.hasPendingCanonicalChanges() ||
+			tombstonesRemoved ||
+			hasConflicts
+		: verifiedMetadataChanged ||
+			hadOperations ||
+			mtimeStamped ||
+			tombstonesRemoved ||
+			baselinesChanged ||
+			pendingWatermarks > 0;
+	if (
+		!indexDirty &&
+		!indexCommittedBeforeDeletes &&
+		deps.canonicalReadSession
+	) {
+		// Preserve applied bytes across failed validation/restart without observing success.
+		deps.canonicalReadSession.assertCurrent();
+		await deps.indexSaveCallback?.();
+		const canonical = await deps.canonicalReadSession(
+			async (observation) => {
+				const guard = await deps.getSyncGuardResult(
+					options?.skipEncryptionGuard,
+					validationToken,
+					options?.validateThroughExternalEncryptionBlock,
+					observation,
+				);
+				if (guard.blockReason) {
+					throw new Error(
+						`Sync aborted before saving: ${guard.blockReason}`,
+					);
+				}
+			},
+		);
+		if (
+			deps.indexManager.hasPendingCanonicalChanges() ||
+			!sameIndexValue(canonical, deps.indexManager.getRemoteIndex())
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Canonical changed before read-only reconciliation completed",
+			);
+		}
+		logger.debug(
+			"[SyncEngine] Canonical unchanged, saving local reconciliation only",
+		);
+		await settleFullPhysicalWork(deps, result);
+		return;
+	}
+
+	const strictNoOp =
+		!indexDirty && !hadPendingCausalWork && !indexCommittedBeforeDeletes;
 	if (!strictNoOp) {
 		const guard = await deps.getSyncGuardResult(
 			options?.skipEncryptionGuard,
@@ -790,7 +864,7 @@ async function commitFullReconciliation(
 			validation: "strict-noop",
 		});
 	}
-	if (!indexDirty) {
+	if (!indexDirty && !indexCommittedBeforeDeletes) {
 		logger.debug(
 			"[SyncEngine] No changes detected, skipping remote index save",
 		);

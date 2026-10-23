@@ -277,84 +277,24 @@ lock`; плашка не показывает готовность, не выд�
 physical, несмотря на короткий интервал; запоздалое mechanical событие старого
 файла не удаляет новый объект. Повторить с offline return второго профиля.
 
-## TC-07. Направленный Force и принятие epoch без Force-loop
+## TC-07. Полный Force и принятие epoch без Force-loop
 
-Использовать два независимых тестовых профиля и изолированную remote-папку.
-Повторить в plaintext и hardened; фактический прогон отмечать отдельно от unit
-и functional harness. Public directed Force отличается от legacy/internal
-compatibility API, которые сохраняют собственные format/proof guards.
+Выполнить [TC-FORCE-REPLACE-01](#tc-force-replace-01--полный-direct-force-два-профиля-и-реальный-диск)
+на двух независимых профилях и disposable remote-папке, в plaintext и hardened.
+Фактический прогон отмечать отдельно от automated functional harness.
 
-1. Синхронизировать A и B, остановить B и оставить в нём offline edit.
-2. На A выбрать фактический source и выполнить Force local; повторить Force remote
-   на восстановленной fixture. Для каждого направления проверить with-backup,
-   without-backup и cancel. Подтверждение показывает направление, папку, mode и
-   число source files; пустой source отдельно предупреждает об очистке.
-3. With-backup: архив подтверждён exact bytes/SHA до destructive apply.
-   Fault backup даёт retry / явное without-backup / cancel; автоматического
-   fallback нет. Retry заново фиксирует защищаемый snapshot.
-   Without-backup: нет ZIP, destination-content snapshot и per-file copies;
-   новые записанные bytes всё равно проверяются. Cancel не заменяет destination.
-4. Проверить canonical нового epoch, local baseline и exact physical/local bytes
-   выбранного source, отсутствие старых mutations/physical actions/покрытых
-   watcher events. Protected/excluded paths и .backup неизменны.
-5. Вернуть B обычным full. До решения accept/preserve/later никакого auto upload:
-   offline bytes, прежние baseline/queues и remote revision сохранены.
-   Later оставляет это состояние; preserve переносит offline delta через обычный
-   three-way merge; accept принимает cloud generation с обычной защитой
-   вытесняемых local bytes. Варианты запускать на независимых snapshots.
-6. После завершения A и B выполняют повторный full с результатом 0/0/0.
-   Новый Force на B не должен требовать ответный Force на A.
+1. До Force оставить offline edit в B. В A заменить выбранное назначение целиком,
+   включая ранее исключённые пути; сохранить только перечисленные исключения.
+2. Вернуть B обычным full. До accept/preserve/later auto upload не выполняется;
+   offline bytes, baseline и очереди сохранены.
+3. Проверить later, preserve через обычный three-way merge и accept с обычной
+   защитой вытесняемых bytes на независимых fixtures.
+4. Повторный ordinary full на обоих профилях сходится без ответного Force-loop.
+   Проверить новые epoch, coherent baseline/queues и сохранность поздних edits.
 
-### Отсутствующий/corrupt destination и recovery
-
-1. Удалить всю remote-папку при сохранённом baseline; отдельно испортить canonical,
-   manifest и оставить старые locks. Force local читает фактический local source,
-   не требует старый destination key и заменяет raw metadata под exclusive lock.
-   Force remote требует полностью читаемый physical source; missing manifest
-   вызывает явный выбор source format, ciphertext требует salt/profile/password.
-2. Повторить с подтверждённым пустым source: syncable destination очищается после
-   Force intent; excluded/protected descendants остаются. Source network/403/
-   decrypt failure никогда не означает empty и не очищает destination.
-3. Прервать prepared checkpoint, intent publication, transfer, cleanup и final
-   local save. После restart продолжить тот же operation ID/epoch без нового
-   автоматического архива; ordinary automation ждёт завершения Force recovery.
-   После intent rollback нового epoch запрещён. Потерянный initiator сам по себе
-   не разрешает другому профилю выдавать незавершённый Force за normal full.
-4. Изменить pinned lock или destination во время apply: изменившийся объект не
-   удаляется по старому fingerprint; максимум три inventories, затем partial
-   failure и durable recovery. После прекращения drift retry/restart сходится.
-5. Запустить новый Force во время задержанного upload прежнего: старый payload
-   не перезаписывает successor, operation authority отозвана, ложного success нет.
-6. На B явно подключить пересозданный root к проверенному completed epoch:
-   failed binding save восстанавливает прежние baseline/queues/codec; успешный
-   binding не обходит последующий epoch choice для offline delta.
-
-### UI, pause и диагностика
-
-1. Повторный клик любого направления наблюдает тот же Promise. Оба контрола
-   заблокированы, loader находится в активной кнопке, Notice показывает фазу.
-   Закрытие/повторное открытие settings не отменяет Force и не теряет progress.
-2. Settings, manual full, encryption и backup не меняют configuration во время
-   Force. Explicit Force работает при paused automation, сохраняя pause.
-3. Success появляется только после bytes/canonical/manifest/baseline/cleanup и
-   coherent save. На partial failure видны причина и незавершённый recovery;
-   обычный full не используется для возврата старых destination queues.
-4. Поздние callbacks, старый таймер Notice и unload не меняют следующий flow.
-   UI прогон выполнить на desktop/mobile; reduced-motion и сохранение текста
-   кнопок проверяются вручную.
-
-Отдельно проверить load/save на synthetic stable 1.1 snapshot с дробным mtime:
-current conversion сохраняет precision до automation; failed initial save/unload
-не заменяет unreadable plugin data defaults. Реальные credentials не использовать.
-
-Покрывает: INIT-014/019/028/030/031, INV-002/003/009, MULTI-012,
-FORCE-001…039, SAFE-002/004/009/013, MIG-004, UI-006.
-Подробный cross-mode прогон: TC-FORCE-REPLACE-01.
-
-Для `FORCE-040` при include `*.md` добавить вне scope длинное plaintext имя из
-base64url/hex символов. Force local не удаляет его по форме имени: неоднозначность
-блокируется до intent без изменений. С явным exclusion посторонний файл сохранён;
-полный raw scope допускает replacement без старого destination key.
+Новый direct Force не использует locks/MOVE, destination fingerprints или scope
+ambiguity для допуска удаления. Старые FORCE-001—FORCE-053 заменены
+FORCE-DIRECT-001—FORCE-DIRECT-016; старые scoped/staged ожидания не применять.
 
 ## TC-08. Шифрование: fresh hardened и unsupported historical data
 
@@ -578,6 +518,12 @@ conflict, Force-loop, неочищенная очередь или второй 
 
 ## TC-09. Конкурентные изменения и восстановление — PENDING
 
+Дополнительно для `SYNC-043`: root с 1001+ объектами, замена root между страницами,
+manifest/canonical/lock drift между проходами и config ABA при позднем ответе.
+Отказ не меняет local bytes/queues и не подтверждает receive. На следующем
+pre-write/retry требуется новая stable root pair; общая observation validators
+не заменяет standalone writeGuard или backup. Реальный прогон — PENDING.
+
 Все подпункты остаются PENDING до реального прогона на двух независимых тестовых
 профилях с disposable remote root. Применимые варианты повторяются в plaintext
 и hardened; fault injection допускается только на тестовых fixtures.
@@ -645,7 +591,7 @@ conflict, Force-loop, неочищенная очередь или второй 
 
 Автоматические regression tests не переводят эти пункты в PASS.
 
-Покрывает: `SYNC-039`, `ERROR-007`, `INIT-037`, `SYNC-038`, `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
+Покрывает: `SYNC-041`, `SYNC-042`, `SYNC-043`, `SYNC-039`, `ERROR-007`, `INIT-037`, `SYNC-038`, `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
 
 ### Local apply, settings и persistence
 
@@ -711,6 +657,14 @@ Pause failure не допускает remote work; ACK failure не показы
   не публикуются в canonical по старой lease. Проверить unique claim, lost reply,
   restart и появление competing lock: bytes сохраняются, ложного success нет.
 
+- `SYNC-041/042` (PENDING, real Android/Obsidian + two-profile Yandex): выполнить
+  established full с 42 изменениями в plaintext и encrypted режиме, затем no-op
+  на обоих профилях. Во время canonical read сменить connection и обратно либо
+  остановить/unload плагин: поздний результат не даёт success/ACK или новых writes.
+  Проверить сохранение pending work и успешный restart/retry. Синтетические request
+  counts не заменяют этот прогон; безопасные счётчики не должны раскрывать payloads
+  или credentials. Active lock/no server hash по-прежнему требуют stable read.
+
 ## TC-MOBILE-01. Постоянная мобильная плашка
 
 Статус: manual-required; автоматические проверки и desktop preview не заменяют
@@ -770,6 +724,29 @@ Pause failure не допускает remote work; ACK failure не показы
    статус и действие. Enter/Space переключают раскрытие; подробности доступны целиком.
    Вращение loader отключено при reduced motion; status icon не вращается.
    Во время sync с ошибкой одновременно видны loader и warning icon. Геометрия обновляется после изменения размеров верхних панелей.
+
+Отдельно проверить первичное подключение Android с 42 уже совпадающими файлами,
+в plaintext и encrypted режиме, по Wi-Fi и мобильной сети. Этап показывает
+«Проверка и получение файлов», initial full завершается без user download и без
+изменения remote bytes. По безопасной debug-диагностике `resourceKind` для передачи
+canonical должно быть не более двух скачиваний за этот full. Completion содержит
+`matchedFiles` и фактическую `concurrency`; записать duration и все категории `apiReads`.
+Для 42 совпавших flat paths с server hash без drift синтетический full допускает
+≤85 API GET (root ≤30, manifest ≤6); реальные tree pages и сеть измеряются отдельно.
+Проверить настройки 1/20/40: nested metadata перекрываются до лимита; flat identical
+использует fresh root metadata без individual GET. На uneven/deep tree дочерняя
+папка начинает читаться до завершения медленного sibling, лимит не превышается;
+ошибка останавливает новые tasks и дожидается начатых. После bulk незатронутые ветки
+не обходятся повторно; старые missing stamps тоже обновляются. Partial pagination
+не означает отсутствие файла. Эти проверки `SYNC-044` и `PERF-008` на реальных
+Android/Obsidian + двух профилях Яндекс Диска остаются PENDING.
+Общие root/manifest
+checks группы не растут с числом файлов. Эти проверки сохраняются до и после группы.
+Повторный full не возвращается к initial receive и не
+перезаписывает совпадающие файлы. При изменении canonical другим профилем,
+смене подключения или timeout видна ошибка без ложного завершения; после
+восстановления/перезапуска повтор завершается. Поздний ответ не меняет local bytes
+(`INIT-032`, `INIT-033`, `INIT-034`). Не включать credentials или signed URL в отчёт.
 
 Плашка сама не изменяет canonical/local/physical; результаты синхронизации
 проверяются обычными критериями workflow. Зафиксировать устройство, ОС, версию
@@ -836,28 +813,78 @@ Obsidian и тему; отсутствующие устройства остав
 Покрывает `UI-020`, `UI-021`. Зафиксировать устройство, ОС, Obsidian и тему;
 отсутствующие платформы оставить явно непроверенными.
 
-## TC-FORCE-REPLACE-01 — два профиля и реальный Диск
+## TC-FORCE-REPLACE-01 — полный direct Force, два профиля и реальный Диск
 
-Ручная приёмка обязательна отдельно от functional harness. Сохранить безопасные
-исходные fixtures и отметить фактическую сборку; не записывать пароли/tokens/content
-в диагностические логи.
+Использовать отдельную disposable remote-папку и два тестовых профиля; production
+vault не использовать. Повторить plaintext/encrypted и с выбранным архивом/без.
 
-1. В профиле A включить encryption, выполнить full дважды и подключить B.
-2. В B оставить offline edit. В A выполнить оба направления Force с архивом/без;
-   проверить точные bytes, удаление лишних syncable paths и сохранность excluded/.backup.
-3. Повторить с plaintext и разными mode сторон; проверить stored/missing/wrong
-   password и Cancel. При lost manifest проверить явный выбор формата и missing salt/profile.
-4. Удалить всю remote-папку, затем отдельно manifest/canonical/user files. Force local
-   должен восстановить выбранный local source. Force remote от подтверждённого пустого
-   source должен очистить syncable local; network/access/decrypt error — сохранить их.
-5. Удалить все локальные syncable файлы и отдельно plugin data во втором профиле.
-   Проверить пустой source, новую installation identity и оба Force.
-6. Вернуть B: offline bytes не отправляются до решения accept/preserve/later.
-   Для пересозданного root сначала явно подключить проверенное новое поколение.
-7. Прервать каждый Force на transfer/commit/cleanup, перезапустить профиль и проверить
-   тот же ID/epoch, завершение recovery и отсутствие ложного success. Проверить
-   поздние события, collisions, pause и конкурирующий Force.
-8. Финальный normal full на обоих профилях должен стать no-op; проверить
-   canonical/manifest, отсутствие pending cleanup и согласованные causal counters.
+1. Заполнить source скрытыми/исключёнными файлами, конфигурацией, пустыми каталогами
+   и zero-byte файлами. Добавить destination-only garbage, corrupt canonical,
+   старые locks, file/folder blockers и .backup.
+2. Local → Disk: одно подтверждение с off-by-default archive и явными исключениями.
+   Проверить полный replacement, удаление garbage/old plugin copies, сохранность
+   .backup, новый canonical и соответствующий manifest. Старый ключ не запрашивается.
+   Во всём trace нет новых временных файлов, leases или MOVE.
+3. Disk → local: после полного source pre-read permanent delete заменяет всё,
+   включая ранее исключённые файлы. Собственный sync-плагин и .backup сохранены;
+   source manifest/bytes не изменены, canonical перестроен. Перезапустить Obsidian.
+4. Wrong/missing password, потерянные salt/profile, нечитаемый file, partial listing
+   и Cancel до очистки не меняют destination. Пустой успешно прочитанный source
+   очищает destination с явными исключениями.
+5. Ошибка выбранного archive остаётся в той же модалке; retry/uncheck/cancel.
+   Без архива нет protective/conflict copies, локального .trash и snapshot старого
+   destination. Не журналировать tokens/passwords/content/ciphertext.
+6. Прервать DELETE/upload/canonical/persistence. Независимые действия продолжаются,
+   partial result честный. Обычный manual/startup/scheduled full повторяет остаток,
+   не очищает заново успешно заменённое дерево и не удаляет источник из-за недокопии.
+7. Повторить с failed subtree delete, JSON restart, late source edit, pause,
+   Settings close и duplicate click. Новый Force повторно подтверждает новый source;
+   старый scoped checkpoint не получает полный purge автоматически.
+8. Вернуть B с offline edits: проверить обычный epoch-bound accept/preserve/later.
+   После Force full с прежними ограниченными фильтрами не удаляет out-of-scope files.
+9. Чужие поздние запросы не блокируют Force. Зафиксировать наблюдавшийся результат,
+   не заявляя server fencing или гарантированное исправление любой concurrent порчи.
 
-Автоматические проверки не являются свидетельством выполнения этого прогона.
+Записать revision, safe counts/hashes, local/canonical/physical результат и остаток
+checkpoint. Автоматическая suite не доказывает выполнение этого manual smoke.
+
+### Ordinary baseline-only reception (SYNC-045/046)
+
+Manual-required: two independent Obsidian profiles against real Yandex Disk,
+plaintext and encrypted. After profile A publishes an edit, profile B's ordinary
+full must apply exact bytes and persist its baseline with unchanged canonical bytes
+and revision, no canonical lock/MOVE. Repeat from an empty newly connected profile.
+A pending matching put/FIFO ACK or verified imported physical stamp must still
+commit and durably settle. Interrupt final validation/save and restart: preserve
+partial baselines, queues and old observed revision/time until retry succeeds;
+no false success or conflict copy. Check startup after token, manual/scheduled full
+and realtime follow-up. Synthetic MemoryDisk diagnostics do not establish this
+native/mobile/two-profile evidence; Android and iOS remain pending.
+
+### Startup service reads and authenticated codec install (SYNC-047/048)
+
+PENDING: two native Obsidian profiles on real Yandex Disk and Android.
+Measure service GET bodies/bytes separately from API metadata and local reads:
+token setup automatic full, cold restart, manual retry and scheduler. Unchanged
+canonical/manifest must download once within each explicit invocation; a future
+invocation must revalidate and read independently. Check plaintext and hardened
+modes, missing/historical manifest, wrong password, Force checkpoint and committed
+encryption recovery. Change token/path/codec during a delayed response and verify
+no late install, automation, write or queued-event ACK. Cancel during the password
+prompt and derivation; reject a local save, restart and reconcile without losing
+work. Matching authenticated codec install must not repeat PBKDF2; iterations stay 600000. Synthetic runner counts and WebCrypto observation are not native proof.
+
+### Realtime tracked-source handoff (SYNC-049)
+
+PENDING native evidence: first synchronize a tracked note,
+modify it, then rename during its native user PUT before canonical commit.
+Expected: exact latest target bytes on both independent profiles, preserved FIFO
+identities, no stuck predecessor, durable ACK and a clean full/no-op after restart.
+Interrupt before user body or canonical commit and restart; also revert target
+bytes to their earlier value. Original put ID/seq must settle before move, with
+fresh source physical/canonical/manifest proofs. Token ABA or pause/resume during
+recovery must perform no further writes or final ACK. Synthetic RED/GREEN covers
+these boundaries; it does not complete this native smoke. Repeat
+plaintext and hardened encryption with a valid manifest, then native Obsidian,
+Android and real Yandex Disk. The existing new-unsynced-source handoff passes a
+different branch and cannot establish this tracked-source result.

@@ -88,24 +88,38 @@ test("missing old upload is superseded only by durable causal evidence", () => {
 	);
 });
 
-test("child rename selects the deepest matching folder parent", () => {
-	const unrelated = folderRenameEvent("unrelated", "X", "Y");
-	const outer = folderRenameEvent("outer", "A", "B");
-	const inner = folderRenameEvent("inner", "A/deep", "B/deep");
-	const selection = selectFolderRenameParent(
-		[inner, unrelated, outer],
-		"A/deep/note.md",
-	);
-	assert.equal(selection.parent?.id, "inner");
-	assert.equal(selection.ambiguous, false);
-});
-
-test("equally specific unordered folder parents are ambiguous", () => {
+test("folder parent selection uses deepest ancestry and rejects equal-time ambiguity", () => {
 	const first = folderRenameEvent("first", "A", "B");
-	const second = folderRenameEvent("second", "A", "C");
-	second.createdAt = first.createdAt;
-	const selection = selectFolderRenameParent([first, second], "A/note.md");
-	assert.equal(selection.ambiguous, true);
+	const second = {
+		...folderRenameEvent("second", "A", "C"),
+		createdAt: first.createdAt,
+	};
+	for (const { label, parents, path, parent, ambiguous } of [
+		{
+			label: "deepest matching ancestor",
+			parents: [
+				folderRenameEvent("inner", "A/deep", "B/deep"),
+				folderRenameEvent("unrelated", "X", "Y"),
+				folderRenameEvent("outer", "A", "B"),
+			],
+			path: "A/deep/note.md",
+			parent: "inner",
+			ambiguous: false,
+		},
+		{
+			label: "equally specific unordered parents",
+			parents: [first, second],
+			path: "A/note.md",
+			parent: undefined,
+			ambiguous: true,
+		},
+	]) {
+		const selection = selectFolderRenameParent(parents, path);
+		assert.equal(selection.ambiguous, ambiguous, label);
+		if (!ambiguous) {
+			assert.equal(selection.parent?.id, parent, label);
+		}
+	}
 });
 
 test("post-full rename preserves newer sources and blocks causal ambiguity", () => {
@@ -145,46 +159,46 @@ const queueContext: WatcherQueueContext = {
 	submittedWatcherIds: new Set(),
 };
 
-test("child rename ignores a newer unrelated folder event", () => {
-	const existing = [
-		{ ...folderRenameEvent("parent-a", "A", "B"), baseRevision: 7 },
-		{
-			...folderRenameEvent("unrelated", "X", "Y"),
-			baseRevision: 7,
-			createdAt: 2,
-		},
-	];
-	const reduction = reduceWatcherQueue(
-		existing,
-		renameEvent("child", "A/note.md", "B/note.md", { createdAt: 3 }),
-		queueContext,
-	);
-
-	assert.equal(reduction.disposition, "absorbed");
-	assert.deepEqual(
-		reduction.events.map((event) => event.id),
-		["parent-a", "unrelated"],
-	);
-});
-
-test("queued target modify is absorbed but recreate of source remains", () => {
+test("queue absorption follows rename targets without swallowing unrelated source work", () => {
 	const rename = renameEvent("rename-a", "A.md", "B.md");
-	const modified = reduceWatcherQueue(
-		[rename],
-		fileEvent("modify-b", "B.md", { createdAt: 2 }),
-		queueContext,
-	);
-	assert.equal(modified.disposition, "absorbed");
-	const recreated = reduceWatcherQueue(
-		modified.events,
-		fileEvent("recreate-a", "A.md", { createdAt: 3 }),
-		queueContext,
-	);
-	assert.equal(recreated.disposition, "queued");
-	assert.deepEqual(
-		recreated.events.map((event) => event.id),
-		["rename-a", "recreate-a"],
-	);
+	const parent = folderRenameEvent("parent-a", "A", "B");
+	const unrelated = {
+		...folderRenameEvent("unrelated", "X", "Y"),
+		createdAt: 2,
+	};
+	for (const { label, existing, incoming, disposition, ids } of [
+		{
+			label: "child notification ignores newer unrelated folder",
+			existing: [parent, unrelated],
+			incoming: renameEvent("child", "A/note.md", "B/note.md", {
+				createdAt: 3,
+			}),
+			disposition: "absorbed",
+			ids: ["parent-a", "unrelated"],
+		},
+		{
+			label: "target modify",
+			existing: [rename],
+			incoming: fileEvent("modify-b", "B.md", { createdAt: 2 }),
+			disposition: "absorbed",
+			ids: ["rename-a"],
+		},
+		{
+			label: "source recreated after rename",
+			existing: [rename],
+			incoming: fileEvent("recreate-a", "A.md", { createdAt: 3 }),
+			disposition: "queued",
+			ids: ["rename-a", "recreate-a"],
+		},
+	]) {
+		const reduction = reduceWatcherQueue(existing, incoming, queueContext);
+		assert.equal(reduction.disposition, disposition, label);
+		assert.deepEqual(
+			reduction.events.map(({ id }) => id),
+			ids,
+			label,
+		);
+	}
 });
 
 test("file and folder chains retain running identities across JSON restart", () => {
@@ -267,79 +281,53 @@ test("folder notifications preserve submitted child rename snapshots", () => {
 	}
 });
 
-test("pending submitted upload leaves its put for rename retarget", () => {
-	const existing: WatcherQueueEvent[] = [
-		fileEvent("upload-a", "A.md"),
-		renameEvent("rename-a", "A.md", "B.md", {
-			createdAt: 2,
-			predecessorUploadId: "upload-a",
-		}),
-	];
-
-	const reduction = reduceUploadCausalReceipts(existing, {
-		completed: [],
-		superseded: ["upload-a"],
-		uploadReceipts: [
-			{
-				eventId: "upload-a",
-				path: "A.md",
-				status: "pending-put",
-				reason: "coalesced",
-				epoch: "epoch-a",
-				canonicalRevision: null,
-				mutationId: "device-a:1",
-				mutationSeq: 1,
-				sha256: "sha-a",
-			},
-		],
-	});
-
-	const rename = reduction.events.find((event) => event.id === "rename-a");
-	assert.ok(rename?.action === "rename" && rename.kind === "file");
-	assert.equal(rename.baseRevision, 7);
-	assert.equal(rename.predecessorUploadId, undefined);
-});
-
-test("accepted upload advances a later queued edit of the same path", () => {
-	const existing: WatcherQueueEvent[] = [
-		fileEvent("upload-previous", "note.md", {
+test("upload receipts release pending rename predecessors and advance accepted edit baselines", () => {
+	for (const status of ["pending-put", "accepted-put"] as const) {
+		const pending = status === "pending-put";
+		const upload = fileEvent("upload", "A.md", {
 			baseRevision: 35,
 			mutationId: "device-a:7",
 			mutationSeq: 7,
 			snapshotSha256: "previous",
-			superseded: true,
-		}),
-		fileEvent("upload-latest", "note.md", {
-			baseRevision: 35,
-			createdAt: 2,
-			mutationId: "device-a:8",
-			mutationSeq: 8,
-			snapshotSha256: "latest",
-		}),
-	];
-
-	const reduction = reduceUploadCausalReceipts(existing, {
-		completed: ["upload-previous"],
-		superseded: [],
-		uploadReceipts: [
-			{
-				eventId: "upload-previous",
-				path: "note.md",
-				status: "accepted-put",
-				reason: "accepted-put",
-				epoch: "epoch-a",
-				canonicalRevision: 36,
-				mutationId: "device-a:7",
-				mutationSeq: 7,
-				sha256: "previous",
-			},
-		],
-	});
-
-	const successor = reduction.events.find(
-		(event) => event.id === "upload-latest",
-	);
-	assert.equal(successor?.action, "upload");
-	assert.equal(successor?.baseRevision, 36);
-	assert.equal(successor?.mutationSeq, 8);
+			superseded: !pending,
+		});
+		const successor = pending
+			? renameEvent("successor", "A.md", "B.md", {
+					createdAt: 2,
+					predecessorUploadId: "upload",
+				})
+			: fileEvent("successor", "A.md", {
+					baseRevision: 35,
+					createdAt: 2,
+					mutationId: "device-a:8",
+					mutationSeq: 8,
+					snapshotSha256: "latest",
+				});
+		const reduction = reduceUploadCausalReceipts([upload, successor], {
+			completed: pending ? [] : [upload.id],
+			superseded: pending ? [upload.id] : [],
+			uploadReceipts: [
+				{
+					eventId: upload.id,
+					path: upload.path,
+					status,
+					reason: pending ? "coalesced" : "accepted-put",
+					epoch: "epoch-a",
+					canonicalRevision: pending ? null : 36,
+					mutationId: upload.mutationId,
+					mutationSeq: upload.mutationSeq,
+					sha256: "previous",
+				},
+			],
+		});
+		const result = reduction.events.find(({ id }) => id === successor.id);
+		assert.equal(result?.action, successor.action, status);
+		assert.equal(result?.baseRevision, pending ? 7 : 36, status);
+		if (pending) {
+			assert.ok(result?.action === "rename" && result.kind === "file");
+			assert.equal(result.predecessorUploadId, undefined, status);
+		} else {
+			assert.equal(result?.mutationSeq, 8, status);
+		}
+	}
 });

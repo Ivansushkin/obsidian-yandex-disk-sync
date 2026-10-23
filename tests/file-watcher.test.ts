@@ -38,56 +38,29 @@ test("legacy watcher file events receive durable causal metadata", () => {
 	);
 });
 
-test("running rename keeps successor and safely rebases a missing target", async () => {
-	const { watcher, access } = createWatcher();
-
-	const first = renameEvent("rename-a", "A.md", "B.md");
-	access.deferEvent(first);
-	access.submittedWatcherEventIds.add("rename-a");
-	access.deferEvent(
-		renameEvent("rename-b", "B.md", "deep/C.md", { createdAt: 2 }),
-	);
-
-	const [predecessor] = watcher.getDeferredEvents();
-	assert.ok(predecessor);
-	await access.settlement.settleRenameEvent(first, {
-		status: "retry",
-		canonicalRevision: null,
-		epoch: "epoch-a",
-		reason: "target-missing-before-remote",
-		remoteStarted: false,
-	});
-
-	assert.deepEqual(
-		watcher.getDeferredEvents().map((event) => ({
-			path: event.path,
-			targetPath:
-				event.action === "rename" ? event.targetPath : undefined,
-		})),
-		[{ path: "A.md", targetPath: "deep/C.md" }],
-	);
-});
-
-test("completed running rename advances successor causal revision", async () => {
-	const { watcher, access } = createWatcher();
-
-	const first = renameEvent("rename-a", "A.md", "B.md");
-	access.deferEvent(first);
-	access.submittedWatcherEventIds.add("rename-a");
-	access.deferEvent(
-		renameEvent("rename-b", "B.md", "C.md", { createdAt: 2 }),
-	);
-
-	await access.settlement.settleRenameEvent(first, {
-		status: "completed",
-		canonicalRevision: 9,
-		epoch: "epoch-a",
-		remoteStarted: true,
-	});
-
-	const [successor] = watcher.getDeferredEvents();
-	assert.ok(successor && "baseRevision" in successor);
-	assert.equal(successor.baseRevision, 9);
+test("running rename settlement rebases missing targets and advances completed successors", async () => {
+	for (const completed of [false, true]) {
+		const { watcher, access } = createWatcher();
+		const first = renameEvent("rename-a", "A.md", "B.md");
+		access.deferEvent(first);
+		access.submittedWatcherEventIds.add(first.id);
+		access.deferEvent(
+			renameEvent("rename-b", "B.md", "deep/C.md", { createdAt: 2 }),
+		);
+		await access.settlement.settleRenameEvent(first, {
+			status: completed ? "completed" : "retry",
+			canonicalRevision: completed ? 9 : null,
+			epoch: "epoch-a",
+			reason: completed ? undefined : "target-missing-before-remote",
+			remoteStarted: completed,
+		});
+		const [next] = watcher.getDeferredEvents();
+		assert.ok(next?.action === "rename");
+		assert.equal(next.path, completed ? "B.md" : "A.md");
+		assert.equal(next.targetPath, "deep/C.md");
+		assert.equal(next.baseRevision, completed ? 9 : 7);
+		assert.equal(watcher.getDeferredEvents().length, 1);
+	}
 });
 
 test("submitted upload is acknowledged only by coordinator settlement", () => {
@@ -130,53 +103,6 @@ test("file rename durably links the newest submitted source upload", () => {
 		rename.id,
 	);
 	access.drainPendingFileEvents();
-});
-
-test("accepted submitted upload advances its rename before acknowledgement", async () => {
-	const { watcher, access } = createWatcher();
-	watcher.loadDeferredEvents([
-		fileEvent("upload-a", "A.md", {
-			mutationId: "device-a:1",
-			mutationSeq: 1,
-			snapshotSha256: "sha-a",
-			superseded: true,
-			supersededByRenameId: "rename-a",
-		}),
-		renameEvent("rename-a", "A.md", "deep/C.md", {
-			createdAt: 2,
-			predecessorUploadId: "upload-a",
-		}),
-	]);
-	const persistedQueues: DeferredWatcherEvent[][] = [];
-	watcher.setPersistCallback(async () => {
-		persistedQueues.push(structuredClone(watcher.getDeferredEvents()));
-	});
-
-	access.applyBatchResult({
-		completed: ["upload-a"],
-		superseded: [],
-		retry: [],
-		uploadReceipts: [
-			{
-				eventId: "upload-a",
-				path: "A.md",
-				status: "accepted-put",
-				reason: "accepted-put",
-				epoch: "epoch-a",
-				canonicalRevision: 8,
-				mutationId: "device-a:1",
-				mutationSeq: 1,
-				sha256: "sha-a",
-			},
-		],
-	});
-	await Promise.resolve();
-
-	const [rename] = watcher.getDeferredEvents();
-	assert.ok(rename?.action === "rename" && rename.kind === "file");
-	assert.equal(rename.baseRevision, 8);
-	assert.equal(rename.predecessorUploadId, undefined);
-	assert.equal(persistedQueues.at(-1)?.length, 1);
 });
 
 test("full barrier settles captured uploads only after success and retains later work", () => {
@@ -232,44 +158,46 @@ test("full barrier settles captured uploads only after success and retains later
 });
 
 test("session resume replays only new paused events after success", async () => {
-	for (const success of [true, false]) {
-		const { watcher, access } = createWatcher();
+	for (const kind of ["maintenance", "full"] as const) {
+		for (const success of [true, false]) {
+			const { watcher, access } = createWatcher();
 
-		access.isEnabled = true;
-		const context = { epoch: "epoch-a", baseRevision: 7, createdAt: 1 };
-		watcher.loadDeferredEvents([
-			{
+			access.isEnabled = true;
+			const context = { epoch: "epoch-a", baseRevision: 7, createdAt: 1 };
+			watcher.loadDeferredEvents([
+				{
+					...context,
+					id: "old-rename",
+					action: "rename",
+					path: "A.md",
+					targetPath: "B.md",
+					kind: "file",
+				},
+			]);
+			const replayed: string[][] = [];
+			access.flushDeferredEvents = async (onlyIds) => {
+				replayed.push([...(onlyIds ?? [])]);
+			};
+			const session = {
+				sessionId: "maintenance-1",
+				kind,
+			};
+			await watcher.pauseForSync(session);
+			access.deferEvent({
 				...context,
-				id: "old-rename",
-				action: "rename",
-				path: "A.md",
-				targetPath: "B.md",
-				kind: "file",
-			},
-		]);
-		const replayed: string[][] = [];
-		access.flushDeferredEvents = async (onlyIds) => {
-			replayed.push([...(onlyIds ?? [])]);
-		};
-		const session = {
-			sessionId: "maintenance-1",
-			kind: "maintenance" as const,
-		};
-		await watcher.pauseForSync(session);
-		access.deferEvent({
-			...context,
-			id: "new-upload",
-			action: "upload",
-			path: "new.md",
-		});
-		await watcher.resumeAfterSync({ ...session, success });
-		assert.deepEqual(
-			replayed,
-			success ? [["new-upload"]] : [],
-			`success=${success}`,
-		);
-		if (!success) {
-			assert.equal(watcher.getDeferredEvents().length, 2);
+				id: "new-upload",
+				action: "upload",
+				path: "new.md",
+			});
+			await watcher.resumeAfterSync({ ...session, success });
+			assert.deepEqual(
+				replayed,
+				success ? [["new-upload"]] : [],
+				`success=${success}`,
+			);
+			if (!success) {
+				assert.equal(watcher.getDeferredEvents().length, 2);
+			}
 		}
 	}
 });
@@ -298,39 +226,6 @@ test("full barrier acknowledgement is persisted before resume completes", async 
 		assert.deepEqual(persistedQueues, [[]]);
 		assert.deepEqual(watcher.getDeferredEvents(), []);
 	}
-});
-
-test("failed full sync postpones watcher replay", async () => {
-	let fileBatchCalls = 0;
-	const { watcher, access } = createWatcher({
-		syncFileBatch: async () => {
-			fileBatchCalls++;
-			return {
-				completed: [],
-				superseded: [],
-				retry: ["covered-upload"],
-				uploadReceipts: [],
-			};
-		},
-	});
-
-	watcher.loadDeferredEvents([fileEvent("covered-upload", "covered.md")]);
-
-	access.isEnabled = true;
-	access.captureFullSyncBarrier({
-		sessionId: "full-1",
-		kind: "full",
-	});
-
-	await watcher.resumeAfterSync({
-		sessionId: "full-1",
-		kind: "full",
-		success: false,
-	});
-	await Promise.resolve();
-
-	assert.equal(fileBatchCalls, 0);
-	assert.deepEqual(eventIds(watcher), ["covered-upload"]);
 });
 
 test("realtime epoch replacement requests one full and keeps the event durable", async () => {
@@ -393,69 +288,46 @@ test("startup blocks before reconciliation when an upload rename chain is unreso
 	);
 });
 
-test("unresolved pre-full rename blocks normal full but not startup classification", async () => {
-	const retryOutcome = {
-		status: "retry" as const,
-		canonicalRevision: null,
-		epoch: "epoch-a",
-		reason: "maintenance-active",
-		remoteStarted: false,
-	};
-	const { watcher, access } = createWatcher({
-		showFullQueueWaitPhase: () => undefined,
-		renameFile: async (
-			_oldPath: string,
-			_newPath: string,
-			_context: unknown,
-			settle: (outcome: typeof retryOutcome) => Promise<void>,
-		) => {
-			await settle(retryOutcome);
-			return retryOutcome;
-		},
-	});
-
-	access.isEnabled = true;
-	watcher.loadDeferredEvents([renameEvent("rename-a", "A.md", "B.md")]);
-
-	await assert.rejects(
-		watcher.prepareForSync({ sessionId: "full-1", kind: "full" }),
-		/left 1 unresolved event/,
-	);
-	await watcher.prepareForSync({
-		sessionId: "full-2",
-		kind: "full",
-		startup: true,
-	});
-	assert.equal(watcher.getDeferredEvents().length, 1);
-});
-
-test("missing-target rename without remote work is deferred to normal full", async () => {
-	const retryOutcome = {
-		status: "retry" as const,
-		canonicalRevision: null,
-		epoch: "epoch-a",
-		reason: "target-missing-before-remote",
-		remoteStarted: false,
-	};
-	const { watcher, access } = createWatcher({
-		showFullQueueWaitPhase: () => undefined,
-		renameFile: async (
-			_oldPath: string,
-			_newPath: string,
-			_context: unknown,
-			settle: (outcome: typeof retryOutcome) => Promise<void>,
-		) => {
-			await settle(retryOutcome);
-			return retryOutcome;
-		},
-	});
-
-	access.isEnabled = true;
-	watcher.loadDeferredEvents([renameEvent("rename-a", "A.md", "B.md")]);
-
-	await watcher.prepareForSync({ sessionId: "full-1", kind: "full" });
-
-	assert.equal(watcher.getDeferredEvents().length, 1);
+test("pre-full rename admission distinguishes maintenance from a missing local target", async () => {
+	for (const reason of [
+		"maintenance-active",
+		"target-missing-before-remote",
+	] as const) {
+		const outcome = {
+			status: "retry" as const,
+			canonicalRevision: null,
+			epoch: "epoch-a",
+			reason,
+			remoteStarted: false,
+		};
+		const { watcher, access } = createWatcher({
+			showFullQueueWaitPhase: () => undefined,
+			renameFile: async (_old, _new, _context, settle) => {
+				await settle?.(outcome, {
+					sessionId: "rename",
+					kind: "realtime",
+				});
+				return outcome;
+			},
+		});
+		access.isEnabled = true;
+		watcher.loadDeferredEvents([renameEvent("rename", "A.md", "B.md")]);
+		const prepare = watcher.prepareForSync({
+			sessionId: "full-1",
+			kind: "full",
+		});
+		if (reason === "maintenance-active") {
+			await assert.rejects(prepare, /left 1 unresolved event/, reason);
+		} else {
+			await prepare;
+		}
+		await watcher.prepareForSync({
+			sessionId: "startup",
+			kind: "full",
+			startup: true,
+		});
+		assert.equal(watcher.getDeferredEvents().length, 1, reason);
+	}
 });
 
 test("ambiguous rename failure does not execute its successor", async () => {

@@ -6,6 +6,24 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"force.preserved_remote":
+			"Existing .backup is kept. The index is rebuilt; encryption metadata is replaced to match the uploaded files.",
+		"force.preserved_local":
+			"Local .backup and this sync plugin are kept. All other files and Obsidian configuration are replaced.",
+		"force.filters_ignored":
+			"The entire vault is included. Normal include/exclude filters do not apply.",
+		"force.optional_archive": "Create an archive before replacement",
+		"force.replace_remote": "Clear Disk and upload local files",
+		"force.replace_local": "Clear local files and download from Disk",
+		"force.archive_retry_inline":
+			"The archive could not be created. Retry, turn off the archive option, or cancel. Replacement has not started.",
+		"force.partial_result":
+			"Replacement partially completed: {successful} actions completed, {failed} errors. Ordinary sync will retry unfinished actions.",
+		"force.not_started": "Replacement has not started.",
+		"force.legacy_recovery":
+			"An old scoped Force operation is unfinished. Confirm a new full Force replacement to reset it.",
+		"force.restart_required":
+			"Obsidian configuration was replaced. Restart Obsidian to apply it.",
 		"storage.replacement": "Connect the recreated Force storage",
 		"storage.replacement_description":
 			"The folder at this path was recreated. A verified new canonical generation can be connected while preserving offline edits; transferring them requires a separate explicit choice.",
@@ -180,6 +198,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.op.creating_folders": "Creating folders...",
 		"status.op.uploading_files": "Uploading files...",
 		"status.op.downloading_files": "Downloading files...",
+		"status.op.receiving_initial_files": "Checking and receiving files...",
 		"status.op.deleting_files": "Deleting files...",
 		"status.op.deleting_remote_files": "Deleting remote files...",
 		"status.op.deleting_local_files": "Deleting local files...",
@@ -305,7 +324,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Time to wait after last change before uploading file",
 		"settings.max_concurrency": "Max concurrent operations",
 		"settings.max_concurrency_desc":
-			"Number of files to sync simultaneously (1-20). Higher values = faster sync, but more API load",
+			"Concurrent file operations and independent metadata reads during ordinary sync (1-40, default 20). Higher values increase API load",
 		"settings.file_filters_section": "File filters",
 		"settings.sync_config_folder": "Sync config folder",
 		"settings.sync_config_folder_desc":
@@ -465,6 +484,24 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"force.preserved_remote":
+			"Существующая .backup сохраняется. Индекс пересоздаётся; метаданные шифрования приводятся к загружаемым файлам.",
+		"force.preserved_local":
+			"Локальная .backup и сам sync-плагин сохраняются. Все остальные файлы и конфигурация Obsidian заменяются.",
+		"force.filters_ignored":
+			"Заменяется весь vault. Обычные фильтры включения и исключения не применяются.",
+		"force.optional_archive": "Создать архив перед заменой",
+		"force.replace_remote": "Очистить Диск и загрузить локальное",
+		"force.replace_local": "Очистить локальное и скачать с Диска",
+		"force.archive_retry_inline":
+			"Архив не создан. Повторите попытку, отключите архив или отмените. Замена не начата.",
+		"force.partial_result":
+			"Замена выполнена частично: завершено действий — {successful}, ошибок — {failed}. Обычный sync повторит оставшиеся действия.",
+		"force.not_started": "Замена не начата.",
+		"force.legacy_recovery":
+			"Осталась старая ограниченная операция Force. Подтвердите новую полную замену, чтобы сбросить её.",
+		"force.restart_required":
+			"Конфигурация Obsidian заменена. Перезапустите Obsidian, чтобы применить её.",
 		"storage.replacement": "Подключить пересозданное Force-хранилище",
 		"storage.replacement_description":
 			"Папка по этому пути пересоздана. Проверенное новое поколение можно подключить с сохранением офлайн-правок; их отправка потребует отдельного явного выбора.",
@@ -490,7 +527,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.confirm_details":
 			"Источник: {source}. Назначение: {target}. Файлов в источнике: {count}. Итоговый режим: {mode}.",
 		"force.empty_source":
-			"Источник пуст. Все синхронизируемые файлы назначения будут удалены.",
+			"Источник пуст. Назначение будет очищено, кроме явно сохраняемых путей.",
 		"force.epoch_title": "Хранилище на Диске заменено",
 		"force.epoch_description":
 			"Ваши офлайн-правки сохранены. Выберите: принять новое состояние Диска, перенести свои правки или решить позже. До выбора ничего не отправляется.",
@@ -642,6 +679,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.op.creating_folders": "Создание папок...",
 		"status.op.uploading_files": "Загрузка файлов...",
 		"status.op.downloading_files": "Скачивание файлов...",
+		"status.op.receiving_initial_files": "Проверка и получение файлов...",
 		"status.op.deleting_files": "Удаление файлов...",
 		"status.op.deleting_remote_files": "Удаление удалённых файлов...",
 		"status.op.deleting_local_files": "Удаление локальных файлов...",
@@ -769,7 +807,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Время ожидания после последнего изменения перед загрузкой файла",
 		"settings.max_concurrency": "Макс. параллельных операций",
 		"settings.max_concurrency_desc":
-			"Количество файлов для синхронизации одновременно (1-20). Больше = быстрее, но выше нагрузка на API",
+			"Параллельные файловые операции и независимые чтения метаданных обычной синхронизации (1-40, по умолчанию 20). Больше — выше нагрузка на API",
 		"settings.file_filters_section": "Фильтры файлов",
 		"settings.sync_config_folder": "Синхронизировать папку настроек",
 		"settings.sync_config_folder_desc":
@@ -920,7 +958,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_warning":
 			"ВНИМАНИЕ: Операция является деструктивной и не может быть отменена. Изменения, сделанные после синхронизации на перезаписываемой стороне, могут быть потеряны.",
 		"modal.force_sync_recommend_backup":
-			"Выберите полный архив или продолжение без него. Проверки снимков и защита отдельных файлов сохраняются.",
+			"Архив необязателен. Без него защитные и конфликтные копии не создаются.",
 		"modal.force_sync_backup_button": "Создать бекап и продолжить",
 		"notice.force_sync_from_local_started":
 			"Принудительная синхронизация из локального в удалённое...",

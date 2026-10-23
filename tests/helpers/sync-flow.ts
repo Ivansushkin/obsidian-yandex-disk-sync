@@ -303,6 +303,23 @@ export class MemoryVault {
 	listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 	adapter = {
 		exists: async (path: string) => this.entries.has(path),
+		list: async (path: string) => ({
+			files: [...this.files.keys()].filter(
+				(name) => parent(name) === path,
+			),
+			folders: [...this.entries.values()]
+				.filter(
+					(entry) =>
+						entry instanceof TFolder && parent(entry.path) === path,
+				)
+				.map((entry) => entry.path),
+		}),
+		readBinary: async (path: string) => {
+			assert.ok(this.files.has(path), `Missing local ${path}`);
+			return this.files.get(path)!.slice(0);
+		},
+		remove: async (path: string) => this.remove(path),
+		rmdir: async (path: string) => this.remove(path),
 		mkdir: async (path: string) => {
 			this.folder(path);
 		},
@@ -317,8 +334,13 @@ export class MemoryVault {
 						mtime: 1,
 						ctime: 1,
 					}
-				: null,
+				: this.entries.has(path)
+					? { type: "folder", size: 0, mtime: 1, ctime: 1 }
+					: null,
 	};
+	async delete(entry: TFile | TFolder) {
+		this.remove(entry.path);
+	}
 	getName() {
 		return "synthetic";
 	}
@@ -478,6 +500,7 @@ export function device(
 		readTimeoutMs?: number;
 		maxRetries?: number;
 	} = {},
+	onPersist?: (snapshot: SavedDevice) => void,
 ) {
 	disk.install();
 	logger.configure({ consoleEnabled: false, fileEnabled: false });
@@ -527,6 +550,7 @@ export function device(
 				pendingWatcherEvents: watcher.getDeferredEvents(),
 			}),
 		) as SavedDevice;
+		onPersist?.(structuredClone(persisted));
 	};
 	engine.setIndexSaveCallback(persist);
 	watcher.setPersistCallback(persist);

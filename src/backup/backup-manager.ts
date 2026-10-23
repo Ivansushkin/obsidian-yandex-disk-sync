@@ -122,6 +122,7 @@ export class BackupManager {
 	async createBackup(
 		passwordOverride?: string,
 		onProgress?: (phase: BackupProgress) => void,
+		fullForce = false,
 	): Promise<BackupResult> {
 		const remotePath = this.settings.remotePath;
 		const password =
@@ -143,6 +144,7 @@ export class BackupManager {
 
 			const snapshot = await captureLogicalVaultSnapshot(
 				this.vaultAdapter,
+				fullForce,
 			);
 			logger.info(`Found ${snapshot.files.length} files to backup`);
 
@@ -227,6 +229,7 @@ export class BackupManager {
 	async createRemoteSnapshotBackup(
 		passwordOverride?: string,
 		onProgress?: (phase: BackupProgress) => void,
+		fullForce = false,
 	): Promise<BackupResult> {
 		const remotePath = this.settings.remotePath;
 		const password =
@@ -247,6 +250,7 @@ export class BackupManager {
 			const snapshot = await captureRemoteRawSnapshot(
 				this.yandexClient,
 				remotePath,
+				fullForce ? this.vaultAdapter.vault.configDir : undefined,
 			);
 			const zip = new JSZip();
 			for (const file of snapshot.files) {

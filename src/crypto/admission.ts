@@ -14,6 +14,8 @@ export interface EncryptionReadyOptions {
 	prompt: boolean;
 	/** Admission checks authority without starting recovery or reconnect. */
 	allowRecovery?: boolean;
+	/** Drop invocation observations before changing codec or entering recovery. */
+	invalidateReads?(): void;
 }
 
 /** Validates current remote encryption and serializes explicit password prompts. */
@@ -76,6 +78,7 @@ export class EncryptionAdmission {
 						if (!options.prompt) {
 							return false;
 						}
+						options.invalidateReads?.();
 						await this.context.engine.runExclusiveMaintenance(
 							async () => {
 								await this.recovery.recoverRemotePlaintextTargetTransition(
@@ -90,6 +93,7 @@ export class EncryptionAdmission {
 					logger.info(
 						"Remote encryption manifest gone; auto-disabling local encryption",
 					);
+					options.invalidateReads?.();
 					await this.workflow.clearLocalEncryptionState();
 					this.context.ui.disabledRemotely();
 					this.context.ui.stateChanged();
@@ -104,6 +108,7 @@ export class EncryptionAdmission {
 				}
 				const recoveryKind =
 					this.controller.getRemoteTargetRecoveryKind(manifest);
+				options.invalidateReads?.();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					recoveryKind === "rotate" ? "rotated" : "recover",
@@ -133,6 +138,7 @@ export class EncryptionAdmission {
 				if (!options.prompt || options.allowRecovery === false) {
 					return false;
 				}
+				options.invalidateReads?.();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					hasLocalEncryption ? "rotated" : "connect",
@@ -152,6 +158,7 @@ export class EncryptionAdmission {
 					if (!options.prompt || options.allowRecovery === false) {
 						return false;
 					}
+					options.invalidateReads?.();
 					return await this.promptForRemoteEncryptionPassword(
 						manifest,
 						"rotated",

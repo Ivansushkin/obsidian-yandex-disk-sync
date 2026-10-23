@@ -80,6 +80,33 @@ Conflict reconciliation сравнивает plaintext SHA, подтвержда
 upload, read-back и canonical confirmation. Проверки повторяют manifest/codec
 guards; plaintext buffers существуют только внутри операции и не журналируются.
 
+Обычный full передаёт manifest validation token из admission в upload guards.
+Неизменный manifest читается body один раз за full; свежая token validation перед
+операциями сохраняется. Missing SHA-256/MD5 не разрешает content reuse: прежний
+stable body read остаётся fallback. Canonical bytes принадлежат только explicit
+read session startup/full invocation, с fresh root/locks/hash и config/transition generation.
+Scope, manifest-token и canonical validators одной initial/full evaluation используют
+одну свежую stable raw root pair, включая manifest и lock identities. Opaque observation
+истекает после callback; следующий write/retry получает новую. Неизвестная root/service
+identity или неполная pagination блокирует sync. Standalone
+writeGuard остаётся независимым. Startup classification, recovery detection и admission
+передают full одну explicit service-read session; standalone refresh закрывает её.
+Manifest/canonical reuse требует fresh unlocked stable root и SHA-256/MD5, no-hash
+повторяет stable body read. Recovery и codec/config drift инвалидируют observations. Snapshot и token не разрешают corrective write: repair повторяет canonical,
+manifest и physical authority. Realtime и Direct Force сохраняют свои пути.
+Initial identical admission может повторно использовать raw physical metadata свежего
+root observation. Общий targeted collector сохраняет active codec conversion и
+shared filters; remote SHA относится к physical ciphertext, local SHA — к plaintext.
+Ни cached listing, ни missing entry не разрешают overwrite/deletion. После bulk
+обновляются только missing stamps, включая старые; service/write guards прежние
+(`SYNC-044`).
+Ordinary baseline-only reception не двигает canonical в lock: canonical JSON и все
+unpublished causal effects проверяются отдельно от local baseline. После coherent
+partial save fresh final evaluation снова проверяет scope/manifest/canonical и
+config generation; совпавший ciphertext hash позволяет reuse bytes, но не обход
+validation. Failure не продвигает observed revision/time или ACK. Imported physical
+stamps и pending watermarks по-прежнему commit-ятся (`SYNC-045/046`).
+
 Current `data.json` содержит `format: "plugin-data"`. Encryption и transition
 snapshots обязаны иметь явный `profileId`. Загрузчик принимает только:
 
@@ -101,6 +128,13 @@ maintenance остаётся заблокированным.
 settings, salt или revision. Wrong password, Cancel и любая coherence/canonical
 ошибка не сохраняют candidate credentials и не выполняют remote writes.
 Password prompt не запускается из guard уже активной coordinator-сессии.
+
+Matching authenticated candidate устанавливается без повторного PBKDF2 только при
+exact manager-owned profile/salt/password. Instance-local WeakMap не удерживает codec
+и не принимает сторонние экземпляры. Verifier, canonical target и fresh manifest
+проверяются до install; cancellation/config ABA во время derivation запрещает позднюю
+публикацию. Отказ persistence сохраняет прежнюю target/error authority, без ложного
+success или rollback после commit (`SYNC-048`).
 
 ## Target proof, publication и rollback
 
@@ -236,27 +270,18 @@ Internal сохранение target snapshot и очередей не прох�
 
 ## Направленный Force
 
-Force использует отдельный maintenance kind и recovery, сохраняя формат markers
-и профиль `hardened`. Он не выполняет enable/disable/rotate как фиктивный переход.
-Локальное → Диск создаёт свежую соль и согласованные target user objects,
-canonical и manifest; источник — фактические локальные plaintext bytes.
-Старый ключ назначения не нужен при полном raw scope. При ограниченных include
-patterns raw имя вне scope, похожее на ciphertext, требует доказанного target
-codec logical path; иначе Force блокируется до удаления, сохраняя возможный
-excluded plaintext. Явное raw exclusion снимает неоднозначность для посторонних
-объектов. Manifest сам по себе не доказывает формат каждого user object.
-Диск → локальное проверяет все source paths и decrypt до первого overwrite/delete.
-Неоднозначный mixed plaintext/ciphertext source также блокируется при decrypt
-failure; посторонние raw objects можно явно исключить до filename conversion.
-При потерянном manifest формат выбирается явно; сохранённые salt/profile допустимы
-только с успешной проверкой пути и bytes. Один пароль не заменяет потерянные salt/profile.
-Пустой remote сохраняет локальный mode и получает рабочие пустые metadata.
+[Полный direct Force](FORCE_SYNC.md) не выполняет enable/disable/rotate как фиктивный
+переход и не меняет semantic markers или hardened profile. Локальное → Диск
+очищает назначение raw без старого ключа и создаёт согласованные новые user bytes,
+canonical и manifest со свежей salt. Для plaintext target старый manifest удаляется.
 
-Подробные backup, source/scope guards и restart phases описаны в
-[ARCHITECTURE.md](ARCHITECTURE.md). Два профиля Obsidian и реальный Диск проверяются
-отдельно; functional harness не является доказательством этого прогона.
+Диск → локальное сначала аутентифицирует все физические source paths и bytes.
+Рабочий manifest и его salt/profile сохраняются. Если manifest утрачен/неверен,
+сохранённые codec parameters можно использовать только с успешным чтением всего
+источника. Один пароль не заменяет потерянные salt/profile. Mixed source, который
+нельзя однозначно прочитать, не разрешает очистку локального назначения.
 
-Force maintenance проверяется по kind до encryption recovery и даёт отдельный
-`force-recovery-pending`. Completion receipt Force не откатывает последующую
-enable/disable/rotate. Guard перед manifest PUT/DELETE не является server fencing;
-late manifest write остаётся P0 release blocker в [проверках Force](FORCE_SAFETY_VALIDATION.md).
+Force не использует временные файлы и не обеспечивает server fencing. Обычный
+sync сначала завершает direct-v1 remainder, затем использует прежние encryption
+guards. Незавершённый старый scoped Force требует новой явной полной замены.
+Реальные два профиля Obsidian/Yandex проверяются отдельно от functional harness.

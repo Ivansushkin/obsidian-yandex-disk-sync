@@ -2,90 +2,40 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	classifyIndexMoveRecovery,
-	rawBuffersEqual,
 	rollbackRawIndexSnapshot,
 	shouldRetryIndexTransaction,
 } from "../src/sync/canonical/transaction";
 
-test("successful but timed out canonical move is classified as committed", () => {
-	assert.equal(
-		classifyIndexMoveRecovery({
-			canonicalExists: true,
-			lockExists: false,
-			canonicalReadable: true,
-			lockReadable: false,
-			canonicalMatchesExpected: true,
-			lockMatchesExpected: false,
-		}),
-		"committed",
-	);
-});
-
-test("verified lock without canonical retries only the final move", () => {
-	assert.equal(
-		classifyIndexMoveRecovery({
-			canonicalExists: false,
-			lockExists: true,
-			canonicalReadable: false,
-			lockReadable: true,
-			canonicalMatchesExpected: false,
-			lockMatchesExpected: true,
-		}),
-		"retry-move",
-	);
-});
-
-test("different canonical is concurrent and dual state is ambiguous", () => {
-	assert.equal(
-		classifyIndexMoveRecovery({
-			canonicalExists: true,
-			lockExists: false,
-			canonicalReadable: true,
-			lockReadable: false,
-			canonicalMatchesExpected: false,
-			lockMatchesExpected: false,
-		}),
-		"concurrent",
-	);
-	assert.equal(
-		classifyIndexMoveRecovery({
-			canonicalExists: true,
-			lockExists: true,
-			canonicalReadable: true,
-			lockReadable: true,
-			canonicalMatchesExpected: true,
-			lockMatchesExpected: true,
-		}),
-		"ambiguous",
-	);
-});
-
-test("transaction retry requires rollback or ordinary contention", () => {
+test("canonical move recovery classifies authority and retry eligibility", () => {
+	for (const [canonical, lock, matches, outcome] of [
+		[true, false, true, "committed"],
+		[false, true, true, "retry-move"],
+		[true, false, false, "concurrent"],
+		[true, true, true, "ambiguous"],
+	] as const) {
+		const actual = classifyIndexMoveRecovery({
+			canonicalExists: canonical,
+			lockExists: lock,
+			canonicalReadable: canonical,
+			lockReadable: lock,
+			canonicalMatchesExpected: canonical && matches,
+			lockMatchesExpected: lock && matches,
+		});
+		assert.equal(
+			actual,
+			outcome,
+			JSON.stringify({ canonical, lock, matches }),
+		);
+	}
+	for (const outcome of ["committed", "concurrent", "ambiguous"] as const) {
+		assert.equal(shouldRetryIndexTransaction(outcome), false, outcome);
+	}
 	assert.equal(shouldRetryIndexTransaction("rolled-back"), true);
-	assert.equal(shouldRetryIndexTransaction("concurrent"), false);
-	assert.equal(shouldRetryIndexTransaction("ambiguous"), false);
 	assert.equal(shouldRetryIndexTransaction("concurrent", true), true);
 });
 
-test("raw rollback comparison is byte exact", () => {
-	assert.equal(
-		rawBuffersEqual(
-			new Uint8Array([1, 2, 3]).buffer,
-			new Uint8Array([1, 2, 3]).buffer,
-		),
-		true,
-	);
-	assert.equal(
-		rawBuffersEqual(
-			new Uint8Array([1, 2, 3]).buffer,
-			new Uint8Array([1, 2, 4]).buffer,
-		),
-		false,
-	);
-});
-
 function createRawBackend(
-	initial: Record<string, number[]>,
+	initial: Record<string, readonly number[]>,
 	throwAfterMove = false,
 	throwAfterWrite = false,
 ) {
@@ -135,65 +85,40 @@ function createRawBackend(
 	};
 }
 
-test("modified encrypted lock rolls back byte-for-byte", async () => {
-	const fake = createRawBackend({ lock: [9, 9, 9] });
+test("raw rollback preserves exact bytes across lost responses and ambiguous ownership", async () => {
 	const original = new Uint8Array([31, 8, 240, 17]).buffer;
-	const outcome = await rollbackRawIndexSnapshot(
-		fake.backend,
-		"lock",
-		"canonical",
-		original,
-		async (raw) => assert.equal(raw.byteLength, 4),
-	);
-
-	assert.equal(outcome, "rolled-back");
-	assert.equal(fake.files.has("lock"), false);
-	assert.equal(rawBuffersEqual(fake.files.get("canonical")!, original), true);
-});
-
-test("rollback recognizes a successful move with a lost response", async () => {
-	const fake = createRawBackend({ lock: [4, 5] }, true);
-	const original = new Uint8Array([1, 2, 3]).buffer;
-	const outcome = await rollbackRawIndexSnapshot(
-		fake.backend,
-		"lock",
-		"canonical",
-		original,
-		async () => undefined,
-	);
-
-	assert.equal(outcome, "rolled-back");
-	assert.equal(fake.files.has("lock"), false);
-});
-
-test("rollback recognizes a successful raw restore with a lost response", async () => {
-	const fake = createRawBackend({ lock: [4, 5] }, false, true);
-	const original = new Uint8Array([1, 2, 3]).buffer;
-	const outcome = await rollbackRawIndexSnapshot(
-		fake.backend,
-		"lock",
-		"canonical",
-		original,
-		async () => undefined,
-	);
-
-	assert.equal(outcome, "rolled-back");
-	assert.equal(rawBuffersEqual(fake.files.get("canonical")!, original), true);
-});
-
-test("rollback preserves ambiguous canonical and lock", async () => {
-	const fake = createRawBackend({
-		lock: [7],
-		canonical: [8],
-	});
-	const outcome = await rollbackRawIndexSnapshot(
-		fake.backend,
-		"lock",
-		"canonical",
-		new Uint8Array([1]).buffer,
-		async () => undefined,
-	);
-
-	assert.equal(outcome, "ambiguous");
-	assert.deepEqual([...fake.files.keys()].sort(), ["canonical", "lock"]);
+	for (const [fault, initial, expected] of [
+		["none", { lock: [9, 9, 9] }, "rolled-back"],
+		["move", { lock: [4, 5] }, "rolled-back"],
+		["write", { lock: [4, 5] }, "rolled-back"],
+		["ambiguous", { lock: [7], canonical: [8] }, "ambiguous"],
+	] as const) {
+		const fake = createRawBackend(
+			initial,
+			fault === "move",
+			fault === "write",
+		);
+		const outcome = await rollbackRawIndexSnapshot(
+			fake.backend,
+			"lock",
+			"canonical",
+			original,
+			async (raw) =>
+				assert.equal(raw.byteLength, original.byteLength, fault),
+		);
+		assert.equal(outcome, expected, fault);
+		const contents = Object.fromEntries(
+			[...fake.files].map(([path, bytes]) => [
+				path,
+				[...new Uint8Array(bytes)],
+			]),
+		);
+		assert.deepEqual(
+			contents,
+			expected === "ambiguous"
+				? initial
+				: { canonical: [...new Uint8Array(original)] },
+			fault,
+		);
+	}
 });

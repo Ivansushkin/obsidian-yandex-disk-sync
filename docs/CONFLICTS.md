@@ -163,3 +163,12 @@ SHA с baseline/canonical и epoch adoption. Эти признаки не зам
 меняют выбор winner. Этапы read/copy/upload/commit/verify/apply логируются без
 bytes; read timeout указывает API/transfer и сохраняет код ошибки. Progress
 подтверждает завершённые попытки, а не начало conflict flow.
+
+## Полный Force
+
+[Direct Force](FORCE_SYNC.md) не разрешает конфликты по старым baseline/tombstones
+или чужой canonical authority. Он удаляет всё назначение с перечисленными
+исключениями и пишет выбранный источник. Include/exclude не применяются,
+protective/conflict copies не создаются. Читаемость источника обязательна.
+Ошибки отдельных операций сохраняются для ordinary full retry до normal merge.
+Обычная синхронизация сохраняет описанные выше правила конфликтов и защитных копий.

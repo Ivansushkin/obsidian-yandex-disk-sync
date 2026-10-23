@@ -17,6 +17,73 @@ const PLUGIN_DIRECTORY_NAMES = new Set([
 ]);
 const LEGACY_LOG_DIRECTORY = "yandex-disk-sync";
 
+/** Validate a literal vault-relative path before an unfiltered Force operation. */
+export function assertForcePath(path: string): void {
+	if (
+		!path ||
+		normalizePath(path) !== path ||
+		path.includes("\0") ||
+		path.split("/").some((part) => part === "." || part === "..")
+	) {
+		throw new Error("Force path is outside the selected tree or invalid");
+	}
+}
+
+/** Reserve only the root service namespace; nested names remain literal user paths. */
+export function isForceServicePath(path: string): boolean {
+	const root = path.split("/")[0]!;
+	return (
+		root === ".obsidian-sync-index.json" ||
+		root === ".obsidian-encrypt.json" ||
+		root.startsWith(REMOTE_INDEX_LOCK_PREFIX)
+	);
+}
+
+/** Keep the installed sync plugin, its state and its old log directory local. */
+export function isForcePluginPath(path: string, configDir: string): boolean {
+	return (
+		[...PLUGIN_DIRECTORY_NAMES].some((name) => {
+			const plugin = joinPath(configDir, "plugins", name);
+			return path === plugin || path.startsWith(`${plugin}/`);
+		}) ||
+		path === joinPath(configDir, LEGACY_LOG_DIRECTORY) ||
+		path.startsWith(`${joinPath(configDir, LEGACY_LOG_DIRECTORY)}/`)
+	);
+}
+
+/** Force source selection never consults ordinary include/exclude settings. */
+export function isForceSourcePath(path: string, configDir: string): boolean {
+	return (
+		path !== ".backup" &&
+		!path.startsWith(".backup/") &&
+		!isForceServicePath(path) &&
+		!isForcePluginPath(path, configDir) &&
+		!isLegacyPluginDataPath(path)
+	);
+}
+
+/** A local purge must descend into ancestors instead of deleting the running plugin. */
+export function preservesForceLocalPath(
+	path: string,
+	configDir: string,
+): boolean {
+	return (
+		path === ".backup" ||
+		path.startsWith(".backup/") ||
+		isForcePluginPath(path, configDir)
+	);
+}
+
+export function containsForceLocalPreservedPath(
+	path: string,
+	configDir: string,
+): boolean {
+	return [...PLUGIN_DIRECTORY_NAMES]
+		.map((name) => joinPath(configDir, "plugins", name))
+		.concat(joinPath(configDir, LEGACY_LOG_DIRECTORY))
+		.some((protectedPath) => protectedPath.startsWith(`${path}/`));
+}
+
 /**
  * Path normalization (remove leading/trailing slashes, replace backslashes)
  */

@@ -3,7 +3,11 @@ import { ForceRecoveryPendingError } from "../workflows/force-state";
  * Synchronization index manager
  */
 
-import { CanonicalRecovery, REMOTE_INDEX_FILENAME } from "./recovery";
+import {
+	CanonicalRecovery,
+	type StableRootListing,
+	REMOTE_INDEX_FILENAME,
+} from "./recovery";
 import { commitCanonicalIndex } from "./commit";
 import { ForcePublication } from "./force-publication";
 
@@ -100,6 +104,32 @@ import {
 } from "./merge";
 import { parseEncryptionManifest } from "../../crypto/manifest-schema";
 
+declare const authorityObservation: unique symbol;
+/** Opaque metadata usable only by validators during its owning read evaluation. */
+export interface RemoteAuthorityObservation {
+	readonly [authorityObservation]: true;
+}
+
+/** Invocation-owned bytes; validators share metadata only within each fresh read. */
+export interface CanonicalReadSession {
+	(
+		validate?: (observation: RemoteAuthorityObservation) => Promise<void>,
+	): Promise<SyncIndex>;
+	load(allowEpochAdoption?: boolean): Promise<SyncIndex>;
+	assertCurrent(): void;
+}
+
+/** Startup service observations expire with their owning lifecycle invocation. */
+export interface StartupReadSession extends CanonicalReadSession {
+	manifest(): Promise<EncryptionManifestRead>;
+	readWithCodecIfPresent(
+		service: EncryptionCodec | null,
+	): Promise<SyncIndex | null>;
+	inspectFormat(): Promise<RemoteCanonicalFormat>;
+	close(): void;
+	bind(assertActive: () => void): void;
+}
+
 export {
 	RemoteIndexTransactionError,
 	RemoteIndexConcurrentModificationError,
@@ -123,7 +153,7 @@ export {
 export { validateEncryptionModeDescriptor } from "./schema";
 
 const ENCRYPTION_MANIFEST_FILENAME = ".obsidian-encrypt.json";
-interface EncryptionManifestRead {
+export interface EncryptionManifestRead {
 	manifest: RemoteEncryptionManifest | null;
 	validationToken: string;
 }
@@ -146,6 +176,11 @@ type IndexCodecAttemptResult =
 type JsonRecord = Record<string, unknown>;
 
 export class IndexManager {
+	private canonicalReadGeneration = 0;
+	private readonly authorityObservations = new WeakMap<
+		RemoteAuthorityObservation,
+		{ listing: StableRootListing; assertCurrent: () => void }
+	>();
 	private yandexClient: YandexDiskClient;
 	private vaultAdapter: VaultAdapter;
 	private settings: YandexDiskSyncSettings;
@@ -169,6 +204,7 @@ export class IndexManager {
 	private forceScope: {
 		remotePath: string;
 		rootResourceId: string | null;
+		direct?: { format: "direct-v1" };
 	} | null = null;
 	private epochAdoptionTarget: string | null = null;
 	private targetRecoveryMaintenanceId: string | null = null;
@@ -224,15 +260,26 @@ export class IndexManager {
 	 * Update settings
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
+		if (this.settings.remotePath !== settings.remotePath) {
+			this.canonicalReadGeneration++;
+		}
 		this.settings = settings;
 		this.operationStore.updateDeviceId(settings.deviceId);
 	}
 
 	/** Bound history must never authorize work in another physical root. */
-	async assertRemoteScope(): Promise<void> {
+	async assertRemoteScope(
+		observation?: RemoteAuthorityObservation,
+	): Promise<void> {
+		const listing = observation
+			? this.getAuthorityListing(observation)
+			: undefined;
 		if (this.forceScope) {
 			if (this.settings.remotePath !== this.forceScope.remotePath) {
 				throw new StorageScopeError("Force remote path changed");
+			}
+			if (this.forceScope.direct) {
+				return;
 			}
 			const root = await this.yandexClient.getResource(
 				this.settings.remotePath,
@@ -251,10 +298,19 @@ export class IndexManager {
 		if (!expected) {
 			return;
 		}
-		const actual = await readRemoteStorageScope(
-			this.yandexClient,
-			this.settings.remotePath,
-		);
+		const actual = listing
+			? listing.root
+				? {
+						remotePath: normalizePath(
+							this.settings.remotePath.replace(/^disk:\//, ""),
+						),
+						rootResourceId: listing.root.resource_id!,
+					}
+				: null
+			: await readRemoteStorageScope(
+					this.yandexClient,
+					this.settings.remotePath,
+				);
 		if (!sameRemoteStorageScope(expected, actual)) {
 			throw new StorageScopeError(
 				"Remote storage changed; confirm the connection before synchronization",
@@ -264,7 +320,11 @@ export class IndexManager {
 
 	/** Scope a confirmed replacement to its selected physical root, ignoring destination history. */
 	async withForceScope<T>(
-		scope: { remotePath: string; rootResourceId: string | null },
+		scope: {
+			remotePath: string;
+			rootResourceId: string | null;
+			direct?: { format: "direct-v1" };
+		},
 		body: () => Promise<T>,
 	): Promise<T> {
 		if (this.forceScope) {
@@ -276,6 +336,53 @@ export class IndexManager {
 		} finally {
 			this.forceScope = null;
 		}
+	}
+
+	/** Publish only new Force bytes directly; old canonical authority is deliberately ignored. */
+	async publishDirectForceCanonical(
+		index: SyncIndex,
+		codec: EncryptionCodec | null,
+		reset = false,
+	): Promise<{ epoch: string; revision: number; canonicalSha256: string }> {
+		if (!this.forceScope?.direct) {
+			throw new Error(
+				"Direct Force publication requires its explicit scope",
+			);
+		}
+		await this.assertRemoteScope();
+		const plain = new TextEncoder().encode(
+			this.serializeCurrentIndex(index),
+		).buffer;
+		const raw = codec ? await codec.encrypt(plain) : plain;
+		const canonicalSha256 = await computeSha256(raw);
+		const path = this.getRemoteIndexPath();
+		if (reset) {
+			await this.yandexClient.deleteResource(path, true, true);
+		}
+		let uploadError: unknown;
+		try {
+			await this.yandexClient.uploadFile(path, raw, false, true, true);
+		} catch (error) {
+			uploadError = error;
+		}
+		const snapshot = await this.yandexClient.downloadStableRawFile(path);
+		if (
+			!snapshot ||
+			(await computeSha256(snapshot.raw)) !== canonicalSha256
+		) {
+			throw uploadError instanceof Error
+				? uploadError
+				: new Error(
+						"Direct Force canonical publication was not confirmed",
+					);
+		}
+		this.remoteIndex = cloneIndex(index);
+		this.loadedRemoteIndex = cloneIndex(index);
+		return {
+			epoch: index.epoch,
+			revision: index.revision,
+			canonicalSha256,
+		};
 	}
 
 	/** Require matching operation authority before every Force write and retry. */
@@ -378,6 +485,7 @@ export class IndexManager {
 		source: EncryptionCodec | null,
 		target: EncryptionCodec | null,
 	): void {
+		this.canonicalReadGeneration++;
 		this.transitionIndexReadService = source;
 		this.transitionIndexWriteService = target;
 	}
@@ -557,6 +665,7 @@ export class IndexManager {
 	}
 
 	clearIndexTransitionServices(): void {
+		this.canonicalReadGeneration++;
 		this.transitionIndexReadService = undefined;
 		this.transitionIndexWriteService = undefined;
 	}
@@ -637,6 +746,19 @@ export class IndexManager {
 	 */
 	getRemoteIndex(): SyncIndex {
 		return this.remoteIndex;
+	}
+
+	/** Include unpublished causal and maintenance work when comparing desired and loaded canonical JSON. */
+	hasPendingCanonicalChanges(): boolean {
+		return (
+			this.getPendingMutations().length > 0 ||
+			this.completedMoveIds.size > 0 ||
+			this.replaceRemoteOnNextSave ||
+			this.allowLegacyWriteOnce ||
+			this.physicalRewriteOnNextSave ||
+			this.targetRecoveryMaintenanceId !== null ||
+			!sameIndexValue(this.remoteIndex, this.loadedRemoteIndex)
+		);
 	}
 
 	/**
@@ -1069,64 +1191,93 @@ export class IndexManager {
 		stableRootDiscovery = false,
 		allowEpochAdoption = false,
 	): Promise<SyncIndex> {
-		await this.assertRemoteScope();
+		const snapshot = await this.loadRemoteIndexSnapshot(
+			allowLegacy,
+			stableRootDiscovery,
+		);
+		return this.acceptLoadedIndex(snapshot.index, allowEpochAdoption);
+	}
+
+	/** Obtain the verified load snapshot before exposing any mutable desired state. */
+	private async loadRemoteIndexSnapshot(
+		allowLegacy: boolean,
+		stableRootDiscovery: boolean,
+		assertCurrent: () => void = () => {},
+	): Promise<IndexFileSnapshot> {
+		assertCurrent();
+		if (!stableRootDiscovery) {
+			await this.assertRemoteScope();
+		}
+		assertCurrent();
+		const discover = () =>
+			this.recovery.waitForCanonicalIndexFromStableRoot(
+				assertCurrent,
+				(listing) =>
+					this.withAuthorityObservation(
+						listing,
+						assertCurrent,
+						async () => {},
+					),
+			);
 		let discovery: {
 			path: string | null;
 			resource?: YandexResource;
 			rootExists?: boolean;
 		} = stableRootDiscovery
-			? await this.recovery.waitForCanonicalIndexFromStableRoot()
+			? await discover()
 			: { path: await this.recovery.waitForCanonicalIndex() };
+		assertCurrent();
 		if (!discovery.path) {
 			if (stableRootDiscovery && discovery.rootExists === false) {
 				await this.createRemotePath();
+				assertCurrent();
 			}
 			await this.recovery.initializeCanonicalIndex();
+			assertCurrent();
 			discovery = stableRootDiscovery
-				? await this.recovery.waitForCanonicalIndexFromStableRoot()
+				? await discover()
 				: { path: await this.recovery.waitForCanonicalIndex() };
+			assertCurrent();
 			if (!discovery.path) {
 				throw new RemoteIndexConcurrentModificationError(
 					"Canonical index could not be initialized",
 				);
 			}
 		}
+		const snapshot = await this.downloadIndexSnapshot(
+			discovery.path,
+			allowLegacy,
+			undefined,
+			undefined,
+			discovery.resource,
+		);
+		assertCurrent();
+		return snapshot;
+	}
 
-		try {
-			this.remoteIndex = (
-				await this.downloadIndexSnapshot(
-					discovery.path,
-					allowLegacy,
-					undefined,
-					undefined,
-					discovery.resource,
-				)
-			).index;
-			this.loadedRemoteIndex = cloneIndex(this.remoteIndex);
-			if (
-				this.localState.observedEpoch === null ||
-				this.localState.observedEpoch === this.remoteIndex.epoch
-			) {
-				this.operationStore.ensureSequenceFloor(
-					this.remoteIndex.appliedMutationSeq[
-						this.settings.deviceId
-					] ?? 0,
-				);
-			}
-			if (!allowEpochAdoption) {
-				this.assertEpochCompatible(this.remoteIndex);
-			}
-			this.assertMaintenanceCompatible(this.remoteIndex);
-			logger.info(
-				`Loaded remote index revision ${this.remoteIndex.revision}: ${
-					Object.keys(this.remoteIndex.files).length
-				} files`,
+	/** Keep desired and reducer baseline independent of a session's private snapshot. */
+	private acceptLoadedIndex(
+		index: SyncIndex,
+		allowEpochAdoption: boolean,
+	): SyncIndex {
+		this.remoteIndex = cloneIndex(index);
+		this.loadedRemoteIndex = cloneIndex(index);
+		if (
+			this.localState.observedEpoch === null ||
+			this.localState.observedEpoch === index.epoch
+		) {
+			this.operationStore.ensureSequenceFloor(
+				index.appliedMutationSeq[this.settings.deviceId] ?? 0,
 			);
-			return this.remoteIndex;
-		} catch (e) {
-			logger.warn("Error loading remote index:", { error: e });
-			throw e;
 		}
+		if (!allowEpochAdoption) {
+			this.assertEpochCompatible(index);
+		}
+		this.assertMaintenanceCompatible(index);
+		logger.info(
+			`Loaded remote index revision ${index.revision}: ${Object.keys(index.files).length} files`,
+		);
+		return this.remoteIndex;
 	}
 
 	/**
@@ -1134,23 +1285,294 @@ export class IndexManager {
 	 * replacing the in-memory desired state.
 	 */
 	async readCanonicalIndex(): Promise<SyncIndex> {
-		await this.assertRemoteScope();
-		const discovery =
-			await this.recovery.waitForCanonicalIndexFromStableRoot();
-		if (!discovery.path) {
-			throw new RemoteIndexConcurrentModificationError(
-				"Canonical index is missing",
+		return await this.createCanonicalReadSession()();
+	}
+
+	/** Revalidate each read, reusing bytes only inside this connection-bound session. */
+	createCanonicalReadSession(
+		assertActive: () => void = () => {},
+	): CanonicalReadSession {
+		return this.createStartupReadSession(assertActive);
+	}
+
+	/** Own private service bytes across classification, admission and the following full. */
+	createStartupReadSession(
+		assertActive: () => void = () => {},
+	): StartupReadSession {
+		const generation = this.canonicalReadGeneration;
+		const configurationVersion =
+			this.yandexClient.getReadConfigurationVersion();
+		const remotePath = this.settings.remotePath;
+		const source = this.transitionIndexReadService;
+		const target = this.transitionIndexWriteService;
+		let snapshot: IndexFileSnapshot | undefined;
+		// Undefined identifies the captured active/transition configuration; null is explicit plaintext.
+		let snapshotService: EncryptionCodec | null | undefined;
+		let manifestRead: EncryptionManifestRead | undefined;
+		let closed = false;
+		const activeGuards = [assertActive];
+		let tail: Promise<unknown> = Promise.resolve();
+		const assertConfiguration = () => {
+			if (
+				closed ||
+				this.canonicalReadGeneration !== generation ||
+				this.yandexClient.getReadConfigurationVersion() !==
+					configurationVersion ||
+				this.settings.remotePath !== remotePath ||
+				this.transitionIndexReadService !== source ||
+				this.transitionIndexWriteService !== target
+			) {
+				throw new StorageScopeError(
+					"Canonical read configuration changed or invocation ended",
+				);
+			}
+			for (const guard of activeGuards) {
+				guard();
+			}
+		};
+		const enqueue = <T>(action: () => Promise<T>): Promise<T> => {
+			const result = tail.then(action);
+			tail = result;
+			return result;
+		};
+		const observe = async (
+			validate: (
+				observation: RemoteAuthorityObservation,
+			) => Promise<void>,
+		) => {
+			const listing =
+				await this.recovery.getStableRootListing(assertConfiguration);
+			await this.withAuthorityObservation(
+				listing,
+				assertConfiguration,
+				validate,
+			);
+			assertConfiguration();
+			return listing;
+		};
+		const readPresent = async (
+			service: EncryptionCodec | null | undefined,
+			validate: (
+				observation: RemoteAuthorityObservation,
+			) => Promise<void> = async () => {},
+			readOnly = false,
+		): Promise<SyncIndex | null> => {
+			assertConfiguration();
+			const listing = readOnly ? await observe(validate) : undefined;
+			const resource = listing?.resources.find(
+				(item) =>
+					item.type === "file" && item.name === REMOTE_INDEX_FILENAME,
+			);
+			const discovery = listing
+				? {
+						path: resource ? this.getRemoteIndexPath() : null,
+						resource,
+						locks: this.recovery.selectIndexLocks(
+							listing.resources,
+						),
+					}
+				: await this.recovery.waitForCanonicalIndexFromStableRoot(
+						assertConfiguration,
+						(listing) =>
+							this.withAuthorityObservation(
+								listing,
+								assertConfiguration,
+								validate,
+							),
+					);
+			assertConfiguration();
+			if (!discovery.path) {
+				snapshot = undefined;
+				snapshotService = undefined;
+				return null;
+			}
+			if (
+				!snapshot ||
+				!this.canReuseCanonicalContent(
+					snapshot.fingerprint,
+					discovery.resource,
+					discovery.locks,
+				)
+			) {
+				snapshot = await this.downloadIndexSnapshot(
+					discovery.path,
+					false,
+					service,
+					undefined,
+					discovery.resource,
+				);
+				assertConfiguration();
+				snapshotService = service;
+			} else if (snapshotService !== service) {
+				const decoded = await this.decodeIndexSnapshot(
+					snapshot.raw,
+					false,
+					service,
+					undefined,
+					snapshot.fingerprint,
+				);
+				assertConfiguration();
+				snapshot = { ...snapshot, ...decoded };
+				snapshotService = service;
+			}
+			return cloneIndex(snapshot.index);
+		};
+		const read = (
+			validate?: (
+				observation: RemoteAuthorityObservation,
+			) => Promise<void>,
+		) =>
+			enqueue(async () => {
+				const index = await readPresent(undefined, validate);
+				if (!index) {
+					throw new RemoteIndexConcurrentModificationError(
+						"Canonical index is missing",
+					);
+				}
+				return index;
+			});
+		return Object.assign(read, {
+			assertCurrent: assertConfiguration,
+			bind: (guard: () => void) => {
+				activeGuards.push(guard);
+				assertConfiguration();
+			},
+			close: () => {
+				closed = true;
+				snapshot = undefined;
+				snapshotService = undefined;
+				manifestRead = undefined;
+			},
+			readWithCodecIfPresent: (service: EncryptionCodec | null) =>
+				enqueue(() => readPresent(service)),
+			inspectFormat: () =>
+				enqueue(async (): Promise<RemoteCanonicalFormat> => {
+					try {
+						return (await readPresent(null, undefined, true))
+							? "current"
+							: "absent";
+					} catch (error) {
+						if (!(error instanceof LegacyIndexFormatError)) {
+							throw error;
+						}
+						// Historical data never seeds a reusable current snapshot.
+						const format =
+							await this.inspectRemoteCanonicalFormat();
+						assertConfiguration();
+						return format;
+					}
+				}),
+			manifest: () =>
+				enqueue(async () => {
+					assertConfiguration();
+					if (manifestRead) {
+						const cached = manifestRead;
+						const token = cached.validationToken;
+						const reusable =
+							token === "absent" ||
+							isHashStableContentFingerprint(
+								token.slice("present:".length),
+							);
+						let unchanged = false;
+						const listing = await observe(async (observation) => {
+							unchanged =
+								reusable &&
+								(await this.isEncryptionManifestTokenCurrent(
+									token,
+									observation,
+								));
+						});
+						if (
+							unchanged &&
+							this.recovery.selectIndexLocks(listing.resources)
+								.length === 0
+						) {
+							return structuredClone(cached);
+						}
+						snapshot = undefined;
+						snapshotService = undefined;
+					}
+					manifestRead =
+						await this.downloadEncryptionManifestForGuard();
+					assertConfiguration();
+					return structuredClone(manifestRead);
+				}),
+
+			load: (allowEpochAdoption = false) =>
+				enqueue(async () => {
+					assertConfiguration();
+					let index = snapshot ? await readPresent(undefined) : null;
+					if (!index) {
+						const loaded = await this.loadRemoteIndexSnapshot(
+							false,
+							true,
+							assertConfiguration,
+						);
+						assertConfiguration();
+						snapshot = loaded;
+						snapshotService = undefined;
+						index = cloneIndex(loaded.index);
+					}
+					assertConfiguration();
+					return cloneIndex(
+						this.acceptLoadedIndex(index, allowEpochAdoption),
+					);
+				}),
+		});
+	}
+
+	/** Keep composite metadata private and expire it before the next operation can use it. */
+	private async withAuthorityObservation(
+		listing: StableRootListing,
+		assertCurrent: () => void,
+		validate: (observation: RemoteAuthorityObservation) => Promise<void>,
+	): Promise<void> {
+		const observation = Object.freeze({}) as RemoteAuthorityObservation;
+		this.authorityObservations.set(observation, { listing, assertCurrent });
+		try {
+			assertCurrent();
+			await this.assertRemoteScope(observation);
+			assertCurrent();
+			await validate(observation);
+			assertCurrent();
+		} finally {
+			this.authorityObservations.delete(observation);
+		}
+	}
+
+	/** Copy fresh root metadata for read-only initial admission; this grants no write authority. */
+	getObservedRootResources(
+		observation: RemoteAuthorityObservation,
+	): YandexResource[] {
+		return JSON.parse(
+			JSON.stringify(this.getAuthorityListing(observation).resources),
+		) as YandexResource[];
+	}
+
+	private getAuthorityListing(
+		observation: RemoteAuthorityObservation,
+	): StableRootListing {
+		const current = this.authorityObservations.get(observation);
+		if (!current) {
+			throw new StorageScopeError(
+				"Read observation expired or belongs to another evaluation",
 			);
 		}
+		current.assertCurrent();
+		return current.listing;
+	}
+
+	/** Only a stable hash and an unlocked root permit reuse of validated canonical bytes. */
+	private canReuseCanonicalContent(
+		fingerprint: string | null | undefined,
+		resource: YandexResource | undefined,
+		locks: YandexResource[],
+	): boolean {
 		return (
-			await this.downloadIndexSnapshot(
-				discovery.path,
-				false,
-				undefined,
-				undefined,
-				discovery.resource,
-			)
-		).index;
+			locks.length === 0 &&
+			isHashStableContentFingerprint(fingerprint) &&
+			matchesStableContentFingerprint(fingerprint, resource ?? null)
+		);
 	}
 
 	/** Read canonical with an explicit target codec without changing local state. */
@@ -1220,15 +1642,14 @@ export class IndexManager {
 				"Canonical index is missing during physical repair",
 			);
 		}
-		const proofMatches =
-			proof !== undefined &&
-			discovery.locks.length === 0 &&
-			isHashStableContentFingerprint(proof.contentFingerprint) &&
-			matchesStableContentFingerprint(
+		if (
+			proof &&
+			this.canReuseCanonicalContent(
 				proof.contentFingerprint,
 				discovery.resource,
-			);
-		if (proofMatches) {
+				discovery.locks,
+			)
+		) {
 			logger.debug("Post-commit canonical proof reused", {
 				postCommitCanonical: "proof",
 				canonicalRevision: proof.revision,
@@ -1290,10 +1711,14 @@ export class IndexManager {
 	}
 
 	/**
-	 * Save remote index to Yandex Disk
+	 * Save remote index; optional authority validation runs on the acquired lock before reduction.
 	 */
-	async saveRemoteIndex(): Promise<CanonicalCommitProof> {
-		const save = this.saveChain.then(() => this.saveRemoteIndexWithRetry());
+	async saveRemoteIndex(
+		assertLatest?: (index: Readonly<SyncIndex>) => void,
+	): Promise<CanonicalCommitProof> {
+		const save = this.saveChain.then(() =>
+			this.saveRemoteIndexWithRetry(assertLatest),
+		);
 		this.saveChain = save.then(
 			() => undefined,
 			() => undefined,
@@ -1301,7 +1726,9 @@ export class IndexManager {
 		return await save;
 	}
 
-	private async saveRemoteIndexWithRetry(): Promise<CanonicalCommitProof> {
+	private async saveRemoteIndexWithRetry(
+		assertLatest?: (index: Readonly<SyncIndex>) => void,
+	): Promise<CanonicalCommitProof> {
 		return await commitCanonicalIndex({
 			client: this.yandexClient,
 			recovery: this.recovery,
@@ -1333,7 +1760,10 @@ export class IndexManager {
 			readUnparsedSnapshot: (path) =>
 				this.downloadUnparsedIndexSnapshot(path),
 			serialize: (index) => this.serializeCurrentIndex(index),
-			reduceLockedIndex: (...args) => this.reduceLockedIndex(...args),
+			reduceLockedIndex: (...args) => {
+				assertLatest?.(cloneIndex(args[0].index));
+				return this.reduceLockedIndex(...args);
+			},
 			acceptCommit: (index, proof) =>
 				this.finalizeCommittedTransaction(index, proof),
 		});
@@ -1520,15 +1950,9 @@ export class IndexManager {
 
 	/**
 	 * Stamp `remoteMtime` on remote index entries that are missing it, using
-	 * the server-side mtime carried by a freshly-read remote file listing.
-	 *
-	 * Used as a batch replacement for per-upload `fetchServerMtime`: the bulk
-	 * upload path writes remote index entries without `remoteMtime`, then the
-	 * sync engine performs a single `getRemoteFiles` call and passes the
-	 * result here. Entries that already carry a `remoteMtime` (e.g. written by
-	 * a single-file upload path) are left untouched. Entries whose path is
-	 * absent from `remoteFiles` keep `remoteMtime` undefined and are verified
-	 * by fingerprint/content during the next causal reconciliation.
+	 * fresh targeted metadata. Existing stamps remain unchanged. Unknown or
+	 * missing resources retain fallback metadata for causal reconciliation;
+	 * an absent result never authorizes deletion or acknowledges content.
 	 */
 	applyServerMtimes(remoteFiles: Map<string, FileMetadata>): boolean {
 		let stamped = 0;
@@ -1686,15 +2110,62 @@ export class IndexManager {
 	/**
 	 * Get files list from remote storage
 	 */
-	async getRemoteFiles(): Promise<Map<string, FileMetadata>> {
+	async getRemoteFiles(
+		directoryPages?: Map<string, number>,
+	): Promise<Map<string, FileMetadata>> {
 		logger.info("Getting remote files list...");
 
 		const resources = await this.yandexClient.getResourcesRecursive(
 			this.settings.remotePath,
 			true,
-			Math.min(this.settings.maxConcurrency, 4),
+			this.settings.maxConcurrency,
+			false,
+			undefined,
+			true,
+			directoryPages
+				? (path, pages) => {
+						directoryPages.set(path, pages);
+					}
+				: undefined,
 		);
 
+		const result = await this.remoteResourcesToFiles(resources);
+
+		logger.info(`Found ${result.size} remote files`);
+		return result;
+	}
+
+	/** Refresh only live entries without stamps, including entries predating this upload. */
+	async refreshMissingServerMetadata(
+		directoryPages: ReadonlyMap<string, number>,
+		assertCurrent?: () => void,
+	): Promise<Map<string, FileMetadata>> {
+		const resources: YandexResource[] = [];
+		const paths = Object.entries(this.remoteIndex.files)
+			.filter(
+				([path, meta]) =>
+					!meta.deleted &&
+					typeof meta.remoteMtime !== "number" &&
+					this.vaultAdapter.shouldSync(path),
+			)
+			.map(([path]) => joinPath(this.settings.remotePath, path));
+		await this.yandexClient.collectLogicalMetadata(
+			paths,
+			this.settings.maxConcurrency,
+			async (_path, resource) => {
+				if (resource) {
+					resources.push(resource);
+				}
+			},
+			{ knownDirectoryPages: directoryPages, assertCurrent },
+		);
+		return await this.remoteResourcesToFiles(resources);
+	}
+
+	/** Apply the ordinary codec, maintenance and user filters to observed resources. */
+	private async remoteResourcesToFiles(
+		resources: YandexResource[],
+	): Promise<Map<string, FileMetadata>> {
 		const result = new Map<string, FileMetadata>();
 		const cleanupPaths = new Set(
 			(this.remoteIndex.maintenance?.cleanup ?? []).map((cleanup) =>
@@ -1758,7 +2229,6 @@ export class IndexManager {
 			});
 		}
 
-		logger.info(`Found ${result.size} remote files`);
 		return result;
 	}
 
@@ -2260,13 +2730,34 @@ export class IndexManager {
 	}
 
 	/** Validate a manifest token without downloading unchanged content. */
-	async isEncryptionManifestTokenCurrent(token: string): Promise<boolean> {
-		const resource = await this.yandexClient.getResource(
-			this.getEncryptionManifestPath(),
-			1,
-			0,
-			true,
-		);
+	async isEncryptionManifestTokenCurrent(
+		token: string,
+		observation?: RemoteAuthorityObservation,
+	): Promise<boolean> {
+		const listing = observation
+			? this.getAuthorityListing(observation)
+			: undefined;
+		const resource = listing
+			? (listing.resources.find(
+					(item) =>
+						item.name === ENCRYPTION_MANIFEST_FILENAME &&
+						item.type === "file",
+				) ?? null)
+			: await this.yandexClient.getResource(
+					this.getEncryptionManifestPath(),
+					1,
+					0,
+					true,
+				);
+		if (
+			listing?.resources.some(
+				(item) =>
+					item.name === ENCRYPTION_MANIFEST_FILENAME &&
+					item.type !== "file",
+			)
+		) {
+			return false;
+		}
 		if (token === "absent") {
 			return resource === null;
 		}

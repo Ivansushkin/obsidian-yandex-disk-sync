@@ -8,10 +8,8 @@ import {
 	canApplyDestructiveFolderMutation,
 	collectFolderDeleteTargets,
 	findFolderTombstone,
-	isPathInsideFolder,
 	isStableLockStale,
 	mergeFileMutation,
-	shouldApplyFileMutation,
 	shouldPreserveConcurrentFolderChild,
 	advanceMutationSequence,
 } from "../src/sync/canonical/mutation-rules";
@@ -28,75 +26,67 @@ function tombstone(path: string, changedRevision: number): FolderTombstone {
 	};
 }
 
-test("folder matching respects segment boundaries and deep paths", () => {
-	assert.equal(isPathInsideFolder("a/b/file.md", "a/b"), true);
-	assert.equal(isPathInsideFolder("a/b", "a/b"), true);
-	assert.equal(isPathInsideFolder("a/bb/file.md", "a/b"), false);
-
-	const deepFolder = Array.from({ length: 100 }, (_, i) => `d${i}`).join("/");
-	assert.equal(isPathInsideFolder(`${deepFolder}/file.md`, deepFolder), true);
-});
-
-test("folder delete targets skip a historical rename tombstone", () => {
-	const targets = collectFolderDeleteTargets(
-		{
-			"folder/Без названия.md": file("folder/Без названия.md", {
-				deleted: true,
-				changedRevision: 6,
-			}),
-			"folder/Чо как.md": file("folder/Чо как.md", {
-				changedRevision: 7,
-			}),
-		},
-		"folder",
+test("folder delete planning skips history, siblings and folder roots at any depth", () => {
+	const deep = Array.from({ length: 100 }, (_, index) => `d${index}`).join(
+		"/",
 	);
-
-	assert.deepEqual(targets, {
-		knownDescendants: 2,
-		livePaths: ["folder/Чо как.md"],
-		historicalTombstonesSkipped: 1,
-	});
-});
-
-test("folder delete with only tombstones has no live targets", () => {
-	const targets = collectFolderDeleteTargets(
+	for (const { label, folder, live, deleted, unrelated = [] } of [
 		{
-			"folder/old.md": file("folder/old.md", { deleted: true }),
+			label: "rename history",
+			folder: "folder",
+			live: ["folder/Чо как.md"],
+			deleted: ["folder/Без названия.md"],
 		},
-		"folder",
-	);
-
-	assert.equal(targets.knownDescendants, 1);
-	assert.deepEqual(targets.livePaths, []);
-	assert.equal(targets.historicalTombstonesSkipped, 1);
-});
-
-test("folder delete targets deep descendants without matching siblings", () => {
-	const targets = collectFolderDeleteTargets(
 		{
-			"folder/deep/note.md": file("folder/deep/note.md"),
-			"folder/deep/old.md": file("folder/deep/old.md", {
-				deleted: true,
-			}),
-			"folder-copy/note.md": file("folder-copy/note.md"),
+			label: "only tombstones",
+			folder: "folder",
+			live: [],
+			deleted: ["folder/old.md"],
 		},
-		"folder/",
-	);
-
-	assert.deepEqual(targets.livePaths, ["folder/deep/note.md"]);
-	assert.equal(targets.knownDescendants, 2);
-	assert.equal(targets.historicalTombstonesSkipped, 1);
-});
-
-test("folder delete target planning handles ten thousand descendants", () => {
-	const files: Record<string, FileMetadata> = {};
-	for (let index = 0; index < 10_000; index++) {
-		files[`folder/deep/${index}.md`] = file(`folder/deep/${index}.md`);
-		files[`sibling/${index}.md`] = file(`sibling/${index}.md`);
+		{
+			label: "segment boundary and trailing slash",
+			folder: "folder/",
+			live: ["folder/deep/note.md"],
+			deleted: ["folder/deep/old.md"],
+			unrelated: ["folder", "folder-copy/note.md"],
+		},
+		{
+			label: "deep path",
+			folder: deep,
+			live: [`${deep}/note.md`],
+			deleted: [],
+		},
+		{
+			label: "large tree",
+			folder: "folder",
+			live: Array.from(
+				{ length: 10_000 },
+				(_, index) => `folder/deep/${index}.md`,
+			),
+			deleted: [],
+			unrelated: Array.from(
+				{ length: 10_000 },
+				(_, index) => `sibling/${index}.md`,
+			),
+		},
+	]) {
+		const files = Object.fromEntries<FileMetadata>([
+			...live.map((path) => [path, file(path)] as const),
+			...deleted.map(
+				(path) => [path, file(path, { deleted: true })] as const,
+			),
+			...unrelated.map((path) => [path, file(path)] as const),
+		]);
+		assert.deepEqual(
+			collectFolderDeleteTargets(files, folder),
+			{
+				knownDescendants: live.length + deleted.length,
+				livePaths: live,
+				historicalTombstonesSkipped: deleted.length,
+			},
+			label,
+		);
 	}
-	const targets = collectFolderDeleteTargets(files, "folder");
-	assert.equal(targets.livePaths.length, 10_000);
-	assert.equal(targets.knownDescendants, 10_000);
 });
 
 test("only stable 1.x numeric indexes are legacy", () => {
@@ -118,28 +108,16 @@ test("only stable 1.x numeric indexes are legacy", () => {
 	assert.equal(classifyIndexFormat({ format: "unknown" }), "unsupported");
 });
 
-test("newest containing folder tombstone is selected", () => {
-	const tombstones = {
-		a: tombstone("a", 3),
-		"a/b": tombstone("a/b", 7),
-	};
-	assert.equal(
-		findFolderTombstone("a/b/file.md", tombstones)?.changedRevision,
-		7,
-	);
-	assert.equal(findFolderTombstone("other/file.md", tombstones), null);
-});
-
-test("folder tombstone lookup scales with path depth, not history size", () => {
+test("folder tombstone lookup selects the newest ancestor in path-depth work", () => {
 	const history: Record<string, FolderTombstone> = {};
 	for (let index = 0; index < 10_000; index++) {
 		history[`unrelated-${index}`] = tombstone(`unrelated-${index}`, index);
 	}
+	history.a = tombstone("a", 3);
 	history["a/b"] = tombstone("a/b", 10_001);
 	let reads = 0;
 	const observed = new Proxy(history, {
-		get(target, property, receiver) {
-			void receiver;
+		get(target, property) {
 			if (typeof property !== "string") {
 				return undefined;
 			}
@@ -147,295 +125,278 @@ test("folder tombstone lookup scales with path depth, not history size", () => {
 			return target[property];
 		},
 	});
-
-	assert.equal(findFolderTombstone("a/b/c/file.md", observed)?.path, "a/b");
-	assert.equal(reads, 3);
+	for (const [path, expected, expectedReads] of [
+		["a/b/c/file.md", "a/b", 3],
+		["other/file.md", undefined, 1],
+	] as const) {
+		reads = 0;
+		assert.equal(findFolderTombstone(path, observed)?.path, expected, path);
+		assert.equal(reads, expectedReads, path);
+	}
 });
 
-test("exact deletion wins concurrent puts but permits causally later restoration", () => {
-	const deleted = file("note.md", { deleted: true, changedRevision: 6 });
-	const cases = [
-		{
-			label: "stale put",
-			current: deleted,
-			incoming: file("note.md"),
-			base: 5,
-			expected: false,
-		},
-		{
-			label: "observed deletion",
-			current: deleted,
-			incoming: file("note.md"),
-			base: 6,
-			expected: true,
-		},
-		{
-			label: "concurrent delete",
-			current: file("note.md", { changedRevision: 8 }),
-			incoming: file("note.md", { deleted: true }),
-			base: 5,
-			expected: true,
-		},
+test("canonical file mutations enforce deletion, causality and FIFO before stamping a merge", () => {
+	type Case = [
+		label: string,
+		current: FileMetadata,
+		incoming: FileMetadata,
+		expected: string,
+		base?: number,
+		causal?: { currentWatermark: number; desiredWatermark: number },
 	];
-	for (const { label, current, incoming, base, expected } of cases) {
+	const current = file("note.md", { changedRevision: 6 });
+	const deleted = { ...current, deleted: true };
+	const folderDeleted = { ...deleted, deletedByFolder: "folder" };
+	const version = (
+		sha256: string,
+		mutationSeq: number,
+		changedRevision?: number,
+		lastModifiedBy = "device-a",
+	) =>
+		file("note.md", {
+			sha256,
+			mutationSeq,
+			changedRevision,
+			lastModifiedBy,
+		});
+	const latest = version("latest", 8, 37);
+	const predecessor = version("previous", 7, 36);
+	const sequence = { currentWatermark: 8, desiredWatermark: 8 };
+	const cases: Case[] = [
+		[
+			"exact delete rejects stale put",
+			deleted,
+			file("note.md"),
+			"rejected-by-delete",
+		],
+		[
+			"observed delete permits restoration",
+			deleted,
+			file("note.md"),
+			"apply",
+			6,
+		],
+		["concurrent exact delete wins", current, deleted, "apply"],
+		[
+			"concurrent live puts conflict",
+			{ ...current, sha256: "a" },
+			file("note.md", { sha256: "b" }),
+			"concurrent-foreign",
+		],
+		[
+			"observed live put can be edited",
+			{ ...current, sha256: "a" },
+			file("note.md", { sha256: "b" }),
+			"apply",
+			6,
+		],
+		[
+			"modified descendant survives folder deletion",
+			folderDeleted,
+			file("note.md", { sha256: "changed" }),
+			"apply",
+		],
+		[
+			"explicit same-content put survives folder deletion",
+			folderDeleted,
+			file("note.md"),
+			"apply",
+		],
+		[
+			"folder delete cannot overwrite concurrent descendant",
+			{ ...current, sha256: "changed" },
+			folderDeleted,
+			"concurrent-foreign",
+		],
+		[
+			"same-device predecessor ignores revision drift",
+			version("old", 3, 20),
+			{
+				...version("old", 4),
+				deleted: true,
+				deletedByFolder: "folder",
+			},
+			"apply",
+			12,
+		],
+		[
+			"same-device replay",
+			latest,
+			{ ...latest },
+			"idempotent",
+			5,
+			sequence,
+		],
+		[
+			"same-device stale put",
+			latest,
+			version("old", 7),
+			"stale-same-device",
+			5,
+			sequence,
+		],
+		[
+			"same-device stale delete",
+			latest,
+			{ ...version("old", 7), deleted: true },
+			"stale-same-device",
+			5,
+			sequence,
+		],
+		[
+			"own exact delete permits next put",
+			{ ...predecessor, deleted: true },
+			version("restored", 8),
+			"apply",
+			5,
+			{ ...sequence, currentWatermark: 7 },
+		],
+		[
+			"foreign edit still uses base revision",
+			version("foreign", 3, 36, "device-b"),
+			version("local", 8),
+			"concurrent-foreign",
+			35,
+			{ ...sequence, currentWatermark: 7 },
+		],
+		[
+			"Force snapshot permits sequence one",
+			version("snapshot", 0, 1),
+			version("edited", 1),
+			"apply",
+			1,
+			{ currentWatermark: 0, desiredWatermark: 1 },
+		],
+		[
+			"continuous edit uses FIFO despite old base",
+			predecessor,
+			version("latest", 8),
+			"apply",
+			35,
+			{ ...sequence, currentWatermark: 7 },
+		],
+		[
+			"equal divergent sequence fails closed",
+			latest,
+			version("different", 8),
+			"invalid-sequence",
+			5,
+			sequence,
+		],
+		[
+			"FIFO gap fails closed",
+			latest,
+			version("future", 10),
+			"fifo-gap",
+			5,
+			sequence,
+		],
+	];
+	for (const [
+		label,
+		current,
+		incoming,
+		expected,
+		base = 5,
+		causal,
+	] of cases) {
 		assert.equal(
-			shouldApplyFileMutation(current, incoming, base),
+			classifyFileMutation(current, incoming, base, causal),
 			expected,
+			label,
+		);
+		assert.deepEqual(
+			mergeFileMutation(
+				current,
+				incoming,
+				base,
+				40,
+				"fallback-device",
+				causal,
+			),
+			expected === "apply"
+				? {
+						...incoming,
+						baseRevision: base,
+						changedRevision: 40,
+						lastModifiedBy:
+							incoming.lastModifiedBy ?? "fallback-device",
+					}
+				: current,
 			label,
 		);
 	}
 });
 
-test("concurrent live puts with different hashes do not overwrite each other", () => {
-	const current = file("note.md", {
-		sha256: "device-a",
-		changedRevision: 5,
-	});
-	const incoming = file("note.md", { sha256: "device-b" });
-	assert.equal(shouldApplyFileMutation(current, incoming, 4), false);
-	assert.equal(shouldApplyFileMutation(current, incoming, 5), true);
-});
-
-test("modified descendant wins over a concurrent folder deletion", () => {
-	const currentDelete = file("folder/note.md", {
-		deleted: true,
-		changedRevision: 6,
-		deletedByFolder: "folder",
-	});
-	assert.equal(
-		shouldApplyFileMutation(
-			currentDelete,
-			{ ...file("folder/note.md"), sha256: "changed" },
-			5,
-		),
-		true,
-	);
-});
-
-test("an explicit same-content put survives a concurrent folder deletion", () => {
-	const currentDelete = file("folder/note.md", {
-		deleted: true,
-		changedRevision: 6,
-		deletedByFolder: "folder",
-	});
-	assert.equal(
-		shouldApplyFileMutation(currentDelete, file("folder/note.md"), 5),
-		true,
-	);
-});
-
-test("folder deletion does not overwrite a concurrently modified descendant", () => {
-	const currentPut = {
-		...file("folder/note.md", { changedRevision: 7 }),
-		sha256: "changed",
-	};
-	const folderDelete = file("folder/note.md", {
-		deleted: true,
-		deletedByFolder: "folder",
-	});
-	assert.equal(shouldApplyFileMutation(currentPut, folderDelete, 5), false);
-});
-
-test("child created after folder baseline is preserved", () => {
-	assert.equal(
-		shouldPreserveConcurrentFolderChild(
-			file("folder/new.md", { changedRevision: 7 }),
-			5,
-		),
-		true,
-	);
-	assert.equal(
-		shouldPreserveConcurrentFolderChild(
-			file("folder/old.md", { changedRevision: 5 }),
-			5,
-		),
-		false,
-	);
-});
-
-test("same-device predecessor is deleted despite a newer canonical revision", () => {
-	const current = file("folder/note.md", {
-		changedRevision: 20,
-		lastModifiedBy: "device-a",
-		mutationSeq: 3,
-	});
-	const incoming = file("folder/note.md", {
-		deleted: true,
-		deletedByFolder: "folder",
-		lastModifiedBy: "device-a",
-		mutationSeq: 4,
-	});
-	assert.equal(shouldApplyFileMutation(current, incoming, 12), true);
-	assert.equal(
-		shouldPreserveConcurrentFolderChild(current, 12, "device-a", 4),
-		false,
-	);
-});
-
-test("foreign newer and unsequenced children are never destructively inferred", () => {
-	const foreign = file("folder/foreign.md", {
-		changedRevision: 20,
-		lastModifiedBy: "device-b",
-		mutationSeq: 1,
-	});
-	const unknown = file("folder/unknown.md", {
-		changedRevision: 20,
-		lastModifiedBy: "device-a",
-	});
-	assert.equal(
-		shouldPreserveConcurrentFolderChild(foreign, 12, "device-a", 4),
-		true,
-	);
-	assert.equal(
-		shouldPreserveConcurrentFolderChild(unknown, 12, "device-a", 4),
-		true,
-	);
-});
-
-test("unsequenced current child never authorizes a destructive folder mutation", () => {
-	const current = file("folder/note.md", {
-		changedRevision: 7,
-		lastModifiedBy: "device-a",
-	});
-	assert.equal(
-		canApplyDestructiveFolderMutation(current, 7, "device-a", 4),
-		false,
-	);
-	current.mutationSeq = 4;
-	assert.equal(
-		canApplyDestructiveFolderMutation(current, 7, "device-a", 4),
-		true,
-	);
-});
-
-test("accepted merge stamps base and changed revisions", () => {
-	const merged = mergeFileMutation(
-		file("note.md", { changedRevision: 4 }),
+test("folder deletion preserves foreign and unknown children but recognizes its own FIFO predecessor", () => {
+	for (const { label, options, base = 12, preserve, authorize } of [
 		{
-			...file("note.md"),
-			sha256: "new",
-			lastModifiedBy: "device-a",
-			mutationSeq: 9,
+			label: "newer child without actor",
+			options: { changedRevision: 20 },
+			preserve: true,
+			authorize: false,
 		},
-		4,
-		5,
-		"device-b",
-	);
-	assert.equal(merged?.baseRevision, 4);
-	assert.equal(merged?.changedRevision, 5);
-	assert.equal(merged?.lastModifiedBy, "device-a");
-	assert.equal(merged?.mutationSeq, 9);
-});
-
-/** Build causally attributed versions without repeating unrelated file metadata. */
-function version(
-	sha256: string,
-	mutationSeq: number,
-	changedRevision?: number,
-	lastModifiedBy = "device-a",
-) {
-	return file("note.md", {
-		sha256,
-		mutationSeq,
-		changedRevision,
-		lastModifiedBy,
-	});
-}
-
-const latest = version("latest", 8, 37);
-const predecessor = version("previous", 7, 36);
-for (const {
-	name,
-	current,
-	incoming,
-	expected,
-	watermark = 8,
-	desired = 8,
-	base = 35,
-} of [
-	{
-		name: "same-device replay is idempotent or stale but never a conflict",
-		current: latest,
-		incoming: { ...latest },
-		expected: "idempotent",
-	},
-	{
-		name: "same-device stale delete cannot remove a newer put",
-		current: latest,
-		incoming: { ...version("old", 7), deleted: true },
-		expected: "stale-same-device",
-	},
-	{
-		name: "same-device put after its own exact delete restores the path",
-		current: { ...predecessor, deleted: true },
-		incoming: version("restored", 8),
-		watermark: 7,
-		expected: "apply",
-	},
-	{
-		name: "foreign edit keeps base-revision conflict rules",
-		current: version("device-b", 3, 36, "device-b"),
-		incoming: version("device-a", 8),
-		watermark: 7,
-		expected: "concurrent-foreign",
-	},
-	{
-		name: "force snapshot is followed by sequence one in the same epoch",
-		current: version("snapshot", 0, 1),
-		incoming: version("edited", 1),
-		watermark: 0,
-		desired: 1,
-		base: 1,
-		expected: "apply",
-	},
-]) {
-	test(name, () => {
+		{
+			label: "child at folder baseline",
+			options: { changedRevision: 12, mutationSeq: 4 },
+			preserve: false,
+			authorize: true,
+		},
+		{
+			label: "same-device predecessor",
+			options: {
+				changedRevision: 20,
+				lastModifiedBy: "device-a",
+				mutationSeq: 3,
+			},
+			preserve: false,
+			authorize: true,
+		},
+		{
+			label: "foreign newer child",
+			options: {
+				changedRevision: 20,
+				lastModifiedBy: "device-b",
+				mutationSeq: 1,
+			},
+			preserve: true,
+			authorize: false,
+		},
+		{
+			label: "same-device unsequenced newer child",
+			options: { changedRevision: 20, lastModifiedBy: "device-a" },
+			preserve: true,
+			authorize: false,
+		},
+		{
+			label: "unsequenced current child",
+			options: { changedRevision: 7, lastModifiedBy: "device-a" },
+			base: 7,
+			preserve: false,
+			authorize: false,
+		},
+		{
+			label: "sequenced current child",
+			options: {
+				changedRevision: 7,
+				lastModifiedBy: "device-a",
+				mutationSeq: 4,
+			},
+			base: 7,
+			preserve: false,
+			authorize: true,
+		},
+	]) {
+		const current = file("folder/note.md", options);
 		assert.equal(
-			classifyFileMutation(current, incoming, base, {
-				currentWatermark: watermark,
-				desiredWatermark: desired,
-			}),
-			expected,
+			shouldPreserveConcurrentFolderChild(current, base, "device-a", 4),
+			preserve,
+			label,
 		);
-		if (expected === "idempotent") {
-			assert.equal(
-				classifyFileMutation(current, version("old", 7), base, {
-					currentWatermark: 8,
-					desiredWatermark: 8,
-				}),
-				"stale-same-device",
-			);
-		}
-	});
-}
-
-test("continuous same-device edit ignores an older base revision", () => {
-	const incoming = version("latest", 8);
-	const sequence = { currentWatermark: 7, desiredWatermark: 8 };
-	assert.equal(
-		classifyFileMutation(predecessor, incoming, 35, sequence),
-		"apply",
-	);
-	assert.equal(
-		mergeFileMutation(predecessor, incoming, 35, 37, "device-a", sequence)
-			?.sha256,
-		"latest",
-	);
-});
-
-test("equal divergent sequence and FIFO gap fail closed", () => {
-	for (const [seq, sha, expected] of [
-		[8, "different", "invalid-sequence"],
-		[10, "future", "fifo-gap"],
-	] as const) {
 		assert.equal(
-			classifyFileMutation(
-				version("canonical", 8, 37),
-				version(sha, seq),
-				35,
-				{ currentWatermark: 8, desiredWatermark: 8 },
-			),
-			expected,
+			canApplyDestructiveFolderMutation(current, base, "device-a", 4),
+			authorize,
+			label,
 		);
 	}
 });

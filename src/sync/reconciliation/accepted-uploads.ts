@@ -72,14 +72,6 @@ export async function repairMissingAcceptedUploads(
 		if (!accepted || accepted.deleted) {
 			continue;
 		}
-		let snapshot = snapshots.get(path);
-		if (!snapshot && deps.vaultAdapter.fileExists(path)) {
-			const content = await deps.vaultAdapter.readFile(path);
-			snapshot = { content, sha256: await computeSha256(content) };
-		}
-		if (!snapshot || snapshot.sha256 !== accepted.sha256) {
-			continue;
-		}
 		const remotePath = joinPath(deps.settings.remotePath, path);
 		const physical = await deps.yandexClient.getLogicalResource(remotePath);
 		let repairFingerprint =
@@ -93,6 +85,14 @@ export async function repairMissingAcceptedUploads(
 				physical,
 			);
 		if (physicalMatches) {
+			continue;
+		}
+		let snapshot = snapshots.get(path);
+		if (!snapshot && deps.vaultAdapter.fileExists(path)) {
+			const content = await deps.vaultAdapter.readFile(path);
+			snapshot = { content, sha256: await computeSha256(content) };
+		}
+		if (!snapshot || snapshot.sha256 !== accepted.sha256) {
 			continue;
 		}
 		const freshCanonical = await deps.indexManager.readCanonicalIndex();

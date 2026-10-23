@@ -917,7 +917,7 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 	}
 });
 
-test("Force UI retains recovery when a pinned orphan changes after intent publication", async () => {
+test("Force UI deletes changed orphan garbage and completes without a normal post-Force merge", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	const path = "vault/.obsidian-sync-index.lock.old.attempt";
@@ -927,25 +927,38 @@ test("Force UI retains recovery when a pinned orphan changes after intent public
 		const changed = bytes(
 			JSON.stringify(createEmptyIndex("device-b", "foreign-epoch")),
 		);
-		disk.afterRequest = async (method, endpoint, target) => {
-			if (
-				method === "POST" &&
-				endpoint.endsWith("/resources/move") &&
-				target === "vault/.obsidian-sync-index.json"
-			) {
+		disk.beforeRequest = async (method, _endpoint, target) => {
+			if (method === "DELETE" && target === path) {
 				disk.files.set(path, changed);
 			}
 		};
-		const controller = forceUi(a).getForceSyncController();
+		const plugin = forceUi(a);
+		let schedulerStarts = 0;
+		Object.assign(plugin, {
+			automationReady: false,
+			persistence: { failed: false },
+			app: { workspace: { layoutReady: true } },
+			syncScheduler: {
+				start: () => {
+					schedulerStarts++;
+				},
+				stop: () => {},
+			},
+			runFullSync: async () => {
+				throw new Error("Force must not require a post-Force merge");
+			},
+		});
+		const controller = plugin.getForceSyncController();
 		await controller.run("from_local");
-		assert.equal(controller.getState()?.outcome, "recovery-pending");
-		assert.equal((await a.canonical()).maintenance?.kind, "force");
+		assert.equal(controller.getState()?.outcome, "success");
+		assert.equal((await a.canonical()).maintenance, undefined);
 		a.assertLocal("Note.md", "kept");
-		assert.equal(disk.files.has("vault/Note.md"), false);
-		assert.deepEqual(disk.files.get(path), changed);
-		assert.equal(a.index.getObservedEpoch(), null);
+		assert.deepEqual(disk.files.get("vault/Note.md"), bytes("kept"));
+		assert.equal(disk.files.has(path), false);
+		assert.ok(a.index.getObservedEpoch());
+		assert.equal(schedulerStarts, 1);
 	} finally {
-		disk.afterRequest = undefined;
+		disk.beforeRequest = undefined;
 		await a.stop();
 	}
 });

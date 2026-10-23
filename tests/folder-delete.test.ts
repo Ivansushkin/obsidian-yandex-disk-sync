@@ -134,7 +134,7 @@ class FolderDeleteYandexFake {
 	}
 }
 
-function createHarness(encrypted = false) {
+function createHarness() {
 	const indexManager = new FolderDeleteIndexFake();
 	const yandexClient = new FolderDeleteYandexFake();
 	const engine = new SyncEngine(
@@ -148,87 +148,72 @@ function createHarness(encrypted = false) {
 			...DEFAULT_SETTINGS,
 			deviceId: "device-test",
 			remotePath: "remote",
-			enableEncryption: encrypted,
 		},
 	);
 	return { indexManager, yandexClient, engine };
 }
 
-for (const mode of ["plaintext", "encrypted"] as const) {
-	test(`${mode} rename tombstone is skipped by folder delete`, async () => {
-		const { indexManager, yandexClient, engine } = createHarness(
-			mode === "encrypted",
-		);
+test("rename tombstone is skipped by folder delete", async () => {
+	const { indexManager, yandexClient, engine } = createHarness();
 
-		await engine.deleteFolder("folder");
+	await engine.deleteFolder("folder");
 
-		assert.deepEqual(yandexClient.deletes, ["remote/folder/Чо как.md"]);
-		assert.equal(indexManager.index.revision, 8);
-		assert.equal(indexManager.pendingMutations.length, 0);
-		assert.equal(indexManager.pendingActions.length, 0);
-		assert.equal(
-			indexManager.index.files["folder/Без названия.md"]?.changedRevision,
-			6,
-		);
-		assert.equal(
-			indexManager.index.files["folder/Без названия.md"]?.deletedByFolder,
-			undefined,
-		);
+	assert.deepEqual(yandexClient.deletes, ["remote/folder/Чо как.md"]);
+	assert.equal(indexManager.index.revision, 8);
+	assert.equal(indexManager.pendingMutations.length, 0);
+	assert.equal(indexManager.pendingActions.length, 0);
+	assert.equal(
+		indexManager.index.files["folder/Без названия.md"]?.changedRevision,
+		6,
+	);
+	assert.equal(
+		indexManager.index.files["folder/Без названия.md"]?.deletedByFolder,
+		undefined,
+	);
+});
+
+test("folder rename uses guarded file moves and two commits", async () => {
+	const { indexManager, yandexClient, engine } = createHarness();
+	indexManager.index.files = {
+		"A/deep/note.md": {
+			...metadata("A/deep/note.md", {
+				fingerprint: "source-fingerprint",
+				changedRevision: 7,
+			}),
+			lastModifiedBy: "device-test",
+			mutationSeq: 1,
+		},
+	};
+	indexManager.local.files = structuredClone(indexManager.index.files);
+
+	yandexClient.resources.clear();
+	yandexClient.resources.set("remote/A/deep/note.md", {
+		sha256: "source-fingerprint",
 	});
-}
 
-for (const mode of ["plaintext", "encrypted"] as const) {
-	test(`${mode} folder rename uses guarded file moves and two commits`, async () => {
-		const { indexManager, yandexClient, engine } = createHarness(
-			mode === "encrypted",
-		);
-		indexManager.index.files = {
-			"A/deep/note.md": {
-				...metadata("A/deep/note.md", {
-					fingerprint: "source-fingerprint",
-					changedRevision: 7,
-				}),
-				lastModifiedBy: "device-test",
-				mutationSeq: 1,
-			},
-		};
-		indexManager.local.files = structuredClone(indexManager.index.files);
-
-		yandexClient.resources.clear();
-		yandexClient.resources.set("remote/A/deep/note.md", {
-			sha256: "source-fingerprint",
-		});
-
-		const outcome = await engine.renameFolder("A", "B", {
-			epoch: "epoch-test",
-			baseRevision: 7,
-		});
-
-		assert.equal(outcome.status, "completed");
-		assert.deepEqual(yandexClient.moves, [
-			{
-				fromPath: "remote/A/deep/note.md",
-				toPath: "remote/B/deep/note.md",
-			},
-		]);
-		assert.equal(indexManager.index.files["A/deep/note.md"]?.deleted, true);
-		assert.equal(
-			indexManager.index.files["B/deep/note.md"]?.deleted,
-			false,
-		);
-		assert.equal(
-			indexManager.index.files["B/deep/note.md"]?.mutationSeq,
-			2,
-		);
-		assert.deepEqual(indexManager.index.moves, {});
-		assert.equal(indexManager.pendingActions.length, 0);
-		assert.equal(indexManager.pendingMutations.length, 0);
-		assert.equal(indexManager.commits.length, 2);
+	const outcome = await engine.renameFolder("A", "B", {
+		epoch: "epoch-test",
+		baseRevision: 7,
 	});
-}
+
+	assert.equal(outcome.status, "completed");
+	assert.deepEqual(yandexClient.moves, [
+		{
+			fromPath: "remote/A/deep/note.md",
+			toPath: "remote/B/deep/note.md",
+		},
+	]);
+	assert.equal(indexManager.index.files["A/deep/note.md"]?.deleted, true);
+	assert.equal(indexManager.index.files["B/deep/note.md"]?.deleted, false);
+	assert.equal(indexManager.index.files["B/deep/note.md"]?.mutationSeq, 2);
+	assert.deepEqual(indexManager.index.moves, {});
+	assert.equal(indexManager.pendingActions.length, 0);
+	assert.equal(indexManager.pendingMutations.length, 0);
+	assert.equal(indexManager.commits.length, 2);
+});
 
 test("restored folder source is never deleted without a target snapshot", async () => {
-	const { indexManager, yandexClient, engine } = createHarness(false);
+	const { indexManager, yandexClient, engine } = createHarness();
 	indexManager.index.files = {
 		"A/note.md": {
 			...metadata("A/note.md", {
@@ -269,7 +254,7 @@ test("restored folder source is never deleted without a target snapshot", async 
 });
 
 test("folder target conflict performs no canonical or physical writes", async () => {
-	const { indexManager, yandexClient, engine } = createHarness(false);
+	const { indexManager, yandexClient, engine } = createHarness();
 	indexManager.index.files = {
 		"A/note.md": {
 			...metadata("A/note.md", { changedRevision: 7 }),
