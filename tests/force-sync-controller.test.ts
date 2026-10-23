@@ -140,86 +140,180 @@ test("Force owns busy state from first click through backup persistence and fina
 	}
 });
 
-test("Force cancellation and blocked preflight never create a backup", async () => {
-	for (const overrides of [
-		{ confirm: async () => "cancel" as const },
-		{ preflight: async () => null },
-	]) {
-		const h = harness(overrides);
-		await h.controller.run("from_local");
-		assert.equal(h.controller.isBusy(), false);
-		assert.ok(!h.calls.includes("backup"));
-		assert.ok(!h.calls.includes("force"));
-	}
-	const h = harness({ isSyncBusy: () => true });
-	await h.controller.run("from_local");
-	assert.deepEqual(h.calls, []);
-});
-
-test("Force backup failure or exception cannot start destructive synchronization", async () => {
-	for (const throws of [false, true]) {
-		const h = harness({
-			backup: async () => {
-				if (throws) {
-					throw new Error("offline");
-				}
-				return { success: false, fileCount: 0, totalSize: 0 };
-			},
-		});
-		await h.controller.run("from_remote");
-		assert.equal(h.controller.getState()?.outcome, "backup-failed");
-		assert.equal(h.controller.isBusy(), false);
-		assert.ok(!h.calls.includes("force"));
-	}
-});
-
-test("Force stale proof and source drift never announce migration success", async () => {
-	for (const code of ["force-backup-stale", "force-source-changed"]) {
-		const h = harness({
-			run: async () =>
-				result({
+test("Force admission and completion reject unverified work and honor the archive choice", async () => {
+	const cleanupError = {
+		message: "interrupted cleanup",
+		path: "old.md",
+		operation: "delete_remote" as const,
+	};
+	const cases: Array<{
+		name: string;
+		overrides: Partial<ForceSyncDependencies>;
+		outcome?: ForceFlowState["outcome"];
+		noForce?: boolean;
+		noReconcile?: boolean;
+		errorCode?: string;
+		noBackup?: boolean;
+	}> = [
+		{
+			name: "cancel",
+			overrides: { confirm: async () => "cancel" },
+			noForce: true,
+			noBackup: true,
+		},
+		{
+			name: "blocked",
+			overrides: { preflight: async () => null },
+			noForce: true,
+			noBackup: true,
+		},
+		{
+			name: "busy",
+			overrides: { isSyncBusy: () => true },
+			noForce: true,
+			noBackup: true,
+		},
+		{
+			name: "backup rejected",
+			overrides: {
+				backup: async () => ({
 					success: false,
-					replacementCommitted: false,
-					errors: [
-						{ code, message: code, path: "", operation: "upload" },
-					],
+					fileCount: 0,
+					totalSize: 0,
 				}),
-		});
-		await h.controller.run("from_local");
-		assert.equal(h.controller.getState()?.outcome, "failed");
-		assert.equal(h.controller.getState()?.errorCode, code);
-		assert.ok(!h.calls.includes("reconcile"));
+			},
+			outcome: "backup-failed",
+			noForce: true,
+		},
+		{
+			name: "backup exception",
+			overrides: {
+				backup: async () => {
+					throw new Error("offline");
+				},
+			},
+			outcome: "backup-failed",
+			noForce: true,
+		},
+		...["force-backup-stale", "force-source-changed"].map((code) => ({
+			name: code,
+			overrides: {
+				run: async () =>
+					result({
+						success: false,
+						replacementCommitted: false,
+						errors: [
+							{
+								code,
+								message: code,
+								path: "",
+								operation: "upload" as const,
+							},
+						],
+					}),
+			},
+			outcome: "failed" as const,
+			errorCode: code,
+			noReconcile: true,
+		})),
+		{
+			name: "uncommitted",
+			overrides: {
+				run: async () => result({ replacementCommitted: false }),
+			},
+		},
+		{
+			name: "no reconciliation",
+			overrides: { reconcile: async () => null },
+		},
+		{
+			name: "failed reconciliation",
+			overrides: { reconcile: async () => result({ success: false }) },
+		},
+		{
+			name: "pending cleanup",
+			overrides: { hasPendingCleanup: () => true },
+		},
+		{
+			name: "recovered cleanup",
+			overrides: {
+				run: async () =>
+					result({ success: false, errors: [cleanupError] }),
+			},
+			outcome: "success",
+		},
+		{
+			name: "without archive",
+			overrides: {
+				confirm: async () => "without-backup",
+				run: async (_, options) => {
+					assert.equal(
+						options.forcePreflightProof?.snapshotDigest,
+						"snapshot",
+					);
+					assert.equal(options.forcePreflightProof?.backup, null);
+					return result();
+				},
+			},
+			outcome: "success",
+			noBackup: true,
+		},
+	];
+	for (const direction of ["from_local", "from_remote"] as const) {
+		for (const row of cases) {
+			const h = harness(row.overrides);
+			await h.controller.run(direction);
+			assert.equal(h.controller.isBusy(), false, row.name);
+			if (row.outcome) {
+				assert.equal(
+					h.controller.getState()?.outcome,
+					row.outcome,
+					row.name,
+				);
+			} else {
+				assert.notEqual(
+					h.controller.getState()?.outcome,
+					"success",
+					row.name,
+				);
+			}
+			if (row.errorCode) {
+				assert.equal(
+					h.controller.getState()?.errorCode,
+					row.errorCode,
+					row.name,
+				);
+			}
+			if (row.noForce) {
+				assert.ok(!h.calls.includes("force"), row.name);
+			}
+			if (row.noReconcile) {
+				assert.ok(!h.calls.includes("reconcile"), row.name);
+			}
+			if (row.noBackup) {
+				assert.ok(!h.calls.includes("backup"), row.name);
+			}
+			if (row.name === "busy") {
+				assert.deepEqual(h.calls, []);
+			}
+			if (row.outcome === "success") {
+				assert.equal(
+					h.calls.filter((call) => call === "reconcile").length,
+					1,
+					row.name,
+				);
+				assert.ok(
+					h.calls.indexOf("committed") < h.calls.indexOf("persist"),
+					row.name,
+				);
+			}
+			if (row.name === "without archive") {
+				assert.ok(
+					!h.states.some((state) => state.phase.includes("backup")),
+				);
+			}
+		}
 	}
-});
-
-test("Force success requires verified commit persistence full and completed cleanup", async () => {
-	for (const overrides of [
-		{ run: async () => result({ replacementCommitted: false }) },
-		{ reconcile: async () => null },
-		{ reconcile: async () => result({ success: false }) },
-		{ hasPendingCleanup: () => true },
-	]) {
-		const h = harness(overrides);
-		await h.controller.run("from_local");
-		assert.notEqual(h.controller.getState()?.outcome, "success");
-	}
-	const h = harness({
-		run: async () =>
-			result({
-				success: false,
-				errors: [
-					{
-						message: "interrupted cleanup",
-						path: "old.md",
-						operation: "delete_remote",
-					},
-				],
-			}),
-	});
-	await h.controller.run("from_local");
-	assert.equal(h.controller.getState()?.outcome, "success");
-	assert.equal(h.calls.filter((call) => call === "reconcile").length, 1);
-	assert.ok(h.calls.indexOf("committed") < h.calls.indexOf("persist"));
 });
 
 test("Force late activity from a completed operation cannot overwrite its successor", async () => {
@@ -245,27 +339,6 @@ test("Force late activity from a completed operation cannot overwrite its succes
 	assert.equal(h.controller.getState()?.activity, undefined);
 	release.resolve();
 	await second;
-});
-
-test("Force without an archive retains preflight and owns final settlement", async () => {
-	for (const direction of ["from_local", "from_remote"] as const) {
-		const h = harness({
-			confirm: async () => "without-backup",
-			run: async (_, options) => {
-				assert.equal(
-					options.forcePreflightProof?.snapshotDigest,
-					"snapshot",
-				);
-				assert.equal(options.forcePreflightProof?.backup, null);
-				return result();
-			},
-		});
-		await h.controller.run(direction);
-		assert.equal(h.controller.getState()?.outcome, "success");
-		assert.ok(!h.calls.includes("backup"));
-		assert.ok(h.calls.includes("persist") && h.calls.includes("reconcile"));
-		assert.ok(!h.states.some((state) => state.phase.includes("backup")));
-	}
 });
 
 test("Force retains the failing boundary and committed outcome without starting preflight mutations", async () => {

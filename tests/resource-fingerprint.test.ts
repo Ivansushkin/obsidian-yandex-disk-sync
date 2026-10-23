@@ -47,15 +47,13 @@ test("physical fingerprints accept every persisted server identity", () => {
 	);
 });
 
-test("service fingerprint never accepts resource id as content identity", () => {
-	const resource = createResource({
-		modified: "",
-		resource_id: "stable-path-id",
-	});
-	assert.equal(getStableContentFingerprint(resource), null);
-});
-
-test("hash service identities match even when stronger metadata appears", () => {
+test("service fingerprints require content identity and retain weaker persisted hashes", () => {
+	assert.equal(
+		getStableContentFingerprint(
+			createResource({ modified: "", resource_id: "stable-path-id" }),
+		),
+		null,
+	);
 	const resource = createResource({
 		sha256: "sha-value",
 		md5: "md5-value",

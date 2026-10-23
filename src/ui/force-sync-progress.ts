@@ -14,6 +14,15 @@ export function formatForceActivity(state: ForceFlowState): string {
 /** A committed replacement can require recovery but can never be reported as rolled back. */
 export function formatForceResult(state: ForceFlowState): string {
 	if (state.outcome === "success") {
+		if (state.direct && state.direction === "from_remote") {
+			return (
+				t("notice.force_sync_completed", {
+					successful: state.successful ?? 0,
+				}) +
+				" " +
+				t("force.restart_required")
+			);
+		}
 		return state.migration
 			? t("notice.force_migration_completed")
 			: t("notice.force_sync_completed", {
@@ -21,6 +30,20 @@ export function formatForceResult(state: ForceFlowState): string {
 				});
 	}
 	if (state.failure) {
+		if (state.direct) {
+			return formatOperationFailure(
+				state.failure,
+				t(
+					state.outcome === "recovery-pending"
+						? "force.partial_result"
+						: "force.not_started",
+					{
+						successful: state.successful ?? 0,
+						failed: state.failed ?? 1,
+					},
+				),
+			);
+		}
 		if (state.outcome === "recovery-pending") {
 			return formatOperationFailure(
 				state.failure,

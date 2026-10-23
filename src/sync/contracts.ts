@@ -1,3 +1,7 @@
+import type {
+	EncryptionManifestRead,
+	RemoteAuthorityObservation,
+} from "./canonical/manager";
 import type { FailureSummary } from "../errors";
 import type { SyncSessionKind, SyncState } from "../types";
 import { type ForceCanonicalProof } from "./canonical/manager";
@@ -16,6 +20,8 @@ export interface SyncGuardResult {
 
 export type SyncGuardCallback = (
 	validationToken?: string,
+	observation?: RemoteAuthorityObservation,
+	manifestRead?: EncryptionManifestRead,
 ) => SyncGuardResult | Promise<SyncGuardResult>;
 
 export type ExternalSyncBlockKind =

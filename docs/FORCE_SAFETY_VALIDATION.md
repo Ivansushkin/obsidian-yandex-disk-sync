@@ -1,4 +1,10 @@
-# Force safety: evidence and remaining release gates
+# Historical staged-Force safety evidence
+
+Current contract: [direct Force](FORCE_SYNC.md). The investigation below describes
+the previous staged/scoped implementation. Its server-fencing expectations are
+retained as diagnostics of a guarantee direct Force explicitly does not provide;
+they are not a release gate for the new contract. Real two-profile Obsidian/Yandex
+validation is still required.
 
 Investigation base: `5aeca24ba618302b150f203e35d96cb552cc432a`.
 Integration base: fresh `origin/master` at `b6f6829361e3e44b33d9f4ca1a0b1a40b8c8a99a`
@@ -89,7 +95,7 @@ A later loaded run also hit the same broad fixture deadline in encryption-workfl
 that test now scopes its 15 ms budget to the stalled canonical read. The original
 521/522 run is kept distinct from the final verification.
 
-## Server fencing: release remains blocked
+## Historical server-fencing failures
 
 Run `npm run test:force-fencing`. These are preservation assertions, not expected
 loss, skipped tests or suppressed exceptions. This command is intentionally a

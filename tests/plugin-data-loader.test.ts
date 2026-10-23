@@ -114,16 +114,20 @@ function rejectData(value: unknown, label?: string) {
 	);
 }
 
-test("fresh plugin data accepts nullish storage and rejects arbitrary roots", () => {
-	assert.equal(loadPluginData(null), null);
-	assert.equal(loadPluginData(undefined), null);
-	for (const value of [0, "data", [], { arbitrary: true }]) {
-		rejectData(value);
-	}
-});
-
 test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty queues", () => {
 	const source = structuredClone(stableFilledFixture);
+	Object.defineProperty(source.localIndex.files, "__proto__", {
+		value: {
+			path: "__proto__",
+			sha256: "proto-sha",
+			size: 5,
+			mtime: 6,
+			syncedAt: 7,
+		},
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
 	const migrated = loadPluginData(source) as unknown as ReturnType<
 		typeof currentData
 	> & {
@@ -137,6 +141,14 @@ test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty qu
 			...createEmptyLocalState(source.settings.deviceId),
 			lastSyncTime: source.localIndex.lastSyncTime,
 			files: {
+				["__proto__"]: {
+					...((source.localIndex.files as Record<string, unknown>)[
+						"__proto__"
+					] as object),
+					deleted: undefined,
+					deletedAt: undefined,
+					lastModifiedBy: undefined,
+				},
 				"deleted.md": source.localIndex.files["deleted.md"],
 				"note.md": {
 					...source.localIndex.files["note.md"],
@@ -168,34 +180,6 @@ test("stable 1.1 empty golden fixture preserves zero interval and config sync", 
 	assert.equal(current.localState.lastSyncTime, 0);
 });
 
-test("legacy root __proto__ path survives stable conversion", () => {
-	const source = structuredClone(stableFilledFixture);
-	Object.defineProperty(source.localIndex.files, "__proto__", {
-		value: {
-			path: "__proto__",
-			sha256: "proto-sha",
-			size: 5,
-			mtime: 6,
-			syncedAt: 7,
-		},
-		enumerable: true,
-		configurable: true,
-		writable: true,
-	});
-	const loaded = loadPluginDataWithSource(source);
-	const current = loaded.data as unknown as {
-		localState: { files: Record<string, { sha256: string }> };
-	};
-	assert.equal(loaded.source, "stable-1x");
-	assert.ok(
-		Object.prototype.hasOwnProperty.call(
-			current.localState.files,
-			"__proto__",
-		),
-	);
-	assert.equal(current.localState.files["__proto__"]?.sha256, "proto-sha");
-});
-
 test("current semantic format preserves causal data with explicit profiles", () => {
 	const source = currentData({
 		localState: {
@@ -221,7 +205,12 @@ test("current semantic format preserves causal data with explicit profiles", () 
 });
 
 test("unsupported local formats fail closed instead of migrating", () => {
+	assert.equal(loadPluginData(null), null);
+	assert.equal(loadPluginData(undefined), null);
 	const cases: [string, unknown][] = [
+		...[0, "data", [], { arbitrary: true }].map(
+			(value): [string, unknown] => ["arbitrary root", value],
+		),
 		["unmarked queues", { ...stableFilledFixture, pendingMutations: [] }],
 		[
 			"partial stable",
@@ -256,7 +245,7 @@ test("unsupported local formats fail closed instead of migrating", () => {
 	}
 });
 
-test("persisted transitions require current authority backup and target proofs", () => {
+test("persisted transitions reject missing authority invalid mappings and incompatible settings", () => {
 	assert.doesNotThrow(() =>
 		loadPluginData(
 			currentData({
@@ -267,97 +256,99 @@ test("persisted transitions require current authority backup and target proofs",
 			}),
 		),
 	);
-	const cases: [string, (transition: Record<string, unknown>) => void][] = [
+	const sourceWithoutProfile = { ...currentTransition().source } as Record<
+		string,
+		unknown
+	>;
+	delete sourceWithoutProfile.profileId;
+	const withoutBackup = { ...currentTransition() } as Record<string, unknown>;
+	delete withoutBackup.backupProof;
+	const historicalMapping = { ...currentTransition() } as Record<
+		string,
+		unknown
+	>;
+	delete historicalMapping.targetRawByLogicalPath;
+	historicalMapping.targetRawPaths = ["new"];
+	const cases: Array<[string, unknown]> = [
 		[
-			"profile",
-			(transition) => {
-				delete (transition.source as Record<string, unknown>).profileId;
-			},
+			"source profile",
+			currentData({
+				encryptionTransition: {
+					...currentTransition(),
+					source: sourceWithoutProfile,
+				},
+			}),
 		],
+		["backup proof", currentData({ encryptionTransition: withoutBackup })],
 		[
-			"backup proof",
-			(transition) => {
-				delete transition.backupProof;
-			},
-		],
-		[
-			"target fingerprints",
-			(transition) => {
-				transition.targetFingerprints = {};
-			},
+			"target proof",
+			currentData({
+				encryptionTransition: {
+					...currentTransition(),
+					targetFingerprints: {},
+				},
+			}),
 		],
 		[
 			"historical mapping",
-			(transition) => {
-				delete transition.targetRawByLogicalPath;
-				transition.targetRawPaths = ["new"];
-			},
+			currentData({ encryptionTransition: historicalMapping }),
+		],
+		...[
+			{ "one.md": "same", "two.md": "same" },
+			{ "one.md": "old" },
+			{ "one.md": ".backup/object" },
+		].map((targetRawByLogicalPath): [string, unknown] => [
+			`target mapping ${JSON.stringify(targetRawByLogicalPath)}`,
+			currentData({
+				encryptionTransition: {
+					...currentTransition(),
+					targetRawByLogicalPath,
+					targetFingerprints: {},
+				},
+			}),
+		]),
+		[
+			"prototype source",
+			currentData({
+				encryptionTransition: {
+					...currentTransition(),
+					sourceRawPaths: ["__proto__"],
+					sourceFingerprints: {},
+				},
+			}),
+		],
+		[
+			"prototype target",
+			currentData({
+				encryptionTransition: {
+					...currentTransition(),
+					targetRawByLogicalPath: { "note.md": "__proto__" },
+					targetFingerprints: {},
+				},
+			}),
+		],
+		[
+			"unrelated settings",
+			currentData({
+				settings: {
+					...currentEncryptedSettings(),
+					encryptionSalt: "unrelated",
+				},
+			}),
+		],
+		[
+			"numbered state",
+			currentData({
+				settings: DEFAULT_SETTINGS,
+				localState: {
+					...createEmptyLocalState("device-a"),
+					version: 1,
+				},
+				encryptionTransition: null,
+			}),
 		],
 	];
-	for (const [label, invalidate] of cases) {
-		const transition = currentTransition() as unknown as Record<
-			string,
-			unknown
-		>;
-		invalidate(transition);
-		rejectData(currentData({ encryptionTransition: transition }), label);
+	for (const [label, value] of cases) {
+		rejectData(value, label);
 	}
-});
-
-test("current transition requires an injective disjoint target mapping", () => {
-	for (const targetRawByLogicalPath of [
-		{ "one.md": "same", "two.md": "same" },
-		{ "one.md": "old" },
-		{ "one.md": ".backup/object" },
-	] as Array<Record<string, string>>) {
-		const transition = {
-			...currentTransition(),
-			targetRawByLogicalPath,
-			targetFingerprints: {},
-		};
-		assert.throws(
-			() =>
-				loadPluginData(
-					currentData({ encryptionTransition: transition }),
-				),
-			UnsupportedHistoricalDataError,
-		);
-	}
-});
-
-test("__proto__ transition paths cannot impersonate persisted fingerprints", () => {
-	for (const patch of [
-		{ sourceRawPaths: ["__proto__"], sourceFingerprints: {} },
-		{
-			targetRawByLogicalPath: { "note.md": "__proto__" },
-			targetFingerprints: {},
-		},
-	]) {
-		rejectData(
-			currentData({
-				encryptionTransition: { ...currentTransition(), ...patch },
-			}),
-		);
-	}
-});
-
-test("current settings must match the source or target transition mode", () => {
-	rejectData(
-		currentData({
-			settings: {
-				...currentEncryptedSettings(),
-				encryptionSalt: "unrelated",
-			},
-		}),
-	);
-});
-
-test("numbered local state marker is rejected from current plugin data", () => {
-	rejectData(
-		currentData({
-			settings: DEFAULT_SETTINGS,
-			localState: { ...createEmptyLocalState("device-a"), version: 1 },
-			encryptionTransition: null,
-		}),
-	);
 });

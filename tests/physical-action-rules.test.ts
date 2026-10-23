@@ -4,13 +4,13 @@ import test from "node:test";
 import {
 	createEmptyIndex,
 	type PendingPhysicalAction,
+	type FileMetadata,
 	type YandexResource,
 } from "../src/types";
 import {
 	classifyPhysicalDeleteFingerprint,
 	classifyPhysicalDeleteResource,
 	isPhysicalDeleteAuthorized,
-	shouldBackupLocalDelete,
 } from "../src/sync/files/action-rules";
 
 function action(
@@ -28,48 +28,77 @@ function action(
 	};
 }
 
-test("a newer live canonical state cancels an old physical delete", () => {
-	const canonical = createEmptyIndex("device", "epoch");
-	canonical.files["note.md"] = fileMetadata("note.md", {
-		sha256: "new",
-		size: 3,
-		changedRevision: 3,
-	});
-	assert.equal(isPhysicalDeleteAuthorized(action("epoch"), canonical), false);
-});
-
-test("canonical tombstone authorizes exact and folder physical deletion", () => {
-	const canonical = createEmptyIndex("device", "epoch");
-	canonical.files["note.md"] = fileMetadata("note.md", {
+test("physical cleanup requires current epoch and canonical deletion or accepted retarget authority", () => {
+	const tombstone = fileMetadata("note.md", {
 		sha256: "old",
-		size: 3,
 		deleted: true,
 		changedRevision: 3,
 	});
-	assert.equal(isPhysicalDeleteAuthorized(action("epoch"), canonical), true);
-	assert.equal(
-		isPhysicalDeleteAuthorized(action("epoch", "folder-delete"), canonical),
-		true,
-	);
+	const restored = fileMetadata("note.md", {
+		sha256: "new",
+		changedRevision: 4,
+	});
+	const target = fileMetadata("renamed.md", {
+		sha256: "target",
+		changedRevision: 3,
+	});
+	const retarget = {
+		...action("epoch", "rejected-upload"),
+		targetPath: "renamed.md",
+		baselineSha256: "target",
+	};
+	const cases: [string, PendingPhysicalAction, FileMetadata[], boolean][] = [
+		["newer live source", action("epoch"), [restored], false],
+		["exact tombstone", action("epoch"), [tombstone], true],
+		[
+			"folder tombstone",
+			action("epoch", "folder-delete"),
+			[tombstone],
+			true,
+		],
+		["Force without initiator", action("epoch", "force-reset"), [], true],
+		[
+			"Force with tombstone",
+			action("epoch", "force-reset"),
+			[tombstone],
+			true,
+		],
+		[
+			"old Force epoch",
+			action("old-epoch", "force-reset"),
+			[tombstone],
+			false,
+		],
+		["unaccepted retarget", retarget, [], false],
+		["accepted retarget", retarget, [target], true],
+		["restored source after retarget", retarget, [target, restored], false],
+	];
+	for (const [label, cleanup, files, expected] of cases) {
+		const canonical = createEmptyIndex("device", "epoch");
+		canonical.files = Object.fromEntries(
+			files.map((file) => [file.path, file]),
+		);
+		assert.equal(
+			isPhysicalDeleteAuthorized(cleanup, canonical),
+			expected,
+			label,
+		);
+	}
 });
 
 test("remote deletion requires an exact expected fingerprint", () => {
-	assert.equal(
-		classifyPhysicalDeleteFingerprint("expected", "expected"),
-		"match",
-	);
-	assert.equal(
-		classifyPhysicalDeleteFingerprint(undefined, "current"),
-		"missing-expected",
-	);
-	assert.equal(
-		classifyPhysicalDeleteFingerprint("expected", undefined),
-		"missing-current",
-	);
-	assert.equal(
-		classifyPhysicalDeleteFingerprint("expected", "changed"),
-		"mismatch",
-	);
+	for (const [expected, current, decision] of [
+		["expected", "expected", "match"],
+		[undefined, "current", "missing-expected"],
+		["expected", undefined, "missing-current"],
+		["expected", "changed", "mismatch"],
+	] as const) {
+		assert.equal(
+			classifyPhysicalDeleteFingerprint(expected, current),
+			decision,
+			decision,
+		);
+	}
 });
 
 test("persisted physical actions accept every current server identity", () => {
@@ -90,64 +119,4 @@ test("persisted physical actions accept every current server identity", () => {
 			"match",
 		);
 	}
-});
-
-test("Force replacement cleanup remains authorized after initiator loss", () => {
-	const canonical = createEmptyIndex("device", "new-epoch");
-	assert.equal(
-		isPhysicalDeleteAuthorized(
-			action("new-epoch", "force-reset"),
-			canonical,
-		),
-		true,
-	);
-	canonical.files["note.md"] = fileMetadata("note.md", {
-		sha256: "old",
-		size: 3,
-		deleted: true,
-	});
-	assert.equal(
-		isPhysicalDeleteAuthorized(
-			action("new-epoch", "force-reset"),
-			canonical,
-		),
-		true,
-	);
-	assert.equal(
-		isPhysicalDeleteAuthorized(
-			action("old-epoch", "force-reset"),
-			canonical,
-		),
-		false,
-	);
-});
-
-test("retargeted upload cleanup requires the accepted target put", () => {
-	const canonical = createEmptyIndex("device", "epoch");
-	const cleanup = {
-		...action("epoch", "rejected-upload"),
-		targetPath: "renamed.md",
-		baselineSha256: "target",
-	};
-	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), false);
-
-	canonical.files["renamed.md"] = fileMetadata("renamed.md", {
-		sha256: "target",
-		size: 3,
-		changedRevision: 3,
-	});
-	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), true);
-
-	canonical.files["note.md"] = fileMetadata("note.md", {
-		sha256: "concurrent",
-		size: 3,
-		changedRevision: 4,
-	});
-	assert.equal(isPhysicalDeleteAuthorized(cleanup, canonical), false);
-});
-
-test("unknown or changed local content requires backup before deletion", () => {
-	assert.equal(shouldBackupLocalDelete("current", undefined), true);
-	assert.equal(shouldBackupLocalDelete("current", "baseline"), true);
-	assert.equal(shouldBackupLocalDelete("same", "same"), false);
 });

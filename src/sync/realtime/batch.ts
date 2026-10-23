@@ -463,7 +463,12 @@ async function applyPreparedRealtimeWindow(
 		const item = prepared[index]!;
 		try {
 			if (item.action === "upload") {
-				if (isUploadHandedOffToRename(item.event)) {
+				const source =
+					deps.indexManager.getRemoteIndex().files[item.path];
+				if (
+					isUploadHandedOffToRename(item.event) &&
+					(!source || source.deleted)
+				) {
 					recordPendingUploadHandoff(batchResult, item);
 					continue;
 				}
@@ -475,7 +480,10 @@ async function applyPreparedRealtimeWindow(
 						false,
 						true,
 					);
-				if (isUploadHandedOffToRename(item.event)) {
+				if (
+					isUploadHandedOffToRename(item.event) &&
+					(!source || source.deleted)
+				) {
 					recordPendingUploadHandoff(batchResult, item);
 					continue;
 				}
@@ -523,7 +531,12 @@ async function applyPreparedRealtimeWindow(
 		await deps.indexSaveCallback();
 	}
 	for (const item of ready) {
-		if (item.action === "upload" && isUploadHandedOffToRename(item.event)) {
+		const source = deps.indexManager.getRemoteIndex().files[item.path];
+		if (
+			item.action === "upload" &&
+			isUploadHandedOffToRename(item.event) &&
+			(!source || source.deleted)
+		) {
 			recordPendingUploadHandoff(batchResult, item);
 			continue;
 		}

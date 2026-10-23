@@ -30,26 +30,25 @@ test("backup envelope is self-contained and authenticated", async () => {
 	assert.equal(opened.header.kind, "logical-vault");
 	assert.equal(opened.header.fileCount, 7);
 	assert.equal("version" in opened.header, false);
-});
-
-test("backup envelope rejects wrong password and modified ciphertext", async () => {
-	const envelope = await sealBackupEnvelope(plaintext, "right-password", {
-		...backupMetadata,
-		kind: "remote-raw",
-	});
-	await assert.rejects(
-		openBackupEnvelope(envelope, "wrong-password"),
-		BackupEnvelopeAuthenticationError,
-	);
 	const corrupted = new Uint8Array(envelope.slice(0));
-	corrupted[corrupted.length - 1] = corrupted[corrupted.length - 1]! ^ 1;
-	await assert.rejects(
-		openBackupEnvelope(corrupted.buffer, "right-password"),
-		BackupEnvelopeAuthenticationError,
-	);
+	corrupted[corrupted.length - 1]! ^= 1;
+	for (const [label, data, password] of [
+		["wrong password", envelope, "wrong-password"],
+		["modified ciphertext", corrupted.buffer, "backup-password"],
+	] as const) {
+		await assert.rejects(
+			openBackupEnvelope(data, password),
+			BackupEnvelopeAuthenticationError,
+			label,
+		);
+	}
 });
 
 test("backup envelope rejects unbounded or unsupported headers before KDF", async () => {
+	assert.equal(
+		isBackupEnvelope(new TextEncoder().encode("OYDSBKP2").buffer),
+		false,
+	);
 	const oversized = new Uint8Array(12);
 	oversized.set(new TextEncoder().encode("OYDSBKP!"));
 	new DataView(oversized.buffer).setUint32(8, 16 * 1024 + 1, false);
@@ -87,9 +86,4 @@ test("backup envelope rejects unbounded or unsupported headers before KDF", asyn
 			/header/,
 		);
 	}
-});
-
-test("numbered historical backup magic is not accepted as a current envelope", () => {
-	const historical = new TextEncoder().encode("OYDSBKP2").buffer;
-	assert.equal(isBackupEnvelope(historical), false);
 });

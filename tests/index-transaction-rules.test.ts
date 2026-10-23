@@ -26,73 +26,66 @@ test("remote root pagination reads objects after the first 1000 entries", async 
 	assert.equal(items[1000], 1000);
 });
 
-test("same-revision orphan with different state is ambiguous", () => {
+test("orphan authority and semantic identity retain meaningful JSON differences", () => {
 	const canonical = createEmptyIndex("device-a");
 	canonical.revision = 4;
-	const orphan = structuredClone(canonical);
-	orphan.deviceId = "device-b";
-
-	assert.equal(isOrphanIndexAmbiguous(canonical, orphan), true);
-	assert.equal(
-		isOrphanIndexAmbiguous(canonical, structuredClone(canonical)),
-		false,
-	);
-});
-
-test("newer orphan is ambiguous while an older orphan is obsolete", () => {
-	const canonical = createEmptyIndex("device-a");
-	canonical.revision = 4;
-	const newer = createEmptyIndex("device-b");
-	newer.revision = 5;
-	const older = createEmptyIndex("device-b");
-	older.revision = 3;
-
-	assert.equal(isOrphanIndexAmbiguous(canonical, newer), true);
-	assert.equal(isOrphanIndexAmbiguous(canonical, older), false);
-});
-
-test("semantic index comparison ignores object insertion order", () => {
-	assert.equal(
-		stableSerialize({ files: { b: 2, a: 1 }, revision: 3 }),
-		stableSerialize({ revision: 3, files: { a: 1, b: 2 } }),
-	);
-});
-
-test("semantic index comparison uses JSON undefined semantics", () => {
-	assert.equal(
-		stableSerialize({ revision: 3, maintenance: undefined }),
-		stableSerialize({ revision: 3 }),
-	);
-	assert.equal(
-		stableSerialize([1, undefined, 3]),
-		stableSerialize([1, null, 3]),
-	);
-});
-
-test("optional metadata survives JSON roundtrip", () => {
-	const metadata = {
-		sha256: "abc",
-		size: 12,
-		mtime: 42,
-		serverMtime: undefined,
-		serverFingerprint: undefined,
-	};
-	const roundtripped = JSON.parse(
-		JSON.stringify(metadata),
-	) as typeof metadata;
-
-	assert.equal(stableSerialize(metadata), stableSerialize(roundtripped));
-});
-
-test("stable serialization keeps real value differences visible", () => {
-	assert.notEqual(
-		stableSerialize({ revision: 3, maintenance: null }),
-		stableSerialize({ revision: 3 }),
-	);
-	assert.notEqual(
-		stableSerialize({ files: [{ size: 1 }] }),
-		stableSerialize({ files: [{ size: 2 }] }),
-	);
+	for (const [revision, deviceId, ambiguous] of [
+		[4, "device-b", true],
+		[4, "device-a", false],
+		[5, "device-b", true],
+		[3, "device-b", false],
+	] as const) {
+		assert.equal(
+			didCanonicalChangeBeforeMaintenanceClaim(
+				canonical.revision,
+				revision,
+			),
+			revision !== canonical.revision,
+			`claim after revision ${revision}`,
+		);
+		assert.equal(
+			isOrphanIndexAmbiguous(canonical, {
+				...canonical,
+				revision,
+				deviceId,
+			}),
+			ambiguous,
+			`${deviceId}@${revision}`,
+		);
+	}
+	for (const [label, left, right, equal] of [
+		[
+			"insertion order",
+			{ files: { b: 2, a: 1 }, revision: 3 },
+			{ revision: 3, files: { a: 1, b: 2 } },
+			true,
+		],
+		[
+			"omitted optional property",
+			{ revision: 3, maintenance: undefined },
+			{ revision: 3 },
+			true,
+		],
+		["array undefined", [1, undefined, 3], [1, null, 3], true],
+		[
+			"explicit null",
+			{ revision: 3, maintenance: null },
+			{ revision: 3 },
+			false,
+		],
+		[
+			"nested value",
+			{ files: [{ size: 1 }] },
+			{ files: [{ size: 2 }] },
+			false,
+		],
+	] as const) {
+		assert.equal(
+			stableSerialize(left) === stableSerialize(right),
+			equal,
+			label,
+		);
+	}
 });
 
 test("stable pagination requires two equal deduplicated snapshots", async () => {
@@ -148,9 +141,4 @@ test("stable pagination includes the root state in its snapshot identity", async
 	);
 	assert.deepEqual(items, []);
 	assert.equal(snapshot, 2);
-});
-
-test("maintenance claim is rejected after a concurrent canonical revision", () => {
-	assert.equal(didCanonicalChangeBeforeMaintenanceClaim(7, 8), true);
-	assert.equal(didCanonicalChangeBeforeMaintenanceClaim(7, 7), false);
 });

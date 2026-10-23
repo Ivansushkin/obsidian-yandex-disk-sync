@@ -23,7 +23,11 @@ import {
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { createConfirmedBaseline } from "../local/baseline-rules";
-import { IndexManager } from "../canonical/manager";
+import {
+	IndexManager,
+	type CanonicalReadSession,
+	type RemoteAuthorityObservation,
+} from "../canonical/manager";
 import { PortablePathCollisionError } from "../canonical/errors";
 import {
 	classifyPhysicalDeleteResource,
@@ -33,6 +37,8 @@ import {
 import type { SyncGuardCallback } from "../contracts";
 import { createSyncError } from "../errors";
 export interface Dependencies {
+	canonicalReadSession?: CanonicalReadSession;
+	validationToken?: string;
 	getSyncGuardResult: SyncGuardCallback;
 	vaultAdapter: VaultAdapter;
 	yandexClient: YandexDiskClient;
@@ -602,7 +608,9 @@ export async function executeOperationsParallel(
 				const expected =
 					deps.indexManager.getRemoteIndex().files[op.path];
 				const expectedEpoch = deps.indexManager.getRemoteIndex().epoch;
-				const guard = await deps.getSyncGuardResult();
+				const guard = await deps.getSyncGuardResult(
+					deps.validationToken,
+				);
 				if (guard.blockReason) {
 					throw new Error(guard.blockReason);
 				}
@@ -612,14 +620,25 @@ export async function executeOperationsParallel(
 					throw new Error("Local file changed after full scan");
 				}
 				const assertAuthority = async () => {
-					const currentGuard = await deps.getSyncGuardResult(
-						guard.validationToken,
-					);
-					if (currentGuard.blockReason) {
-						throw new Error(currentGuard.blockReason);
+					const validate = async (
+						observation?: RemoteAuthorityObservation,
+					) => {
+						const currentGuard = await deps.getSyncGuardResult(
+							guard.validationToken,
+							observation,
+						);
+						if (currentGuard.blockReason) {
+							throw new Error(currentGuard.blockReason);
+						}
+					};
+					let canonical;
+					if (deps.canonicalReadSession) {
+						canonical = await deps.canonicalReadSession(validate);
+					} else {
+						await validate();
+						canonical =
+							await deps.indexManager.readCanonicalIndex();
 					}
-					const canonical =
-						await deps.indexManager.readCanonicalIndex();
 					const current = canonical.files[op.path];
 					if (
 						canonical.epoch !== expectedEpoch ||
@@ -655,6 +674,7 @@ export async function executeOperationsParallel(
 								"Physical file changed before full upload",
 							);
 						}
+						deps.canonicalReadSession?.assertCurrent();
 					},
 					() =>
 						confirmUploadedSnapshot(

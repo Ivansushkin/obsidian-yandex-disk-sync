@@ -3,7 +3,10 @@ import type { ExternalSyncBlockKind } from "./sync/contracts";
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
 import type { EncryptionReadyOptions } from "./crypto/admission";
 import { t } from "./i18n/index";
-import type { IndexManager } from "./sync/canonical/manager";
+import type {
+	IndexManager,
+	StartupReadSession,
+} from "./sync/canonical/manager";
 import { LegacyIndexFormatError } from "./sync/canonical/errors";
 import type { SyncEngine } from "./sync/engine";
 import { createSyncFailure, formatOperationFailure } from "./sync/errors";
@@ -21,8 +24,10 @@ interface StartupPorts {
 	index: Pick<
 		IndexManager,
 		"downloadEncryptionManifest" | "inspectRemoteCanonicalFormat"
-	>;
-	engine: Pick<SyncEngine, "runExclusiveMaintenance">;
+	> &
+		Partial<Pick<IndexManager, "createStartupReadSession">>;
+	engine: Pick<SyncEngine, "runExclusiveMaintenance"> &
+		Partial<Pick<SyncEngine, "createReadLifetimeGuard">>;
 	getSettings(): Pick<
 		YandexDiskSyncSettings,
 		"yandexTokenSecret" | "enableEncryption"
@@ -39,11 +44,34 @@ interface StartupPorts {
 	): void;
 	ensureStorageBinding(prompt: boolean): Promise<boolean>;
 	recoverEncryptionTransition(): Promise<void>;
-	tryRecoverRemoteTargetTransition(): Promise<boolean>;
+	tryRecoverRemoteTargetTransition(
+		reads?: StartupReadSession,
+	): Promise<boolean>;
 	ensureEncryptionReady(
 		options: EncryptionReadyOptions,
 		read: { manifest: RemoteEncryptionManifest | null },
 	): Promise<boolean>;
+}
+
+/** One explicit lifecycle invocation; mutations discard all earlier service observations. */
+export class StartupInvocation {
+	private session?: StartupReadSession;
+	private ended = false;
+	constructor(private readonly create?: () => StartupReadSession) {}
+	get reads(): StartupReadSession | undefined {
+		if (this.ended) {
+			throw new Error("Startup invocation ended");
+		}
+		return (this.session ??= this.create?.());
+	}
+	invalidate(): void {
+		this.session?.close();
+		this.session = undefined;
+	}
+	close(): void {
+		this.invalidate();
+		this.ended = true;
+	}
 }
 
 /** Classify storage, history and encryption before any normal synchronization. */
@@ -51,11 +79,44 @@ export class PluginStartup {
 	validated = false;
 	constructor(private readonly deps: StartupPorts) {}
 
+	/** Keep standalone refreshes and their following full explicitly separate from future invocations. */
+	async runInvocation<T>(
+		action: (invocation: StartupInvocation) => Promise<T>,
+	): Promise<T> {
+		const invocation = new StartupInvocation(
+			this.deps.index?.createStartupReadSession
+				? () => {
+						const assertLifetime =
+							this.deps.engine.createReadLifetimeGuard?.();
+						return this.deps.index.createStartupReadSession!(() => {
+							assertLifetime?.();
+							if (this.deps.isStopped()) {
+								throw new Error(
+									"Startup invocation interrupted",
+								);
+							}
+						});
+					}
+				: undefined,
+		);
+		try {
+			return await action(invocation);
+		} finally {
+			invocation.close();
+		}
+	}
+
 	/** Recheck stale migration decisions and preserve distinct typed block outcomes. */
 	async refresh(
 		prompt: boolean,
 		allowRecovery = true,
+		invocation?: StartupInvocation,
 	): Promise<StartupState> {
+		if (!invocation) {
+			return await this.runInvocation((owned) =>
+				this.refresh(prompt, allowRecovery, owned),
+			);
+		}
 		const { deps } = this;
 		if (deps.isStopped()) {
 			return "blocked";
@@ -96,13 +157,16 @@ export class PluginStartup {
 					}
 				}
 			}
-			const manifest = await deps.index.downloadEncryptionManifest();
+			const manifest = invocation.reads
+				? (await invocation.reads.manifest()).manifest
+				: await deps.index.downloadEncryptionManifest();
 			if (deps.isStopped()) {
 				return "blocked";
 			}
 			if (!manifest) {
-				const canonicalFormat =
-					await deps.index.inspectRemoteCanonicalFormat();
+				const canonicalFormat = invocation.reads
+					? await invocation.reads.inspectFormat()
+					: await deps.index.inspectRemoteCanonicalFormat();
 				if (deps.isStopped()) {
 					return "blocked";
 				}
@@ -137,6 +201,7 @@ export class PluginStartup {
 			}
 			if (allowRecovery) {
 				if (deps.hasTransition()) {
+					invocation.invalidate();
 					await deps.engine.runExclusiveMaintenance(async () => {
 						if (!deps.isStopped()) {
 							await deps.recoverEncryptionTransition();
@@ -144,7 +209,9 @@ export class PluginStartup {
 					});
 					recovered = true;
 				} else {
-					recovered = await deps.tryRecoverRemoteTargetTransition();
+					recovered = await deps.tryRecoverRemoteTargetTransition(
+						invocation.reads,
+					);
 				}
 			} else if (deps.hasTransition()) {
 				deps.setBlock("encryption", t("notice.encryption_remote_busy"));
@@ -153,14 +220,23 @@ export class PluginStartup {
 			if (deps.isStopped()) {
 				return "blocked";
 			}
-			const currentManifest = recovered
-				? await deps.index.downloadEncryptionManifest()
-				: manifest;
+			if (recovered) {
+				invocation.invalidate();
+			}
+			const currentManifest = invocation.reads
+				? (await invocation.reads.manifest()).manifest
+				: recovered
+					? await deps.index.downloadEncryptionManifest()
+					: manifest;
 			if (deps.isStopped()) {
 				return "blocked";
 			}
 			const ready = await deps.ensureEncryptionReady(
-				{ prompt, allowRecovery },
+				{
+					prompt,
+					allowRecovery,
+					invalidateReads: () => invocation.invalidate(),
+				},
 				{ manifest: currentManifest },
 			);
 			if (deps.isStopped()) {

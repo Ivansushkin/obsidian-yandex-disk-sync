@@ -175,47 +175,28 @@ function stable1xIndex(version: 1 | 2 = 2): Record<string, unknown> {
 	};
 }
 
-test("encryption source snapshot rejects an unprovable raw user object", async () => {
-	const manager = new IndexManager(
-		{
-			getResourcesRecursive: async () => [
-				{
-					name: "note.md",
-					path: "vault/note.md",
-					type: "file",
-					created: "",
-					modified: "",
-				},
-			],
-		} as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
-
-	await assert.rejects(
-		manager.getRemoteRawFileSnapshots(),
-		/no stable fingerprint/,
-	);
-});
-
-test("remote paths rewritten by current normalization fail before indexing", async () => {
-	const manager = new IndexManager(
-		{
-			getResourcesRecursive: async () => [
-				{
-					name: "notes\\name.md",
-					path: "vault/notes\\name.md",
-					type: "file",
-					created: "",
-					modified: "",
-				},
-			],
-		} as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		createSettings("device-a"),
-	);
-
-	await assert.rejects(manager.getRemoteFiles(), PortablePathCollisionError);
+test("remote discovery rejects unprovable identity and rewritten paths", async () => {
+	for (const [name, method, error] of [
+		["note.md", "getRemoteRawFileSnapshots", /no stable fingerprint/],
+		["notes\\name.md", "getRemoteFiles", PortablePathCollisionError],
+	] as const) {
+		const manager = new IndexManager(
+			{
+				getResourcesRecursive: async () => [
+					{
+						name,
+						path: `vault/${name}`,
+						type: "file",
+						created: "",
+						modified: "",
+					},
+				],
+			} as unknown as YandexDiskClient,
+			{} as VaultAdapter,
+			createSettings("device-a"),
+		);
+		await assert.rejects(manager[method](), error, name);
+	}
 });
 
 async function runLegacyForceCommit(
@@ -226,6 +207,7 @@ async function runLegacyForceCommit(
 		corruptIndexUpload?: boolean;
 		hashlessMetadata?: boolean;
 	} = {},
+	label = "legacy Force",
 ): Promise<{
 	client: FakeIndexYandex;
 	manager: IndexManager;
@@ -260,173 +242,146 @@ async function runLegacyForceCommit(
 		revision: number;
 		files: Record<string, FileMetadata>;
 	};
-	assert.equal(canonical.format, CURRENT_INDEX_FORMAT);
-	assert.equal("version" in canonical, false);
-	assert.equal(canonical.revision, 1);
-	assert.ok(canonical.epoch);
-	assert.equal(canonical.files["note.md"]?.mutationSeq, 0);
-	assert.equal(canonical.files["note.md"]?.mtime, 10.375);
-	assert.equal(manager.getObservedEpoch(), canonical.epoch);
-	assert.equal(manager.getObservedRevision(), canonical.revision);
-	assert.equal(client.moveCount, 2);
-	assert.equal(proof.epoch, canonical.epoch);
-	assert.equal(proof.revision, canonical.revision);
+	assert.equal(canonical.format, CURRENT_INDEX_FORMAT, label);
+	assert.equal("version" in canonical, false, label);
+	assert.equal(canonical.revision, 1, label);
+	assert.ok(canonical.epoch, label);
+	assert.equal(canonical.files["note.md"]?.mutationSeq, 0, label);
+	assert.equal(canonical.files["note.md"]?.mtime, 10.375, label);
+	assert.equal(manager.getObservedEpoch(), canonical.epoch, label);
+	assert.equal(manager.getObservedRevision(), canonical.revision, label);
+	assert.equal(client.moveCount, 2, label);
+	assert.equal(proof.epoch, canonical.epoch, label);
+	assert.equal(proof.revision, canonical.revision, label);
 	assert.match(
 		proof.contentFingerprint,
 		faults.hashlessMetadata ? /^modified:/ : /^sha256:/,
+		label,
 	);
 	assert.equal(
 		client.stableReadCount,
 		faults.hashlessMetadata ? 5 : faults.throwAfterFinalMove ? 4 : 3,
+		label,
 	);
 	assert.deepEqual(
 		[...client.files.keys()].filter((path) => path.includes(".lock.")),
 		[],
+		label,
 	);
 	return { client, manager };
 }
 
-test("plaintext stable 1.0/1.1 Force commits and verifies current canonical", async () => {
-	for (const version of [1, 2] as const) {
-		await runLegacyForceCommit(null, stable1xIndex(version));
-	}
-	const fixtureResult = await runLegacyForceCommit(
-		null,
-		stableCanonicalFixture,
-	);
-	const historicalDelete =
-		fixtureResult.manager.getRemoteIndex().files["deleted.md"];
-	assert.equal(historicalDelete?.deleted, true);
-	assert.equal(historicalDelete?.mutationSeq, 0);
-});
-
-test("stable fractional mtime survives Force replacement and current canonical readback", async () => {
+test("stable plaintext Force preserves legacy edge paths and verifies canonical across transport faults", async () => {
 	const source = structuredClone(stableCanonicalFixture);
 	for (const metadata of Object.values(source.files)) {
 		metadata.mtime += 0.375;
 	}
-	const { manager } = await runLegacyForceCommit(null, source);
-	assert.equal(
-		manager.getRemoteIndex().files["deleted.md"]?.mtime,
-		source.files["deleted.md"].mtime,
-	);
-});
-
-test("Force replacement tombstones survive initiator loss", async () => {
-	const source = stable1xIndex();
-	const files = source.files as Record<string, unknown>;
-	files["removed.md"] = fileMetadata("removed.md", {
+	const removed = fileMetadata("removed.md", {
 		sha256: "removed-sha",
 		size: 7,
 		mtime: 8,
 		syncedAt: 9,
 	});
-	const { manager } = await runLegacyForceCommit(null, source);
-	const tombstone = manager.getRemoteIndex().files["removed.md"];
-	assert.equal(tombstone?.deleted, true);
-	assert.equal(tombstone?.mutationSeq, 0);
-	assert.equal(tombstone?.lastModifiedBy, "new-device");
-});
-
-test("legacy root __proto__ path survives conversion and Force", async () => {
-	const source = stable1xIndex();
-	const files = source.files as Record<string, unknown>;
-	Object.defineProperty(files, "__proto__", {
-		value: fileMetadata("__proto__", {
-			sha256: "proto-sha",
-			size: 5,
-			mtime: 6,
-			syncedAt: 7,
-		}),
+	Object.assign(source.files, { "removed.md": removed });
+	Object.defineProperty(source.files, "__proto__", {
+		value: { ...removed, path: "__proto__" },
 		enumerable: true,
-		configurable: true,
-		writable: true,
 	});
-	const { manager } = await runLegacyForceCommit(null, source);
-	const replacement = manager.getRemoteIndex().files;
-	assert.equal(
-		Object.prototype.hasOwnProperty.call(replacement, "__proto__"),
-		true,
-	);
-	assert.equal(replacement["__proto__"]?.deleted, true);
-	assert.equal(replacement["__proto__"]?.mutationSeq, 0);
+	for (const [label, legacy, faults] of [
+		["stable 1.0", stable1xIndex(1), {}],
+		["stable 1.1 edge paths", source, {}],
+		["hashless canonical", stable1xIndex(2), { hashlessMetadata: true }],
+		[
+			"lost final move response",
+			stable1xIndex(2),
+			{ throwAfterFinalMove: true },
+		],
+	] as const) {
+		const { manager } = await runLegacyForceCommit(
+			null,
+			legacy,
+			faults,
+			label,
+		);
+		if (label === "stable 1.1 edge paths") {
+			const files = manager.getRemoteIndex().files;
+			assert.equal(
+				files["deleted.md"]?.mtime,
+				source.files["deleted.md"].mtime,
+			);
+			for (const path of ["deleted.md", "removed.md", "__proto__"]) {
+				assert.equal(
+					Object.prototype.hasOwnProperty.call(files, path),
+					true,
+					path,
+				);
+				assert.equal(files[path]?.deleted, true, path);
+				assert.equal(files[path]?.mutationSeq, 0, path);
+			}
+			assert.equal(files["removed.md"]?.lastModifiedBy, "new-device");
+		}
+	}
 });
 
-test("versioned data outside the exact stable 1.x shape is rejected before Force locks", async () => {
-	const { manager, client } = await createIndexManagerWithContent(
-		{
-			version: 2,
-			lastSyncTime: 1,
-			deviceId: "historical-device",
-			files: {},
-			pendingMutations: [],
-		},
-		null,
-	);
-	manager.beginForceBootstrap(true);
-	await assert.rejects(
-		manager.saveRemoteIndex(),
-		UnsupportedHistoricalDataError,
-	);
-	assert.equal(client.moveCount, 0);
+test("Force rejects unsupported history without moving or changing source bytes", async () => {
+	for (const [label, content, codec] of [
+		[
+			"extra stable field",
+			{ ...stable1xIndex(), pendingMutations: [] },
+			null,
+		],
+		["encrypted legacy", stable1xIndex(), xorCodec(0xa5)],
+		[
+			"numeric current history",
+			{ version: 4, revision: 1, files: {} },
+			null,
+		],
+	] as const) {
+		const { manager, client, canonicalPath } =
+			await createIndexManagerWithContent(content, codec);
+		const original = client.files.get(canonicalPath)!.slice(0);
+		manager.beginForceBootstrap(true);
+		manager.updateRemoteFile(
+			"note.md",
+			fileMetadata("note.md", { size: 4, mtime: 10, syncedAt: 10 }),
+		);
+		await assert.rejects(
+			manager.saveRemoteIndex(),
+			UnsupportedHistoricalDataError,
+			label,
+		);
+		assert.equal(client.moveCount, 0, label);
+		assert.deepEqual(client.files.get(canonicalPath), original, label);
+	}
 });
 
-test("encrypted legacy index is rejected before Force acquires a lock", async () => {
-	const encryption = xorCodec(0xa5);
-	const { manager, client } = await createIndexManagerWithContent(
-		stable1xIndex(),
-		encryption,
-	);
-	manager.beginForceBootstrap(true);
-	await assert.rejects(
-		manager.saveRemoteIndex(),
-		UnsupportedHistoricalDataError,
-	);
-	assert.equal(client.moveCount, 0);
-});
-
-test("hashless canonical metadata falls back to semantic verification", async () => {
-	await runLegacyForceCommit(null, undefined, { hashlessMetadata: true });
-});
-
-test("encryption manifest validation token detects unchanged and changed content", async () => {
-	const client = new FakeIndexYandex("vault", null);
+test("manifest guard tokens detect mutation from present and absent states", async () => {
 	const manifestPath = "vault/.obsidian-encrypt.json";
-	const manifest = encryptionManifest();
-	client.files.set(manifestPath, jsonBytes(manifest));
-	const manager = indexManager(client, "device-a");
-	const read = await manager.downloadEncryptionManifestForGuard();
-	assert.equal(
-		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
-		true,
-	);
-	client.files.set(
-		manifestPath,
-		jsonBytes({ ...manifest, salt: "AQEBAQEBAQEBAQEBAQEBAQ==" }),
-	);
-	assert.equal(
-		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
-		false,
-	);
-});
-
-test("absent manifest token detects a newly created manifest", async () => {
-	const client = new FakeIndexYandex("vault", null);
-	const manager = indexManager(client, "device-a");
-	const read = await manager.downloadEncryptionManifestForGuard();
-	assert.equal(read.validationToken, "absent");
-	assert.equal(
-		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
-		true,
-	);
-	client.files.set(
-		"vault/.obsidian-encrypt.json",
-		new TextEncoder().encode("{}").buffer,
-	);
-	assert.equal(
-		await manager.isEncryptionManifestTokenCurrent(read.validationToken),
-		false,
-	);
+	for (const present of [true, false]) {
+		const client = new FakeIndexYandex("vault", null);
+		const manifest = encryptionManifest();
+		if (present) {
+			client.files.set(manifestPath, jsonBytes(manifest));
+		}
+		const manager = indexManager(client);
+		const { validationToken } =
+			await manager.downloadEncryptionManifestForGuard();
+		if (!present) {
+			assert.equal(validationToken, "absent");
+		}
+		assert.equal(
+			await manager.isEncryptionManifestTokenCurrent(validationToken),
+			true,
+		);
+		client.files.set(
+			manifestPath,
+			jsonBytes({ ...manifest, salt: "AQEBAQEBAQEBAQEBAQEBAQ==" }),
+		);
+		assert.equal(
+			await manager.isEncryptionManifestTokenCurrent(validationToken),
+			false,
+		);
+	}
 });
 
 async function readEncryptionManifest(manifest: object) {
@@ -445,16 +400,14 @@ const manifestCommon = {
 	updatedBy: "device-a",
 };
 
-test("numeric historical manifests are rejected as unsupported data", async () => {
+test("strict semantic manifest accepts only the hardened profile", async () => {
 	for (const version of [1, 2, 3]) {
 		await assert.rejects(
 			readEncryptionManifest({ version, ...manifestCommon }),
 			UnsupportedHistoricalDataError,
+			`historical manifest ${version}`,
 		);
 	}
-});
-
-test("strict semantic manifest accepts only the hardened profile", async () => {
 	const hardened = encryptionManifest();
 	const parsed = await readEncryptionManifest(hardened);
 	assert.equal(parsed?.format, "encryption-manifest");
@@ -646,127 +599,146 @@ async function createIndexManagerWithContent(
 	};
 }
 
-test("plaintext stable 1.x startup preserves LegacyIndexFormatError", async () => {
-	const { manager } = await createIndexManagerWithContent(stable1xIndex());
-	await assert.rejects(manager.loadRemoteIndex(), LegacyIndexFormatError);
+test("legacy migration rejects protected exposure and path collisions before user reads or writes", async () => {
+	for (const [label, indexedPath, physicalPath, missingCanonical, error] of [
+		[
+			"indexed plugin exposure",
+			null,
+			"vault-config/plugins/yandex-disk-sync/data.json",
+			false,
+			LegacyPluginDataExposureError,
+		],
+		[
+			"plugin exposure without canonical",
+			null,
+			"vault-config/plugins/yandex-disk-sync/data.json",
+			true,
+			LegacyPluginDataExposureError,
+		],
+		[
+			"indexed service collision",
+			"notes/.obsidian-encrypt.json",
+			null,
+			false,
+			LegacyServicePathCollisionError,
+		],
+		[
+			"rewritten legacy path",
+			"notes\\name.md",
+			null,
+			false,
+			LegacyServicePathCollisionError,
+		],
+		[
+			"physical-only service collision",
+			null,
+			"notes/.obsidian-encrypt.json",
+			false,
+			LegacyServicePathCollisionError,
+		],
+	] as const) {
+		const source = stable1xIndex();
+		if (indexedPath) {
+			(source.files as Record<string, unknown>)[indexedPath] =
+				fileMetadata(indexedPath, {
+					sha256: "collision",
+					size: 3,
+					syncedAt: 2,
+				});
+		}
+		const { manager, client, canonicalPath } =
+			await createIndexManagerWithContent(source);
+		if (missingCanonical) {
+			client.files.delete(canonicalPath);
+		}
+		if (physicalPath) {
+			client.files.set(
+				`vault/${physicalPath}`,
+				jsonBytes("must-not-be-read"),
+			);
+		}
+		await assert.rejects(
+			manager.assertLegacyMigrationPathsSafe(),
+			error,
+			label,
+		);
+		assert.equal(client.moveCount, 0, label);
+		assert.equal(
+			client.downloadedPaths.every((path) => path === canonicalPath),
+			true,
+			label,
+		);
+		if (missingCanonical) {
+			assert.deepEqual(client.downloadedPaths, [], label);
+		}
+	}
 });
 
-test("legacy protected plugin data blocks migration without content download", async () => {
-	const source = stable1xIndex();
-	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(source);
-	client.files.set(
-		"vault/vault-config/plugins/yandex-disk-sync/data.json",
-		new TextEncoder().encode("must-not-be-read").buffer,
-	);
-	await assert.rejects(
-		manager.assertLegacyMigrationPathsSafe(),
-		LegacyPluginDataExposureError,
-	);
-	assert.equal(
-		client.downloadedPaths.every((path) => path === canonicalPath),
-		true,
-	);
-});
-
-test("missing legacy canonical cannot hide exposed plugin data", async () => {
-	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(stable1xIndex());
-	client.files.delete(canonicalPath);
-	client.files.set(
-		"vault/vault-config/plugins/yandex-disk-sync/data.json",
-		new TextEncoder().encode("must-not-be-read").buffer,
-	);
-	await assert.rejects(
-		manager.assertLegacyMigrationPathsSafe(),
-		LegacyPluginDataExposureError,
-	);
-	assert.deepEqual(client.downloadedPaths, []);
-});
-
-test("legacy service-name collision blocks migration before remote writes", async () => {
-	const source = stable1xIndex();
-	const files = source.files as Record<string, unknown>;
-	files["notes/.obsidian-encrypt.json"] = fileMetadata(
-		"notes/.obsidian-encrypt.json",
-		{ sha256: "collision", size: 3, syncedAt: 2 },
-	);
-	const { manager, client } = await createIndexManagerWithContent(source);
-	await assert.rejects(
-		manager.assertLegacyMigrationPathsSafe(),
-		LegacyServicePathCollisionError,
-	);
-	assert.equal(client.moveCount, 0);
-});
-
-test("legacy paths that current normalization would rewrite block migration", async () => {
-	const source = stable1xIndex();
-	const files = source.files as Record<string, unknown>;
-	files["notes\\name.md"] = fileMetadata("notes\\name.md", {
-		sha256: "legacy-path",
-		size: 3,
-		syncedAt: 2,
-	});
-	const { manager, client } = await createIndexManagerWithContent(source);
-	await assert.rejects(
-		manager.assertLegacyMigrationPathsSafe(),
-		LegacyServicePathCollisionError,
-	);
-	assert.equal(client.moveCount, 0);
-});
-
-test("legacy physical-only service collision is not silently filtered", async () => {
-	const { manager, client } =
-		await createIndexManagerWithContent(stable1xIndex());
-	client.files.set(
-		"vault/notes/.obsidian-encrypt.json",
-		new TextEncoder().encode("user-content").buffer,
-	);
-	await assert.rejects(
-		manager.assertLegacyMigrationPathsSafe(),
-		LegacyServicePathCollisionError,
-	);
-});
-
-test("encrypted legacy startup is rejected as unsupported data", async () => {
-	const encryption = xorCodec(0xa5);
-	const { manager, client, canonicalPath } =
-		await createIndexManagerWithContent(stable1xIndex(), encryption);
-	const originalRaw = client.files.get(canonicalPath)!.slice(0);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		UnsupportedHistoricalDataError,
-	);
-	assert.deepEqual(
-		new Uint8Array(client.files.get(canonicalPath)!),
-		new Uint8Array(originalRaw),
-	);
-	assert.equal(client.moveCount, 0);
-});
-
-test("plaintext legacy index never falls back from an active encryption codec", async () => {
-	const encryption = xorCodec(0xa5);
-	const { manager } = await createIndexManagerWithContent(
-		stable1xIndex(),
-		encryption,
-		null,
-	);
-	await assert.rejects(manager.loadRemoteIndex(), UnreadableRemoteIndexError);
-});
-
-test("encrypted current index loads without plaintext fallback", async () => {
-	const encryption = xorCodec(0xa5);
-	const { manager } = await createIndexManagerWithContent(
-		{
-			...createEmptyIndex("device-current", "epoch-current"),
-			epoch: "epoch-current",
-			revision: 4,
-		},
-		encryption,
-	);
-	const index = await manager.loadRemoteIndex();
-	assert.equal(index.epoch, "epoch-current");
-	assert.equal(index.revision, 4);
+test("canonical load admission preserves history and active codec boundaries", async () => {
+	const codec = xorCodec(0xa5);
+	const current = {
+		...createEmptyIndex("device-current", "epoch-current"),
+		revision: 4,
+	};
+	for (const [label, content, active, storage, error] of [
+		[
+			"stable plaintext startup",
+			stable1xIndex(),
+			null,
+			null,
+			LegacyIndexFormatError,
+		],
+		[
+			"encrypted legacy",
+			stable1xIndex(),
+			codec,
+			codec,
+			UnsupportedHistoricalDataError,
+		],
+		[
+			"plaintext legacy with active codec",
+			stable1xIndex(),
+			codec,
+			null,
+			UnreadableRemoteIndexError,
+		],
+		["encrypted current", current, codec, codec, null],
+		["malformed JSON", "not-json", null, null, UnreadableRemoteIndexError],
+		[
+			"encrypted historical format",
+			{ version: 999, files: {} },
+			codec,
+			codec,
+			UnsupportedHistoricalDataError,
+		],
+		[
+			"numeric format 3",
+			{ version: 3, revision: 1, files: {} },
+			null,
+			null,
+			UnsupportedHistoricalDataError,
+		],
+		[
+			"numeric format 4",
+			{ version: 4, revision: 1, files: {} },
+			null,
+			null,
+			UnsupportedHistoricalDataError,
+		],
+	] as const) {
+		const { manager, client, canonicalPath } =
+			await createIndexManagerWithContent(content, active, storage);
+		const original = client.files.get(canonicalPath)!.slice(0);
+		if (error) {
+			await assert.rejects(manager.loadRemoteIndex(), error, label);
+		} else {
+			const loaded = await manager.loadRemoteIndex();
+			assert.equal(loaded.epoch, "epoch-current", label);
+			assert.equal(loaded.revision, 4, label);
+		}
+		assert.deepEqual(client.files.get(canonicalPath), original, label);
+		assert.equal(client.moveCount, 0, label);
+	}
 });
 
 test("only full discovery may load a replacement current epoch", async () => {
@@ -792,7 +764,7 @@ test("only full discovery may load a replacement current epoch", async () => {
 	assert.equal(manager.getObservedEpoch(), "epoch-a");
 });
 
-test("canonical file metadata preserves timestamp precision and validates causal counters", async () => {
+test("canonical schema preserves precise metadata and rejects incoherent files and maintenance before writes", async () => {
 	const index = createEmptyIndex("device-current", "epoch-current");
 	index.revision = 4;
 	index.files["note.md"] = fileMetadata("note.md", {
@@ -809,104 +781,102 @@ test("canonical file metadata preserves timestamp precision and validates causal
 		(await manager.loadRemoteIndex()).files["note.md"]?.mtime,
 		1.375,
 	);
-	for (const patch of [
-		...[-1, NaN, Infinity, Number.MAX_VALUE, "1", null].map((mtime) => ({
-			mtime,
-		})),
-		{ size: 1.375 },
-		{ mutationSeq: 0.375 },
-		{ changedRevision: 1.375 },
-		{ mutationSeq: undefined },
-		{ mutationSeq: 2 },
-	]) {
-		const invalid = structuredClone(index);
-		Object.assign(invalid.files["note.md"]!, patch);
-		const { manager, client } =
-			await createIndexManagerWithContent(invalid);
-		await assert.rejects(
-			manager.loadRemoteIndex(),
-			InvalidCurrentIndexError,
-		);
-		assert.equal(client.moveCount, 0);
-	}
-});
-
-test("malformed current canonical is rejected as a semantic index error", async () => {
-	const malformed = createEmptyIndex("device-current", "epoch-current");
-	(malformed as unknown as { files: unknown }).files = [];
-	const { manager } = await createIndexManagerWithContent(malformed);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		(error: unknown) =>
-			error instanceof InvalidCurrentIndexError &&
-			error.section === "files",
-	);
-});
-
-test("malformed maintenance is rejected before any remote write", async () => {
-	const source = encryptedMode();
-	const target = encryptedMode(2, "target-salt", "target-verifier");
-	const valid = createMaintenance({
-		kind: "rotate" as const,
-		phase: "index-committed" as const,
+	const maintenance = createMaintenance({
+		kind: "rotate",
+		phase: "index-committed",
 		targetRevision: 6,
-		source,
-		target,
+		source: encryptedMode(),
+		target: encryptedMode(2, "target-salt", "target-verifier"),
 		cleanup: [{ path: "old-raw", expectedFingerprint: "sha256:old" }],
 	});
-	const variants: unknown[] = [
-		{ ...valid, extra: true },
-		{ ...valid, phase: "prepared", targetRevision: 6 },
-		{ ...valid, phase: "prepared", targetRevision: null },
-		{ ...valid, targetRevision: null },
-		{ ...valid, kind: "enable" },
-		{
-			...valid,
-			cleanup: [
-				{ path: ".backup/object", expectedFingerprint: "sha256:old" },
-			],
-		},
-		{
-			...valid,
-			cleanup: [
-				{ path: "old-raw", expectedFingerprint: "sha256:old" },
-				{ path: "old-raw", expectedFingerprint: "sha256:old" },
-			],
-		},
-	];
+	const invalidFiles = [
+		["negative mtime", { mtime: -1 }],
+		["unsafe mtime", { mtime: Number.MAX_VALUE }],
+		["string mtime", { mtime: "1" }],
+		["null mtime", { mtime: null }],
+		["fractional size", { size: 1.375 }],
+		["fractional sequence", { mutationSeq: 0.375 }],
+		["fractional revision", { changedRevision: 1.375 }],
+		["missing sequence", { mutationSeq: undefined }],
+		["unapplied sequence", { mutationSeq: 2 }],
+	] as const;
+	const invalidMaintenance = [
+		["unknown field", 0, { extra: true }],
+		[
+			"prepared with target revision",
+			0,
+			{ phase: "prepared", targetRevision: 6 },
+		],
+		[
+			"prepared with cleanup",
+			0,
+			{ phase: "prepared", targetRevision: null },
+		],
+		["committed without target revision", 0, { targetRevision: null }],
+		["wrong kind", 0, { kind: "enable" }],
+		[
+			"protected cleanup",
+			0,
+			{
+				cleanup: [
+					{
+						path: ".backup/object",
+						expectedFingerprint: "sha256:old",
+					},
+				],
+			},
+		],
+		[
+			"duplicate cleanup",
+			0,
+			{ cleanup: [...maintenance.cleanup, ...maintenance.cleanup] },
+		],
+		["old target revision", 6, { targetRevision: 5 }],
+		["future target revision", 6, { targetRevision: 7 }],
+		["cleanup revision drift", 8, { phase: "cleanup" }],
+		["stable cleanup remains", 6, { phase: "stable" }],
+		["source after target", 6, { sourceRevision: 6 }],
+	] as const;
 	const cases = [
-		...variants.map((maintenance) => ({ revision: 0, maintenance })),
-		...[5, 7].map((targetRevision) => ({
-			revision: 6,
-			maintenance: { ...valid, targetRevision },
+		...invalidFiles.map(([label, patch]) => ({
+			label,
+			value: {
+				...index,
+				files: { "note.md": { ...index.files["note.md"], ...patch } },
+			},
+			section: undefined,
 		})),
-		{ revision: 8, maintenance: { ...valid, phase: "cleanup" } },
-		{ revision: 6, maintenance: { ...valid, phase: "stable" } },
-		{ revision: 6, maintenance: { ...valid, sourceRevision: 6 } },
+		{
+			label: "array files",
+			value: { ...index, files: [] },
+			section: "files",
+		},
+		{
+			label: "numeric marker",
+			value: { ...index, version: 4 },
+			section: undefined,
+		},
+		...invalidMaintenance.map(([label, revision, patch]) => ({
+			label,
+			value: {
+				...createEmptyIndex("device-current", "epoch-current"),
+				revision,
+				maintenance: { ...maintenance, ...patch },
+			},
+			section: undefined,
+		})),
 	];
-	for (const { revision, maintenance } of cases) {
-		const index = {
-			...createEmptyIndex("device-current", "epoch-current"),
-			revision,
-			maintenance,
-		};
-		const { manager, client } = await createIndexManagerWithContent(index);
+	for (const { label, value, section } of cases) {
+		const { manager, client } = await createIndexManagerWithContent(value);
 		await assert.rejects(
 			manager.loadRemoteIndex(),
-			InvalidCurrentIndexError,
+			(error: unknown) =>
+				error instanceof InvalidCurrentIndexError &&
+				(!section || error.section === section),
+			label,
 		);
-		assert.equal(client.moveCount, 0);
+		assert.equal(client.moveCount, 0, label);
 	}
-});
-
-test("current canonical rejects an extra numeric format marker", async () => {
-	const current = {
-		...createEmptyIndex("device-current", "epoch-current"),
-		version: 4,
-	};
-	const { manager, client } = await createIndexManagerWithContent(current);
-	await assert.rejects(manager.loadRemoteIndex(), InvalidCurrentIndexError);
-	assert.equal(client.moveCount, 0);
 });
 
 test("physical metadata refresh preserves zero-sequence causality under canonical transactions", async () => {
@@ -1152,37 +1122,6 @@ test("wrong encrypted index key is classified as unreadable", async () => {
 	);
 });
 
-test("invalid plaintext index is classified as unreadable", async () => {
-	const { manager } = await createIndexManagerWithContent("not-json");
-	await assert.rejects(manager.loadRemoteIndex(), UnreadableRemoteIndexError);
-});
-
-test("historical format errors are not masked by codec fallback", async () => {
-	const encryption = xorCodec(0xa5);
-	const { manager } = await createIndexManagerWithContent(
-		{ version: 999, files: {} },
-		encryption,
-	);
-	await assert.rejects(
-		manager.loadRemoteIndex(),
-		UnsupportedHistoricalDataError,
-	);
-});
-
-test("numeric historical canonical formats are rejected during normal load", async () => {
-	for (const version of [3, 4]) {
-		const { manager, client } = await createIndexManagerWithContent(
-			{ version, revision: 1, files: {} },
-			null,
-		);
-		await assert.rejects(
-			manager.loadRemoteIndex(),
-			UnsupportedHistoricalDataError,
-		);
-		assert.equal(client.moveCount, 0);
-	}
-});
-
 test("explicit transition codec does not fall back to plaintext", async () => {
 	const encryption = xorCodec(0xa5);
 	const { manager, client, canonicalPath } =
@@ -1213,32 +1152,6 @@ test("explicit transition codec does not fall back to plaintext", async () => {
 	);
 });
 
-test("Force rejects numeric historical canonical before any remote move", async () => {
-	const client = new FakeIndexYandex("vault", null);
-	const canonicalPath = "vault/.obsidian-sync-index.json";
-	const source = jsonBytes({
-		version: 4,
-		revision: 1,
-		files: {},
-	});
-	client.files.set(canonicalPath, source.slice(0));
-	const manager = indexManager(client, "device-a");
-	manager.beginForceBootstrap(true);
-	manager.updateRemoteFile(
-		"note.md",
-		fileMetadata("note.md", { size: 4, mtime: 10, syncedAt: 10 }),
-	);
-	await assert.rejects(
-		manager.saveRemoteIndex(),
-		UnsupportedHistoricalDataError,
-	);
-	assert.equal(client.moveCount, 0);
-	assert.deepEqual(
-		new Uint8Array(client.files.get(canonicalPath)!),
-		new Uint8Array(source),
-	);
-});
-
 test("Force canonical proof becomes stale before any replacement write", async () => {
 	const { manager, client, canonicalPath } =
 		await createIndexManagerWithContent(
@@ -1254,13 +1167,6 @@ test("Force canonical proof becomes stale before any replacement write", async (
 		ForceBackupStaleError,
 	);
 	assert.equal(client.moveCount, 0);
-});
-
-test("successful final move with a lost response still commits", async () => {
-	const { client } = await runLegacyForceCommit(null, undefined, {
-		throwAfterFinalMove: true,
-	});
-	assert.equal(client.moveCount, 2);
 });
 
 test("resolved lost move retains commit proof when the network fails after read-back", async () => {
