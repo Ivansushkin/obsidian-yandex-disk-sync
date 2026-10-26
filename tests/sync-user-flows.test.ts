@@ -252,6 +252,397 @@ test("ordinary reception keeps canonical read-only but commits pending FIFO ackn
 	}
 });
 
+test("published rename reception applies a durable local tombstone without canonical writes after restart", async (t) => {
+	const makeDevice = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const desktop = makeDevice(disk, "desktop", codec);
+		let phone = makeDevice(disk, "phone", await codecFor(encrypted));
+		desktop.vault.put("Old.md", bytes("original"));
+		await desktop.full();
+		await phone.full();
+		const saved = await phone.saved();
+		await phone.stop();
+		desktop.vault.rename("Old.md", "New.md");
+		desktop.vault.put("New.md", bytes("renamed and edited"));
+		let targetReads = 0;
+		const target = await desktop.client.getPhysicalPath("vault/New.md");
+		disk.beforeRequest = async (_method, endpoint, path) => {
+			if (endpoint === "/download" && path === target) {
+				targetReads++;
+			}
+		};
+		await desktop.engine.renameFile("Old.md", "New.md");
+		assert.equal(
+			targetReads,
+			1,
+			"Stable target proof is reused only under fresh matching hashes",
+		);
+		disk.beforeRequest = undefined;
+		const remote = structuredClone([...disk.files]);
+		phone = makeDevice(
+			disk,
+			"phone",
+			await codecFor(encrypted),
+			phone.vault,
+			saved,
+		);
+		bindInitialReadGuards(phone);
+		let writes = 0;
+		disk.beforeRequest = async (method) => {
+			writes += Number(method !== "GET");
+		};
+		const received = await phone.full();
+		assert.deepEqual([received.downloaded, received.deleted], [1, 1]);
+		assert.equal(
+			writes,
+			0,
+			"Published tombstones require no canonical transaction",
+		);
+		assert.deepEqual([...disk.files], remote);
+		await phone.assertSettled({ "New.md": "renamed and edited" });
+		const noop = await phone.full();
+		assert.deepEqual(
+			[noop.uploaded, noop.downloaded, noop.deleted],
+			[0, 0, 0],
+		);
+		assert.equal(writes, 0);
+		disk.beforeRequest = undefined;
+	}
+});
+
+test("rename cleanup preserves a physical source edited while canonical authority is in flight", async (t) => {
+	const makeDevice = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = makeDevice(disk, "desktop", codec);
+		a.vault.put("Old.md", bytes("original"));
+		await a.full();
+		a.vault.rename("Old.md", "New.md");
+		a.vault.put("New.md", bytes("renamed"));
+		const source = await a.client.getPhysicalPath("vault/Old.md");
+		const foreign = codec
+			? await codec.encrypt(bytes("foreign physical edit"))
+			: bytes("foreign physical edit");
+		const read = a.index.readCanonicalIndex.bind(a.index);
+		let moveReads = 0;
+		a.index.readCanonicalIndex = async () => {
+			const canonical = await read();
+			if (
+				a.index.hasPendingPhysicalAction("move-remote", "Old.md") &&
+				++moveReads === 2
+			) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				disk.files.set(source, foreign);
+			}
+			return canonical;
+		};
+		await a.engine.renameFile("Old.md", "New.md").catch(() => undefined);
+		assert.ok(moveReads >= 2);
+		assert.ok(
+			disk.files.has(source),
+			"A delayed authority read cannot authorize deletion of later physical bytes",
+		);
+		assert.deepEqual(
+			await a.client.downloadFile("vault/Old.md"),
+			bytes("foreign physical edit"),
+		);
+		a.assertLocal("New.md", "renamed");
+		assert.equal(
+			a.index.hasPendingPhysicalAction("move-remote", "Old.md"),
+			true,
+		);
+	}
+});
+
+test("stable logical verification rejects bytes that do not match the physical ciphertext hash", async (t) => {
+	const makeDevice = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = makeDevice(disk, "a", codec);
+		a.vault.put("Note.md", bytes("foreign"));
+		await a.full();
+		const path = await a.client.getPhysicalPath("vault/Note.md");
+		const original = disk.files.get(path)!;
+		const transient = codec
+			? await codec.encrypt(bytes("expected"))
+			: bytes("expected");
+		disk.beforeRequest = async (_method, endpoint, target) => {
+			if (endpoint === "/download" && target === path) {
+				disk.files.set(path, transient);
+			}
+		};
+		disk.afterRequest = async (_method, endpoint, target) => {
+			if (endpoint === "/download" && target === path) {
+				disk.files.set(path, original);
+			}
+		};
+		await assert.rejects(
+			a.client.downloadStableLogicalFile("vault/Note.md"),
+			/content hash/,
+		);
+		disk.beforeRequest = undefined;
+		disk.afterRequest = undefined;
+		assert.deepEqual(
+			await a.client.downloadFile("vault/Note.md"),
+			bytes("foreign"),
+		);
+	}
+});
+
+test("published local tombstones retain protection and durable recovery after save or backup failure", async (t) => {
+	const makeDevice = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		for (const failure of ["save", "backup"] as const) {
+			const disk = new MemoryDisk();
+			const desktop = makeDevice(
+				disk,
+				"desktop",
+				await codecFor(encrypted),
+			);
+			let phone = makeDevice(disk, "phone", await codecFor(encrypted));
+			desktop.vault.put("Old.md", bytes("original"));
+			await desktop.full();
+			await phone.full();
+			const observed = phone.index.getObservedRevision();
+			desktop.vault.rename("Old.md", "New.md");
+			desktop.vault.put("New.md", bytes("published"));
+			await desktop.engine.renameFile("Old.md", "New.md");
+			const remote = structuredClone([...disk.files]);
+			if (failure === "save") {
+				phone.engine.setIndexSaveCallback(async () => {
+					await phone.saved();
+					if (
+						phone.index.hasPendingPhysicalAction(
+							"delete-local",
+							"Old.md",
+						)
+					) {
+						throw new Error("Synthetic durable save failure");
+					}
+				});
+			} else {
+				phone.vault.put("Old.md", bytes("offline edit"));
+				phone.adapter.backupOverwrittenFile = async () => {
+					throw new Error("Synthetic mandatory backup failure");
+				};
+			}
+			assert.equal(
+				(await phone.engine.fullSync()).success,
+				false,
+				failure,
+			);
+			phone.assertLocal(
+				"Old.md",
+				failure === "save" ? "original" : "offline edit",
+			);
+			assert.equal(phone.index.getObservedRevision(), observed);
+			const saved = await phone.saved();
+			assert.ok(
+				saved.pendingPhysicalActions.some(
+					(action) =>
+						action.type === "delete-local" &&
+						action.path === "Old.md",
+				),
+			);
+			assert.deepEqual([...disk.files], remote);
+			await phone.stop();
+			phone = makeDevice(
+				disk,
+				"phone",
+				await codecFor(encrypted),
+				phone.vault,
+				saved,
+			);
+			await phone.full();
+			await phone.assertSettled({ "New.md": "published" });
+			assert.deepEqual([...disk.files], remote);
+		}
+	}
+});
+
+test("unchanged realtime notifications preserve FIFO and retain a genuinely later edit", async (t) => {
+	const makeDevice = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const a = makeDevice(disk, "desktop", await codecFor(encrypted));
+		a.vault.put("Old.md", bytes("old"));
+		await a.full();
+		a.vault.rename("Old.md", "New.md");
+		a.vault.put("New.md", bytes("renamed"));
+		await a.engine.renameFile("Old.md", "New.md");
+		const before = await a.canonical();
+		const sequence = a.index.getLocalIndexData().nextMutationSeq;
+		let writes = 0;
+		disk.beforeRequest = async (method) => {
+			writes += Number(method !== "GET");
+		};
+		a.start();
+		a.vault.put("New.md", bytes("renamed"));
+		await a.drain();
+		assert.equal(
+			writes,
+			0,
+			"A confirmed snapshot needs no put or canonical write",
+		);
+		assert.equal(a.index.getLocalIndexData().nextMutationSeq, sequence);
+		assert.deepEqual(await a.canonical(), before);
+		assert.deepEqual(a.watcher.getDeferredEvents(), []);
+		disk.beforeRequest = undefined;
+		const b = makeDevice(disk, "foreign", await codecFor(encrypted));
+		await b.full();
+		b.vault.put("New.md", bytes("foreign intermediate edit"));
+		await b.full();
+		b.vault.put("New.md", bytes("renamed"));
+		await b.full();
+		let unchangedReceipt = false;
+		const batch = a.engine.syncFileBatch.bind(a.engine);
+		a.engine.syncFileBatch = async (...args) => {
+			const result = await batch(...args);
+			unchangedReceipt ||= result.uploadReceipts.some(
+				(receipt) => receipt.status === "confirmed-unchanged",
+			);
+			return result;
+		};
+		a.vault.put("New.md", bytes("renamed"));
+		await a.drain();
+		assert.equal(a.index.getLocalIndexData().nextMutationSeq, sequence + 1);
+		assert.equal(
+			unchangedReceipt,
+			false,
+			"Same SHA does not erase a foreign causal successor",
+		);
+		const physical = await a.client.getPhysicalPath("vault/New.md");
+		let lateEdit = false;
+		disk.beforeRequest = async (_method, endpoint, path) => {
+			if (
+				!lateEdit &&
+				endpoint.endsWith("/resources") &&
+				path === physical
+			) {
+				lateEdit = true;
+				a.vault.put("New.md", bytes("real successor"));
+			}
+		};
+		a.vault.put("New.md", bytes("renamed"));
+		await a.drain();
+		await a.drain();
+		assert.equal(lateEdit, true);
+		disk.beforeRequest = undefined;
+		await a.full();
+		await a.assertSettled({ "New.md": "real successor" });
+	}
+});
+
+test("startup services overlap raw reads without accepting encrypted canonical before authentication", async (t) => {
+	const makeDevice = managedDevices(t);
+	const disk = new MemoryDisk();
+	const codec = (await codecFor(true))!;
+	const a = makeDevice(disk, "a", codec);
+	a.vault.put("Note.md", bytes("encrypted"));
+	await a.full();
+	const manifest = await new EncryptionManager().createManifest({
+		service: codec,
+		salt: EncryptionService.bytesToBase64(new Uint8Array(16).fill(12)),
+		state: "enabled",
+		revision: 1,
+		deviceId: "a",
+	});
+	disk.files.set(
+		"vault/.obsidian-encrypt.json",
+		bytes(JSON.stringify(manifest)),
+	);
+	const b = makeDevice(disk, "b", null);
+	let started = 0;
+	let expired = false;
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const timeout = setTimeout(() => {
+		expired = true;
+		release();
+	}, 1000);
+	disk.beforeRequest = async (_method, endpoint, path) => {
+		if (
+			endpoint === "/download" &&
+			(path.endsWith(".obsidian-sync-index.json") ||
+				path.endsWith(".obsidian-encrypt.json"))
+		) {
+			started++;
+			if (started === 2) {
+				release();
+			}
+			await gate;
+		}
+	};
+	const session = b.index.createStartupReadSession();
+	try {
+		const read = await session.inspectServices();
+		assert.equal(started, 2);
+		assert.equal(
+			expired,
+			false,
+			"Both bodies start before either completes",
+		);
+		assert.equal(read.manifest?.format, "encryption-manifest");
+		assert.equal(b.index.getRemoteIndex().revision, 0);
+		const canonical = await session.readWithCodecIfPresent(codec);
+		assert.ok(canonical?.files["Note.md"]?.sha256);
+		assert.equal(Boolean(canonical?.files["Note.md"]?.deleted), false);
+		assert.equal(
+			started,
+			2,
+			"Authenticated decoding reuses private pinned raw bytes",
+		);
+	} finally {
+		clearTimeout(timeout);
+		release();
+		session.close();
+		disk.beforeRequest = undefined;
+	}
+});
+
+test("ordinary full overlaps local and remote scans before analysis", async (t) => {
+	const makeDevice = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = makeDevice(disk, "a", null);
+	a.vault.put("Note.md", bytes("unchanged"));
+	await a.full();
+	const original = a.index.buildLocalIndex.bind(a.index);
+	let scanning = false;
+	let overlapped = false;
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const timeout = setTimeout(release, 250);
+	a.index.buildLocalIndex = async () => {
+		scanning = true;
+		await gate;
+		const files = await original();
+		scanning = false;
+		return files;
+	};
+	const remote = a.index.getRemoteFiles.bind(a.index);
+	a.index.getRemoteFiles = async (...args) => {
+		overlapped = scanning;
+		release();
+		return await remote(...args);
+	};
+	const result = await a.full();
+	clearTimeout(timeout);
+	assert.equal(overlapped, true);
+	assert.deepEqual(
+		[result.uploaded, result.downloaded, result.deleted],
+		[0, 0, 0],
+	);
+	await a.assertSettled({ "Note.md": "unchanged" });
+});
+
 test("ordinary reception preserves partial baselines on final drift and rejects failed saves across restart", async (t) => {
 	const device = managedDevices(t);
 	for (const encrypted of [false, true]) {

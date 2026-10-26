@@ -312,3 +312,27 @@ Native request не отменяется; лимит ожидания не до�
 Force не ждёт чужих leases/запросов и не гарантирует server fencing: поздний
 DELETE/PUT может изменить уже завершённый результат. Это отдельная диагностика,
 а не обязательная гарантия direct Force.
+
+## Rename/edit latency boundaries
+
+After admission/adoption/recovery, ordinary full starts local SHA scanning and
+remote tree enumeration together and joins both outcomes before classification.
+A failed branch does not release the coordinator while its sibling still runs.
+Existing per-directory concurrency and bounded transfer windows remain unchanged.
+Healthy encrypted startup bounds parallel raw service reads by min(maxConcurrency, 4);
+mutating recovery, authentication, snapshot installation and ACK remain ordered.
+
+Canonical authority must precede the physical observations that authorize MOVE or
+DELETE. In particular, a physical source read completed before a slow canonical
+read can miss a later overwrite and must not authorize deletion. Move admission
+keeps canonical then source/target observations; cleanup keeps canonical, verified
+target, then fresh source metadata. Revalidate runs once in DELETE beforeAttempt,
+again for every retry. A prior stable target proof skips a body download only with
+fresh matching SHA-256 bound to the actual downloaded raw bytes and identical
+logical/config authority. MD5-only/hashless/drift
+uses a stable logical read. Backup and source removal never overlap.
+
+Canonical transactions can request existingParentOnly MOVE for same-root raw
+canonical/lock paths. This skips parent preparation, not writeGuard, exclusive MOVE,
+completion polling or ambiguous recovery. Missing roots are not recreated there.
+Other moves and Force/encryption workflows retain their default behavior.

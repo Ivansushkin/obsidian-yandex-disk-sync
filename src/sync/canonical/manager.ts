@@ -103,6 +103,7 @@ import {
 	type RejectedCanonicalPut,
 } from "./merge";
 import { parseEncryptionManifest } from "../../crypto/manifest-schema";
+import { runWithConcurrencySettled } from "../../utils/semaphore";
 
 declare const authorityObservation: unique symbol;
 /** Opaque metadata usable only by validators during its owning read evaluation. */
@@ -121,6 +122,7 @@ export interface CanonicalReadSession {
 
 /** Startup service observations expire with their owning lifecycle invocation. */
 export interface StartupReadSession extends CanonicalReadSession {
+	inspectServices(): Promise<EncryptionManifestRead>;
 	manifest(): Promise<EncryptionManifestRead>;
 	readWithCodecIfPresent(
 		service: EncryptionCodec | null,
@@ -1306,6 +1308,9 @@ export class IndexManager {
 		const source = this.transitionIndexReadService;
 		const target = this.transitionIndexWriteService;
 		let snapshot: IndexFileSnapshot | undefined;
+		let prefetchedRaw:
+			| Awaited<ReturnType<YandexDiskClient["downloadStableRawFile"]>>
+			| undefined;
 		// Undefined identifies the captured active/transition configuration; null is explicit plaintext.
 		let snapshotService: EncryptionCodec | null | undefined;
 		let manifestRead: EncryptionManifestRead | undefined;
@@ -1394,13 +1399,36 @@ export class IndexManager {
 					discovery.locks,
 				)
 			) {
-				snapshot = await this.downloadIndexSnapshot(
-					discovery.path,
-					false,
-					service,
-					undefined,
-					discovery.resource,
-				);
+				if (
+					prefetchedRaw &&
+					this.canReuseCanonicalContent(
+						prefetchedRaw.fingerprint,
+						discovery.resource,
+						discovery.locks,
+					)
+				) {
+					const decoded = await this.decodeIndexSnapshot(
+						prefetchedRaw.raw,
+						false,
+						service,
+						undefined,
+						prefetchedRaw.fingerprint,
+					);
+					snapshot = {
+						raw: prefetchedRaw.raw,
+						fingerprint: prefetchedRaw.fingerprint,
+						...decoded,
+					};
+				} else {
+					snapshot = await this.downloadIndexSnapshot(
+						discovery.path,
+						false,
+						service,
+						undefined,
+						discovery.resource,
+					);
+				}
+				prefetchedRaw = undefined;
 				assertConfiguration();
 				snapshotService = service;
 			} else if (snapshotService !== service) {
@@ -1432,6 +1460,101 @@ export class IndexManager {
 				return index;
 			});
 		return Object.assign(read, {
+			inspectServices: () =>
+				enqueue(async () => {
+					const listing = await observe(async () => {});
+					const canonical = listing.resources.find(
+						(entry) =>
+							entry.name === REMOTE_INDEX_FILENAME &&
+							entry.type === "file",
+					);
+					const manifest = listing.resources.find(
+						(entry) =>
+							entry.name === ENCRYPTION_MANIFEST_FILENAME &&
+							entry.type === "file",
+					);
+					if (
+						!canonical ||
+						this.recovery.selectIndexLocks(listing.resources)
+							.length ||
+						!isHashStableContentFingerprint(
+							this.yandexClient.getContentFingerprint(canonical),
+						) ||
+						(manifest &&
+							!isHashStableContentFingerprint(
+								this.yandexClient.getContentFingerprint(
+									manifest,
+								),
+							))
+					) {
+						manifestRead =
+							await this.downloadEncryptionManifestForGuard();
+						assertConfiguration();
+						return structuredClone(manifestRead);
+					}
+					const reads = await runWithConcurrencySettled<
+						Awaited<
+							ReturnType<
+								YandexDiskClient["downloadStableRawFile"]
+							>
+						>
+					>(
+						[
+							() =>
+								this.yandexClient.downloadStableRawFile(
+									this.getRemoteIndexPath(),
+									canonical,
+								),
+							() =>
+								manifest
+									? this.yandexClient.downloadStableRawFile(
+											this.getEncryptionManifestPath(),
+											manifest,
+										)
+									: Promise.resolve(null),
+						],
+						Math.min(
+							Math.max(1, this.settings.maxConcurrency || 1),
+							4,
+						),
+						undefined,
+						{ stopOnError: () => true },
+					);
+					assertConfiguration();
+					const [canonicalRead, manifestResult] = reads;
+					if (!canonicalRead || !manifestResult) {
+						throw new Error(
+							"Incomplete startup service observations",
+						);
+					}
+					if (canonicalRead.status === "rejected") {
+						throw canonicalRead.reason;
+					}
+					if (manifestResult.status === "rejected") {
+						throw manifestResult.reason;
+					}
+					const raw = canonicalRead.value;
+					const rawManifest = manifestResult.value;
+					if (!raw || (manifest && !rawManifest)) {
+						throw new RemoteIndexConcurrentModificationError(
+							"Startup services disappeared during observation",
+						);
+					}
+					prefetchedRaw = raw;
+					manifestRead = rawManifest
+						? {
+								manifest: parseEncryptionManifest(
+									JSON.parse(
+										new TextDecoder().decode(
+											rawManifest.raw,
+										),
+									) as Record<string, unknown>,
+								),
+								validationToken: `present:${rawManifest.fingerprint}`,
+							}
+						: { manifest: null, validationToken: "absent" };
+					return structuredClone(manifestRead);
+				}),
 			assertCurrent: assertConfiguration,
 			bind: (guard: () => void) => {
 				activeGuards.push(guard);
@@ -1442,6 +1565,7 @@ export class IndexManager {
 				snapshot = undefined;
 				snapshotService = undefined;
 				manifestRead = undefined;
+				prefetchedRaw = undefined;
 			},
 			readWithCodecIfPresent: (service: EncryptionCodec | null) =>
 				enqueue(() => readPresent(service)),
@@ -1491,6 +1615,7 @@ export class IndexManager {
 						}
 						snapshot = undefined;
 						snapshotService = undefined;
+						prefetchedRaw = undefined;
 					}
 					manifestRead =
 						await this.downloadEncryptionManifestForGuard();
@@ -1501,7 +1626,10 @@ export class IndexManager {
 			load: (allowEpochAdoption = false) =>
 				enqueue(async () => {
 					assertConfiguration();
-					let index = snapshot ? await readPresent(undefined) : null;
+					let index =
+						snapshot || prefetchedRaw
+							? await readPresent(undefined)
+							: null;
 					if (!index) {
 						const loaded = await this.loadRemoteIndexSnapshot(
 							false,

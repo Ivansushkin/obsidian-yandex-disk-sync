@@ -137,12 +137,28 @@ export async function saveMoveCompletionBestEffort(
 	}
 }
 
-/** Commit deletion intent before removing any physical resource. */
+export type DeletionIntentResult =
+	| { kind: "committed"; proof: CanonicalCommitProof }
+	| { kind: "already-published" };
+
+/** Persist physical intent before applying published tombstones or committing new deletes. */
 export async function commitDeletionIntents(
 	deps: Dependencies,
 	operations: SyncOperation[],
 	result: SyncResult,
-): Promise<CanonicalCommitProof | null> {
+	allowPublishedLocalDeletes = false,
+): Promise<DeletionIntentResult | null> {
+	const publishedLocalDeletes =
+		allowPublishedLocalDeletes &&
+		!deps.indexManager.hasPendingCanonicalChanges() &&
+		!deps.indexManager.getMaintenance() &&
+		operations.every(
+			(operation) =>
+				operation.action === "delete_local" &&
+				!operation.remoteMeta &&
+				deps.indexManager.getRemoteIndex().files[operation.path]
+					?.deleted === true,
+		);
 	const unsafeFolderDeletes = operations.filter((operation) => {
 		if (!operation.folderTombstonePath) {
 			return false;
@@ -251,7 +267,11 @@ export async function commitDeletionIntents(
 			operation.path,
 			{
 				canonicalRevision:
-					deps.indexManager.getRemoteIndex().revision + 1,
+					deps.indexManager.getRemoteIndex().revision +
+					(publishedLocalDeletes ? 0 : 1),
+				expectedChangedRevision: publishedLocalDeletes
+					? canonical?.changedRevision
+					: undefined,
 				expectedFingerprint: operation.remoteMeta?.remoteFingerprint,
 				origin: operation.folderTombstonePath
 					? "folder-delete"
@@ -276,8 +296,12 @@ export async function commitDeletionIntents(
 	if (deps.indexSaveCallback) {
 		await deps.indexSaveCallback();
 	}
+	if (publishedLocalDeletes) {
+		return { kind: "already-published" };
+	}
 	deps.indexManager.updateSyncTime();
-	return await saveRemoteIndexOrAbort(deps, result);
+	const proof = await saveRemoteIndexOrAbort(deps, result);
+	return proof ? { kind: "committed", proof } : null;
 }
 
 /** Keep only deletes still authorized by the committed canonical state. */

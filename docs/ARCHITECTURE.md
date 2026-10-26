@@ -886,3 +886,32 @@ encryption-manifest, plugin-data, hardened и persisted physical actions не м
 Старая fencing suite сохраняется как диагностика отсутствующей гарантии, а не
 условие выпуска этого контракта. [Контракт](FORCE_SYNC.md);
 [исторические наблюдения](FORCE_SAFETY_VALIDATION.md).
+
+## Ordinary rename/edit latency
+
+`commitDeletionIntents` distinguishes a confirmed canonical commit proof from
+an already-published local tombstone. The latter persists only physical actions
+at the current canonical revision; it does not update canonical sync time or
+publish a no-op transaction. Eligibility excludes adoption, pending causal work,
+maintenance, remote cleanup and any desired/loaded canonical difference. Local
+backup/identity/authority checks and fresh read-only final validation remain.
+
+Realtime may emit an ephemeral `confirmed-unchanged` upload receipt before any
+sequence allocation. The plaintext snapshot, confirmed causal baseline, fresh
+canonical, physical content and manifest must agree. This receipt rebases causal
+successors but never confirms a put or advances a watermark. Rename baselines
+are promoted only after the single-rename completion commit; updating them during
+physical batch work can turn a late own edit into a false conflict.
+
+Healthy encrypted startup can fetch raw canonical/manifest bodies concurrently
+inside StartupReadSession. Bytes remain private and undecoded until the selected
+codec is authenticated; decoding never accepts desired state. Fresh hash/lock/root
+checks still precede reuse and full admission. Plaintext startup keeps its prior
+manifest discovery because there are no two bodies to overlap. Old backup sweeping
+runs once after a successful startup, through the same maintenance coordinator.
+
+Build logs include a source-derived buildId, recalculated on incremental rebuilds. Transport totals count native requests,
+API requests, direct transfers/bytes, polling and completed request milliseconds.
+These totals are not latency: concurrent durations add, and an unresolved native
+read may finish after its owning wrapper timed out. Full logs include session deltas;
+scan/startup/window/transaction logs expose their own elapsed time and snapshot size.

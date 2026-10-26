@@ -3,6 +3,7 @@ import process from "process";
 import { builtinModules } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { readLocalPluginPath } from "./scripts/local-build-env.mjs";
 
 const banner = `/*
@@ -16,6 +17,45 @@ const prod = process.argv[2] === "production";
 // Пути для сборки
 const BUILD_DIR = "./build";
 const TEST_VAULT_PLUGIN_DIR = readLocalPluginPath();
+const buildIdentityPlugin = {
+	name: "build-identity",
+	setup(build) {
+		build.onLoad({ filter: /[/\\]build-info\.ts$/ }, () => {
+			const sourceHash = createHash("sha256");
+			const sourceDirectories = ["src"];
+			const sourceFiles = [];
+			const sourceWatchDirectories = [];
+			while (sourceDirectories.length > 0) {
+				const directory = sourceDirectories.pop();
+				sourceWatchDirectories.push(directory);
+				for (const entry of fs.readdirSync(directory, {
+					withFileTypes: true,
+				})) {
+					const sourcePath = path.join(directory, entry.name);
+					if (entry.isDirectory()) {
+						sourceDirectories.push(sourcePath);
+					} else if (entry.isFile() && entry.name.endsWith(".ts")) {
+						sourceFiles.push(sourcePath);
+					}
+				}
+			}
+			for (const sourcePath of sourceFiles.sort()) {
+				sourceHash
+					.update(sourcePath)
+					.update("\0")
+					.update(fs.readFileSync(sourcePath))
+					.update("\0");
+			}
+			const buildId = sourceHash.digest("hex").slice(0, 12);
+			return {
+				contents: `export const SYNC_BUILD_ID = ${JSON.stringify(buildId)};`,
+				loader: "ts",
+				watchFiles: sourceFiles,
+				watchDirs: sourceWatchDirectories,
+			};
+		});
+	},
+};
 
 // Файлы для копирования
 const FILES_TO_COPY = ["manifest.json", "styles.css"];
@@ -100,7 +140,7 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: path.join(BUILD_DIR, "main.js"),
 	minify: prod,
-	plugins: [copyPlugin],
+	plugins: [buildIdentityPlugin, copyPlugin],
 });
 
 if (prod) {

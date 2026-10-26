@@ -259,6 +259,7 @@ interface FullPlan {
 	operations: SyncOperation[];
 	verifiedMetadataChanged: boolean;
 	baselinesChanged: boolean;
+	allowPublishedLocalDeletes: boolean;
 }
 
 /** Discover canonical state and finish first-connection reception before adoption. */
@@ -435,12 +436,25 @@ async function scanFullReconciliation(
 ): Promise<FullPlan> {
 	// 3. Build local index
 	deps.setSyncPhase("scanning-local");
-	const localFiles = await deps.indexManager.buildLocalIndex();
-
-	// 4. Get remote files list
-	deps.setSyncPhase("scanning-remote");
 	const directoryPages = new Map<string, number>();
-	const remoteFiles = await deps.indexManager.getRemoteFiles(directoryPages);
+	const scanStartedAt = Date.now();
+	const scans = await Promise.allSettled([
+		deps.indexManager.buildLocalIndex(),
+		deps.indexManager.getRemoteFiles(directoryPages),
+	]);
+	if (scans[0].status === "rejected") {
+		throw scans[0].reason;
+	}
+	if (scans[1].status === "rejected") {
+		throw scans[1].reason;
+	}
+	const localFiles = scans[0].value;
+	const remoteFiles = scans[1].value;
+	logger.info("Full scan observations completed", {
+		durationMs: Date.now() - scanStartedAt,
+		localFiles: localFiles.size,
+		remoteFiles: remoteFiles.size,
+	});
 	const verifiedMetadataChanged =
 		await reconcileBaselines.verifyRemoteContentCandidates(
 			deps.syncReconciliation,
@@ -567,6 +581,10 @@ async function scanFullReconciliation(
 		verifiedMetadataChanged,
 		baselinesChanged,
 		directoryPages,
+		allowPublishedLocalDeletes:
+			!adoption.adoptionSnapshot &&
+			!hadPendingCausalWork &&
+			!remoteIndex.maintenance,
 	};
 }
 
@@ -580,6 +598,7 @@ async function applyFullReconciliation(
 		verifiedMetadataChanged,
 		baselinesChanged,
 		directoryPages,
+		allowPublishedLocalDeletes,
 	}: FullPlan,
 	hadPendingCausalWork: boolean,
 	validationToken?: string,
@@ -670,17 +689,23 @@ async function applyFullReconciliation(
 				deps.syncReconciliation,
 				deletes,
 				result,
+				Boolean(deps.canonicalReadSession) &&
+					allowPublishedLocalDeletes &&
+					!options?.skipEncryptionGuard &&
+					!options?.skipMaintenanceGuard,
 			);
 		if (!deletionCommitProof) {
 			return;
 		}
-		await reconcileAcceptedUploads.repairMissingAcceptedUploads(
-			deps.syncReconciliation,
-			uploads.map((operation) => operation.path),
-			deletionCommitProof,
-			validationToken,
-		);
-		indexCommittedBeforeDeletes = true;
+		if (deletionCommitProof.kind === "committed") {
+			await reconcileAcceptedUploads.repairMissingAcceptedUploads(
+				deps.syncReconciliation,
+				uploads.map((operation) => operation.path),
+				deletionCommitProof.proof,
+				validationToken,
+			);
+			indexCommittedBeforeDeletes = true;
+		}
 		deletes = syncReconciliation.filterCommittedDeletions(
 			deps.syncReconciliation,
 			deletes,
