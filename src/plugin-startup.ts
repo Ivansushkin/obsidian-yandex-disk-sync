@@ -118,6 +118,7 @@ export class PluginStartup {
 			);
 		}
 		const { deps } = this;
+		const admissionStartedAt = Date.now();
 		if (deps.isStopped()) {
 			return "blocked";
 		}
@@ -158,7 +159,12 @@ export class PluginStartup {
 				}
 			}
 			const manifest = invocation.reads
-				? (await invocation.reads.manifest()).manifest
+				? (
+						await (deps.getSettings().enableEncryption &&
+						!deps.hasTransition()
+							? invocation.reads.inspectServices()
+							: invocation.reads.manifest())
+					).manifest
 				: await deps.index.downloadEncryptionManifest();
 			if (deps.isStopped()) {
 				return "blocked";
@@ -243,6 +249,10 @@ export class PluginStartup {
 				return "blocked";
 			}
 			this.validated = ready || Boolean(deps.getBlocks().encryption);
+			logger.info("Startup admission completed", {
+				durationMs: Date.now() - admissionStartedAt,
+				ready,
+			});
 			if (!ready) {
 				return "blocked";
 			}

@@ -29,7 +29,8 @@ export interface RealtimeFileEvent extends WatcherCausalContext {
 export interface UploadCausalReceipt {
 	eventId: string;
 	path: string;
-	status: "pending-put" | "accepted-put" | "rejected-put";
+	status:
+		"pending-put" | "accepted-put" | "rejected-put" | "confirmed-unchanged";
 	reason:
 		| "accepted-put"
 		| "coalesced"

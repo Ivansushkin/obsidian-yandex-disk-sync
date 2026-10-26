@@ -285,3 +285,17 @@ Force не использует временные файлы и не обесп
 sync сначала завершает direct-v1 remainder, затем использует прежние encryption
 guards. Незавершённый старый scoped Force требует новой явной полной замены.
 Реальные два профиля Obsidian/Yandex проверяются отдельно от functional harness.
+
+## Rename/edit optimization guards
+
+SYNC-050/051 and PERF-014 apply in plaintext and hardened encrypted mode. Unchanged
+realtime detection compares plaintext SHA plus causal identity; physical ciphertext
+SHA/MD5 only pins a previously verified logical snapshot. The reusable proof binds actual raw ciphertext bytes to server SHA-256 before
+decryption. Resource ID or MD5-only metadata cannot reuse that proof; those paths
+require a fresh stable logical download/decryption.
+
+Startup raw canonical prefetch grants no authentication or write authority. Manifest
+parsing, verifier/candidate checks and canonical decoding retain their existing
+owners; a failed or invalidated invocation cannot install late bytes. Config/codec
+changes discard invocation caches, while recovery starts an independent observation.
+Force and encryption transitions do not use the published-local-tombstone fast path.

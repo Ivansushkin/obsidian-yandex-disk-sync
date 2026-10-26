@@ -36,7 +36,8 @@ export interface CanonicalCommitDependencies {
 		| "uploadFile"
 		| "getResource"
 		| "getContentFingerprint"
-	>;
+	> &
+		Partial<Pick<YandexDiskClient, "getTransportMetrics">>;
 	recovery: Pick<
 		CanonicalRecovery,
 		| "ensureCanonicalIndex"
@@ -83,8 +84,23 @@ export async function commitCanonicalIndex(
 ): Promise<CanonicalCommitProof> {
 	let lastError: Error | null = null;
 	for (let attempt = 0; attempt < 4; attempt++) {
+		const startedAt = Date.now();
+		const transportBefore = deps.client.getTransportMetrics?.();
+		const stageMs: Record<string, number> = {};
+		let currentStage = "scope-validation";
+		let stageStartedAt = startedAt;
+		let result = "error";
+		const enterStage = (next: string) => {
+			const now = Date.now();
+			stageMs[currentStage] =
+				(stageMs[currentStage] ?? 0) + now - stageStartedAt;
+			currentStage = next;
+			stageStartedAt = now;
+		};
 		try {
-			return await saveRemoteIndexLocked(deps);
+			const proof = await saveRemoteIndexLocked(deps, enterStage);
+			result = "proof-returned";
+			return proof;
 		} catch (e) {
 			if (!(e instanceof RemoteIndexTransactionError && e.retryable)) {
 				throw e;
@@ -99,7 +115,29 @@ export async function commitCanonicalIndex(
 				epoch: shortenDiagnosticValue(deps.getDesired().epoch),
 				error: e,
 			});
+			enterStage("retry-delay");
 			await waitForIndexRetry(INDEX_LOCK_RETRY_MS + Math.random() * 500);
+		} finally {
+			enterStage("finished");
+			const transportAfter = deps.client.getTransportMetrics?.();
+			const transport =
+				transportBefore && transportAfter
+					? Object.fromEntries(
+							Object.entries(transportAfter).map(
+								([key, value]) => [
+									key,
+									value - (transportBefore[key] ?? 0),
+								],
+							),
+						)
+					: undefined;
+			logger.info("Canonical transaction cost", {
+				attempt: attempt + 1,
+				result,
+				durationMs: Date.now() - startedAt,
+				stageMs,
+				transport,
+			});
 		}
 	}
 	throw (
@@ -113,6 +151,7 @@ export async function commitCanonicalIndex(
 /** Own the exclusive move/write/read-back protocol and its irreversible commit boundary. */
 async function saveRemoteIndexLocked(
 	deps: CanonicalCommitDependencies,
+	enterStage: (stage: string) => void,
 ): Promise<CanonicalCommitProof> {
 	await deps.assertRemoteScope();
 	const canonicalPath = deps.getCanonicalPath();
@@ -122,6 +161,7 @@ async function saveRemoteIndexLocked(
 		`${REMOTE_INDEX_LOCK_PREFIX}${deps.getDeviceId()}.${transactionId}`,
 	);
 	const pending = deps.getPendingCounts();
+	const transactionStartedAt = Date.now();
 	const transactionContext = {
 		indexTransactionId: transactionId,
 		lockName: lockPath.split("/").pop() ?? lockPath,
@@ -136,12 +176,19 @@ async function saveRemoteIndexLocked(
 	if (deps.isReplacing()) {
 		await deps.assertForceSourceSupported();
 	}
+	enterStage("prepare-canonical");
 	const initializedIndex = await deps.recovery.ensureCanonicalIndex();
 
+	enterStage("acquire-lock");
 	let acquired = false;
 	for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
 		try {
-			await deps.client.moveResourceExclusive(canonicalPath, lockPath);
+			await deps.client.moveResourceExclusive(
+				canonicalPath,
+				lockPath,
+				undefined,
+				{ existingParentOnly: true },
+			);
 			acquired = true;
 			logger.debug("Canonical index lock acquired", {
 				...transactionContext,
@@ -191,6 +238,7 @@ async function saveRemoteIndexLocked(
 	let merged: SyncIndex | null = null;
 	let writtenFingerprint: string | null = null;
 	try {
+		enterStage("read-lock");
 		try {
 			originalSnapshot = await deps.readSnapshot(
 				lockPath,
@@ -202,6 +250,7 @@ async function saveRemoteIndexLocked(
 			originalSnapshot = await deps.readUnparsedSnapshot(lockPath);
 			throw sourceReadError;
 		}
+		enterStage("reduce");
 		const reduced = await deps.reduceLockedIndex(
 			originalSnapshot,
 			initializedIndex,
@@ -214,6 +263,7 @@ async function saveRemoteIndexLocked(
 			merged.revision = latest.revision + 1;
 		}
 		if (merged.revision !== latest.revision) {
+			enterStage("write-lock");
 			merged.format = CURRENT_INDEX_FORMAT;
 			merged.deviceId = deps.getDeviceId();
 			merged.lastSyncTime = Date.now();
@@ -239,6 +289,7 @@ async function saveRemoteIndexLocked(
 				uploadError = error;
 			}
 			stage = "written";
+			enterStage("verify-lock");
 			const verifiedLock = await deps.readSnapshot(
 				lockPath,
 				deps.allowLegacyWrite(),
@@ -272,6 +323,7 @@ async function saveRemoteIndexLocked(
 			});
 		}
 		if (writtenFingerprint === null) {
+			enterStage("lock-fingerprint");
 			const writtenLock = await deps.client.getResource(
 				lockPath,
 				1,
@@ -282,12 +334,18 @@ async function saveRemoteIndexLocked(
 			stage = "verified";
 		}
 		stage = "move-attempted";
+		enterStage("publish");
 		if (deps.isReplacing()) {
 			await deps.assertForceLocksUnchanged(lockPath);
 		}
 		let resolvedProof: CanonicalCommitProof | null = null;
 		try {
-			await deps.client.moveResourceExclusive(lockPath, canonicalPath);
+			await deps.client.moveResourceExclusive(
+				lockPath,
+				canonicalPath,
+				undefined,
+				{ existingParentOnly: true },
+			);
 		} catch (error) {
 			const recovered = await deps.recovery.recoverAmbiguousFinalMove(
 				lockPath,
@@ -312,6 +370,7 @@ async function saveRemoteIndexLocked(
 			}
 			resolvedProof = recovered.proof;
 		}
+		enterStage("verify-canonical");
 		const canonicalProof =
 			resolvedProof ??
 			(await deps.recovery.verifyCanonicalCommit(
@@ -328,8 +387,10 @@ async function saveRemoteIndexLocked(
 				canonicalProof.contentFingerprint,
 			),
 		});
+		enterStage("accept-commit");
 		await deps.acceptCommit(merged, canonicalProof);
 		logger.info("Canonical index transaction committed", {
+			durationMs: Date.now() - transactionStartedAt,
 			...transactionContext,
 			outcome: "committed",
 			stage,
@@ -343,6 +404,7 @@ async function saveRemoteIndexLocked(
 		if (stage === "committed") {
 			throw e;
 		}
+		enterStage("recover-commit");
 		const canonicalProof =
 			stage === "move-attempted" && merged
 				? await deps.recovery.isExpectedCanonicalCommitted(
@@ -354,6 +416,7 @@ async function saveRemoteIndexLocked(
 				: null;
 		if (merged && canonicalProof) {
 			stage = "committed";
+			enterStage("accept-commit");
 			await deps.acceptCommit(merged, canonicalProof);
 			logger.warn(
 				"Canonical index commit was confirmed after an ambiguous response",
@@ -368,6 +431,7 @@ async function saveRemoteIndexLocked(
 			return canonicalProof;
 		}
 
+		enterStage("rollback");
 		const rollbackOutcome = originalSnapshot
 			? await deps.recovery.rollbackOwnedLock(
 					lockPath,

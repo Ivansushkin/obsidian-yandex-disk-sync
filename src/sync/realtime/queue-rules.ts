@@ -377,7 +377,8 @@ export function reduceUploadCausalReceipts(
 		const receipt = receipts.get(candidate.predecessorUploadId);
 		const event = {
 			...candidate,
-			...(receipt?.status === "accepted-put"
+			...(receipt?.status === "accepted-put" ||
+			receipt?.status === "confirmed-unchanged"
 				? {
 						baseRevision: receipt.canonicalRevision,
 						epoch: receipt.epoch,
@@ -390,7 +391,8 @@ export function reduceUploadCausalReceipts(
 	});
 	for (const receipt of receipts.values()) {
 		if (
-			receipt.status !== "accepted-put" ||
+			(receipt.status !== "accepted-put" &&
+				receipt.status !== "confirmed-unchanged") ||
 			receipt.canonicalRevision === null
 		) {
 			continue;

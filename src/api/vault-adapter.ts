@@ -513,7 +513,11 @@ export class VaultAdapter {
 	 * bound. Each backup is trashed (recoverable) and counted. Errors per-file
 	 * are logged and skipped so one bad file doesn't abort the whole sweep.
 	 */
-	async cleanupOldBackups(maxAgeDays = 30): Promise<number> {
+	async cleanupOldBackups(
+		maxAgeDays = 30,
+		assertActive: () => void = () => {},
+	): Promise<number> {
+		assertActive();
 		const configDir = this.app.vault.configDir;
 		const backupDir = obsidianNormalize(
 			`${configDir}/plugins/yandex-disk-sync/overwritten`,
@@ -526,8 +530,10 @@ export class VaultAdapter {
 		let removed = 0;
 		const listed = await this.vault.adapter.list(backupDir);
 		for (const backupPath of listed.files) {
+			assertActive();
 			try {
 				const stat = await this.vault.adapter.stat(backupPath);
+				assertActive();
 				if (stat?.type === "file" && stat.mtime < cutoff) {
 					if (await this.vault.adapter.trashSystem(backupPath)) {
 						removed++;
@@ -543,6 +549,7 @@ export class VaultAdapter {
 				});
 			}
 		}
+		assertActive();
 		if (removed > 0) {
 			logger.info(
 				`Cleaned up ${removed} stale overwritten-file backup(s) older than ${maxAgeDays}d`,

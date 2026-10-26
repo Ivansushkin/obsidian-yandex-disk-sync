@@ -36,6 +36,7 @@ import {
 	toLocalPath,
 } from "../utils/path-utils";
 import { runWithConcurrencySettled } from "../utils/semaphore";
+import { computeSha256 } from "../utils/hash-utils";
 import {
 	getMatchingStableContentFingerprint,
 	getStableContentFingerprint,
@@ -66,6 +67,7 @@ export interface StableLogicalFileSnapshot {
 	content: ArrayBuffer;
 	resource: YandexResource;
 	fingerprint: string;
+	verifiedRawSha256?: string;
 }
 
 type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
@@ -124,6 +126,21 @@ export class YandexDiskClient {
 		tree: 0,
 		other: 0,
 	};
+	private transportMetrics = {
+		requests: 0,
+		apiRequests: 0,
+		uploadTransfers: 0,
+		downloadTransfers: 0,
+		uploadBytes: 0,
+		downloadBytes: 0,
+		polls: 0,
+		requestMs: 0,
+	};
+
+	/** Return aggregate transport cost without URLs, headers or payloads. */
+	getTransportMetrics(): Record<string, number> {
+		return { ...this.transportMetrics };
+	}
 
 	constructor(config: YandexClientConfig) {
 		this.token = config.token;
@@ -279,12 +296,14 @@ export class YandexDiskClient {
 		expectedResource?: YandexResource,
 		budget = this.createDownloadBudget(),
 	): Promise<StableLogicalFileSnapshot | null> {
+		const configurationVersion = this.getReadConfigurationVersion();
 		const before =
 			expectedResource ?? (await this.getLogicalResource(path, budget));
 		if (!before || !this.getContentFingerprint(before)) {
 			return null;
 		}
-		const content = await this.downloadFile(path, false, budget);
+		const rawPath = await this.encryptFilePath(path);
+		const raw = await this.downloadFile(rawPath, true, budget);
 		const after = await this.getLogicalResource(path, budget);
 		if (!after) {
 			throw new Error("Remote user file disappeared while being read");
@@ -297,7 +316,28 @@ export class YandexDiskClient {
 		if (!matchingFingerprint || !afterFingerprint) {
 			throw new Error("Remote user file changed while being read");
 		}
-		return { content, resource: after, fingerprint: afterFingerprint };
+		let verifiedRawSha256: string | undefined;
+		if (after.sha256) {
+			verifiedRawSha256 = await computeSha256(raw);
+			if (verifiedRawSha256 !== after.sha256) {
+				throw new Error(
+					"Remote user file content hash does not match downloaded bytes",
+				);
+			}
+		}
+		if (configurationVersion !== this.getReadConfigurationVersion()) {
+			throw new Error("Logical read configuration changed");
+		}
+		const content = await this.decryptContent(raw);
+		if (configurationVersion !== this.getReadConfigurationVersion()) {
+			throw new Error("Logical read configuration changed");
+		}
+		return {
+			content,
+			resource: after,
+			fingerprint: afterFingerprint,
+			verifiedRawSha256,
+		};
 	}
 
 	/**
@@ -1326,6 +1366,8 @@ export class YandexDiskClient {
 						size: response.arrayBuffer.byteLength,
 						status: response.status,
 					});
+					this.transportMetrics.downloadBytes +=
+						response.arrayBuffer.byteLength;
 					const result = raw
 						? response.arrayBuffer
 						: await this.decryptContent(response.arrayBuffer);
@@ -1449,6 +1491,7 @@ export class YandexDiskClient {
 		toPath: string,
 		overwrite = false,
 		beforeAttempt?: () => Promise<void>,
+		existingParentOnly = false,
 	): Promise<void> {
 		await beforeAttempt?.();
 		const encryptedFrom = await this.encryptFilePath(fromPath);
@@ -1461,7 +1504,23 @@ export class YandexDiskClient {
 			0,
 			encryptedTo.lastIndexOf("/"),
 		);
-		if (parentPath) {
+		if (existingParentOnly) {
+			const root = normalizePath(this.remotePath.replace(/^disk:\//, ""));
+			for (const path of [encryptedFrom, encryptedTo]) {
+				const normalized = normalizePath(path.replace(/^disk:\//, ""));
+				const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+				if (
+					normalized.slice(0, normalized.lastIndexOf("/")) !== root ||
+					(name !== ".obsidian-sync-index.json" &&
+						!isRootIndexLockPath(name))
+				) {
+					throw new Error(
+						"Existing-parent MOVE is restricted to canonical service paths",
+					);
+				}
+			}
+		}
+		if (parentPath && !existingParentOnly) {
 			const parent = await this.getResource(parentPath, 1, 0, true);
 			if (!parent) {
 				await beforeAttempt?.();
@@ -1489,8 +1548,15 @@ export class YandexDiskClient {
 		fromPath: string,
 		toPath: string,
 		beforeAttempt?: () => Promise<void>,
+		options?: { existingParentOnly: true },
 	): Promise<void> {
-		await this.moveResource(fromPath, toPath, false, beforeAttempt);
+		await this.moveResource(
+			fromPath,
+			toPath,
+			false,
+			beforeAttempt,
+			options?.existingParentOnly,
+		);
 	}
 
 	/**
@@ -1652,10 +1718,24 @@ export class YandexDiskClient {
 	private async requestNative(
 		params: RequestUrlParam,
 	): Promise<RequestUrlResponse> {
+		const startedAt = Date.now();
+		this.transportMetrics.requests++;
+		if (params.url.startsWith(API_BASE_URL + "/")) {
+			this.transportMetrics.apiRequests++;
+		} else if (params.method === "PUT") {
+			this.transportMetrics.uploadTransfers++;
+			if (params.body instanceof ArrayBuffer) {
+				this.transportMetrics.uploadBytes += params.body.byteLength;
+			}
+		} else if (params.method === "GET" && !params.headers?.Authorization) {
+			this.transportMetrics.downloadTransfers++;
+		}
 		try {
 			return await requestUrl(params);
 		} catch (error) {
 			throw new NetworkRequestError(error);
+		} finally {
+			this.transportMetrics.requestMs += Date.now() - startedAt;
 		}
 	}
 
@@ -1828,6 +1908,7 @@ export class YandexDiskClient {
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
 
 		for (let attempt = 0; attempt < 120; attempt++) {
+			this.transportMetrics.polls++;
 			const operationResponse = await this.requestRead(
 				{
 					url: operationUrl,

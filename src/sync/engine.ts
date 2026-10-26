@@ -1005,6 +1005,8 @@ export class SyncEngine {
 						this.indexManager.createCanonicalReadSession(
 							this.createReadLifetimeGuard(),
 						);
+					deps.readCanonical = lifetime;
+					deps.assertCurrent = () => lifetime.assertCurrent();
 					return await this.yandexClient.withWriteGuard(
 						() => lifetime.assertCurrent(),
 						() => realtimeSync.reconcileRealtimeBatch(deps, events),
@@ -1347,6 +1349,7 @@ export class SyncEngine {
 		const result = this.createEmptyResult(startTime);
 		const lifecycleContext = this.getSyncLifecycleContext();
 		const apiReadsBefore = this.yandexClient.getApiReadMetrics?.();
+		const transportBefore = this.yandexClient.getTransportMetrics?.();
 		this.isSyncing = true;
 		let resumeAttempted = false;
 
@@ -1446,7 +1449,11 @@ export class SyncEngine {
 				...this.getDiagnosticSnapshot(),
 				failure: result.failure,
 				durationMs: result.endTime - startTime,
-				apiReads: this.diffApiReadMetrics(
+				transport: this.diffRequestMetrics(
+					transportBefore,
+					this.yandexClient.getTransportMetrics?.(),
+				),
+				apiReads: this.diffRequestMetrics(
 					apiReadsBefore,
 					this.yandexClient.getApiReadMetrics?.(),
 				),
@@ -1499,7 +1506,11 @@ export class SyncEngine {
 			logger.error("Critical synchronization error:", {
 				...this.getDiagnosticSnapshot(),
 				durationMs: result.endTime - startTime,
-				apiReads: this.diffApiReadMetrics(
+				transport: this.diffRequestMetrics(
+					transportBefore,
+					this.yandexClient.getTransportMetrics?.(),
+				),
+				apiReads: this.diffRequestMetrics(
 					apiReadsBefore,
 					this.yandexClient.getApiReadMetrics?.(),
 				),
@@ -1525,6 +1536,7 @@ export class SyncEngine {
 		const canonical = this.indexManager.getRemoteIndex();
 		const maintenance = this.indexManager.getMaintenance();
 		return {
+			transportTotal: this.yandexClient.getTransportMetrics?.(),
 			epoch: shortenDiagnosticValue(canonical.epoch),
 			observedEpoch: shortenDiagnosticValue(local.observedEpoch),
 			observedRevision: local.observedRevision,
@@ -1543,20 +1555,19 @@ export class SyncEngine {
 		};
 	}
 
-	private diffApiReadMetrics(
-		before?: ReturnType<YandexDiskClient["getApiReadMetrics"]>,
-		after?: ReturnType<YandexDiskClient["getApiReadMetrics"]>,
-	): ReturnType<YandexDiskClient["getApiReadMetrics"]> | undefined {
+	private diffRequestMetrics(
+		before?: Record<string, number>,
+		after?: Record<string, number>,
+	): Record<string, number> | undefined {
 		if (!before || !after) {
 			return undefined;
 		}
-		return {
-			manifest: after.manifest - before.manifest,
-			index: after.index - before.index,
-			root: after.root - before.root,
-			tree: after.tree - before.tree,
-			other: after.other - before.other,
-		};
+		return Object.fromEntries(
+			Object.entries(after).map(([key, value]) => [
+				key,
+				value - (before[key] ?? 0),
+			]),
+		);
 	}
 
 	/** Consume the one-shot request emitted by a realtime epoch replacement. */

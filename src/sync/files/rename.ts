@@ -545,6 +545,8 @@ export async function renameFileNow(
 			pendingPutApplied,
 			pendingPutAccepted,
 			sourceCausallyLive,
+			snapshotBytes: content.byteLength,
+			snapshotMatchesSource: canonicalSource?.sha256 === sha256,
 			plan,
 		});
 
@@ -941,6 +943,22 @@ async function commitFileRename(
 		);
 	}
 	deps.indexManager.confirmAppliedMutations();
+	const confirmedTarget = deps.indexManager.getRemoteIndex().files[newPath];
+	const targetBaseline = deps.indexManager.getLocalIndex().files[newPath];
+	if (
+		confirmedTarget &&
+		!confirmedTarget.deleted &&
+		targetBaseline?.sha256 === confirmedTarget.sha256
+	) {
+		deps.indexManager.updateLocalFile(
+			newPath,
+			createConfirmedBaseline(
+				targetBaseline,
+				confirmedTarget,
+				confirmedTarget,
+			),
+		);
+	}
 	if (deps.indexSaveCallback) {
 		await deps.indexSaveCallback();
 	}

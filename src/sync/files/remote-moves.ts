@@ -12,6 +12,9 @@ import { joinPath } from "../../utils/path-utils";
 import {
 	getPhysicalResourceFingerprint,
 	matchesPhysicalResourceFingerprint,
+	getStableContentFingerprint,
+	isHashStableContentFingerprint,
+	matchesStableContentFingerprint,
 } from "../../utils/resource-fingerprint";
 import { IndexManager } from "../canonical/manager";
 export interface Dependencies {
@@ -50,6 +53,8 @@ export async function executeGuardedRemoteMove(
 		toPath,
 	};
 	logger.info("Guarded remote move started", actionContext);
+	const remoteFrom = joinPath(deps.settings.remotePath, fromPath);
+	const remoteTo = joinPath(deps.settings.remotePath, toPath);
 	const canonical = await deps.indexManager.readCanonicalIndex();
 	const move = Object.values(canonical.moves).find(
 		(candidate) =>
@@ -87,12 +92,19 @@ export async function executeGuardedRemoteMove(
 		return;
 	}
 
-	const remoteFrom = joinPath(deps.settings.remotePath, fromPath);
-	const remoteTo = joinPath(deps.settings.remotePath, toPath);
-	const [source, target] = await Promise.all([
+	const observations = await Promise.allSettled([
 		deps.yandexClient.getLogicalResource(remoteFrom),
 		deps.yandexClient.getLogicalResource(remoteTo),
 	]);
+	if (observations[0].status === "rejected") {
+		throw observations[0].reason;
+	}
+	if (observations[1].status === "rejected") {
+		throw observations[1].reason;
+	}
+	const source = observations[0].value;
+	const target = observations[1].value;
+
 	if (!sourceRetainsMoveIntent) {
 		if (target) {
 			if (
@@ -124,7 +136,7 @@ export async function executeGuardedRemoteMove(
 				`Restored move source requires a target snapshot: ${toPath}`,
 			);
 		}
-		const writtenTarget = await materializeMoveTarget(
+		const { resource: writtenTarget } = await materializeMoveTarget(
 			deps,
 			toPath,
 			repairSnapshot,
@@ -177,7 +189,7 @@ export async function executeGuardedRemoteMove(
 		if (!repairSnapshot || !targetMetadata || targetMetadata.deleted) {
 			throw new Error(`Move source is missing: ${fromPath}`);
 		}
-		const repairedTarget = await materializeMoveTarget(
+		const { resource: repairedTarget } = await materializeMoveTarget(
 			deps,
 			toPath,
 			repairSnapshot,
@@ -257,12 +269,13 @@ export async function executeGuardedRemoteMove(
 				`Changed move target cannot be materialized: ${toPath}`,
 			);
 		}
-		const writtenTarget = await materializeMoveTarget(
-			deps,
-			toPath,
-			repairSnapshot,
-			targetMetadata,
-		);
+		const { resource: writtenTarget, verifiedRawSha256 } =
+			await materializeMoveTarget(
+				deps,
+				toPath,
+				repairSnapshot,
+				targetMetadata,
+			);
 		await deleteMoveSourceIfUnchanged(
 			deps,
 			fromPath,
@@ -272,6 +285,13 @@ export async function executeGuardedRemoteMove(
 			toPath,
 			move,
 			canonical.epoch,
+			{
+				resource: writtenTarget,
+				metadata: targetMetadata,
+				configurationVersion:
+					deps.yandexClient.getReadConfigurationVersion(),
+				rawSha256: verifiedRawSha256,
+			},
 		);
 		completeMovedTarget(
 			deps,
@@ -383,43 +403,32 @@ export async function materializeMoveTarget(
 	path: string,
 	snapshot: { content: ArrayBuffer; sha256: string },
 	metadata: FileMetadata,
-): Promise<YandexResource> {
+): Promise<{ resource: YandexResource; verifiedRawSha256?: string }> {
 	const remotePath = joinPath(deps.settings.remotePath, path);
+	let uploadFailure: unknown;
 	try {
 		await deps.yandexClient.uploadFileExclusive(
 			remotePath,
 			snapshot.content,
 		);
 	} catch (error) {
-		const concurrentTarget =
-			await deps.yandexClient.getLogicalResource(remotePath);
-		if (
-			!concurrentTarget ||
-			!(await remoteResourceMatchesCanonical(
-				deps,
-				path,
-				concurrentTarget,
-				metadata,
-			))
-		) {
-			throw error;
-		}
-		return concurrentTarget;
+		uploadFailure = error;
 	}
-	const writtenTarget =
-		await deps.yandexClient.getLogicalResource(remotePath);
+	const written =
+		await deps.yandexClient.downloadStableLogicalFile(remotePath);
 	if (
-		!writtenTarget ||
-		!(await remoteResourceMatchesCanonical(
-			deps,
-			path,
-			writtenTarget,
-			metadata,
-		))
+		!written ||
+		(await computeSha256(written.content)) !== metadata.sha256
 	) {
+		if (uploadFailure instanceof Error) {
+			throw uploadFailure;
+		}
 		throw new Error(`Move target upload could not be verified: ${path}`);
 	}
-	return writtenTarget;
+	return {
+		resource: written.resource,
+		verifiedRawSha256: written.verifiedRawSha256,
+	};
 }
 
 /** Compare a physical remote object with canonical metadata without trusting client clocks. */
@@ -487,6 +496,12 @@ export async function deleteMoveSourceIfUnchanged(
 	toPath: string,
 	move: IndexMove,
 	epoch: string,
+	verifiedTarget?: {
+		resource: YandexResource;
+		metadata: FileMetadata;
+		configurationVersion: number;
+		rawSha256?: string;
+	},
 ): Promise<void> {
 	const matchesExpected =
 		action?.expectedFingerprint !== undefined &&
@@ -531,14 +546,31 @@ export async function deleteMoveSourceIfUnchanged(
 		const physicalTarget = await deps.yandexClient.getLogicalResource(
 			joinPath(deps.settings.remotePath, toPath),
 		);
+		const proofFingerprint = verifiedTarget
+			? getStableContentFingerprint(verifiedTarget.resource)
+			: null;
+		const proofMatches =
+			verifiedTarget &&
+			verifiedTarget.rawSha256 !== undefined &&
+			proofFingerprint === `sha256:${verifiedTarget.rawSha256}` &&
+			verifiedTarget.configurationVersion ===
+				deps.yandexClient.getReadConfigurationVersion() &&
+			isHashStableContentFingerprint(proofFingerprint) &&
+			matchesStableContentFingerprint(proofFingerprint, physicalTarget) &&
+			verifiedTarget.metadata.sha256 === target.sha256 &&
+			verifiedTarget.metadata.changedRevision ===
+				target.changedRevision &&
+			verifiedTarget.metadata.lastModifiedBy === target.lastModifiedBy &&
+			verifiedTarget.metadata.mutationSeq === target.mutationSeq;
 		if (
 			!physicalTarget ||
-			!(await remoteResourceMatchesCanonical(
-				deps,
-				toPath,
-				physicalTarget,
-				target,
-			))
+			(!proofMatches &&
+				!(await remoteResourceMatchesCanonical(
+					deps,
+					toPath,
+					physicalTarget,
+					target,
+				)))
 		) {
 			throw new MoveCleanupAuthorityError();
 		}
@@ -555,7 +587,6 @@ export async function deleteMoveSourceIfUnchanged(
 			throw new MoveCleanupAuthorityError();
 		}
 	};
-	await revalidate();
 	try {
 		await deps.yandexClient.deleteResource(
 			remotePath,

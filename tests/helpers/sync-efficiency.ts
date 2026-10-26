@@ -719,6 +719,10 @@ async function realtimeSeries(encrypted: boolean) {
 }
 
 export async function run() {
+	if (process.argv.includes("--rename-latency")) {
+		await renameLatency();
+		return;
+	}
 	if (process.argv.includes("--realtime-boundaries")) {
 		activeScenario = "realtime-boundaries";
 		const { runRealtimeBoundaries } =
@@ -865,3 +869,121 @@ export async function run() {
 }
 
 export { setup, measure, counters, awaitRealtime };
+
+/** Compare the approved rename histories with identical algorithm and byte oracles. */
+async function renameLatency() {
+	for (const encrypted of [false, true]) {
+		for (const history of [
+			"duplicate",
+			"late",
+			"inflight",
+			"move-duplicate",
+			"move-late",
+		] as const) {
+			const ctx = await setup(encrypted);
+			try {
+				await ctx.host.tokenSetup();
+				ctx.current.start();
+				const source = "note-1.md";
+				const target = "Renamed.md";
+				const moveOnly = history.startsWith("move-");
+				const physical = await ctx.current.client.getPhysicalPath(
+					`vault/${history === "inflight" ? source : target}`,
+				);
+				const rename = () => {
+					ctx.expected[target] = ctx.expected[source]!;
+					delete ctx.expected[source];
+					ctx.expectedDeleted.add(source);
+					ctx.vault.rename(source, target);
+				};
+				ctx.disk.beforeRequest = async (method, endpoint, path) => {
+					if (
+						((method === "PUT" && endpoint === "/upload") ||
+							(moveOnly &&
+								method === "POST" &&
+								endpoint.endsWith("/resources/move"))) &&
+						path === physical
+					) {
+						ctx.disk.beforeRequest = undefined;
+						if (history === "inflight") {
+							rename();
+						} else if (
+							history === "late" ||
+							history === "move-late"
+						) {
+							ctx.expected[target] =
+								"late edit after rename snapshot";
+							ctx.vault.put(target, bytes(ctx.expected[target]));
+						}
+					}
+				};
+				await measure(
+					ctx,
+					`realtime-edit-rename-latency-${history}`,
+					async () => {
+						if (!moveOnly) {
+							ctx.expected[source] = "modified before rename";
+							ctx.vault.put(source, bytes(ctx.expected[source]));
+						}
+						if (history !== "inflight") {
+							rename();
+						}
+						await awaitRealtime(ctx, [target]);
+						if (
+							history === "duplicate" ||
+							history === "move-duplicate"
+						) {
+							ctx.vault.put(target, bytes(ctx.expected[target]!));
+							await awaitRealtime(ctx, [target]);
+						}
+					},
+				);
+				await ctx.desktop.full();
+				await ctx.desktop.assertSettled(ctx.expected);
+			} finally {
+				ctx.disk.beforeRequest = undefined;
+				await ctx.stop();
+			}
+		}
+		const ctx = await setup(encrypted);
+		try {
+			await ctx.host.tokenSetup();
+			const saved = await ctx.current.saved();
+			ctx.desktop.vault.rename("note-1.md", "Renamed.md");
+			ctx.desktop.vault.put(
+				"Renamed.md",
+				bytes("published rename and edit"),
+			);
+			await ctx.desktop.engine.renameFile("note-1.md", "Renamed.md");
+			delete ctx.expected["note-1.md"];
+			ctx.expectedDeleted.add("note-1.md");
+			ctx.expected["Renamed.md"] = "published rename and edit";
+			await ctx.restart(saved);
+			await measure(ctx, "restart-receive-rename-edit", () =>
+				ctx.host.full(),
+			);
+			await measure(
+				ctx,
+				"rename-followup-noop",
+				() => ctx.host.full(),
+				true,
+			);
+		} finally {
+			await ctx.stop();
+		}
+	}
+	const flag = process.argv.indexOf("--out");
+	assert.ok(
+		flag >= 0 && process.argv[flag + 1],
+		"Rename latency run needs a fresh --out path",
+	);
+	await writeFile(
+		process.argv[flag + 1]!,
+		JSON.stringify(
+			{ schema: "sync-rename-latency-v1", success: true, rows },
+			null,
+			"\t",
+		) + "\n",
+		{ flag: "wx" },
+	);
+}

@@ -214,6 +214,23 @@ test("unavailable system trash preserves stale backup", async () => {
 	assert.equal(await vaultAdapter.cleanupOldBackups(30), 0);
 	assert.equal(await dataAdapter.exists(oldPath), true);
 	assert.equal(dataAdapter.localTrashCalls, 0);
+	let stopped = false;
+	dataAdapter.systemTrashAvailable = true;
+	dataAdapter.stat = async (path: string): Promise<Stat | null> => {
+		const stat = await originalStat(path);
+		stopped = true;
+		return stat ? { ...stat, mtime: 0 } : stat;
+	};
+	await assert.rejects(
+		vaultAdapter.cleanupOldBackups(30, () => {
+			if (stopped) {
+				throw new Error("Stopped maintenance");
+			}
+		}),
+		/Stopped maintenance/,
+	);
+	assert.equal(await dataAdapter.exists(oldPath), true);
+	assert.deepEqual(dataAdapter.systemTrash, []);
 });
 
 function downloadEngine(

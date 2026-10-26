@@ -1,4 +1,5 @@
 import type { StartupReadSession } from "./sync/canonical/manager";
+import { SYNC_BUILD_ID } from "./build-info";
 import type { StartupInvocation } from "./plugin-startup";
 import type { RemoteAuthorityObservation } from "./sync/canonical/manager";
 import type { OperationBackupChoice } from "./backup/operation-backup-choice";
@@ -164,6 +165,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	private regularSyncStarted = false;
 	private automationReady = false;
+	private backupSweepScheduled = false;
+	private readonly pluginLoadStartedAt = Date.now();
 	private activeFullRuns = 0;
 	private activeFullPromise: Promise<SyncResult | null> | null = null;
 	private readonly encryptionManager = new EncryptionManager();
@@ -201,6 +204,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			fileEnabled: this.settings.logToFile,
 			baseContext: {
 				pluginVersion: this.manifest.version,
+				buildId: SYNC_BUILD_ID,
 			},
 		});
 		logger.info("Loading Yandex Disk Sync plugin...");
@@ -209,6 +213,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		logger.configure({
 			baseContext: {
 				pluginVersion: this.manifest.version,
+				buildId: SYNC_BUILD_ID,
 				deviceId: shortenDiagnosticValue(installationDeviceId),
 			},
 		});
@@ -666,6 +671,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 */
 	private async onLayoutReady(invocation?: StartupInvocation): Promise<void> {
 		if (!invocation) {
+			logger.info("Startup layout ready", {
+				elapsedSincePluginLoadMs: Date.now() - this.pluginLoadStartedAt,
+			});
 			return await this.getStartup().runInvocation((owned) =>
 				this.onLayoutReady(owned),
 			);
@@ -696,17 +704,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.unloaded
 			) {
 				return;
-			}
-
-			// Sweep stale overwritten-file backups so the data folder doesn't grow
-			// without bound. Non-critical: log and ignore failures so a backup
-			// cleanup problem never blocks sync startup.
-			try {
-				await this.vaultAdapter.cleanupOldBackups();
-			} catch (error) {
-				logger.warn("Overwritten-file backup cleanup failed:", {
-					error,
-				});
 			}
 		} catch (error) {
 			this.stopRegularSync();
@@ -1798,6 +1795,26 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.automationReady = true;
 		this.startAutomationIfReady();
 		logger.info("[Main] Synchronization started");
+		if (!this.backupSweepScheduled) {
+			this.backupSweepScheduled = true;
+			void this.syncEngine
+				.runExclusiveMaintenance(async () => {
+					if (!this.unloaded && !this.syncEngine.isSyncPaused()) {
+						const lifetime =
+							this.indexManager.createCanonicalReadSession(
+								this.syncEngine.createReadLifetimeGuard(),
+							);
+						await this.vaultAdapter.cleanupOldBackups(30, () =>
+							lifetime.assertCurrent(),
+						);
+					}
+				})
+				.catch((error) =>
+					logger.warn("Overwritten-file backup cleanup failed:", {
+						error,
+					}),
+				);
+		}
 	}
 
 	/**
@@ -2072,6 +2089,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			fileEnabled: this.settings.logToFile,
 			baseContext: {
 				pluginVersion: this.manifest.version,
+				buildId: SYNC_BUILD_ID,
 				deviceId: shortenDiagnosticValue(this.settings.deviceId),
 			},
 		});

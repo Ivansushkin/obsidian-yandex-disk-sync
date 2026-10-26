@@ -97,6 +97,22 @@ class RenameYandexFake {
 		return resource.content.slice(0);
 	}
 
+	getReadConfigurationVersion() {
+		return 0;
+	}
+
+	async downloadStableLogicalFile(path: string) {
+		const resource = await this.getLogicalResource(path);
+		return resource
+			? {
+					resource,
+					content: await this.downloadFile(path),
+					fingerprint: `sha256:${resource.sha256}`,
+					verifiedRawSha256: resource.sha256,
+				}
+			: null;
+	}
+
 	async getLogicalResource(path: string) {
 		const resource = this.resources.get(path);
 		if (!resource) {
