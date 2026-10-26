@@ -2,42 +2,29 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { LocalOperationStore } from "../src/sync/local/operation-store";
 
-test("mutation replay advances and confirms only a contiguous FIFO prefix", () => {
-	const store = new LocalOperationStore("device-a");
-	store.loadMutations(undefined, 1);
-	const first = store.enqueueMutation("put", "a.md", "epoch-a", 0);
-	const second = store.enqueueMutation("delete-file", "b.md", "epoch-a", 0);
-	const applied: Record<string, number> = {};
-
-	assert.equal(store.stageMutation(applied, second), false);
-	store.confirmMutation(second.id, applied);
-	assert.equal(store.getMutations().length, 2);
-
-	store.stagePendingMutations(applied);
-	assert.equal(applied["device-a"], 2);
-	store.confirmAppliedMutations(applied);
-	assert.deepEqual(store.getMutations(), []);
-	assert.equal(first.seq, 1);
-	assert.equal(second.seq, 2);
-});
-
-test("reloaded mutation sequence continues after the durable watermark", () => {
-	const store = new LocalOperationStore("device-a");
-	store.loadMutations(undefined, 8);
-	const mutation = store.enqueueMutation("put", "note.md", "epoch-a", 7);
-	assert.equal(mutation.seq, 8);
-	assert.equal(mutation.id, "device-a:8");
-	assert.equal(mutation.epoch, "epoch-a");
-});
-
-test("put mutation retains the pre-upload baseline hash", () => {
-	const store = new LocalOperationStore("device-a");
-	store.loadMutations(undefined, 1);
-	store.enqueueMutation("put", "note.md", "epoch-a", 3, {
-		sha256: "new",
-		baselineSha256: "old",
-	});
-	assert.equal(store.findLatestPutBaselineSha("note.md"), "old");
+test("mutation replay advances only a contiguous FIFO prefix from its durable allocation floor", () => {
+	for (const firstSeq of [1, 8]) {
+		const label = `allocation floor ${firstSeq}`;
+		const store = new LocalOperationStore("device-a");
+		store.loadMutations(undefined, firstSeq);
+		const first = store.enqueueMutation("put", "a.md", "epoch-a", 7);
+		const second = store.enqueueMutation(
+			"delete-file",
+			"b.md",
+			"epoch-a",
+			7,
+		);
+		const applied = { "device-a": firstSeq - 1 };
+		assert.equal(first.id, `device-a:${firstSeq}`, label);
+		assert.equal(second.seq, firstSeq + 1, label);
+		assert.equal(store.stageMutation(applied, second), false, label);
+		store.confirmMutation(second.id, applied);
+		assert.equal(store.getMutations().length, 2, label);
+		store.stagePendingMutations(applied);
+		assert.equal(applied["device-a"], firstSeq + 1, label);
+		store.confirmAppliedMutations(applied);
+		assert.deepEqual(store.getMutations(), [], label);
+	}
 });
 
 test("retargeted put preserves FIFO sequence and causal baseline", () => {
@@ -48,6 +35,7 @@ test("retargeted put preserves FIFO sequence and causal baseline", () => {
 		baselineSha256: "baseline",
 	});
 
+	assert.equal(store.findLatestPutBaselineSha("A.md"), "baseline");
 	const retargeted = store.retargetLatestPut(
 		"A.md",
 		"folder/B.md",
@@ -63,54 +51,40 @@ test("retargeted put preserves FIFO sequence and causal baseline", () => {
 	assert.equal(store.getNextMutationSeq(), 2);
 });
 
-test("delete supersedes an uncommitted put without a FIFO gap", () => {
-	const store = new LocalOperationStore("device-a");
-	store.loadMutations(undefined, 1);
-	const put = store.enqueueMutation("put", "A.md", "epoch-a", 7, {
-		sha256: "content",
-	});
-
-	const deletion = store.replacePutWithDelete(put.id);
-
-	assert.ok(deletion);
-	assert.equal(deletion.id, put.id);
-	assert.equal(deletion.seq, put.seq);
-	assert.equal(deletion.type, "delete-file");
-	assert.equal(deletion.sha256, undefined);
-	assert.equal(store.getNextMutationSeq(), 2);
-	const applied: Record<string, number> = {};
-	assert.equal(store.stageMutation(applied, deletion), true);
-	assert.equal(applied["device-a"], 1);
-});
-
-test("full-sync no-op preserves and completes the original FIFO sequence", () => {
-	const firstStore = new LocalOperationStore("device-a");
-	firstStore.loadMutations(undefined, 1);
-	const put = firstStore.enqueueMutation("put", "missing.md", "epoch-a", 7, {
-		sha256: "obsolete-content",
-		baselineSha256: "baseline",
-	});
-
-	const noop = firstStore.replacePutWithNoop(put.id);
-
-	assert.ok(noop);
-	assert.equal(noop.id, put.id);
-	assert.equal(noop.seq, put.seq);
-	assert.equal(noop.epoch, put.epoch);
-	assert.equal(noop.baseRevision, put.baseRevision);
-	assert.equal(noop.type, "noop");
-	assert.equal(noop.sha256, undefined);
-	assert.equal(noop.baselineSha256, undefined);
-
-	const reloadedStore = new LocalOperationStore("device-a");
-	reloadedStore.loadMutations(firstStore.getMutations(), 2);
-	const applied: Record<string, number> = {};
-	reloadedStore.stagePendingMutations(applied);
-	reloadedStore.confirmAppliedMutations(applied);
-
-	assert.equal(applied["device-a"], 1);
-	assert.deepEqual(reloadedStore.getMutations(), []);
-	assert.equal(reloadedStore.getNextMutationSeq(), 2);
+test("superseded puts become delete or no-op without FIFO gaps across reload", () => {
+	for (const replacement of ["delete-file", "noop"] as const) {
+		const store = new LocalOperationStore("device-a");
+		store.loadMutations(undefined, 1);
+		const put = store.enqueueMutation("put", "A.md", "epoch-a", 7, {
+			sha256: "obsolete",
+			baselineSha256: "baseline",
+		});
+		const replaced =
+			replacement === "noop"
+				? store.replacePutWithNoop(put.id)
+				: store.replacePutWithDelete(put.id);
+		assert.ok(replaced, replacement);
+		assert.equal(replaced.id, put.id, replacement);
+		assert.equal(replaced.seq, put.seq, replacement);
+		assert.equal(replaced.epoch, put.epoch, replacement);
+		assert.equal(replaced.baseRevision, put.baseRevision, replacement);
+		assert.equal(replaced.type, replacement, replacement);
+		assert.equal(replaced.sha256, undefined, replacement);
+		if (replacement === "noop") {
+			assert.equal(replaced.baselineSha256, undefined, replacement);
+		}
+		const reloaded = new LocalOperationStore("device-a");
+		reloaded.loadMutations(
+			store.getMutations(),
+			store.getNextMutationSeq(),
+		);
+		const applied: Record<string, number> = {};
+		reloaded.stagePendingMutations(applied);
+		reloaded.confirmAppliedMutations(applied);
+		assert.equal(applied["device-a"], 1, replacement);
+		assert.deepEqual(reloaded.getMutations(), [], replacement);
+		assert.equal(reloaded.getNextMutationSeq(), 2, replacement);
+	}
 });
 
 test("physical actions are idempotent and survive local reload", () => {

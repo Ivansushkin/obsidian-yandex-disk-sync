@@ -52,8 +52,10 @@
 - The remote source of truth is one canonical `.obsidian-sync-index.json` with
   `format: "sync-index"`, `epoch`, `revision`, file states, folder tombstones,
   pending moves, and `appliedMutationSeq`.
-- Canonical commits use an exclusive move to a unique lock and back. Never
-  bypass `IndexManager` transaction/recovery rules with direct writes.
+- Ordinary canonical commits use an exclusive move to a unique lock and back.
+  Confirmed direct Force is the explicit exception: IndexManager validates,
+  deletes/recreates and verifies the final canonical path without any temporary
+  file, lease or MOVE. Never publish canonical outside IndexManager.
 - A `CanonicalCommitProof` is ephemeral and may skip an index download only
   after a stable hash-matching root listing. It never authorizes a physical
   write; re-read canonical and revalidate encryption before corrective upload.
@@ -67,13 +69,15 @@
   exists. Client clocks never decide a causal winner.
 - Ordinary sync commits a tombstone before physical deletion. Confirmed Force
   publishes its own durable intent before replacing the syncable destination.
-  A destructive remote action requires fresh canonical/operation authority
-  and a matching expected physical fingerprint.
+  Ordinary destructive remote actions require fresh canonical/operation authority
+  and a matching expected physical fingerprint. Direct Force deliberately ignores
+  destination authority and fingerprints, clears the full destination and copies
+  its readable source directly. See docs/FORCE_SYNC.md.
   A failed mandatory backup blocks ordinary-sync local overwrite or deletion. Confirmed Force uses its explicit per-run backup policy.
 - Exact delete beats a concurrent stale put. A new or modified descendant
   survives folder delete. Initial device connection receives canonical versions with protective copies;
   after connection, a file without baseline is new.
-- Empty folders are not synchronized separately.
+- Ordinary sync does not synchronize empty folders separately. Direct Force copies them.
 
 ## Fingerprints and paths
 
@@ -116,11 +120,21 @@
 - Stable plaintext 1.0/1.1 local migration is irreversible. Persist one coherent
   current snapshot after installation identity initialization and before automation.
   A failed initial save blocks sync and unload must not retry it.
-- Full archives before Force and encryption transitions are explicit per-run choices:
-  with-backup, without-backup, or cancel. Recovery and epoch adoption never create
-  an archive automatically. Ordinary sync retains mandatory protective copies.
-  Confirmed Force without-backup also skips individual protective copies and
-  destination-content snapshots; source, scope and operation authority remain mandatory.
+- Direct Force covers the entire vault, including hidden/config files, ignoring
+  ordinary filters. Preserve root .backup and the local running sync plugin/state;
+  never upload its credentials. Rebuild canonical; preserve or rebuild the
+  encryption manifest only to match authenticated source/output parameters.
+- Force offers one confirmation with an archive toggle off by default. A selected
+  archive must succeed before purge; errors stay in that dialog. Force never
+  creates staging, locks, trash or protective/conflict copies.
+- Force continues independent actions after individual errors and persists a
+  direct-v1 remainder. Ordinary manual/startup/scheduled full resumes it before
+  normal merge, without repeating a completed broad purge. Legacy checkpoints
+  must never be silently widened; a new full Force requires confirmation.
+- Force does not require stopping other devices and provides no server fencing.
+  Source read/decryption failure is never an empty source. Connection changes and
+  unload stop further writes. Success requires verified output and persistence.
+- Encryption transitions retain their independent per-run archive choice.
 - Startup blocks are non-persisted and typed. Confirmed Force validates its
   selected readable source independently of normal startup admission. Destination
   encryption, historical metadata, baseline, tombstones and queues cannot choose

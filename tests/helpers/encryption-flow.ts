@@ -1,3 +1,4 @@
+import { PluginStartup, type StartupBlocks } from "../../src/plugin-startup";
 import { BackupManager } from "../../src/backup/backup-manager";
 import { captureLogicalVaultDigest } from "../../src/backup/backup-snapshot";
 import type { EncryptionContext } from "../../src/crypto/context";
@@ -79,4 +80,65 @@ export function encryptionFlow(
 			};
 		},
 	};
+}
+
+/** Bind actual startup/recovery/admission to the same algorithms used by lifecycle full. */
+export function startupFlow(
+	a: ReturnType<typeof device>,
+	flow: ReturnType<typeof encryptionFlow>,
+) {
+	const blocks: StartupBlocks = {
+		migration: null,
+		historical: null,
+		authentication: null,
+		encryption: null,
+	};
+	a.settings.yandexTokenSecret = "synthetic";
+	const startup = new PluginStartup({
+		index: a.index,
+		engine: a.engine,
+		getSettings: () => a.settings,
+		getBlocks: () => ({ ...blocks, encryption: flow.block() }),
+		hasTransition: () => flow.context.getTransition() !== null,
+		isStopped: () => flow.context.isCancelled(),
+		setBlock: (kind, reason) => {
+			blocks[kind] = reason;
+			a.engine.setExternalBlock(kind, reason);
+		},
+		ensureStorageBinding: async () => {
+			await a.index.assertRemoteScope();
+			return true;
+		},
+		recoverEncryptionTransition: () =>
+			flow.workflow.recovery.recoverEncryptionTransition(),
+		tryRecoverRemoteTargetTransition: (reads) =>
+			flow.workflow.recovery.tryRecoverRemoteTargetTransition(reads),
+		ensureEncryptionReady: (options, read) =>
+			flow.workflow.admission.ensureEncryptionReady(options, read),
+	});
+	a.engine.setSyncGuardCallback(async (token, observation, known) => {
+		await a.index.assertRemoteScope(observation);
+		if (token !== undefined) {
+			return {
+				blockReason: (await a.index.isEncryptionManifestTokenCurrent(
+					token,
+					observation,
+				))
+					? null
+					: "manifest changed",
+				validationToken: token,
+			};
+		}
+		const read =
+			known ?? (await a.index.downloadEncryptionManifestForGuard());
+		const ready = await flow.workflow.admission.ensureEncryptionReady(
+			{ prompt: false },
+			read,
+		);
+		return {
+			blockReason: ready ? null : "encryption blocked",
+			validationToken: read.validationToken,
+		};
+	});
+	return startup;
 }

@@ -36,6 +36,7 @@ import * as reconciliationContext from "../reconciliation/context";
 import * as fileOperations from "./operations";
 import * as remoteMoves from "./remote-moves";
 export interface Dependencies {
+	assertActive: () => void;
 	getWatcherCausalContext: () => WatcherCausalContext;
 	vaultAdapter: VaultAdapter;
 	getSyncGuardResult: (
@@ -136,12 +137,14 @@ export async function renameFileNow(
 	newPath: string,
 	context: WatcherCausalContext = deps.getWatcherCausalContext(),
 ): Promise<FileRenameOutcome> {
+	deps.assertActive();
 	const targetSnapshot = await captureRenameTarget(
 		deps,
 		oldPath,
 		newPath,
 		context,
 	);
+	deps.assertActive();
 	if (targetSnapshot && "status" in targetSnapshot) {
 		return targetSnapshot;
 	}
@@ -168,6 +171,7 @@ export async function renameFileNow(
 		const { content, sha256, mtime } = targetSnapshot!;
 		const oldLocalMeta = deps.indexManager.getLocalIndex().files[oldPath];
 		const canonical = await deps.indexManager.refreshCanonicalForMutation();
+		deps.assertActive();
 		const pendingMove = deps.indexManager
 			.getPendingMutations()
 			.find(
@@ -309,6 +313,228 @@ export async function renameFileNow(
 			canonicalSource ?? oldLocalMeta,
 			sha256,
 		);
+		if (
+			plan !== "put-target" &&
+			pendingPut &&
+			pendingPut.sha256 !== undefined &&
+			!pendingPutApplied &&
+			pendingPut.epoch === canonical.epoch &&
+			sourceCausallyLive
+		) {
+			deps.assertActive();
+			const assertRecoverySource = (current: Readonly<SyncIndex>) => {
+				deps.assertActive();
+				const source = current.files[oldPath];
+				if (
+					current.epoch !== canonical.epoch ||
+					current.maintenance ||
+					source?.sha256 !== canonicalSource?.sha256 ||
+					source?.deleted ||
+					source?.changedRevision !==
+						canonicalSource?.changedRevision ||
+					source?.lastModifiedBy !==
+						canonicalSource?.lastModifiedBy ||
+					source?.mutationSeq !== canonicalSource?.mutationSeq
+				) {
+					throw new Error("Source put recovery authority changed");
+				}
+			};
+			let recoveryPut = pendingPut;
+			const remoteSource = joinPath(deps.settings.remotePath, oldPath);
+			let uploaded =
+				await deps.yandexClient.downloadStableLogicalFile(remoteSource);
+			let uploadedSha = uploaded
+				? await computeSha256(uploaded.content)
+				: null;
+			deps.assertActive();
+			if (
+				uploaded &&
+				uploadedSha !== pendingPut.sha256 &&
+				uploadedSha !== canonicalSource?.sha256
+			) {
+				const committed = await putRenamedUnsyncedFile(
+					deps,
+					oldPath,
+					newPath,
+					{ content, sha256 },
+					context,
+				);
+				return {
+					status: committed ? "completed" : "retry",
+					plan: "put-target",
+					canonicalRevision: committed
+						? deps.indexManager.getRemoteIndex().revision
+						: null,
+					epoch: context.epoch,
+					reason: committed
+						? undefined
+						: "index-commit-not-confirmed",
+					remoteStarted: true,
+				};
+			}
+			if (
+				uploadedSha !== pendingPut.sha256 &&
+				(uploadedSha === null ||
+					uploadedSha === canonicalSource?.sha256) &&
+				pendingPut.seq ===
+					(canonical.appliedMutationSeq[deps.settings.deviceId] ??
+						0) +
+						1
+			) {
+				const expectedSource = uploaded?.resource ?? null;
+				const assertAuthority = async () => {
+					deps.assertActive();
+					const guard = await deps.getSyncGuardResult(
+						false,
+						validationToken,
+					);
+					const current =
+						await deps.indexManager.readCanonicalIndex();
+					deps.assertActive();
+					if (guard.blockReason) {
+						throw new Error(guard.blockReason);
+					}
+					assertRecoverySource(current);
+				};
+				const retained = deps.indexManager.retargetPendingPut(
+					oldPath,
+					oldPath,
+					sha256,
+					pendingPut.baselineSha256,
+				);
+				if (retained?.id !== pendingPut.id) {
+					throw new Error("Source put recovery identity changed");
+				}
+				recoveryPut = retained;
+				if (deps.indexSaveCallback) {
+					await deps.indexSaveCallback();
+				}
+				deps.assertActive();
+				await fileOperations.materializeUploadedFile(
+					deps.fileOperations,
+					oldPath,
+					{ content, sha256 },
+					false,
+					false,
+					async () => {
+						await assertAuthority();
+						const physical =
+							await deps.yandexClient.getLogicalResource(
+								remoteSource,
+							);
+						deps.assertActive();
+						if (
+							expectedSource
+								? !matchesPhysicalResourceFingerprint(
+										getPhysicalResourceFingerprint(
+											expectedSource,
+										) ?? undefined,
+										physical,
+									)
+								: physical !== null
+						) {
+							throw new Error(
+								"Source put recovery physical identity changed",
+							);
+						}
+					},
+					() =>
+						fileOperations.confirmUploadedSnapshot(
+							deps.fileOperations,
+							oldPath,
+							sha256,
+							assertAuthority,
+							validationToken,
+						),
+				);
+				uploaded =
+					await deps.yandexClient.downloadStableLogicalFile(
+						remoteSource,
+					);
+				uploadedSha = uploaded
+					? await computeSha256(uploaded.content)
+					: null;
+				deps.assertActive();
+			}
+			if (!uploaded || uploadedSha !== recoveryPut.sha256) {
+				return {
+					status: "retry",
+					canonicalRevision: null,
+					epoch: context.epoch,
+					reason: "source-put-not-materialized",
+					remoteStarted: true,
+				};
+			}
+			fileOperations.applyUploadedFileMetadata(
+				deps.fileOperations,
+				oldPath,
+				{
+					path: oldPath,
+					sha256: uploadedSha,
+					size: uploaded.content.byteLength,
+					mtime: oldLocalMeta?.mtime ?? mtime,
+					syncedAt: Date.now(),
+					remoteMtime: Number.isFinite(
+						new Date(uploaded.resource.modified).getTime(),
+					)
+						? new Date(uploaded.resource.modified).getTime()
+						: undefined,
+					remoteFingerprint:
+						getPhysicalResourceFingerprint(uploaded.resource) ??
+						undefined,
+				},
+				recoveryPut,
+			);
+			stageRenameMutation(deps.indexManager, recoveryPut, newPath);
+			if (deps.indexSaveCallback) {
+				await deps.indexSaveCallback();
+			}
+			deps.assertActive();
+			const proof = await syncReconciliation.saveRemoteIndexBestEffort(
+				deps.syncReconciliation,
+				assertRecoverySource,
+			);
+			deps.assertActive();
+			if (!proof) {
+				return {
+					status: "retry",
+					canonicalRevision: null,
+					epoch: context.epoch,
+					reason: "source-put-commit-not-confirmed",
+					remoteStarted: true,
+				};
+			}
+			await reconcileAcceptedUploads.repairMissingAcceptedUploads(
+				deps.syncReconciliation,
+				[
+					{
+						path: oldPath,
+						snapshot: {
+							content: uploaded.content,
+							sha256: uploadedSha,
+						},
+					},
+				],
+				proof,
+			);
+			deps.assertActive();
+			deps.indexManager.confirmAppliedMutations();
+			if (deps.indexSaveCallback) {
+				await deps.indexSaveCallback();
+			}
+			deps.assertActive();
+			const committed = deps.indexManager.getRemoteIndex();
+			const acceptedSource = committed.files[oldPath];
+			return await renameFileNow(deps, oldPath, newPath, {
+				...context,
+				baseRevision:
+					acceptedSource?.sha256 === uploadedSha &&
+					acceptedSource.lastModifiedBy === deps.settings.deviceId &&
+					acceptedSource.mutationSeq === pendingPut.seq
+						? committed.revision
+						: context.baseRevision,
+			});
+		}
 		logger.info("File rename planned", {
 			oldPath,
 			newPath,
@@ -319,6 +545,8 @@ export async function renameFileNow(
 			pendingPutApplied,
 			pendingPutAccepted,
 			sourceCausallyLive,
+			snapshotBytes: content.byteLength,
+			snapshotMatchesSource: canonicalSource?.sha256 === sha256,
 			plan,
 		});
 
@@ -715,6 +943,22 @@ async function commitFileRename(
 		);
 	}
 	deps.indexManager.confirmAppliedMutations();
+	const confirmedTarget = deps.indexManager.getRemoteIndex().files[newPath];
+	const targetBaseline = deps.indexManager.getLocalIndex().files[newPath];
+	if (
+		confirmedTarget &&
+		!confirmedTarget.deleted &&
+		targetBaseline?.sha256 === confirmedTarget.sha256
+	) {
+		deps.indexManager.updateLocalFile(
+			newPath,
+			createConfirmedBaseline(
+				targetBaseline,
+				confirmedTarget,
+				confirmedTarget,
+			),
+		);
+	}
 	if (deps.indexSaveCallback) {
 		await deps.indexSaveCallback();
 	}
@@ -750,12 +994,15 @@ function stageRenameMutation(
 		if (
 			pending.seq !== sequence + 1 ||
 			pending.epoch !== mutation.epoch ||
-			pending.type !== "put" ||
+			(pending.type !== "put" && pending.type !== "noop") ||
 			pending.path !== targetPath
 		) {
 			break;
 		}
-		const noop = index.replacePendingPutWithNoop(pending.id);
+		const noop =
+			pending.type === "noop"
+				? pending
+				: index.replacePendingPutWithNoop(pending.id);
 		if (!noop) {
 			break;
 		}

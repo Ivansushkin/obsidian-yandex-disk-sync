@@ -18,6 +18,11 @@ import {
 	shouldInspectRawSyncPath,
 	getDirectory,
 	hasPortablePathCollision,
+	getAncestorDirectories,
+	assertForcePath,
+	isForceSourcePath,
+	preservesForceLocalPath,
+	containsForceLocalPreservedPath,
 } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { runWithConcurrency } from "../utils/semaphore";
@@ -125,6 +130,129 @@ export class VaultAdapter {
 			this.app.vault.configDir,
 			encrypted,
 		);
+	}
+
+	/** Walk actual storage, including hidden configuration and empty directories. */
+	async getForceTree(
+		source: boolean,
+	): Promise<{ files: string[]; directories: string[] }> {
+		const files: string[] = [];
+		const directories: string[] = [];
+		const visit = async (directory: string) => {
+			const listed = await this.vault.adapter.list(directory);
+			for (const path of [...listed.files, ...listed.folders]) {
+				assertForcePath(path);
+				if (getDirectory(path) !== directory) {
+					throw new Error("Force local listing escaped its parent");
+				}
+				if (
+					source
+						? !isForceSourcePath(path, this.vault.configDir)
+						: preservesForceLocalPath(path, this.vault.configDir)
+				) {
+					continue;
+				}
+				if (listed.folders.includes(path)) {
+					directories.push(path);
+					await visit(path);
+				} else {
+					files.push(path);
+				}
+			}
+		};
+		await visit("");
+		return { files: files.sort(), directories: directories.sort() };
+	}
+
+	/** Read hidden storage through the public adapter and loaded files through Vault. */
+	async readForceFile(path: string): Promise<ArrayBuffer> {
+		assertForcePath(path);
+		return this.getFile(path)
+			? this.readFile(path)
+			: this.vault.adapter.readBinary(path);
+	}
+
+	/** Permanently remove a Force destination; never move it to Obsidian trash. */
+	async deleteForcePath(
+		path: string,
+		beforeMutation?: () => Promise<void>,
+	): Promise<void> {
+		assertForcePath(path);
+		if (
+			preservesForceLocalPath(path, this.vault.configDir) ||
+			containsForceLocalPreservedPath(path, this.vault.configDir)
+		) {
+			throw new Error(
+				"Force cannot delete its preserved local installation",
+			);
+		}
+		const entry = this.vault.getAbstractFileByPath(path);
+		if (entry) {
+			await beforeMutation?.();
+			// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- Confirmed Force explicitly requires permanent deletion without trash.
+			await this.vault.delete(entry, true);
+		} else {
+			const stat = await this.vault.adapter.stat(path);
+			await beforeMutation?.();
+			if (stat?.type === "folder") {
+				await this.vault.adapter.rmdir(path, true);
+			} else if (stat) {
+				await this.vault.adapter.remove(path);
+			}
+		}
+	}
+
+	/** Make a literal Force directory, replacing a file occupying that path. */
+	async createForceDirectory(
+		path: string,
+		beforeMutation?: () => Promise<void>,
+	): Promise<void> {
+		for (const directory of [...getAncestorDirectories([path])]
+			.reverse()
+			.concat(path)) {
+			assertForcePath(directory);
+			const stat = await this.vault.adapter.stat(directory);
+			if (stat?.type === "file") {
+				await this.deleteForcePath(directory, beforeMutation);
+			}
+			if (!stat || stat.type === "file") {
+				await beforeMutation?.();
+				await this.vault.adapter.mkdir(directory);
+			}
+		}
+	}
+
+	/** Write directly to the final Force path without snapshots or protective copies. */
+	async writeForceFile(
+		path: string,
+		content: ArrayBuffer,
+		beforeMutation?: () => Promise<void>,
+	): Promise<void> {
+		assertForcePath(path);
+		if (
+			preservesForceLocalPath(path, this.vault.configDir) ||
+			containsForceLocalPreservedPath(path, this.vault.configDir)
+		) {
+			throw new Error(
+				"Force source collides with its local installation",
+			);
+		}
+		const parent = getDirectory(path);
+		if (parent) {
+			await this.createForceDirectory(parent, beforeMutation);
+		}
+		if ((await this.vault.adapter.stat(path))?.type === "folder") {
+			await this.deleteForcePath(path, beforeMutation);
+		}
+		const file = this.getFile(path);
+		await beforeMutation?.();
+		if (file) {
+			await this.vault.modifyBinary(file, content);
+		} else if (!path.split("/").some((part) => part.startsWith("."))) {
+			await this.vault.createBinary(path, content);
+		} else {
+			await this.vault.adapter.writeBinary(path, content);
+		}
 	}
 
 	/**
@@ -385,7 +513,11 @@ export class VaultAdapter {
 	 * bound. Each backup is trashed (recoverable) and counted. Errors per-file
 	 * are logged and skipped so one bad file doesn't abort the whole sweep.
 	 */
-	async cleanupOldBackups(maxAgeDays = 30): Promise<number> {
+	async cleanupOldBackups(
+		maxAgeDays = 30,
+		assertActive: () => void = () => {},
+	): Promise<number> {
+		assertActive();
 		const configDir = this.app.vault.configDir;
 		const backupDir = obsidianNormalize(
 			`${configDir}/plugins/yandex-disk-sync/overwritten`,
@@ -398,8 +530,10 @@ export class VaultAdapter {
 		let removed = 0;
 		const listed = await this.vault.adapter.list(backupDir);
 		for (const backupPath of listed.files) {
+			assertActive();
 			try {
 				const stat = await this.vault.adapter.stat(backupPath);
+				assertActive();
 				if (stat?.type === "file" && stat.mtime < cutoff) {
 					if (await this.vault.adapter.trashSystem(backupPath)) {
 						removed++;
@@ -415,6 +549,7 @@ export class VaultAdapter {
 				});
 			}
 		}
+		assertActive();
 		if (removed > 0) {
 			logger.info(
 				`Cleaned up ${removed} stale overwritten-file backup(s) older than ${maxAgeDays}d`,

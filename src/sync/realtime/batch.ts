@@ -3,6 +3,7 @@ import { t } from "../../i18n";
 import type {
 	FileMetadata,
 	PendingMutation,
+	SyncIndex,
 	SyncPhase,
 	SyncProgress,
 	YandexDiskSyncSettings,
@@ -10,6 +11,12 @@ import type {
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
+import { joinPath } from "../../utils/path-utils";
+import {
+	getStableContentFingerprint,
+	isHashStableContentFingerprint,
+	matchesStableContentFingerprint,
+} from "../../utils/resource-fingerprint";
 import { IndexManager } from "../canonical/manager";
 import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
 import * as fileOperations from "../files/operations";
@@ -33,6 +40,8 @@ const MAX_REALTIME_WINDOW_EVENTS = 32;
 const REALTIME_WINDOW_BYTES = 8 * 1024 * 1024;
 
 export interface Dependencies {
+	readCanonical?: () => Promise<SyncIndex>;
+	assertCurrent?: () => void;
 	indexManager: IndexManager;
 	settings: YandexDiskSyncSettings;
 	getSyncGuardResult: (
@@ -382,6 +391,7 @@ export async function reconcileRealtimeBatch(
 	let cursor = 0;
 	while (cursor < events.length) {
 		const result = createRealtimeBatchResult();
+		const windowStartedAt = Date.now();
 		if (cursor > 0) {
 			const guard = await deps.getSyncGuardResult(false, validationToken);
 			if (guard.blockReason || deps.isPaused) {
@@ -418,6 +428,17 @@ export async function reconcileRealtimeBatch(
 				batchResult.requiresFullSync = result.requiresFullSync;
 			}
 		} finally {
+			logger.info("Realtime window released", {
+				durationMs: Date.now() - windowStartedAt,
+				events: consumed,
+				retainedSnapshotBytes: prepared.reduce(
+					(sum, item) =>
+						sum + (item.snapshot?.content.byteLength ?? 0),
+					0,
+				),
+				completed: result.completed.length,
+				retry: result.retry.length,
+			});
 			// Repair and durable settlement have finished, or retry must recapture bytes.
 			for (const item of prepared) {
 				delete item.snapshot;
@@ -463,7 +484,12 @@ async function applyPreparedRealtimeWindow(
 		const item = prepared[index]!;
 		try {
 			if (item.action === "upload") {
-				if (isUploadHandedOffToRename(item.event)) {
+				const source =
+					deps.indexManager.getRemoteIndex().files[item.path];
+				if (
+					isUploadHandedOffToRename(item.event) &&
+					(!source || source.deleted)
+				) {
 					recordPendingUploadHandoff(batchResult, item);
 					continue;
 				}
@@ -475,7 +501,10 @@ async function applyPreparedRealtimeWindow(
 						false,
 						true,
 					);
-				if (isUploadHandedOffToRename(item.event)) {
+				if (
+					isUploadHandedOffToRename(item.event) &&
+					(!source || source.deleted)
+				) {
 					recordPendingUploadHandoff(batchResult, item);
 					continue;
 				}
@@ -523,7 +552,12 @@ async function applyPreparedRealtimeWindow(
 		await deps.indexSaveCallback();
 	}
 	for (const item of ready) {
-		if (item.action === "upload" && isUploadHandedOffToRename(item.event)) {
+		const source = deps.indexManager.getRemoteIndex().files[item.path];
+		if (
+			item.action === "upload" &&
+			isUploadHandedOffToRename(item.event) &&
+			(!source || source.deleted)
+		) {
 			recordPendingUploadHandoff(batchResult, item);
 			continue;
 		}
@@ -621,6 +655,112 @@ async function applyPreparedRealtimeWindow(
 	return batchResult;
 }
 
+/** Confirm a redundant notification without allocating or acknowledging a put sequence. */
+async function confirmUnchangedUpload(
+	deps: Dependencies,
+	event: RealtimeFileEvent,
+	sha256: string,
+	recordDecision: (reason: string) => void,
+): Promise<UploadCausalReceipt | null> {
+	const baseline = deps.indexManager.getLocalIndex().files[event.path];
+	const skip = (reason: string) => {
+		recordDecision(reason);
+		return null;
+	};
+	if (!deps.readCanonical) {
+		return skip("no-canonical-reader");
+	}
+	if (event.mutationId || event.mutationSeq !== undefined) {
+		return skip("allocated-mutation");
+	}
+	if (event.superseded) {
+		return skip("superseded-event");
+	}
+	if (!baseline || baseline.deleted) {
+		return skip("missing-baseline");
+	}
+	if (baseline.sha256 !== sha256) {
+		return skip("local-content-differs");
+	}
+	if (
+		typeof baseline.changedRevision !== "number" ||
+		typeof baseline.mutationSeq !== "number"
+	) {
+		return skip("incomplete-causal-baseline");
+	}
+	if (deps.indexManager.hasPendingCanonicalChanges()) {
+		return skip("pending-canonical-work");
+	}
+	const matches = (index: SyncIndex) => {
+		const current = index.files[event.path];
+		return (
+			!index.maintenance &&
+			!Object.values(index.moves).some((move) => move.pending) &&
+			index.epoch === event.epoch &&
+			index.epoch === deps.indexManager.getObservedEpoch() &&
+			current &&
+			!current.deleted &&
+			current.sha256 === sha256 &&
+			current.changedRevision === baseline.changedRevision &&
+			current.lastModifiedBy === baseline.lastModifiedBy &&
+			current.mutationSeq === baseline.mutationSeq
+		);
+	};
+	const canonical = await deps.readCanonical();
+	if (!matches(canonical)) {
+		return skip("canonical-identity-differs");
+	}
+	const client = deps.fileOperations.yandexClient;
+	const remotePath = joinPath(deps.settings.remotePath, event.path);
+	const resource = await client.getLogicalResource(remotePath);
+	const fingerprint = getStableContentFingerprint(resource);
+	const physicalMatches =
+		resource &&
+		isHashStableContentFingerprint(fingerprint) &&
+		matchesStableContentFingerprint(fingerprint, resource) &&
+		canonical.files[event.path]?.remoteFingerprint ===
+			(resource.sha256 ?? resource.md5);
+	if (!physicalMatches) {
+		const snapshot = await client.downloadStableLogicalFile(remotePath);
+		if (!snapshot || (await computeSha256(snapshot.content)) !== sha256) {
+			return skip("physical-content-differs");
+		}
+	}
+	const guard = await deps.getSyncGuardResult(
+		false,
+		deps.realtimeGuardValidationToken,
+	);
+	if (guard.blockReason) {
+		recordDecision("guard-blocked");
+		deps.setBlockedState(guard.blockReason);
+		throw new Error(guard.blockReason);
+	}
+	const latest = await deps.readCanonical();
+	deps.assertCurrent?.();
+	if (!matches(latest)) {
+		return skip("canonical-changed-during-check");
+	}
+	if (
+		event.superseded ||
+		!deps.vaultAdapter.fileExists(event.path) ||
+		(await computeSha256(await deps.vaultAdapter.readFile(event.path))) !==
+			sha256
+	) {
+		return skip("local-changed-during-check");
+	}
+	deps.assertCurrent?.();
+	recordDecision("confirmed-unchanged");
+	return {
+		eventId: event.id,
+		path: event.path,
+		status: "confirmed-unchanged",
+		reason: "idempotent",
+		epoch: latest.epoch,
+		canonicalRevision: latest.revision,
+		sha256,
+	};
+}
+
 /** Snapshot current watcher events and retain causal receipts before physical application. */
 async function prepareRealtimeEvents(
 	deps: Dependencies,
@@ -628,6 +768,7 @@ async function prepareRealtimeEvents(
 	batchResult: RealtimeBatchResult,
 ): Promise<{ prepared: PreparedRealtimeItem[]; consumed: number }> {
 	const prepared: PreparedRealtimeItem[] = [];
+	const unchangedDecisions: Record<string, number> = {};
 	let consumed = 0;
 	let retainedBytes = 0;
 	for (const event of events) {
@@ -763,6 +904,21 @@ async function prepareRealtimeEvents(
 					break;
 				}
 				const sha256 = await computeSha256(content);
+				const unchanged = await confirmUnchangedUpload(
+					deps,
+					event,
+					sha256,
+					(reason) => {
+						unchangedDecisions[reason] =
+							(unchangedDecisions[reason] ?? 0) + 1;
+					},
+				);
+				if (unchanged) {
+					event.snapshotSha256 = sha256;
+					batchResult.uploadReceipts.push(unchanged);
+					batchResult.completed.push(event.id);
+					continue;
+				}
 				retainedBytes += content.byteLength;
 				const mutation =
 					reusePendingFileMutation(deps, event, "put", sha256) ??
@@ -854,6 +1010,11 @@ async function prepareRealtimeEvents(
 					epoch: event.epoch,
 					baseRevision: event.baseRevision,
 				}),
+		});
+	}
+	if (Object.keys(unchangedDecisions).length > 0) {
+		logger.info("Realtime unchanged checks completed", {
+			decisions: unchangedDecisions,
 		});
 	}
 	return { prepared, consumed };

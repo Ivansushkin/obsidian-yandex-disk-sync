@@ -1,3 +1,4 @@
+import type { RemoteAuthorityObservation } from "./canonical/manager";
 import { VaultAdapter } from "../api/vault-adapter";
 import { YandexDiskClient } from "../api/yandex-client";
 import type { FailureSummary, RetryProgress } from "../errors";
@@ -12,7 +13,12 @@ import type {
 } from "../types";
 import { INITIAL_SYNC_STATE } from "../types";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
-import { IndexManager } from "./canonical/manager";
+import {
+	IndexManager,
+	type CanonicalReadSession,
+	type StartupReadSession,
+	type EncryptionManifestRead,
+} from "./canonical/manager";
 import type {
 	ExternalSyncBlock,
 	ExternalSyncBlockKind,
@@ -52,6 +58,7 @@ import * as encryptionRewrite from "./workflows/encryption-rewrite";
 import * as forceSync from "./workflows/force";
 import {
 	applyForceReplacement,
+	resumeForceReplacement,
 	type ForceReplacementDependencies,
 	type ForceReplacementPorts,
 } from "./workflows/force-replacement";
@@ -87,6 +94,7 @@ export class SyncEngine {
 	>();
 	private isSyncing = false;
 	private isPaused = false;
+	private pauseGeneration = 0;
 	private coordinator: SyncCoordinator;
 	private uiOwnerSessionId: string | null = null;
 	private expectedWatcherEvents = new Map<string, number>();
@@ -125,6 +133,7 @@ export class SyncEngine {
 		vaultAdapter: VaultAdapter,
 		indexManager: IndexManager,
 		settings: YandexDiskSyncSettings,
+		private readonly isStopped: () => boolean = () => false,
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
@@ -193,6 +202,8 @@ export class SyncEngine {
 				return readPorts().retireWatcherEvents;
 			},
 			expectWatcherEvent: this.workflowWatcherEvent,
+			progress: (phase, completed, total) =>
+				this.setSyncPhase(phase, undefined, { completed, total }),
 		};
 	}
 
@@ -587,10 +598,21 @@ export class SyncEngine {
 		});
 	}
 
+	/** Capture cancellation across startup reads before coordinator admission, including pause/resume ABA. */
+	createReadLifetimeGuard(): () => void {
+		const generation = this.pauseGeneration;
+		return () => {
+			if (this.isStopped() || this.pauseGeneration !== generation) {
+				throw new Error("Read invocation interrupted");
+			}
+		};
+	}
+
 	/**
 	 * Pause synchronization
 	 */
 	pause(): void {
+		this.pauseGeneration++;
 		this.isPaused = true;
 		this.updateState({
 			status: "paused",
@@ -644,27 +666,90 @@ export class SyncEngine {
 	/**
 	 * Perform full synchronization
 	 */
-	async fullSync(options?: SyncRunOptions): Promise<SyncResult> {
+	async fullSync(
+		options?: SyncRunOptions,
+		startupReads?: StartupReadSession,
+	): Promise<SyncResult> {
+		const pendingForce = this.forceReplacementPorts?.getRecovery?.();
+		if (pendingForce?.direct) {
+			options = {
+				...options,
+				forceReplacement: {
+					plan: await resumeForceReplacement(
+						this.forceReplacementDependencies(),
+						pendingForce,
+					),
+					backupMode: pendingForce.backupMode,
+					continuing: true,
+				},
+			};
+		}
 		const adoption: fullSync.FullSyncContext = {
 			adoptionSnapshot: null,
 			adoptedEpoch: null,
 		};
+		const invocationPauseGeneration = this.pauseGeneration;
 		const run = async () => {
+			let readSession: CanonicalReadSession | undefined = startupReads;
+			const assertCurrent = () => readSession?.assertCurrent();
+			const sessionId = this.coordinator.getActiveSession()?.id;
+			startupReads?.bind(() => {
+				if (
+					this.isStopped() ||
+					this.isPaused ||
+					this.pauseGeneration !== invocationPauseGeneration ||
+					this.coordinator.getActiveSession()?.id !== sessionId
+				) {
+					throw new Error("Full startup read session interrupted");
+				}
+			});
 			try {
 				const result = await this.runSyncSession(
 					options,
 					async (result, startTime, validationToken) => {
-						return await fullSync.reconcileFullSync(
-							this.fullSyncDependencies(),
-							options,
-							adoption,
-							result,
-							startTime,
+						if (options?.forceReplacement?.plan.recovery.direct) {
+							const applied = await applyForceReplacement(
+								this.forceReplacementDependencies(),
+								options.forceReplacement.plan,
+								options.forceReplacement.backupMode,
+							);
+							result.uploaded += applied.uploaded;
+							result.downloaded += applied.downloaded;
+							result.deleted += applied.deleted;
+							result.errors.push(...applied.errors);
+							if (!applied.completed) {
+								return;
+							}
+							result.replacementCommitted = true;
+						}
+						const deps = this.fullSyncDependencies(
 							validationToken,
+							!options?.forceReplacement &&
+								!options?.skipMaintenanceGuard &&
+								!options?.skipEncryptionGuard,
+							startupReads,
 						);
+						readSession = deps.canonicalReadSession;
+						const reconcile = () =>
+							fullSync.reconcileFullSync(
+								deps,
+								options,
+								adoption,
+								result,
+								startTime,
+								validationToken,
+							);
+						return await (deps.canonicalReadSession
+							? this.yandexClient.withWriteGuard(
+									assertCurrent,
+									reconcile,
+								)
+							: reconcile());
 					},
 					(result) =>
 						`Full reconciliation completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, conflicts ${result.conflicts}, errors ${result.errors.length}`,
+					startupReads,
+					assertCurrent,
 				);
 				if (adoption.adoptionSnapshot && !result.success) {
 					fullSync.restoreAdoptionSnapshot(
@@ -746,15 +831,16 @@ export class SyncEngine {
 				options,
 				async (result, _startTime, validationToken) => {
 					if (options?.forceReplacement) {
-						await applyForceReplacement(
+						const applied = await applyForceReplacement(
 							this.forceReplacementDependencies(),
 							options.forceReplacement.plan,
 							options.forceReplacement.backupMode,
 						);
-						result.replacementCommitted = true;
+						result.replacementCommitted = applied.completed;
 						result.epochAdopted = true;
-						result.uploaded =
-							options.forceReplacement.plan.recovery.source.length;
+						result.uploaded = applied.uploaded;
+						result.deleted = applied.deleted;
+						result.errors.push(...applied.errors);
 						return;
 					}
 					return await forceSync.reconcileForceLocal(
@@ -787,15 +873,16 @@ export class SyncEngine {
 				options,
 				async (result) => {
 					if (options?.forceReplacement) {
-						await applyForceReplacement(
+						const applied = await applyForceReplacement(
 							this.forceReplacementDependencies(),
 							options.forceReplacement.plan,
 							options.forceReplacement.backupMode,
 						);
-						result.replacementCommitted = true;
+						result.replacementCommitted = applied.completed;
 						result.epochAdopted = true;
-						result.downloaded =
-							options.forceReplacement.plan.recovery.source.length;
+						result.downloaded = applied.downloaded;
+						result.deleted = applied.deleted;
+						result.errors.push(...applied.errors);
 						return;
 					}
 					return await forceSync.reconcileForceRemote(
@@ -914,9 +1001,15 @@ export class SyncEngine {
 							windowsSettled = true;
 						},
 					);
-					return await realtimeSync.reconcileRealtimeBatch(
-						deps,
-						events,
+					const lifetime =
+						this.indexManager.createCanonicalReadSession(
+							this.createReadLifetimeGuard(),
+						);
+					deps.readCanonical = lifetime;
+					deps.assertCurrent = () => lifetime.assertCurrent();
+					return await this.yandexClient.withWriteGuard(
+						() => lifetime.assertCurrent(),
+						() => realtimeSync.reconcileRealtimeBatch(deps, events),
 					);
 				},
 				{
@@ -952,9 +1045,10 @@ export class SyncEngine {
 				"realtime",
 				() => {
 					this.setSyncPhase("applying", t("status.op.renaming_file"));
-					return renameBatchNow(
-						this.fileRenameDependencies(),
-						events,
+					const deps = this.fileRenameDependencies();
+					return this.yandexClient.withWriteGuard(
+						deps.assertActive,
+						() => renameBatchNow(deps, events),
 					);
 				},
 				{
@@ -990,11 +1084,16 @@ export class SyncEngine {
 				"realtime",
 				() => {
 					this.setSyncPhase("applying", t("status.op.renaming_file"));
-					return fileRename.renameFileNow(
-						this.fileRenameDependencies(),
-						oldPath,
-						newPath,
-						context,
+					const deps = this.fileRenameDependencies();
+					return this.yandexClient.withWriteGuard(
+						deps.assertActive,
+						() =>
+							fileRename.renameFileNow(
+								deps,
+								oldPath,
+								newPath,
+								context,
+							),
 					);
 				},
 				{
@@ -1179,9 +1278,12 @@ export class SyncEngine {
 	private async notifySyncFinalizeCallbacks(
 		context: SyncLifecycleContext,
 		result: SyncResult,
+		assertCurrent?: () => void,
 	): Promise<void> {
 		for (const callback of this.syncFinalizeCallbacks) {
+			assertCurrent?.();
 			await callback(context, result);
+			assertCurrent?.();
 		}
 	}
 
@@ -1221,6 +1323,8 @@ export class SyncEngine {
 			validationToken?: string,
 		) => Promise<void>,
 		logMessage: (result: SyncResult) => string,
+		startupReads?: StartupReadSession,
+		assertCurrent?: () => void,
 	): Promise<SyncResult> {
 		if (
 			this.coordinator.getActiveKind() === "maintenance" &&
@@ -1245,6 +1349,7 @@ export class SyncEngine {
 		const result = this.createEmptyResult(startTime);
 		const lifecycleContext = this.getSyncLifecycleContext();
 		const apiReadsBefore = this.yandexClient.getApiReadMetrics?.();
+		const transportBefore = this.yandexClient.getTransportMetrics?.();
 		this.isSyncing = true;
 		let resumeAttempted = false;
 
@@ -1256,8 +1361,9 @@ export class SyncEngine {
 			);
 			this.setSyncPhase("validating");
 			const guard =
-				this.coordinator.getActiveKind() === "force" &&
-				options?.forceReplacement
+				options?.forceReplacement?.plan.recovery.direct ||
+				(this.coordinator.getActiveKind() === "force" &&
+					options?.forceReplacement)
 					? {
 							blockReason: null,
 							validationToken: undefined,
@@ -1269,6 +1375,10 @@ export class SyncEngine {
 							options?.skipEncryptionGuard,
 							undefined,
 							options?.validateThroughExternalEncryptionBlock,
+							undefined,
+							startupReads
+								? await startupReads.manifest()
+								: undefined,
 						);
 			if (guard.blockReason) {
 				result.errors.push({
@@ -1288,7 +1398,11 @@ export class SyncEngine {
 			}
 
 			if (result.errors.length === 0) {
-				if (result.epochAdopted) {
+				assertCurrent?.();
+				if (
+					result.epochAdopted &&
+					!options?.forceReplacement?.plan.recovery.direct
+				) {
 					await this.indexManager.assertCanonicalEpoch(
 						this.indexManager.getRemoteIndex().epoch,
 					);
@@ -1297,7 +1411,9 @@ export class SyncEngine {
 				await this.notifySyncFinalizeCallbacks(
 					lifecycleContext,
 					result,
+					assertCurrent,
 				);
+				assertCurrent?.();
 			}
 			result.success = result.errors.length === 0;
 			if (result.success) {
@@ -1333,7 +1449,11 @@ export class SyncEngine {
 				...this.getDiagnosticSnapshot(),
 				failure: result.failure,
 				durationMs: result.endTime - startTime,
-				apiReads: this.diffApiReadMetrics(
+				transport: this.diffRequestMetrics(
+					transportBefore,
+					this.yandexClient.getTransportMetrics?.(),
+				),
+				apiReads: this.diffRequestMetrics(
 					apiReadsBefore,
 					this.yandexClient.getApiReadMetrics?.(),
 				),
@@ -1360,8 +1480,7 @@ export class SyncEngine {
 			if (
 				this.coordinator.getActiveKind() === "force" &&
 				options?.forceReplacement &&
-				this.indexManager.getRemoteIndex().epoch ===
-					options.forceReplacement.plan.recovery.epoch
+				options.forceReplacement.plan.recovery.completion !== null
 			) {
 				result.replacementCommitted = true;
 			}
@@ -1387,7 +1506,11 @@ export class SyncEngine {
 			logger.error("Critical synchronization error:", {
 				...this.getDiagnosticSnapshot(),
 				durationMs: result.endTime - startTime,
-				apiReads: this.diffApiReadMetrics(
+				transport: this.diffRequestMetrics(
+					transportBefore,
+					this.yandexClient.getTransportMetrics?.(),
+				),
+				apiReads: this.diffRequestMetrics(
 					apiReadsBefore,
 					this.yandexClient.getApiReadMetrics?.(),
 				),
@@ -1413,6 +1536,7 @@ export class SyncEngine {
 		const canonical = this.indexManager.getRemoteIndex();
 		const maintenance = this.indexManager.getMaintenance();
 		return {
+			transportTotal: this.yandexClient.getTransportMetrics?.(),
 			epoch: shortenDiagnosticValue(canonical.epoch),
 			observedEpoch: shortenDiagnosticValue(local.observedEpoch),
 			observedRevision: local.observedRevision,
@@ -1431,20 +1555,19 @@ export class SyncEngine {
 		};
 	}
 
-	private diffApiReadMetrics(
-		before?: ReturnType<YandexDiskClient["getApiReadMetrics"]>,
-		after?: ReturnType<YandexDiskClient["getApiReadMetrics"]>,
-	): ReturnType<YandexDiskClient["getApiReadMetrics"]> | undefined {
+	private diffRequestMetrics(
+		before?: Record<string, number>,
+		after?: Record<string, number>,
+	): Record<string, number> | undefined {
 		if (!before || !after) {
 			return undefined;
 		}
-		return {
-			manifest: after.manifest - before.manifest,
-			index: after.index - before.index,
-			root: after.root - before.root,
-			tree: after.tree - before.tree,
-			other: after.other - before.other,
-		};
+		return Object.fromEntries(
+			Object.entries(after).map(([key, value]) => [
+				key,
+				value - (before[key] ?? 0),
+			]),
+		);
 	}
 
 	/** Consume the one-shot request emitted by a realtime epoch replacement. */
@@ -1474,6 +1597,8 @@ export class SyncEngine {
 		skipGuard?: boolean,
 		validationToken?: string,
 		validateThroughExternalBlock = false,
+		observation?: RemoteAuthorityObservation,
+		manifestRead?: EncryptionManifestRead,
 	): Promise<SyncGuardResult> {
 		const external = this.getHighestPriorityExternalBlock((block) => {
 			if (
@@ -1504,11 +1629,17 @@ export class SyncEngine {
 		if (!this.syncGuardCallback) {
 			return { blockReason: null };
 		}
-		return await this.syncGuardCallback(validationToken);
+		return await this.syncGuardCallback(
+			validationToken,
+			observation,
+			manifestRead,
+		);
 	}
 
 	private getExternalBlockCode(kind: ExternalSyncBlockKind): string {
 		switch (kind) {
+			case "force":
+				return "force-recovery-pending";
 			case "local-state":
 				return "local-state-blocked";
 			case "migration":
@@ -1539,6 +1670,7 @@ export class SyncEngine {
 	): ExternalSyncBlock | null {
 		for (const kind of [
 			"local-state",
+			"force",
 			"historical",
 			"authentication",
 			"encryption",
@@ -1577,12 +1709,22 @@ export class SyncEngine {
 	private readonly workflowPhase = this.setSyncPhase.bind(this);
 	private readonly workflowProgress = this.reportProgress.bind(this);
 
-	private fileOperationsDependencies(): fileOperations.Dependencies {
+	private fileOperationsDependencies(
+		canonicalReadSession?: CanonicalReadSession,
+		validationToken?: string,
+	): fileOperations.Dependencies {
 		const getSettings = () => this.settings;
 		const getIsPaused = () => this.isPaused;
 		return {
-			getSyncGuardResult: (validationToken) =>
-				this.getSyncGuardResult(false, validationToken),
+			canonicalReadSession,
+			validationToken,
+			getSyncGuardResult: (validationToken, observation) =>
+				this.getSyncGuardResult(
+					false,
+					validationToken,
+					false,
+					observation,
+				),
 			vaultAdapter: this.vaultAdapter,
 			yandexClient: this.yandexClient,
 			get settings() {
@@ -1712,11 +1854,33 @@ export class SyncEngine {
 		};
 	}
 
-	private fullSyncDependencies(): fullSync.Dependencies {
+	private fullSyncDependencies(
+		validationToken?: string,
+		reuseCanonical = false,
+		startupReads?: StartupReadSession,
+	): fullSync.Dependencies {
+		const sessionId = this.coordinator.getActiveSession()?.id;
+		const pauseGeneration = this.pauseGeneration;
+		const canonicalReadSession = reuseCanonical
+			? (startupReads ??
+				this.indexManager.createCanonicalReadSession(() => {
+					if (
+						this.isStopped() ||
+						this.isPaused ||
+						this.pauseGeneration !== pauseGeneration ||
+						this.coordinator.getActiveSession()?.id !== sessionId
+					) {
+						throw new Error(
+							"Full canonical read session interrupted",
+						);
+					}
+				}))
+			: undefined;
 		const getSettings = () => this.settings;
 		const getIndexSaveCallback = () => this.indexSaveCallback;
 		const getIsPaused = () => this.isPaused;
 		return {
+			canonicalReadSession,
 			decideEpochAdoption: (epoch) =>
 				this.epochAdoptionDecision?.(epoch) ?? Promise.resolve(null),
 			indexManager: this.indexManager,
@@ -1734,7 +1898,10 @@ export class SyncEngine {
 				return getIsPaused();
 			},
 			getSyncGuardResult: this.workflowGuard,
-			fileOperations: this.fileOperationsDependencies(),
+			fileOperations: this.fileOperationsDependencies(
+				canonicalReadSession,
+				validationToken,
+			),
 			syncReconciliation: this.syncReconciliationDependencies(),
 		};
 	}
@@ -1780,6 +1947,9 @@ export class SyncEngine {
 	}
 
 	private fileRenameDependencies(): fileRename.Dependencies {
+		const lifetime = this.indexManager.createCanonicalReadSession(
+			this.createReadLifetimeGuard(),
+		);
 		const getRealtimeGuardValidationToken = () =>
 			this.realtimeGuardValidationToken;
 		const getEpochReplacementPending = () => this.epochReplacementPending;
@@ -1796,6 +1966,7 @@ export class SyncEngine {
 			this.epochReplacementPending = value;
 		};
 		return {
+			assertActive: () => lifetime.assertCurrent(),
 			getWatcherCausalContext: () => this.getWatcherCausalContext(),
 			vaultAdapter: this.vaultAdapter,
 			getSyncGuardResult: this.workflowGuard,

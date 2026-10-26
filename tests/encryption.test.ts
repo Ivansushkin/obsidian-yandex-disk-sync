@@ -24,11 +24,7 @@ test("AES-SIV matches the RFC 5297 deterministic vector", () => {
 const salt = new Uint8Array(SALT_LENGTH).fill(11);
 const password = "hardened-password";
 
-/** Derive independent test keys to construct authenticated malformed payloads. */
-async function deriveTestKey(
-	domain: string,
-	bits: number,
-): Promise<ArrayBuffer> {
+const testMasterKey = (async () => {
 	const passwordKey = await crypto.subtle.importKey(
 		"raw",
 		new TextEncoder().encode(password),
@@ -41,13 +37,16 @@ async function deriveTestKey(
 		passwordKey,
 		256,
 	);
-	const masterKey = await crypto.subtle.importKey(
-		"raw",
-		masterBytes,
-		"HKDF",
-		false,
-		["deriveBits"],
-	);
+	return crypto.subtle.importKey("raw", masterBytes, "HKDF", false, [
+		"deriveBits",
+	]);
+})();
+
+/** Derive independent oracle keys without repeating the expensive password KDF. */
+async function deriveTestKey(
+	domain: string,
+	bits: number,
+): Promise<ArrayBuffer> {
 	return crypto.subtle.deriveBits(
 		{
 			name: "HKDF",
@@ -57,7 +56,7 @@ async function deriveTestKey(
 				`obsidian-yandex-disk-sync:${domain}`,
 			),
 		},
-		masterKey,
+		await testMasterKey,
 		bits,
 	);
 }
@@ -88,24 +87,20 @@ test("hardened encryption round-trips content and deterministic Unicode filename
 		const second = await service.encryptFilename(filename);
 		assert.equal(first, second);
 		assert.equal(await service.decryptFilename(first), filename);
-	}
-});
-
-test("hardened filename ciphertext does not expose the legacy public IV", async () => {
-	const service = await hardenedServicePromise;
-	const filename = "guessable.md";
-	const encrypted = EncryptionService.base64UrlDecode(
-		await service.encryptFilename(filename),
-	);
-	const legacyPublicIv = new Uint8Array(
-		await crypto.subtle.digest(
-			"SHA-256",
-			new TextEncoder().encode(
-				`${filename}:iv:${EncryptionService.bytesToBase64(salt)}`,
+		const legacyPublicIv = new Uint8Array(
+			await crypto.subtle.digest(
+				"SHA-256",
+				new TextEncoder().encode(
+					`${filename}:iv:${EncryptionService.bytesToBase64(salt)}`,
+				),
 			),
-		),
-	).slice(0, 12);
-	assert.notDeepEqual(encrypted.slice(0, 12), legacyPublicIv);
+		).slice(0, 12);
+		assert.notDeepEqual(
+			EncryptionService.base64UrlDecode(first).slice(0, 12),
+			legacyPublicIv,
+			filename,
+		);
+	}
 });
 
 test("hardened verifier uses the unnumbered verifier and content-key domains", async () => {
@@ -131,35 +126,34 @@ test("hardened verifier uses the unnumbered verifier and content-key domains", a
 	);
 });
 
-test("encrypted filenames fail closed on invalid paths and ciphertext", async () => {
+test("encrypted filenames reject unsafe paths, tampering and authenticated invalid UTF-8", async () => {
 	const service = await hardenedServicePromise;
 	for (const invalid of ["", ".", "..", "a/b", "a\\b", "a\0b"]) {
-		await assert.rejects(service.encryptFilename(invalid));
+		await assert.rejects(
+			service.encryptFilename(invalid),
+			Error,
+			JSON.stringify(invalid),
+		);
 	}
-	await assert.rejects(service.decryptFilename("not+base64url"));
-	const valid = EncryptionService.base64UrlDecode(
+	const tampered = EncryptionService.base64UrlDecode(
 		await service.encryptFilename("safe.md"),
 	);
-	valid[valid.length - 1] = valid[valid.length - 1]! ^ 1;
-	await assert.rejects(
-		service.decryptFilename(EncryptionService.base64UrlEncode(valid)),
-	);
-});
-
-test("hardened filename decryption rejects authenticated invalid UTF-8", async () => {
-	const filenameKey = new Uint8Array(
-		await deriveTestKey("filename-key", 512),
-	);
+	tampered[tampered.length - 1]! ^= 1;
 	const invalidUtf8 = aessiv(
-		filenameKey,
+		new Uint8Array(await deriveTestKey("filename-key", 512)),
 		new TextEncoder().encode("obsidian-yandex-disk-sync:filename"),
 	).encrypt(new Uint8Array([0xff]));
-	await assert.rejects(
-		(await hardenedServicePromise).decryptFilename(
+	for (const [label, ciphertext, error] of [
+		["noncanonical encoding", "not+base64url", /Base64URL/],
+		["modified tag", EncryptionService.base64UrlEncode(tampered), Error],
+		[
+			"authenticated invalid UTF-8",
 			EncryptionService.base64UrlEncode(invalidUtf8),
-		),
-		/encoded data|encoding/i,
-	);
+			/encoded data|encoding/i,
+		],
+	] as const) {
+		await assert.rejects(service.decryptFilename(ciphertext), error, label);
+	}
 });
 
 test("hardened codec rejects content and filename ciphertext from numbered historical domains", async () => {

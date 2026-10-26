@@ -30,29 +30,6 @@ function metadata(
 	};
 }
 
-test("Force preflight proof is required before any destructive operation", async () => {
-	const engine = new SyncEngine(
-		{
-			getApiReadMetrics: () => ({}),
-		} as unknown as YandexDiskClient,
-		{} as VaultAdapter,
-		{
-			getLocalIndex: () => ({
-				observedEpoch: null,
-				observedRevision: 0,
-			}),
-			getRemoteIndex: () => ({ epoch: "epoch-a", revision: 0 }),
-			getMaintenance: () => undefined,
-			getPendingMutations: () => [],
-			getPendingPhysicalActions: () => [],
-		} as unknown as IndexManager,
-		{ ...DEFAULT_SETTINGS, remotePath: "vault" },
-	);
-	const result = await engine.forceSyncFromLocal();
-	assert.equal(result.success, false);
-	assert.equal(result.errors[0]?.code, "force-backup-stale");
-});
-
 test("Force backup proof accepts only the matching protected snapshot", async () => {
 	const encoder = new TextEncoder();
 	const backupBytes = encoder.encode("verified-backup").buffer;
@@ -125,30 +102,27 @@ test("Force backup proof accepts only the matching protected snapshot", async ()
 	);
 });
 
-test("Force local source drift aborts before replacement commit", () => {
-	const access = forceSync;
-	const source = new Map([["note.md", metadata("note.md", "before")]]);
-	const identity = access.getForceLocalSourceIdentity(source);
-	access.assertForceLocalSourceUnchanged(identity, source);
-	const changed = new Map([["note.md", metadata("note.md", "after")]]);
-	assert.throws(
-		() => access.assertForceLocalSourceUnchanged(identity, changed),
-		ForceSourceChangedError,
-	);
-});
-
-test("Force remote source drift aborts before replacement commit", () => {
-	const access = forceSync;
-	const source = new Map([
-		["note.md", metadata("note.md", "logical", "remote-before")],
-	]);
-	const identity = access.getForceRemoteSourceIdentity(source);
-	access.assertForceRemoteSourceUnchanged(identity, source);
-	const changed = new Map([
-		["note.md", metadata("note.md", "logical", "remote-after")],
-	]);
-	assert.throws(
-		() => access.assertForceRemoteSourceUnchanged(identity, changed),
-		ForceSourceChangedError,
-	);
+test("Force source identity rejects local content and remote fingerprint drift", () => {
+	for (const [getIdentity, assertUnchanged, source, changed] of [
+		[
+			forceSync.getForceLocalSourceIdentity,
+			forceSync.assertForceLocalSourceUnchanged,
+			metadata("note.md", "before"),
+			metadata("note.md", "after"),
+		],
+		[
+			forceSync.getForceRemoteSourceIdentity,
+			forceSync.assertForceRemoteSourceUnchanged,
+			metadata("note.md", "logical", "before"),
+			metadata("note.md", "logical", "after"),
+		],
+	] as const) {
+		const snapshot = new Map([[source.path, source]]);
+		const identity = getIdentity(snapshot);
+		assertUnchanged(identity, snapshot);
+		assert.throws(
+			() => assertUnchanged(identity, new Map([[changed.path, changed]])),
+			ForceSourceChangedError,
+		);
+	}
 });

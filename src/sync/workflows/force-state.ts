@@ -1,5 +1,5 @@
 import { validateEncryptionModeDescriptor } from "../canonical/schema";
-import { isRootIndexLockPath } from "../../utils/path-utils";
+import { assertForcePath, isRootIndexLockPath } from "../../utils/path-utils";
 import type {
 	EncryptionManifest,
 	EncryptionModeDescriptor,
@@ -20,8 +20,30 @@ export interface ForceSourceFile {
 	fingerprint: string | null;
 }
 
+/** Direct replacement progress is local; no locks or payload files are created remotely. */
+export interface DirectForceCheckpoint {
+	format: "direct-v1";
+	configDir: string;
+	stage: "purging" | "copying" | "publishing";
+	directories: { path: string; rawPath: string }[];
+	pendingDeletes: {
+		path: string;
+		location: "local" | "remote";
+		kind: "file" | "dir";
+	}[];
+	pendingFiles: string[];
+	pendingDirectories: string[];
+	canonicalReset: boolean;
+}
+
 /** Durable source identities and authority; credentials remain exclusively in local plugin data. */
 export interface ForceRecovery {
+	direct?: DirectForceCheckpoint;
+	completion: {
+		epoch: string;
+		revision: number;
+		canonicalSha256: string;
+	} | null;
 	password: string | null;
 	id: string;
 	direction: ForceDirection;
@@ -59,6 +81,7 @@ export function assertForceRecovery(
 	}
 	const state = value as ForceRecovery;
 	const keys = [
+		"completion",
 		"password",
 		"id",
 		"direction",
@@ -79,6 +102,13 @@ export function assertForceRecovery(
 		"targetHashes",
 		"files",
 	];
+	if ("direct" in state) {
+		keys.push("direct");
+		assertDirectCheckpoint(state.direct);
+	}
+	const assertPath = state.direct
+		? assertForcePath
+		: (path: string) => assertSafeTransitionPath(path, "Force");
 	if (
 		Object.keys(value).length !== keys.length ||
 		!keys.every((key) => key in value) ||
@@ -117,6 +147,20 @@ export function assertForceRecovery(
 	) {
 		throw new Error("Invalid Force archive proof");
 	}
+	if (
+		state.completion !== null &&
+		(!state.completion ||
+			typeof state.completion !== "object" ||
+			Array.isArray(state.completion) ||
+			Object.keys(state.completion).length !== 3 ||
+			state.completion.epoch !== state.epoch ||
+			!Number.isSafeInteger(state.completion.revision) ||
+			state.completion.revision < 1 ||
+			!/^[a-f0-9]{64}$/.test(state.completion.canonicalSha256) ||
+			state.phase !== "cleanup")
+	) {
+		throw new Error("Invalid Force completion receipt");
+	}
 	validateEncryptionModeDescriptor(state.target, "Force target");
 	assertForceManifest(state);
 	if (
@@ -133,8 +177,8 @@ export function assertForceRecovery(
 	const rawPaths = new Set<string>();
 	const paths = new Set<string>();
 	for (const file of state.source) {
-		assertSafeTransitionPath(file.path, "Force source");
-		assertSafeTransitionPath(file.rawPath, "Force raw source");
+		assertPath(file.path);
+		assertPath(file.rawPath);
 		if (
 			Object.keys(file).length !== 6 ||
 			paths.has(file.path) ||
@@ -158,7 +202,7 @@ export function assertForceRecovery(
 		throw new Error("Invalid Force target proofs");
 	}
 	for (const [path, hash] of Object.entries(state.targetHashes)) {
-		assertSafeTransitionPath(path, "Force target hash");
+		assertPath(path);
 		if (!/^[a-f0-9]{64}$/.test(hash)) {
 			throw new Error("Invalid Force target hash");
 		}
@@ -195,6 +239,63 @@ export function assertForceRecovery(
 		) {
 			throw new Error("Invalid Force cleanup proof");
 		}
+	}
+}
+
+/** Reject malformed direct checkpoints rather than widening the scope of old recovery. */
+function assertDirectCheckpoint(
+	value: unknown,
+): asserts value is DirectForceCheckpoint {
+	const state = value as DirectForceCheckpoint | undefined;
+	const keys = [
+		"format",
+		"configDir",
+		"stage",
+		"directories",
+		"pendingDeletes",
+		"pendingFiles",
+		"pendingDirectories",
+		"canonicalReset",
+	];
+	if (
+		!state ||
+		Object.keys(state).length !== keys.length ||
+		!keys.every((key) => key in state) ||
+		state.format !== "direct-v1" ||
+		typeof state.configDir !== "string" ||
+		!["purging", "copying", "publishing"].includes(state.stage) ||
+		typeof state.canonicalReset !== "boolean" ||
+		!Array.isArray(state.directories) ||
+		!Array.isArray(state.pendingDeletes) ||
+		!Array.isArray(state.pendingFiles) ||
+		!Array.isArray(state.pendingDirectories)
+	) {
+		throw new Error("Invalid direct Force checkpoint");
+	}
+	assertForcePath(state.configDir);
+	for (const directory of state.directories) {
+		if (!directory || Object.keys(directory).length !== 2) {
+			throw new Error("Invalid Force source directory");
+		}
+		assertForcePath(directory.path);
+		assertForcePath(directory.rawPath);
+	}
+	for (const entry of state.pendingDeletes) {
+		if (
+			!entry ||
+			Object.keys(entry).length !== 3 ||
+			!["local", "remote"].includes(entry.location) ||
+			!["file", "dir"].includes(entry.kind)
+		) {
+			throw new Error("Invalid Force deletion");
+		}
+		assertForcePath(entry.path);
+		if (entry.path === ".backup" || entry.path.startsWith(".backup/")) {
+			throw new Error("Force cannot delete backups");
+		}
+	}
+	for (const path of [...state.pendingFiles, ...state.pendingDirectories]) {
+		assertForcePath(path);
 	}
 }
 
@@ -259,4 +360,15 @@ function matchesParameters(
 			([key, entry]) => (value as Record<string, unknown>)[key] === entry,
 		)
 	);
+}
+
+/** Uncertain Force state requires explicit recovery rather than encryption authentication. */
+export class ForceRecoveryPendingError extends Error {
+	readonly code = "force-recovery-pending";
+	constructor(
+		message = "Force recovery is pending; continue the saved operation or explicitly confirm a new replacement",
+	) {
+		super(message);
+		this.name = "ForceRecoveryPendingError";
+	}
 }

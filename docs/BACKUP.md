@@ -86,23 +86,21 @@ Password policy:
 - объект отсутствует или bytes отличаются — имя считается collision, создаётся
   новое random имя; существующий объект не перезаписывается.
 
-Перед Force и enable/disable/rotate пользователь выбирает `with-backup`,
-`without-backup` или `cancel` на один запуск. Обычный sync сохраняет обязательные
-protective copies; transition archive не заменяет его политику сохранности. Для Force явный
-`without-backup` отключает также per-file copies и старый destination snapshot;
-содержимое назначения не скачивается ради проверки старого canonical.
+Force показывает один диалог с выключенным по умолчанию выбором архива.
+При ошибке выбранного архива пользователь остаётся в том же диалоге: retry,
+отключить архив или cancel. Очистка до создания выбранного архива не начинается.
+Архив Force покрывает полное заменяемое дерево без обычных фильтров, кроме корневой
+.backup и собственных credentials/state/logs плагина. Старые удалённые копии plugin
+data пропускаются без чтения, а не блокируют Force archive.
+Local → Disk сохраняет raw remote archive; Disk → local — logical local archive.
+Обычные backup/sync и encryption transitions сохраняют прежние scope/защиту.
 
-Force local архивирует raw remote snapshot, Force remote — logical local snapshot.
-Выбранный архив проверяется по exact bytes/SHA и snapshot digest до destructive
-apply. Ошибка предлагает повтор, явное продолжение без любых копий или отмену;
-автоматического fallback нет. Архив остаётся в защищённой `.backup`.
-
-Проверенный proof и выбор сохраняются в `forceRecovery`. Recovery повторно
-проверяет существующий архив и не создаёт новый. Source проверяется независимо
-от backup choice; source read/decrypt failure никогда не означает пустой source.
-Canonical назначения не декодируется для допуска Force: его raw replacement
-принадлежит эксклюзивной транзакции IndexManager. До destructive действий
-публикуется Force intent; cleanup проверяет storage/operation/fingerprint.
+Без архива Force не скачивает старый destination ради snapshot/validation,
+не создаёт ZIP, staging, per-file protective/conflict copies или trash.
+До удаления читается источник. Direct-v1 checkpoint и новый canonical принадлежат
+существующим persistence/IndexManager; stale destination fingerprints не блокируют
+Force. Ordinary full продолжает только оставшиеся действия без нового архива.
+Старый scoped checkpoint требует нового подтверждения полного Force.
 
 `crypto/workflow.ts` запрашивает выбранный transition archive через прежний
 `BackupManager` после source preflight; claim проверяется в `crypto/maintenance.ts`.
@@ -124,7 +122,7 @@ Metadata scan и remote-raw snapshot блокируют старую remote plug
 Stable local data необратимо преобразуется в current snapshot при загрузке, после
 installation identity и до автоматизации. Ни эта запись, ни foreign epoch adoption
 не создают архив. После подтверждённого Force intent авторитетен новый epoch;
-незавершённый directed replacement продолжает отдельный Force recovery с теми же
+незавершённый direct replacement продолжает обычный full с теми же
 ID/epoch, а обычная автоматизация ждёт его завершения. Этот recovery не создаёт
 новый архив. Normal full принимает завершённое поколение по правилам epoch choice.
 

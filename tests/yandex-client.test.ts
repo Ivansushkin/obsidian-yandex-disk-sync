@@ -95,52 +95,44 @@ class StableReadClient extends YandexDiskClient {
 	}
 }
 
-test("stable raw read accepts unchanged content identity", async () => {
-	const client = new StableReadClient([
-		fileResource("vault/index", { md5: "same" }),
-		fileResource("vault/index", { md5: "same", sha256: "strong" }),
-	]);
-	const snapshot = await client.downloadStableRawFile("vault/index");
-	assert.ok(snapshot);
-	assert.equal(snapshot.fingerprint, "sha256:strong");
-	assert.equal(snapshot.raw.byteLength, 4);
-});
-
-test("stable raw read rejects content changed during download", async () => {
-	const client = new StableReadClient([
-		fileResource("vault/index", { md5: "before" }),
-		fileResource("vault/index", { md5: "after" }),
-	]);
-	await assert.rejects(
-		client.downloadStableRawFile("vault/index"),
-		/changed while being read/,
-	);
-});
-
-test("stable raw read reuses caller metadata as its before observation", async () => {
-	const before = fileResource("vault/index", { md5: "same" });
-	const client = new StableReadClient([
-		fileResource("vault/index", { md5: "same", sha256: "strong" }),
-	]);
-	const snapshot = await client.downloadStableRawFile("vault/index", before);
-	assert.ok(snapshot);
-	assert.equal(snapshot.fingerprint, "sha256:strong");
-});
-
-test("resource id alone cannot prove stable service-file content", async () => {
-	const withoutContentIdentity = {
-		...fileResource("vault/index"),
+test("stable raw reads require unchanged content identity with optional caller observations", async () => {
+	const same = fileResource("vault/index", { md5: "same" });
+	const stronger = { ...same, sha256: "strong" };
+	const changed = { ...same, md5: "after" };
+	const unprovable = {
+		...same,
+		md5: undefined,
 		modified: "",
 		resource_id: "stable-resource-id",
 	};
-	const client = new StableReadClient([
-		withoutContentIdentity,
-		withoutContentIdentity,
-	]);
-	await assert.rejects(
-		client.downloadStableRawFile("vault/index"),
-		/no stable content fingerprint/,
-	);
+	for (const [label, before, after, supplied, error] of [
+		["stronger metadata", same, stronger, false, null],
+		["caller observation", same, stronger, true, null],
+		["changed hash", same, changed, false, /changed while being read/],
+		[
+			"resource ID only",
+			unprovable,
+			unprovable,
+			false,
+			/no stable content fingerprint/,
+		],
+	] as const) {
+		const client = new StableReadClient(
+			supplied ? [after] : [before, after],
+		);
+		const read = client.downloadStableRawFile(
+			"vault/index",
+			supplied ? before : undefined,
+		);
+		if (error) {
+			await assert.rejects(read, error, label);
+		} else {
+			const snapshot = await read;
+			assert.ok(snapshot, label);
+			assert.equal(snapshot.fingerprint, "sha256:strong", label);
+			assert.equal(snapshot.raw.byteLength, 4, label);
+		}
+	}
 });
 
 class TreeClient extends YandexDiskClient {
@@ -186,55 +178,37 @@ test("remote tree uses bounded folder concurrency and skips backup", async () =>
 	assert.equal(client.maxActive, 2);
 });
 
-const cacheCases = [
-	{
-		name: "observed remote folders skip redundant mkdir",
-		puts: 0,
-		invalidate: async () => {},
-	},
-	{
-		name: "confirmed delete and credential change invalidate folder observations",
-		puts: 2,
-		invalidate: async (client: YandexDiskClient) => {
-			await client.deleteResource("vault", false, true);
-			await client.createFolder("vault");
-			client.setToken("second");
-		},
-	},
-	{
-		name: "not-found delete invalidates a cached folder observation",
-		puts: 1,
-		deleteStatus: 404,
-		invalidate: async (client: YandexDiskClient) => {
-			await client.deleteResource("vault", false, true);
-		},
-	},
-	{
-		name: "encryption codec change invalidates folder observations",
-		puts: 1,
-		invalidate: async (client: YandexDiskClient) => {
-			client.setEncryptionService({} as never);
-		},
-	},
-];
-for (const scenario of cacheCases) {
-	test(scenario.name, async () => {
+test("folder observations skip mkdir until delete or connection changes invalidate them", async () => {
+	for (const [change, expectedPuts] of [
+		["none", 0],
+		["delete and token", 2],
+		["missing delete", 1],
+		["codec", 1],
+	] as const) {
 		let puts = 0;
 		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
 			if (method === "PUT") {
 				puts++;
 			}
 			return method === "DELETE"
-				? response(scenario.deleteStatus ?? 204)
+				? response(change === "missing delete" ? 404 : 204)
 				: response(method === "PUT" ? 201 : 200, directory("vault"));
 		};
 		const client = createClient();
 		await client.getResource("vault", 1, 0, true);
-		await scenario.invalidate(client);
+		if (change === "delete and token" || change === "missing delete") {
+			await client.deleteResource("vault", false, true);
+		}
+		if (change === "delete and token") {
+			await client.createFolder("vault");
+			client.setToken("second");
+		} else if (change === "codec") {
+			client.setEncryptionService({} as never);
+		}
 		await client.createFolderRecursive("vault");
-		assert.equal(puts, scenario.puts);
-	});
-}
+		assert.equal(puts, expectedPuts, change);
+	}
+});
 
 test("unknown folder conflict requires directory readback", async () => {
 	requestGlobal.__obsidianRequestUrl = async (params) => {
@@ -298,6 +272,12 @@ test("missing cached upload parent is recreated before retry", async () => {
 			folderCreates++;
 			return response(201);
 		}
+		if (
+			uploadLinkAttempts === 1 &&
+			new URL(params.url).searchParams.get("path") === "vault/folder"
+		) {
+			return response(404);
+		}
 		return response(200, directory("vault/folder"));
 	};
 	const client = createClient();
@@ -313,34 +293,37 @@ test("missing cached upload parent is recreated before retry", async () => {
 	assert.equal(contentUploads, 1);
 });
 
-for (const stage of ["guard", "verification"] as const) {
-	test(`upload ${stage} 404 cannot trigger parent recovery or confirm a write`, async () => {
-		const original = bytes("current remote version");
-		let remoteBytes = original;
-		let puts = 0;
-		let mkdirs = 0;
-		let checks = 0;
-		const failure = new YandexApiError("authority read failed", 404);
-		requestGlobal.__obsidianRequestUrl = async (params) => {
-			if (params.url.includes("/resources/upload?")) {
-				return response(200, { href: "https://upload.test/file" });
+test("upload authority 404 cannot trigger parent recovery or confirm a write", async () => {
+	const original = bytes("current remote version");
+	let remoteBytes = original;
+	let stage: "guard" | "verification" = "guard";
+	let puts = 0;
+	let mkdirs = 0;
+	let checks = 0;
+	const failure = new YandexApiError("authority read failed", 404);
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		if (params.url.includes("/resources/upload?")) {
+			return response(200, { href: "https://upload.test/file" });
+		}
+		if (params.url === "https://upload.test/file") {
+			puts++;
+			if (stage === "verification" && puts === 1) {
+				return response(503);
 			}
-			if (params.url === "https://upload.test/file") {
-				puts++;
-				if (stage === "verification" && puts === 1) {
-					return response(503);
-				}
-				remoteBytes = params.body as ArrayBuffer;
-				return response(201);
-			}
-			if (params.method === "PUT") {
-				mkdirs++;
-				return response(201);
-			}
-			return response(200, directory("vault/folder"));
-		};
-		const client = createClient();
-		await client.getResource("vault/folder", 1, 0, true);
+			remoteBytes = params.body as ArrayBuffer;
+			return response(201);
+		}
+		if (params.method === "PUT") {
+			mkdirs++;
+			return response(201);
+		}
+		return response(200, directory("vault/folder"));
+	};
+	const client = createClient();
+	await client.getResource("vault/folder", 1, 0, true);
+	for (stage of ["guard", "verification"] as const) {
+		puts = 0;
+		checks = 0;
 		await assert.rejects(
 			client.uploadFile(
 				"vault/folder/file.md",
@@ -349,8 +332,7 @@ for (const stage of ["guard", "verification"] as const) {
 				true,
 				true,
 				async () => {
-					checks++;
-					if (stage === "guard" && checks === 2) {
+					if (stage === "guard" && ++checks === 2) {
 						throw failure;
 					}
 				},
@@ -359,12 +341,44 @@ for (const stage of ["guard", "verification"] as const) {
 				},
 			),
 			(error) => error === failure,
+			stage,
 		);
-		assert.deepEqual(remoteBytes, original);
-		assert.equal(mkdirs, 0);
-		assert.equal(puts, stage === "guard" ? 0 : 1);
+		assert.deepEqual(remoteBytes, original, stage);
+		assert.equal(mkdirs, 0, stage);
+		assert.equal(puts, stage === "guard" ? 0 : 1, stage);
+	}
+
+	// Expiry after async authority settles must still stop the native PUT.
+	puts = 0;
+	let active = true;
+	client.setWriteGuard(async () => {
+		queueMicrotask(() => {
+			queueMicrotask(() => {
+				active = false;
+			});
+		});
 	});
-}
+	await assert.rejects(
+		client.withWriteGuard(
+			() => {
+				if (!active) {
+					throw new Error("Expired synthetic invocation");
+				}
+			},
+			() =>
+				client.uploadFile(
+					"vault/folder/file.md",
+					bytes("late write"),
+					true,
+					true,
+				),
+		),
+		/Expired synthetic invocation/,
+	);
+	assert.equal(puts, 0);
+	assert.deepEqual(remoteBytes, original);
+	assert.equal(mkdirs, 0);
+});
 
 test("DELETE retry revalidates revoked authority before sending another request", async () => {
 	const original = new TextEncoder().encode("current plaintext").buffer;
@@ -430,14 +444,23 @@ test("DELETE guard failures are not treated as resource absence", async () => {
 	await client.deleteResource("vault/note.md", false, true, async () => {
 		checked = true;
 	});
-	requestGlobal.__obsidianRequestUrl = async (params) =>
-		params.method === "DELETE"
-			? response(202, { href: "https://synthetic.invalid/operation" })
-			: response(404);
-	await assert.rejects(
-		client.deleteResource("vault/note.md", false, true),
-		(error) => error instanceof YandexApiError && error.status === 404,
-	);
+	for (const [label, body, error] of [
+		["missing operation link", {}, /operation link/],
+		[
+			"operation read 404",
+			{ href: "https://synthetic.invalid/operation" },
+			(error: unknown) =>
+				error instanceof YandexApiError && error.status === 404,
+		],
+	] as const) {
+		requestGlobal.__obsidianRequestUrl = async (params) =>
+			params.method === "DELETE" ? response(202, body) : response(404);
+		await assert.rejects(
+			client.deleteResource("vault/note.md", false, true),
+			error,
+			label,
+		);
+	}
 });
 
 test("direct download retries transient transfer failures with fresh links and stops at final errors", async () => {
@@ -660,4 +683,76 @@ test("unknown response decoding failure stops snapshot capture without transport
 		(error) => error === cause,
 	);
 	assert.equal(requests, 1);
+});
+
+test("paginated inventory rejects a changing total instead of accepting a partial source", async () => {
+	const disk = new MemoryDisk();
+	for (let i = 0; i < 1001; i++) {
+		disk.files.set(
+			`vault/${String(i).padStart(4, "0")}.md`,
+			bytes("source"),
+		);
+	}
+	let changed = false;
+	disk.afterRequest = async (method, endpoint, path) => {
+		if (
+			!changed &&
+			method === "GET" &&
+			endpoint.endsWith("/resources") &&
+			path === "vault"
+		) {
+			changed = true;
+			disk.files.set("vault/late.md", bytes("late source"));
+		}
+	};
+	disk.install();
+	await assert.rejects(
+		createClient().getResourcesRecursive("vault", true),
+		/listing/,
+	);
+	changed = false;
+	disk.files.delete("vault/late.md");
+	let admitted = 0;
+	await assert.rejects(
+		createClient().collectLogicalMetadata(
+			["vault/0000.md", "vault/1000.md"],
+			20,
+			async () => {
+				admitted++;
+			},
+			{ knownDirectoryPages: new Map([["vault", 1]]) },
+		),
+		/listing/,
+	);
+	assert.equal(
+		admitted,
+		0,
+		"No file may be admitted from an inconsistent parent listing",
+	);
+	disk.files.delete("vault/late.md");
+	const resource = disk.resource.bind(disk);
+	let replaced = false;
+	disk.resource = async (path) => {
+		const meta = await resource(path);
+		return path === "vault" && replaced ? { ...meta, type: "file" } : meta;
+	};
+	disk.afterRequest = async () => {
+		replaced = true;
+	};
+	await assert.rejects(
+		createClient().collectLogicalMetadata(
+			["vault/0000.md", "vault/1000.md"],
+			20,
+			async () => {
+				admitted++;
+			},
+			{ knownDirectoryPages: new Map([["vault", 1]]) },
+		),
+		/listing/,
+	);
+	assert.equal(
+		admitted,
+		0,
+		"Directory replacement cannot admit a partial listing",
+	);
 });

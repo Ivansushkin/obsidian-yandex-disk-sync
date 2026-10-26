@@ -1,3 +1,5 @@
+import type { StartupReadSession } from "../sync/canonical/manager";
+import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import { t } from "../i18n/index";
 import type { IndexMaintenance, RemoteEncryptionManifest } from "../types";
 import { logger } from "../utils/logger";
@@ -63,13 +65,16 @@ export class EncryptionRecovery {
 							this.context.index.getMaintenance(),
 						).maintenance,
 					persist: async () => {
-						await this.workflow.applyEncryptionSnapshot({
-							enabled: true,
-							salt: manifest.salt,
-							password,
-							revision: manifest.revision,
-							profileId: "hardened",
-						});
+						await this.workflow.applyEncryptionSnapshot(
+							{
+								enabled: true,
+								salt: manifest.salt,
+								password,
+								revision: manifest.revision,
+								profileId: "hardened",
+							},
+							service,
+						);
 					},
 				});
 				if (!maintenance) {
@@ -187,22 +192,30 @@ export class EncryptionRecovery {
 		this.context.ui.stateChanged();
 	}
 
-	async tryRecoverRemoteTargetTransition(): Promise<boolean> {
+	async tryRecoverRemoteTargetTransition(
+		reads?: StartupReadSession,
+	): Promise<boolean> {
 		try {
-			const manifest =
-				await this.context.index.downloadEncryptionManifest();
+			const manifest = reads
+				? (await reads.manifest()).manifest
+				: await this.context.index.downloadEncryptionManifest();
 			if (!manifest) {
-				const canonical =
-					await this.context.index.readCanonicalIndexWithCodecIfPresent(
-						null,
-					);
+				const canonical = reads
+					? await reads.readWithCodecIfPresent(null)
+					: await this.context.index.readCanonicalIndexWithCodecIfPresent(
+							null,
+						);
 				if (!canonical?.maintenance) {
 					return false;
+				}
+				if (canonical.maintenance.kind === "force") {
+					throw new ForceRecoveryPendingError();
 				}
 				this.controller.createRemoteTargetRecoveryPlan(
 					null,
 					canonical.maintenance,
 				);
+				reads?.close();
 				await this.context.engine.runExclusiveMaintenance(async () => {
 					await this.recoverRemotePlaintextTargetTransition(
 						null,
@@ -220,6 +233,38 @@ export class EncryptionRecovery {
 			) {
 				return false;
 			}
+			const service = this.context.getService();
+			if (
+				reads &&
+				manifest.state === "enabled" &&
+				service &&
+				(this.context.getSettings().encryptionRevision ?? 1) ===
+					manifest.revision
+			) {
+				if (
+					!(await this.context.manager.verifyCandidate(
+						service,
+						manifest.verifier,
+					))
+				) {
+					throw new Error(t("notice.encryption_wrong_password"));
+				}
+				const canonical = await reads.readWithCodecIfPresent(service);
+				if (!canonical) {
+					throw new Error(t("notice.encryption_remote_busy"));
+				}
+				await this.controller.assertStableManifestTarget(
+					manifest,
+					canonical.maintenance,
+					service,
+				);
+				reads.assertCurrent();
+				if (!canonical.maintenance) {
+					return false;
+				}
+			}
+			// Recovery owns writes and never borrows pre-recovery service observations.
+			reads?.close();
 			await this.connectForSync(password, manifest);
 			return true;
 		} catch (error) {

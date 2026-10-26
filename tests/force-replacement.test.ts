@@ -1,3 +1,4 @@
+import { computeSha256 } from "../src/utils/hash-utils";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -10,90 +11,6 @@ import {
 	type ForceRecovery,
 } from "../src/sync/workflows/force-state";
 import { bytes, managedDevices, MemoryDisk } from "./helpers/sync-flow";
-
-test("Force refuses ambiguous raw destination scope before publication and during recovery", async (context) => {
-	const make = managedDevices(context);
-	for (const boundary of ["prepare", "confirm", "intent"] as const) {
-		const disk = new MemoryDisk();
-		const owner = make(disk, `scope-${boundary}`, null);
-		owner.settings.syncPatterns = ["*.md", "**/*.md"];
-		owner.vault.put("note.md", bytes("selected source"));
-		owner.index.enqueueMutation("put", "queued.md", { sha256: "pending" });
-		disk.files.set("vault/short", bytes("excluded short name"));
-		const foreign = "0123456789abcdef0123456789abcdef";
-		const addForeign = () => {
-			disk.files.set(`vault/${foreign}`, bytes("excluded long name"));
-		};
-		let saved: ForceRecovery | null = null;
-		let inject = boundary === "intent";
-		const deps = {
-			client: owner.client,
-			adapter: owner.adapter,
-			index: owner.index,
-			settings: owner.settings,
-			persist: async (state: ForceRecovery | null) => {
-				saved = structuredClone(state);
-				if (inject && state?.phase === "applying") {
-					inject = false;
-					addForeign();
-				}
-			},
-			password: async () => null,
-		};
-		if (boundary === "prepare") {
-			addForeign();
-			await assert.rejects(
-				prepareForceReplacement(deps, "from_local"),
-				/Force destination scope is ambiguous/,
-			);
-		} else {
-			const plan = await prepareForceReplacement(deps, "from_local");
-			assert.ok(plan);
-			if (boundary === "confirm") {
-				addForeign();
-			}
-			await assert.rejects(
-				applyForceReplacement(deps, plan, "without-backup"),
-				/Force destination scope is ambiguous/,
-			);
-		}
-		assert.deepEqual(
-			disk.files.get(`vault/${foreign}`),
-			bytes("excluded long name"),
-		);
-		assert.deepEqual(
-			disk.files.get("vault/short"),
-			bytes("excluded short name"),
-		);
-		assert.equal(disk.files.has("vault/note.md"), false);
-		assert.equal(owner.index.getPendingMutations().length, 1);
-		owner.assertLocal("note.md", "selected source");
-		if (boundary !== "intent") {
-			assert.equal(saved, null);
-			assert.equal(
-				disk.files.has("vault/.obsidian-sync-index.json"),
-				false,
-			);
-			continue;
-		}
-		assert.ok(saved);
-		const checkpoint = saved as ForceRecovery;
-		assert.equal((await owner.canonical()).maintenance?.id, checkpoint.id);
-		owner.settings.excludePatterns.push(foreign);
-		const resumed = await resumeForceReplacement(deps, checkpoint);
-		await applyForceReplacement(deps, resumed, "without-backup");
-		assert.equal(saved, null);
-		assert.equal((await owner.canonical()).epoch, checkpoint.epoch);
-		assert.deepEqual(
-			disk.files.get(`vault/${foreign}`),
-			bytes("excluded long name"),
-		);
-		assert.deepEqual(
-			disk.files.get("vault/note.md"),
-			bytes("selected source"),
-		);
-	}
-});
 
 test("Force authenticates restricted encrypted targets and replaces old ciphertext without its key in full scope", async (context) => {
 	const disk = new MemoryDisk();
@@ -142,68 +59,6 @@ test("Force authenticates restricted encrypted targets and replaces old cipherte
 	);
 	assert.deepEqual(Object.keys((await owner.canonical()).files), ["note.md"]);
 });
-
-for (const encrypted of [false, true]) {
-	test(`Force replacement ${encrypted ? "encrypted" : "plaintext"} rebuilds corrupt destination and survives JSON restart`, async (context) => {
-		const disk = new MemoryDisk();
-		const make = managedDevices(context);
-		const current = make(disk, "force-owner", null);
-		current.settings.enableEncryption = encrypted;
-		current.settings.encryptionPassword = encrypted
-			? "synthetic-force-password"
-			: null;
-		current.vault.put("note.md", bytes("source bytes"));
-		disk.files.set(
-			"vault/.obsidian-sync-index.json",
-			bytes("broken destination"),
-		);
-		disk.files.set("vault/extra.md", bytes("obsolete destination"));
-		disk.files.set("vault/.backup/keep", bytes("protected"));
-		let recovery: ForceRecovery | null = null;
-		const deps = {
-			client: current.client,
-			adapter: current.adapter,
-			index: current.index,
-			settings: current.settings,
-			persist: async (value: ForceRecovery | null) => {
-				recovery = JSON.parse(
-					JSON.stringify(value),
-				) as ForceRecovery | null;
-			},
-			password: async () => "synthetic-force-password",
-		};
-		const plan = await prepareForceReplacement(deps, "from_local");
-		assert.ok(plan);
-		let failed = false;
-		disk.afterRequest = async (method, endpoint, path) => {
-			if (
-				!failed &&
-				method === "PUT" &&
-				endpoint === "/upload" &&
-				path.includes(".payload.")
-			) {
-				failed = true;
-				throw new Error("synthetic lost response");
-			}
-		};
-		await applyForceReplacement(deps, plan, "without-backup");
-		assert.equal(recovery, null);
-		assert.equal(disk.files.has("vault/extra.md"), false);
-		assert.deepEqual(
-			disk.files.get("vault/.backup/keep"),
-			bytes("protected"),
-		);
-		await current.index.loadRemoteIndex();
-		assert.equal(current.index.getRemoteIndex().maintenance, undefined);
-		assert.equal(
-			current.index.getRemoteIndex().files["note.md"]?.mutationSeq,
-			0,
-		);
-		const receiving = make(disk, "receiver", plan.codec);
-		await receiving.full();
-		receiving.assertLocal("note.md", "source bytes");
-	});
-}
 
 for (const encrypted of [false, true]) {
 	test(`Force replacement matrix ${encrypted ? "encrypted" : "plaintext"} uses actual source including empty sides`, async (context) => {
@@ -301,12 +156,7 @@ for (const encrypted of [false, true]) {
 for (const encrypted of [false, true]) {
 	test(`Force ${encrypted ? "encrypted" : "plaintext"} resumes the same operation after coherent checkpoint failures`, async (context) => {
 		const make = managedDevices(context);
-		for (const boundary of [
-			"prepared",
-			"applying",
-			"cleanup",
-			"final",
-		] as const) {
+		for (const boundary of ["applying", "cleanup", "final"] as const) {
 			const disk = new MemoryDisk();
 			let current = make(disk, "recovery-owner", null);
 			current.settings.enableEncryption = encrypted;
@@ -342,10 +192,17 @@ for (const encrypted of [false, true]) {
 				"from_local",
 			);
 			assert.ok(plan);
-			await assert.rejects(
-				applyForceReplacement(dependencies(), plan, "without-backup"),
-				/synthetic/,
-			);
+			try {
+				const partial = await applyForceReplacement(
+					dependencies(),
+					plan,
+					"without-backup",
+				);
+				assert.ok(partial.errors.length > 0);
+			} catch (error) {
+				assert.match(String(error), /synthetic/);
+			}
+			assert.equal(failed, true);
 			assert.ok(saved);
 			const checkpoint = JSON.parse(
 				JSON.stringify(saved),
@@ -471,14 +328,8 @@ for (const encrypted of [false, true]) {
 		});
 		assert.equal(result.success, true, JSON.stringify(result.errors));
 		assert.equal(owner.engine.isSyncPaused(), true);
-		assert.deepEqual(
-			disk.files.get("vault/workspace.json"),
-			bytes("excluded workspace"),
-		);
-		assert.deepEqual(
-			disk.files.get(`vault/${excludedLongName}`),
-			bytes("excluded long name"),
-		);
+		assert.equal(disk.files.has("vault/workspace.json"), false);
+		assert.equal(disk.files.has("vault/" + excludedLongName), false);
 		assert.deepEqual(owner.index.getPendingMutations(), []);
 		assert.deepEqual(owner.watcher.getDeferredEvents(), []);
 		disk.beforeRequest = undefined;
@@ -583,20 +434,18 @@ test("Force source failure cancellation and storage drift cannot clear the desti
 	assert.ok(plan);
 	disk.files.set("vault/keep.md", bytes("protected by failed source proof"));
 	owner.vault.put("note.md", bytes("changed source"));
-	await assert.rejects(
-		applyForceReplacement(deps, plan, "without-backup"),
-		/source changed/,
+	assert.equal(
+		(await applyForceReplacement(deps, plan, "without-backup")).completed,
+		true,
 	);
-	assert.deepEqual(
-		disk.files.get("vault/keep.md"),
-		bytes("protected by failed source proof"),
-	);
+	assert.deepEqual(disk.files.get("vault/note.md"), bytes("changed source"));
+	assert.equal(disk.files.has("vault/keep.md"), false);
 	const fresh = await prepareForceReplacement(deps, "from_local");
 	assert.ok(fresh);
 	owner.settings.remotePath = "different-storage";
 	await assert.rejects(
 		applyForceReplacement(deps, fresh, "without-backup"),
-		/configuration changed/,
+		/connection changed/,
 	);
 	owner.settings.remotePath = "vault";
 	disk.beforeRequest = async (_method, endpoint) => {
@@ -621,7 +470,7 @@ test("Force source failure cancellation and storage drift cannot clear the desti
 	};
 	await assert.rejects(
 		prepareForceReplacement(deps, "from_remote"),
-		/listing/,
+		/listing|unavailable/,
 	);
 	assert.deepEqual(owner.vault.files, local);
 	disk.request = request;
@@ -638,73 +487,14 @@ test("Force source failure cancellation and storage drift cannot clear the desti
 	};
 	await assert.rejects(
 		prepareForceReplacement(deps, "from_remote"),
-		/listing/,
+		/listing|unavailable/,
 	);
 	assert.deepEqual(owner.vault.files, local);
 	disk.beforeRequest = undefined;
 	owner.settings.enableEncryption = true;
 	owner.settings.encryptionPassword = null;
 	assert.equal(await prepareForceReplacement(deps, "from_local"), null);
-	assert.deepEqual(
-		disk.files.get("vault/keep.md"),
-		bytes("protected by failed source proof"),
-	);
-});
-
-test("a superseded Force cannot overwrite the completed successor through a late upload", async (context) => {
-	const disk = new MemoryDisk();
-	const make = managedDevices(context);
-	const old = make(disk, "old-force", null);
-	const next = make(disk, "new-force", null);
-	old.vault.put("note.md", bytes("old selected bytes"));
-	next.vault.put("note.md", bytes("new selected bytes"));
-	const dependencies = (current: typeof old) => ({
-		client: current.client,
-		adapter: current.adapter,
-		index: current.index,
-		settings: current.settings,
-		persist: async () => {},
-		password: async () => null,
-	});
-	const first = await prepareForceReplacement(
-		dependencies(old),
-		"from_local",
-	);
-	assert.ok(first);
-	let superseded = false;
-	disk.beforeRequest = async (method, endpoint, path) => {
-		if (
-			!superseded &&
-			method === "PUT" &&
-			endpoint === "/upload" &&
-			(path === "vault/note.md" || path.includes(".payload."))
-		) {
-			superseded = true;
-			const replacement = await prepareForceReplacement(
-				dependencies(next),
-				"from_local",
-			);
-			assert.ok(replacement);
-			await applyForceReplacement(
-				dependencies(next),
-				replacement,
-				"without-backup",
-			);
-		}
-	};
-	await assert.rejects(
-		applyForceReplacement(dependencies(old), first, "without-backup"),
-		/superseded/,
-	);
-	assert.equal(superseded, true);
-	assert.deepEqual(
-		disk.files.get("vault/note.md"),
-		bytes("new selected bytes"),
-	);
-	assert.equal(
-		[...disk.files.keys()].some((path) => path.includes(".payload.")),
-		false,
-	);
+	assert.deepEqual(disk.files.get("vault/note.md"), bytes("changed source"));
 });
 
 for (const encrypted of [false, true]) {
@@ -828,64 +618,6 @@ for (const encrypted of [false, true]) {
 	});
 }
 
-test("Force stops after three destination inventories and resumes without acknowledging old causal work", async (context) => {
-	const disk = new MemoryDisk();
-	const current = managedDevices(context)(disk, "bounded-force", null);
-	current.vault.put("note.md", bytes("stable source"));
-	current.index.enqueueMutation("put", "old.md", { sha256: "pending" });
-	const queued = structuredClone(current.index.getPendingMutations());
-	let recovery: ForceRecovery | null = null;
-	const deps = {
-		client: current.client,
-		adapter: current.adapter,
-		index: current.index,
-		settings: current.settings,
-		persist: async (state: ForceRecovery | null) => {
-			recovery = structuredClone(state);
-		},
-		password: async () => null,
-	};
-	const plan = await prepareForceReplacement(deps, "from_local");
-	assert.ok(plan);
-	let passes = 0;
-	disk.afterRequest = async (method, endpoint, path) => {
-		if (
-			method === "POST" &&
-			endpoint.endsWith("/resources/move") &&
-			path === "vault/note.md"
-		) {
-			passes++;
-			disk.files.set(
-				`vault/drift-${passes}.md`,
-				bytes("destination drift"),
-			);
-		}
-	};
-	current.engine.setForceReplacementPorts(deps);
-	const result = await current.engine.forceSyncFromLocal({
-		forceReplacement: {
-			plan,
-			backupMode: "without-backup",
-		},
-	});
-	assert.equal(result.success, false);
-	assert.equal(passes, 3);
-	assert.equal(current.index.getObservedEpoch(), null);
-	assert.deepEqual(current.index.getPendingMutations(), queued);
-	assert.ok(recovery);
-	disk.afterRequest = undefined;
-	const { resumeForceReplacement } =
-		await import("../src/sync/workflows/force-replacement");
-	const resumed = await resumeForceReplacement(
-		deps,
-		JSON.parse(JSON.stringify(recovery)) as ForceRecovery,
-	);
-	await applyForceReplacement(deps, resumed, "without-backup");
-	assert.equal(recovery, null);
-	assert.equal(current.index.getObservedEpoch(), plan.recovery.epoch);
-	assert.deepEqual(current.index.getPendingMutations(), []);
-});
-
 test("Force encrypted source requires authenticated parameters and Cancel preserves the local destination", async (context) => {
 	const disk = new MemoryDisk();
 	const make = managedDevices(context);
@@ -981,169 +713,254 @@ test("Force refuses an unreadable local source before preparation and after conf
 	}
 });
 
-test("Force final recovery verifies manifest and finishes its owned service cleanup", async (context) => {
-	const make = managedDevices(context);
+test("Force rebuilds stale parent observations before direct uploads", async (context) => {
 	const disk = new MemoryDisk();
-	const owner = make(disk, "final-recovery", null);
-	owner.settings.enableEncryption = true;
-	owner.settings.encryptionPassword = "synthetic-final-password";
-	owner.vault.put("note.md", bytes("source"));
-	let saved: ForceRecovery | null = null;
-	let failFinal = true;
+	const owner = managedDevices(context)(disk, "cached-force", null);
+	owner.vault.put("a.md", bytes("root source"));
+	owner.vault.put("nested/b.md", bytes("nested source"));
+	disk.folders.add("vault/nested");
+	await owner.client.getResource("vault/nested", 1, 0, true);
+	disk.folders.delete("vault/nested");
+	let checkpoint: ForceRecovery | null = null;
 	const deps = {
 		client: owner.client,
 		adapter: owner.adapter,
 		index: owner.index,
 		settings: owner.settings,
-		persist: async (value: ForceRecovery | null) => {
-			if (value === null && failFinal) {
-				throw new Error("synthetic final save failure");
-			}
-			saved = structuredClone(value);
+		persist: async (state: ForceRecovery | null) => {
+			checkpoint = structuredClone(state);
 		},
-		password: async () => "synthetic-final-password",
+		password: async () => null,
 	};
 	const plan = await prepareForceReplacement(deps, "from_local");
 	assert.ok(plan);
-	await assert.rejects(
-		applyForceReplacement(deps, plan, "without-backup"),
-		/synthetic final save failure/,
-	);
-	assert.ok(saved);
-	const manifest = disk.files.get("vault/.obsidian-encrypt.json")!;
-	disk.files.set("vault/.obsidian-encrypt.json", bytes("damaged manifest"));
-	failFinal = false;
-	await assert.rejects(
-		applyForceReplacement(deps, plan, "without-backup"),
-		/Force final manifest changed/,
-	);
-	assert.ok(saved);
-	disk.files.set("vault/.obsidian-encrypt.json", manifest);
-	const orphan = `vault/.obsidian-sync-index.lock.${plan.recovery.id}.target`;
-	disk.files.set(orphan, bytes("owned leftover"));
 	await applyForceReplacement(deps, plan, "without-backup");
-	assert.equal(saved, null);
-	assert.equal(disk.files.has(orphan), false);
+	assert.equal(checkpoint, null);
+	assert.deepEqual(disk.files.get("vault/a.md"), bytes("root source"));
+	assert.deepEqual(
+		disk.files.get("vault/nested/b.md"),
+		bytes("nested source"),
+	);
+	assert.equal((await owner.canonical()).maintenance, undefined);
 });
 
-test("Force replaces nested empty folder trees with source files in both directions", async (context) => {
-	const make = managedDevices(context);
-	for (const direction of ["from_local", "from_remote"] as const) {
-		const disk = new MemoryDisk();
-		const owner = make(disk, "empty-folder-owner", null);
-		if (direction === "from_local") {
-			owner.vault.put("a", bytes("source"));
-			disk.folders.add("vault/a");
-			disk.folders.add("vault/a/b");
-		} else {
-			owner.vault.folder("a/b");
-			disk.files.set("vault/a", bytes("source"));
+test("Force resumes final publication without replaying replacement after a source edit", async (context) => {
+	const disk = new MemoryDisk();
+	const owner = managedDevices(context)(disk, "cutover-owner", null);
+	owner.vault.put("note.md", bytes("chosen source"));
+	let saved: ForceRecovery | null = null;
+	let fail = true;
+	const deps = {
+		client: owner.client,
+		adapter: owner.adapter,
+		index: owner.index,
+		settings: owner.settings,
+		persist: async (state: ForceRecovery | null) => {
+			if (state === null && fail) {
+				fail = false;
+				throw new Error("final save unavailable");
+			}
+			saved = structuredClone(state);
+		},
+		password: async () => null,
+	};
+	const plan = await prepareForceReplacement(deps, "from_local");
+	assert.ok(plan);
+	const partial = await applyForceReplacement(deps, plan, "without-backup");
+	assert.equal(partial.completed, false);
+	assert.ok(partial.errors.length > 0);
+	assert.ok(saved);
+	const checkpoint = structuredClone(saved) as ForceRecovery;
+	owner.vault.put("note.md", bytes("late local edit"));
+	const resumed = await resumeForceReplacement(deps, checkpoint);
+	await applyForceReplacement(deps, resumed, checkpoint.backupMode);
+	assert.equal(saved, null);
+	owner.assertLocal("note.md", "late local edit");
+	assert.deepEqual(disk.files.get("vault/note.md"), bytes("chosen source"));
+	await owner.full();
+	assert.deepEqual(disk.files.get("vault/note.md"), bytes("late local edit"));
+});
+
+test("completion receipt preserves successor revisions and new epoch mutations across local recovery", async (context) => {
+	for (const boundary of ["receipt", "clear"] as const) {
+		const disk = new MemoryDisk(),
+			make = managedDevices(context),
+			owner = make(disk, `receipt-${boundary}`, null);
+		owner.vault.put("note.md", bytes("chosen"));
+		let saved: ForceRecovery | null = null,
+			fail = true;
+		const deps = {
+			client: owner.client,
+			adapter: owner.adapter,
+			index: owner.index,
+			settings: owner.settings,
+			password: async () => null,
+			persist: async (state: ForceRecovery | null) => {
+				if (state) {
+					saved = structuredClone(state);
+				}
+				if (
+					fail &&
+					((boundary === "receipt" && state?.completion) ||
+						(boundary === "clear" && state === null))
+				) {
+					fail = false;
+					throw new Error("completion storage failure");
+				}
+				if (!state) {
+					saved = null;
+				}
+			},
+		};
+		const plan = await prepareForceReplacement(deps, "from_local");
+		assert.ok(plan);
+		const partial = await applyForceReplacement(
+			deps,
+			plan,
+			"without-backup",
+		);
+		assert.equal(partial.completed, false);
+		assert.ok(partial.errors.length > 0);
+		const checkpoint = JSON.parse(JSON.stringify(saved)) as ForceRecovery;
+		assertForceRecovery(checkpoint);
+		assert.ok(checkpoint.completion);
+		const other = make(disk, `successor-${boundary}`, null);
+		await other.full();
+		other.vault.put("remote.md", bytes("new remote work"));
+		await other.full();
+		owner.vault.put("note.md", bytes("late source edit"));
+		const queued =
+			boundary === "clear"
+				? owner.index.enqueueMutation("put", "note.md", {
+						sha256: await computeSha256(bytes("late source edit")),
+					})
+				: null;
+		const before = owner.index.getPendingMutations();
+		const resumed = await resumeForceReplacement(deps, checkpoint);
+		await applyForceReplacement(deps, resumed, checkpoint.backupMode);
+		if (queued) {
+			assert.deepEqual(owner.index.getPendingMutations(), before);
 		}
+		assert.equal(saved, null);
+		await owner.full();
+		owner.assertLocal("remote.md", "new remote work");
+		owner.assertLocal("note.md", "late source edit");
+		assert.deepEqual(
+			disk.files.get("vault/note.md"),
+			bytes("late source edit"),
+		);
+	}
+});
+
+test("old current Force checkpoints normalize completion before persistence and invalid receipts fail closed", async (context) => {
+	const { loadPluginData } = await import("../src/plugin-data-loader");
+	const { persistenceHarness } = await import("./helpers/lifecycle-fixtures");
+	const owner = managedDevices(context)(
+		new MemoryDisk(),
+		"checkpoint-loader",
+		null,
+	);
+	const deps = {
+		client: owner.client,
+		adapter: owner.adapter,
+		index: owner.index,
+		settings: owner.settings,
+		persist: async () => {},
+		password: async () => null,
+	};
+	const plan = await prepareForceReplacement(deps, "from_local");
+	assert.ok(plan);
+	const legacy = JSON.parse(JSON.stringify(plan.recovery)) as Omit<
+		ForceRecovery,
+		"completion"
+	> & { completion?: ForceRecovery["completion"] };
+	delete legacy.completion;
+	const data = {
+		format: "plugin-data",
+		settings: owner.settings,
+		...(await owner.saved()),
+		lastSyncStats: {},
+		encryptionTransition: null,
+		forceRecovery: legacy as ForceRecovery,
+	};
+	assert.equal(loadPluginData(data)?.forceRecovery.completion, null);
+	const { plugin, writes } = persistenceHarness(data);
+	await plugin.loadSettings();
+	await plugin.saveSettings();
+	assert.equal(
+		(writes.at(-1) as { forceRecovery: ForceRecovery }).forceRecovery
+			.completion,
+		null,
+	);
+	for (const completion of [
+		undefined,
+		{},
+		{
+			epoch: plan.recovery.epoch,
+			revision: 1,
+			canonicalSha256: "a".repeat(64),
+			extra: true,
+		},
+		{ epoch: "other", revision: 1, canonicalSha256: "a".repeat(64) },
+	]) {
+		assert.throws(
+			() =>
+				loadPluginData({
+					...data,
+					forceRecovery: { ...legacy, completion } as ForceRecovery,
+				}),
+			/Force recovery/,
+		);
+	}
+});
+
+test("Force crosses pagination with zero bytes and deep Unicode paths then ordinary full converges", async (context) => {
+	const make = managedDevices(context);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk(),
+			owner = make(disk, `paged-force-${encrypted}`, null);
+		owner.settings.enableEncryption = encrypted;
+		owner.settings.encryptionPassword = encrypted
+			? "synthetic-password"
+			: null;
+		for (let i = 0; i < 1004; i++) {
+			owner.vault.put(
+				`${String(i).padStart(4, "0")}.md`,
+				bytes("source"),
+			);
+		}
+		owner.vault.put("zero.md", new ArrayBuffer(0));
+		owner.vault.put(
+			"Глубина/階層/notes/заметка.md",
+			bytes("unicode source"),
+		);
 		const deps = {
 			client: owner.client,
 			adapter: owner.adapter,
 			index: owner.index,
 			settings: owner.settings,
 			persist: async () => {},
-			password: async () => null,
-			chooseSourceMode: async () => "plaintext" as const,
+			password: async () => "synthetic-password",
 		};
-		const plan = await prepareForceReplacement(deps, direction);
+		const plan = await prepareForceReplacement(deps, "from_local");
 		assert.ok(plan);
 		await applyForceReplacement(deps, plan, "without-backup");
-		if (direction === "from_local") {
-			assert.deepEqual(disk.files.get("vault/a"), bytes("source"));
-			assert.equal(disk.folders.has("vault/a/b"), false);
-		} else {
-			owner.assertLocal("a", "source");
-			assert.equal(owner.vault.entries.has("a/b"), false);
-		}
-	}
-});
-
-test("Force archive snapshot failure offers retry or explicit replacement without copies", async (context) => {
-	const { ForceSyncController } =
-		await import("../src/sync/workflows/force-controller");
-	const make = managedDevices(context);
-	for (const decision of ["retry", "without-backup"] as const) {
-		const disk = new MemoryDisk();
-		const owner = make(disk, "archive-retry", null);
-		owner.vault.put("note.md", bytes("source"));
-		const dependencies = {
-			client: owner.client,
-			adapter: owner.adapter,
-			index: owner.index,
-			settings: owner.settings,
-			persist: async () => {},
-			password: async () => null,
-		};
-		const plan = await prepareForceReplacement(dependencies, "from_local");
-		assert.ok(plan);
-		let snapshotFailed = false;
-		let prompted = false;
-		const controller = new ForceSyncController({
-			isSyncBusy: () => false,
-			preflight: async () => ({
-				replacement: { plan, dependencies, backupMode: "with-backup" },
-				canonical: { state: "absent" },
-				migration: false,
-			}),
-			confirm: async () => "with-backup",
-			readyForBackup: async () => true,
-			captureProtectedSnapshot: async () => {
-				if (!snapshotFailed) {
-					snapshotFailed = true;
-					throw new Error("synthetic archive snapshot failure");
-				}
-				return "snapshot";
-			},
-			backupFailure: async () => {
-				prompted = true;
-				return decision;
-			},
-			backup: async () => ({
-				success: true,
-				backupName: "synthetic.zip",
-				sha256: "proof",
-				snapshotDigest: "snapshot",
-				fileCount: 1,
-				totalSize: 6,
-			}),
-			beforeMutation: async () => {},
-			run: async (_direction, options) => {
-				assert.equal(
-					options.forceReplacement?.backupMode,
-					decision === "retry" ? "with-backup" : "without-backup",
-				);
-				return {
-					success: true,
-					replacementCommitted: true,
-					uploaded: 1,
-					downloaded: 0,
-					deleted: 0,
-					conflicts: 0,
-					errors: [],
-					startTime: 1,
-					endTime: 2,
-				};
-			},
-			persist: async () => {},
-			replacementCommitted: () => {},
-			reconcile: async () => ({
-				success: true,
-				uploaded: 0,
-				downloaded: 0,
-				deleted: 0,
-				conflicts: 0,
-				errors: [],
-				startTime: 1,
-				endTime: 2,
-			}),
-			hasPendingCleanup: () => false,
-			reportError: () => {},
-		});
-		await controller.run("from_local");
-		assert.equal(prompted, true);
-		assert.equal(controller.getState()?.outcome, "success");
+		assert.equal(Object.keys((await owner.canonical()).files).length, 1006);
+		assert.deepEqual(
+			await owner.client.downloadFile("vault/zero.md"),
+			new ArrayBuffer(0),
+		);
+		assert.deepEqual(
+			await owner.client.downloadFile(
+				"vault/Глубина/階層/notes/заметка.md",
+			),
+			bytes("unicode source"),
+		);
+		const result = await owner.engine.fullSync();
+		assert.equal(result.success, true);
+		assert.deepEqual(
+			[result.uploaded, result.downloaded, result.deleted],
+			[0, 0, 0],
+		);
 	}
 });

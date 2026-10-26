@@ -1,3 +1,4 @@
+import type { StartupReadSession } from "../sync/canonical/manager";
 import type { OperationBackupChoice } from "../backup/operation-backup-choice";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { t } from "../i18n/index";
@@ -168,23 +169,36 @@ export class EncryptionWorkflow {
 			return;
 		}
 
+		const assertLifetime = this.context.engine.createReadLifetimeGuard();
+		const reads = this.context.index.createStartupReadSession(() => {
+			assertLifetime();
+			this.context.assertConnectionAllowed();
+		});
 		try {
-			const salt = EncryptionService.base64ToBytes(
-				settings.encryptionSalt,
-			);
-			const service = createEncryptionCodec(
+			const service = await this.context.manager.createCodec(
 				this.requireEncryptionProfileId(),
-				salt,
+				settings.encryptionSalt,
+				settings.encryptionPassword,
 			);
-			await service.initializeKey(settings.encryptionPassword);
+			reads.assertCurrent();
 			this.context.setService(service);
 			this.context.client.setEncryptionService(service);
 			logger.info("Encryption initialized successfully");
 		} catch (e) {
+			if (this.context.isCancelled()) {
+				return;
+			}
+			try {
+				reads.assertCurrent();
+			} catch {
+				return;
+			}
 			logger.warn("Failed to initialize encryption:", { error: e });
 			this.context.setService(null);
 			this.context.client.setEncryptionService(null);
 			this.context.ui.setBlock(t("notice.encryption_wrong_password"));
+		} finally {
+			reads.close();
 		}
 	}
 
@@ -454,8 +468,35 @@ export class EncryptionWorkflow {
 		password: string,
 		manifest?: RemoteEncryptionManifest,
 	): Promise<void> {
-		const remoteManifest =
-			manifest ?? (await this.context.index.downloadEncryptionManifest());
+		const assertLifetime = this.context.engine.createReadLifetimeGuard();
+		const reads = this.context.index.createStartupReadSession(() => {
+			assertLifetime();
+			this.context.assertConnectionAllowed();
+		});
+		try {
+			await this.connectToRemoteEncryptionWithReads(
+				password,
+				manifest,
+				reads,
+			);
+		} finally {
+			reads.close();
+		}
+	}
+
+	/** Authenticate and validate the exact remote target before installing its prepared codec. */
+	private async connectToRemoteEncryptionWithReads(
+		password: string,
+		expected: RemoteEncryptionManifest | undefined,
+		reads: StartupReadSession,
+	): Promise<void> {
+		const remoteManifest = (await reads.manifest()).manifest;
+		if (
+			expected &&
+			JSON.stringify(expected) !== JSON.stringify(remoteManifest)
+		) {
+			throw new Error(t("notice.encryption_state_changed"));
+		}
 		if (!remoteManifest) {
 			throw new Error(t("notice.encryption_remote_missing"));
 		}
@@ -476,14 +517,17 @@ export class EncryptionWorkflow {
 					password,
 				);
 		await this.verifyRemoteEncryptionPassword(candidate, remoteManifest);
+		reads.assertCurrent();
 		const recoveryKind =
 			this.controller.getRemoteTargetRecoveryKind(remoteManifest);
 		if (recoveryKind === "disable") {
+			reads.close();
 			await this.recovery.recoverRemotePlaintextTargetTransition(
 				remoteManifest,
 				candidate,
 			);
 		} else if (recoveryKind === "enable" || recoveryKind === "rotate") {
+			reads.close();
 			await this.recovery.recoverRemoteEncryptedTargetTransition(
 				remoteManifest,
 				candidate,
@@ -495,24 +539,36 @@ export class EncryptionWorkflow {
 				verifier: remoteManifest.verifier,
 				validateAuthority: async () => {
 					const current =
-						await this.context.index.readCanonicalIndexWithCodec(
-							candidate,
-						);
+						await reads.readWithCodecIfPresent(candidate);
+					if (!current) {
+						throw new Error(t("notice.encryption_remote_busy"));
+					}
 					await this.controller.assertStableManifestTarget(
 						remoteManifest,
 						current.maintenance,
 						candidate,
 					);
+					const latest = (await reads.manifest()).manifest;
+					if (
+						JSON.stringify(latest) !==
+						JSON.stringify(remoteManifest)
+					) {
+						throw new Error(t("notice.encryption_state_changed"));
+					}
+					reads.assertCurrent();
 					return current;
 				},
 				persist: async () => {
-					await this.maintenance.applyEncryptionSnapshot({
-						enabled: true,
-						salt: remoteManifest.salt,
-						password,
-						revision: remoteManifest.revision,
-						profileId,
-					});
+					await this.maintenance.applyEncryptionSnapshot(
+						{
+							enabled: true,
+							salt: remoteManifest.salt,
+							password,
+							revision: remoteManifest.revision,
+							profileId,
+						},
+						candidate,
+					);
 				},
 			});
 			if (!canonical) {
@@ -543,6 +599,7 @@ export class EncryptionWorkflow {
 				);
 			}
 		}
+		this.context.assertConnectionAllowed();
 		this.context.ui.setBlock(null);
 		logger.info("Encryption configured from remote manifest");
 	}

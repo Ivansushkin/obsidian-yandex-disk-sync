@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "./workflows/force-state";
 import {
 	OperationFailure,
 	type FailureContext,
@@ -29,12 +30,15 @@ import {
 } from "./canonical/errors";
 
 /** Format one sanitized failure for Notice, desktop, mobile and dialogs. */
-export function formatOperationFailure(failure: FailureSummary): string {
+export function formatOperationFailure(
+	failure: FailureSummary,
+	nextAction?: string,
+): string {
 	const location = failure.path ? ` · ${failure.path}` : "";
 	const stageKey = `failure.stage.${failure.stage}`;
 	const translated = t(stageKey);
 	const stage = translated === stageKey ? failure.stage : translated;
-	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${failure.message}. ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${t(`failure.next.${failure.category}`)}`;
+	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${failure.message}. ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${nextAction ?? t(`failure.next.${failure.category}`)}`;
 }
 
 /** Preserve the first reason and total failures without exposing raw exceptions. */
@@ -117,6 +121,14 @@ export function classifySyncError(error: Error): string | undefined {
 }
 
 function classifyDomainError(error: Error): string | undefined {
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof ForceRecoveryPendingError,
+		)
+	) {
+		return "force-recovery-pending";
+	}
 	if (
 		findErrorCause(
 			error,

@@ -1,3 +1,7 @@
+import type {
+	EncryptionManifestRead,
+	RemoteAuthorityObservation,
+} from "./canonical/manager";
 import type { FailureSummary } from "../errors";
 import type { SyncSessionKind, SyncState } from "../types";
 import { type ForceCanonicalProof } from "./canonical/manager";
@@ -16,10 +20,13 @@ export interface SyncGuardResult {
 
 export type SyncGuardCallback = (
 	validationToken?: string,
+	observation?: RemoteAuthorityObservation,
+	manifestRead?: EncryptionManifestRead,
 ) => SyncGuardResult | Promise<SyncGuardResult>;
 
 export type ExternalSyncBlockKind =
 	| "local-state"
+	| "force"
 	| "migration"
 	| "encryption"
 	| "historical"
@@ -43,6 +50,7 @@ export interface SyncRunOptions {
 	epochAdoption?: { epoch: string; decision: "accept" | "preserve" };
 	/** Direction-verified replacement, created before the destructive confirmation. */
 	forceReplacement?: {
+		continuing?: boolean;
 		plan: import("./workflows/force-replacement").PreparedForceReplacement;
 		backupMode: "with-backup" | "without-backup";
 	};

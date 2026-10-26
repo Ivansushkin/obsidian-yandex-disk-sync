@@ -2,49 +2,45 @@ import type { PreparedForceReplacement } from "../sync/workflows/force-replaceme
 import type { OperationBackupChoice } from "../backup/operation-backup-choice";
 import { App, Modal, Setting } from "obsidian";
 import { t } from "../i18n";
+import { createSyncFailure, formatOperationFailure } from "../sync/errors";
 
 export type ForceSyncDirection = "from_local" | "from_remote";
 
+/** One destructive confirmation; an optional archive failure remains in this dialog. */
 export class ForceSyncModal extends Modal {
-	private direction: ForceSyncDirection;
-	private onAction: (action: OperationBackupChoice) => void;
-	private requireLegacyClientsStopped: boolean;
 	private settled = false;
 
 	constructor(
 		app: App,
-		direction: ForceSyncDirection,
-		onAction: (action: OperationBackupChoice) => void,
-		requireLegacyClientsStopped = false,
+		private readonly direction: ForceSyncDirection,
+		private readonly onAction: (action: OperationBackupChoice) => void,
+		_requireLegacyClientsStopped = false,
 		private readonly replacement?: PreparedForceReplacement,
+		private readonly prepareArchive?: () => Promise<void>,
 	) {
 		super(app);
-		this.direction = direction;
-		this.onAction = onAction;
-		this.requireLegacyClientsStopped = requireLegacyClientsStopped;
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
-
 		contentEl.createEl("h2", { text: t("modal.force_sync_title") });
-
-		const text =
-			this.direction === "from_local"
-				? t("modal.force_sync_from_local_text")
-				: t("modal.force_sync_from_remote_text");
-
-		contentEl.createEl("p", { text });
+		contentEl.createEl("p", {
+			text: t(
+				this.direction === "from_local"
+					? "modal.force_sync_from_local_text"
+					: "modal.force_sync_from_remote_text",
+			),
+		});
 		if (this.replacement) {
 			const state = this.replacement.recovery;
 			contentEl.createEl("p", {
 				text: t("force.confirm_details", {
 					source:
-						state.direction === "from_local"
+						this.direction === "from_local"
 							? this.app.vault.getName()
 							: state.remotePath,
 					target:
-						state.direction === "from_local"
+						this.direction === "from_local"
 							? state.remotePath
 							: this.app.vault.getName(),
 					count: state.source.length,
@@ -56,68 +52,86 @@ export class ForceSyncModal extends Modal {
 				}),
 			});
 			if (state.source.length === 0) {
-				contentEl.createEl("p", { text: t("force.empty_source") });
+				contentEl.createEl("p", {
+					text: t("force.empty_source"),
+					cls: "force-sync-warning",
+				});
 			}
 		}
-
-		const warningEl = contentEl.createDiv({ cls: "force-sync-warning" });
-		warningEl.createEl("strong", { text: t("modal.force_sync_warning") });
-
 		contentEl.createEl("p", {
-			text: t("modal.force_sync_recommend_backup"),
+			text: t(
+				this.direction === "from_local"
+					? "force.preserved_remote"
+					: "force.preserved_local",
+			),
 		});
-		let legacyClientsStopped = !this.requireLegacyClientsStopped;
-		const continueButtons: { setDisabled(disabled: boolean): unknown }[] =
-			[];
-		if (this.requireLegacyClientsStopped) {
-			new Setting(contentEl)
-				.setName(t("modal.force_sync_legacy_devices_title"))
-				.setDesc(t("modal.force_sync_legacy_devices_desc"))
-				.addToggle((toggle) =>
-					toggle.setValue(false).onChange((value) => {
-						legacyClientsStopped = value;
-						for (const button of continueButtons) {
-							button.setDisabled(!value);
-						}
-					}),
-				);
-		}
-
-		const setting = new Setting(contentEl)
-			.addButton((btn) =>
-				(continueButtons.push(btn), btn)
-					.setDisabled(this.requireLegacyClientsStopped)
-					.setButtonText(t("modal.force_sync_backup_button"))
-					.setCta()
-					.onClick(() => {
-						if (!legacyClientsStopped) {
-							return;
-						}
-						btn.setDisabled(true);
-						this.finish("with-backup");
-					}),
-			)
-			.addButton((btn) => {
-				continueButtons.push(btn);
-				btn.setDisabled(this.requireLegacyClientsStopped)
-					.setButtonText(t("modal.continue_without_backup"))
-					.onClick(() => {
-						if (legacyClientsStopped) {
-							this.finish("without-backup");
-						}
-					});
-			})
-			.addButton((btn) =>
-				btn.setButtonText(t("modal.cancel_button")).onClick(() => {
-					this.finish("cancel");
+		contentEl.createEl("p", { text: t("force.filters_ignored") });
+		contentEl.createEl("p", {
+			text: t("modal.force_sync_warning"),
+			cls: "force-sync-warning",
+		});
+		let withArchive = false;
+		const archive = new Setting(contentEl)
+			.setName(t("force.optional_archive"))
+			.addToggle((toggle) =>
+				toggle.setValue(false).onChange((value) => {
+					withArchive = value;
 				}),
 			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
+		const errorEl = contentEl.createDiv({ cls: "force-sync-warning" });
+		new Setting(contentEl)
+			.addButton((button) =>
+				button
+					.setButtonText(
+						t(
+							this.direction === "from_local"
+								? "force.replace_remote"
+								: "force.replace_local",
+						),
+					)
+					.setDestructive()
+					.onClick(async () => {
+						button.setDisabled(true);
+						archive.setDisabled(true);
+						errorEl.empty();
+						try {
+							if (withArchive && this.prepareArchive) {
+								await this.prepareArchive();
+							}
+							if (!this.settled) {
+								this.finish(
+									withArchive
+										? "with-backup"
+										: "without-backup",
+								);
+							}
+						} catch (error) {
+							if (!this.settled) {
+								errorEl.setText(
+									formatOperationFailure(
+										createSyncFailure(error, {
+											stage: "creating-backup",
+											action: "write",
+											outcome: "stopped-before-write",
+										}).summary,
+										t("force.archive_retry_inline"),
+									),
+								);
+								button.setDisabled(false);
+								archive.setDisabled(false);
+							}
+						}
+					}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText(t("modal.cancel_button"))
+					.onClick(() => this.finish("cancel")),
+			);
 	}
 
 	onClose(): void {
-		const { contentEl } = this;
-		contentEl.empty();
+		this.contentEl.empty();
 		if (!this.settled) {
 			this.settled = true;
 			this.onAction("cancel");

@@ -30,9 +30,13 @@ export {
 import {
 	encodePathForUrl,
 	isProtectedPath,
+	isRootIndexLockPath,
 	normalizePath,
+	joinPath,
+	toLocalPath,
 } from "../utils/path-utils";
-import { runWithConcurrency } from "../utils/semaphore";
+import { runWithConcurrencySettled } from "../utils/semaphore";
+import { computeSha256 } from "../utils/hash-utils";
 import {
 	getMatchingStableContentFingerprint,
 	getStableContentFingerprint,
@@ -63,6 +67,7 @@ export interface StableLogicalFileSnapshot {
 	content: ArrayBuffer;
 	resource: YandexResource;
 	fingerprint: string;
+	verifiedRawSha256?: string;
 }
 
 type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
@@ -82,11 +87,37 @@ export class YandexDiskClient {
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
+	private readConfigurationVersion = 0;
 	private writeGuard: (() => Promise<void>) | null = null;
+	private readonly invocationWriteGuards = new Set<() => void>();
 
 	/** Check storage ownership again for each physical write or retry. */
 	setWriteGuard(guard: () => Promise<void>): void {
 		this.writeGuard = guard;
+	}
+
+	/** Bind physical dispatch to an invocation without replacing fresh remote authority checks. */
+	async withWriteGuard<T>(
+		assertCurrent: () => void,
+		action: () => Promise<T>,
+	): Promise<T> {
+		const guard = () => assertCurrent();
+		this.invocationWriteGuards.add(guard);
+		try {
+			guard();
+			const result = await action();
+			guard();
+			return result;
+		} finally {
+			this.invocationWriteGuards.delete(guard);
+		}
+	}
+
+	/** Recheck synchronous lifecycle/config guards after awaited authority and before dispatch. */
+	private assertWriteInvocation(): void {
+		for (const guard of this.invocationWriteGuards) {
+			guard();
+		}
 	}
 	private apiReadMetrics: Record<ApiReadCategory, number> = {
 		manifest: 0,
@@ -95,6 +126,21 @@ export class YandexDiskClient {
 		tree: 0,
 		other: 0,
 	};
+	private transportMetrics = {
+		requests: 0,
+		apiRequests: 0,
+		uploadTransfers: 0,
+		downloadTransfers: 0,
+		uploadBytes: 0,
+		downloadBytes: 0,
+		polls: 0,
+		requestMs: 0,
+	};
+
+	/** Return aggregate transport cost without URLs, headers or payloads. */
+	getTransportMetrics(): Record<string, number> {
+		return { ...this.transportMetrics };
+	}
 
 	constructor(config: YandexClientConfig) {
 		this.token = config.token;
@@ -110,6 +156,7 @@ export class YandexDiskClient {
 	setToken(token: string): void {
 		if (this.token !== token) {
 			this.clearFolderCache();
+			this.readConfigurationVersion++;
 		}
 		this.token = token;
 	}
@@ -121,6 +168,7 @@ export class YandexDiskClient {
 	setEncryptionService(service: EncryptionCodec | null): void {
 		if (this.encryptionService !== service) {
 			this.clearFolderCache();
+			this.readConfigurationVersion++;
 		}
 		this.encryptionService = service;
 	}
@@ -142,8 +190,14 @@ export class YandexDiskClient {
 		const normalized = normalizePath(remotePath);
 		if (this.remotePath !== normalized) {
 			this.clearFolderCache();
+			this.readConfigurationVersion++;
 		}
 		this.remotePath = normalized;
+	}
+
+	/** Identify connection or codec changes without exposing their values. */
+	getReadConfigurationVersion(): number {
+		return this.readConfigurationVersion;
 	}
 
 	/**
@@ -242,12 +296,14 @@ export class YandexDiskClient {
 		expectedResource?: YandexResource,
 		budget = this.createDownloadBudget(),
 	): Promise<StableLogicalFileSnapshot | null> {
+		const configurationVersion = this.getReadConfigurationVersion();
 		const before =
 			expectedResource ?? (await this.getLogicalResource(path, budget));
 		if (!before || !this.getContentFingerprint(before)) {
 			return null;
 		}
-		const content = await this.downloadFile(path, false, budget);
+		const rawPath = await this.encryptFilePath(path);
+		const raw = await this.downloadFile(rawPath, true, budget);
 		const after = await this.getLogicalResource(path, budget);
 		if (!after) {
 			throw new Error("Remote user file disappeared while being read");
@@ -260,7 +316,28 @@ export class YandexDiskClient {
 		if (!matchingFingerprint || !afterFingerprint) {
 			throw new Error("Remote user file changed while being read");
 		}
-		return { content, resource: after, fingerprint: afterFingerprint };
+		let verifiedRawSha256: string | undefined;
+		if (after.sha256) {
+			verifiedRawSha256 = await computeSha256(raw);
+			if (verifiedRawSha256 !== after.sha256) {
+				throw new Error(
+					"Remote user file content hash does not match downloaded bytes",
+				);
+			}
+		}
+		if (configurationVersion !== this.getReadConfigurationVersion()) {
+			throw new Error("Logical read configuration changed");
+		}
+		const content = await this.decryptContent(raw);
+		if (configurationVersion !== this.getReadConfigurationVersion()) {
+			throw new Error("Logical read configuration changed");
+		}
+		return {
+			content,
+			resource: after,
+			fingerprint: afterFingerprint,
+			verifiedRawSha256,
+		};
 	}
 
 	/**
@@ -451,6 +528,109 @@ export class YandexDiskClient {
 		return await this.getResource(target, 1000, 0, true, budget);
 	}
 
+	/** Collect requested metadata within one invocation; listings never establish absence. */
+	async collectLogicalMetadata(
+		paths: string[],
+		concurrency: number,
+		onResource: (
+			path: string,
+			resource: YandexResource | null,
+			budget: DownloadReadBudget,
+		) => Promise<void>,
+		options: {
+			knownDirectoryPages?: ReadonlyMap<string, number>;
+			observedResources?: readonly YandexResource[];
+			assertCurrent?: () => void;
+		} = {},
+	): Promise<void> {
+		const configurationVersion = this.getReadConfigurationVersion();
+		const assertCurrent = () => {
+			if (configurationVersion !== this.getReadConfigurationVersion()) {
+				throw new Error("Metadata collection configuration changed");
+			}
+			options.assertCurrent?.();
+		};
+		const physical = new Map<string, string>();
+		const groups = new Map<string, string[]>();
+		const observed = new Map(
+			(options.observedResources ?? []).map((resource) => [
+				resource.path.replace(/^disk:\//, ""),
+				resource,
+			]),
+		);
+		for (const path of new Set(paths)) {
+			assertCurrent();
+			const target = (await this.encryptFilePath(path)).replace(
+				/^disk:\//,
+				"",
+			);
+			assertCurrent();
+			physical.set(path, target);
+			if (!observed.has(target)) {
+				const parent = target.slice(0, target.lastIndexOf("/"));
+				const group = groups.get(parent) ?? [];
+				group.push(path);
+				groups.set(parent, group);
+			}
+		}
+		const listings = new Map<
+			string,
+			Promise<Map<string, YandexResource>>
+		>();
+		const outcomes = await runWithConcurrencySettled(
+			[...physical].map(([path, target]) => async () => {
+				assertCurrent();
+				const budget = this.createDownloadBudget();
+				let resource = observed.get(target);
+				const parent = target.slice(0, target.lastIndexOf("/"));
+				const pages = options.knownDirectoryPages?.get(parent);
+				if (
+					!resource &&
+					pages !== undefined &&
+					pages < (groups.get(parent)?.length ?? 0)
+				) {
+					let listing = listings.get(parent);
+					if (!listing) {
+						listing = this.readDirectoryPageSet(
+							parent,
+							true,
+							false,
+							false,
+							undefined,
+							budget,
+						).then(
+							(batch) =>
+								new Map(
+									batch.files.map((entry) => [
+										entry.path.replace(/^disk:\//, ""),
+										entry,
+									]),
+								),
+						);
+						listings.set(parent, listing);
+					}
+					resource = (await listing).get(target);
+					assertCurrent();
+				}
+				// Missing or unlisted resources require their own GET, never inferred deletion.
+				const current =
+					resource ?? (await this.getLogicalResource(path, budget));
+				assertCurrent();
+				await onResource(path, current, budget);
+				assertCurrent();
+			}),
+			Math.max(1, Math.min(concurrency, 40)),
+			undefined,
+			{ stopOnError: () => true },
+		);
+		const failure = outcomes.find(
+			(outcome) => outcome.status === "rejected",
+		);
+		if (failure?.status === "rejected") {
+			throw failure.reason;
+		}
+	}
+
 	/**
 	 * Resolve a logical path to the physical remote path for transition cleanup.
 	 */
@@ -489,37 +669,76 @@ export class YandexDiskClient {
 		raw = false,
 		concurrency = 4,
 		includeDirectories = false,
+		inspectRawPath?: (path: string) => boolean,
+		allowMissingRoot = true,
+		onDirectoryPages?: (path: string, pages: number) => void,
 	): Promise<YandexResource[]> {
 		const startedAt = Date.now();
 		const results: YandexResource[] = [];
 		const visited = new Set<string>();
-		let level = [path];
-		const limit = Math.max(1, Math.min(concurrency, 4));
-
-		while (level.length > 0) {
-			const currentLevel = [...new Set(level)]
-				.filter((currentPath) => !visited.has(currentPath))
-				.sort((left, right) => left.localeCompare(right));
-			for (const currentPath of currentLevel) {
-				visited.add(currentPath);
-			}
-			const batches = await runWithConcurrency(
-				currentLevel.map(
-					(currentPath) => async () =>
-						await this.readDirectoryPageSet(
-							currentPath,
-							raw,
-							currentPath === path,
-							includeDirectories,
-						),
-				),
-				limit,
-			);
-			level = batches.flatMap((batch) => batch.directories);
-			for (const batch of batches) {
-				results.push(...batch.files);
-			}
-		}
+		const queue = [path];
+		visited.add(normalizePath(path.replace(/^disk:\//, "")));
+		const limit = Math.max(1, Math.min(concurrency, 40));
+		let active = 0;
+		let failed = false;
+		let failure: Error | undefined;
+		await new Promise<void>((resolve, reject) => {
+			const dispatch = () => {
+				while (!failed && active < limit && queue.length > 0) {
+					const currentPath = queue.shift()!;
+					active++;
+					void this.readDirectoryPageSet(
+						currentPath,
+						raw,
+						allowMissingRoot && currentPath === path,
+						includeDirectories,
+						inspectRawPath,
+					)
+						.then((batch) => {
+							results.push(...batch.files);
+							for (const child of batch.directories) {
+								const key = normalizePath(
+									child.replace(/^disk:\//, ""),
+								);
+								if (!visited.has(key)) {
+									visited.add(key);
+									queue.push(child);
+								}
+							}
+							onDirectoryPages?.(
+								currentPath.replace(/^disk:\//, ""),
+								batch.pages,
+							);
+						})
+						.catch((error: unknown) => {
+							if (!failed) {
+								failed = true;
+								failure =
+									error instanceof Error
+										? error
+										: new Error(
+												"Remote tree traversal failed",
+											);
+							}
+						})
+						.finally(() => {
+							active--;
+							dispatch();
+						});
+				}
+				if (active === 0) {
+					if (failed) {
+						reject(
+							failure ??
+								new Error("Remote tree traversal failed"),
+						);
+					} else {
+						resolve();
+					}
+				}
+			};
+			dispatch();
+		});
 		logger.debug("Remote tree traversal completed", {
 			folders: visited.size,
 			files: results.length,
@@ -532,18 +751,42 @@ export class YandexDiskClient {
 		);
 	}
 
+	/** List every immediate raw child for a confirmed full replacement. */
+	async getRawChildren(path: string): Promise<YandexResource[]> {
+		return (
+			await this.readDirectoryPageSet(path, true, true, true, () => true)
+		).files;
+	}
+
 	private async readDirectoryPageSet(
 		path: string,
 		raw: boolean,
 		allowMissingRoot: boolean,
 		includeDirectories: boolean,
-	): Promise<{ files: YandexResource[]; directories: string[] }> {
+		inspectRawPath?: (path: string) => boolean,
+		budget?: DownloadReadBudget,
+	): Promise<{
+		files: YandexResource[];
+		directories: string[];
+		pages: number;
+	}> {
 		const files: YandexResource[] = [];
 		const directories: string[] = [];
 		let offset = 0;
+		let total: number | null = null;
+		let identity: string | undefined;
+		let pages = 0;
+		const seen = new Set<string>();
 		const limit = 1000;
 		while (true) {
-			const resource = await this.getResource(path, limit, offset, true);
+			const resource = await this.getResource(
+				path,
+				limit,
+				offset,
+				true,
+				budget,
+			);
+			pages++;
 			if (!resource) {
 				if (allowMissingRoot && offset === 0) {
 					break;
@@ -553,25 +796,79 @@ export class YandexDiskClient {
 				);
 			}
 			if (resource.type === "file") {
+				if (offset !== 0) {
+					throw new Error(
+						"Remote directory type changed during listing",
+					);
+				}
 				files.push(
 					raw ? resource : await this.decryptResource(resource),
 				);
 				break;
 			}
+			if (resource.type !== "dir") {
+				throw new Error("Remote directory listing has an invalid type");
+			}
+			const directoryPath = normalizePath(path.replace(/^disk:\//, ""));
+			const resourceIdentity = `${resource.path}:${resource.resource_id ?? ""}`;
+			if (
+				normalizePath(resource.path.replace(/^disk:\//, "")) !==
+					directoryPath ||
+				(identity !== undefined && identity !== resourceIdentity)
+			) {
+				throw new Error(
+					"Remote directory identity changed during listing",
+				);
+			}
+			identity = resourceIdentity;
 			const embedded = resource._embedded;
 			if (
 				!embedded ||
 				!Array.isArray(embedded.items) ||
 				!Number.isSafeInteger(embedded.total) ||
 				embedded.total < 0 ||
+				embedded.offset !== offset ||
+				!Number.isSafeInteger(embedded.limit) ||
+				embedded.limit < 1 ||
+				embedded.items.length > embedded.limit ||
+				offset + embedded.items.length > embedded.total ||
+				(total !== null && total !== embedded.total) ||
 				(embedded.items.length === 0 && offset < embedded.total)
 			) {
 				throw new Error("Remote directory listing is incomplete");
 			}
+			total = embedded.total;
 			for (const item of embedded.items) {
+				if (
+					!item ||
+					!item.name ||
+					!item.path ||
+					!["file", "dir"].includes(item.type) ||
+					normalizePath(item.path.replace(/^disk:\//, "")) !==
+						joinPath(directoryPath, item.name) ||
+					item.name.includes("/") ||
+					item.name === "." ||
+					item.name === ".."
+				) {
+					throw new Error(
+						"Remote directory listing contains invalid paths",
+					);
+				}
+				const itemPath = normalizePath(
+					item.path.replace(/^disk:\//, ""),
+				);
+				if (seen.has(itemPath)) {
+					throw new Error(
+						"Remote directory listing contains duplicate paths",
+					);
+				}
+				seen.add(itemPath);
+				if (inspectRawPath && !inspectRawPath(item.path)) {
+					continue;
+				}
 				if (item.type === "dir") {
 					this.rememberFolder(item.path.replace(/^disk:\//, ""));
-					if (!isProtectedPath(item.path)) {
+					if (inspectRawPath || !isProtectedPath(item.path)) {
 						directories.push(item.path);
 						if (includeDirectories) {
 							files.push(
@@ -588,7 +885,7 @@ export class YandexDiskClient {
 			}
 			offset += embedded.items.length;
 		}
-		return { files, directories };
+		return { files, directories, pages };
 	}
 
 	/**
@@ -741,7 +1038,8 @@ export class YandexDiskClient {
 	 * When `raw` is true, skips content and path encryption (for metadata files).
 	 *
 	 * Preflight may be skipped for an already observed parent. In either mode,
-	 * a transport 404 recreates the parent and retries once. Guard and ambiguous
+	 * a transport 404 or a known missing-parent 409 permits a raw parent GET.
+	 * Only a confirmed parent 404 recreates it and retries once. Guard and ambiguous
 	 * verification failures never authorize parent recovery, regardless of status.
 	 */
 	async uploadFile(
@@ -764,6 +1062,7 @@ export class YandexDiskClient {
 			try {
 				await beforeAttempt?.();
 				await this.writeGuard?.();
+				this.assertWriteInvocation();
 			} catch (error) {
 				callbackFailed = true;
 				throw error;
@@ -792,7 +1091,23 @@ export class YandexDiskClient {
 			logger.debug(`Uploaded file: ${remotePath}`);
 			return;
 		} catch (e) {
-			if (callbackFailed || !this.isNotFoundError(e)) {
+			if (
+				callbackFailed ||
+				!(
+					this.isNotFoundError(e) ||
+					(e instanceof YandexApiError &&
+						e.status === 409 &&
+						e.code === "DiskPathDoesntExistsError")
+				)
+			) {
+				throw e;
+			}
+			await beforeAttempt?.();
+			const parentPath = await this.getUploadParent(remotePath, raw);
+			if (
+				!parentPath ||
+				(await this.getResource(parentPath, 1, 0, true))
+			) {
 				throw e;
 			}
 			logger.info("Upload parent missing; recreating before one retry", {
@@ -850,7 +1165,21 @@ export class YandexDiskClient {
 		if (!parentPath) {
 			return;
 		}
-		this.invalidateFolder(parentPath);
+		let candidate = parentPath;
+		while (candidate) {
+			const resource = await this.getResource(candidate, 1, 0, true);
+			if (resource) {
+				if (resource.type !== "dir") {
+					throw new Error("Upload parent is not a directory");
+				}
+				break;
+			}
+			this.invalidateFolder(candidate);
+			candidate = candidate.slice(
+				0,
+				Math.max(0, candidate.lastIndexOf("/")),
+			);
+		}
 		await this.createFolderRecursive(parentPath);
 	}
 
@@ -891,6 +1220,7 @@ export class YandexDiskClient {
 		let lastError: Error | null = null;
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			await beforeAttempt();
+			this.assertWriteInvocation();
 			const startedAt = Date.now();
 			try {
 				const response = await this.requestNative({
@@ -984,6 +1314,7 @@ export class YandexDiskClient {
 		raw = false,
 		budget = this.createDownloadBudget(),
 	): Promise<ArrayBuffer> {
+		const resourceKind = this.getDownloadResourceKind(remotePath);
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			const downloadLink = await this.getDownloadLink(
 				remotePath,
@@ -993,6 +1324,7 @@ export class YandexDiskClient {
 			let response: RequestUrlResponse | undefined;
 			const startedAt = Date.now();
 			logger.debug("Download transfer started", {
+				resourceKind,
 				attempt: attempt + 1,
 				timeoutMs: this.readTimeoutMs,
 			});
@@ -1008,6 +1340,7 @@ export class YandexDiskClient {
 				);
 			} catch (error) {
 				logger.warn("Download transfer failed", {
+					resourceKind,
 					attempt: attempt + 1,
 					durationMs: Date.now() - startedAt,
 					kind: isRemoteReadTimeout(error) ? "timeout" : "network",
@@ -1027,11 +1360,14 @@ export class YandexDiskClient {
 			if (response) {
 				if (response.status >= 200 && response.status < 300) {
 					logger.debug("Download transfer completed", {
+						resourceKind,
 						attempt: attempt + 1,
 						durationMs: Date.now() - startedAt,
 						size: response.arrayBuffer.byteLength,
 						status: response.status,
 					});
+					this.transportMetrics.downloadBytes +=
+						response.arrayBuffer.byteLength;
 					const result = raw
 						? response.arrayBuffer
 						: await this.decryptContent(response.arrayBuffer);
@@ -1155,6 +1491,7 @@ export class YandexDiskClient {
 		toPath: string,
 		overwrite = false,
 		beforeAttempt?: () => Promise<void>,
+		existingParentOnly = false,
 	): Promise<void> {
 		await beforeAttempt?.();
 		const encryptedFrom = await this.encryptFilePath(fromPath);
@@ -1167,8 +1504,30 @@ export class YandexDiskClient {
 			0,
 			encryptedTo.lastIndexOf("/"),
 		);
-		if (parentPath) {
-			await this.createFolderRecursive(parentPath);
+		if (existingParentOnly) {
+			const root = normalizePath(this.remotePath.replace(/^disk:\//, ""));
+			for (const path of [encryptedFrom, encryptedTo]) {
+				const normalized = normalizePath(path.replace(/^disk:\//, ""));
+				const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+				if (
+					normalized.slice(0, normalized.lastIndexOf("/")) !== root ||
+					(name !== ".obsidian-sync-index.json" &&
+						!isRootIndexLockPath(name))
+				) {
+					throw new Error(
+						"Existing-parent MOVE is restricted to canonical service paths",
+					);
+				}
+			}
+		}
+		if (parentPath && !existingParentOnly) {
+			const parent = await this.getResource(parentPath, 1, 0, true);
+			if (!parent) {
+				await beforeAttempt?.();
+				await this.recreateUploadParent(encryptedTo, true);
+			} else if (parent.type !== "dir") {
+				throw new Error("Move destination parent is not a directory");
+			}
 		}
 
 		const response = await this.request(
@@ -1189,8 +1548,15 @@ export class YandexDiskClient {
 		fromPath: string,
 		toPath: string,
 		beforeAttempt?: () => Promise<void>,
+		options?: { existingParentOnly: true },
 	): Promise<void> {
-		await this.moveResource(fromPath, toPath, false, beforeAttempt);
+		await this.moveResource(
+			fromPath,
+			toPath,
+			false,
+			beforeAttempt,
+			options?.existingParentOnly,
+		);
 	}
 
 	/**
@@ -1228,6 +1594,7 @@ export class YandexDiskClient {
 			}
 			if (method !== "GET") {
 				await this.writeGuard?.();
+				this.assertWriteInvocation();
 			}
 			const startedAt = Date.now();
 			try {
@@ -1351,10 +1718,24 @@ export class YandexDiskClient {
 	private async requestNative(
 		params: RequestUrlParam,
 	): Promise<RequestUrlResponse> {
+		const startedAt = Date.now();
+		this.transportMetrics.requests++;
+		if (params.url.startsWith(API_BASE_URL + "/")) {
+			this.transportMetrics.apiRequests++;
+		} else if (params.method === "PUT") {
+			this.transportMetrics.uploadTransfers++;
+			if (params.body instanceof ArrayBuffer) {
+				this.transportMetrics.uploadBytes += params.body.byteLength;
+			}
+		} else if (params.method === "GET" && !params.headers?.Authorization) {
+			this.transportMetrics.downloadTransfers++;
+		}
 		try {
 			return await requestUrl(params);
 		} catch (error) {
 			throw new NetworkRequestError(error);
+		} finally {
+			this.transportMetrics.requestMs += Date.now() - startedAt;
 		}
 	}
 
@@ -1466,15 +1847,30 @@ export class YandexDiskClient {
 		this.remainingReadTime(budget, "download retry");
 	}
 
+	/** Classify diagnostics without retaining paths or signed transfer URLs. */
+	private getDownloadResourceKind(
+		path: string,
+	): "canonical" | "manifest" | "user" {
+		const relative = toLocalPath(path, this.remotePath);
+		if (relative === ".obsidian-encrypt.json") {
+			return "manifest";
+		}
+		return relative === ".obsidian-sync-index.json" ||
+			isRootIndexLockPath(relative)
+			? "canonical"
+			: "user";
+	}
+
 	private recordApiRead(endpoint: string): void {
 		let category: ApiReadCategory = "other";
-		if (endpoint.includes(".obsidian-encrypt.json")) {
+		const query = endpoint.slice(endpoint.indexOf("?") + 1);
+		const encodedPath = new URLSearchParams(query).get("path") ?? "";
+		const kind = this.getDownloadResourceKind(encodedPath);
+		if (kind === "manifest") {
 			category = "manifest";
-		} else if (endpoint.includes(".obsidian-sync-index")) {
+		} else if (kind === "canonical") {
 			category = "index";
 		} else if (endpoint.startsWith("/resources?")) {
-			const query = endpoint.slice(endpoint.indexOf("?") + 1);
-			const encodedPath = new URLSearchParams(query).get("path") ?? "";
 			const path = normalizePath(encodedPath.replace(/^disk:\//, ""));
 			category = path === this.remotePath ? "root" : "tree";
 		}
@@ -1503,13 +1899,16 @@ export class YandexDiskClient {
 		}
 		const href = (response.json as { href?: unknown } | null)?.href;
 		if (typeof href !== "string" || !href) {
-			return;
+			throw new Error(
+				"Accepted async operation is missing its operation link; completion is unknown",
+			);
 		}
 		const operationUrl = href.startsWith("http")
 			? href
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
 
 		for (let attempt = 0; attempt < 120; attempt++) {
+			this.transportMetrics.polls++;
 			const operationResponse = await this.requestRead(
 				{
 					url: operationUrl,

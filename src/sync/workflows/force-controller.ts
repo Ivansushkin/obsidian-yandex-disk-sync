@@ -1,3 +1,4 @@
+import { confirmForceReplacementPlan } from "./force-replacement";
 import type { OperationBackupChoice } from "../../backup/operation-backup-choice";
 import type { BackupProgress, BackupResult } from "../../backup/backup-manager";
 import type { SyncResult, SyncState } from "../../types";
@@ -21,6 +22,7 @@ export type ForceOutcome =
 	| "blocked"
 	| "backup-failed"
 	| "failed"
+	| "recovery-pending"
 	| "cleanup-pending";
 
 export interface ForceFlowState {
@@ -34,6 +36,8 @@ export interface ForceFlowState {
 	errorCode?: string;
 	failure?: FailureSummary;
 	successful?: number;
+	failed?: number;
+	direct?: boolean;
 }
 
 export interface ForceSyncDependencies {
@@ -47,6 +51,7 @@ export interface ForceSyncDependencies {
 		direction: ForceDirection,
 		migration: boolean,
 		replacement?: SyncRunOptions["forceReplacement"],
+		prepareArchive?: () => Promise<void>,
 	): Promise<OperationBackupChoice>;
 	captureProtectedSnapshot(direction: ForceDirection): Promise<string>;
 	readyForBackup(
@@ -72,6 +77,7 @@ export interface ForceSyncDependencies {
 		onActivity: (state: SyncState) => void,
 	): Promise<SyncResult | null>;
 	hasPendingCleanup(): boolean;
+	hasPendingRecovery(): boolean;
 	reportError(error: unknown): void;
 }
 
@@ -165,7 +171,9 @@ export class ForceSyncController {
 			});
 			this.deps.reportError(failure);
 			update({
-				outcome,
+				outcome: this.deps.hasPendingRecovery()
+					? "recovery-pending"
+					: outcome,
 				failure: failure.summary,
 				errorCode: failure.summary.code,
 			});
@@ -178,17 +186,139 @@ export class ForceSyncController {
 				return;
 			}
 			update({ migration: prepared.migration });
+			if (prepared.replacement?.plan.recovery.direct) {
+				const replacement = prepared.replacement;
+				update({ direct: true });
+				phase("confirming");
+				const archiveWork: { pending: Promise<void> | null } = {
+					pending: null,
+				};
+				const createArchive = async () => {
+					try {
+						if (
+							!(await this.deps.readyForBackup(
+								false,
+								replacement,
+							))
+						) {
+							throw new Error(
+								"Force archive destination is unavailable",
+							);
+						}
+						phase("protected-snapshot");
+						const snapshotDigest =
+							await this.deps.captureProtectedSnapshot(direction);
+						phase("creating-backup");
+						const backup = await this.deps.backup(
+							direction,
+							phase,
+							replacement,
+						);
+						if (
+							!backup.success ||
+							!backup.backupName ||
+							!backup.sha256 ||
+							backup.snapshotDigest !== snapshotDigest
+						) {
+							throw (
+								backup.failureCause ??
+								new Error(
+									backup.error ??
+										"The selected archive was not verified",
+								)
+							);
+						}
+						replacement.plan.recovery.backupProof = {
+							name: backup.backupName,
+							sha256: backup.sha256,
+							snapshotDigest,
+						};
+					} finally {
+						phase("confirming");
+					}
+				};
+				const prepareArchive = () => {
+					if (!archiveWork.pending) {
+						archiveWork.pending = createArchive();
+						void archiveWork.pending.then(
+							() => {
+								archiveWork.pending = null;
+							},
+							() => {
+								archiveWork.pending = null;
+							},
+						);
+					}
+					return archiveWork.pending;
+				};
+				let choice: OperationBackupChoice;
+				try {
+					choice = await this.deps.confirm(
+						direction,
+						false,
+						replacement,
+						prepareArchive,
+					);
+				} finally {
+					// Closing confirmation cancels replacement, but cannot release an active archive scope.
+					await archiveWork.pending?.catch(() => {});
+				}
+				if (choice === "cancel") {
+					update({ outcome: "cancelled" });
+					return;
+				}
+				if (
+					choice === "with-backup" &&
+					!replacement.plan.recovery.backupProof
+				) {
+					await prepareArchive();
+				}
+				confirmForceReplacementPlan(replacement.plan);
+				phase("syncing");
+				const result = await this.deps.run(direction, {
+					forceReplacement: { ...replacement, backupMode: choice },
+					onActivity: (activity) => update({ activity }),
+				});
+				committed = result.replacementCommitted === true;
+				phase("persisting");
+				await this.deps.persist(result);
+				update({
+					successful:
+						result.uploaded + result.downloaded + result.deleted,
+					failed: result.errors.length,
+				});
+				if (!result.success || !committed) {
+					fail(
+						result.errors[0]?.failureCause ??
+							new Error(
+								result.errors[0]?.message ??
+									"Force replacement remains incomplete",
+							),
+						"failed",
+					);
+					return;
+				}
+				this.deps.replacementCommitted();
+				update({ outcome: "success" });
+				return;
+			}
 			phase("confirming");
-			let choice = await this.deps.confirm(
-				direction,
-				prepared.migration,
-				prepared.replacement,
-			);
+			let choice = prepared.replacement?.continuing
+				? prepared.replacement.backupMode
+				: await this.deps.confirm(
+						direction,
+						prepared.migration,
+						prepared.replacement,
+					);
 			if (choice === "cancel") {
 				update({ outcome: "cancelled" });
 				return;
 			}
+			if (prepared.replacement && !prepared.replacement.continuing) {
+				confirmForceReplacementPlan(prepared.replacement.plan);
+			}
 			if (
+				!prepared.replacement?.continuing &&
 				!(await this.deps.readyForBackup(
 					prepared.migration,
 					prepared.replacement,
@@ -204,7 +334,10 @@ export class ForceSyncController {
 					await this.deps.captureProtectedSnapshot(direction);
 			}
 			let backupProof: ForcePreflightProof["backup"] = null;
-			while (choice === "with-backup") {
+			while (
+				choice === "with-backup" &&
+				!prepared.replacement?.continuing
+			) {
 				let backup: BackupResult;
 				try {
 					if (prepared.replacement) {
@@ -264,7 +397,7 @@ export class ForceSyncController {
 				};
 				break;
 			}
-			if (prepared.replacement) {
+			if (prepared.replacement && !prepared.replacement.continuing) {
 				prepared.replacement.plan.recovery.backupProof = backupProof
 					? {
 							name: backupProof.backupName,
@@ -276,6 +409,7 @@ export class ForceSyncController {
 			phase("syncing");
 			if (
 				prepared.replacement &&
+				!prepared.replacement.continuing &&
 				choice === "with-backup" &&
 				snapshotDigest !==
 					(await this.deps.captureProtectedSnapshot(direction))

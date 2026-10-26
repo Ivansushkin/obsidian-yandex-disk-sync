@@ -1,3 +1,4 @@
+import { confirmForceReplacementPlan } from "../src/sync/workflows/force-replacement";
 import { encryptionFlow } from "./helpers/encryption-flow";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -98,9 +99,7 @@ test("stale lock codec fallback reuses stable bytes and stops unresolved reads",
 	for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);
-		const a = device(disk, "device-a", codec, undefined, undefined, {
-			readTimeoutMs: 15,
-		});
+		const a = device(disk, "device-a", codec);
 		const recovery = (a.index as unknown as { recovery: CanonicalRecovery })
 			.recovery;
 		const lockPath = "vault/.obsidian-sync-index.lock.interrupted";
@@ -135,18 +134,37 @@ test("stale lock codec fallback reuses stable bytes and stops unresolved reads",
 					complete();
 				}
 			};
-			await assert.rejects(
-				recovery.recoverStaleLock([resource]),
-				(error) => {
-					const failure = new OperationFailure(error, {
-						stage: "stale-lock",
-						action: "read",
-					});
-					assert.equal(failure.summary.code, "remote-read-timeout");
-					assert.equal(failure.summary.requestState, "unresolved");
-					return isRemoteReadTimeout(error);
-				},
-			);
+			const readStable = a.client.downloadStableRawFile.bind(a.client);
+			a.client.downloadStableRawFile = (path, expected, budget) =>
+				readStable(
+					path,
+					expected,
+					path === lockPath
+						? { deadline: Date.now() + 15, timeoutMs: 15 }
+						: budget,
+				);
+			try {
+				await assert.rejects(
+					recovery.recoverStaleLock([resource]),
+					(error) => {
+						const failure = new OperationFailure(error, {
+							stage: "stale-lock",
+							action: "read",
+						});
+						assert.equal(
+							failure.summary.code,
+							"remote-read-timeout",
+						);
+						assert.equal(
+							failure.summary.requestState,
+							"unresolved",
+						);
+						return isRemoteReadTimeout(error);
+					},
+				);
+			} finally {
+				a.client.downloadStableRawFile = readStable;
+			}
 			assert.equal(downloads, 1);
 			release();
 			await lateReply;
@@ -888,6 +906,7 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 			(await captureRemoteRawSnapshot(a.client, "vault")).digest,
 			before.digest,
 		);
+		confirmForceReplacementPlan(prepared.replacement.plan);
 		const result = await a.engine.forceSyncFromLocal({
 			forceReplacement: prepared.replacement,
 		});
@@ -898,7 +917,7 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 	}
 });
 
-test("Force UI never reports success while a changed orphan survives its final full", async () => {
+test("Force UI deletes changed orphan garbage and completes without a normal post-Force merge", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	const path = "vault/.obsidian-sync-index.lock.old.attempt";
@@ -908,22 +927,38 @@ test("Force UI never reports success while a changed orphan survives its final f
 		const changed = bytes(
 			JSON.stringify(createEmptyIndex("device-b", "foreign-epoch")),
 		);
-		disk.afterRequest = async (method, endpoint, target) => {
-			if (
-				method === "POST" &&
-				endpoint.endsWith("/resources/move") &&
-				target === "vault/.obsidian-sync-index.json"
-			) {
+		disk.beforeRequest = async (method, _endpoint, target) => {
+			if (method === "DELETE" && target === path) {
 				disk.files.set(path, changed);
 			}
 		};
-		const controller = forceUi(a).getForceSyncController();
+		const plugin = forceUi(a);
+		let schedulerStarts = 0;
+		Object.assign(plugin, {
+			automationReady: false,
+			persistence: { failed: false },
+			app: { workspace: { layoutReady: true } },
+			syncScheduler: {
+				start: () => {
+					schedulerStarts++;
+				},
+				stop: () => {},
+			},
+			runFullSync: async () => {
+				throw new Error("Force must not require a post-Force merge");
+			},
+		});
+		const controller = plugin.getForceSyncController();
 		await controller.run("from_local");
-		assert.equal(controller.getState()?.outcome, "cleanup-pending");
-		assert.deepEqual(disk.files.get(path), changed);
-		assert.equal(a.index.getObservedEpoch(), null);
+		assert.equal(controller.getState()?.outcome, "success");
+		assert.equal((await a.canonical()).maintenance, undefined);
+		a.assertLocal("Note.md", "kept");
+		assert.deepEqual(disk.files.get("vault/Note.md"), bytes("kept"));
+		assert.equal(disk.files.has(path), false);
+		assert.ok(a.index.getObservedEpoch());
+		assert.equal(schedulerStarts, 1);
 	} finally {
-		disk.afterRequest = undefined;
+		disk.beforeRequest = undefined;
 		await a.stop();
 	}
 });

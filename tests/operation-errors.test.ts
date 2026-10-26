@@ -51,82 +51,66 @@ test("recovery policy preserves read write and polling limits and refuses unreso
 	}
 });
 
-test("domain safety retains priority and summaries exclude credentials and signed links", () => {
-	const guard = new ForceSourceChangedError();
-	Object.assign(guard, {
-		cause: new YandexApiError(
-			"password=private OAuth abcdefghijklmn https://signed.example/file?secret=hidden",
-			403,
-		),
-	});
-	const failure = createSyncFailure(guard, {
-		stage: "preflight",
-		action: "write",
-	});
-	assert.equal(failure.summary.category, "safety");
-	assert.equal(failure.summary.code, "force-source-changed");
-	assert.equal(failure.cause, guard);
-	const transport = new OperationFailure(
-		(guard as Error & { cause: Error }).cause,
-		{ stage: "download", path: "note.md", action: "read" },
-	);
-	const serialized = JSON.stringify(transport.summary);
-	for (const secret of [
-		"private",
-		"abcdefghijklmn",
-		"signed.example",
-		"hidden",
-	]) {
-		assert.equal(serialized.includes(secret), false);
+test("domain safety outranks nested transport failures and diagnostics exclude provider data", () => {
+	const privateBody =
+		"password=private OAuth abcdefghijklmn https://signed.example/file?secret=hidden";
+	const provider = new YandexApiError(privateBody, 503, "ServiceUnavailable");
+	const changed = new ForceSourceChangedError();
+	Object.assign(changed, { cause: provider });
+	const cases = [
+		[changed, "force-source-changed"],
+		[
+			new OperationFailure(
+				new NetworkRequestError(new Error("socket failed")),
+				{ stage: "protective-backup", action: "local" },
+				{ category: "safety", code: "mandatory-backup-failed" },
+			),
+			"mandatory-backup-failed",
+		],
+		[
+			new AmbiguousRemoteIndexStateError(
+				"Canonical recovery required",
+				"acquired",
+				provider,
+			),
+			"ambiguous-index-state",
+		],
+	] as const;
+	for (const [error, code] of cases) {
+		const failure = createSyncFailure(error, {
+			stage: "canonical",
+			action: "write",
+		});
+		assert.equal(failure.summary.category, "safety", code);
+		assert.equal(failure.summary.code, code);
+		assert.deepEqual(
+			decideRecovery(failure, { attemptsRemaining: 3, remainingMs: 100 }),
+			{ retry: false, confirm: false },
+			code,
+		);
+		if (error === changed) {
+			assert.equal(failure.cause, changed);
+		}
 	}
-	assert.equal(serialized.includes('"cause"'), false);
-});
-
-test("mandatory backup failure outranks a nested transport error without retry", () => {
-	const failure = new OperationFailure(
-		new NetworkRequestError(new Error("socket failed")),
-		{ stage: "protective-backup", action: "local" },
-		{ category: "safety", code: "mandatory-backup-failed" },
-	);
-	const adapted = createSyncFailure(failure, {
-		stage: "download",
-		action: "read",
-	});
-	assert.equal(adapted.summary.code, "mandatory-backup-failed");
-	assert.equal(adapted.summary.category, "safety");
-	assert.deepEqual(
-		decideRecovery(adapted, { attemptsRemaining: 3, remainingMs: 100 }),
-		{ retry: false, confirm: false },
-	);
-});
-
-test("canonical ambiguity outranks transport and rollback wrappers do not expose provider bodies", () => {
-	const provider = new YandexApiError(
-		"provider-private-body",
-		503,
-		"ServiceUnavailable",
-	);
-	const ambiguous = createSyncFailure(
-		new AmbiguousRemoteIndexStateError(
-			"Canonical recovery required",
-			"acquired",
-			provider,
-		),
-		{ stage: "canonical", action: "write" },
-	);
-	assert.equal(ambiguous.summary.category, "safety");
-	assert.equal(ambiguous.summary.code, "ambiguous-index-state");
-	assert.deepEqual(
-		decideRecovery(ambiguous, { attemptsRemaining: 3, remainingMs: 100 }),
-		{ retry: false, confirm: false },
-	);
-	const rollback = createSyncFailure(
+	for (const cause of [
+		provider,
 		new RemoteIndexRolledBackError(provider.message, "acquired", provider),
-		{ stage: "canonical", action: "write" },
-	);
-	assert.equal(
-		JSON.stringify(rollback.summary).includes("provider-private-body"),
-		false,
-	);
-	assert.equal(rollback.summary.httpStatus, 503);
+	]) {
+		const failure = createSyncFailure(cause, {
+			stage: "download",
+			path: "note.md",
+			action: "read",
+		});
+		const serialized = JSON.stringify(failure.summary);
+		for (const secret of [
+			"private",
+			"abcdefghijklmn",
+			"signed.example",
+			"hidden",
+			'"cause"',
+		]) {
+			assert.equal(serialized.includes(secret), false, secret);
+		}
+		assert.equal(failure.summary.httpStatus, 503);
+	}
 });

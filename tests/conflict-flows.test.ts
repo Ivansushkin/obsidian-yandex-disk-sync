@@ -207,24 +207,33 @@ for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);
 		const desktop = device(disk, "desktop", codec);
-		const phone = device(disk, "phone", codec);
+		const phone = device(disk, "phone", codec, undefined, undefined, {
+			readTimeoutMs: 1000,
+		});
 		let restarted: ReturnType<typeof device> | undefined;
 
 		desktop.vault.put("a.md", bytes("cloud a"));
 		desktop.vault.put("b.md", bytes("cloud b"));
 		await desktop.full();
-		phone.settings.maxConcurrency = 1;
+		phone.settings.maxConcurrency = 2;
 		phone.vault.put("a.md", bytes("old a"));
 		phone.vault.put("b.md", bytes("old b"));
 		phone.vault.put("local.md", bytes("local"));
 		const blocked = await phone.client.getPhysicalPath("vault/b.md");
 		const before = structuredClone([...disk.files]);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
 		disk.beforeRequest = async (_method, endpoint, path) => {
 			if (endpoint === "/download" && path === blocked) {
-				throw new Error("synthetic unavailable object");
+				await gate;
 			}
 		};
-		assert.equal((await phone.engine.fullSync()).success, false);
+		const result = await phone.engine.fullSync().finally(() => release());
+		assert.equal(result.success, false);
+		assert.equal(result.errors[0]?.code, "remote-read-timeout");
+		await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.deepEqual([...disk.files], before);
 		phone.assertLocal("a.md", "cloud a");
 		phone.assertLocal("b.md", "old b");

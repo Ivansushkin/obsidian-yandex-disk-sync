@@ -8,6 +8,7 @@ import type { YandexDiskClient } from "../../api/yandex-client";
 import type { EncryptionCodec } from "../../crypto/encryption";
 import {
 	joinPath,
+	normalizePath,
 	isRootIndexLockPath,
 	REMOTE_INDEX_LOCK_PREFIX,
 } from "../../utils/path-utils";
@@ -25,6 +26,7 @@ import { decideRecovery, OperationFailure } from "../../errors";
 import { isStableLockStale } from "./mutation-rules";
 import {
 	collectStablePaginatedItems,
+	UnstablePaginationError,
 	isOrphanIndexAmbiguous,
 } from "./transaction-rules";
 import {
@@ -54,6 +56,12 @@ const INDEX_LOCK_STALE_MS = 2 * 60 * 1000;
 export const INDEX_LOCK_RETRY_MS = 750;
 export const INDEX_LOCK_ATTEMPTS =
 	Math.ceil(INDEX_LOCK_STALE_MS / INDEX_LOCK_RETRY_MS) + 10;
+
+export interface StableRootListing {
+	resources: YandexResource[];
+	root: YandexResource | null;
+	rootExists: boolean;
+}
 
 export interface CanonicalRecoveryDependencies {
 	client: Pick<
@@ -135,7 +143,12 @@ export class CanonicalRecovery {
 	}
 
 	/** Discover canonical and locks through two matching fully paginated listings. */
-	async waitForCanonicalIndexFromStableRoot(): Promise<{
+	async waitForCanonicalIndexFromStableRoot(
+		assertCurrent: () => void = () => {},
+		validate: (
+			listing: StableRootListing,
+		) => Promise<void> = async () => {},
+	): Promise<{
 		path: string | null;
 		resource?: YandexResource;
 		rootExists: boolean;
@@ -143,7 +156,10 @@ export class CanonicalRecovery {
 	}> {
 		const canonicalPath = this.deps.getCanonicalPath();
 		for (let attempt = 0; attempt < INDEX_LOCK_ATTEMPTS; attempt++) {
-			const { resources, rootExists } = await this.getStableRootListing();
+			const listing = await this.getStableRootListing(assertCurrent);
+			await validate(listing);
+			assertCurrent();
+			const { resources, rootExists } = listing;
 			const canonical = resources.find(
 				(resource) =>
 					resource.type === "file" &&
@@ -246,37 +262,128 @@ export class CanonicalRecovery {
 	}
 
 	/** Read a stable root observation without caching it across operations. */
-	async getStableRootListing(): Promise<{
-		resources: YandexResource[];
-		rootExists: boolean;
-	}> {
-		let rootExists = false;
+	async getStableRootListing(
+		assertCurrent: () => void = () => {},
+	): Promise<StableRootListing> {
+		let root: YandexResource | null = null;
+		let identity: string | undefined;
+		let total = 0;
+		const paths = new Set<string>();
+		const remotePath = normalizePath(
+			this.deps.getRemotePath().replace(/^disk:\//, ""),
+		);
 		const resources = await collectStablePaginatedItems(
 			async (limit, offset) => {
-				const root = await this.deps.client.getResource(
+				assertCurrent();
+				const pageRoot = await this.deps.client.getResource(
 					this.deps.getRemotePath(),
 					limit,
 					offset,
 					true,
 				);
-				if (offset === 0) {
-					rootExists = root !== null;
+				assertCurrent();
+				if (
+					pageRoot &&
+					(pageRoot.type !== "dir" ||
+						!pageRoot.resource_id ||
+						typeof pageRoot.path !== "string" ||
+						normalizePath(pageRoot.path.replace(/^disk:\//, "")) !==
+							remotePath)
+				) {
+					throw new UnstablePaginationError(
+						"Remote root identity is unavailable",
+					);
 				}
-				return {
-					items: root?._embedded?.items ?? [],
-					total: root?._embedded?.total ?? 0,
-				};
+				const pageIdentity = pageRoot
+					? `${pageRoot.path}:${pageRoot.resource_id}`
+					: "missing";
+				if (identity !== undefined && identity !== pageIdentity) {
+					throw new UnstablePaginationError(
+						"Remote root changed during observation",
+					);
+				}
+				identity = pageIdentity;
+				root = pageRoot;
+				if (!pageRoot) {
+					return { items: [], total: 0 };
+				}
+				const embedded = pageRoot._embedded;
+				if (
+					!embedded ||
+					!Array.isArray(embedded.items) ||
+					!Number.isSafeInteger(embedded.total) ||
+					embedded.total < 0
+				) {
+					throw new UnstablePaginationError(
+						"Remote root listing is incomplete",
+					);
+				}
+				if (offset === 0) {
+					total = embedded.total;
+					paths.clear();
+				}
+				if (
+					embedded.total !== total ||
+					embedded.items.length > limit ||
+					offset + embedded.items.length > total ||
+					(offset < total && embedded.items.length === 0)
+				) {
+					throw new UnstablePaginationError(
+						"Remote root pagination is incomplete",
+					);
+				}
+				for (const resource of embedded.items) {
+					if (
+						!resource ||
+						!resource.name ||
+						!resource.path ||
+						normalizePath(resource.path.replace(/^disk:\//, "")) !==
+							joinPath(remotePath, resource.name) ||
+						!["file", "dir"].includes(resource.type)
+					) {
+						throw new UnstablePaginationError(
+							"Remote root item identity is unavailable",
+						);
+					}
+					if (paths.has(resource.path)) {
+						throw new UnstablePaginationError(
+							"Remote root listing contains duplicate items",
+						);
+					}
+					paths.add(resource.path);
+					const service =
+						resource.name === REMOTE_INDEX_FILENAME ||
+						resource.name === ".obsidian-encrypt.json" ||
+						isRootIndexLockPath(resource.name);
+					if (
+						service &&
+						(resource.type !== "file" ||
+							!getStableContentFingerprint(resource))
+					) {
+						throw new UnstablePaginationError(
+							"Remote service identity is unavailable",
+						);
+					}
+				}
+				return { items: embedded.items, total };
 			},
-			(resource) => resource.path || resource.name,
+			(resource) => resource.path,
 			(resource) =>
 				[
+					resource.type,
+					resource.name,
 					resource.resource_id || "",
 					getStableContentFingerprint(resource) || "",
 				].join(":"),
 			4,
-			() => (rootExists ? "exists" : "missing"),
+			() => identity ?? "unknown",
 		);
-		return { resources, rootExists };
+		if (resources.length !== total) {
+			throw new UnstablePaginationError(
+				"Remote root listing contains duplicate or missing items",
+			);
+		}
+		return { resources, root, rootExists: root !== null };
 	}
 
 	selectIndexLocks(resources: YandexResource[]): YandexResource[] {

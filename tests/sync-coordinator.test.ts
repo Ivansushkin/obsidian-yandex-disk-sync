@@ -29,25 +29,31 @@ test("coordinator never overlaps sessions across kinds", async () => {
 	assert.equal(maximum, 1);
 });
 
-test("concurrent full requests share one execution", async () => {
+test("concurrent full requests share preparation execution and result until settlement", async () => {
 	const coordinator = new SyncCoordinator();
+	let prepares = 0;
 	let executions = 0;
-	const task = async (): Promise<number> => {
+	const hooks = {
+		prepare: async () => {
+			prepares++;
+			await Promise.resolve();
+		},
+	};
+	const task = async () => {
 		executions++;
-		await new Promise((resolve) => setTimeout(resolve, 5));
+		await Promise.resolve();
 		return 42;
 	};
-
-	const [first, second] = await Promise.all([
-		coordinator.run("full", task),
-		coordinator.run("full", task),
-	]);
-	assert.equal(first, 42);
-	assert.equal(second, 42);
-	assert.equal(executions, 1);
-
-	assert.equal(await coordinator.run("full", task), 42);
-	assert.equal(executions, 2);
+	assert.deepEqual(
+		await Promise.all([
+			coordinator.run("full", task, hooks),
+			coordinator.run("full", task, hooks),
+		]),
+		[42, 42],
+	);
+	assert.deepEqual([prepares, executions], [1, 1]);
+	assert.equal(await coordinator.run("full", task, hooks), 42);
+	assert.deepEqual([prepares, executions], [2, 2]);
 });
 
 test("coordinator clears active metadata when enter hook fails", async () => {
@@ -62,25 +68,6 @@ test("coordinator clears active metadata when enter hook fails", async () => {
 	);
 	assert.equal(coordinator.getActiveSession(), null);
 	assert.equal(coordinator.getActiveKind(), null);
-});
-
-test("full preparation and execution are shared by concurrent callers", async () => {
-	const coordinator = new SyncCoordinator();
-	let prepares = 0;
-	let executions = 0;
-	const hooks = {
-		prepare: async () => {
-			prepares++;
-			await Promise.resolve();
-		},
-	};
-
-	await Promise.all([
-		coordinator.run("full", async () => ++executions, hooks),
-		coordinator.run("full", async () => ++executions, hooks),
-	]);
-	assert.equal(prepares, 1);
-	assert.equal(executions, 1);
 });
 
 test("settlement completes before the next session starts", async () => {

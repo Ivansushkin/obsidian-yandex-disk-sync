@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { YandexApiError } from "../src/api/yandex-client";
 import { computeSha256 } from "../src/utils/hash-utils";
-import { encryptionFlow } from "./helpers/encryption-flow";
+import { encryptionFlow, startupFlow } from "./helpers/encryption-flow";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
 import { isRemoteReadTimeout, OperationFailure } from "../src/errors";
+import { SyncScheduler } from "../src/sync/scheduler";
+import { EncryptionManager } from "../src/crypto/encryption-manager";
+import type { StartupReadSession } from "../src/sync/canonical/manager";
 import { InvalidCurrentIndexError } from "../src/sync/canonical/errors";
 
 test("encryption recovery only falls back after a canonical decode mismatch", async () => {
 	const disk = new MemoryDisk();
-	const a = device(disk, "device-a", null, undefined, undefined, {
-		readTimeoutMs: 15,
-	});
+	const a = device(disk, "device-a", null);
 	const ea = encryptionFlow(a);
 	const canonicalPath = "vault/.obsidian-sync-index.json";
 	let release!: () => void;
@@ -86,15 +87,35 @@ test("encryption recovery only falls back after a canonical decode mismatch", as
 			a.engine.runExclusiveMaintenance(() =>
 				ea.workflow.recovery.recoverEncryptionTransition(),
 			);
-		await assert.rejects(recover(), (error) => {
-			const failure = new OperationFailure(error, {
-				stage: "encryption-recovery",
-				action: "read",
+		const readStable = a.client.downloadStableRawFile.bind(a.client);
+		const expectedCanonical = await a.client.getResource(
+			canonicalPath,
+			1,
+			0,
+			true,
+		);
+		assert.ok(expectedCanonical);
+		a.client.downloadStableRawFile = (path, expected, budget) =>
+			readStable(
+				path,
+				path === canonicalPath ? expectedCanonical : expected,
+				path === canonicalPath
+					? { deadline: Date.now() + 15, timeoutMs: 15 }
+					: budget,
+			);
+		try {
+			await assert.rejects(recover(), (error) => {
+				const failure = new OperationFailure(error, {
+					stage: "encryption-recovery",
+					action: "read",
+				});
+				assert.equal(failure.summary.code, "remote-read-timeout");
+				assert.equal(failure.summary.requestState, "unresolved");
+				return isRemoteReadTimeout(error);
 			});
-			assert.equal(failure.summary.code, "remote-read-timeout");
-			assert.equal(failure.summary.requestState, "unresolved");
-			return isRemoteReadTimeout(error);
-		});
+		} finally {
+			a.client.downloadStableRawFile = readStable;
+		}
 		assert.equal(manifests, 1);
 		assert.equal(downloads, 1);
 		release();
@@ -239,12 +260,10 @@ test("encryption workflow preserves exact bytes through enable rotate restart an
 	}
 });
 
-test("encryption admission shares a prompt and rejects its late password after unload", async () => {
+test("encryption admission shares a prompt and rejects its late password or derivation after unload", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
-	const b = device(disk, "device-b", null);
 	const ea = encryptionFlow(a);
-	const eb = encryptionFlow(b);
 	try {
 		a.vault.put("Note.md", bytes("kept"));
 		await a.full();
@@ -254,34 +273,67 @@ test("encryption admission shares a prompt and rejects its late password after u
 		const manifest = await a.index.downloadEncryptionManifest();
 		assert.ok(manifest);
 		const before = structuredClone(disk.files);
-		const saved = await eb.saved();
-		let resolvePassword!: (password: string) => void;
-		let shown = 0;
-		const password = new Promise<string>((resolve) => {
-			resolvePassword = resolve;
-		});
-		eb.context.ui.requestPassword = () => {
-			shown++;
-			return password;
-		};
-		const first = eb.workflow.admission.ensureEncryptionReady(
-			{ prompt: true },
-			{ manifest },
-		);
-		const second = eb.workflow.admission.ensureEncryptionReady(
-			{ prompt: true },
-			{ manifest },
-		);
-		assert.equal(shown, 1);
-		eb.cancel();
-		resolvePassword("password");
-		assert.deepEqual(await Promise.all([first, second]), [false, false]);
-		assert.deepEqual(await eb.saved(), saved);
-		assert.deepEqual(disk.files, before);
-		assert.equal(eb.context.getService(), null);
+		for (const boundary of ["password", "derivation"]) {
+			const b = device(disk, "device-b", null);
+			const eb = encryptionFlow(b);
+			try {
+				const saved = await eb.saved();
+				let resolvePassword!: (password: string) => void;
+				let shown = 0;
+				const password = new Promise<string>((resolve) => {
+					resolvePassword = resolve;
+				});
+				eb.context.ui.requestPassword = () => {
+					shown++;
+					return password;
+				};
+				let derived!: () => void, release!: () => void;
+				const entered = new Promise<void>((resolve) => {
+					derived = resolve;
+				});
+				const gate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				const create = eb.context.manager.createCodec.bind(
+					eb.context.manager,
+				);
+				if (boundary === "derivation") {
+					eb.context.manager.createCodec = async (...args) => {
+						const codec = await create(...args);
+						derived();
+						await gate;
+						return codec;
+					};
+				}
+				const first = eb.workflow.admission.ensureEncryptionReady(
+					{ prompt: true },
+					{ manifest },
+				);
+				const second = eb.workflow.admission.ensureEncryptionReady(
+					{ prompt: true },
+					{ manifest },
+				);
+				assert.equal(shown, 1);
+				if (boundary === "derivation") {
+					resolvePassword("password");
+					await entered;
+				}
+				eb.cancel();
+				resolvePassword("password");
+				release();
+				assert.deepEqual(await Promise.all([first, second]), [
+					false,
+					false,
+				]);
+				assert.deepEqual(await eb.saved(), saved);
+				assert.deepEqual(disk.files, before);
+				assert.equal(eb.context.getService(), null);
+			} finally {
+				await b.stop();
+			}
+		}
 	} finally {
 		await a.stop();
-		await b.stop();
 	}
 });
 
@@ -355,9 +407,19 @@ test("committed encryption workflow recovers on another device before replaying 
 		er.context.setTransition(saved.transition);
 		try {
 			await er.workflow.initEncryption();
-			await restarted.engine.runExclusiveMaintenance(() =>
-				er.workflow.recovery.recoverEncryptionTransition(),
-			);
+			const startup = startupFlow(restarted, er);
+			await startup.runInvocation(async (invocation) => {
+				const staleReads = invocation.reads!;
+				assert.equal(
+					await startup.refresh(false, true, invocation),
+					"ready",
+				);
+				assert.notEqual(invocation.reads, staleReads);
+				assert.throws(
+					() => staleReads.assertCurrent(),
+					/invocation ended|configuration changed/,
+				);
+			});
 			assert.equal(er.context.getTransition(), null);
 			await b.full();
 			await restarted.full();
@@ -777,5 +839,292 @@ test("completed source rollback retires its stale checkpoint without acquiring d
 		disk.beforeRequest = undefined;
 		await a.stop();
 		await restarted?.stop();
+	}
+});
+
+test("authenticated startup candidate installs once and rejects wrong credentials before persistence", async () => {
+	const disk = new MemoryDisk();
+	const a = device(disk, "device-a", null);
+	const b = device(disk, "device-b", null);
+	const ea = encryptionFlow(a);
+	const eb = encryptionFlow(b);
+	const originalDerive = crypto.subtle.deriveBits.bind(crypto.subtle);
+	try {
+		a.vault.put("Note.md", bytes("preserved plaintext"));
+		await a.full();
+		await a.engine.runExclusiveMaintenance(() =>
+			ea.workflow.enableEncryptionNow(
+				"target-password",
+				"without-backup",
+			),
+		);
+		const derive = crypto.subtle.deriveBits.bind(crypto.subtle);
+		let derivations = 0;
+		crypto.subtle.deriveBits = (
+			...args: Parameters<SubtleCrypto["deriveBits"]>
+		) => {
+			if ((args[0] as Algorithm).name === "PBKDF2") {
+				derivations++;
+			}
+			return derive(...args);
+		};
+		await eb.workflow.connectForSync("target-password");
+		assert.equal(
+			derivations,
+			1,
+			"install must reuse the authenticated candidate",
+		);
+		const active = eb.context.getService();
+		const saved = await eb.saved();
+		derivations = 0;
+		await eb.workflow.connectForSync("target-password");
+		assert.equal(
+			derivations,
+			0,
+			"matching active candidate needs no PBKDF2",
+		);
+		assert.equal(eb.context.getService(), active);
+		const persist = eb.context.persist.bind(eb.context);
+		const failure = new Error("synthetic install save failure");
+		eb.context.persist = async () => {
+			throw failure;
+		};
+		await assert.rejects(
+			eb.workflow.connectForSync("target-password"),
+			(error) => error === failure,
+		);
+		assert.equal(eb.context.getService(), active);
+		assert.deepEqual(await eb.saved(), saved);
+		eb.context.persist = persist;
+		const foreign = await new EncryptionManager().createCodec(
+			"hardened",
+			b.settings.encryptionSalt!,
+			"wrong-password",
+		);
+		const installed = await eb.context.manager.applySnapshot(
+			{ ...b.settings },
+			eb.context.manager.captureSnapshot(b.settings),
+			foreign,
+		);
+		assert.notEqual(installed, foreign);
+		const manifest = await b.index.downloadEncryptionManifest();
+		assert.equal(await installed!.verifyVerifier(manifest!.verifier), true);
+		await assert.rejects(eb.workflow.connectForSync("wrong-password"));
+		assert.equal(eb.context.getService(), active);
+		assert.deepEqual(await eb.saved(), saved);
+		await b.full();
+		await b.assertSettled({ "Note.md": "preserved plaintext" });
+	} finally {
+		crypto.subtle.deriveBits = originalDerive;
+		await a.stop();
+		await b.stop();
+	}
+});
+
+test("startup invocation shares authenticated service bytes and expires before drift or a future full", async () => {
+	const derive = crypto.subtle.deriveBits.bind(crypto.subtle);
+	let derivations = 0;
+	crypto.subtle.deriveBits = (
+		...args: Parameters<SubtleCrypto["deriveBits"]>
+	) => {
+		if ((args[0] as Algorithm).name === "PBKDF2") {
+			derivations++;
+		}
+		return derive(...args);
+	};
+	try {
+		for (const encrypted of [false, true]) {
+			const disk = new MemoryDisk();
+			const a = device(disk, "device-a", null);
+			const ea = encryptionFlow(a);
+			try {
+				a.vault.put("Note.md", bytes("unchanged"));
+				await a.full();
+				if (encrypted) {
+					await a.engine.runExclusiveMaintenance(() =>
+						ea.workflow.enableEncryptionNow(
+							"target-password",
+							"without-backup",
+						),
+					);
+				}
+				const startup = startupFlow(a, ea);
+				if (!encrypted) {
+					const raw = disk.files.get(
+						"vault/.obsidian-sync-index.json",
+					)!;
+					disk.files.set("vault/.obsidian-sync-index.lock.a.1", raw);
+					disk.files.set("vault/.obsidian-sync-index.lock.b.1", raw);
+					const before = structuredClone(disk.files);
+					assert.equal(
+						await startup.refresh(false, false),
+						"ready",
+						"read-only startup classification must not enter lock recovery",
+					);
+					assert.deepEqual(disk.files, before);
+					disk.files.delete("vault/.obsidian-sync-index.lock.a.1");
+					disk.files.delete("vault/.obsidian-sync-index.lock.b.1");
+				}
+				let canonicalBodies = 0,
+					manifestBodies = 0;
+				const observeReads: NonNullable<
+					MemoryDisk["beforeRequest"]
+				> = async (_method, endpoint, path) => {
+					if (
+						endpoint === "/download" &&
+						path.endsWith(".obsidian-sync-index.json")
+					) {
+						canonicalBodies++;
+					}
+					if (
+						endpoint === "/download" &&
+						path.endsWith(".obsidian-encrypt.json")
+					) {
+						manifestBodies++;
+					}
+				};
+				disk.beforeRequest = observeReads;
+				for (let run = 1; run <= 2; run++) {
+					startup.validated = false;
+					derivations = 0;
+					let expired: StartupReadSession | undefined;
+					await startup.runInvocation(async (invocation) => {
+						assert.equal(
+							await startup.refresh(false, true, invocation),
+							"ready",
+						);
+						expired = invocation.reads!;
+						const result = await a.engine.fullSync(
+							undefined,
+							invocation.reads,
+						);
+						assert.equal(result.success, true);
+					});
+					assert.throws(
+						() => expired!.assertCurrent(),
+						/invocation ended|configuration changed/,
+					);
+					assert.equal(
+						derivations,
+						0,
+						"stable startup must not derive the matching active codec again",
+					);
+					assert.equal(canonicalBodies, run);
+					assert.equal(manifestBodies, encrypted ? run : 0);
+					disk.beforeRequest = undefined;
+					await a.assertSettled({ "Note.md": "unchanged" });
+					disk.beforeRequest = observeReads;
+				}
+				// Exercise the actual scheduler timer, whose admission goes directly through engine full.
+				const scheduler = new SyncScheduler(a.engine, {
+					...a.settings,
+					syncInterval: 0.001,
+				});
+				const full = a.engine.fullSync.bind(a.engine);
+				let completed!: (success: boolean) => void;
+				const tick = new Promise<boolean>((resolve) => {
+					completed = resolve;
+				});
+				a.engine.fullSync = async (...args) => {
+					try {
+						const result = await full(...args);
+						completed(result.success);
+						return result;
+					} catch (error) {
+						completed(false);
+						throw error;
+					}
+				};
+				const counts = [canonicalBodies, manifestBodies];
+				derivations = 0;
+				try {
+					scheduler.start();
+					assert.equal(await tick, true);
+				} finally {
+					scheduler.stop();
+					a.engine.fullSync = full;
+				}
+				assert.equal(canonicalBodies, counts[0]! + 1);
+				assert.equal(manifestBodies, counts[1]! + (encrypted ? 1 : 0));
+				assert.equal(derivations, 0);
+				const local = a.index.captureLocalCausalState();
+				for (const boundary of ["token", "pause"]) {
+					await startup.runInvocation(async (invocation) => {
+						await invocation.reads!.manifest();
+						if (boundary === "token") {
+							a.client.setToken("changed");
+							a.client.setToken("synthetic");
+						} else {
+							a.engine.pause();
+							a.engine.resume();
+						}
+						await assert.rejects(
+							invocation.reads!.manifest(),
+							/configuration changed|interrupted/,
+						);
+					});
+				}
+				assert.deepEqual(a.index.captureLocalCausalState(), local);
+				if (encrypted) {
+					const resource = disk.resource.bind(disk);
+					disk.resource = async (path) => {
+						const item = await resource(path);
+						if (item && path.endsWith(".obsidian-encrypt.json")) {
+							delete item.sha256;
+						}
+						return item;
+					};
+					const beforeBodies = manifestBodies;
+					await startup.runInvocation(async (invocation) => {
+						await invocation.reads!.manifest();
+						await invocation.reads!.manifest();
+					});
+					assert.equal(
+						manifestBodies,
+						beforeBodies + 2,
+						"mtime/size must not authorize manifest byte reuse",
+					);
+					disk.resource = resource;
+					await startup.runInvocation(async (invocation) => {
+						await invocation.reads!.manifest();
+						await invocation.reads!.load();
+						const manifest =
+							await a.index.downloadEncryptionManifest();
+						const wrong = await ea.context.manager.createCodec(
+							"hardened",
+							manifest!.salt,
+							"wrong-password",
+						);
+						disk.files.set(
+							"vault/.obsidian-encrypt.json",
+							bytes(
+								JSON.stringify({
+									...manifest,
+									verifier: await wrong.createVerifier(),
+								}),
+							),
+						);
+						const before = structuredClone(disk.files);
+						const result = await a.engine.fullSync(
+							undefined,
+							invocation.reads,
+						);
+						assert.equal(result.success, false);
+						assert.deepEqual(disk.files, before);
+						assert.deepEqual(
+							a.index.captureLocalCausalState(),
+							local,
+						);
+					});
+				} else {
+					await a.assertSettled({ "Note.md": "unchanged" });
+				}
+			} finally {
+				disk.beforeRequest = undefined;
+				await a.stop();
+			}
+		}
+	} finally {
+		crypto.subtle.deriveBits = derive;
 	}
 });

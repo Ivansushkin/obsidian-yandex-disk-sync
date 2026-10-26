@@ -1,9 +1,8 @@
 import { t } from "./i18n/index";
-import type { StartupState } from "./plugin-startup";
+import type { StartupInvocation, StartupState } from "./plugin-startup";
 import type { SyncResult } from "./types";
 import type { SyncEngine } from "./sync/engine";
 import type { FileWatcher } from "./sync/realtime/watcher";
-import type { SyncScheduler } from "./sync/scheduler";
 import type { YandexDiskSyncSettings } from "./types";
 
 const USER_SETTING_KEYS = [
@@ -58,7 +57,8 @@ export function prepareSettingsPatch(
 		(patch.debounceDelay !== undefined && patch.debounceDelay < 0) ||
 		(patch.maxConcurrency !== undefined &&
 			(!Number.isInteger(patch.maxConcurrency) ||
-				patch.maxConcurrency < 1))
+				patch.maxConcurrency < 1 ||
+				patch.maxConcurrency > 40))
 	) {
 		throw new Error("Invalid scheduling setting");
 	}
@@ -108,17 +108,20 @@ interface SettingsWorkflowPorts {
 	isLayoutReady(): boolean;
 	setUpdating(updating: boolean): void;
 	stopRegularSync(): void;
-	markRegularStarted(): void;
+	startAutomation(): void;
 	invalidateRemoteStateClassification(): void;
 	settingsSaveRejected(): void;
 	persistPluginData(patch: UserSettingsPatch): Promise<void>;
+	runStartupInvocation?<T>(
+		action: (invocation: StartupInvocation) => Promise<T>,
+	): Promise<T>;
 	refreshRemoteStartupState(
 		prompt: boolean,
 		recovery: boolean,
+		invocation?: StartupInvocation,
 	): Promise<StartupState>;
-	reconcile(): Promise<SyncResult | null>;
+	reconcile(invocation?: StartupInvocation): Promise<SyncResult | null>;
 	watcher?: Pick<FileWatcher, "waitForPendingPersistence" | "start">;
-	scheduler: Pick<SyncScheduler, "start">;
 	engine?: Pick<
 		SyncEngine,
 		"hasPendingWork" | "setExternalBlock" | "isSyncPaused"
@@ -129,7 +132,13 @@ interface SettingsWorkflowPorts {
 export async function applyUserSettingsPatch(
 	deps: SettingsWorkflowPorts,
 	patch: UserSettingsPatch,
+	invocation?: StartupInvocation,
 ): Promise<void> {
+	if (!invocation && deps.runStartupInvocation) {
+		return await deps.runStartupInvocation((owned) =>
+			applyUserSettingsPatch(deps, patch, owned),
+		);
+	}
 	const draft = prepareSettingsPatch(deps.getSettings(), patch);
 	patch = {
 		...patch,
@@ -160,6 +169,7 @@ export async function applyUserSettingsPatch(
 			t("notice.configuration_busy"),
 		);
 	}
+	let automationReady = false;
 	try {
 		if (changesScope) {
 			await deps.watcher?.waitForPendingPersistence();
@@ -176,7 +186,11 @@ export async function applyUserSettingsPatch(
 		}
 		if (changesScope) {
 			deps.invalidateRemoteStateClassification();
-			const ready = await deps.refreshRemoteStartupState(false, false);
+			const ready = await deps.refreshRemoteStartupState(
+				false,
+				false,
+				invocation,
+			);
 			if (
 				ready === "ready" &&
 				!deps.isUnloaded() &&
@@ -184,16 +198,12 @@ export async function applyUserSettingsPatch(
 				!deps.engine?.isSyncPaused()
 			) {
 				if (draft.needsFull || recoveringPersistence) {
-					const result = await deps.reconcile();
+					const result = await deps.reconcile(invocation);
 					if (!result?.success) {
 						return;
 					}
 				}
-				if (!deps.isUnloaded() && !deps.engine?.isSyncPaused()) {
-					deps.watcher?.start();
-					deps.scheduler.start();
-					deps.markRegularStarted();
-				}
+				automationReady = true;
 			}
 		}
 	} catch (error) {
@@ -204,6 +214,9 @@ export async function applyUserSettingsPatch(
 	} finally {
 		if (changesScope) {
 			deps.setUpdating(false);
+		}
+		if (automationReady) {
+			deps.startAutomation();
 		}
 	}
 }

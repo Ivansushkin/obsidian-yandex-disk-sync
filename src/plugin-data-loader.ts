@@ -83,6 +83,16 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		if (!("forceRecovery" in data)) {
 			data = { ...data, forceRecovery: null };
 		}
+		const force = data.forceRecovery as unknown;
+		if (isRecord(force) && !("completion" in force)) {
+			data = {
+				...data,
+				forceRecovery: {
+					...force,
+					completion: null,
+				} as unknown as ForceRecovery,
+			};
+		}
 		try {
 			assertForceRecovery(data.forceRecovery);
 		} catch {

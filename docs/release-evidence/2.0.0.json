@@ -8,6 +8,9 @@
 		"Real two-profile Yandex Disk run is not recorded",
 		"2.0.0 fresh install, plaintext stable 1.0/1.1 migration, and historical-format fail-closed evidence is not recorded",
 		"Current desktop, Obsidian 1.0.0 desktop, and current mobile evidence is not recorded",
-		"PERF-006 and PBKDF2 mobile p95 evidence is not recorded"
+		"PERF-006 and PBKDF2 mobile p95 evidence is not recorded",
+		"Server fencing release gate fails: late Force DELETE, ordinary PUT and encryption manifest PUT/DELETE can damage a completed successor",
+		"Conditional DELETE MD5 and atomic PUT/MOVE version guarantees have not been verified on real Yandex Disk",
+		"Force receipt/recovery and automation changes require a real two-profile Obsidian/Yandex smoke"
 	]
 }

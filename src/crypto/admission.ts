@@ -1,3 +1,4 @@
+import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { t } from "../i18n/index";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
@@ -13,6 +14,8 @@ export interface EncryptionReadyOptions {
 	prompt: boolean;
 	/** Admission checks authority without starting recovery or reconnect. */
 	allowRecovery?: boolean;
+	/** Drop invocation observations before changing codec or entering recovery. */
+	invalidateReads?(): void;
 }
 
 /** Validates current remote encryption and serializes explicit password prompts. */
@@ -62,6 +65,9 @@ export class EncryptionAdmission {
 						return false;
 					}
 					if (plaintextCanonical.maintenance) {
+						if (plaintextCanonical.maintenance.kind === "force") {
+							throw new ForceRecoveryPendingError();
+						}
 						this.controller.createRemoteTargetRecoveryPlan(
 							null,
 							plaintextCanonical.maintenance,
@@ -72,6 +78,7 @@ export class EncryptionAdmission {
 						if (!options.prompt) {
 							return false;
 						}
+						options.invalidateReads?.();
 						await this.context.engine.runExclusiveMaintenance(
 							async () => {
 								await this.recovery.recoverRemotePlaintextTargetTransition(
@@ -86,6 +93,7 @@ export class EncryptionAdmission {
 					logger.info(
 						"Remote encryption manifest gone; auto-disabling local encryption",
 					);
+					options.invalidateReads?.();
 					await this.workflow.clearLocalEncryptionState();
 					this.context.ui.disabledRemotely();
 					this.context.ui.stateChanged();
@@ -100,6 +108,7 @@ export class EncryptionAdmission {
 				}
 				const recoveryKind =
 					this.controller.getRemoteTargetRecoveryKind(manifest);
+				options.invalidateReads?.();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					recoveryKind === "rotate" ? "rotated" : "recover",
@@ -129,6 +138,7 @@ export class EncryptionAdmission {
 				if (!options.prompt || options.allowRecovery === false) {
 					return false;
 				}
+				options.invalidateReads?.();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					hasLocalEncryption ? "rotated" : "connect",
@@ -148,6 +158,7 @@ export class EncryptionAdmission {
 					if (!options.prompt || options.allowRecovery === false) {
 						return false;
 					}
+					options.invalidateReads?.();
 					return await this.promptForRemoteEncryptionPassword(
 						manifest,
 						"rotated",
@@ -158,6 +169,9 @@ export class EncryptionAdmission {
 			this.context.ui.setBlock(null);
 			return true;
 		} catch (e) {
+			if (e instanceof ForceRecoveryPendingError) {
+				throw e;
+			}
 			if (e instanceof UnsupportedHistoricalDataError) {
 				this.context.ui.setBlock(null, false);
 				this.context.ui.setHistoricalBlock(

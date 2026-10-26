@@ -13,20 +13,19 @@ Local settings and baseline are saved immediately as current `plugin-data`
 after installation identity initialization, before automation starts. Downgrading
 the local format to 1.1 is unsupported; a failed save blocks synchronization.
 A plaintext stable canonical with `version: 1`/`version: 2` requires explicit Force.
-Update all devices and stop old builds first. Each Force run offers an archive,
-continuing without an archive, or cancellation. Canonical, snapshot and fingerprint
-guards apply to both choices. Other devices adopt the current epoch through normal
-full sync without an automatic archive; an absent canonical permits initial sync.
-Resume cannot bypass startup blocks.
+Force replaces the full destination and offers an optional archive, off by default.
+Old destination canonical/fingerprints do not select a winner; source is read
+before clearing. Other devices adopt the new epoch through ordinary full and its
+offline-edit decision. Stopping other devices is not a Force prerequisite, but
+late requests from old clients may change the result. Resume does not bypass
+ordinary startup blocks.
 
-If stable 1.1 synchronized the configuration directory and remote metadata
-contains this plugin's directory, migration stops without downloading its
-contents or adding it to a remote snapshot backup. Delete that remote plugin
-directory and replace the OAuth token; a non-secret local remediation marker
-keeps Force blocked across restart until the token changes. Rename any user
-path that conflicts with a current service filename or current path rules.
-Force remote also stops before local writes on NFC/case-insensitive path
-collisions.
+If stable 1.1 uploaded the sync plugin directory, ordinary migration blocks reading
+that exposed data. Full Force local omits its own credentials from source/archive
+and removes old remote plugin copies without reading them. Rotate a previously
+exposed OAuth token separately; Force does not undo credential exposure.
+Force remote omits plugin data and rejects ambiguous portable source paths before
+local writes.
 
 Encrypted legacy data and every other historical format are unsupported.
 Invalid local data blocks startup and mutating workflows. Unsupported remote
@@ -44,7 +43,7 @@ repeat Force local with an explicit archive choice.
 
 > **Data safety**
 > Use an independent backup for important vaults. Deletions propagate to other
-> devices. Force replaces the selected sync scope and offers an explicit backup
+> devices. Force replaces the entire destination and offers an explicit backup
 > choice. OAuth tokens and encryption passwords are stored in plaintext in local
 > plugin data; never share that directory or diagnostic data containing secrets.
 > The plugin sends synchronized data to Yandex Disk and collects no telemetry.
@@ -61,7 +60,7 @@ repeat Force local with an explicit archive choice.
 - **Flexible filters** — configurable include/exclude file patterns
 - **Multi-device support** — work under one token on different devices
 - **Backup system** — create ZIP backups of vault stored on Yandex Disk
-- **Force synchronization** — confirmed replacement of the selected sync scope from local or remote files
+- **Force synchronization** — confirmed replacement of the entire destination from local or remote files
 - **End-to-end encryption** — AES-256-GCM content encryption and deterministic AES-SIV filenames with separated keys
 
 ## Installation
@@ -91,21 +90,23 @@ repeat Force local with an explicit archive choice.
 
 ### Plugin Settings
 
-| Parameter                     | Description                                                    | Recommended Value         |
-| ----------------------------- | -------------------------------------------------------------- | ------------------------- |
-| **OAuth token**               | Token for Yandex Disk API access                               | Obtained in settings      |
-| **Remote path**               | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`) | `obsidian-sync`           |
-| **Real-time sync**            | Automatic synchronization when files are changed               | Enabled                   |
-| **Full sync interval**        | Full synchronization interval in minutes (0 = manual only)     | 5 minutes                 |
-| **Sync delay**                | Delay before uploading file after change (debounce)            | 1000 ms                   |
-| **Max concurrent operations** | Bounded file-operation concurrency                             | 10                        |
-| **Sync config folder**        | Synchronize Obsidian settings folder                           | Disabled (by default)     |
-| **Include/Exclude patterns**  | Glob patterns for file filtering                               | `**` (all syncable files) |
-| **Force Sync**                | Replace selected sync scope from local or remote files         | —                         |
-| **Backup**                    | Create ZIP backups of synchronized files                       | Manual / per-run choice   |
-| **Encryption**                | Enable end-to-end AES-256-GCM encryption                       | Disabled (by default)     |
-| **Encryption info**           | Information about encryption and password storage              | —                         |
-| **Change password**           | Change encryption password (when encryption is enabled)        | —                         |
+| Parameter                     | Description                                                      | Recommended Value         |
+| ----------------------------- | ---------------------------------------------------------------- | ------------------------- |
+| **OAuth token**               | Token for Yandex Disk API access                                 | Obtained in settings      |
+| **Remote path**               | Path to folder on Yandex Disk (e.g., `obsidian-sync/my-vault`)   | `obsidian-sync`           |
+| **Real-time sync**            | Automatic synchronization when files are changed                 | Enabled                   |
+| **Full sync interval**        | Full synchronization interval in minutes (0 = manual only)       | 5 minutes                 |
+| **Sync delay**                | Delay before uploading file after change (debounce)              | 1000 ms                   |
+| **Max concurrent operations** | Concurrent file operations and independent metadata reads (1–40) | 20                        |
+| **Sync config folder**        | Synchronize Obsidian settings folder                             | Disabled (by default)     |
+| **Include/Exclude patterns**  | Glob patterns for file filtering                                 | `**` (all syncable files) |
+| **Force Sync**                | Replace entire destination from local or remote files            | —                         |
+| **Backup**                    | Create ZIP backups of synchronized files                         | Manual / per-run choice   |
+| **Encryption**                | Enable end-to-end AES-256-GCM encryption                         | Disabled (by default)     |
+| **Encryption info**           | Information about encryption and password storage                | —                         |
+| **Change password**           | Change encryption password (when encryption is enabled)          | —                         |
+
+The default concurrency is 20 when the setting is absent; saved values are preserved. Ordinary folder reads use the same limit. Canonical commits and causally dependent operations retain their required order.
 
 ## Commands
 
@@ -189,27 +190,26 @@ Plugin includes built-in backup system for creating ZIP archives of your vault:
 
 ### Force Synchronization
 
-Choose the authoritative source in **Settings → Force Sync**:
+Force clears the selected destination and writes the actual source directly.
+It ignores normal filters and includes hidden files and Obsidian configuration.
 
-- **Local → remote** replaces syncable destination files with the local snapshot.
-- **Remote → local** replaces syncable local files with the authenticated remote snapshot.
+- **Local → Disk:** keep .backup, remove old files/directories/index/locks and upload
+  local data directly. The previous destination encryption key is unnecessary.
+- **Disk → local:** read/authenticate the complete physical source, preserve local
+  .backup and this sync plugin, and replace everything else. Rebuild the index from
+  source and preserve working source encryption parameters.
 
-Files absent from the source are removed only inside the selected sync scope.
-Protected/excluded paths, `.backup`, and this plugin's directory remain protected.
-An unreadable source never means an empty source. Ambiguous filename scope stops
-Force instead of deleting a possibly excluded file.
+An unreadable source is not empty. A successfully read empty source clears the
+destination. Force creates no temporary files, locks, trash or protective/conflict
+copies. One confirmation offers an archive, off by default; archive errors remain
+in that dialog until retry, disabling the archive or cancellation. Restart Obsidian
+after replacing configuration.
 
-Each run offers **with backup**, **without backup**, or **cancel**. A chosen archive
-must pass exact verification; failure offers retry, explicit continuation without
-copies, or cancellation. **Without backup also skips per-file protective/conflict
-copies and the old destination-content snapshot.** Ordinary sync retains mandatory
-protective copies. Encryption transitions have their own archive choice.
-
-Force publishes a durable intent with a new epoch. After interruption, restart
-continues the same operation; do not repeat Force to repair unfinished cleanup.
-Another device with offline changes must choose to accept the remote generation,
-preserve its changes, or defer before uploading. Details: [architecture](docs/ARCHITECTURE.md)
-and [backup policy](docs/BACKUP.md).
+Independent errors do not stop other actions. Partial results list failures;
+ordinary manual/startup/scheduled full retries the remainder without repeating
+the full purge. A new Force always starts a newly confirmed replacement.
+Other devices need not stop; late foreign requests are not fenced.
+See the [Force contract](docs/FORCE_SYNC.md).
 
 ## Encryption
 

@@ -13,8 +13,6 @@ import type {
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
 import {
-	getAncestorDirectories,
-	getAncestorDirectoriesDeepestFirst,
 	getDirectory,
 	hasPortablePathCollision,
 	joinPath,
@@ -25,7 +23,11 @@ import {
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { createConfirmedBaseline } from "../local/baseline-rules";
-import { IndexManager } from "../canonical/manager";
+import {
+	IndexManager,
+	type CanonicalReadSession,
+	type RemoteAuthorityObservation,
+} from "../canonical/manager";
 import { PortablePathCollisionError } from "../canonical/errors";
 import {
 	classifyPhysicalDeleteResource,
@@ -35,6 +37,8 @@ import {
 import type { SyncGuardCallback } from "../contracts";
 import { createSyncError } from "../errors";
 export interface Dependencies {
+	canonicalReadSession?: CanonicalReadSession;
+	validationToken?: string;
 	getSyncGuardResult: SyncGuardCallback;
 	vaultAdapter: VaultAdapter;
 	yandexClient: YandexDiskClient;
@@ -575,77 +579,12 @@ export async function ensureFoldersExist(
 	}
 }
 
-/** Prune deepest first only after observing that a remote folder is empty. */
+/** Remote recursive deletion cannot preserve descendants arriving after an emptiness check. */
 export async function pruneRemoteFolders(
-	deps: Dependencies,
-	localPaths: string[],
+	_deps: Dependencies,
+	_localPaths: string[],
 ): Promise<void> {
-	const candidates = getAncestorDirectoriesDeepestFirst(localPaths);
-	if (candidates.length === 0) {
-		return;
-	}
-
-	const expectedEpoch = deps.indexManager.getRemoteIndex().epoch;
-	const remoteFiles = deps.indexManager.getRemoteIndex().files;
-	const liveAncestors = getAncestorDirectories(
-		Object.keys(remoteFiles).filter((path) => !remoteFiles[path]?.deleted),
-	);
-	const emptyDirs = candidates.filter((dir) => !liveAncestors.has(dir));
-	if (emptyDirs.length === 0) {
-		return;
-	}
-
-	for (const dir of emptyDirs) {
-		const remoteDir = joinPath(deps.settings.remotePath, dir);
-		// Re-check against the live remote state. Under a stale index this
-		// prevents deleting a folder that actually still contains files.
-		let isEmpty: boolean;
-		try {
-			isEmpty = await deps.yandexClient.isFolderEmpty(remoteDir);
-		} catch (e) {
-			logger.warn(
-				`[SyncEngine] Could not verify emptiness of ${dir}, skipping prune:`,
-				{ error: e },
-			);
-			continue;
-		}
-		if (!isEmpty) {
-			continue;
-		}
-
-		try {
-			await deps.yandexClient.deleteResource(
-				remoteDir,
-				false,
-				false,
-				async () => {
-					const canonical =
-						await deps.indexManager.readCanonicalIndex();
-					if (
-						canonical.epoch !== expectedEpoch ||
-						canonical.maintenance ||
-						Object.entries(canonical.files).some(
-							([path, meta]) =>
-								!meta.deleted && path.startsWith(`${dir}/`),
-						) ||
-						!(await deps.yandexClient.isFolderEmpty(remoteDir))
-					) {
-						throw new Error(
-							"Folder is no longer eligible for cleanup",
-						);
-					}
-				},
-			);
-			if (await deps.yandexClient.getLogicalResource(remoteDir)) {
-				throw new Error("Folder cleanup is not confirmed");
-			}
-			logger.debug(`[SyncEngine] Pruned empty remote folder: ${dir}`);
-		} catch (e) {
-			logger.warn(`[SyncEngine] Failed to prune empty folder ${dir}:`, {
-				error: e,
-			});
-		}
-	}
+	// Keep ordinary file settlement independent from optional, unsafe directory pruning.
 }
 
 /** Execute operations in parallel with concurrency control */
@@ -669,7 +608,9 @@ export async function executeOperationsParallel(
 				const expected =
 					deps.indexManager.getRemoteIndex().files[op.path];
 				const expectedEpoch = deps.indexManager.getRemoteIndex().epoch;
-				const guard = await deps.getSyncGuardResult();
+				const guard = await deps.getSyncGuardResult(
+					deps.validationToken,
+				);
 				if (guard.blockReason) {
 					throw new Error(guard.blockReason);
 				}
@@ -679,14 +620,25 @@ export async function executeOperationsParallel(
 					throw new Error("Local file changed after full scan");
 				}
 				const assertAuthority = async () => {
-					const currentGuard = await deps.getSyncGuardResult(
-						guard.validationToken,
-					);
-					if (currentGuard.blockReason) {
-						throw new Error(currentGuard.blockReason);
+					const validate = async (
+						observation?: RemoteAuthorityObservation,
+					) => {
+						const currentGuard = await deps.getSyncGuardResult(
+							guard.validationToken,
+							observation,
+						);
+						if (currentGuard.blockReason) {
+							throw new Error(currentGuard.blockReason);
+						}
+					};
+					let canonical;
+					if (deps.canonicalReadSession) {
+						canonical = await deps.canonicalReadSession(validate);
+					} else {
+						await validate();
+						canonical =
+							await deps.indexManager.readCanonicalIndex();
 					}
-					const canonical =
-						await deps.indexManager.readCanonicalIndex();
 					const current = canonical.files[op.path];
 					if (
 						canonical.epoch !== expectedEpoch ||
@@ -722,6 +674,7 @@ export async function executeOperationsParallel(
 								"Physical file changed before full upload",
 							);
 						}
+						deps.canonicalReadSession?.assertCurrent();
 					},
 					() =>
 						confirmUploadedSnapshot(

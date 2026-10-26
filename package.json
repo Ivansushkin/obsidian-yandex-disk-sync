@@ -7,8 +7,10 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"check:sync-efficiency": "node scripts/check-sync-efficiency.mjs",
 		"check:bundle": "node scripts/check-bundle.mjs",
 		"test": "node test.config.mjs",
+		"test:force-fencing": "node test.config.mjs --force-fencing",
 		"validate:release": "node scripts/validate-release.mjs",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
 		"lint": "eslint . --max-warnings 0",
