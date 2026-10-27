@@ -496,6 +496,8 @@ export function device(
 	saved?: SavedDevice,
 	clientOptions: {
 		readTimeoutMs?: number;
+		apiReadAttemptTimeoutMs?: number;
+		downloadTimeoutMs?: number;
 		maxRetries?: number;
 	} = {},
 	onPersist?: (snapshot: SavedDevice) => void,

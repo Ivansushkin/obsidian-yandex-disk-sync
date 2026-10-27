@@ -5,6 +5,7 @@ import {
 } from "./workflows/force-state";
 import {
 	OperationFailure,
+	RemoteReadInterruptedError,
 	type FailureContext,
 	type FailureSummary,
 } from "../errors";
@@ -139,6 +140,14 @@ export function classifySyncError(error: Error): string | undefined {
 }
 
 function classifyDomainError(error: Error): string | undefined {
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof RemoteReadInterruptedError,
+		)
+	) {
+		return "sync-interrupted";
+	}
 	if (
 		findErrorCause(
 			error,

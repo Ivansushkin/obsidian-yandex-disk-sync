@@ -15,6 +15,7 @@ import {
 	YandexApiError,
 	RemoteHttpError,
 	RemoteReadTimeoutError,
+	RemoteReadInterruptedError,
 	NetworkRequestError,
 	OperationFailure,
 	decideRecovery,
@@ -37,6 +38,7 @@ import {
 } from "../utils/path-utils";
 import { runWithConcurrencySettled } from "../utils/semaphore";
 import { computeSha256 } from "../utils/hash-utils";
+import { RemoteReadTransport, type RemoteReadBudget } from "./read-transport";
 import {
 	getMatchingStableContentFingerprint,
 	getStableContentFingerprint,
@@ -50,12 +52,11 @@ export interface YandexClientConfig {
 	retryDelay?: number;
 	readTimeoutMs?: number;
 	downloadTimeoutMs?: number;
+	apiReadAttemptTimeoutMs?: number;
+	maxConcurrency?: number;
 }
 
-interface DownloadReadBudget {
-	deadline: number;
-	timeoutMs: number;
-}
+type DownloadReadBudget = RemoteReadBudget;
 
 interface StableRawFileSnapshot {
 	raw: ArrayBuffer;
@@ -84,6 +85,10 @@ export class YandexDiskClient {
 	private retryDelay: number;
 	private readonly readTimeoutMs: number;
 	private readonly downloadTimeoutMs: number;
+	private readonly apiReadAttemptTimeoutMs: number;
+	private readonly readTransport: RemoteReadTransport;
+	private readLifetime = new AbortController();
+	private readsStopped = false;
 	private folderCache: Set<string> = new Set();
 	private encryptionService: EncryptionCodec | null = null;
 	private remotePath = "";
@@ -148,6 +153,30 @@ export class YandexDiskClient {
 		this.retryDelay = config.retryDelay ?? 1000;
 		this.readTimeoutMs = config.readTimeoutMs ?? 60_000;
 		this.downloadTimeoutMs = config.downloadTimeoutMs ?? 60_000;
+		this.apiReadAttemptTimeoutMs =
+			config.apiReadAttemptTimeoutMs ??
+			Math.min(15_000, this.readTimeoutMs);
+		this.readTransport = new RemoteReadTransport(
+			(params) => this.requestNative(params),
+			config.maxConcurrency ?? 20,
+		);
+	}
+
+	/** Keep the native read ceiling aligned with the existing runtime setting. */
+	setReadConcurrency(concurrency: number): void {
+		this.readTransport.setConcurrency(concurrency);
+	}
+
+	/** Revoke queued waits and late responses without claiming native cancellation. */
+	interruptReads(): void {
+		this.readLifetime.abort();
+		this.readLifetime = new AbortController();
+	}
+
+	/** Unload permanently closes this client's read admission. */
+	stopReads(): void {
+		this.readsStopped = true;
+		this.interruptReads();
 	}
 
 	/**
@@ -157,6 +186,7 @@ export class YandexDiskClient {
 		if (this.token !== token) {
 			this.clearFolderCache();
 			this.readConfigurationVersion++;
+			this.interruptReads();
 		}
 		this.token = token;
 	}
@@ -169,6 +199,7 @@ export class YandexDiskClient {
 		if (this.encryptionService !== service) {
 			this.clearFolderCache();
 			this.readConfigurationVersion++;
+			this.interruptReads();
 		}
 		this.encryptionService = service;
 	}
@@ -191,6 +222,7 @@ export class YandexDiskClient {
 		if (this.remotePath !== normalized) {
 			this.clearFolderCache();
 			this.readConfigurationVersion++;
+			this.interruptReads();
 		}
 		this.remotePath = normalized;
 	}
@@ -255,6 +287,7 @@ export class YandexDiskClient {
 		budget = this.createDownloadBudget(),
 		retryContentMismatch = true,
 	): Promise<StableRawFileSnapshot | null> {
+		budget = this.bindReadBudget(budget);
 		const startedAt = Date.now();
 		const before =
 			expectedResource ??
@@ -305,6 +338,7 @@ export class YandexDiskClient {
 		expectedResource?: YandexResource,
 		budget = this.createDownloadBudget(),
 	): Promise<StableLogicalFileSnapshot | null> {
+		budget = this.bindReadBudget(budget);
 		const configurationVersion = this.getReadConfigurationVersion();
 		const before =
 			expectedResource ?? (await this.getLogicalResource(path, budget));
@@ -533,6 +567,7 @@ export class YandexDiskClient {
 		path: string,
 		budget?: DownloadReadBudget,
 	): Promise<YandexResource | null> {
+		budget = this.bindReadBudget(budget);
 		const target = await this.encryptFilePath(path);
 		return await this.getResource(target, 1000, 0, true, budget);
 	}
@@ -1381,6 +1416,7 @@ export class YandexDiskClient {
 		budget = this.createDownloadBudget(),
 	): Promise<ArrayBuffer> {
 		const resourceKind = this.getDownloadResourceKind(remotePath);
+		budget = this.bindReadBudget(budget);
 		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
 			const downloadLink = await this.getDownloadLink(
 				remotePath,
@@ -1395,14 +1431,20 @@ export class YandexDiskClient {
 				timeoutMs: this.readTimeoutMs,
 			});
 			try {
-				response = await this.requestRead(
+				response = await this.readTransport.request(
 					{
 						url: downloadLink.href,
 						method: "GET",
 						throw: false,
 					},
-					"download transfer",
-					budget,
+					{
+						operation: "download transfer",
+						endpoint: "signed-transfer",
+						category: "transfer",
+						attempt: attempt + 1,
+					},
+					this.bindReadBudget(budget),
+					this.readTimeoutMs,
 				);
 			} catch (error) {
 				logger.warn("Download transfer failed", {
@@ -1411,6 +1453,9 @@ export class YandexDiskClient {
 					durationMs: Date.now() - startedAt,
 					kind: isRemoteReadTimeout(error) ? "timeout" : "network",
 				});
+				if (isRemoteReadTimeout(error)) {
+					throw error;
+				}
 				this.remainingReadTime(budget, "download transfer");
 				if (
 					!this.recovery(
@@ -1637,6 +1682,15 @@ export class YandexDiskClient {
 	): Promise<RequestUrlResponse> {
 		const url = `${API_BASE_URL}${endpoint}`;
 		const endpointName = endpoint.split("?", 1)[0] ?? endpoint;
+		if (method === "GET") {
+			budget = this.bindReadBudget(budget);
+		}
+		const canReplace =
+			method === "GET" &&
+			["/resources", "/resources/download", "/resources/upload"].includes(
+				endpointName,
+			);
+		let replacement = false;
 
 		const params: RequestUrlParam = {
 			url,
@@ -1664,9 +1718,7 @@ export class YandexDiskClient {
 			}
 			const startedAt = Date.now();
 			try {
-				if (method === "GET") {
-					this.recordApiRead(endpoint);
-				}
+				this.remainingReadTime(budget, `API ${method} ${endpointName}`);
 				logger.debug(`API request: ${method} ${endpointName}`, {
 					attempt: attempt + 1,
 					maxRetries: this.maxRetries,
@@ -1674,10 +1726,21 @@ export class YandexDiskClient {
 
 				const response =
 					method === "GET"
-						? await this.requestRead(
+						? await this.readTransport.request(
 								params,
-								`API ${method} ${endpointName}`,
-								budget,
+								{
+									operation: `API ${method} ${endpointName}`,
+									endpoint: endpointName,
+									category:
+										endpointName.endsWith("/download") ||
+										endpointName.endsWith("/upload")
+											? "link"
+											: this.getApiReadCategory(endpoint),
+									attempt: attempt + 1,
+								},
+								budget!,
+								this.apiReadAttemptTimeoutMs,
+								replacement,
 							)
 						: await this.requestNative(params);
 
@@ -1705,6 +1768,7 @@ export class YandexDiskClient {
 					attempt: attempt + 1,
 				});
 				if (
+					!replacement &&
 					this.recovery(
 						failure,
 						method === "GET" ? "read" : "write",
@@ -1733,7 +1797,41 @@ export class YandexDiskClient {
 					requestState: "completed",
 				});
 			} catch (e) {
-				if (e instanceof YandexApiError || isRemoteReadTimeout(e)) {
+				if (isRemoteReadTimeout(e)) {
+					const retry =
+						canReplace &&
+						!replacement &&
+						e instanceof RemoteReadTimeoutError &&
+						e.requestState === "unresolved" &&
+						attempt < this.maxRetries &&
+						Boolean(
+							budget &&
+							budget.deadline > Date.now() &&
+							!budget.signal?.aborted,
+						);
+					logger.warn("API read timeout recovery", {
+						endpoint: endpointName,
+						category: this.getApiReadCategory(endpoint),
+						attempt: attempt + 1,
+						retry,
+						remainingMs: Math.max(
+							0,
+							(budget?.deadline ?? Date.now()) - Date.now(),
+						),
+					});
+					if (!retry) {
+						throw e;
+					}
+					replacement = true;
+					await this.waitBeforeRetry(
+						this.getRetryDelay(attempt),
+						attempt,
+						`API ${method} ${endpointName}`,
+						budget,
+					);
+					continue;
+				}
+				if (e instanceof YandexApiError) {
 					throw e;
 				}
 				this.remainingReadTime(budget, `API ${method} ${endpointName}`);
@@ -1745,6 +1843,7 @@ export class YandexDiskClient {
 				});
 
 				if (
+					!replacement &&
 					this.recovery(
 						e,
 						method === "GET" ? "read" : "write",
@@ -1788,6 +1887,13 @@ export class YandexDiskClient {
 		this.transportMetrics.requests++;
 		if (params.url.startsWith(API_BASE_URL + "/")) {
 			this.transportMetrics.apiRequests++;
+			if (params.method === "GET") {
+				this.apiReadMetrics[
+					this.getApiReadCategory(
+						params.url.slice(API_BASE_URL.length),
+					)
+				]++;
+			}
 		} else if (params.method === "PUT") {
 			this.transportMetrics.uploadTransfers++;
 			if (params.body instanceof ArrayBuffer) {
@@ -1820,58 +1926,39 @@ export class YandexDiskClient {
 		);
 	}
 
-	/** Bound read waiting without retrying an unresolved native request or applying its late result. */
-	private async requestRead(
-		params: RequestUrlParam,
-		operation: string,
-		budget?: DownloadReadBudget,
-	): Promise<RequestUrlResponse> {
-		const timeoutMs = Math.min(
-			this.readTimeoutMs,
-			this.remainingReadTime(budget, operation),
-		);
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const response = await Promise.race([
-				this.requestNative(params),
-				new Promise<never>((_, reject) => {
-					timer = setTimeout(
-						() =>
-							reject(
-								new RemoteReadTimeoutError(
-									timeoutMs,
-									operation,
-								),
-							),
-						timeoutMs,
-					);
-				}),
-			]);
-			this.remainingReadTime(budget, operation);
-			return response;
-		} finally {
-			clearTimeout(timer);
-		}
-	}
-
 	/** Share one wall-clock deadline across a stable snapshot and its retries. */
 	createDownloadBudget(): DownloadReadBudget {
 		return {
 			deadline: Date.now() + this.downloadTimeoutMs,
 			timeoutMs: this.downloadTimeoutMs,
+			signal: this.readLifetime.signal,
 		};
+	}
+
+	private bindReadBudget(
+		budget = this.createDownloadBudget(),
+	): DownloadReadBudget {
+		this.remainingReadTime(budget, "read admission");
+		return { ...budget, signal: budget.signal ?? this.readLifetime.signal };
 	}
 
 	private remainingReadTime(
 		budget: DownloadReadBudget | undefined,
 		operation: string,
 	): number {
+		if (this.readsStopped || budget?.signal?.aborted) {
+			throw new RemoteReadInterruptedError();
+		}
 		if (!budget) {
 			return this.readTimeoutMs;
 		}
 		const remaining = budget.deadline - Date.now();
 		if (remaining <= 0) {
-			throw new RemoteReadTimeoutError(budget.timeoutMs, operation);
+			throw new RemoteReadTimeoutError(
+				budget.timeoutMs,
+				operation,
+				"not-started",
+			);
 		}
 		return remaining;
 	}
@@ -1927,7 +2014,7 @@ export class YandexDiskClient {
 			: "user";
 	}
 
-	private recordApiRead(endpoint: string): void {
+	private getApiReadCategory(endpoint: string): ApiReadCategory {
 		let category: ApiReadCategory = "other";
 		const query = endpoint.slice(endpoint.indexOf("?") + 1);
 		const encodedPath = new URLSearchParams(query).get("path") ?? "";
@@ -1940,7 +2027,7 @@ export class YandexDiskClient {
 			const path = normalizePath(encodedPath.replace(/^disk:\//, ""));
 			category = path === this.remotePath ? "root" : "tree";
 		}
-		this.apiReadMetrics[category]++;
+		return category;
 	}
 
 	private sleep(ms: number): Promise<void> {
@@ -1972,10 +2059,15 @@ export class YandexDiskClient {
 		const operationUrl = href.startsWith("http")
 			? href
 			: `${API_BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
+		const signal = this.bindReadBudget().signal;
 
 		for (let attempt = 0; attempt < 120; attempt++) {
+			const budget = this.bindReadBudget({
+				...this.createDownloadBudget(),
+				signal,
+			});
 			this.transportMetrics.polls++;
-			const operationResponse = await this.requestRead(
+			const operationResponse = await this.readTransport.request(
 				{
 					url: operationUrl,
 					method: "GET",
@@ -1984,7 +2076,14 @@ export class YandexDiskClient {
 					},
 					throw: false,
 				},
-				"operation status",
+				{
+					operation: "operation status",
+					endpoint: "/operations",
+					category: "poll",
+					attempt: attempt + 1,
+				},
+				budget,
+				this.readTimeoutMs,
 			);
 			if (
 				operationResponse.status < 200 ||
@@ -2004,6 +2103,7 @@ export class YandexDiskClient {
 						this.getRetryDelay(attempt % 4),
 						attempt,
 						"polling",
+						budget,
 					);
 					continue;
 				}

@@ -7,12 +7,15 @@ import { logger } from "../utils/logger";
 import type { EncryptionContext, EncryptionPromptMode } from "./context";
 import type { EncryptionTransitionController } from "./encryption-transition";
 import type { EncryptionRecovery } from "./recovery";
-import type { EncryptionWorkflow } from "./workflow";
+import type {
+	EncryptionConnectionOptions,
+	EncryptionWorkflow,
+} from "./workflow";
 
 export interface EncryptionReadyOptions {
 	/** Whether the user can be prompted for a missing or rotated password. */
 	prompt: boolean;
-	/** Admission checks authority without starting recovery or reconnect. */
+	/** Whether admission may recover transitions or change the remote encryption mode. */
 	allowRecovery?: boolean;
 	/** Drop invocation observations before changing codec or entering recovery. */
 	invalidateReads?(): void;
@@ -112,6 +115,7 @@ export class EncryptionAdmission {
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					recoveryKind === "rotate" ? "rotated" : "recover",
+					options,
 				);
 			}
 
@@ -135,13 +139,14 @@ export class EncryptionAdmission {
 					? t("notice.encryption_password_changed_remote")
 					: t("notice.encryption_password_required");
 				this.context.ui.setBlock(reason);
-				if (!options.prompt || options.allowRecovery === false) {
+				if (!options.prompt) {
 					return false;
 				}
 				options.invalidateReads?.();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					hasLocalEncryption ? "rotated" : "connect",
+					options,
 				);
 			}
 
@@ -155,13 +160,14 @@ export class EncryptionAdmission {
 					this.context.ui.setBlock(
 						t("notice.encryption_password_changed_remote"),
 					);
-					if (!options.prompt || options.allowRecovery === false) {
+					if (!options.prompt) {
 						return false;
 					}
 					options.invalidateReads?.();
 					return await this.promptForRemoteEncryptionPassword(
 						manifest,
 						"rotated",
+						options,
 					);
 				}
 			}
@@ -197,31 +203,49 @@ export class EncryptionAdmission {
 
 	private async promptForRemoteEncryptionPassword(
 		manifest: RemoteEncryptionManifest,
-		mode: "connect" | "rotated" | "recover",
+		mode: EncryptionPromptMode,
+		options: EncryptionConnectionOptions,
 	): Promise<boolean> {
 		if (this.encryptionPromptPromise) {
 			return await this.encryptionPromptPromise;
 		}
 
 		this.encryptionPromptPromise =
-			this.promptForRemoteEncryptionPasswordOnce(manifest, mode).finally(
-				() => {
-					this.encryptionPromptPromise = null;
-				},
-			);
+			this.promptForRemoteEncryptionPasswordOnce(
+				manifest,
+				mode,
+				options,
+			).finally(() => {
+				this.encryptionPromptPromise = null;
+			});
 
 		return await this.encryptionPromptPromise;
 	}
 	private async promptForRemoteEncryptionPasswordOnce(
 		manifest: RemoteEncryptionManifest,
 		mode: EncryptionPromptMode,
+		options: EncryptionConnectionOptions,
 	): Promise<boolean> {
-		const password = await this.context.ui.requestPassword(manifest, mode);
-		if (!password || this.context.isCancelled()) {
-			return false;
-		}
+		const assertLifetime = this.context.engine.createReadLifetimeGuard();
+		const reads = this.context.index.createStartupReadSession(() => {
+			assertLifetime();
+			this.context.assertConnectionAllowed();
+		}, true);
 		try {
-			await this.workflow.connectForSync(password, manifest);
+			reads.assertCurrent();
+			const password = await this.context.ui.requestPassword(
+				manifest,
+				mode,
+			);
+			if (!password || this.context.isCancelled()) {
+				return false;
+			}
+			reads.assertCurrent();
+			await this.workflow.connectForSync(password, manifest, {
+				allowRecovery: options.allowRecovery,
+				assertCurrent: () => reads.assertCurrent(),
+			});
+			assertLifetime();
 			if (this.context.isCancelled()) {
 				return false;
 			}
@@ -229,12 +253,19 @@ export class EncryptionAdmission {
 			this.context.ui.stateChanged();
 			return true;
 		} catch (error) {
+			try {
+				reads.assertCurrent();
+			} catch {
+				return false;
+			}
 			if (!this.context.isCancelled()) {
 				this.context.ui.setBlock(
 					error instanceof Error ? error.message : String(error),
 				);
 			}
 			return false;
+		} finally {
+			reads.close();
 		}
 	}
 }

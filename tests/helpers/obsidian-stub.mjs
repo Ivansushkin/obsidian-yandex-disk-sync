@@ -17,7 +17,7 @@ export const obsidianStubPlugin = {
 					export class PluginSettingTab {}
 					export class Setting {}
 					export class Notice {
-						constructor(message) { this.message = message; this.noticeEl = { isConnected: true }; }
+						constructor(message) { this.message = message; this.noticeEl = { isConnected: true }; this.messageEl = this.noticeEl; }
 						setMessage(message) { this.message = message; }
 						hide() { this.noticeEl.isConnected = false; }
 					}

@@ -568,6 +568,33 @@ test("DELETE guard failures are not treated as resource absence", async () => {
 			label,
 		);
 	}
+	let polls = 0;
+	const polled = deferred();
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		if (params.method === "DELETE") {
+			return response(202, {
+				href: "https://synthetic.invalid/operation",
+			});
+		}
+		polls++;
+		polled.resolve();
+		return response(200, {
+			status: polls === 1 ? "in-progress" : "success",
+		});
+	};
+	const interrupted = assert.rejects(
+		client.deleteResource("vault/note.md", false, true),
+		/interrupted/,
+	);
+	await polled.promise;
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	client.setToken("synthetic-replacement");
+	await interrupted;
+	assert.equal(
+		polls,
+		1,
+		"A poll cannot continue under a replacement connection",
+	);
 });
 
 test("direct download retries transient transfer failures with fresh links and stops at final errors", async () => {
@@ -715,7 +742,7 @@ test("download budget includes metadata, fresh links and completed network failu
 	}
 });
 
-test("stalled remote reads expire without retrying an unresolved native request", async () => {
+test("stalled API reads allow one bounded replacement while signed bytes remain single-flight", async () => {
 	for (const stage of ["link", "bytes", "metadata"] as const) {
 		const gate = deferred();
 		let blockedRequests = 0;
@@ -740,6 +767,8 @@ test("stalled remote reads expire without retrying an unresolved native request"
 				maxRetries: 3,
 				retryDelay: 0,
 				readTimeoutMs: 10,
+				apiReadAttemptTimeoutMs: 10,
+				downloadTimeoutMs: 100,
 			});
 			const operation =
 				stage === "metadata"
@@ -757,11 +786,132 @@ test("stalled remote reads expire without retrying an unresolved native request"
 				]),
 				/Remote read timed out/,
 			);
-			assert.equal(blockedRequests, 1);
+			assert.equal(blockedRequests, stage === "bytes" ? 1 : 2);
 		} finally {
 			clearTimeout(safetyTimer);
 			gate.resolve();
 			delete requestGlobal.__obsidianRequestUrl;
+		}
+	}
+});
+
+test("replacement metadata ignores the first response even when it arrives before the winner", async () => {
+	const first = deferred<ReturnType<typeof response>>();
+	const second = deferred<ReturnType<typeof response>>();
+	const entered = deferred();
+	let requests = 0;
+	requestGlobal.__obsidianRequestUrl = async () => {
+		requests++;
+		if (requests === 1) {
+			return first.promise;
+		}
+		entered.resolve();
+		return second.promise;
+	};
+	const client = createClient({ maxRetries: 3, apiReadAttemptTimeoutMs: 10 });
+	let settled = false;
+	const reading = client.getResource("vault/note.md").finally(() => {
+		settled = true;
+	});
+	try {
+		await entered.promise;
+		first.resolve(response(200, fileResource("vault/old.md")));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(settled, false);
+		second.resolve(response(200, fileResource("vault/current.md")));
+		assert.equal((await reading)?.name, "current.md");
+		assert.equal(requests, 2);
+	} finally {
+		first.resolve(response(200));
+		second.resolve(response(200));
+		await reading.catch(() => {});
+	}
+});
+
+test("read revocation stops replacement dispatch and observes a late native rejection", async () => {
+	for (const change of ["token", "path", "pause", "unload"] as const) {
+		let rejectNative!: (error: Error) => void;
+		let requests = 0;
+		requestGlobal.__obsidianRequestUrl = async () => {
+			requests++;
+			return new Promise<ReturnType<typeof response>>((_, reject) => {
+				rejectNative = reject;
+			});
+		};
+		const client = createClient({
+			maxRetries: 3,
+			apiReadAttemptTimeoutMs: 5,
+		});
+		client.setRetryCallback((progress) => {
+			if (!progress) {
+				return;
+			}
+			if (change === "token") {
+				client.setToken("synthetic-replacement");
+			} else if (change === "path") {
+				client.setRemotePath("different-root");
+			} else if (change === "pause") {
+				client.interruptReads();
+			} else {
+				client.stopReads();
+			}
+		});
+		await assert.rejects(
+			client.getResource("vault/note.md"),
+			/interrupted/,
+		);
+		assert.equal(requests, 1);
+		rejectNative(new Error("synthetic late network rejection"));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+});
+
+test("native read capacity survives deadlines and expired waiters never dispatch later", async () => {
+	const gates = Array.from({ length: 4 }, () => deferred());
+	let preparing = true;
+	let requests = 0;
+	requestGlobal.__obsidianRequestUrl = async () => {
+		if (preparing) {
+			return response(200, directory("vault"));
+		}
+		const index = requests++;
+		await gates[index]?.promise;
+		return response(200, fileResource("vault/note.md"));
+	};
+	const client = createClient({
+		maxRetries: 3,
+		maxConcurrency: 2,
+		apiReadAttemptTimeoutMs: 10,
+		downloadTimeoutMs: 45,
+	});
+	try {
+		await client.getResourcesRecursive("vault");
+		preparing = false;
+		await Promise.all(
+			[1, 2].map(async (n) => {
+				await assert.rejects(
+					client.getResource(`vault/${n}.md`),
+					/timed out/,
+				);
+			}),
+		);
+		assert.equal(requests, 4);
+		await assert.rejects(
+			client.getResource("vault/queued.md"),
+			/timed out/,
+		);
+		assert.equal(requests, 4);
+		gates[0]!.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(requests, 4, "An expired waiter cannot use a late permit");
+		assert.equal(
+			(await client.getResource("vault/fresh.md"))?.name,
+			"note.md",
+		);
+		assert.equal(requests, 5);
+	} finally {
+		for (const gate of gates) {
+			gate.resolve();
 		}
 	}
 });

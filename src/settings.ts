@@ -159,12 +159,21 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 		const state = this.plugin.getForceSyncController().getState();
 		const foreground = this.plugin.getForegroundOperation();
+		const checkingConnection = Boolean(this.plugin.getConnectionActivity());
 		const fullActive =
-			this.plugin.isFullSyncInProgress() && !state?.active && !foreground;
+			(this.plugin.isFullSyncInProgress() || checkingConnection) &&
+			!state?.active &&
+			!foreground;
 		this.setButtonActivity(
 			this.syncButton,
 			fullActive,
-			t(fullActive ? "settings.syncing_button" : "settings.sync_button"),
+			t(
+				checkingConnection
+					? "status.checking_connection"
+					: fullActive
+						? "settings.syncing_button"
+						: "settings.sync_button",
+			),
 		);
 		for (const { button, direction } of this.forceButtons) {
 			const active =

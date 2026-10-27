@@ -1,4 +1,5 @@
 import type { StartupReadSession } from "./sync/canonical/manager";
+import type { RetryProgress } from "./errors";
 import { SYNC_BUILD_ID } from "./build-info";
 import type { StartupInvocation } from "./plugin-startup";
 import type { RemoteAuthorityObservation } from "./sync/canonical/manager";
@@ -250,6 +251,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.unloaded = true;
+		this.yandexClient?.stopReads();
 		this.forceSyncController?.dispose();
 		logger.info("Unloading Yandex Disk Sync plugin...");
 
@@ -290,6 +292,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		// Create API client
 		this.yandexClient = new YandexDiskClient({
 			token: this.settings.yandexTokenSecret,
+			maxConcurrency: this.settings.maxConcurrency,
 		});
 		this.yandexClient.setRemotePath(this.settings.remotePath);
 		this.configuredToken = this.settings.yandexTokenSecret;
@@ -324,9 +327,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.settings,
 			() => this.unloaded || this.persistence.failed,
 		);
-		this.yandexClient.setRetryCallback((progress) =>
-			this.syncEngine.reportRetry(progress),
-		);
+		this.yandexClient.setRetryCallback((progress) => {
+			this.syncEngine.reportRetry(progress);
+			this.connectionRetry = progress;
+			this.notifyManualActivity();
+		});
 		this.register(() => this.yandexClient.setRetryCallback());
 
 		this.encryptionWorkflow = new EncryptionWorkflow({
@@ -559,6 +564,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					force: this.forceSyncController?.getState() ?? null,
 					foreground: this.getForegroundOperation(),
 					fullSyncInProgress: this.isFullSyncInProgress(),
+					connection: this.getConnectionActivity(),
 					syncUnavailable: this.isConfigurationBusy(),
 				}),
 				Platform.isMobile ? "top" : "bottom",
@@ -656,6 +662,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			return false;
 		}
+		this.beginConnectionCheck();
 		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
 		this.notifyManualActivity();
 		try {
@@ -711,6 +718,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.unloaded || this.isConfigurationBusy()) {
 			return;
 		}
+		this.beginConnectionCheck();
 		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
 		this.notifyManualActivity();
 		try {
@@ -980,6 +988,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (showProgressNotice && this.activeManualFullPromise) {
 			return await this.activeManualFullPromise;
 		}
+		this.beginConnectionCheck();
 		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
 		this.notifyManualActivity();
 		const run = async (): Promise<SyncResult | null> => {
@@ -1215,6 +1224,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Hide a blocking Notice when its code matches the resolved condition. */
 	private clearBlockingNotice(code?: string): void {
+		if (!code || this.connectionIssue?.kind === code) {
+			this.connectionIssue = undefined;
+		}
 		if (code && this.blockingNotice?.code !== code) {
 			return;
 		}
@@ -1230,6 +1242,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	): void {
 		if (this.unloaded) {
 			return;
+		}
+		if (this.getConnectionActivity()) {
+			this.connectionIssue = { kind: code, message };
 		}
 		if (this.isForceSyncBusy()) {
 			reuseProgressNotice = true;
@@ -1995,6 +2010,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private configurationUpdatePending = false;
+	private configurationSyncPending = false;
+	private connectionIssue?: { kind: string; message: string };
+	private connectionPreviousFailure?: FailureSummary;
+	private connectionRetry?: RetryProgress;
 	private foregroundOperation:
 		"encryption" | "encryption-password" | "backup" | null = null;
 	private unloaded = false;
@@ -2021,8 +2040,27 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.hasDurableConfigurationWork(),
 				isUnloaded: () => this.isPluginUnloaded(),
 				isLayoutReady: () => this.app.workspace.layoutReady,
-				setUpdating: (updating) => {
+				setUpdating: (updating, synchronizing = false) => {
+					if (
+						updating &&
+						synchronizing &&
+						!this.configurationSyncPending
+					) {
+						this.beginConnectionCheck();
+					}
 					this.configurationUpdatePending = updating;
+					this.configurationSyncPending = updating && synchronizing;
+					if (
+						!updating &&
+						!this.unloaded &&
+						!this.blockingNotice &&
+						this.authenticationBlockReason
+					) {
+						this.showBlockingNotice(
+							"authentication",
+							this.authenticationBlockReason,
+						);
+					}
 					this.notifyManualActivity();
 				},
 				stopRegularSync: () => this.stopRegularSync(),
@@ -2044,7 +2082,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						);
 					}
 				},
-				persistPluginData: (draft) => this.persistPluginData(draft),
+				persistPluginData: async (draft) => {
+					await this.persistPluginData(draft);
+					if (draft.yandexTokenSecret && !this.unloaded) {
+						this.clearBlockingNotice("authentication");
+					}
+				},
 				runStartupInvocation: (action) =>
 					this.getStartup().runInvocation(action),
 				refreshRemoteStartupState: (prompt, recovery, invocation) =>
@@ -2076,6 +2119,36 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.activeFullRuns ||
 			this.syncEngine?.getState().sessionKind === "full",
 		);
+	}
+
+	private beginConnectionCheck(): void {
+		this.connectionIssue = undefined;
+		this.connectionRetry = undefined;
+		this.connectionPreviousFailure = this.syncEngine?.getState?.().failure;
+	}
+
+	/** Present this invocation's admission, without clearing any owning safety block. */
+	getConnectionActivity():
+		{ errorMessage?: string; retry?: RetryProgress } | undefined {
+		const state = this.syncEngine?.getState?.();
+		if (
+			this.unloaded ||
+			(!this.configurationSyncPending && !this.activeFullRuns) ||
+			state?.status === "paused" ||
+			state?.sessionKind ||
+			state?.status === "syncing"
+		) {
+			return undefined;
+		}
+		return {
+			errorMessage:
+				this.connectionIssue?.message ??
+				(state?.failure &&
+				state.failure !== this.connectionPreviousFailure
+					? state.errorMessage
+					: undefined),
+			retry: this.connectionRetry,
+		};
 	}
 
 	isConfigurationBusy(): boolean {
@@ -2157,6 +2230,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 		// Update components
 		if (this.yandexClient) {
+			this.yandexClient.setReadConcurrency(this.settings.maxConcurrency);
 			this.yandexClient.setToken(this.settings.yandexTokenSecret);
 			this.yandexClient.setRemotePath(this.settings.remotePath);
 		}
@@ -2497,6 +2571,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		failure?: FailureSummary,
 		showNotice = true,
 	): void {
+		if (this.configurationSyncPending || this.activeFullRuns) {
+			if (reason) {
+				this.connectionIssue = { kind, message: reason };
+			} else if (this.connectionIssue?.kind === kind) {
+				this.connectionIssue = undefined;
+			}
+		}
 		this.syncEngine?.setExternalBlock(kind, reason, failure);
 		const codes: Record<StartupBlockKind, string> = {
 			force: "force-recovery-pending",

@@ -70,13 +70,27 @@ export class YandexApiError extends RemoteHttpError {
 	}
 }
 
-/** A native read may still be running; starting another request is forbidden. */
+/** A native timeout retains its occupancy; only the API transport may replace it. */
 export class RemoteReadTimeoutError extends Error {
-	constructor(timeoutMs: number, operation: string) {
+	constructor(
+		timeoutMs: number,
+		operation: string,
+		readonly requestState: "unresolved" | "not-started" = "unresolved",
+	) {
 		super(
 			`Remote read timed out after ${timeoutMs / 1000}s (${operation})`,
 		);
 		this.name = "RemoteReadTimeoutError";
+	}
+}
+
+/** Revocation is an admission failure, never a retryable native rejection. */
+export class RemoteReadInterruptedError extends Error {
+	constructor() {
+		super(
+			"Read invocation interrupted: configuration changed or lifetime ended",
+		);
+		this.name = "RemoteReadInterruptedError";
 	}
 }
 
@@ -245,7 +259,11 @@ export class OperationFailure extends Error {
 				? sanitizeFailureMessage(context.path)
 				: inherited?.path,
 			requestState: timeout
-				? "unresolved"
+				? (findErrorCause(
+						cause,
+						(candidate): candidate is RemoteReadTimeoutError =>
+							candidate instanceof RemoteReadTimeoutError,
+					)?.requestState ?? "unresolved")
 				: (inherited?.requestState ??
 					requestContext?.requestState ??
 					(api || network

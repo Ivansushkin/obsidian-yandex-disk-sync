@@ -611,6 +611,7 @@ export class SyncEngine {
 	 */
 	pause(): void {
 		this.pauseGeneration++;
+		this.yandexClient.interruptReads();
 		this.isPaused = true;
 		this.updateState({
 			status: "paused",

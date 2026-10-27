@@ -275,9 +275,18 @@ password/salt/transition не копируются в новый runtime и со
 coherent очередью вместе с baseline и pending work.
 
 `crypto/admission.ts` сохраняет порядок manifest/verifier checks и единственный
-ожидающий password prompt. `allowRecovery: false` запрещает reconnect, mutating
-recovery и prompt. Ответ закрытого после unload диалога не подключает codec и
-не меняет credentials. UI и foreground reservation принадлежат `main.ts`;
+ожидающий password prompt. `prompt` разрешает ввод credentials, а
+`allowRecovery: false` независимо запрещает mutating recovery и смену remote mode.
+После успешного сохранения изменённого token/path settings workflow использует
+`prompt: true, allowRecovery: false`, если layout готов и sync не на паузе.
+Подключение допускается только к stable enabled manifest без canonical maintenance;
+manifest и canonical перечитываются до сохранения candidate credentials, без
+восстановления locks или cleanup. Runtime/scope settings, persistence repair и reopen
+сами пароль не запрашивают. Cancel/wrong password оставляют admission block и
+не запускают automation; следующий ручной Sync позволяет повторить ввод.
+Lifetime и configuration capture до prompt сохраняются через очередь и derivation.
+Token/path/codec change, pause/resume и unload отвергают поздний ответ без
+подключения codec или изменения credentials. UI и foreground reservation принадлежат `main.ts`;
 после подключения watcher/scheduler запускаются только после успешного full
 и повторных lifecycle/pause checks. Подтверждение нового пароля в Force modal
 сохраняет `confirmPassword`; recovery по-прежнему не создаёт новый архив.

@@ -213,7 +213,7 @@ test("encryption workflow preserves exact bytes through enable rotate restart an
 	}
 });
 
-test("encryption admission shares a prompt and rejects its late password or derivation after unload", async () => {
+test("encryption admission shares a prompt and rejects revoked password or derivation results", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	const ea = encryptionFlow(a);
@@ -224,7 +224,15 @@ test("encryption admission shares a prompt and rejects its late password or deri
 		const manifest = await a.index.downloadEncryptionManifest();
 		assert.ok(manifest);
 		const before = structuredClone(disk.files);
-		for (const boundary of ["password", "derivation"]) {
+		for (const { boundary, revoke } of [
+			{ boundary: "password", revoke: "unload" },
+			{ boundary: "derivation", revoke: "unload" },
+			{ boundary: "password", revoke: "token" },
+			{ boundary: "password", revoke: "path" },
+			{ boundary: "password", revoke: "codec" },
+			{ boundary: "password", revoke: "pause" },
+			{ boundary: "derivation", revoke: "pause" },
+		]) {
 			const b = device(disk, "device-b", null);
 			const eb = encryptionFlow(b);
 			try {
@@ -249,11 +257,11 @@ test("encryption admission shares a prompt and rejects its late password or deri
 					};
 				}
 				const first = eb.workflow.admission.ensureEncryptionReady(
-					{ prompt: true },
+					{ prompt: true, allowRecovery: false },
 					{ manifest },
 				);
 				const second = eb.workflow.admission.ensureEncryptionReady(
-					{ prompt: true },
+					{ prompt: true, allowRecovery: false },
 					{ manifest },
 				);
 				assert.equal(shown, 1);
@@ -261,7 +269,18 @@ test("encryption admission shares a prompt and rejects its late password or deri
 					password.resolve("password");
 					await entered.promise;
 				}
-				eb.cancel();
+				if (revoke === "unload") {
+					eb.cancel();
+				} else if (revoke === "token") {
+					b.client.setToken("replacement-token");
+				} else if (revoke === "path") {
+					b.client.setRemotePath("another-vault");
+				} else if (revoke === "codec") {
+					b.client.setEncryptionService(ea.context.getService());
+				} else {
+					b.engine.pause();
+					b.engine.resume();
+				}
 				password.resolve("password");
 				gate.resolve();
 				assert.deepEqual(await Promise.all([first, second]), [
@@ -361,6 +380,31 @@ test("committed encryption workflow recovers on another device before replaying 
 		disk.afterRequest = undefined;
 		assert.equal(disk.files.has("vault/Note.md"), true);
 		if (kind === "enable") {
+			const manifest = await a.index.downloadEncryptionManifest();
+			assert.ok(manifest);
+			const savedBefore = await eb.saved();
+			const stable =
+				await ea.workflow.maintenance.createEncryptionManifest(
+					ea.context.getService()!,
+					manifest.salt,
+					"enabled",
+					manifest.revision,
+				);
+			for (const candidateManifest of [manifest, stable]) {
+				await a.index.uploadEncryptionManifest(candidateManifest);
+				const remoteBefore = structuredClone(disk.files);
+				await assert.rejects(
+					eb.workflow.connectForSync(
+						"target-password",
+						candidateManifest,
+						{ allowRecovery: false },
+					),
+				);
+				assert.deepEqual(await eb.saved(), savedBefore);
+				assert.deepEqual(disk.files, remoteBefore);
+				assert.equal(eb.context.getService(), null);
+			}
+			await a.index.uploadEncryptionManifest(manifest);
 			await eb.workflow.connectForSync("target-password");
 		} else {
 			assert.equal(b.settings.encryptionPassword, null);

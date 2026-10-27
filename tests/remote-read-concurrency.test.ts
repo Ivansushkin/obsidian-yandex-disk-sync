@@ -32,6 +32,7 @@ test("ordinary remote inventory honors configured read concurrency without chang
 				prepareSettingsPatch(phone.settings, { maxConcurrency: limit })
 					.settings,
 			);
+			phone.client.setReadConcurrency(phone.settings.maxConcurrency);
 			let active = 0;
 			let peak = 0;
 			const slowFolder =

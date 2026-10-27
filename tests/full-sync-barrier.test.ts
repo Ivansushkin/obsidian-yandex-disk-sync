@@ -103,6 +103,7 @@ function createHarness(encrypted: boolean) {
 	const vaultFiles = new Set<string>();
 	let folderCacheClearCount = 0;
 	const yandexClient = {
+		interruptReads: () => {},
 		async withWriteGuard<T>(
 			assertCurrent: () => void,
 			action: () => Promise<T>,

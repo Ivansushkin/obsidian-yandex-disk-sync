@@ -1009,6 +1009,48 @@ prefers-reduced-motion. Использовать тестовые plaintext/encr
    работают без дополнительного общего подтверждения.
 6. Во время скачивания архива остальные download-кнопки отключены; после ошибки
    они возвращаются в актуальное состояние. Дождаться завершения и проверить ZIP.
+7. На новом mobile profile вставить token encrypted vault и удержать remote GET.
+   Кнопка и плашка сразу показывают loader/«Проверка подключения». Старое «нужен
+   token» временно скрыто; после успешного save старый authentication Notice исчезает.
+   Reopen сохраняет activity; новые password/error/pause состояния видимы.
+   После ответа manifest модалка пароля открывается автоматически, без Sync;
+   правильный пароль продолжает initial receive и запускает automation только
+   после успешного full. Повторить на desktop и при смене remote path.
+   Cancel/wrong password снимают loader, сохраняют block и не меняют remote/queues;
+   reopen и runtime/scope patches не открывают модалку повторно, ручной Sync
+   позволяет повторить ввод. Во время prompt/derivation выполнить pause/resume
+   или unload: поздний ответ не устанавливает credentials. Незавершённые transition
+   manifest/canonical maintenance остаются заблокированными без cleanup.
+   После подключения перезапустить профиль и синхронизировать offline edit;
+   отдельно повторить plaintext connection без запроса пароля.
+   Save failure не запускает reads и сохраняет исходный token/admission reason.
+   После timeout/retry/final error loader снимается; manual retry снова показывает
+   проверку. Runtime-only settings save не изображает full.
 
 Покрывает: `UI-022`, `UI-023`, `UI-024`. Автоматические проверки не заменяют
 этот прогон в Obsidian и не устанавливают готовность к релизу.
+
+## TC-READ-RETRY-01. Ограниченное восстановление API GET
+
+На Android Obsidian и втором независимом desktop profile, plaintext/encrypted:
+
+1. Проверить initial receive с кириллицей и символами `#?+%` в путях. Удержать
+   первый metadata GET дольше 15 s; replacement должен завершить чтение. Вернуть
+   первый ответ до/после replacement: он ignored, без false progress/success.
+2. Удержать все ответы: максимум один replacement на логический GET, два reserve
+   места на клиент; native occupancy не освобождается по timeout. Queue, backoff
+   и transfer используют общий 60 s budget. Поздний permit не запускает expired HTTP.
+3. Повторить с изменением token/path/codec, pause/resume и unload между attempts и
+   перед reply. Старый workflow не читает новую конфигурацию и не подтверждает state.
+   Signed download и polling после unresolved timeout не дублируются.
+4. Проверить обычные HTTP transient retries, постоянный 401/403 и неизвестный decode
+   error: прежние write guards и предел attempts сохранены. В логе endpoint без
+   query, category, request ID, queue/native duration, remaining budget и outcome;
+   credentials, paths, ciphertext и signed URLs отсутствуют.
+5. После failed receive перезапустить phone, получить canonical, сделать offline
+   edit, изменить другой файл на desktop и вернуть phone. Оба профиля сходятся
+   без потери bytes/queues и ложного observed revision. Сравнить реальный elapsed
+   time и peak requests при `maxConcurrency` 1, 4 и 20.
+
+Покрывает `UI-022`, `ERROR-001`, `ERROR-005`, `ERROR-007`, `SYNC-042`.
+Synthetic histories не заменяют этот прогон и не подтверждают мобильную готовность.

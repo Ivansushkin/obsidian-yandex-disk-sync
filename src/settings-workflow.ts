@@ -117,7 +117,7 @@ interface SettingsWorkflowPorts {
 	hasDurableConfigurationWork(): boolean;
 	isUnloaded(): boolean;
 	isLayoutReady(): boolean;
-	setUpdating(updating: boolean): void;
+	setUpdating(updating: boolean, synchronizing?: boolean): void;
 	stopRegularSync(): void;
 	startAutomation(): void;
 	refreshAutomation?(): void;
@@ -179,7 +179,7 @@ export async function applyUserSettingsPatch(
 		throw new Error(t("notice.configuration_busy"));
 	}
 	if (requiresIdle) {
-		deps.setUpdating(true);
+		deps.setUpdating(true, stopsAutomation);
 	}
 	if (stopsAutomation) {
 		deps.stopRegularSync();
@@ -219,8 +219,8 @@ export async function applyUserSettingsPatch(
 			}
 			if (!requiresIdle) {
 				requiresIdle = true;
-				deps.setUpdating(true);
 			}
+			deps.setUpdating(true, true);
 			stopsAutomation = true;
 			deps.stopRegularSync();
 			stage = "watcher-persistence";
@@ -235,7 +235,9 @@ export async function applyUserSettingsPatch(
 		if (stopsAutomation) {
 			stage = "startup";
 			const ready = await deps.refreshRemoteStartupState(
-				false,
+				draft.changesConnection &&
+					deps.isLayoutReady() &&
+					!deps.engine?.isSyncPaused(),
 				false,
 				invocation,
 			);

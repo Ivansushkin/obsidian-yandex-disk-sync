@@ -164,9 +164,14 @@ fingerprint guards; direct Force и новые encryption replacements испо�
 явные destructive authority, не старые fingerprints назначения. Ordinary remote
 pruning выключен; replacement может рекурсивно удалять разрешённый subtree.
 
-GET deadline — 60 s; stable raw/logical и direct download делят этот budget между
-metadata/link/bytes/backoff. Unresolved native timeout не повторяется, поздние bytes
-не применяются. Queued downloads не запускаются после failure; уже начатые tasks
+Read budget — 60 s; stable raw/logical и direct download делят его между queue wait,
+metadata/link/bytes/backoff. API metadata/link attempt — 15 s; максимум четыре
+attempts, после unresolved timeout — максимум один replacement. Native occupancy
+удерживается до реального settlement: основной пул равен `maxConcurrency`, reserve
+для replacement имеет два места. Queue wait ограничен тем же budget; истёкший или
+отозванный waiter не запускает HTTP после получения permit. Config changes,
+pause/resume и unload отзывают старые waits. Signed bytes и polling после unresolved
+timeout не дублируются; поздние bytes не применяются. Queued downloads не запускаются после failure; уже начатые tasks
 joined до освобождения сессии. Пропущенные tasks не увеличивают progress.
 
 Realtime content windows имеют предел 32 events / целевые 8 MiB retained plaintext;

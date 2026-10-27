@@ -99,9 +99,12 @@ FIFO остаются для restart. Corrective upload сохраняет пр�
 retry с новой signed link. API GET также повторяет завершённые 500/502/504;
 это не расширяет правила неоднозначных PUT.
 Исчерпание попыток оставляет download ошибкой без подтверждения baseline.
-Каждый GET ограничен 60 s; stable raw/logical snapshot и direct download также
-имеют общий бюджет 60 s на metadata, link, bytes и retry/backoff; timeout не повторяет неотменённый native
-request и запрещает применять его поздний ответ. Full выходит до последующих
+Stable raw/logical snapshot и direct download имеют общий бюджет 60 s на очередь,
+metadata, link, bytes и retry/backoff. API metadata/link attempt ограничен 15 s и
+допускает один replacement после unresolved timeout в пределах четырёх attempts.
+Native GET удерживает permit до фактического settlement; reserve ограничен двумя
+местами. Signed bytes и polling после unresolved timeout не дублируются; поздний
+ответ не применяется. Full выходит до последующих
 conflict/delete commits; уже начатые downloads завершаются с прежними guards. После
 restart неизменённый local файл с прежним baseline получает remote update без
 ложного конфликта; независимая local правка по-прежнему требует causal comparison.

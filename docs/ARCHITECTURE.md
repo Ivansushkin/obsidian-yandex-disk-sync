@@ -14,7 +14,7 @@
 | `main.ts`                                                                                         | Composition root, Obsidian lifecycle/UI, foreground reservation, wiring live ports.                     |
 | `plugin-persistence.ts`                                                                           | Один plugin snapshot, последовательная coherent save queue, load generation и unload admission.         |
 | `plugin-startup.ts`, `settings-workflow.ts`                                                       | Read-only startup classification; проверка, сохранение и публикация settings drafts.                    |
-| `api/yandex-client.ts`, `api/vault-adapter.ts`                                                    | HTTP/codec transport и доступ к Obsidian Vault/DataAdapter/FileManager.                                 |
+| `api/yandex-client.ts`, `api/read-transport.ts`, `api/vault-adapter.ts`                           | HTTP/codec transport, bounded native GET occupancy и доступ к Obsidian Vault/DataAdapter/FileManager.   |
 | `sync/engine.ts`, `sync/coordinator.ts`                                                           | Публичные входы, одна очередь сессий, lifecycle guards, sync-state и callbacks.                         |
 | `sync/canonical/schema.ts`, `merge.ts`                                                            | Чистая валидация canonical и causal reducer.                                                            |
 | `sync/canonical/manager.ts`                                                                       | Фасад canonical, baseline и causal work; единственная точка публикации canonical.                       |
@@ -290,6 +290,17 @@ realtime, configuration update, Force, backup и encryption отключают �
 прогресса не пересоздают поля. Весь раздел логов доступен во время работы, кроме
 собственных migration/lifecycle ограничений. Logging patches идут через общую
 persistence queue без remote recheck и не инвалидируют backup context.
+Settings-triggered full показывает «Проверка подключения» и loader уже во время
+save/admission до engine session. UI временно заменяет прежнюю ошибку, но не снимает
+admission block. После сохранения token устаревший authentication Notice скрывается;
+новая причина, password prompt и pause остаются видимыми. Reopen читает live activity,
+а `finally` снимает её. Runtime-only save не изображает подключение.
+После save изменённого token/path интерактивный admission автоматически запрашивает
+пароль stable encrypted vault при готовом layout и отсутствии pause, затем продолжает
+full. Разрешение prompt не разрешает recovery: canonical maintenance или переходный
+manifest блокируют candidate до сохранения credentials. Lifetime/configuration
+capture до prompt действует через maintenance queue и derivation. Cancel/wrong
+password завершают текущую попытку без automation; reopen не создаёт новый prompt.
 
 Создание ручного backup и очистка журнала требуют явного подтверждения. Закрытие
 диалога означает отказ; UI повторно проверяет lifecycle, конфигурацию и busy перед
@@ -300,13 +311,28 @@ workflow. Это UI-admission, а не новый coordinator или persisted o
 этапом и безопасным code. Root/canonical/local identity/mandatory backup ошибки имеют
 приоритет над вложенной сетью. Signed-link 404 не доказывает absence API resource.
 Только native transport rejection считается network; decode/unknown ошибки не
-повторяются автоматически. GET/read deadline — 60 s; unresolved native timeout не
-повторяется, late bytes не применяются. Retry/backoff остаются у transport owner.
+повторяются автоматически. Read budget — 60 s, включая очередь, backoff и все этапы
+stable snapshot. API metadata/link GET attempt — 15 s; до четырёх attempts всего,
+после unresolved timeout — максимум один replacement. Общая recovery policy не
+разрешает unresolved retry: узкое исключение принадлежит API transport. Signed
+bytes и operation polling после unresolved timeout не дублируются.
+
+Native GET удерживает место до фактического ответа, даже после timeout/отзыва.
+Основной пул соответствует `maxConcurrency`, отдельный replacement pool — два
+места на клиент. Локальная concurrency обхода/backup не меняет глобальный пул.
+Polling сохраняет исходный lifetime между iterations и backoff.
+Истёкший/отозванный waiter не dispatch-ится при позднем освобождении
+места. Смена token/path/codec, pause/resume и unload отзывает старые waits; поздние
+ответы наблюдаются без применения. Это не отмена native HTTP и не второй sync
+coordinator. Retry/backoff остаются у transport owner; writes сохраняют прежние guards.
 
 Логи не содержат credentials, keys, ciphertext, content, signed links или полный
 canonical. Build ID и request/byte counters помогают сравнивать runs; сумма длительностей
 конкурентных запросов не равна latency. Synthetic tests проверяют реальные algorithms
 через искусственный transport; они не доказывают работу Obsidian/Yandex/mobile.
+На info/warn фиксируются безопасные request ID, endpoint без query, категория
+чтения, attempt, queue/native duration, remaining budget и решение recovery.
+Capacity timeout отличается от native timeout; late reply помечается ignored.
 
 Команды разработки и проверок — [README.md](README.md#разработка-и-проверки), реальный
 двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Machine-readable

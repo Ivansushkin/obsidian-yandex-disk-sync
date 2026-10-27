@@ -9,6 +9,7 @@ import {
 } from "obsidian";
 import { t } from "../i18n";
 import type { SyncState } from "../types";
+import type { RetryProgress } from "../errors";
 import type { ForceFlowState } from "../sync/workflows/force-controller";
 import {
 	getSyncStatusIcon,
@@ -20,6 +21,7 @@ interface SyncIndicatorContext {
 	force: ForceFlowState | null;
 	foreground: "encryption" | "backup" | null;
 	fullSyncInProgress: boolean;
+	connection?: { errorMessage?: string; retry?: RetryProgress };
 	syncUnavailable: boolean;
 }
 
@@ -197,10 +199,21 @@ export class SyncIndicator extends Component {
 			return;
 		}
 		this.ensureMounted();
-		const { sync, force, foreground, fullSyncInProgress, syncUnavailable } =
-			this.readContext();
+		const {
+			sync,
+			force,
+			foreground,
+			fullSyncInProgress,
+			syncUnavailable,
+			connection,
+		} = this.readContext();
 		this.syncButton.disabled = syncUnavailable || this.syncRequested;
-		this.syncButton.setAttribute("aria-busy", String(fullSyncInProgress));
+		this.syncButton.setAttribute(
+			"aria-busy",
+			String(
+				fullSyncInProgress || Boolean(connection) || this.syncRequested,
+			),
+		);
 		let state = sync;
 		let text: string;
 		let detail = "";
@@ -223,6 +236,11 @@ export class SyncIndicator extends Component {
 		} else if (foreground) {
 			state = { ...sync, status: "syncing" };
 			text = t(`status.mobile.${foreground}`);
+		} else if (connection) {
+			state = { ...sync, status: "syncing", retry: connection.retry };
+			text = t("status.checking_connection");
+			detail = connection.errorMessage ?? "";
+			progress = formatSyncRetry(state);
 		} else if (
 			fullSyncInProgress &&
 			(sync.status === "idle" || sync.status === "initializing")

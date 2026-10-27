@@ -21,6 +21,12 @@ import {
 import { EncryptionMaintenance } from "./maintenance";
 import { EncryptionRecovery } from "./recovery";
 
+/** Bound a credential connection to its original operation and recovery permission. */
+export interface EncryptionConnectionOptions {
+	allowRecovery?: boolean;
+	assertCurrent?(): void;
+}
+
 /** Prepares transitions and wires the existing controller to snapshot and recovery ports. */
 export class EncryptionWorkflow {
 	readonly maintenance: EncryptionMaintenance;
@@ -159,11 +165,18 @@ export class EncryptionWorkflow {
 	async connectForSync(
 		password: string,
 		manifest?: RemoteEncryptionManifest,
+		options: EncryptionConnectionOptions = {},
 	): Promise<void> {
+		options.assertCurrent?.();
 		this.context.assertConnectionAllowed();
 		await this.context.engine.runExclusiveMaintenance(async () => {
+			options.assertCurrent?.();
 			this.context.assertConnectionAllowed();
-			await this.connectToRemoteEncryptionNow(password, manifest);
+			await this.connectToRemoteEncryptionNow(
+				password,
+				manifest,
+				options,
+			);
 		});
 	}
 
@@ -488,17 +501,20 @@ export class EncryptionWorkflow {
 	async connectToRemoteEncryptionNow(
 		password: string,
 		manifest?: RemoteEncryptionManifest,
+		options: EncryptionConnectionOptions = {},
 	): Promise<void> {
 		const assertLifetime = this.context.engine.createReadLifetimeGuard();
 		const reads = this.context.index.createStartupReadSession(() => {
+			options.assertCurrent?.();
 			assertLifetime();
 			this.context.assertConnectionAllowed();
-		});
+		}, options.allowRecovery === false);
 		try {
 			await this.connectToRemoteEncryptionWithReads(
 				password,
 				manifest,
 				reads,
+				options,
 			);
 		} finally {
 			reads.close();
@@ -510,6 +526,7 @@ export class EncryptionWorkflow {
 		password: string,
 		expected: RemoteEncryptionManifest | undefined,
 		reads: StartupReadSession,
+		options: EncryptionConnectionOptions,
 	): Promise<void> {
 		const remoteManifest = (await reads.manifest()).manifest;
 		if (
@@ -520,6 +537,12 @@ export class EncryptionWorkflow {
 		}
 		if (!remoteManifest) {
 			throw new Error(t("notice.encryption_remote_missing"));
+		}
+		if (
+			options.allowRecovery === false &&
+			remoteManifest.state !== "enabled"
+		) {
+			throw new Error(t("notice.encryption_remote_busy"));
 		}
 		const profileId =
 			this.context.manager.getManifestProfileId(remoteManifest);
@@ -564,6 +587,12 @@ export class EncryptionWorkflow {
 					if (!current) {
 						throw new Error(t("notice.encryption_remote_busy"));
 					}
+					if (
+						options.allowRecovery === false &&
+						current.maintenance
+					) {
+						throw new Error(t("notice.encryption_remote_busy"));
+					}
 					await this.controller.assertStableManifestTarget(
 						remoteManifest,
 						current.maintenance,
@@ -580,6 +609,7 @@ export class EncryptionWorkflow {
 					return current;
 				},
 				persist: async () => {
+					reads.assertCurrent();
 					await this.maintenance.applyEncryptionSnapshot(
 						{
 							enabled: true,

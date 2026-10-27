@@ -1535,6 +1535,7 @@ test("canonical observations reject paginated root replacement and incomplete li
 
 test("initial canonical timeout stops queued authority reads and recovers after restart", async (t) => {
 	const device = managedDevices(t);
+	const paths = ["a.md", "папка #?+%/заметка.md", "c.md"];
 	for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);
@@ -1542,7 +1543,7 @@ test("initial canonical timeout stops queued authority reads and recovers after 
 		const phone = device(disk, "phone", codec, undefined, undefined, {
 			readTimeoutMs: 1000,
 		});
-		for (const path of ["a.md", "b.md", "c.md"]) {
+		for (const path of paths) {
 			desktop.vault.put(path, bytes("kept"));
 			phone.vault.put(path, bytes("kept"));
 		}
@@ -1592,17 +1593,68 @@ test("initial canonical timeout stops queued authority reads and recovers after 
 		assert.equal(saved.localState.lastSyncTime, 0);
 		assert.deepEqual(saved.localState.files, {});
 		assert.deepEqual([...disk.files], remote);
-		for (const path of ["a.md", "b.md", "c.md"]) {
+		for (const path of paths) {
 			phone.assertLocal(path, "kept");
 		}
 		await phone.stop();
 		disk.beforeRequest = undefined;
-		const restarted = device(disk, "phone", codec, phone.vault, saved);
-		assert.equal((await restarted.full()).downloaded, 0);
+		const restarted = device(
+			disk,
+			"phone",
+			await codecFor(encrypted),
+			phone.vault,
+			saved,
+			{
+				maxRetries: 3,
+				apiReadAttemptTimeoutMs: 10,
+			},
+		);
+		const target = await restarted.client.getPhysicalPath(
+			`vault/${paths[1]}`,
+		);
+		let metadataReads = 0;
+		let releaseMetadata!: () => void;
+		const lateMetadata = new Promise<void>((resolve) => {
+			releaseMetadata = resolve;
+		});
+		disk.beforeRequest = async (_method, endpoint, path) => {
+			if (endpoint === "/v1/disk/resources" && path === target) {
+				metadataReads++;
+				if (metadataReads === 1) {
+					await lateMetadata;
+				}
+			}
+		};
+		try {
+			assert.equal((await restarted.full()).downloaded, 0);
+			assert.equal(metadataReads, 2);
+		} finally {
+			releaseMetadata();
+			disk.beforeRequest = undefined;
+		}
 		assert.equal(restarted.index.getObservedRevision(), 1);
 		assert.deepEqual([...disk.files], remote);
 		assert.deepEqual(restarted.index.getPendingMutations(), []);
 		assert.deepEqual(restarted.index.getPendingPhysicalActions(), []);
+		disk.resource = resource;
+		await restarted.stop();
+		const connected = await restarted.saved();
+		restarted.vault.put(paths[1]!, bytes("phone offline edit"));
+		desktop.vault.put("desktop-new.md", bytes("desktop edit"));
+		await desktop.full();
+		const returned = device(
+			disk,
+			"phone",
+			await codecFor(encrypted),
+			restarted.vault,
+			connected,
+		);
+		await returned.full();
+		await desktop.full();
+		returned.assertLocal(paths[1]!, "phone offline edit");
+		desktop.assertLocal(paths[1]!, "phone offline edit");
+		returned.assertLocal("desktop-new.md", "desktop edit");
+		assert.deepEqual(returned.index.getPendingMutations(), []);
 	}
 });
 
@@ -1664,11 +1716,11 @@ test("canonical read sessions reject connection changes before and during cached
 				}
 				await assert.rejects(
 					boundary === "load-body" ? read.load(true) : read(),
-					/Canonical read configuration changed/,
+					/Canonical read configuration changed|Read invocation interrupted/,
 				);
 				await assert.rejects(
 					read(),
-					/Canonical read configuration changed/,
+					/Canonical read configuration changed|Read invocation interrupted/,
 				);
 				if (boundary === "load-body") {
 					assert.deepEqual(
@@ -1721,7 +1773,10 @@ test("ordinary full rejects a late canonical load after pause or host stop witho
 			};
 			const result = await engine.fullSync();
 			assert.equal(result.success, false);
-			assert.match(result.errors[0]!.message, /session interrupted/);
+			assert.match(
+				result.errors[0]!.message,
+				/session interrupted|Read invocation interrupted/,
+			);
 			assert.deepEqual(phone.index.getRemoteIndex(), before);
 			assert.deepEqual([...disk.files], remote);
 			phone.assertLocal("note.md", "local");

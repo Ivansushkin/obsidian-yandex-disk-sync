@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { Notice } from "obsidian";
 import test, { type TestContext } from "node:test";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
@@ -9,18 +10,27 @@ import { transition } from "./helpers/encryption-scenarios";
 import { SyncScheduler } from "../src/sync/scheduler";
 
 /** Combine real settings publication and sync algorithms over synthetic storage. */
-async function settingsHost(t: TestContext, encrypted = false) {
-	const disk = new MemoryDisk();
+async function settingsHost(
+	t: TestContext,
+	encrypted = false,
+	remote?: MemoryDisk,
+) {
+	const disk = remote ?? new MemoryDisk();
 	const a = device(disk, "settings-device", null);
-	a.vault.put("note.md", bytes("unchanged"));
-	await a.full();
+	if (!remote) {
+		a.vault.put("note.md", bytes("unchanged"));
+		await a.full();
+	}
 	const flow = encryptionFlow(a);
 	if (encrypted) {
 		await transition(a, flow, "enable", "synthetic-password");
 	}
 	const { plugin, persistence } = persistenceHarness();
 	await plugin.loadSettings();
-	plugin.settings = { ...a.settings, yandexTokenSecret: "synthetic" };
+	plugin.settings = {
+		...a.settings,
+		yandexTokenSecret: remote ? "" : "synthetic",
+	};
 	const scheduler = new SyncScheduler(a.engine, plugin.settings);
 	Object.assign(plugin, {
 		app: { ...plugin.app, workspace: { layoutReady: true } },
@@ -37,24 +47,168 @@ async function settingsHost(t: TestContext, encrypted = false) {
 				return true;
 			},
 		},
-		configuredToken: "synthetic",
+		configuredToken: remote ? "" : "synthetic",
 		configuredRemotePath: "vault",
 		localStateRestored: true,
 		syncLifecycleRegistered: true,
-		automationReady: true,
-		regularSyncStarted: true,
+		automationReady: !remote,
+		regularSyncStarted: !remote,
 	});
-	plugin["remoteStateValidated"] = true;
-	a.watcher.start();
-	scheduler.start();
+	plugin["remoteStateValidated"] = !remote;
+	if (!remote) {
+		a.watcher.start();
+		scheduler.start();
+	}
 	afterTest(t, async () => {
 		disk.beforeRequest = undefined;
 		scheduler.stop();
 		await a.stop();
 	});
 	const update = plugin.applySettingsPatch.bind(plugin);
-	return { plugin, persistence, a, disk, scheduler, update };
+	return { plugin, persistence, a, disk, scheduler, update, flow };
 }
+
+test("connection settings request the encrypted vault password and finish initial sync", async (t) => {
+	for (const outcome of [
+		"plaintext",
+		"connect",
+		"path",
+		"cancel",
+		"wrong",
+		"save-failure",
+	] as const) {
+		const disk = new MemoryDisk();
+		const source = device(disk, "source", null);
+		afterTest(t, () => source.stop());
+		source.vault.put("remote.md", bytes("remote content"));
+		await source.full();
+		if (outcome !== "plaintext") {
+			await transition(
+				source,
+				encryptionFlow(source),
+				"enable",
+				"password",
+			);
+		}
+		const { plugin, a, flow, update, scheduler } = await settingsHost(
+			t,
+			false,
+			disk,
+		);
+		flow.context.getSettings = () => plugin.settings;
+		flow.context.persist = () => plugin.saveSettings();
+		flow.context.ui.setBlock = (reason, notice) =>
+			plugin["setEncryptionBlock"](reason, notice);
+		const install = flow.context.setService.bind(flow.context);
+		flow.context.setService = (service) => {
+			install(service);
+			plugin["encryptionService"] = service;
+		};
+		a.vault.put("offline.md", bytes("offline addition"));
+		const local = a.index.captureLocalCausalState();
+		const remote = structuredClone(disk.files);
+		let prompts = 0;
+		flow.context.ui.requestPassword = async () => {
+			prompts++;
+			assert.equal(plugin.isConfigurationBusy(), true);
+			await assert.rejects(update({ yandexTokenSecret: "second-token" }));
+			return outcome === "cancel"
+				? null
+				: outcome === "wrong"
+					? "wrong"
+					: "password";
+		};
+		if (outcome === "save-failure") {
+			plugin.saveData = async () => {
+				throw new Error("synthetic save failure");
+			};
+			await assert.rejects(
+				update({ yandexTokenSecret: "new-token" }),
+				/save failure/,
+			);
+			assert.equal(plugin.settings.yandexTokenSecret, "");
+		} else if (outcome === "path") {
+			plugin.settings.remotePath = "previous-vault";
+			plugin.settings.yandexTokenSecret = "new-token";
+			await plugin.saveSettings();
+			await update({ remotePath: "vault" });
+		} else {
+			await update({ yandexTokenSecret: "new-token" });
+		}
+		assert.equal(
+			prompts,
+			outcome === "plaintext" || outcome === "save-failure" ? 0 : 1,
+			outcome,
+		);
+		assert.equal(plugin.isConfigurationBusy(), false);
+		const connected =
+			outcome === "connect" ||
+			outcome === "path" ||
+			outcome === "plaintext";
+		assert.equal(scheduler["isRunning"], connected, outcome);
+		assert.equal(a.watcher["isEnabled"], connected, outcome);
+		if (connected) {
+			assert.equal(
+				plugin.settings.enableEncryption,
+				outcome !== "plaintext",
+			);
+			assert.equal(plugin["encryptionBlockReason"], null);
+			await a.assertSettled({
+				"remote.md": "remote content",
+				"offline.md": "offline addition",
+			});
+			const restarted = device(
+				disk,
+				"settings-device",
+				null,
+				a.vault,
+				await a.saved(),
+			);
+			afterTest(t, () => restarted.stop());
+			Object.assign(restarted.settings, plugin.settings);
+			await encryptionFlow(restarted).workflow.initEncryption();
+			restarted.vault.put("offline.md", bytes("offline after restart"));
+			await restarted.full();
+			await restarted.assertSettled({
+				"remote.md": "remote content",
+				"offline.md": "offline after restart",
+			});
+		} else {
+			assert.equal(flow.context.getService(), null);
+			assert.equal(Boolean(plugin.settings.encryptionPassword), false);
+			assert.deepEqual(disk.files, remote);
+			assert.deepEqual(a.index.captureLocalCausalState(), local);
+			assert.equal(
+				a.vault.getAbstractFileByPath("remote.md") !== null,
+				false,
+			);
+			if (outcome !== "save-failure") {
+				await update({ maxConcurrency: 7 });
+				await update({ excludePatterns: ["ignored/**"] });
+				await update({ yandexTokenSecret: "new-token" });
+				assert.equal(prompts, 1);
+				assert.deepEqual(disk.files, remote);
+				flow.context.ui.requestPassword = async () => {
+					prompts++;
+					return "password";
+				};
+				const oldWindow = globalThis.window;
+				Object.assign(globalThis, { window: globalThis });
+				try {
+					assert.equal((await plugin.runFullSync())?.success, true);
+				} finally {
+					plugin["disposeSyncNotice"]();
+					Object.assign(globalThis, { window: oldWindow });
+				}
+				assert.equal(prompts, 2);
+				await a.assertSettled({
+					"remote.md": "remote content",
+					"offline.md": "offline addition",
+				});
+			}
+		}
+	}
+});
 
 test("runtime settings preserve admitted storage and durable state without remote reclassification", async (t) => {
 	for (const encrypted of [false, true]) {
@@ -249,8 +403,43 @@ test("settings drain errors preserve the rejected draft and allow a normal full 
 		}
 	});
 	afterTest(t, unsubscribe);
-	await update({ yandexTokenSecret: "synthetic-replacement" });
-	assert.deepEqual(failures, []);
+	plugin["setAuthenticationBlock"]("synthetic missing token");
+	const oldNotice = (plugin["blockingNotice"] as { notice: Notice } | null)
+		?.notice;
+	assert.ok(oldNotice);
+	const entered = deferred();
+	const release = deferred();
+	afterTest(t, release.resolve);
+	disk.beforeRequest = async () => {
+		entered.resolve();
+		await release.promise;
+	};
+	const reconnecting = update({ yandexTokenSecret: "synthetic-replacement" });
+	await entered.promise;
+	try {
+		assert.ok(plugin.getConnectionActivity());
+		assert.equal(plugin.getConnectionActivity()?.errorMessage, undefined);
+		assert.equal(plugin.isFullSyncInProgress(), false);
+		assert.equal(
+			plugin["authenticationBlockReason"],
+			"synthetic missing token",
+		);
+		assert.equal(oldNotice.messageEl.isConnected, false);
+		assert.equal(a.watcher["isEnabled"], false);
+		await assert.rejects(
+			update({ remotePath: "another-vault" }),
+			/pending/,
+		);
+	} finally {
+		disk.beforeRequest = undefined;
+		release.resolve();
+		await reconnecting;
+	}
+	assert.equal(plugin.getConnectionActivity(), undefined);
+	assert.deepEqual(
+		failures.filter((message) => message !== "synthetic missing token"),
+		[],
+	);
 	assert.equal(plugin["remoteStateValidated"], true);
 	assert.equal(plugin["blockingNotice"], null);
 	assert.equal(a.watcher["isEnabled"], true);
