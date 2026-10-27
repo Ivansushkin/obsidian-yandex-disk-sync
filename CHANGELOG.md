@@ -6,114 +6,153 @@ Changes since stable `1.1.0`.
 
 ### Breaking changes
 
+- Raised the minimum supported Obsidian version from 0.15.0 to 1.0.0.
 - Replaced the legacy synchronization format with one canonical index marked
-  by `format: "sync-index"`. It uses epochs, revisions, per-device mutation
-  sequences, file and folder tombstones, pending moves, and durable
-  physical-action queues.
-- Limited automatic migration to plaintext stable 1.0.0 and 1.1.0 local data.
-  Their `localIndex` is converted once into the current baseline. Plaintext
-  canonical indexes carrying stable `version: 1` or `version: 2` require an
-  explicit Force sync with a per-run choice of a verified archive or no archive.
-- Encrypted legacy data, numeric historical manifests and canonical indexes,
-  unmarked transition/queue data, and incomplete current metadata are
-  unsupported for reading/migration and block ordinary sync. Confirmed Force
-  local can replace canonical metadata from a readable source; scoped cleanup
-  requires a readable destination manifest and verified encrypted path codec; invalid
-  local state is never bypassed. Update all devices before using the new format.
-- Current entries without `mutationSeq` cannot authorize destructive folder
-  operations.
+  by `format: "sync-index"`: epochs, revisions, per-device mutation sequences,
+  file and folder tombstones, pending moves, and durable physical-action queues.
+  Local state uses `format: "plugin-data"`; encryption metadata uses
+  `format: "encryption-manifest"`. These are semantic markers, not numbered
+  format versions. Update every device before using 2.0.0; concurrent use with
+  older builds is unsupported.
+- Automatic local migration supports only plaintext stable 1.0.0/1.1.0 data
+  and is irreversible. An existing stable remote index (`version: 1` or
+  `version: 2`) requires explicitly confirmed Force synchronization with an
+  optional archive. See the [upgrade guide](README.md#upgrading-from-110-to-200).
+- Historical encrypted formats and unsupported or incomplete local state are
+  rejected. Unsupported remote metadata blocks ordinary sync; Force local can
+  rebuild destination metadata from a readable local source. Encrypted
+  destination cleanup still requires an authenticated, supported filename codec.
+- Ordinary destructive folder operations require valid causal mutation metadata;
+  entries without `mutationSeq` cannot authorize them.
 
 ### Added
 
-- Added optional end-to-end encryption with PBKDF2-HMAC-SHA256 at 600,000
-  iterations, HKDF-separated content and filename keys, AES-256-GCM file
-  content, deterministic RFC 5297 AES-SIV path segments, and a strict manifest
-  marked by `format: "encryption-manifest"`.
-- Added coordinated, crash-safe encryption enable, password rotation, disable,
-  and post-commit recovery. New transitions replace the selected scope with the
-  initiating local reference in a fresh epoch; other devices receive that reference
-  before replay. Cleanup retains protected/excluded resources and durable recovery.
-  Legacy checkpoints keep their fingerprint-guarded policy.
-- Added self-contained `OYDSBKP!` encrypted backup envelopes with bounded,
+- Optional end-to-end encryption of file contents, remote file/folder names,
+  and index contents: AES-256-GCM, deterministic RFC 5297 AES-SIV path segments,
+  PBKDF2-HMAC-SHA256 (600,000 iterations), and HKDF-separated content/filename
+  keys. Manifest algorithms, parameters, and the `hardened` profile are strictly
+  validated before use.
+- Encryption enable, disable, password changes, and recovery after interruption.
+  These operations use the initiating device's local files as the reference
+  within the selected filters; other devices receive the replacement before
+  merging further changes. Each run offers its own archive choice.
+- Self-contained `OYDSBKP!` encrypted backup envelopes with bounded,
   authenticated headers and archive-specific PBKDF2/AES-GCM parameters.
-- Added collision-resistant backup names, non-overwriting upload, and exact
-  SHA-256 plus byte read-back after success, timeout, or an ambiguous response.
-- Added Force local and Force remote recovery with an optional verified archive,
-  a new epoch, source/scope verification, and resumable checkpoints. Other
-  devices with offline changes choose accept, preserve, or defer before replay.
-- Added persistent watcher events, per-device mutation FIFO, resumable physical
-  actions, coordinated status UI, and sanitized correlated diagnostics.
+  Archives can be downloaded with their original password after the vault
+  password changes or encryption is disabled.
+- Persistent watcher events, per-device mutation FIFO, and resumable physical
+  actions, saved together with the baseline and settings in one coherent local
+  snapshot. Retries retain the original operation IDs and mutation sequences.
+- A collapsible synchronization badge on desktop, Android, iPhone, and iPad,
+  showing current activity, progress, last successful sync, and error details.
+  On desktop it replaces the old status-bar item.
+- A log viewer, optional debug logging, and diagnostics for sync phases,
+  conflicts, retries, and timeouts.
 
 ### Changed
 
-- Full, realtime, Force, and encryption maintenance now share one exclusive
-  coordinator. Changes observed during another session remain durable and are
-  replayed in causal order.
-- File reconciliation now uses plaintext SHA-256, the device baseline,
-  canonical revision and mutation metadata, plus server fingerprints or server
-  mtime when a fingerprint is unavailable. Client clocks do not select a
-  winner.
-- Concurrent edits create conflict copies. Exact deletion beats an older edit,
-  while a new or changed descendant survives a concurrent folder deletion.
-- Folder rename and move are logical mutations backed by guarded per-file
+- Reworked conflict resolution around plaintext SHA-256, the device baseline,
+  canonical revisions and mutation metadata, and server fingerprints, falling
+  back to server mtime when a fingerprint is unavailable. Client clocks no
+  longer choose the winner. Concurrent edits preserve conflict copies; ordinary
+  local overwrite or deletion stops if a required protective copy fails.
+- New devices first receive the existing cloud state, preserving displaced
+  local content in protective copies, before publishing local changes.
+- Full sync, realtime sync, Force, and encryption maintenance share one
+  coordinator. Watcher events and unfinished operations survive restarts and
+  retain their causal order.
+- File and folder renames/moves are logical mutations backed by guarded physical
   actions. Rename chains and Obsidian's mechanical child events are coalesced
-  without restoring stale paths.
-- Canonical commits now use an exclusive rename lock, stable JSON semantics,
-  strict validation, read-back verification, byte-exact rollback, stale-lock
-  recovery, and fail-closed handling of ambiguous lock states.
-- Ordinary physical delete, move and rejected-upload cleanup require fresh canonical
-  authority and a matching physical fingerprint. Explicit encryption replacement
-  uses its durable subtree authority; pre-commit rollback retains fingerprint guards.
-- Startup uses stable service-file reads, paginated root discovery, bounded
-  parallel traversal, and a remote-folder observation cache invalidated by
-  writes and encryption/path changes.
-- Browser runtime dependencies are pinned, Obsidian is a development-only
-  dependency, and CI validates tests on Node 20 and 22, lint, build, audits,
-  release evidence, exact assets, and downloaded asset hashes.
-- Separated canonical schema/merge/transactions, encryption workflows, plugin
-  persistence/startup, watcher rules/settlement, and reconciliation stages while
-  retaining one coordinator and coherent local persistence flow.
+  without restoring obsolete paths.
+- Ordinary index updates use an exclusive rename lock, stable JSON semantics,
+  strict validation, read-back verification, byte-exact rollback, and stale-lock
+  recovery. Ambiguous or competing lock states block synchronization rather
+  than selecting an arbitrary index.
+- Ordinary physical delete, move, and rejected-upload cleanup require fresh
+  canonical authority and a matching physical fingerprint. New encryption
+  transitions instead use a durable replacement descriptor, frozen filters,
+  and a fresh epoch for recursive cleanup, preserving protected/excluded paths
+  and verified target bytes. Legacy transition checkpoints retain fingerprint
+  guards. Before encryption commit the source remains authoritative; after
+  commit rollback is forbidden and target-mode cleanup is repeatable.
+- Rebuilt Force local/remote as direct replacement of the selected destination,
+  including empty folders. Both directions honor include/exclude filters,
+  configuration-folder selection, `.backup`, and the running plugin's own data.
+- Force uses one dialog for source checks, password entry, confirmation, and
+  results. The archive option is off by default; a selected archive must be
+  verified before deletion. Without it, Force creates no archive, staging,
+  trash, or individual protective/conflict copies.
+- Interrupted Force saves remaining work for the next manual, startup, or
+  scheduled full sync without repeating completed broad deletion. Other devices
+  with offline changes can accept the new state, preserve their changes, or
+  defer. Successful completion restores watcher/scheduler readiness. Force
+  publishes and verifies a rebuilt canonical in a new epoch directly at its
+  final path, without ordinary rename locking. It does not fence requests
+  already sent by other devices.
+- Backup uploads use collision-resistant names, never overwrite existing
+  archives, and verify both SHA-256 and exact downloaded bytes after success,
+  timeout, or an ambiguous response. Historical plaintext ZIPs remain readable;
+  unsupported historical encrypted archives are rejected.
+- Settings take effect only after a successful local save. Scheduling, logging,
+  and concurrency edits avoid unnecessary full sync or remote revalidation.
+  Operation buttons show actual activity and block incompatible actions.
+- Split synchronization, encryption, startup, and persistence into focused
+  modules. Browser runtime dependencies are pinned and Obsidian is a
+  development-only dependency. CI runs tests on Node 20 and 22, lint, formatting,
+  build and bundle checks; release workflows additionally check dependency
+  audits, release evidence, exact assets, and published asset hashes.
 
 ### Fixed
 
-- Prevented deleted folders and files from returning after restart or a later
-  full synchronization.
-- Prevented stale watcher uploads, same-device replays, and partially completed
-  rename chains from creating false conflicts or duplicate paths.
-- Prevented unresolved causal work from being acknowledged or advancing the
-  local observed revision.
-- Recovered successful uploads and canonical commits whose final response was
-  lost or timed out without reporting false success for unverified operations.
-- Force honors shared protected paths, include/exclude patterns and configuration
-  selection in both directions. Excluded encrypted bytes retain their verified codec;
-  conflicting file/folder replacements and unsafe codec removal stop before writes.
-- Explicit Force without-backup skips individual copies and old user-content
-  snapshots. Ordinary sync still blocks destructive changes after a failed
-  mandatory protective copy.
-- Rejected malformed canonical records, paths, watermarks, transitions,
-  ciphertext, and unsupported formats before Vault API or remote mutation.
-- Revalidated canonical state and encryption immediately before corrective
-  uploads so newer foreign state or maintenance blocks stale writes.
-- Incomplete local reads fail closed instead of producing remote deletions.
-- Force cannot infer deletion scope from a ciphertext-like filename alone.
-- Folder-delete suppression retains genuine deletes of recreated descendants.
-- Pre-commit encryption rollback preserves source authority and resumes after
-  interruption without publishing an invalid cleanup phase.
-- Codec fallback reuses downloaded bytes and preserves transport/semantic errors.
-- Stale-lock recovery verifies a unique raw claim before canonical publication,
-  preserving renewed locks across MOVE races, retries, and restart.
+- Deleted files/folders no longer return through stale uploads, replayed events,
+  or incomplete rename chains. Exact deletion wins over a concurrent stale edit;
+  new or modified descendants survive a concurrent folder deletion.
+- Rename chains and duplicate child events no longer recreate obsolete paths or
+  produce avoidable conflicts. Files changed during a guarded move are preserved.
+- Lost upload/commit responses are reconciled against verified remote state;
+  unresolved work is retained instead of being acknowledged as synchronized.
+- Unresolved causal work cannot advance the local observed revision or skip a
+  gap in the per-device acknowledgement watermark. Same-device replay and
+  interrupted settlement retain pending work instead of creating false success.
+- Stale-lock recovery verifies an exclusive raw claim before publication and
+  preserves renewed locks across MOVE races, retries, and restart.
+- Interrupted downloads and transient read failures use bounded retries.
+  Stalled native reads no longer block every later read; late results are ignored
+  after timeout, cancellation, or a connection change.
+- Downloaded service-file bytes are checked against the server content hash
+  before index validation. Malformed metadata, unsafe paths, unsupported
+  encryption, and corrupt ciphertext block unsafe writes.
+- Incomplete scans or source read/decryption failures no longer become an empty
+  source or authorize deletion. Corrective uploads recheck index and encryption
+  state immediately before writing.
+- Interrupted encryption rollback and cleanup retain recovery state. Connecting
+  to an encrypted vault validates the password and index before saving the new
+  configuration and resuming synchronization. Pre-commit rollback preserves
+  source authority; post-commit recovery can be completed by another device
+  that authenticates the target mode.
+- Excluded encrypted resources retain their authenticated codec. Unsafe codec
+  removal and file/folder replacements that would erase excluded descendants
+  stop before writes; ciphertext-like filenames alone never authorize deletion.
+- The plugin's credentials, local state, and logs are excluded from configuration
+  sync and Force archives. Previously uploaded plugin data requires separate
+  removal and OAuth token rotation; upgrading does not undo earlier exposure.
 
 ### Performance
 
-- Avoided canonical writes and redundant manifest checks on strict no-op sync.
-- Realtime verification uses targeted canonical and physical reads instead of a
-  complete remote-tree traversal.
-- Pass-local FIFO/path indexes remove repeated scans without caching authority.
-- Digest-only traversal releases each file buffer after hashing; ZIP creation
-  still materializes content.
-- Realtime file batches use sequential windows of up to 32 events / target 8 MiB
-  plaintext, with per-window settlement. Extra windows require extra commits;
-  this is not a hard cap on whole-process memory or an oversized file.
+- Avoided index writes and redundant manifest reads when nothing changed.
+  Realtime verification uses targeted reads instead of full remote-tree scans.
+- Overlapped independent local/remote scans and metadata reads, reused verified
+  service reads, added stable paginated root discovery and bounded parallel
+  traversal, and cached observed remote folders with invalidation after
+  delete/move or connection, path, and codec changes.
+  Default concurrency increased from 10 to 20; saved values are preserved.
+- Batched independent renames and coalesced rename chains. Realtime uploads and
+  deletes settle in windows of up to 32 events with an 8 MiB plaintext target;
+  oversized files are handled separately, so this is not a total memory cap.
+- Pass-local FIFO/path indexes and ancestry sets/maps reduce repeated scans
+  without caching write authority. Digest-only verification releases each file
+  buffer after hashing. ZIP creation still materializes file contents; these
+  changes do not establish a lower memory limit for large archives.
 
 ## 1.1.0
 
