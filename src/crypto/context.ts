@@ -16,8 +16,17 @@ import type { LocalEncryptionTransition } from "./encryption-transition";
 export type EncryptionIndex = Pick<
 	IndexManager,
 	| "assertMaintenanceAuthority"
+	| "buildLocalIndex"
+	| "getEncryptionReplacementScope"
+	| "stageEncryptionReplacement"
+	| "finishEncryptionReplacement"
+	| "beginEpochAdoption"
+	| "endEpochAdoption"
+	| "captureLocalCausalState"
+	| "restoreLocalCausalState"
 	| "clearIndexTransitionServices"
 	| "createStartupReadSession"
+	| "createCanonicalReadSession"
 	| "clearMaintenance"
 	| "completePhysicalAction"
 	| "deleteEncryptionManifest"
@@ -50,17 +59,22 @@ export type EncryptionEngine = Pick<
 >;
 export type EncryptionClient = Pick<
 	YandexDiskClient,
+	| "collectLogicalMetadata"
 	| "decodePhysicalUserPath"
 	| "deleteResource"
 	| "downloadStableRawFile"
 	| "getPhysicalPath"
+	| "getResourcesRecursive"
+	| "getReadConfigurationVersion"
+	| "uploadFile"
+	| "withWriteGuard"
 	| "getResource"
 	| "isRawFolderEmpty"
 	| "setEncryptionService"
 >;
 
 export type EncryptionWorkflowSettings = LocalEncryptionSettings &
-	Pick<YandexDiskSyncSettings, "deviceId" | "remotePath">;
+	Pick<YandexDiskSyncSettings, "deviceId" | "remotePath" | "maxConcurrency">;
 
 export type EncryptionPromptMode = "connect" | "rotated" | "recover";
 
@@ -79,6 +93,7 @@ export interface EncryptionUI {
 
 /** Current snapshot ports share the plugin's single coherent persistence queue. */
 export interface EncryptionContext {
+	readonly readLocalFile?: (path: string) => Promise<ArrayBuffer>;
 	readonly client: EncryptionClient;
 	readonly index: EncryptionIndex;
 	readonly engine: EncryptionEngine;

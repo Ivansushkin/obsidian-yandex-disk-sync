@@ -4,13 +4,12 @@
 	"testedCommit": null,
 	"scenarios": [],
 	"blockers": [
-		"The clean-cut 2.0.0 commit has not been recorded or tested",
-		"Real two-profile Yandex Disk run is not recorded",
-		"2.0.0 fresh install, plaintext stable 1.0/1.1 migration, and historical-format fail-closed evidence is not recorded",
-		"Current desktop, Obsidian 1.0.0 desktop, and current mobile evidence is not recorded",
-		"PERF-006 and PBKDF2 mobile p95 evidence is not recorded",
-		"Server fencing release gate fails: late Force DELETE, ordinary PUT and encryption manifest PUT/DELETE can damage a completed successor",
-		"Conditional DELETE MD5 and atomic PUT/MOVE version guarantees have not been verified on real Yandex Disk",
-		"Force receipt/recovery and automation changes require a real two-profile Obsidian/Yandex smoke"
+		"The exact 2.0.0 test commit and per-scenario manual evidence have not been recorded",
+		"Real two-profile Yandex Disk runs in plaintext and hardened encrypted modes are not recorded",
+		"Fresh install, plaintext stable 1.0/1.1 migration and historical-format rejection evidence is not recorded",
+		"Current desktop, Obsidian 1.0.0 desktop and current mobile evidence is not recorded",
+		"PERF-006 mobile memory and PBKDF2 p95 evidence is not recorded",
+		"Direct Force archive, partial recovery, offline epoch choice and automation smoke is not recorded",
+		"Authoritative encryption enable/rotate/disable, offline replacement, selected archive and interrupted cleanup smoke is not recorded"
 	]
 }

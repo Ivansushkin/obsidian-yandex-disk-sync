@@ -1,3 +1,4 @@
+import { ForceScopeConflictError } from "../force-errors";
 import { OperationFailure } from "../errors";
 /**
  * Adapter for working with Obsidian Vault files
@@ -135,6 +136,7 @@ export class VaultAdapter {
 	/** Walk actual storage, including hidden configuration and empty directories. */
 	async getForceTree(
 		source: boolean,
+		inspect: (path: string, directory: boolean) => boolean = () => true,
 	): Promise<{ files: string[]; directories: string[] }> {
 		const files: string[] = [];
 		const directories: string[] = [];
@@ -150,6 +152,9 @@ export class VaultAdapter {
 						? !isForceSourcePath(path, this.vault.configDir)
 						: preservesForceLocalPath(path, this.vault.configDir)
 				) {
+					continue;
+				}
+				if (!inspect(path, listed.folders.includes(path))) {
 					continue;
 				}
 				if (listed.folders.includes(path)) {
@@ -202,7 +207,7 @@ export class VaultAdapter {
 		}
 	}
 
-	/** Make a literal Force directory, replacing a file occupying that path. */
+	/** Make a Force directory only after explicit deletion has removed its blockers. */
 	async createForceDirectory(
 		path: string,
 		beforeMutation?: () => Promise<void>,
@@ -213,9 +218,9 @@ export class VaultAdapter {
 			assertForcePath(directory);
 			const stat = await this.vault.adapter.stat(directory);
 			if (stat?.type === "file") {
-				await this.deleteForcePath(directory, beforeMutation);
+				throw new ForceScopeConflictError();
 			}
-			if (!stat || stat.type === "file") {
+			if (!stat) {
 				await beforeMutation?.();
 				await this.vault.adapter.mkdir(directory);
 			}
@@ -242,7 +247,7 @@ export class VaultAdapter {
 			await this.createForceDirectory(parent, beforeMutation);
 		}
 		if ((await this.vault.adapter.stat(path))?.type === "folder") {
-			await this.deleteForcePath(path, beforeMutation);
+			throw new ForceScopeConflictError();
 		}
 		const file = this.getFile(path);
 		await beforeMutation?.();

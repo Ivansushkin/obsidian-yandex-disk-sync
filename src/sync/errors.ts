@@ -1,4 +1,8 @@
-import { ForceRecoveryPendingError } from "./workflows/force-state";
+import {
+	ForceRecoveryPendingError,
+	ForceSourceFormatError,
+	ForceScopeConflictError,
+} from "./workflows/force-state";
 import {
 	OperationFailure,
 	type FailureContext,
@@ -38,7 +42,21 @@ export function formatOperationFailure(
 	const stageKey = `failure.stage.${failure.stage}`;
 	const translated = t(stageKey);
 	const stage = translated === stageKey ? failure.stage : translated;
-	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${failure.message}. ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${nextAction ?? t(`failure.next.${failure.category}`)}`;
+	const message =
+		failure.code === "force-source-format"
+			? t("force.source_format_error")
+			: failure.code === "force-scope-conflict"
+				? t("force.scope_conflict")
+				: failure.message;
+	const nextKey =
+		failure.code === "force-source-format"
+			? "force-source-format"
+			: failure.code === "force-scope-conflict"
+				? "force-scope-conflict"
+				: failure.code === "local-persistence"
+					? "local-persistence"
+					: failure.category;
+	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${message}. ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${nextAction ?? t(`failure.next.${nextKey}`)}`;
 }
 
 /** Preserve the first reason and total failures without exposing raw exceptions. */
@@ -121,6 +139,22 @@ export function classifySyncError(error: Error): string | undefined {
 }
 
 function classifyDomainError(error: Error): string | undefined {
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof ForceScopeConflictError,
+		)
+	) {
+		return "force-scope-conflict";
+	}
+	if (
+		findErrorCause(
+			error,
+			(candidate) => candidate instanceof ForceSourceFormatError,
+		)
+	) {
+		return "force-source-format";
+	}
 	if (
 		findErrorCause(
 			error,

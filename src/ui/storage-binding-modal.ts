@@ -26,11 +26,14 @@ export class StorageBindingModal extends Modal {
 				{ path: this.path },
 			),
 		});
-		const buttons = new Setting(this.contentEl);
 		if (this.canAdoptReplacement) {
 			this.contentEl.createEl("p", {
 				text: t("storage.replacement_description"),
 			});
+		}
+		const buttons = new Setting(this.contentEl);
+		buttons.settingEl.addClass("sync-modal-actions");
+		if (this.canAdoptReplacement) {
 			buttons.addButton((button) =>
 				button
 					.setButtonText(t("storage.replacement"))

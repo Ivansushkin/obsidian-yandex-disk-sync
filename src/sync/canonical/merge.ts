@@ -23,6 +23,7 @@ import {
 export type CanonicalMergeMode =
 	| { kind: "normal" }
 	| { kind: "physical-rewrite" }
+	| { kind: "encryption-replacement" }
 	| { kind: "target-recovery"; maintenanceId: string }
 	| { kind: "replacement"; replacementDeletedAt: number };
 
@@ -78,6 +79,33 @@ export function mergeDesiredIndex(
 	const rejectedPuts: RejectedCanonicalPut[] = [];
 	const diagnostics: CanonicalMergeDiagnostic[] = [];
 	const nextRevision = latest.revision + 1;
+	if (mode.kind === "encryption-replacement") {
+		const authority = desiredIndex.maintenance;
+		if (
+			!authority?.replacement ||
+			latest.maintenance?.id !== authority.id ||
+			latest.maintenance.initiatedBy !== deviceId ||
+			latest.epoch !== authority.replacement.sourceEpoch ||
+			desiredIndex.epoch !== authority.replacement.targetEpoch
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Encryption replacement authority changed",
+			);
+		}
+		const index = cloneIndex(desiredIndex);
+		index.revision = nextRevision;
+		index.folderTombstones = {};
+		index.moves = {};
+		index.appliedMutationSeq = {};
+		for (const meta of Object.values(index.files)) {
+			meta.changedRevision = nextRevision;
+			meta.baseRevision = latest.revision;
+			meta.lastModifiedBy = deviceId;
+			meta.mutationSeq = 0;
+		}
+		index.maintenance!.targetRevision = nextRevision;
+		return { index, rejectedPuts, diagnostics };
+	}
 	if (mode.kind === "replacement") {
 		const replacement = cloneIndex(desiredIndex);
 		replacement.revision = nextRevision;
@@ -124,6 +152,30 @@ export function mergeDesiredIndex(
 			"Maintenance changed since it was observed",
 		);
 	}
+
+	if (!sameValue(desiredIndex.epochAdoption, latest.epochAdoption)) {
+		const receipt = desiredIndex.epochAdoption;
+		const authority = latest.maintenance;
+		if (
+			!receipt ||
+			!authority?.replacement ||
+			authority.id !== receipt.operationId ||
+			!sameValue(
+				{ ...receipt, preservedRawPaths: [] },
+				{ ...latest.epochAdoption, preservedRawPaths: [] },
+			) ||
+			!sameValue(
+				receipt.preservedRawPaths,
+				desiredMaintenance?.replacement?.preservedRawPaths,
+			)
+		) {
+			throw new RemoteIndexConcurrentModificationError(
+				"Encryption receipt authority changed",
+			);
+		}
+		merged.epochAdoption = cloneValue(receipt);
+		changed = true;
+	}
 	if (mode.kind === "target-recovery") {
 		if (
 			!isTargetRecoveryIndex(latest, mode.maintenanceId) ||
@@ -134,14 +186,34 @@ export function mergeDesiredIndex(
 				"Target recovery authority changed before commit",
 			);
 		}
+		if (latest.maintenance?.replacement) {
+			for (const [path, desired] of Object.entries(desiredIndex.files)) {
+				if (sameValue(desired, loadedBase.files[path])) {
+					continue;
+				}
+				const physical = mergePhysicalMetadata(
+					latest.files[path],
+					loadedBase.files[path],
+					desired,
+				);
+				if (!physical) {
+					throw new RemoteIndexConcurrentModificationError(
+						"Replacement target changed during recovery",
+					);
+				}
+				setRecordValue(merged.files, path, physical);
+				changed = true;
+			}
+		}
 		if (!sameValue(desiredMaintenance, latest.maintenance)) {
 			if (desiredMaintenance) {
 				merged.maintenance = cloneValue(desiredMaintenance);
 			} else {
 				delete merged.maintenance;
 			}
-			merged.revision = nextRevision;
+			changed = true;
 		}
+		merged.revision = changed ? nextRevision : latest.revision;
 		return { index: merged, rejectedPuts, diagnostics };
 	}
 	if (

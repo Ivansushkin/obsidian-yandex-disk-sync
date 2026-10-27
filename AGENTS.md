@@ -71,8 +71,8 @@
   publishes its own durable intent before replacing the syncable destination.
   Ordinary destructive remote actions require fresh canonical/operation authority
   and a matching expected physical fingerprint. Direct Force deliberately ignores
-  destination authority and fingerprints, clears the full destination and copies
-  its readable source directly. See docs/FORCE_SYNC.md.
+  destination authority and fingerprints, replaces the selected destination and
+  copies its readable source directly while preserving excluded/protected paths. See docs/FORCE_SYNC.md.
   A failed mandatory backup blocks ordinary-sync local overwrite or deletion. Confirmed Force uses its explicit per-run backup policy.
 - Exact delete beats a concurrent stale put. A new or modified descendant
   survives folder delete. Initial device connection receives canonical versions with protective copies;
@@ -105,8 +105,15 @@
 - Enable, disable, rotate, and post-commit recovery use the existing
   `EncryptionTransitionController` over `SyncEngine` and `IndexManager`.
 - Before canonical commit, source mode is authoritative. After commit, rollback
-  is forbidden; target mode is authoritative and cleanup is repeatable and
-  fingerprint-guarded.
+  is forbidden; target mode is authoritative and cleanup is repeatable.
+- New enable/disable/rotate runs explicitly replace the initiating local snapshot
+  within frozen sync filters. Their durable replacement descriptor and fresh epoch
+  authorize recursive cleanup; stale devices receive that reference before merge.
+  Preserve protected/excluded raw resources and verified target bytes. Legacy
+  checkpoints without the descriptor retain fingerprint guards and their epoch.
+- Every cleanup attempt revalidates authority and lifetime; rejected guards never
+  acknowledge absence. Join admitted writes before recovery. Revocation cannot
+  start automatic recovery under a new configuration. See docs/E2E_ENCRYPTION.md.
 - `clearIndexTransitionServices()` must run through `finally` around physical
   re-encoding.
 - Passwords and OAuth tokens stay only in local plugin data. Never put them in
@@ -120,9 +127,12 @@
 - Stable plaintext 1.0/1.1 local migration is irreversible. Persist one coherent
   current snapshot after installation identity initialization and before automation.
   A failed initial save blocks sync and unload must not retry it.
-- Direct Force covers the entire vault, including hidden/config files, ignoring
-  ordinary filters. Preserve root .backup and the local running sync plugin/state;
-  never upload its credentials. Rebuild canonical; preserve or rebuild the
+- Direct Force honors shared protected paths, user include/exclude filters and the
+  configuration sync switch in both source reads and destination cleanup. Preserve
+  .backup and the local running sync plugin/state;
+  never upload its credentials. Rebuild canonical; authenticate encrypted destination names before scoped cleanup.
+  Reuse its codec when encryption remains enabled so excluded ciphertext stays
+  readable; reject codec removal that would strand it. Preserve or rebuild the
   encryption manifest only to match authenticated source/output parameters.
 - Force offers one confirmation with an archive toggle off by default. A selected
   archive must succeed before purge; errors stay in that dialog. Force never

@@ -6,15 +6,40 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
-		"force.preserved_remote":
-			"Existing .backup is kept. The index is rebuilt; encryption metadata is replaced to match the uploaded files.",
+		"force.scope_conflict":
+			"Replacement would affect excluded or protected destination data",
+		"failure.next.force-scope-conflict":
+			"Resolve the file/folder collision or change encryption in its settings first. Excluded data is preserved.",
+		"force.source_format_error":
+			"The encrypted source contains names or file contents that do not match its encryption format",
+		"failure.next.force-source-format":
+			"Check for ordinary folders, damaged files, or an unfinished encryption transition on Disk. This is not a password-entry error.",
+		"force.paths": "{source} → {target}",
+		"force.source_checking":
+			"Checking the source. Destination files are not being changed.",
+		"force.source_progress":
+			"Source objects verified: {completed} of {total}. Destination files are not being changed.",
+		"force.source_password":
+			"Enter the encryption password to read the files on Disk.",
+		"force.check_password": "Verify password",
+		"force.preparation_failed":
+			"The source could not be verified. Replacement has not started.",
+		"force.local_source_details":
+			"Files to copy: {count}. On Disk: {mode}.",
+		"force.remote_source_details":
+			"Files to copy: {count}. On Disk: {mode}. Local copies will be decrypted.",
+		"force.archive_local":
+			"Archive the full local vault on Disk before replacement",
+		"force.archive_remote": "Archive files on Disk",
+		"force.archive_destination": "Save to: {path}",
+		"force.preserved_remote": "The .backup folder is kept.",
 		"force.preserved_local":
-			"Local .backup and this sync plugin are kept. All other files and Obsidian configuration are replaced.",
-		"force.filters_ignored":
-			"The entire vault is included. Normal include/exclude filters do not apply.",
+			"Local .backup and this sync plugin are kept. Restart Obsidian afterwards.",
+		"force.filters_applied":
+			"Uses your include/exclude filters and the Obsidian configuration setting. Excluded and protected files are kept.",
 		"force.optional_archive": "Create an archive before replacement",
-		"force.replace_remote": "Clear Disk and upload local files",
-		"force.replace_local": "Clear local files and download from Disk",
+		"force.replace_remote": "Replace on Disk",
+		"force.replace_local": "Replace locally",
 		"force.archive_retry_inline":
 			"The archive could not be created. Retry, turn off the archive option, or cancel. Replacement has not started.",
 		"force.partial_result":
@@ -30,11 +55,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.password_create": "Create encrypted destination",
 		"force.password_description":
 			"Enter the password for the selected Force operation. Cancel leaves the destination unchanged.",
-		"force.source_mode_title": "Select remote source format",
-		"force.source_mode_description":
-			"The manifest is missing. Choose how to read the source. Encrypted reading requires the original salt/profile and a valid password; all source files are verified before replacement.",
-		"force.plaintext": "Plaintext",
-		"force.encrypted": "Encrypted",
+		"force.plaintext": "unencrypted",
+		"force.encrypted": "encrypted",
 		"force.backup_failed_title": "The archive could not be verified",
 		"force.backup_failed_description":
 			"Retry, explicitly continue without any protective copies, or cancel.",
@@ -46,8 +68,6 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Continue the saved direction, encryption mode and backup choice, or confirm a new replacement separately. Cancel keeps recovery unchanged.",
 		"force.recovery_pending":
 			"Force recovery is unfinished. Resume it before normal synchronization.",
-		"force.confirm_details":
-			"Source: {source}. Destination: {target}. Source files: {count}. Resulting mode: {mode}.",
 		"force.empty_source":
 			"The source is empty. All synchronized files in the destination will be deleted.",
 		"force.epoch_title": "The remote storage was replaced",
@@ -79,6 +99,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"failure.stage.verifying-backup": "backup verification",
 		"failure.stage.protective-backup": "mandatory protective copy",
 		"failure.stage.persisting": "local state persistence",
+		"failure.stage.watcher-persistence": "watcher state persistence",
 		"failure.stage.reconciling": "final reconciliation",
 		"failure.stage.encryption": "encryption",
 		"failure.stage.encryption-validation": "encryption verification",
@@ -108,6 +129,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Check plugin status and resolve the safety block before retrying.",
 		"failure.next.local":
 			"Check local storage and backup access before retrying.",
+		"failure.next.local-persistence":
+			"Check local storage access and save settings again before synchronizing.",
 		"failure.next.unknown":
 			"Check plugin status and diagnostics before retrying.",
 		"notice.force_phase_protected-snapshot": "Reading protected snapshot…",
@@ -225,8 +248,10 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync stopped because the selected source changed during the operation. Start a new attempt and choose the archive option again.",
 		"notice.force_cleanup_pending":
 			"The replacement snapshot is committed. Cleanup is incomplete and will resume during normal synchronization; do not repeat Force sync.",
-		"notice.remote_recheck_required":
-			"Token or remote path changed. Remote state must be checked again before synchronization.",
+		"notice.local_persistence_failed":
+			"Local synchronization state could not be saved. Check local storage access and save settings again before synchronizing.",
+		"notice.sync_interrupted":
+			"Synchronization stopped because the plugin was unloaded.",
 		"notice.remote_state_check_failed":
 			"Remote state could not be checked. Synchronization remains blocked without remote changes.",
 		"settings.migration_features_locked":
@@ -424,8 +449,12 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Warning: If you lose your password, encrypted files cannot be decrypted. There is no password recovery mechanism.",
 		"settings.encryption_info_password":
 			"The password is stored locally in plugin settings and is never sent to remote storage.",
+		"notice.encryption_reference_received":
+			"Received the encryption initiator's vault reference. Previous-generation local changes will not be uploaded.",
+		"notice.encryption_replacement_warning":
+			"Do not edit this vault on this or any other device until the operation finishes. This device is the reference; concurrent changes on other devices will be overwritten.",
 		"notice.encryption_syncing":
-			"Encryption enabled. Re-uploading files...",
+			"Enabling encryption. Re-uploading files...",
 		"notice.encryption_disabling":
 			"Disabling encryption. Re-uploading files as plaintext...",
 		"notice.encryption_disabled": "Encryption disabled",
@@ -448,7 +477,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_sync_failed":
 			"Encryption sync failed with {errors} errors",
 		"notice.encryption_disable_partial":
-			"Encryption disabled with some errors. Please verify files on disk and locally — some remote API requests failed. If everything looks OK, run a manual sync to ensure full consistency.",
+			"Encryption transition is incomplete. Do not edit this vault on any device. Run synchronization again to resume recovery.",
 		"notice.encryption_connected":
 			"Encrypted vault connected on this device",
 		"notice.encryption_password_rotating":
@@ -466,13 +495,12 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force synchronization ignores all conditions (timestamps, file hashes, indexes). Creates an exact copy in the specified direction.",
 		"settings.force_sync_from_local_button": "Sync from local → remote",
 		"settings.force_sync_from_remote_button": "Sync from remote → local",
-		"modal.force_sync_title": "Force sync confirmation",
+		"modal.force_sync_title": "Force synchronization",
 		"modal.force_sync_from_local_text":
-			"This operation will overwrite ALL files on Yandex Disk with local versions. Files that exist only on Yandex Disk will be permanently deleted.",
+			"Selected files on Disk will be replaced with local versions. Selected Disk-only files will be permanently deleted.",
 		"modal.force_sync_from_remote_text":
-			"This operation will overwrite ALL local files with versions from Yandex Disk. Local files that do not exist on Yandex Disk will be permanently deleted.",
-		"modal.force_sync_warning":
-			"WARNING: This operation is destructive and cannot be undone. Changes made after the sync on the overwritten side may be lost.",
+			"Selected local files will be replaced with versions from Disk. Selected local-only files will be permanently deleted.",
+		"modal.force_sync_warning": "This cannot be undone.",
 		"modal.force_sync_recommend_backup":
 			"Choose a full archive or continue without one. Snapshot and file protection checks remain active.",
 		"modal.force_sync_backup_button": "Create backup and proceed",
@@ -484,15 +512,40 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
-		"force.preserved_remote":
-			"Существующая .backup сохраняется. Индекс пересоздаётся; метаданные шифрования приводятся к загружаемым файлам.",
+		"force.scope_conflict":
+			"Замена затронет исключённые или защищённые данные назначения",
+		"failure.next.force-scope-conflict":
+			"Устраните конфликт файла и папки или сначала измените шифрование через его настройки. Исключённые данные сохраняются.",
+		"force.source_format_error":
+			"В зашифрованном источнике найдены имена или содержимое файлов, не соответствующие его формату шифрования",
+		"failure.next.force-source-format":
+			"Проверьте обычные папки, повреждённые файлы и незавершённый переход шифрования на Диске. Это не ошибка ввода пароля.",
+		"force.paths": "{source} → {target}",
+		"force.source_checking":
+			"Проверяем источник. Файлы назначения ещё не изменяются.",
+		"force.source_progress":
+			"Проверено объектов источника: {completed} из {total}. Файлы назначения ещё не изменяются.",
+		"force.source_password":
+			"Введите пароль шифрования для чтения файлов на Диске.",
+		"force.check_password": "Проверить пароль",
+		"force.preparation_failed":
+			"Не удалось проверить источник. Замена не начата.",
+		"force.local_source_details":
+			"Файлов для копирования: {count}. На Диске — {mode}.",
+		"force.remote_source_details":
+			"Файлов для копирования: {count}. На Диске — {mode}, локально — без шифрования.",
+		"force.archive_local":
+			"Сохранить полный локальный vault в архив на Диске перед заменой",
+		"force.archive_remote": "Архив файлов на Диске",
+		"force.archive_destination": "Сохранить в: {path}",
+		"force.preserved_remote": "Папка .backup сохранится.",
 		"force.preserved_local":
-			"Локальная .backup и сам sync-плагин сохраняются. Все остальные файлы и конфигурация Obsidian заменяются.",
-		"force.filters_ignored":
-			"Заменяется весь vault. Обычные фильтры включения и исключения не применяются.",
+			"Папка .backup и этот плагин сохранятся. После замены перезапустите Obsidian.",
+		"force.filters_applied":
+			"Учитываются включения, исключения и настройка синхронизации конфигурации Obsidian. Исключённые и защищённые файлы сохраняются.",
 		"force.optional_archive": "Создать архив перед заменой",
-		"force.replace_remote": "Очистить Диск и загрузить локальное",
-		"force.replace_local": "Очистить локальное и скачать с Диска",
+		"force.replace_remote": "Заменить на Диске",
+		"force.replace_local": "Заменить локально",
 		"force.archive_retry_inline":
 			"Архив не создан. Повторите попытку, отключите архив или отмените. Замена не начата.",
 		"force.partial_result":
@@ -508,11 +561,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.password_create": "Создание зашифрованного назначения",
 		"force.password_description":
 			"Введите пароль для выбранной операции Force. Отмена сохраняет назначение без изменений.",
-		"force.source_mode_title": "Выберите формат источника на Диске",
-		"force.source_mode_description":
-			"Manifest отсутствует. Укажите формат чтения источника. Для шифрования нужны исходные salt/profile и верный пароль; все файлы проверяются до замены назначения.",
-		"force.plaintext": "Без шифрования",
-		"force.encrypted": "С шифрованием",
+		"force.plaintext": "без шифрования",
+		"force.encrypted": "с шифрованием",
 		"force.backup_failed_title": "Архив не прошёл проверку",
 		"force.backup_failed_description":
 			"Повторите попытку, явно продолжите без любых защитных копий или отмените операцию.",
@@ -524,8 +574,6 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Продолжить сохранённое направление, режим шифрования и выбор архива либо отдельно подтвердить новую замену. Отмена сохраняет recovery.",
 		"force.recovery_pending":
 			"Восстановление Force не завершено. Продолжите его перед обычной синхронизацией.",
-		"force.confirm_details":
-			"Источник: {source}. Назначение: {target}. Файлов в источнике: {count}. Итоговый режим: {mode}.",
 		"force.empty_source":
 			"Источник пуст. Назначение будет очищено, кроме явно сохраняемых путей.",
 		"force.epoch_title": "Хранилище на Диске заменено",
@@ -558,6 +606,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"failure.stage.verifying-backup": "проверка резервной копии",
 		"failure.stage.protective-backup": "обязательная защитная копия",
 		"failure.stage.persisting": "сохранение локального состояния",
+		"failure.stage.watcher-persistence": "сохранение событий файлов",
 		"failure.stage.reconciling": "финальная сверка",
 		"failure.stage.encryption": "шифрование",
 		"failure.stage.encryption-validation": "проверка шифрования",
@@ -588,6 +637,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Проверьте статус плагина и устраните блокировку перед повтором.",
 		"failure.next.local":
 			"Проверьте локальное хранилище и доступ к резервным копиям.",
+		"failure.next.local-persistence":
+			"Проверьте доступ к локальному хранилищу и повторно сохраните настройки перед синхронизацией.",
 		"failure.next.unknown":
 			"Проверьте статус плагина и диагностику перед повтором.",
 		"notice.force_phase_protected-snapshot": "Чтение защищаемого снимка…",
@@ -707,8 +758,10 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync остановлен: выбранный источник изменился во время операции. Запустите новую попытку и снова выберите вариант архива.",
 		"notice.force_cleanup_pending":
 			"Новое состояние уже зафиксировано. Очистка не завершена и продолжится обычной синхронизацией; не повторяйте Force sync.",
-		"notice.remote_recheck_required":
-			"Токен или удалённый путь изменился. Перед синхронизацией нужно заново проверить удалённое состояние.",
+		"notice.local_persistence_failed":
+			"Не удалось сохранить локальное состояние синхронизации. Проверьте доступ к локальному хранилищу и повторно сохраните настройки перед синхронизацией.",
+		"notice.sync_interrupted":
+			"Синхронизация остановлена из-за выгрузки плагина.",
 		"notice.remote_state_check_failed":
 			"Удалённое состояние не удалось проверить. Синхронизация остаётся заблокированной без изменений на диске.",
 		"settings.migration_features_locked":
@@ -907,8 +960,12 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Предупреждение: При утере пароля зашифрованные файлы невозможно расшифровать. Механизма восстановления пароля нет.",
 		"settings.encryption_info_password":
 			"Пароль хранится локально в настройках плагина и никогда не отправляется в удалённое хранилище.",
+		"notice.encryption_reference_received":
+			"Получен эталон хранилища с устройства, изменившего шифрование. Локальные изменения прежнего поколения не будут отправлены.",
+		"notice.encryption_replacement_warning":
+			"Нельзя менять хранилище здесь и на других устройствах до завершения операции. Это устройство — эталон; одновременные изменения других устройств будут перезаписаны.",
 		"notice.encryption_syncing":
-			"Шифрование включено. Перезапись файлов...",
+			"Включение шифрования. Перезапись файлов...",
 		"notice.encryption_disabling":
 			"Шифрование отключается. Перезапись файлов в открытом виде...",
 		"notice.encryption_disabled": "Шифрование отключено",
@@ -931,7 +988,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.encryption_sync_failed":
 			"Синхронизация шифрования завершилась с ошибками: {errors}",
 		"notice.encryption_disable_partial":
-			"Шифрование выключено с ошибками. Проверьте файлы на диске и локально — часть удалённых API-запросов завершилась с ошибками. Если всё выглядит корректно, запустите синхронизацию вручную для полной сверки.",
+			"Переход шифрования не завершён. Не меняйте хранилище ни на одном устройстве. Повторите синхронизацию для продолжения восстановления.",
 		"notice.encryption_connected":
 			"Зашифрованное хранилище подключено на этом устройстве",
 		"notice.encryption_password_rotating":
@@ -950,13 +1007,12 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.force_sync_from_local_button": "Синхр. локальное → удалённое",
 		"settings.force_sync_from_remote_button":
 			"Синхр. удалённое → локальное",
-		"modal.force_sync_title": "Подтверждение принудительной синхронизации",
+		"modal.force_sync_title": "Принудительная синхронизация",
 		"modal.force_sync_from_local_text":
-			"Эта операция перезапишет ВСЕ файлы на Яндекс.Диске локальными версиями. Файлы, которые существуют только на Яндекс.Диске, будут безвозвратно удалены.",
+			"Выбранные фильтрами файлы на Диске будут заменены локальными, а выбранные файлы, отсутствующие локально, — удалены навсегда.",
 		"modal.force_sync_from_remote_text":
-			"Эта операция перезапишет ВСЕ локальные файлы версиями с Яндекс.Диска. Локальные файлы, которых нет на Яндекс.Диске, будут безвозвратно удалены.",
-		"modal.force_sync_warning":
-			"ВНИМАНИЕ: Операция является деструктивной и не может быть отменена. Изменения, сделанные после синхронизации на перезаписываемой стороне, могут быть потеряны.",
+			"Выбранные фильтрами локальные файлы будут заменены версиями с Диска, а выбранные файлы, отсутствующие на Диске, — удалены навсегда.",
+		"modal.force_sync_warning": "Отменить замену нельзя.",
 		"modal.force_sync_recommend_backup":
 			"Архив необязателен. Без него защитные и конфликтные копии не создаются.",
 		"modal.force_sync_backup_button": "Создать бекап и продолжить",

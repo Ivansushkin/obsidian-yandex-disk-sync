@@ -303,15 +303,13 @@ function admission(current: Device, codec: EncryptionCodec | null) {
 					setUpdating: () => {},
 					stopRegularSync: () => current.watcher.stop(),
 					startAutomation: () => {},
-					invalidateRemoteStateClassification: () => {
-						startup.validated = false;
-					},
 					settingsSaveRejected: unexpected,
 					persistPluginData: async (patch) => {
 						// Fixture has coherent JSON persistence; the actual PluginPersistence queue is covered by the suite.
 						await current.saved();
 						Object.assign(current.settings, patch);
 						current.client.setToken("synthetic");
+						startup.validated = false;
 					},
 					runStartupInvocation: (action) =>
 						startup.runInvocation(action),
@@ -719,6 +717,13 @@ async function realtimeSeries(encrypted: boolean) {
 }
 
 export async function run() {
+	if (process.argv.includes("--encryption-transitions")) {
+		activeScenario = "encryption-transitions";
+		const { runEncryptionTransitions } =
+			await import("./sync-efficiency-encryption");
+		await runEncryptionTransitions();
+		return;
+	}
 	if (process.argv.includes("--rename-latency")) {
 		await renameLatency();
 		return;

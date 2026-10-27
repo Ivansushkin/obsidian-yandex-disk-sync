@@ -37,7 +37,11 @@ function forceUi(a: ReturnType<typeof device>) {
 			forceRecovery: null,
 			localStateRestored: true,
 			syncLifecycleRegistered: true,
-			confirmForceSync: async () => "without-backup",
+			openForceSyncModal: () => ({
+				confirm: async () => "without-backup",
+				render: () => {},
+				close: () => {},
+			}),
 			renderForceProgress: () => {},
 			isForceSyncUnavailable: () => false,
 			persistPluginData: async () => {
@@ -47,7 +51,10 @@ function forceUi(a: ReturnType<typeof device>) {
 		},
 	) as unknown as {
 		settings: typeof a.settings;
-		prepareForceSync(direction: "from_local" | "from_remote"): Promise<{
+		prepareForceSync(
+			direction: "from_local" | "from_remote",
+			preparation: import("../src/sync/workflows/force-controller").ForcePreparationContext,
+		): Promise<{
 			canonical: ForcePreflightProof["canonical"];
 			replacement: NonNullable<
 				import("../src/sync/contracts").SyncRunOptions["forceReplacement"]
@@ -900,7 +907,11 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 		}
 		const before = await captureRemoteRawSnapshot(a.client, "vault");
 		const plugin = forceUi(a);
-		const prepared = await plugin.prepareForceSync("from_local");
+		const prepared = await plugin.prepareForceSync("from_local", {
+			isCancelled: () => false,
+			password: async () => null,
+			progress: () => {},
+		});
 		assert.equal(prepared?.canonical.state, "absent");
 		assert.equal(
 			(await captureRemoteRawSnapshot(a.client, "vault")).digest,
@@ -995,7 +1006,13 @@ test("directional Force admission ignores destination maintenance without implic
 		const plugin = forceUi(a);
 		plugin.settings.enableEncryption = true;
 		plugin.settings.encryptionPassword = "synthetic-password";
-		assert.ok(await plugin.prepareForceSync("from_local"));
+		assert.ok(
+			await plugin.prepareForceSync("from_local", {
+				isCancelled: () => false,
+				password: async () => null,
+				progress: () => {},
+			}),
+		);
 		assert.deepEqual(
 			disk.files.get("vault/.obsidian-sync-index.json"),
 			raw,

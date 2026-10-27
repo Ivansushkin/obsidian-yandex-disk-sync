@@ -16,6 +16,7 @@ import {
 import type YandexDiskSyncPlugin from "./main";
 import { t } from "./i18n/index";
 import { logger } from "./utils/logger";
+import { createSyncFailure, formatOperationFailure } from "./sync/errors";
 import { BackupListModal } from "./ui/backup-list-modal";
 import { LogViewerModal } from "./ui/log-viewer-modal";
 import {
@@ -127,7 +128,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		try {
 			await this.plugin.applySettingsPatch(patch);
 		} catch (error) {
-			new Notice(error instanceof Error ? error.message : String(error));
+			if (this.plugin.isPluginUnloaded()) {
+				return;
+			}
+			new Notice(
+				formatOperationFailure(
+					createSyncFailure(error, {
+						stage: "persisting",
+						action: "local",
+					}).summary,
+				),
+			);
 			this.renderSettings();
 		}
 	}

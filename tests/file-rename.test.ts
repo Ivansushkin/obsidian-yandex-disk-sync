@@ -53,6 +53,20 @@ class RenameVaultFake {
 }
 
 class RenameYandexFake {
+	async collectLogicalMetadata(
+		...[paths, , onResource, options]: Parameters<
+			YandexDiskClient["collectLogicalMetadata"]
+		>
+	) {
+		for (const path of paths) {
+			options?.assertCurrent?.();
+			await onResource(path, await this.getLogicalResource(path), {
+				deadline: Date.now() + 60000,
+				timeoutMs: 60000,
+			});
+		}
+		options?.assertCurrent?.();
+	}
 	async withWriteGuard<T>(
 		assertCurrent: () => void,
 		action: () => Promise<T>,
@@ -124,6 +138,7 @@ class RenameYandexFake {
 			type: "file" as const,
 			size: resource.content.byteLength,
 			modified: resource.modified,
+			created: resource.modified,
 			sha256: resource.sha256,
 		};
 	}
@@ -172,6 +187,7 @@ class RenameIndexFake extends MemoryIndex {
 			return await this.readCanonicalIndex();
 		};
 		return Object.assign(read, {
+			close: () => {},
 			assertCurrent: assertActive,
 			load: read,
 		});
@@ -303,11 +319,10 @@ test("accepted upload repair revalidates canonical and encryption authority", as
 			proof,
 			revoked === "encryption" ? "old-manifest" : undefined,
 		);
-		if (revoked === "encryption") {
-			await assert.rejects(repair, /encryption state changed/i);
-		} else {
-			await repair;
-		}
+		await assert.rejects(
+			repair,
+			/canonical changed|encryption state changed/i,
+		);
 		assert.deepEqual(yandex.uploads, [], revoked);
 		assert.equal(yandex.resources.has("remote/note.md"), false, revoked);
 	}

@@ -1,5 +1,8 @@
+import { planRecursiveDeletes } from "../files/deletion-cover";
 import {
 	assertForceRecovery,
+	ForceSourceFormatError,
+	ForceScopeConflictError,
 	type ForceDirection,
 	type ForceRecovery,
 	type ForceSourceFile,
@@ -10,9 +13,16 @@ import type { EncryptionCodec } from "../../crypto/encryption";
 import { EncryptionManager } from "../../crypto/encryption-manager";
 import { parseEncryptionManifest } from "../../crypto/manifest-schema";
 import {
+	isReplacementPath,
+	isReplacementSubtree,
+	isPreservedRawPath,
+} from "../../crypto/replacement";
+import {
 	createEmptyIndex,
 	createSyncEpoch,
 	type EncryptionManifest,
+	type EncryptionReplacementScope,
+	type RecursiveDeleteAction,
 	type SyncIndex,
 	type SyncPhase,
 	type SyncResult,
@@ -26,7 +36,11 @@ import {
 	hasPortablePathCollision,
 	isForceSourcePath,
 	joinPath,
+	mayBeEncryptedPath,
 	preservesForceLocalPath,
+	shouldInspectRawSyncDirectory,
+	shouldInspectRawSyncPath,
+	shouldTraverseSyncDirectory,
 	toLocalPath,
 } from "../../utils/path-utils";
 import { createSafeRecord, setRecordValue } from "../../utils/record-utils";
@@ -40,9 +54,9 @@ export interface ForceReplacementDependencies {
 	index: IndexManager;
 	settings: YandexDiskSyncSettings;
 	persist(state: ForceRecovery | null): Promise<void>;
-	password(create: boolean): Promise<string | null>;
+	password(create: boolean, invalid?: boolean): Promise<string | null>;
+	sourceProgress?(completed: number, total: number): void;
 	isCancelled?(): boolean;
-	chooseSourceMode?(): Promise<"plaintext" | "encrypted" | null>;
 	watcherCutoff?(): string[];
 	retireWatcherEvents?(cutoff: string[]): Promise<void>;
 	expectWatcherEvent?(path: string, action: "upload" | "delete"): void;
@@ -54,7 +68,6 @@ export type ForceReplacementPorts = Pick<
 	| "persist"
 	| "password"
 	| "isCancelled"
-	| "chooseSourceMode"
 	| "watcherCutoff"
 	| "retireWatcherEvents"
 	| "getRecovery"
@@ -63,6 +76,10 @@ export interface PreparedForceReplacement {
 	recovery: ForceRecovery;
 	codec: EncryptionCodec | null;
 	password: string | null;
+	/** Ephemeral selection; persisted pending actions already freeze the admitted remainder. */
+	scope?: EncryptionReplacementScope;
+	destinationCodec?: EncryptionCodec | null;
+	destinationManifest?: EncryptionManifest | null;
 	assertConfiguration(): Promise<void>;
 }
 export interface ForceApplyResult {
@@ -75,6 +92,35 @@ export interface ForceApplyResult {
 const encryption = new EncryptionManager();
 const manifestName = ".obsidian-encrypt.json";
 const indexName = ".obsidian-sync-index.json";
+
+function traverse(path: string, scope: EncryptionReplacementScope): boolean {
+	return shouldTraverseSyncDirectory(
+		path,
+		scope.syncPatterns,
+		scope.excludePatterns,
+		scope.syncDotObsidian,
+		scope.configDir,
+	);
+}
+
+function inspectRaw(
+	path: string,
+	scope: EncryptionReplacementScope,
+	encrypted: boolean,
+	directory: boolean,
+): boolean {
+	const inspect = directory
+		? shouldInspectRawSyncDirectory
+		: shouldInspectRawSyncPath;
+	return inspect(
+		path,
+		scope.syncPatterns,
+		scope.excludePatterns,
+		scope.syncDotObsidian,
+		scope.configDir,
+		encrypted,
+	);
+}
 
 /** Allocate a replacement generation only after its destructive confirmation. */
 export function confirmForceReplacementPlan(
@@ -117,15 +163,35 @@ async function logicalPath(
 	path: string,
 	codec: EncryptionCodec | null,
 ): Promise<string> {
-	const logical = codec
-		? (
+	let logical = path;
+	if (codec) {
+		try {
+			logical = (
 				await Promise.all(
 					path.split("/").map((part) => codec.decryptFilename(part)),
 				)
-			).join("/")
-		: path;
+			).join("/");
+		} catch {
+			throw new ForceSourceFormatError();
+		}
+	}
 	assertForcePath(logical);
 	return logical;
+}
+
+/** Preserve the selected source mode; failed authentication never becomes raw plaintext. */
+async function decodeSourceContent(
+	raw: ArrayBuffer,
+	codec: EncryptionCodec | null,
+): Promise<ArrayBuffer> {
+	if (!codec) {
+		return raw;
+	}
+	try {
+		return await codec.decrypt(raw);
+	} catch {
+		throw new ForceSourceFormatError();
+	}
 }
 
 /** Prove every selected source is readable before any destination deletion. */
@@ -137,17 +203,35 @@ async function scanSource(
 	const direct = state.direct!;
 	const source: ForceSourceFile[] = [];
 	const directories: { path: string; rawPath: string }[] = [];
+	await plan.assertConfiguration();
+	let completed = 0;
 	if (state.direction === "from_local") {
-		const tree = await deps.adapter.getForceTree(true);
+		const tree = await deps.adapter.getForceTree(
+			true,
+			(path, directory) =>
+				!plan.scope ||
+				(directory
+					? traverse(path, plan.scope)
+					: isReplacementPath(path, plan.scope)),
+		);
+		const total = tree.directories.length + tree.files.length;
+		deps.sourceProgress?.(0, total);
 		for (const path of tree.directories) {
+			await plan.assertConfiguration();
+			if (plan.scope && !isReplacementPath(path, plan.scope)) {
+				deps.sourceProgress?.(++completed, total);
+				continue;
+			}
 			directories.push({
 				path,
 				rawPath: await physicalPath(path, plan.codec),
 			});
+			deps.sourceProgress?.(++completed, total);
 		}
 		for (const path of tree.files) {
 			await plan.assertConfiguration();
 			const content = await deps.adapter.readForceFile(path);
+			await plan.assertConfiguration();
 			const stat = await deps.adapter.vault.adapter.stat(path);
 			if (!stat || stat.type !== "file") {
 				throw new Error("Force local source became unavailable");
@@ -160,6 +244,7 @@ async function scanSource(
 				mtime: stat.mtime,
 				fingerprint: null,
 			});
+			deps.sourceProgress?.(++completed, total);
 		}
 	} else {
 		const resources = await deps.client.getResourcesRecursive(
@@ -167,19 +252,52 @@ async function scanSource(
 			true,
 			4,
 			true,
-			(raw) =>
-				isForceSourcePath(
-					toLocalPath(raw, state.remotePath),
-					direct.configDir,
-				),
+			(raw, kind) => {
+				const path = toLocalPath(raw, state.remotePath);
+				return (
+					isForceSourcePath(path, direct.configDir) &&
+					(!plan.scope ||
+						inspectRaw(
+							path,
+							plan.scope,
+							!!plan.codec,
+							kind === "dir",
+						))
+				);
+			},
 			false,
 		);
+		deps.sourceProgress?.(0, resources.length);
+		const excluded = new Set<string>();
 		for (const resource of resources) {
 			await plan.assertConfiguration();
 			const rawPath = toLocalPath(resource.path, state.remotePath);
 			assertForcePath(rawPath);
+			if (
+				isPreservedRawPath(rawPath, [...excluded]) ||
+				(plan.scope &&
+					!inspectRaw(
+						rawPath,
+						plan.scope,
+						!!plan.codec,
+						resource.type === "dir",
+					))
+			) {
+				deps.sourceProgress?.(++completed, resources.length);
+				continue;
+			}
 			const path = await logicalPath(rawPath, plan.codec);
-			if (!isForceSourcePath(path, direct.configDir)) {
+			if (
+				!isForceSourcePath(path, direct.configDir) ||
+				(plan.scope &&
+					(resource.type === "dir"
+						? !traverse(path, plan.scope)
+						: !isReplacementPath(path, plan.scope)))
+			) {
+				if (resource.type === "dir") {
+					excluded.add(rawPath);
+				}
+				deps.sourceProgress?.(++completed, resources.length);
 				continue;
 			}
 			if (
@@ -192,18 +310,21 @@ async function scanSource(
 				);
 			}
 			if (resource.type === "dir") {
-				directories.push({ path, rawPath });
+				if (!plan.scope || isReplacementPath(path, plan.scope)) {
+					directories.push({ path, rawPath });
+				}
+				deps.sourceProgress?.(++completed, resources.length);
 				continue;
 			}
+			await plan.assertConfiguration();
 			const snapshot = await deps.client.downloadStableRawFile(
 				joinPath(state.remotePath, rawPath),
 			);
+			await plan.assertConfiguration();
 			if (!snapshot) {
 				throw new Error("Force remote source became unavailable");
 			}
-			const content = plan.codec
-				? await plan.codec.decrypt(snapshot.raw)
-				: snapshot.raw;
+			const content = await decodeSourceContent(snapshot.raw, plan.codec);
 			source.push({
 				path,
 				rawPath,
@@ -212,6 +333,7 @@ async function scanSource(
 				mtime: Date.parse(snapshot.resource.modified),
 				fingerprint: snapshot.fingerprint,
 			});
+			deps.sourceProgress?.(++completed, resources.length);
 		}
 	}
 	source.sort((a, b) => a.path.localeCompare(b.path));
@@ -223,6 +345,7 @@ async function scanSource(
 	) {
 		throw new Error("Force source has ambiguous portable paths");
 	}
+	await plan.assertConfiguration();
 	state.source = source;
 	state.sourceDigest = await digestSource(source);
 	direct.directories = directories.sort((a, b) =>
@@ -241,73 +364,77 @@ export async function prepareForceReplacement(
 	const remotePath = deps.settings.remotePath;
 	assertForcePath(remotePath.replace(/^disk:\//, ""));
 	const token = deps.settings.yandexTokenSecret;
+	if (deps.isCancelled?.()) {
+		return null;
+	}
 	const root = await deps.client.getResource(remotePath, 1, 0, true);
+	if (deps.isCancelled?.()) {
+		return null;
+	}
 	if (direction === "from_remote" && !root) {
 		throw new Error("Force remote source is unavailable");
 	}
 	if (root && root.type !== "dir") {
 		throw new Error("Force storage root is not a folder");
 	}
-	let codec: EncryptionCodec | null = null;
-	let manifest: EncryptionManifest | null = null;
+	const scope: EncryptionReplacementScope = {
+		syncPatterns: [...deps.settings.syncPatterns],
+		excludePatterns: [...deps.settings.excludePatterns],
+		syncDotObsidian: deps.settings.syncDotObsidian,
+		configDir: deps.adapter.vault.configDir,
+	};
+	const destinationManifest = await deps.index.downloadEncryptionManifest();
+	let destinationCodec: EncryptionCodec | null = null;
 	let password = deps.settings.encryptionPassword;
-	if (direction === "from_local" && deps.settings.enableEncryption) {
-		password ||= await deps.password(true);
-		if (!password) {
-			return null;
-		}
-		const { snapshot } = encryption.createTargetSnapshot(
-			password,
-			(deps.settings.encryptionRevision ?? 0) + 1,
-		);
-		codec = await encryption.createCodec(
-			"hardened",
-			snapshot.salt!,
-			password,
-		);
-		manifest = await encryption.createManifest({
-			service: codec,
-			salt: snapshot.salt!,
-			revision: snapshot.revision!,
-			state: "enabled",
-			deviceId: deps.settings.deviceId,
-		});
-	} else if (direction === "from_remote") {
-		const resources = await deps.client.getRawChildren(remotePath);
-		const hasUserData = resources.some((entry) =>
-			isForceSourcePath(
-				toLocalPath(entry.path, remotePath),
-				deps.adapter.vault.configDir,
-			),
-		);
-		let manifestError: unknown;
-		let remoteManifest: Awaited<
-			ReturnType<IndexManager["downloadEncryptionManifest"]>
-		> = null;
-		try {
-			remoteManifest = await deps.index.downloadEncryptionManifest();
-		} catch (error) {
-			manifestError = error;
-		}
-		let encrypted = remoteManifest !== null;
-		if (!remoteManifest && hasUserData) {
-			const choice = await deps.chooseSourceMode?.();
-			if (choice === null) {
+	if (destinationManifest) {
+		let invalid = false;
+		while (true) {
+			if (deps.isCancelled?.()) {
 				return null;
 			}
-			if (!choice) {
-				throw manifestError instanceof Error
-					? manifestError
-					: new Error(
-							"Choose the readable Force source format: plaintext or encrypted",
-						);
+			if (password) {
+				destinationCodec = await encryption.createCodec(
+					"hardened",
+					destinationManifest.salt,
+					password,
+				);
+				if (
+					await encryption.verifyCandidate(
+						destinationCodec,
+						destinationManifest.verifier,
+					)
+				) {
+					break;
+				}
+				invalid = true;
 			}
-			encrypted = choice === "encrypted";
-		} else if (
-			!hasUserData &&
-			!remoteManifest &&
-			deps.settings.enableEncryption
-		) {
+			password = await deps.password(false, invalid);
+			if (!password) {
+				return null;
+			}
+		}
+	}
+	let codec: EncryptionCodec | null = null;
+	let manifest: EncryptionManifest | null = null;
+	const encryptedOutput =
+		direction === "from_remote"
+			? !!destinationManifest
+			: deps.settings.enableEncryption;
+	if (encryptedOutput) {
+		if (destinationManifest) {
+			codec = destinationCodec;
+			manifest =
+				destinationManifest.state === "enabled" &&
+				!destinationManifest.transition
+					? destinationManifest
+					: await encryption.createManifest({
+							service: codec!,
+							salt: destinationManifest.salt,
+							revision: destinationManifest.revision,
+							state: "enabled",
+							deviceId: deps.settings.deviceId,
+						});
+		} else {
 			password ||= await deps.password(true);
 			if (!password) {
 				return null;
@@ -328,60 +455,6 @@ export async function prepareForceReplacement(
 				state: "enabled",
 				deviceId: deps.settings.deviceId,
 			});
-		}
-		if (encrypted) {
-			const salt = remoteManifest?.salt ?? deps.settings.encryptionSalt;
-			const profile =
-				remoteManifest?.profileId ?? deps.settings.encryptionProfileId;
-			if (!salt || profile !== "hardened") {
-				throw new Error(
-					"Encrypted Force source requires its salt/profile; a password alone cannot restore it",
-				);
-			}
-			password ||= await deps.password(false);
-			if (!password) {
-				return null;
-			}
-			codec = await encryption.createCodec("hardened", salt, password);
-			if (
-				remoteManifest &&
-				!(await encryption.verifyCandidate(
-					codec,
-					remoteManifest.verifier,
-				))
-			) {
-				password = await deps.password(false);
-				if (!password) {
-					return null;
-				}
-				codec = await encryption.createCodec(
-					"hardened",
-					salt,
-					password,
-				);
-				if (
-					!(await encryption.verifyCandidate(
-						codec,
-						remoteManifest.verifier,
-					))
-				) {
-					throw new Error("Wrong Force source encryption password");
-				}
-			}
-			manifest =
-				remoteManifest?.state === "enabled" &&
-				!remoteManifest.transition
-					? remoteManifest
-					: await encryption.createManifest({
-							service: codec,
-							salt,
-							revision:
-								remoteManifest?.revision ??
-								deps.settings.encryptionRevision ??
-								1,
-							state: "enabled",
-							deviceId: deps.settings.deviceId,
-						});
 		}
 	}
 	const recovery: ForceRecovery = {
@@ -429,18 +502,27 @@ export async function prepareForceReplacement(
 		recovery,
 		codec,
 		password: codec ? password : null,
+		scope,
+		destinationCodec,
+		destinationManifest,
 		assertConfiguration: async () => {
 			if (
 				deps.isCancelled?.() ||
 				deps.settings.remotePath !== remotePath ||
 				deps.settings.yandexTokenSecret !== token ||
-				deps.adapter.vault.configDir !== recovery.direct!.configDir
+				deps.adapter.vault.configDir !== recovery.direct!.configDir ||
+				JSON.stringify(deps.settings.syncPatterns) !==
+					JSON.stringify(scope.syncPatterns) ||
+				JSON.stringify(deps.settings.excludePatterns) !==
+					JSON.stringify(scope.excludePatterns) ||
+				deps.settings.syncDotObsidian !== scope.syncDotObsidian
 			) {
 				throw new Error("Force connection changed or plugin unloaded");
 			}
 		},
 	};
 	await scanSource(deps, plan);
+	await prepareDeletion(deps, plan);
 	return plan;
 }
 
@@ -545,27 +627,173 @@ function forceIndex(
 	return index;
 }
 
+/** Freeze selected deletes while retaining every excluded or protected descendant. */
+async function prepareScopedDeletion(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+): Promise<void> {
+	const state = plan.recovery;
+	const scope = plan.scope!;
+	const local = state.direction === "from_remote";
+	const codec = local ? null : (plan.destinationCodec ?? null);
+	const preserved = new Set<string>();
+	let preservedEncrypted = false;
+	let entries: RecursiveDeleteAction[];
+	if (local) {
+		const tree = await deps.adapter.getForceTree(false);
+		entries = [
+			...tree.files.map((path) => ({ path, kind: "file" as const })),
+			...tree.directories.map((path) => ({ path, kind: "dir" as const })),
+		];
+	} else {
+		const resources = await deps.client.getResourcesRecursive(
+			state.remotePath,
+			true,
+			4,
+			true,
+			(raw, kind) => {
+				const path = toLocalPath(raw, state.remotePath);
+				const inspect =
+					isForceSourcePath(path, scope.configDir) &&
+					inspectRaw(path, scope, !!codec, kind === "dir");
+				if (!inspect) {
+					preserved.add(path);
+					preservedEncrypted ||= !!codec && mayBeEncryptedPath(path);
+				}
+				return inspect;
+			},
+		);
+		entries = resources.map((entry) => ({
+			path: toLocalPath(entry.path, state.remotePath),
+			kind: entry.type,
+		}));
+	}
+	const removable = new Set<string>();
+	const collapsible = new Set<string>();
+	const logicalEntries = new Map<string, RecursiveDeleteAction>();
+	for (const entry of [...entries].sort((a, b) =>
+		a.path.localeCompare(b.path),
+	)) {
+		await plan.assertConfiguration();
+		if (isPreservedRawPath(entry.path, [...preserved])) {
+			continue;
+		}
+		const path = await logicalPath(entry.path, codec);
+		logicalEntries.set(path, entry);
+		const selected =
+			isForceSourcePath(path, scope.configDir) &&
+			isReplacementPath(path, scope);
+		if (
+			(entry.kind === "file" && !selected) ||
+			(entry.kind === "dir" &&
+				(!isForceSourcePath(path, scope.configDir) ||
+					!traverse(path, scope)))
+		) {
+			preserved.add(entry.path);
+			preservedEncrypted ||= !!codec;
+			continue;
+		}
+		if (selected) {
+			removable.add(entry.path);
+		}
+		if (
+			entry.kind === "dir" &&
+			isReplacementSubtree(path, scope) &&
+			!containsForceLocalPreservedPath(path, scope.configDir)
+		) {
+			collapsible.add(entry.path);
+		}
+	}
+	if (preservedEncrypted && !plan.codec) {
+		throw new ForceScopeConflictError();
+	}
+	// A selected file must not recursively replace a directory holding excluded data.
+	for (const file of [
+		...state.source.map((file) => ({ ...file, kind: "file" })),
+		...state.direct!.directories.map((folder) => ({
+			...folder,
+			kind: "dir",
+		})),
+	]) {
+		const targetPath = local ? file.path : file.rawPath;
+		if (
+			[...preserved].some(
+				(path) =>
+					targetPath === path ||
+					targetPath.startsWith(`${path}/`) ||
+					(file.kind === "file" && path.startsWith(`${targetPath}/`)),
+			)
+		) {
+			throw new ForceScopeConflictError();
+		}
+		const target = logicalEntries.get(file.path);
+		if (
+			file.kind === "file" &&
+			target?.kind === "dir" &&
+			(!collapsible.has(target.path) ||
+				[...preserved].some((path) =>
+					path.startsWith(`${target.path}/`),
+				))
+		) {
+			throw new ForceScopeConflictError();
+		}
+		for (
+			let parent = getDirectory(file.path);
+			parent;
+			parent = getDirectory(parent)
+		) {
+			const blocker = logicalEntries.get(parent);
+			if (blocker?.kind === "file" && !removable.has(blocker.path)) {
+				throw new ForceScopeConflictError();
+			}
+		}
+	}
+	state.direct!.pendingDeletes = planRecursiveDeletes(
+		entries,
+		removable,
+		preserved,
+		(path) => collapsible.has(path),
+	).map((entry) => ({ ...entry, location: local ? "local" : "remote" }));
+	{
+		state.direct!.pendingDeletes.push(
+			...(await deps.client.getRawChildren(state.remotePath))
+				.filter((entry) =>
+					toLocalPath(entry.path, state.remotePath).startsWith(
+						".obsidian-sync-index.lock.",
+					),
+				)
+				.map((entry) => ({
+					path: toLocalPath(entry.path, state.remotePath),
+					location: "remote" as const,
+					kind: entry.type,
+				})),
+		);
+	}
+}
+
 /** Inventory deletion targets once; subsequent sync retries never restart the broad purge. */
 async function prepareDeletion(
 	deps: ForceReplacementDependencies,
-	state: ForceRecovery,
+	plan: PreparedForceReplacement,
 ): Promise<void> {
+	const state = plan.recovery;
 	const direct = state.direct!;
+	if (plan.scope) {
+		await prepareScopedDeletion(deps, plan);
+		return;
+	}
 	if (state.direction === "from_local") {
-		direct.pendingDeletes = (
+		const entries = (
 			await deps.client.getRawChildren(state.remotePath)
-		)
-			.filter(
-				(entry) =>
-					![".backup", indexName, manifestName].includes(
-						toLocalPath(entry.path, state.remotePath),
-					),
-			)
-			.map((entry) => ({
-				path: toLocalPath(entry.path, state.remotePath),
-				location: "remote",
-				kind: entry.type,
-			}));
+		).map((entry) => ({
+			path: toLocalPath(entry.path, state.remotePath),
+			kind: entry.type,
+		}));
+		direct.pendingDeletes = planRecursiveDeletes(
+			entries,
+			new Set(entries.map((entry) => entry.path)),
+			new Set([".backup", indexName, manifestName]),
+		).map((entry) => ({ ...entry, location: "remote" }));
 	} else {
 		const tree = await deps.adapter.getForceTree(false);
 		const directories = tree.directories.filter(
@@ -677,12 +905,7 @@ async function ensureRemoteDirectory(
 		current = joinPath(current, segment);
 		const resource = await deps.client.getResource(current, 1, 0, true);
 		if (resource?.type === "file") {
-			await deps.client.deleteResource(
-				current,
-				true,
-				true,
-				beforeMutation,
-			);
+			throw new ForceScopeConflictError();
 		}
 		await beforeMutation();
 		await deps.client.createFolder(current);
@@ -735,9 +958,7 @@ async function transferFile(
 			);
 		}
 		if ((await deps.client.getResource(path, 1, 0, true))?.type === "dir") {
-			await deps.client.deleteResource(path, true, true, () =>
-				plan.assertConfiguration(),
-			);
+			throw new ForceScopeConflictError();
 		}
 		let uploadError: unknown;
 		try {
@@ -764,9 +985,7 @@ async function transferFile(
 		if (!source) {
 			throw new Error("Force remote source is no longer readable");
 		}
-		content = plan.codec
-			? await plan.codec.decrypt(source.raw)
-			: source.raw;
+		content = await decodeSourceContent(source.raw, plan.codec);
 		resource = source.resource;
 		deps.expectWatcherEvent?.(file.path, "upload");
 		await deps.adapter.writeForceFile(file.path, content, () =>
@@ -819,6 +1038,44 @@ async function finishForceReplacement(
 	await deps.persist(null);
 }
 
+/** Revalidate the selected source mode before and after its final read-only scan. */
+async function assertSourceEncryptionCurrent(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+): Promise<void> {
+	if (plan.recovery.direction !== "from_remote") {
+		if (plan.scope) {
+			const current = await deps.index.downloadEncryptionManifest();
+			await plan.assertConfiguration();
+			if (
+				JSON.stringify(current) !==
+				JSON.stringify(plan.destinationManifest)
+			) {
+				throw new Error(
+					"Force destination encryption changed during preparation",
+				);
+			}
+		}
+		return;
+	}
+	const manifest = await deps.index.downloadEncryptionManifest();
+	await plan.assertConfiguration();
+	const target = plan.recovery.target;
+	if (
+		Boolean(manifest) !== target.enabled ||
+		(manifest &&
+			(manifest.salt !== target.salt ||
+				manifest.revision !== target.revision ||
+				!plan.codec ||
+				!(await encryption.verifyCandidate(
+					plan.codec,
+					manifest.verifier,
+				))))
+	) {
+		throw new Error("Force source encryption changed after preparation");
+	}
+}
+
 /** Attempt all independent deletes and transfers, keeping only unfinished work for ordinary sync. */
 export async function applyForceReplacement(
 	deps: ForceReplacementDependencies,
@@ -862,7 +1119,9 @@ export async function applyForceReplacement(
 		return result;
 	}
 	if (state.phase === "prepared") {
+		await assertSourceEncryptionCurrent(deps, plan);
 		await scanSource(deps, plan);
+		await assertSourceEncryptionCurrent(deps, plan);
 		if (choice === "with-backup") {
 			const proof = state.backupProof;
 			if (!proof) {
@@ -884,7 +1143,7 @@ export async function applyForceReplacement(
 		}
 		state.backupMode = choice;
 		await ensureForceRoot(deps, plan);
-		await prepareDeletion(deps, state);
+		await prepareDeletion(deps, plan);
 		state.phase = "applying";
 		await deps.persist(state);
 	}

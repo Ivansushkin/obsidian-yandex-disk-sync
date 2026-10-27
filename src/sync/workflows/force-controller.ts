@@ -32,6 +32,7 @@ export interface ForceFlowState {
 	active: boolean;
 	phase: ForcePhase;
 	activity?: SyncState;
+	sourceProgress?: { completed: number; total: number };
 	outcome?: ForceOutcome;
 	errorCode?: string;
 	failure?: FailureSummary;
@@ -40,9 +41,23 @@ export interface ForceFlowState {
 	direct?: boolean;
 }
 
+/** Read-only preparation capabilities scoped to one reserved Force invocation. */
+export interface ForcePreparationContext {
+	isCancelled(): boolean;
+	password(create: boolean, invalid?: boolean): Promise<string | null>;
+	progress(completed: number, total: number): void;
+}
+
 export interface ForceSyncDependencies {
+	open?(direction: ForceDirection): void;
+	close?(): void;
+	password?(create: boolean, invalid?: boolean): Promise<string | null>;
+	retryPreparation?(failure: FailureSummary): Promise<boolean>;
 	isSyncBusy(): boolean;
-	preflight(direction: ForceDirection): Promise<{
+	preflight(
+		direction: ForceDirection,
+		preparation: ForcePreparationContext,
+	): Promise<{
 		replacement?: NonNullable<SyncRunOptions["forceReplacement"]>;
 		canonical: ForcePreflightProof["canonical"];
 		migration: boolean;
@@ -85,6 +100,7 @@ export interface ForceSyncDependencies {
 export class ForceSyncController {
 	private state: ForceFlowState | null = null;
 	private sequence = 0;
+	private cancelRequested = false;
 	private running: Promise<void> | null = null;
 	private listeners = new Set<(state: ForceFlowState) => void>();
 
@@ -103,7 +119,21 @@ export class ForceSyncController {
 		return () => this.listeners.delete(listener);
 	}
 
+	/** Cancellation joins admitted reads/archive work; a confirmed replacement can only be hidden. */
+	cancel(): boolean {
+		if (
+			!this.isBusy() ||
+			["syncing", "persisting", "reconciling"].includes(this.state!.phase)
+		) {
+			return false;
+		}
+		this.cancelRequested = true;
+		return true;
+	}
+
 	dispose(): void {
+		this.cancel();
+		this.deps.close?.();
 		this.listeners.clear();
 	}
 
@@ -123,6 +153,8 @@ export class ForceSyncController {
 			return;
 		}
 		const id = ++this.sequence;
+		this.cancelRequested = false;
+		const isCancelled = () => this.cancelRequested || this.state?.id !== id;
 		this.state = {
 			id,
 			direction,
@@ -144,7 +176,11 @@ export class ForceSyncController {
 			}
 		};
 		const phase = (value: ForcePhase) =>
-			update({ phase: value, activity: undefined });
+			update({
+				phase: value,
+				activity: undefined,
+				sourceProgress: undefined,
+			});
 		let committed = false;
 		const startedAt = Date.now();
 		const fail = (error: unknown, outcome: ForceOutcome) => {
@@ -179,8 +215,56 @@ export class ForceSyncController {
 			});
 		};
 		try {
+			this.deps.open?.(direction);
 			update({});
-			const prepared = await this.deps.preflight(direction);
+			let prepared: Awaited<
+				ReturnType<ForceSyncDependencies["preflight"]>
+			> = null;
+			while (!isCancelled()) {
+				try {
+					prepared = await this.deps.preflight(direction, {
+						isCancelled,
+						password: (create, invalid) =>
+							this.deps.password?.(create, invalid) ??
+							Promise.resolve(null),
+						progress: (completed, total) =>
+							update({ sourceProgress: { completed, total } }),
+					});
+					break;
+				} catch (error) {
+					if (isCancelled()) {
+						break;
+					}
+					const failure = createSyncFailure(error, {
+						stage: "preflight",
+						action: "read",
+						outcome: "stopped-before-write",
+					}).summary;
+					update({
+						failure,
+						errorCode: failure.code,
+						sourceProgress: undefined,
+					});
+					if (
+						!this.deps.retryPreparation ||
+						!(await this.deps.retryPreparation(failure))
+					) {
+						if (!isCancelled()) {
+							throw error;
+						}
+						break;
+					}
+					update({
+						sourceProgress: undefined,
+						failure: undefined,
+						errorCode: undefined,
+					});
+				}
+			}
+			if (isCancelled()) {
+				update({ outcome: "cancelled" });
+				return;
+			}
 			if (!prepared) {
 				update({ outcome: "blocked" });
 				return;
@@ -193,8 +277,16 @@ export class ForceSyncController {
 				const archiveWork: { pending: Promise<void> | null } = {
 					pending: null,
 				};
+				const assertArchiveActive = () => {
+					if (isCancelled()) {
+						throw new Error(
+							"Force archive was cancelled before replacement",
+						);
+					}
+				};
 				const createArchive = async () => {
 					try {
+						assertArchiveActive();
 						if (
 							!(await this.deps.readyForBackup(
 								false,
@@ -205,9 +297,11 @@ export class ForceSyncController {
 								"Force archive destination is unavailable",
 							);
 						}
+						assertArchiveActive();
 						phase("protected-snapshot");
 						const snapshotDigest =
 							await this.deps.captureProtectedSnapshot(direction);
+						assertArchiveActive();
 						phase("creating-backup");
 						const backup = await this.deps.backup(
 							direction,
@@ -228,6 +322,7 @@ export class ForceSyncController {
 								)
 							);
 						}
+						assertArchiveActive();
 						replacement.plan.recovery.backupProof = {
 							name: backup.backupName,
 							sha256: backup.sha256,
@@ -263,7 +358,7 @@ export class ForceSyncController {
 					// Closing confirmation cancels replacement, but cannot release an active archive scope.
 					await archiveWork.pending?.catch(() => {});
 				}
-				if (choice === "cancel") {
+				if (choice === "cancel" || isCancelled()) {
 					update({ outcome: "cancelled" });
 					return;
 				}
@@ -272,6 +367,10 @@ export class ForceSyncController {
 					!replacement.plan.recovery.backupProof
 				) {
 					await prepareArchive();
+				}
+				if (isCancelled()) {
+					update({ outcome: "cancelled" });
+					return;
 				}
 				confirmForceReplacementPlan(replacement.plan);
 				phase("syncing");
@@ -310,7 +409,7 @@ export class ForceSyncController {
 						prepared.migration,
 						prepared.replacement,
 					);
-			if (choice === "cancel") {
+			if (choice === "cancel" || isCancelled()) {
 				update({ outcome: "cancelled" });
 				return;
 			}
@@ -485,7 +584,11 @@ export class ForceSyncController {
 					result.uploaded + result.downloaded + result.deleted,
 			});
 		} catch (error) {
-			fail(error, committed ? "cleanup-pending" : "failed");
+			if (isCancelled()) {
+				update({ outcome: "cancelled" });
+			} else {
+				fail(error, committed ? "cleanup-pending" : "failed");
+			}
 		} finally {
 			update({ active: false });
 		}

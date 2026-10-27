@@ -173,10 +173,42 @@ export type RemoteEncryptionManifest = EncryptionManifest;
 
 export const CURRENT_INDEX_FORMAT = "sync-index" as const;
 
+/** Frozen user selection; replacement never widens ordinary sync filters. */
+export interface EncryptionReplacementScope {
+	syncPatterns: string[];
+	excludePatterns: string[];
+	syncDotObsidian: boolean;
+	configDir: string;
+}
+
+/** One raw subtree or uncovered file, never the storage root. */
+export interface RecursiveDeleteAction {
+	path: string;
+	kind: "file" | "dir";
+}
+
+/** Durable authority understood without the obsolete encryption key. */
+export interface EncryptionReplacement {
+	sourceEpoch: string;
+	targetEpoch: string;
+	scope: EncryptionReplacementScope;
+	preservedRawPaths: string[];
+	deletions: RecursiveDeleteAction[];
+}
+
+/** Survives maintenance so offline devices cannot replay the discarded epoch. */
+export interface EncryptionEpochAdoption {
+	kind: "encryption-replacement";
+	operationId: string;
+	initiatedBy: string;
+	scope: EncryptionReplacementScope;
+	preservedRawPaths: string[];
+}
+
 export interface SyncIndex {
 	/** Stable artifact marker; causal revisions are stored separately. */
 	format: typeof CURRENT_INDEX_FORMAT;
-	/** Causal history generation replaced only by an explicit Force sync */
+	/** Causal generation replaced by explicit Force or authoritative encryption */
 	epoch: string;
 	/** Monotonic revision of the authoritative remote index */
 	revision: number;
@@ -194,6 +226,7 @@ export interface SyncIndex {
 	appliedMutationSeq: Record<string, number>;
 	/** Distributed encryption maintenance owned through the index transaction */
 	maintenance?: IndexMaintenance;
+	epochAdoption?: EncryptionEpochAdoption;
 }
 
 export interface IndexMaintenanceCleanupAction {
@@ -222,6 +255,8 @@ export interface EncryptionIndexMaintenance {
 	target: EncryptionModeDescriptor;
 	/** Guarded cleanup work that any target-capable device may resume */
 	cleanup: IndexMaintenanceCleanupAction[];
+	/** Absent on historical guarded transitions; never inferred on load. */
+	replacement?: EncryptionReplacement;
 }
 
 /** Explicit replacement authority, independent from encryption transitions. */

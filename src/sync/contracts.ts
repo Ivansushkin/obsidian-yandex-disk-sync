@@ -25,6 +25,7 @@ export type SyncGuardCallback = (
 ) => SyncGuardResult | Promise<SyncGuardResult>;
 
 export type ExternalSyncBlockKind =
+	| "persistence"
 	| "local-state"
 	| "force"
 	| "migration"
@@ -73,6 +74,8 @@ export interface SyncRunOptions {
 	 * operation, avoiding race conditions from concurrent folder deletions.
 	 */
 	skipRemoteDeletes?: boolean;
+	/** Only a locally confirmed replacement may overwrite competing target bytes. */
+	authoritativeEncryption?: boolean;
 	/** Run after all target files are uploaded and before the canonical commit. */
 	beforeIndexCommit?: () => void | Promise<void>;
 	/** Prove one rewritten target object before it can enter canonical state. */

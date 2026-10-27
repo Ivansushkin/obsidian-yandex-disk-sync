@@ -808,6 +808,7 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 		"missing-proof",
 		"remaining",
 		"lost-response",
+		"guard-absent",
 	] as const) {
 		const manager = new IndexManager(
 			{} as YandexDiskClient,
@@ -832,13 +833,30 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 			}),
 		);
 		let canonical = structuredClone(index);
-		manager.readCanonicalIndex = async () => structuredClone(canonical);
+		const read = async () => structuredClone(canonical);
+		manager.readCanonicalIndex = read;
+		manager.createCanonicalReadSession = (assertCurrent = () => {}) =>
+			Object.assign(read, {
+				load: read,
+				assertCurrent,
+				close: () => {},
+			});
 		let present = true;
 		let deletes = 0;
 		let completed = false;
+		let inDeleteAttempt = false;
 		const client = {
+			getReadConfigurationVersion: () => 0,
+			withWriteGuard: async (
+				_assertCurrent: () => void,
+				action: () => Promise<void>,
+			) => await action(),
 			getPhysicalPath: async (path: string) => path,
 			getResource: async () => {
+				if (mode === "guard-absent" && inDeleteAttempt) {
+					present = false;
+					throw new Error("synthetic guard rejected");
+				}
 				if (mode === "revoked") {
 					canonical = createEmptyIndex("B", "E1");
 					canonical.files["note.md"] = fileMetadata("note.md", {
@@ -855,7 +873,12 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 				_raw: boolean,
 				guard: () => Promise<void>,
 			) => {
-				await guard();
+				inDeleteAttempt = true;
+				try {
+					await guard();
+				} finally {
+					inDeleteAttempt = false;
+				}
 				deletes++;
 				if (mode === "lost-response") {
 					present = false;
@@ -865,11 +888,12 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 		} as unknown as YandexDiskClient;
 		const controller = new EncryptionTransitionController(
 			manager,
-			{} as SyncEngine,
+			{ createReadLifetimeGuard: () => () => {} } as SyncEngine,
 			createLifecycle(),
 			{
 				client,
 				getRemotePath: () => "vault",
+				getConcurrency: () => 1,
 				completeAction: () => {
 					completed = true;
 				},
@@ -885,11 +909,14 @@ test("cleanup rechecks canonical ownership and retains ambiguous deletion for re
 		} else {
 			await assert.rejects(
 				run,
-				/authority changed|timeout|target changed|no longer authorized/,
+				/authority changed|timeout|target changed|no longer authorized|guard rejected/,
 			);
 		}
 		assert.equal(completed, mode === "lost-response");
-		assert.equal(present, mode !== "lost-response");
+		assert.equal(
+			present,
+			mode !== "lost-response" && mode !== "guard-absent",
+		);
 		assert.equal(
 			deletes,
 			mode === "remaining" || mode === "lost-response" ? 1 : 0,

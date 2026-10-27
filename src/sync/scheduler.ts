@@ -23,7 +23,14 @@ export class SyncScheduler {
 	 * Update settings
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
+		const restart =
+			this.isRunning &&
+			this.settings.syncInterval !== settings.syncInterval;
 		this.settings = settings;
+		if (restart) {
+			this.stop();
+			this.start();
+		}
 	}
 
 	/**

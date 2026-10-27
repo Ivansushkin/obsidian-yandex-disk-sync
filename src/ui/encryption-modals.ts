@@ -97,7 +97,7 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 					.setButtonText(t("modal.cancel_button"))
 					.onClick(() => this.cancel()),
 			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
+		setting.settingEl.addClass("sync-modal-actions");
 	}
 
 	protected cancel(): void {
@@ -163,7 +163,7 @@ export class DisableEncryptionModal extends ResolvableModal<boolean> {
 					this.close();
 				}),
 			);
-		setting.settingEl.addClass("force-sync-modal-buttons");
+		setting.settingEl.addClass("sync-modal-actions");
 	}
 }
 

@@ -1,4 +1,5 @@
 import type { LocalEncryptionTransition } from "./crypto/encryption-transition";
+import { OperationFailure, type FailureSummary } from "./errors";
 import {
 	loadPluginDataWithSource,
 	PLUGIN_DATA_FORMAT,
@@ -40,7 +41,7 @@ interface PersistencePorts {
 	snapshot(): PluginData;
 	publish(patch: UserSettingsPatch): void;
 	isUnloaded(): boolean;
-	failed(): void;
+	failed(failure: FailureSummary): void;
 }
 
 /** Own the single device snapshot queue and invalidate stale work before reload. */
@@ -49,6 +50,8 @@ export class PluginPersistence {
 	private generation = 0;
 	private loaded = false;
 	private saveFailed = false;
+	private saveFailure: FailureSummary | undefined;
+	private failureGeneration = 0;
 	private data: PluginData | null = null;
 
 	constructor(private readonly ports: PersistencePorts) {}
@@ -58,6 +61,19 @@ export class PluginPersistence {
 	}
 	get failed(): boolean {
 		return this.saveFailed;
+	}
+	get failure(): FailureSummary | undefined {
+		return this.saveFailure;
+	}
+	get recoveryGeneration(): number | undefined {
+		return this.saveFailure ? this.failureGeneration : undefined;
+	}
+
+	/** Retire a repaired failure only after reconciliation of that exact generation. */
+	completeRecovery(generation: number): void {
+		if (!this.saveFailed && generation === this.failureGeneration) {
+			this.saveFailure = undefined;
+		}
 	}
 	get canSaveOnUnload(): boolean {
 		return this.loaded && !this.saveFailed;
@@ -99,6 +115,7 @@ export class PluginPersistence {
 			await this.persist();
 			this.assertGeneration(generation);
 			this.saveFailed = false;
+			this.saveFailure = undefined;
 		} catch (error) {
 			if (generation === this.generation) {
 				this.loaded = false;
@@ -124,6 +141,9 @@ export class PluginPersistence {
 			}
 			this.requireLoaded();
 			this.assertGeneration(generation);
+			if (patch && this.ports.isUnloaded()) {
+				throw new Error("Plugin was unloaded before settings save");
+			}
 			const current = this.ports.snapshot();
 			if (patch) {
 				current.settings = prepareSettingsPatch(
@@ -138,13 +158,26 @@ export class PluginPersistence {
 			} catch (error) {
 				if (generation === this.generation) {
 					this.saveFailed = true;
-					this.ports.failed();
+					this.failureGeneration++;
+					this.saveFailure = new OperationFailure(
+						error,
+						{
+							stage: "persisting",
+							action: "local",
+							outcome: "unknown",
+						},
+						{ category: "local", code: "local-persistence" },
+					).summary;
+					this.ports.failed(this.saveFailure);
 				}
 				throw error;
 			}
 			this.assertGeneration(generation);
 			this.data = snapshot;
 			if (patch) {
+				if (this.ports.isUnloaded()) {
+					throw new Error("Plugin was unloaded during settings save");
+				}
 				this.ports.publish(patch);
 				this.saveFailed = false;
 			}

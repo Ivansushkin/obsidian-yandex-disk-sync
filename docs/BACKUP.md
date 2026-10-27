@@ -86,18 +86,23 @@ Password policy:
 - объект отсутствует или bytes отличаются — имя считается collision, создаётся
   новое random имя; существующий объект не перезаписывается.
 
-Force показывает один диалог с выключенным по умолчанию выбором архива.
+Force открывает один диалог до read-only проверки источника и ввода пароля.
+После проверки он показывает подтверждение с выключенным по умолчанию выбором
+архива и конкретной remote `.backup` папкой. Для Диск → локальное это полный
+локальный vault перед заменой; для локальное → Диск — прежнее содержимое Диска.
 При ошибке выбранного архива пользователь остаётся в том же диалоге: retry,
 отключить архив или cancel. Очистка до создания выбранного архива не начинается.
-Архив Force покрывает полное заменяемое дерево без обычных фильтров, кроме корневой
+Явно выбранный архив Force по-прежнему покрывает полное дерево vault без обычных фильтров, кроме корневой
 .backup и собственных credentials/state/logs плагина. Старые удалённые копии plugin
 data пропускаются без чтения, а не блокируют Force archive.
 Local → Disk сохраняет raw remote archive; Disk → local — logical local archive.
 Обычные backup/sync и encryption transitions сохраняют прежние scope/защиту.
 
-Без архива Force не скачивает старый destination ради snapshot/validation,
+Без архива Force не скачивает старое пользовательское содержимое destination ради snapshot/validation,
 не создаёт ZIP, staging, per-file protective/conflict copies или trash.
-До удаления читается источник. Direct-v1 checkpoint и новый canonical принадлежат
+До удаления читаются выбранный источник и manifest назначения, а raw metadata
+назначения классифицируются через frozen filters. Исключённые ciphertext требуют
+сохранения проверенного codec; данные архива не становятся payload Force. Direct-v1 checkpoint и новый canonical принадлежат
 существующим persistence/IndexManager; stale destination fingerprints не блокируют
 Force. Ordinary full продолжает только оставшиеся действия без нового архива.
 Старый scoped checkpoint требует нового подтверждения полного Force.
@@ -160,9 +165,8 @@ source preflight; Force архивирует только защищаемую �
 полные bytes через `captureLogicalVaultSnapshot`/`captureRemoteRawSnapshot`;
 уменьшение peak ZIP/envelope не доказано. Без архива public directed Force
 не создаёт destination-content snapshot и не вызывает digest traversal назначения.
-Проверка source и новых записанных bytes остаётся обязательной. Synthetic
-retention evidence описано в [отчёте о рефакторинге](REFACTOR_REPORT.md#что-измерено); реальный mobile heap — manual PERF-006,
-обязательный release gate.
+Проверка source и новых записанных bytes остаётся обязательной. Воспроизводимая проверка identities находится в `tests/backup-snapshot.test.ts`;
+реальный mobile heap — manual `PERF-006`, обязательный release gate.
 
 ## Проверки
 
@@ -171,4 +175,4 @@ corrupted tag/header, lost response, 409/collision, exact read-back, unique
 names, plaintext historical ZIP и fail-closed для non-envelope `.enc.zip`,
 unknown bytes и encrypted legacy names. Реальное создание, download и restore
 до/после rotate/disable входят в `SMOKE_TESTS.md` TC-08. Freshness proof Force
-проверяется в TC-07.
+проверяется в TC-07 и TC-FORCE-REPLACE-01.

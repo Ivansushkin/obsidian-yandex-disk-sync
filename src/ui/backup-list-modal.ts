@@ -72,7 +72,8 @@ export class BackupListModal extends Modal {
 			const errorEl = contentEl.createDiv({ cls: "backup-list-error" });
 			errorEl.setText(t("notice.backup_list_load_failed"));
 
-			const retryButton = contentEl.createEl("button", {
+			const actions = contentEl.createDiv({ cls: "sync-modal-actions" });
+			const retryButton = actions.createEl("button", {
 				cls: "mod-cta",
 				text: t("settings.backup_button"),
 			});

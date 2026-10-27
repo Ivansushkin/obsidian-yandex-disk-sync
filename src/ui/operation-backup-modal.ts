@@ -19,7 +19,7 @@ export class OperationBackupModal extends Modal {
 		this.contentEl.createEl("p", {
 			text: t("modal.operation_backup_description"),
 		});
-		new Setting(this.contentEl)
+		const buttons = new Setting(this.contentEl)
 			.addButton((button) =>
 				button
 					.setButtonText(t("modal.force_sync_backup_button"))
@@ -36,6 +36,7 @@ export class OperationBackupModal extends Modal {
 					.setButtonText(t("modal.cancel_button"))
 					.onClick(() => this.finish("cancel")),
 			);
+		buttons.settingEl.addClass("sync-modal-actions");
 	}
 
 	onClose(): void {

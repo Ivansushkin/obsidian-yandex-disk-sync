@@ -372,3 +372,8 @@ export class ForceRecoveryPendingError extends Error {
 		this.name = "ForceRecoveryPendingError";
 	}
 }
+
+export {
+	ForceSourceFormatError,
+	ForceScopeConflictError,
+} from "../../force-errors";

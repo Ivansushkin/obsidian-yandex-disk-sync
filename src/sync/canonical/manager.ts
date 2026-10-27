@@ -1,3 +1,4 @@
+import { isPreservedRawPath } from "../../crypto/replacement";
 import { ForceRecoveryPendingError } from "../workflows/force-state";
 /**
  * Synchronization index manager
@@ -118,6 +119,7 @@ export interface CanonicalReadSession {
 	): Promise<SyncIndex>;
 	load(allowEpochAdoption?: boolean): Promise<SyncIndex>;
 	assertCurrent(): void;
+	close(): void;
 }
 
 /** Startup service observations expire with their owning lifecycle invocation. */
@@ -128,7 +130,6 @@ export interface StartupReadSession extends CanonicalReadSession {
 		service: EncryptionCodec | null,
 	): Promise<SyncIndex | null>;
 	inspectFormat(): Promise<RemoteCanonicalFormat>;
-	close(): void;
 	bind(assertActive: () => void): void;
 }
 
@@ -203,6 +204,7 @@ export class IndexManager {
 	private transitionIndexReadService: EncryptionCodec | null | undefined;
 	private transitionIndexWriteService: EncryptionCodec | null | undefined;
 	private physicalRewriteOnNextSave = false;
+	private encryptionReplacementCommit = false;
 	private forceScope: {
 		remotePath: string;
 		rootResourceId: string | null;
@@ -673,8 +675,11 @@ export class IndexManager {
 	}
 
 	/** Allow one full reconciliation to commit against a replacement epoch. */
-	beginEpochAdoption(epoch: string): void {
+	beginEpochAdoption(epoch: string, resetQueues = true): void {
 		this.epochAdoptionTarget = epoch;
+		if (!resetQueues) {
+			return;
+		}
 		this.operationStore.resetForEpoch(epoch);
 		this.operationStore.ensureSequenceFloor(
 			this.remoteIndex.appliedMutationSeq[this.settings.deviceId] ?? 0,
@@ -710,11 +715,54 @@ export class IndexManager {
 		this.operationStore.loadPhysicalActions(snapshot.physicalActions);
 	}
 
+	/** Capture selection without reading remote payloads or changing local bytes. */
+	getEncryptionReplacementScope(): import("../../types").EncryptionReplacementScope {
+		return {
+			syncPatterns: [...this.settings.syncPatterns],
+			excludePatterns: [...this.settings.excludePatterns],
+			syncDotObsidian: this.settings.syncDotObsidian,
+			configDir: this.vaultAdapter.vault.configDir,
+		};
+	}
+
+	/** Only an owned transition can replace causal history at the target commit. */
+	stageEncryptionReplacement(
+		replacement: import("../../types").EncryptionReplacement,
+	): void {
+		const maintenance = this.remoteIndex.maintenance;
+		if (
+			!maintenance ||
+			maintenance.initiatedBy !== this.settings.deviceId ||
+			maintenance.replacement?.targetEpoch !== replacement.targetEpoch
+		) {
+			throw new Error(
+				"Encryption replacement requires owned maintenance",
+			);
+		}
+		this.encryptionReplacementCommit = true;
+		this.epochAdoptionTarget = replacement.targetEpoch;
+		this.remoteIndex.epoch = replacement.targetEpoch;
+		this.remoteIndex.epochAdoption = {
+			kind: "encryption-replacement",
+			operationId: maintenance.id,
+			initiatedBy: maintenance.initiatedBy,
+			scope: structuredClone(replacement.scope),
+			preservedRawPaths: [...replacement.preservedRawPaths],
+		};
+	}
+
+	/** Retire old history only after authoritative bytes and the final index were verified. */
+	finishEncryptionReplacement(files = this.remoteIndex.files): void {
+		this.finalizeForceEpoch({ ...this.remoteIndex, files });
+		this.epochAdoptionTarget = null;
+	}
+
 	beginPhysicalRewriteCommit(): void {
 		this.physicalRewriteOnNextSave = true;
 	}
 
 	cancelPhysicalRewriteCommit(): void {
+		this.encryptionReplacementCommit = false;
 		this.physicalRewriteOnNextSave = false;
 	}
 
@@ -1290,16 +1338,18 @@ export class IndexManager {
 		return await this.createCanonicalReadSession()();
 	}
 
-	/** Revalidate each read, reusing bytes only inside this connection-bound session. */
+	/** Revalidate scoped bytes; read-only mode rejects locks/missing canonical without repair. */
 	createCanonicalReadSession(
 		assertActive: () => void = () => {},
+		readOnly = false,
 	): CanonicalReadSession {
-		return this.createStartupReadSession(assertActive);
+		return this.createStartupReadSession(assertActive, readOnly);
 	}
 
 	/** Own private service bytes across classification, admission and the following full. */
 	createStartupReadSession(
 		assertActive: () => void = () => {},
+		readOnlyCanonical = false,
 	): StartupReadSession {
 		const generation = this.canonicalReadGeneration;
 		const configurationVersion =
@@ -1360,7 +1410,7 @@ export class IndexManager {
 			validate: (
 				observation: RemoteAuthorityObservation,
 			) => Promise<void> = async () => {},
-			readOnly = false,
+			readOnly = readOnlyCanonical,
 		): Promise<SyncIndex | null> => {
 			assertConfiguration();
 			const listing = readOnly ? await observe(validate) : undefined;
@@ -1386,6 +1436,11 @@ export class IndexManager {
 							),
 					);
 			assertConfiguration();
+			if (readOnlyCanonical && discovery.locks.length > 0) {
+				throw new RemoteIndexConcurrentModificationError(
+					"Read-only canonical observation is locked",
+				);
+			}
 			if (!discovery.path) {
 				snapshot = undefined;
 				snapshotService = undefined;
@@ -1946,9 +2001,11 @@ export class IndexManager {
 						kind: "target-recovery",
 						maintenanceId: this.targetRecoveryMaintenanceId,
 					}
-				: this.physicalRewriteOnNextSave
-					? { kind: "physical-rewrite" }
-					: { kind: "normal" };
+				: this.encryptionReplacementCommit
+					? { kind: "encryption-replacement" }
+					: this.physicalRewriteOnNextSave
+						? { kind: "physical-rewrite" }
+						: { kind: "normal" };
 		const result = mergeDesiredIndex({
 			latest,
 			loadedBase: this.loadedRemoteIndex,
@@ -2314,6 +2371,10 @@ export class IndexManager {
 				this.settings.remotePath,
 			);
 			if (
+				isPreservedRawPath(
+					rawLocalPath,
+					this.remoteIndex.epochAdoption?.preservedRawPaths ?? [],
+				) ||
 				cleanupPaths.has(normalizePath(rawLocalPath)) ||
 				this.vaultAdapter.shouldInspectRaw?.(
 					rawLocalPath,
@@ -2733,8 +2794,10 @@ export class IndexManager {
 	async assertMaintenanceAuthority(
 		epoch: string,
 		expected: IndexMaintenance,
+		readCanonical: () => Promise<SyncIndex> = () =>
+			this.readCanonicalIndex(),
 	): Promise<SyncIndex> {
-		const current = await this.readCanonicalIndex();
+		const current = await readCanonical();
 		const maintenance = current.maintenance;
 		if (
 			current.epoch !== epoch ||
@@ -2746,6 +2809,7 @@ export class IndexManager {
 			maintenance.targetRevision !== expected.targetRevision ||
 			!sameIndexValue(maintenance.source, expected.source) ||
 			!sameIndexValue(maintenance.target, expected.target) ||
+			!sameIndexValue(maintenance.replacement, expected.replacement) ||
 			maintenance.phase !== expected.phase
 		) {
 			throw new RemoteIndexConcurrentModificationError(
@@ -2835,26 +2899,19 @@ export class IndexManager {
 
 	/** Read the manifest and retain its opaque content-version validation token. */
 	async downloadEncryptionManifestForGuard(): Promise<EncryptionManifestRead> {
-		try {
-			const snapshot = await this.yandexClient.downloadStableRawFile(
-				this.getEncryptionManifestPath(),
-			);
-			if (!snapshot) {
-				return { manifest: null, validationToken: "absent" };
-			}
-			const data = JSON.parse(
-				new TextDecoder().decode(snapshot.raw),
-			) as Record<string, unknown>;
-			return {
-				manifest: parseEncryptionManifest(data),
-				validationToken: `present:${snapshot.fingerprint}`,
-			};
-		} catch (e) {
-			if (this.isNotFoundError(e)) {
-				return { manifest: null, validationToken: "absent" };
-			}
-			throw e;
+		const snapshot = await this.yandexClient.downloadStableRawFile(
+			this.getEncryptionManifestPath(),
+		);
+		if (!snapshot) {
+			return { manifest: null, validationToken: "absent" };
 		}
+		const data = JSON.parse(
+			new TextDecoder().decode(snapshot.raw),
+		) as Record<string, unknown>;
+		return {
+			manifest: parseEncryptionManifest(data),
+			validationToken: `present:${snapshot.fingerprint}`,
+		};
 	}
 
 	/** Validate a manifest token without downloading unchanged content. */

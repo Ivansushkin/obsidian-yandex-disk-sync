@@ -17,7 +17,8 @@ Changes since stable `1.1.0`.
 - Encrypted legacy data, numeric historical manifests and canonical indexes,
   unmarked transition/queue data, and incomplete current metadata are
   unsupported for reading/migration and block ordinary sync. Confirmed Force
-  local can replace raw destination metadata from a readable source; invalid
+  local can replace canonical metadata from a readable source; scoped cleanup
+  requires a readable destination manifest and verified encrypted path codec; invalid
   local state is never bypassed. Update all devices before using the new format.
 - Current entries without `mutationSeq` cannot authorize destructive folder
   operations.
@@ -29,8 +30,10 @@ Changes since stable `1.1.0`.
   content, deterministic RFC 5297 AES-SIV path segments, and a strict manifest
   marked by `format: "encryption-manifest"`.
 - Added coordinated, crash-safe encryption enable, password rotation, disable,
-  and post-commit recovery. Cleanup is repeatable and guarded by canonical
-  state and physical fingerprints.
+  and post-commit recovery. New transitions replace the selected scope with the
+  initiating local reference in a fresh epoch; other devices receive that reference
+  before replay. Cleanup retains protected/excluded resources and durable recovery.
+  Legacy checkpoints keep their fingerprint-guarded policy.
 - Added self-contained `OYDSBKP!` encrypted backup envelopes with bounded,
   authenticated headers and archive-specific PBKDF2/AES-GCM parameters.
 - Added collision-resistant backup names, non-overwriting upload, and exact
@@ -58,8 +61,9 @@ Changes since stable `1.1.0`.
 - Canonical commits now use an exclusive rename lock, stable JSON semantics,
   strict validation, read-back verification, byte-exact rollback, stale-lock
   recovery, and fail-closed handling of ambiguous lock states.
-- Physical delete, move, rejected-upload cleanup, and encryption cleanup require
-  a fresh canonical authorization check and a matching server fingerprint.
+- Ordinary physical delete, move and rejected-upload cleanup require fresh canonical
+  authority and a matching physical fingerprint. Explicit encryption replacement
+  uses its durable subtree authority; pre-commit rollback retains fingerprint guards.
 - Startup uses stable service-file reads, paginated root discovery, bounded
   parallel traversal, and a remote-folder observation cache invalidated by
   writes and encryption/path changes.
@@ -80,7 +84,10 @@ Changes since stable `1.1.0`.
   local observed revision.
 - Recovered successful uploads and canonical commits whose final response was
   lost or timed out without reporting false success for unverified operations.
-- Explicit Force without-backup skips individual copies and old destination
+- Force honors shared protected paths, include/exclude patterns and configuration
+  selection in both directions. Excluded encrypted bytes retain their verified codec;
+  conflicting file/folder replacements and unsafe codec removal stop before writes.
+- Explicit Force without-backup skips individual copies and old user-content
   snapshots. Ordinary sync still blocks destructive changes after a failed
   mandatory protective copy.
 - Rejected malformed canonical records, paths, watermarks, transitions,

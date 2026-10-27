@@ -77,6 +77,26 @@ test("transition manifests preserve semantic descriptors and authenticate their 
 		salt,
 		"wrong-password",
 	);
+	const snapshot = localSnapshot(salt, "target-password", 5);
+	for (const candidate of [targetCodec, wrongCodec]) {
+		const descriptor = await manager.createModeDescriptor(
+			snapshot,
+			candidate,
+		);
+		assert.equal(
+			await targetCodec.verifyVerifier(descriptor.verifier!),
+			true,
+		);
+		assert.equal(
+			await manager.verifyCandidate(candidate, descriptor.verifier!),
+			candidate === targetCodec,
+		);
+	}
+	const settings = {} as YandexDiskSyncSettings;
+	assert.equal(
+		await manager.applySnapshot(settings, snapshot, targetCodec),
+		targetCodec,
+	);
 	const verifier = await targetCodec.createVerifier();
 	const sourceSalt = EncryptionService.bytesToBase64(
 		new Uint8Array(16).fill(6),

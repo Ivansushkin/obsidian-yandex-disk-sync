@@ -23,6 +23,7 @@ import {
 } from "../../src/crypto/encryption";
 import { computeSha256 } from "../../src/utils/hash-utils";
 import { logger } from "../../src/utils/logger";
+import { afterTest } from "./test-context";
 import { isProtectedPath, toLocalPath } from "../../src/utils/path-utils";
 
 export const bytes = (value: string) => new TextEncoder().encode(value).buffer;
@@ -466,10 +467,7 @@ export interface SavedDevice {
 export function managedDevices(context: TestContext): typeof device {
 	return (...args) => {
 		const current = device(...args);
-		const hooks = context as TestContext & {
-			after(cleanup: () => Promise<void>): void;
-		};
-		hooks.after(async () => {
+		afterTest(context, async () => {
 			args[0].beforeRequest = undefined;
 			args[0].afterRequest = undefined;
 			await current.stop();
@@ -501,6 +499,7 @@ export function device(
 		maxRetries?: number;
 	} = {},
 	onPersist?: (snapshot: SavedDevice) => void,
+	isStopped: () => boolean = () => false,
 ) {
 	disk.install();
 	logger.configure({ consoleEnabled: false, fileEnabled: false });
@@ -535,7 +534,7 @@ export function device(
 		index.loadPendingMutations(saved.pendingMutations);
 		index.loadPendingPhysicalActions(saved.pendingPhysicalActions);
 	}
-	const engine = new SyncEngine(client, adapter, index, settings);
+	const engine = new SyncEngine(client, adapter, index, settings, isStopped);
 	const watcher = new FileWatcher(app, engine, settings);
 	if (saved) {
 		watcher.loadDeferredEvents(saved.pendingWatcherEvents);

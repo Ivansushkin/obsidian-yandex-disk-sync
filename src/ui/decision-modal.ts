@@ -17,6 +17,7 @@ export class DecisionModal<T extends string | null> extends Modal {
 		this.contentEl.createEl("h2", { text: this.title });
 		this.contentEl.createEl("p", { text: this.description });
 		const row = new Setting(this.contentEl);
+		row.settingEl.addClass("sync-modal-actions");
 		for (const choice of this.choices) {
 			row.addButton((button) =>
 				button.setButtonText(choice.label).onClick(() => {

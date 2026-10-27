@@ -18,6 +18,7 @@ export function encryptionFlow(
 	let cancelled = false;
 	let block: string | null = null;
 	const context: EncryptionContext = {
+		readLocalFile: (path) => a.adapter.readFile(path),
 		client: a.client,
 		index: a.index,
 		engine: a.engine,
@@ -141,4 +142,25 @@ export function startupFlow(
 		};
 	});
 	return startup;
+}
+
+/** Seed the historical guarded protocol explicitly; new host workflows use the default replacement policy. */
+export function legacyEncryptionFlow(
+	...args: Parameters<typeof encryptionFlow>
+) {
+	const flow = encryptionFlow(...args);
+	const begin = flow.workflow.maintenance.beginEncryptionTransition.bind(
+		flow.workflow.maintenance,
+	);
+	flow.workflow.maintenance.beginEncryptionTransition = (...values) =>
+		begin(
+			values[0],
+			values[1],
+			values[2],
+			values[3],
+			values[4],
+			values[5],
+			"guarded",
+		);
+	return flow;
 }

@@ -254,7 +254,13 @@ test("post-commit Force failure resumes cleanup without repeating migration", as
 			assertForceCleanupComplete: async () => {},
 		},
 	});
-	plugin["confirmForceSync"] = async () => "with-backup";
+	Object.assign(plugin, {
+		openForceSyncModal: () => ({
+			confirm: async () => "with-backup",
+			render: () => {},
+			close: () => {},
+		}),
+	});
 	Object.assign(plugin, {
 		backupManager: {
 			createRemoteSnapshotBackup: async () => ({

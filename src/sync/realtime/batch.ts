@@ -17,7 +17,10 @@ import {
 	isHashStableContentFingerprint,
 	matchesStableContentFingerprint,
 } from "../../utils/resource-fingerprint";
-import { IndexManager } from "../canonical/manager";
+import {
+	IndexManager,
+	type RemoteAuthorityObservation,
+} from "../canonical/manager";
 import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
 import * as fileOperations from "../files/operations";
 import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
@@ -40,7 +43,9 @@ const MAX_REALTIME_WINDOW_EVENTS = 32;
 const REALTIME_WINDOW_BYTES = 8 * 1024 * 1024;
 
 export interface Dependencies {
-	readCanonical?: () => Promise<SyncIndex>;
+	readCanonical?: (
+		validate?: (observation: RemoteAuthorityObservation) => Promise<void>,
+	) => Promise<SyncIndex>;
 	assertCurrent?: () => void;
 	indexManager: IndexManager;
 	settings: YandexDiskSyncSettings;
@@ -48,6 +53,7 @@ export interface Dependencies {
 		skipGuard?: boolean,
 		validationToken?: string,
 		validateThroughExternalBlock?: boolean,
+		observation?: RemoteAuthorityObservation,
 	) => Promise<SyncGuardResult>;
 	isPaused: boolean;
 	setBlockedState: (
@@ -500,6 +506,43 @@ async function applyPreparedRealtimeWindow(
 						item.snapshot!,
 						false,
 						true,
+						async () => {
+							let validated = false;
+							const validate = async (
+								observation?: RemoteAuthorityObservation,
+							) => {
+								const guard = await deps.getSyncGuardResult(
+									false,
+									deps.realtimeGuardValidationToken,
+									false,
+									observation,
+								);
+								if (guard.blockReason) {
+									throw new Error(
+										"Realtime upload lost its encryption authority",
+									);
+								}
+								validated = true;
+							};
+							const current = deps.readCanonical
+								? await deps.readCanonical(validate)
+								: await deps.indexManager.readCanonicalIndex();
+							if (!validated) {
+								await validate();
+							}
+							if (current.epoch !== item.mutation.epoch) {
+								batchResult.requiresFullSync = "epoch-replaced";
+							}
+							if (
+								current.maintenance ||
+								current.epoch !== item.mutation.epoch
+							) {
+								throw new Error(
+									"Realtime upload lost its epoch authority",
+								);
+							}
+							deps.assertCurrent?.();
+						},
 					);
 				if (
 					isUploadHandedOffToRename(item.event) &&

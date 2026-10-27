@@ -545,10 +545,10 @@ export class YandexDiskClient {
 	): Promise<void> {
 		const configurationVersion = this.getReadConfigurationVersion();
 		const assertCurrent = () => {
+			options.assertCurrent?.();
 			if (configurationVersion !== this.getReadConfigurationVersion()) {
 				throw new Error("Metadata collection configuration changed");
 			}
-			options.assertCurrent?.();
 		};
 		const physical = new Map<string, string>();
 		const groups = new Map<string, string[]>();
@@ -577,8 +577,30 @@ export class YandexDiskClient {
 			string,
 			Promise<Map<string, YandexResource>>
 		>();
-		const outcomes = await runWithConcurrencySettled(
-			[...physical].map(([path, target]) => async () => {
+		const leading: Array<[string, string]> = [];
+		const remaining: Array<[string, string]> = [];
+		const scheduledParents = new Set<string>();
+		for (const entry of physical) {
+			const [path, target] = entry;
+			const parent = target.slice(0, target.lastIndexOf("/"));
+			const pages = options.knownDirectoryPages?.get(parent);
+			if (
+				!observed.has(target) &&
+				pages !== undefined &&
+				pages < (groups.get(parent)?.length ?? 0) &&
+				!scheduledParents.has(parent)
+			) {
+				scheduledParents.add(parent);
+				leading.push([path, target]);
+			} else {
+				remaining.push([path, target]);
+			}
+		}
+		let failed = false;
+		let firstFailure: unknown;
+		await runWithConcurrencySettled(
+			// Start independent parent reads before their siblings occupy all worker slots.
+			[...leading, ...remaining].map(([path, target]) => async () => {
 				assertCurrent();
 				const budget = this.createDownloadBudget();
 				let resource = observed.get(target);
@@ -621,13 +643,20 @@ export class YandexDiskClient {
 			}),
 			Math.max(1, Math.min(concurrency, 40)),
 			undefined,
-			{ stopOnError: () => true },
+			{
+				stopOnError: () => true,
+				onError: (reason) => {
+					if (!failed) {
+						failed = true;
+						firstFailure = reason;
+					}
+				},
+			},
 		);
-		const failure = outcomes.find(
-			(outcome) => outcome.status === "rejected",
-		);
-		if (failure?.status === "rejected") {
-			throw failure.reason;
+		// A revoked invocation must not recover under a new configuration after joining reads.
+		assertCurrent();
+		if (failed) {
+			throw firstFailure;
 		}
 	}
 
@@ -669,7 +698,7 @@ export class YandexDiskClient {
 		raw = false,
 		concurrency = 4,
 		includeDirectories = false,
-		inspectRawPath?: (path: string) => boolean,
+		inspectRawPath?: (path: string, type: "file" | "dir") => boolean,
 		allowMissingRoot = true,
 		onDirectoryPages?: (path: string, pages: number) => void,
 	): Promise<YandexResource[]> {
@@ -763,7 +792,7 @@ export class YandexDiskClient {
 		raw: boolean,
 		allowMissingRoot: boolean,
 		includeDirectories: boolean,
-		inspectRawPath?: (path: string) => boolean,
+		inspectRawPath?: (path: string, type: "file" | "dir") => boolean,
 		budget?: DownloadReadBudget,
 	): Promise<{
 		files: YandexResource[];
@@ -863,7 +892,7 @@ export class YandexDiskClient {
 					);
 				}
 				seen.add(itemPath);
-				if (inspectRawPath && !inspectRawPath(item.path)) {
+				if (inspectRawPath && !inspectRawPath(item.path, item.type)) {
 					continue;
 				}
 				if (item.type === "dir") {
@@ -938,7 +967,7 @@ export class YandexDiskClient {
 	/**
 	 * Ensure multiple folders exist (optimized batch creation)
 	 */
-	async ensureFoldersExist(paths: string[]): Promise<void> {
+	async ensureFoldersExist(paths: string[], concurrency = 1): Promise<void> {
 		// Encrypt every folder segment independently under the current profile.
 		const effectivePaths = this.encryptionService
 			? await Promise.all(paths.map((p) => this.encryptFilePath(p)))
@@ -966,9 +995,37 @@ export class YandexDiskClient {
 			return depthA - depthB;
 		});
 
-		// Create folders sequentially by level
-		for (const folder of sortedFolders) {
-			await this.createFolder(folder);
+		const configuration = this.getReadConfigurationVersion();
+		let offset = 0;
+		while (offset < sortedFolders.length) {
+			const depth = sortedFolders[offset]!.split("/").length;
+			let end = offset + 1;
+			while (
+				end < sortedFolders.length &&
+				sortedFolders[end]!.split("/").length === depth
+			) {
+				end++;
+			}
+			const outcomes = await runWithConcurrencySettled(
+				sortedFolders.slice(offset, end).map((folder) => async () => {
+					if (configuration !== this.getReadConfigurationVersion()) {
+						throw new Error(
+							"Folder preparation configuration changed",
+						);
+					}
+					await this.createFolder(folder);
+				}),
+				Math.max(1, Math.min(concurrency, 4)),
+				undefined,
+				{ stopOnError: () => true },
+			);
+			const failure = outcomes.find(
+				(outcome) => outcome.status === "rejected",
+			);
+			if (failure?.status === "rejected") {
+				throw failure.reason;
+			}
+			offset = end;
 		}
 	}
 

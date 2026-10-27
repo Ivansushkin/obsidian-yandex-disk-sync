@@ -13,7 +13,7 @@ Local settings and baseline are saved immediately as current `plugin-data`
 after installation identity initialization, before automation starts. Downgrading
 the local format to 1.1 is unsupported; a failed save blocks synchronization.
 A plaintext stable canonical with `version: 1`/`version: 2` requires explicit Force.
-Force replaces the full destination and offers an optional archive, off by default.
+Force replaces selected destination files and offers an optional archive, off by default.
 Old destination canonical/fingerprints do not select a winner; source is read
 before clearing. Other devices adopt the new epoch through ordinary full and its
 offline-edit decision. Stopping other devices is not a Force prerequisite, but
@@ -21,8 +21,8 @@ late requests from old clients may change the result. Resume does not bypass
 ordinary startup blocks.
 
 If stable 1.1 uploaded the sync plugin directory, ordinary migration blocks reading
-that exposed data. Full Force local omits its own credentials from source/archive
-and removes old remote plugin copies without reading them. Rotate a previously
+that exposed data. Force omits its own credentials from source/archive and preserves protected remote
+plugin copies without reading them. Remove previously exposed copies separately. Rotate a previously
 exposed OAuth token separately; Force does not undo credential exposure.
 Force remote omits plugin data and rejects ambiguous portable source paths before
 local writes.
@@ -43,7 +43,7 @@ repeat Force local with an explicit archive choice.
 
 > **Data safety**
 > Use an independent backup for important vaults. Deletions propagate to other
-> devices. Force replaces the entire destination and offers an explicit backup
+> devices. Force replaces selected destination files and offers an explicit backup
 > choice. OAuth tokens and encryption passwords are stored in plaintext in local
 > plugin data; never share that directory or diagnostic data containing secrets.
 > The plugin sends synchronized data to Yandex Disk and collects no telemetry.
@@ -60,7 +60,7 @@ repeat Force local with an explicit archive choice.
 - **Flexible filters** — configurable include/exclude file patterns
 - **Multi-device support** — work under one token on different devices
 - **Backup system** — create ZIP backups of vault stored on Yandex Disk
-- **Force synchronization** — confirmed replacement of the entire destination from local or remote files
+- **Force synchronization** — confirmed replacement of selected destination files from local or remote files
 - **End-to-end encryption** — AES-256-GCM content encryption and deterministic AES-SIV filenames with separated keys
 
 ## Installation
@@ -100,7 +100,7 @@ repeat Force local with an explicit archive choice.
 | **Max concurrent operations** | Concurrent file operations and independent metadata reads (1–40) | 20                        |
 | **Sync config folder**        | Synchronize Obsidian settings folder                             | Disabled (by default)     |
 | **Include/Exclude patterns**  | Glob patterns for file filtering                                 | `**` (all syncable files) |
-| **Force Sync**                | Replace entire destination from local or remote files            | —                         |
+| **Force Sync**                | Replace selected destination files from local or remote files    | —                         |
 | **Backup**                    | Create ZIP backups of synchronized files                         | Manual / per-run choice   |
 | **Encryption**                | Enable end-to-end AES-256-GCM encryption                         | Disabled (by default)     |
 | **Encryption info**           | Information about encryption and password storage                | —                         |
@@ -190,17 +190,21 @@ Plugin includes built-in backup system for creating ZIP archives of your vault:
 
 ### Force Synchronization
 
-Force clears the selected destination and writes the actual source directly.
-It ignores normal filters and includes hidden files and Obsidian configuration.
+Force replaces selected destination files with the actual source directly.
+Both directions honor include/exclude filters, protected paths and the Obsidian
+configuration switch. Excluded files and this sync plugin remain untouched.
 
-- **Local → Disk:** keep .backup, remove old files/directories/index/locks and upload
-  local data directly. The previous destination encryption key is unnecessary.
-- **Disk → local:** read/authenticate the complete physical source, preserve local
-  .backup and this sync plugin, and replace everything else. Rebuild the index from
-  source and preserve working source encryption parameters.
+- **Local → Disk:** replace selected remote payloads and rebuild the index.
+  An encrypted destination requires its verified password to classify exclusions;
+  keeping encryption preserves its codec so excluded ciphertext stays readable.
+- **Disk → local:** read/authenticate selected physical files and replace selected
+  local files. Keep .backup, excluded files and this plugin; preserve source encryption.
 
-An unreadable source is not empty. A successfully read empty source clears the
-destination. Force creates no temporary files, locks, trash or protective/conflict
+Disabling encryption while excluded encrypted files remain is blocked; use the
+dedicated encryption settings first. A corrupt destination manifest also blocks
+scoped cleanup. File/folder collisions that would erase exclusions stop before writes.
+
+An unreadable source is not empty. A successfully read empty selection clears only selected destination files. Force creates no temporary files, locks, trash or protective/conflict
 copies. One confirmation offers an archive, off by default; archive errors remain
 in that dialog until retry, disabling the archive or cancellation. Restart Obsidian
 after replacing configuration.
@@ -217,15 +221,19 @@ New encrypted vaults use the `hardened` profile: PBKDF2-HMAC-SHA256 with
 600,000 iterations derives a master key, then HKDF-SHA256 derives independent
 AES-256-GCM content and AES-SIV filename keys.
 
-While encryption is being enabled, disabled, or rotated, other devices block
-normal synchronization. A target-capable device can finish fingerprint-guarded
-post-commit cleanup from canonical metadata without the source password.
-Passwords entered on another device remain candidate credentials until the
-manifest verifier, transition/canonical coherence, and canonical decryption all
-succeed. A wrong or cancelled password does not replace the active settings.
-Every rewritten object is downloaded back and checked against its decoded
-logical path and plaintext SHA-256 before its fingerprint can authorize commit
-or cleanup.
+Enable, disable and password rotation use **the initiating device's local files
+as the reference** within the current sync filters. Remote-only files and older
+offline edits on other devices are not merged into that reference. Other devices
+automatically receive the selected generation, replacing their old queues and
+selected local extras.
+
+Do not edit the vault on any device until completion. Already-sent foreign requests
+can finish after verification; there is no server fencing. Each target is downloaded
+back and checked against its plaintext SHA-256. Failures retain recovery; foreign
+completion and legacy checkpoint limits are covered in the
+[encryption guide](docs/E2E_ENCRYPTION.md). Another device's password is saved only
+after verifier and canonical authentication; wrong or cancelled credentials do not
+replace active settings.
 
 - **Content encryption**: each file gets a random 12-byte IV, ensuring unique ciphertext even for identical files
 - **Filename encryption**: RFC 5297 AES-SIV with fixed domain AAD and canonical Base64URL; paths remain stable across devices and folder moves do not re-encode descendants
@@ -238,17 +246,18 @@ or cleanup.
 2. Click the encryption toggle
 3. Enter and confirm your password
 4. Choose a full archive, continue without one, or cancel. A selected archive must pass exact byte verification
-5. Wait for the initial encryption sync (all files are re-uploaded encrypted)
+5. Leave files unchanged on every device until completion; selected local files are uploaded encrypted
 
 **Password recovery**: The password is NOT recoverable. If you lose the password while encryption is enabled, your data on Yandex Disk becomes permanently inaccessible. Keep the password in a safe place (e.g., password manager).
 
 **Password storage**: The password is stored in `data.json` (Obsidian plugin config) as a plaintext string. It is never sent to Yandex or any third party.
 
 > **Warning**
-> Enabling encryption re-uploads every file in encrypted form. The old
-> plaintext set remains authoritative until the canonical commit and is then
-> deleted only by fingerprint-guarded cleanup. The resulting encrypted data
-> cannot be read without the password.
+> The transition replaces the selected Disk scope with the local reference.
+> Source mode is authoritative before canonical commit; target mode is authoritative
+> afterward, with no rollback. Protected/excluded paths are retained. Save any needed
+> remote-only or offline edits separately before starting. Encrypted output requires
+> its password.
 
 Numeric historical manifests and historical encrypted backup formats are
 unsupported. Non-envelope `.enc.zip`, encrypted legacy names, and
@@ -257,69 +266,21 @@ decryption attempt. Plaintext historical ZIP archives remain downloadable.
 
 ## Development
 
-### Requirements
-
-- Node.js 20.19+
-- npm
-
-### Install Dependencies
+Requires Node.js 20.19+ and npm.
 
 ```bash
 npm install
-```
-
-### Development Mode
-
-Create a local environment file once and set the absolute test-vault plugin
-directory. The file is ignored by Git and its value takes precedence over any
-shell variable with the same name:
-
-```bash
-cp .env.example .env
-```
-
-```dotenv
-YANDEX_PLUGIN_PATH=/absolute/path/to/test-vault/.obsidian/plugins/yandex-disk-sync
-```
-
-```bash
-npm run dev
-```
-
-### Build
-
-```bash
-npm run build
-```
-
-Built files are written to `build/`. When `.env` contains
-`YANDEX_PLUGIN_PATH`, the build also copies release artifacts to that
-test-vault plugin directory. A clean checkout without `.env` only creates the
-release artifacts.
-
-### Linting and formatting
-
-```bash
+npm test
 npm run lint
+npm run build
 npm run format:check
-npm run lint:fix
-npm run format
 ```
 
-ESLint requires braces around every control-flow body, including single-line
-`if`/`else`. Prettier owns formatting; its settings match `.editorconfig`.
-`npm install` also installs the Husky pre-commit hook. On commit, lint-staged
-runs ESLint fixes followed by Prettier on staged code and formats staged
-JSON, CSS, Markdown and YAML. Unstaged hunks are preserved; errors that cannot
-be fixed automatically block the commit. CI checks lint and formatting too.
-
-### Testing policy
-
-Bulk unit-test generation is prohibited. Keep only compact tests of complex
-algorithms and function interactions; avoid trivial checks, UI mocks, and
-coverage-driven growth. A bug fix does not automatically require a new unit test.
-Follow [AGENTS.md](AGENTS.md#documentation-and-testing) and verify user behavior
-with the [real Obsidian smoke scenarios](docs/SMOKE_TESTS.md).
+Build assets go to `build/`; `npm run dev` enables incremental builds. Test-vault
+configuration through `.env`, hooks, formatting and diagnostics are covered in the
+[development guide](docs/README.md#разработка-и-проверки).
+[AGENTS.md](AGENTS.md) defines code rules and the compact algorithm-test policy.
+Native Obsidian acceptance uses the [smoke cases](docs/SMOKE_TESTS.md).
 
 ## Architecture
 
@@ -327,8 +288,7 @@ The normative catalogue of synchronization, multi-device, failure-recovery,
 and encryption scenarios is maintained in
 [`docs/SYNC_USER_SCENARIOS.md`](docs/SYNC_USER_SCENARIOS.md).
 
-Start with the [documentation guide](docs/README.md). The completed refactor and
-subsequent correctness fixes are summarized in [REFACTOR_REPORT.md](docs/REFACTOR_REPORT.md).
+Start with the [documentation guide](docs/README.md) and [architecture](docs/ARCHITECTURE.md).
 
 ## Security
 
@@ -343,7 +303,7 @@ subsequent correctness fixes are summarized in [REFACTOR_REPORT.md](docs/REFACTO
 
 ## Limitations
 
-- Empty folders, symlinks and special file attributes are not synchronized separately.
+- Ordinary sync does not transfer empty folders; direct Force does. Symlinks and special file attributes are not synchronized.
 - Old and current plugin builds must not use the same remote storage concurrently.
 - Provider quotas, file-size limits and throttling depend on Yandex Disk; check your
   current account limits. The plugin cannot raise them.
@@ -366,7 +326,7 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-**Last Updated**: October 22, 2026
+**Last Updated**: October 27, 2026
 
 **Version**: 2.0.0
 

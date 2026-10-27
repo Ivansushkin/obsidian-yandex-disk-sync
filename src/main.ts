@@ -75,6 +75,7 @@ import {
 	ForceSyncController,
 	type ForceDirection,
 	type ForceFlowState,
+	type ForcePreparationContext,
 } from "./sync/workflows/force-controller";
 import {
 	DEFAULT_SETTINGS,
@@ -138,10 +139,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.publishSettingsToComponents();
 		},
 		isUnloaded: () => this.unloaded,
-		failed: () => {
+		failed: (failure) => {
 			this.stopRegularSync();
 			this.remoteStateValidated = false;
-			this.setAuthenticationBlock(t("notice.remote_recheck_required"));
+			const reason = formatOperationFailure(failure);
+			this.syncEngine?.setExternalBlock("persistence", reason, failure);
+			this.showBlockingNotice("local-persistence", reason);
 		},
 	});
 	private localStateRestored = false;
@@ -327,6 +330,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.register(() => this.yandexClient.setRetryCallback());
 
 		this.encryptionWorkflow = new EncryptionWorkflow({
+			readLocalFile: (path) => this.vaultAdapter.readFile(path),
 			client: this.yandexClient,
 			index: this.indexManager,
 			engine: this.syncEngine,
@@ -445,6 +449,31 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 		this.syncEngine.setSyncGuardCallback(
 			async (validationToken, observation, knownManifest) => {
+				const hostBlock = () => {
+					if (this.unloaded) {
+						return {
+							blockReason: t("notice.sync_interrupted"),
+							blockCode: "sync-interrupted",
+							blockStatus: "error" as const,
+						};
+					}
+					if (this.persistence.failed) {
+						const failure = this.persistence.failure;
+						return {
+							blockReason: failure
+								? formatOperationFailure(failure)
+								: t("notice.local_persistence_failed"),
+							blockCode: "local-persistence",
+							blockStatus: "error" as const,
+							failure,
+						};
+					}
+					return null;
+				};
+				const initialBlock = hostBlock();
+				if (initialBlock) {
+					return initialBlock;
+				}
 				if (this.forceRecovery) {
 					return {
 						blockReason: t("force.recovery_pending"),
@@ -458,8 +487,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						blockStatus: "error",
 					};
 				}
-				if (this.persistence.failed || this.unloaded) {
-					return { blockReason: t("notice.remote_recheck_required") };
+				const lateBlock = hostBlock();
+				if (lateBlock) {
+					return lateBlock;
 				}
 				if (!this.settings.yandexTokenSecret) {
 					return { blockReason: null };
@@ -976,6 +1006,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				if (showProgressNotice) {
 					this.beginSyncNotice(t("notice.sync_started"));
 				}
+				const recoveryGeneration = this.persistence.recoveryGeneration;
 				const result = await this.syncEngine.fullSync(
 					options,
 					this.forceRecovery?.direct ? undefined : invocation.reads,
@@ -985,6 +1016,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 				// Save updated index after sync
 				await this.persistPluginData();
+				if (result.success && recoveryGeneration !== undefined) {
+					this.persistence.completeRecovery(recoveryGeneration);
+				}
 				if (
 					!options?.epochRetry &&
 					result.errors.some(
@@ -1001,26 +1035,25 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.automationReady = true;
 					this.clearBlockingNotice();
 				}
-				if (result.epochAdopted && !showProgressNotice) {
-					new Notice(
-						result.conflicts > 0
+				const adoptionMessage =
+					result.epochAdopted &&
+					this.indexManager.getRemoteIndex().epochAdoption?.kind ===
+						"encryption-replacement"
+						? t("notice.encryption_reference_received")
+						: result.conflicts > 0
 							? t("notice.epoch_adopted_conflicts", {
 									conflicts: result.conflicts,
 								})
-							: t("notice.epoch_adopted"),
-						5000,
-					);
+							: t("notice.epoch_adopted");
+				if (result.epochAdopted && !showProgressNotice) {
+					new Notice(adoptionMessage, 5000);
 				}
 				if (showProgressNotice) {
 					const successful =
 						result.uploaded + result.downloaded + result.deleted;
 					this.finishSyncNotice(
 						result.epochAdopted
-							? result.conflicts > 0
-								? t("notice.epoch_adopted_conflicts", {
-										conflicts: result.conflicts,
-									})
-								: t("notice.epoch_adopted")
+							? adoptionMessage
 							: result.success
 								? successful === 0
 									? t("notice.sync_no_changes")
@@ -1091,6 +1124,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private beginSyncNotice(
 		initialMessage: string,
 		subscribeToEngine = true,
+		warning?: string,
 	): Notice {
 		this.syncNoticeGeneration++;
 		if (this.syncNoticeHideTimer !== null) {
@@ -1107,22 +1141,23 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.activeSyncNotice ??
 			reusableBlockingNotice ??
 			new Notice(initialMessage, 0);
-		notice.setMessage(initialMessage);
+		notice.setMessage(
+			warning ? `${initialMessage}\n\n${warning}` : initialMessage,
+		);
 		this.activeSyncNotice = notice;
-		if (!subscribeToEngine) {
-			this.syncNoticeUnsubscribe?.();
-			this.syncNoticeUnsubscribe = null;
-		}
-		if (subscribeToEngine && !this.syncNoticeUnsubscribe) {
+		this.syncNoticeUnsubscribe?.();
+		this.syncNoticeUnsubscribe = null;
+		if (subscribeToEngine) {
 			this.syncNoticeUnsubscribe = this.syncEngine.onStateChange(
 				(state) => {
 					if (state.status !== "syncing" || !this.activeSyncNotice) {
 						return;
 					}
+					const progress = t("notice.sync_progress", {
+						operation: formatSyncActivity(state),
+					});
 					this.activeSyncNotice.setMessage(
-						t("notice.sync_progress", {
-							operation: formatSyncActivity(state),
-						}),
+						warning ? `${progress}\n\n${warning}` : progress,
 					);
 				},
 			);
@@ -1307,27 +1342,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		return true;
 	}
 
-	/**
-	 * Show confirm modal for force sync operation
-	 */
-	private confirmForceSync(
-		direction: ForceDirection,
-		requireLegacyClientsStopped: boolean,
-		replacement?: SyncRunOptions["forceReplacement"],
-		prepareArchive?: () => Promise<void>,
-	): Promise<OperationBackupChoice> {
-		return new Promise((resolve) => {
-			new ForceSyncModal(
-				this.app,
-				direction,
-				resolve,
-				requireLegacyClientsStopped,
-				replacement?.plan,
-				prepareArchive,
-			).open();
-		});
-	}
-
 	/** Compose source validation and local recovery persistence without reading destination canonical. */
 	private forceReplacementDependencies(): ForceReplacementDependencies {
 		const getSettings = () => this.settings;
@@ -1385,27 +1399,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						create,
 					).open(),
 				),
-			chooseSourceMode: () =>
-				new Promise((resolve) =>
-					new DecisionModal<"plaintext" | "encrypted" | null>(
-						this.app,
-						t("force.source_mode_title"),
-						t("force.source_mode_description"),
-						[
-							{
-								label: t("force.plaintext"),
-								value: "plaintext" as const,
-							},
-							{
-								label: t("force.encrypted"),
-								value: "encrypted" as const,
-							},
-							{ label: t("modal.cancel_button"), value: null },
-						],
-						null,
-						resolve,
-					).open(),
-				),
 			watcherCutoff: () =>
 				this.fileWatcher
 					.getDeferredEvents()
@@ -1418,20 +1411,29 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/** Prepare only the selected readable source; stale destination state cannot veto Force. */
-	private async prepareForceSync(direction: ForceDirection): Promise<{
+	private async prepareForceSync(
+		direction: ForceDirection,
+		preparation: ForcePreparationContext,
+	): Promise<{
 		canonical: ForceBackupProof["canonical"];
 		migration: boolean;
 		replacement?: NonNullable<SyncRunOptions["forceReplacement"]>;
 	} | null> {
 		if (!this.settings.yandexTokenSecret) {
-			this.showBlockingNotice("token-missing", t("notice.token_missing"));
-			return null;
+			throw new Error(t("notice.token_missing"));
 		}
 		this.restoreLocalStateOnce();
 		this.registerSyncLifecycleOnce();
 		const dependencies = this.forceReplacementDependencies();
 		const plan = await prepareForceReplacement(
-			dependencies,
+			{
+				...dependencies,
+				password: (create, invalid) =>
+					preparation.password(create, invalid),
+				isCancelled: () => this.unloaded || preparation.isCancelled(),
+				sourceProgress: (completed, total) =>
+					preparation.progress(completed, total),
+			},
 			direction,
 			true,
 		);
@@ -1459,20 +1461,47 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			: await captureLogicalVaultDigest(this.vaultAdapter, true);
 	}
 
+	/** Open presentation before the controller starts read-only preparation. */
+	private openForceSyncModal(direction: ForceDirection): ForceSyncModal {
+		const modal = new ForceSyncModal(
+			this.app,
+			direction,
+			this.settings.remotePath,
+			() => {
+				this.forceSyncController?.cancel();
+			},
+		);
+		modal.open();
+		return modal;
+	}
+
 	/** Compose the shared Force workflow; the controller owns its lifetime. */
 	getForceSyncController(): ForceSyncController {
 		if (!this.forceSyncController) {
 			let replacementResult: SyncResult | null = null;
+			let modal: ForceSyncModal | null = null;
 			this.forceSyncController = new ForceSyncController({
+				open: (direction) => {
+					modal?.close();
+					modal = this.openForceSyncModal(direction);
+				},
+				close: () => modal?.close(),
+				password: (create, invalid) =>
+					modal?.requestPassword(create, invalid) ??
+					Promise.resolve(null),
+				retryPreparation: (failure) =>
+					modal?.retryPreparation(failure) ?? Promise.resolve(false),
 				isSyncBusy: () => this.isForceSyncUnavailable(),
-				preflight: (direction) => this.prepareForceSync(direction),
-				confirm: (direction, migration, replacement, prepareArchive) =>
-					this.confirmForceSync(
-						direction,
-						migration,
-						replacement,
-						prepareArchive,
-					),
+				preflight: (direction, preparation) =>
+					this.prepareForceSync(direction, preparation),
+				confirm: (
+					_direction,
+					_migration,
+					replacement,
+					prepareArchive,
+				) =>
+					modal?.confirm(replacement?.plan, prepareArchive) ??
+					Promise.resolve("cancel"),
 				captureProtectedSnapshot: (direction) =>
 					this.captureForceSnapshot(direction),
 				readyForBackup: async (_migration, replacement) => {
@@ -1603,6 +1632,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					logger.error("Force workflow failed", { error }),
 			});
 			this.forceSyncController.subscribe((state) => {
+				modal?.render(state);
 				this.renderForceProgress(state);
 				this.startAutomationIfReady();
 			});
@@ -1966,17 +1996,26 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private unloaded = false;
 	private storageBinding!: StorageBindingController;
 
+	/** Suppress presentation after the plugin lifecycle has ended. */
+	isPluginUnloaded(): boolean {
+		return this.unloaded;
+	}
+
 	/** Save user drafts through the same persistence owner as internal transitions. */
 	async applySettingsPatch(patch: UserSettingsPatch): Promise<void> {
 		await applyUserSettingsPatch(
 			{
 				getSettings: () => this.settings,
 				persistenceFailed: () => this.persistence.failed,
+				persistenceRecoveryGeneration: () =>
+					this.persistence.recoveryGeneration,
+				completePersistenceRecovery: (generation) =>
+					this.persistence.completeRecovery(generation),
 				isConfigurationBusy: () => this.isConfigurationBusy(),
 				hasTransition: () => this.encryptionTransition !== null,
 				hasDurableConfigurationWork: () =>
 					this.hasDurableConfigurationWork(),
-				isUnloaded: () => this.unloaded,
+				isUnloaded: () => this.isPluginUnloaded(),
 				isLayoutReady: () => this.app.workspace.layoutReady,
 				setUpdating: (updating) => {
 					this.configurationUpdatePending = updating;
@@ -1987,13 +2026,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.automationReady = true;
 					this.startAutomationIfReady();
 				},
-				invalidateRemoteStateClassification: () =>
-					this.invalidateRemoteStateClassification(),
-				settingsSaveRejected: () => {
+				refreshAutomation: () => this.startAutomationIfReady(true),
+				settingsSaveRejected: (error, stage) => {
 					this.remoteStateValidated = false;
-					this.setAuthenticationBlock(
-						t("notice.remote_recheck_required"),
-					);
+					if (!this.persistence.failed) {
+						const failure = createSyncFailure(error, {
+							stage,
+							action: "unknown",
+						}).summary;
+						this.showBlockingNotice(
+							"settings-update",
+							formatOperationFailure(failure),
+						);
+					}
 				},
 				persistPluginData: (draft) => this.persistPluginData(draft),
 				runStartupInvocation: (action) =>
@@ -2160,7 +2205,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (this.unloaded) {
 				throw new Error("Plugin was unloaded");
 			}
-			this.beginSyncNotice(t("notice.encryption_syncing"));
+			this.beginSyncNotice(
+				t("notice.encryption_syncing"),
+				true,
+				t("notice.encryption_replacement_warning"),
+			);
 			try {
 				await this.syncEngine.runExclusiveMaintenance(async () => {
 					await this.encryptionWorkflow.enableEncryptionNow(
@@ -2204,7 +2253,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (this.unloaded) {
 				throw new Error("Plugin was unloaded");
 			}
-			this.beginSyncNotice(t("notice.encryption_disabling"));
+			this.beginSyncNotice(
+				t("notice.encryption_disabling"),
+				true,
+				options?.reuploadPlaintext
+					? t("notice.encryption_replacement_warning")
+					: undefined,
+			);
 			try {
 				const result = await this.syncEngine.runExclusiveMaintenance(
 					async () =>
@@ -2246,7 +2301,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			if (this.unloaded) {
 				throw new Error("Plugin was unloaded");
 			}
-			this.beginSyncNotice(t("notice.encryption_password_rotating"));
+			this.beginSyncNotice(
+				t("notice.encryption_password_rotating"),
+				true,
+				t("notice.encryption_replacement_warning"),
+			);
 			try {
 				await this.syncEngine.runExclusiveMaintenance(async () => {
 					await this.encryptionWorkflow.rotateEncryptionPasswordNow(
@@ -2439,11 +2498,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/** Start listeners only after durable reconciliation and all owning flows have settled. */
-	private startAutomationIfReady(): void {
+	private startAutomationIfReady(refresh = false): void {
 		if (this.forceRecovery?.direct) {
 			if (
 				!this.unloaded &&
 				!this.persistence.failed &&
+				this.persistence.recoveryGeneration === undefined &&
 				!this.isConfigurationBusy() &&
 				this.app.workspace?.layoutReady &&
 				!this.syncEngine.isSyncPaused() &&
@@ -2455,9 +2515,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 		if (
 			!this.automationReady ||
-			this.regularSyncStarted ||
+			(this.regularSyncStarted && !refresh) ||
 			this.unloaded ||
 			this.persistence.failed ||
+			this.persistence.recoveryGeneration !== undefined ||
 			this.isConfigurationBusy() ||
 			!this.app.workspace?.layoutReady ||
 			this.syncEngine.isSyncPaused() ||
@@ -2494,10 +2555,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/** Token or remote-path changes invalidate every cached startup decision. */
 	private invalidateRemoteStateClassification(): void {
 		this.remoteStateValidated = false;
-		this.setMigrationBlock(null);
-		this.setHistoricalBlock(null);
-		this.setEncryptionBlock(null, false);
-		this.setAuthenticationBlock(t("notice.remote_recheck_required"));
 	}
 
 	private async requireCanonicalMaintenanceCleanupComplete(): Promise<void> {

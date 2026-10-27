@@ -17,7 +17,7 @@ const PLUGIN_DIRECTORY_NAMES = new Set([
 ]);
 const LEGACY_LOG_DIRECTORY = "yandex-disk-sync";
 
-/** Validate a literal vault-relative path before an unfiltered Force operation. */
+/** Validate a literal vault-relative path before a Force filesystem operation. */
 export function assertForcePath(path: string): void {
 	if (
 		!path ||
@@ -51,7 +51,7 @@ export function isForcePluginPath(path: string, configDir: string): boolean {
 	);
 }
 
-/** Force source selection never consults ordinary include/exclude settings. */
+/** Protect the Force/archive namespace before applying caller-specific user filters. */
 export function isForceSourcePath(path: string, configDir: string): boolean {
 	return (
 		path !== ".backup" &&
@@ -326,7 +326,10 @@ export function shouldSyncFile(
 	}
 
 	// Check config directory
-	if (configDir && normalized.startsWith(configDir)) {
+	if (
+		configDir &&
+		(normalized === configDir || normalized.startsWith(`${configDir}/`))
+	) {
 		if (!syncDotObsidian) {
 			return false;
 		}
@@ -345,6 +348,74 @@ export function shouldSyncFile(
 	return matchesPatterns(normalized, includePatterns);
 }
 
+/** Traverse possible included descendants without mistaking a directory for a file glob. */
+export function shouldTraverseSyncDirectory(
+	path: string,
+	includePatterns: string[],
+	excludePatterns: string[],
+	syncDotObsidian: boolean,
+	configDir: string,
+): boolean {
+	if (
+		!shouldSyncFile(path, [], [], syncDotObsidian, configDir) ||
+		excludePatterns.some(
+			(pattern) =>
+				pattern === "**" ||
+				(pattern.endsWith("/**") &&
+					matchPattern(path, pattern.slice(0, -3))),
+		)
+	) {
+		return false;
+	}
+	return (
+		includePatterns.length === 0 ||
+		includePatterns.some((pattern) => {
+			const normalized = normalizePath(pattern);
+			if (!normalized.includes("/") && !normalized.includes("**")) {
+				return false;
+			}
+			const prefix = normalized.split("*")[0]!;
+			return (
+				!prefix ||
+				prefix.startsWith(`${path}/`) ||
+				`${path}/`.startsWith(prefix)
+			);
+		})
+	);
+}
+
+/** Filename codecs add a 16-byte tag and emit unpadded Base64URL segments. */
+export function mayBeEncryptedPath(path: string): boolean {
+	return path
+		.split("/")
+		.every((segment) => /^[A-Za-z0-9_-]{23,}$/.test(segment));
+}
+
+/** Raw encrypted directory names must be decoded before applying logical file filters. */
+export function shouldInspectRawSyncDirectory(
+	path: string,
+	includePatterns: string[],
+	excludePatterns: string[],
+	syncDotObsidian: boolean,
+	configDir: string,
+	encrypted: boolean,
+): boolean {
+	if (
+		!shouldTraverseSyncDirectory(path, [], excludePatterns, true, configDir)
+	) {
+		return false;
+	}
+	return encrypted && mayBeEncryptedPath(path)
+		? true
+		: shouldTraverseSyncDirectory(
+				path,
+				includePatterns,
+				excludePatterns,
+				syncDotObsidian,
+				configDir,
+			);
+}
+
 /** Keep raw excluded plaintext objects outside codec conversion while validating possible ciphertext. */
 export function shouldInspectRawSyncPath(
 	path: string,
@@ -361,9 +432,7 @@ export function shouldInspectRawSyncPath(
 		return false;
 	}
 	// AES-SIV adds a 16-byte tag to each non-empty filename before Base64URL encoding.
-	const mayBeEncoded = path
-		.split("/")
-		.every((segment) => /^[A-Za-z0-9_-]{23,}$/.test(segment));
+	const mayBeEncoded = mayBeEncryptedPath(path);
 	return encrypted && mayBeEncoded
 		? true
 		: shouldSyncFile(

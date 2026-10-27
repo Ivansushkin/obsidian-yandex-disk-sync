@@ -1,3 +1,6 @@
+import { cleanupEncryptionReplacement } from "./replacement-cleanup";
+import { isPreservedRawPath, isReplacementPath } from "./replacement";
+import { planRecursiveDeletes } from "../sync/files/deletion-cover";
 import { t } from "../i18n/index";
 import { RemoteIndexConcurrentModificationError } from "../sync/canonical/errors";
 import type {
@@ -8,7 +11,11 @@ import type {
 } from "../types";
 import { computeSha256 } from "../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
-import { joinPath, toLocalPath } from "../utils/path-utils";
+import {
+	joinPath,
+	toLocalPath,
+	shouldInspectRawSyncPath,
+} from "../utils/path-utils";
 import type { EncryptionContext } from "./context";
 import { type EncryptionCodec } from "./encryption";
 import {
@@ -22,6 +29,7 @@ import {
 
 /** Owns canonical maintenance, strict cleanup proofs and snapshot publication. */
 export class EncryptionMaintenance {
+	private cleanupSourceCodec: EncryptionCodec | null | undefined;
 	constructor(
 		private readonly context: EncryptionContext,
 		private readonly controller: EncryptionTransitionController,
@@ -102,8 +110,62 @@ export class EncryptionMaintenance {
 		sourceRawPaths: string[],
 		sourceFingerprints: Record<string, string>,
 		backupProof: EncryptionBackupProof | null,
+		policy: "guarded" | "initiator-wins" = "initiator-wins",
 	): Promise<LocalEncryptionTransition> {
+		this.cleanupSourceCodec = this.context.getService();
+		const canonical = this.context.index.getRemoteIndex();
+		const scope =
+			policy === "initiator-wins"
+				? this.context.index.getEncryptionReplacementScope()
+				: undefined;
+		const referenceFiles = scope
+			? Object.fromEntries(
+					[...(await this.context.index.buildLocalIndex())].map(
+						([path, file]) => [path, { ...file, mutationSeq: 0 }],
+					),
+				)
+			: undefined;
+		const preserved = new Set(
+			canonical.epochAdoption?.preservedRawPaths ?? [],
+		);
+		for (const path of scope ? sourceRawPaths : []) {
+			if (isPreservedRawPath(path, [...preserved])) {
+				continue;
+			}
+			if (
+				!shouldInspectRawSyncPath(
+					path,
+					scope!.syncPatterns,
+					scope!.excludePatterns,
+					scope!.syncDotObsidian,
+					scope!.configDir,
+					source.enabled,
+				)
+			) {
+				preserved.add(path);
+				continue;
+			}
+			const logical = await this.context.client.decodePhysicalUserPath(
+				path,
+				this.context.getService(),
+			);
+			if (!isReplacementPath(logical, scope!)) {
+				preserved.add(path);
+			}
+		}
 		const transition: LocalEncryptionTransition = {
+			...(scope
+				? {
+						referenceFiles,
+						replacement: {
+							sourceEpoch: canonical.epoch,
+							targetEpoch: crypto.randomUUID(),
+							scope,
+							preservedRawPaths: [...preserved].sort(),
+							deletions: [],
+						},
+					}
+				: {}),
 			id: `${this.context.getSettings().deviceId}:${kind}:${Date.now().toString(36)}`,
 			kind,
 			phase: "prepared",
@@ -151,8 +213,12 @@ export class EncryptionMaintenance {
 
 	private async createEncryptionModeDescriptor(
 		snapshot: LocalEncryptionSnapshot,
+		candidate?: EncryptionCodec | null,
 	): Promise<EncryptionModeDescriptor> {
-		return await this.context.manager.createModeDescriptor(snapshot);
+		return await this.context.manager.createModeDescriptor(
+			snapshot,
+			candidate,
+		);
 	}
 
 	private async getLogicalVaultSnapshotDigest(): Promise<string> {
@@ -162,10 +228,12 @@ export class EncryptionMaintenance {
 	/** Claim the selected source revision without silently refreshing its archive. */
 	async claimEncryptionMaintenance(
 		transition: LocalEncryptionTransition,
+		targetCandidate?: EncryptionCodec | null,
 	): Promise<void> {
 		const canonical = await this.context.index.readCanonicalIndex();
 		if (
-			canonical.revision !== transition.sourceCanonicalRevision ||
+			(!transition.replacement &&
+				canonical.revision !== transition.sourceCanonicalRevision) ||
 			canonical.epoch !== this.context.index.getRemoteIndex().epoch ||
 			canonical.maintenance
 		) {
@@ -174,6 +242,9 @@ export class EncryptionMaintenance {
 			);
 		}
 		await this.assertTransitionSourceUnchanged(transition);
+		if (transition.replacement) {
+			transition.sourceCanonicalRevision = canonical.revision;
+		}
 		const proof = transition.backupProof;
 		if (proof !== null) {
 			if (
@@ -195,13 +266,19 @@ export class EncryptionMaintenance {
 				);
 			}
 		}
-		await this.commitCanonicalMaintenance(transition, "prepared");
+		await this.commitCanonicalMaintenance(
+			transition,
+			"prepared",
+			[],
+			targetCandidate,
+		);
 	}
 
 	async stageCanonicalMaintenance(
 		transition: LocalEncryptionTransition,
 		phase: EncryptionTransitionPhase,
 		cleanup: IndexMaintenance["cleanup"] = [],
+		targetCandidate?: EncryptionCodec | null,
 	): Promise<void> {
 		const existing = this.context.index.getMaintenance();
 		const maintenance: IndexMaintenance = {
@@ -219,11 +296,20 @@ export class EncryptionMaintenance {
 					: null,
 			source:
 				existing?.source ??
-				(await this.createEncryptionModeDescriptor(transition.source)),
+				(await this.createEncryptionModeDescriptor(
+					transition.source,
+					this.context.getService(),
+				)),
 			target:
 				existing?.target ??
-				(await this.createEncryptionModeDescriptor(transition.target)),
+				(await this.createEncryptionModeDescriptor(
+					transition.target,
+					targetCandidate,
+				)),
 			cleanup,
+			...(transition.replacement
+				? { replacement: structuredClone(transition.replacement) }
+				: {}),
 		};
 		this.context.index.setMaintenance(maintenance);
 		logger.debug("Encryption maintenance staged in memory", {
@@ -237,8 +323,14 @@ export class EncryptionMaintenance {
 		transition: LocalEncryptionTransition,
 		phase: EncryptionTransitionPhase,
 		cleanup: IndexMaintenance["cleanup"] = [],
+		targetCandidate?: EncryptionCodec | null,
 	): Promise<void> {
-		await this.stageCanonicalMaintenance(transition, phase, cleanup);
+		await this.stageCanonicalMaintenance(
+			transition,
+			phase,
+			cleanup,
+			targetCandidate,
+		);
 		logger.info("Committing encryption maintenance phase", {
 			...this.getEncryptionTransitionLogContext(transition, phase),
 			cleanupActions: cleanup.length,
@@ -304,6 +396,11 @@ export class EncryptionMaintenance {
 	async resolveTransitionTargetPaths(
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
+		if (transition.referenceFiles) {
+			this.context.index.getRemoteIndex().files = structuredClone(
+				transition.referenceFiles,
+			);
+		}
 		const logicalPaths = Object.entries(
 			this.context.index.getRemoteIndex().files,
 		)
@@ -327,12 +424,72 @@ export class EncryptionMaintenance {
 			targetEntries,
 			transition.sourceRawPaths,
 		);
+		if (transition.replacement) {
+			const targetPaths = new Set(
+				Object.values(transition.targetRawByLogicalPath),
+			);
+			transition.replacement.preservedRawPaths =
+				transition.replacement.preservedRawPaths.filter(
+					(path) => !targetPaths.has(path),
+				);
+			if (
+				transition.replacement.preservedRawPaths.some((path) =>
+					[...targetPaths].some(
+						(target) =>
+							target.startsWith(`${path}/`) ||
+							path.startsWith(`${target}/`),
+					),
+				)
+			) {
+				throw new Error(
+					"Selected target overlaps a retained raw subtree",
+				);
+			}
+			const preserved = new Set([
+				...transition.replacement.preservedRawPaths,
+				...Object.values(transition.targetRawByLogicalPath),
+			]);
+			const removable = new Set(
+				transition.sourceRawPaths.filter(
+					(path) =>
+						!isPreservedRawPath(
+							path,
+							transition.replacement!.preservedRawPaths,
+						),
+				),
+			);
+			transition.replacement.deletions = planRecursiveDeletes(
+				transition.sourceRawPaths.map((path) => ({
+					path,
+					kind: "file" as const,
+				})),
+				removable,
+				preserved,
+			);
+		}
 		await this.context.persist();
 	}
 
 	async assertTransitionSourceUnchanged(
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
+		if (transition.referenceFiles) {
+			const actual = Object.fromEntries(
+				await this.context.index.buildLocalIndex(),
+			);
+			if (
+				Object.keys(actual).length !==
+					Object.keys(transition.referenceFiles).length ||
+				Object.entries(transition.referenceFiles).some(
+					([path, file]) => actual[path]?.sha256 !== file.sha256,
+				)
+			) {
+				throw new Error(
+					"Local encryption reference changed during replacement",
+				);
+			}
+			return;
+		}
 		const snapshots = await this.context.index.getRemoteRawFileSnapshots();
 		const current = new Map(
 			snapshots.map((snapshot) => [snapshot.path, snapshot.fingerprint]),
@@ -386,6 +543,10 @@ export class EncryptionMaintenance {
 		paths: string[],
 		fingerprints: Record<string, string>,
 	): Promise<void> {
+		if (this.context.index.getMaintenance()?.replacement) {
+			await this.context.persist();
+			return;
+		}
 		const transition = this.context.getTransition();
 		logger.info("Persisting guarded encryption cleanup actions", {
 			...(transition
@@ -435,6 +596,13 @@ export class EncryptionMaintenance {
 		paths: string[],
 		expectedFingerprints: Record<string, string> = {},
 	): Promise<void> {
+		if (this.context.index.getMaintenance()?.replacement) {
+			await cleanupEncryptionReplacement(
+				this.context,
+				this.cleanupSourceCodec,
+			);
+			return;
+		}
 		await this.controller.cleanupRawPaths(paths, expectedFingerprints);
 	}
 

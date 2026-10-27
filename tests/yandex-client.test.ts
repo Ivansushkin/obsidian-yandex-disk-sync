@@ -5,6 +5,7 @@ import { IndexManager } from "../src/sync/canonical/manager";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
 import { MemoryDisk, bytes } from "./helpers/sync-flow";
+import { deferred } from "./helpers/deferred";
 
 import {
 	createClient,
@@ -207,6 +208,66 @@ test("folder observations skip mkdir until delete or connection changes invalida
 		}
 		await client.createFolderRecursive("vault");
 		assert.equal(puts, expectedPuts, change);
+	}
+});
+
+test("parallel folder preparation preserves depth barriers and joins failed siblings", async () => {
+	for (const fail of [false, true]) {
+		const disk = new MemoryDisk();
+		disk.install();
+		const client = createClient();
+		const siblings = deferred<boolean>();
+		const gate = deferred();
+		let settled = false;
+		disk.beforeRequest = async (method, endpoint, path) => {
+			if (method !== "PUT" || !endpoint.endsWith("/resources")) {
+				return;
+			}
+			if (path === "vault/A") {
+				await gate.promise;
+			}
+			if (path === "vault/B") {
+				siblings.resolve(true);
+				if (fail) {
+					throw new Error("synthetic folder failure");
+				}
+			}
+			if (path.endsWith("/child")) {
+				assert.equal(disk.folders.has("vault/A"), true);
+				assert.equal(disk.folders.has("vault/B"), true);
+			}
+		};
+		const operation = client
+			.ensureFoldersExist(["vault/A/child", "vault/B/child"], 2)
+			.then(
+				() => null,
+				(error: unknown) => error,
+			)
+			.finally(() => {
+				settled = true;
+			});
+		const timeout = setTimeout(() => siblings.resolve(false), 1000);
+		let overlapped: boolean;
+		try {
+			overlapped = await siblings.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(settled, false);
+			assert.equal(disk.folders.has("vault/A/child"), false);
+		} finally {
+			clearTimeout(timeout);
+			gate.resolve();
+		}
+		const error = await operation;
+		assert.equal(overlapped, true);
+		if (fail) {
+			assert.match(String(error), /folder failure/);
+		} else {
+			assert.equal(error, null);
+		}
+		for (const folder of ["A", "B"]) {
+			assert.equal(disk.folders.has(`vault/${folder}/child`), !fail);
+		}
+		assert.equal(disk.files.size, 0);
 	}
 });
 
@@ -610,10 +671,7 @@ test("download budget includes metadata, fresh links and completed network failu
 
 test("stalled remote reads expire without retrying an unresolved native request", async () => {
 	for (const stage of ["link", "bytes", "metadata"] as const) {
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
+		const gate = deferred();
 		let blockedRequests = 0;
 		requestGlobal.__obsidianRequestUrl = async (params) => {
 			const link = params.url.includes("/resources/download?");
@@ -623,7 +681,7 @@ test("stalled remote reads expire without retrying an unresolved native request"
 				(stage === "bytes" && !link)
 			) {
 				blockedRequests++;
-				await gate;
+				await gate.promise;
 			}
 			return link
 				? response(200, { href: "https://synthetic.invalid/content" })
@@ -656,7 +714,7 @@ test("stalled remote reads expire without retrying an unresolved native request"
 			assert.equal(blockedRequests, 1);
 		} finally {
 			clearTimeout(safetyTimer);
-			release();
+			gate.resolve();
 			delete requestGlobal.__obsidianRequestUrl;
 		}
 	}
@@ -683,6 +741,64 @@ test("unknown response decoding failure stops snapshot capture without transport
 		(error) => error === cause,
 	);
 	assert.equal(requests, 1);
+});
+
+test("metadata collection joins failures and gives revocation precedence", async () => {
+	for (const revoked of [false, true]) {
+		const client = createClient();
+		const entered = deferred();
+		const release = deferred();
+		const first = new Error("first metadata failure");
+		const later = new Error("later metadata failure");
+		const revocation = new Error("metadata lifetime revoked");
+		let started = 0;
+		let finished = false;
+		let invalid = false;
+		client.getLogicalResource = async (path) => {
+			if (++started === 4) {
+				entered.resolve();
+			}
+			await entered.promise;
+			if (path === "vault/1.md") {
+				throw first;
+			}
+			await release.promise;
+			if (path === "vault/0.md") {
+				throw later;
+			}
+			return fileResource(path);
+		};
+		const operation = client
+			.collectLogicalMetadata(
+				Array.from({ length: 6 }, (_, i) => `vault/${i}.md`),
+				4,
+				async () => {},
+				{
+					assertCurrent: () => {
+						if (invalid) {
+							throw revocation;
+						}
+					},
+				},
+			)
+			.finally(() => {
+				finished = true;
+			});
+		const result = assert.rejects(
+			operation,
+			(error) => error === (revoked ? revocation : first),
+		);
+		try {
+			await entered.promise;
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(started, 4, "failure stops new admissions");
+			assert.equal(finished, false, "admitted reads are joined");
+			invalid = revoked;
+		} finally {
+			release.resolve();
+		}
+		await result;
+	}
 });
 
 test("paginated inventory rejects a changing total instead of accepting a partial source", async () => {
@@ -755,4 +871,31 @@ test("paginated inventory rejects a changing total instead of accepting a partia
 		0,
 		"Directory replacement cannot admit a partial listing",
 	);
+
+	// A complete listing is a positive observation, never an absence proof.
+	const missingDisk = new MemoryDisk();
+	missingDisk.files.set("vault/present.md", bytes("present"));
+	missingDisk.install();
+	let missingGets = 0;
+	missingDisk.beforeRequest = async (method, endpoint, path) => {
+		if (
+			method === "GET" &&
+			endpoint.endsWith("/resources") &&
+			path === "vault/missing.md"
+		) {
+			missingGets++;
+		}
+	};
+	const observed = new Map<string, YandexResource | null>();
+	await createClient().collectLogicalMetadata(
+		["vault/present.md", "vault/missing.md"],
+		4,
+		async (path, resource) => {
+			observed.set(path, resource);
+		},
+		{ knownDirectoryPages: new Map([["vault", 1]]) },
+	);
+	assert.equal(missingGets, 1);
+	assert.equal(observed.get("vault/missing.md"), null);
+	assert.equal(observed.get("vault/present.md")?.type, "file");
 });

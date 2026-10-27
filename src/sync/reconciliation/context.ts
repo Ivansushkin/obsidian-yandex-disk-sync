@@ -7,6 +7,7 @@ import * as fileOperations from "../files/operations";
 import * as remoteMoves from "../files/remote-moves";
 import { ConflictResolver } from "./conflicts";
 export interface Dependencies {
+	createReadLifetimeGuard: () => () => void;
 	indexManager: IndexManager;
 	indexSaveCallback: IndexSaveCallback | null;
 	realtimeGuardValidationToken: string | undefined;
