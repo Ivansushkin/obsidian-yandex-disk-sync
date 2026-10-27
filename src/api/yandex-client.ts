@@ -253,6 +253,7 @@ export class YandexDiskClient {
 		path: string,
 		expectedResource?: YandexResource,
 		budget = this.createDownloadBudget(),
+		retryContentMismatch = true,
 	): Promise<StableRawFileSnapshot | null> {
 		const startedAt = Date.now();
 		const before =
@@ -279,6 +280,14 @@ export class YandexDiskClient {
 		const afterFingerprint = this.getContentFingerprint(after);
 		if (!matchingFingerprint || !afterFingerprint) {
 			throw new Error("Remote service file changed while being read");
+		}
+		if (after.sha256 && (await computeSha256(raw)) !== after.sha256) {
+			if (retryContentMismatch) {
+				return this.downloadStableRawFile(path, before, budget, false);
+			}
+			throw new Error(
+				"Remote service file content hash does not match downloaded bytes",
+			);
 		}
 		logger.debug("Stable raw service-file read completed", {
 			durationMs: Date.now() - startedAt,

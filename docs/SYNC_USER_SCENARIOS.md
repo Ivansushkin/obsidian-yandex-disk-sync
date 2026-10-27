@@ -773,3 +773,15 @@ MULTI-004–008/013–017, ENC-001–014 и ERROR-001–003. Уже submitted so
 | ID        | Приоритет | Сценарий                                                                 | Ожидаемый canonical/local/physical результат                                                                                                                                                                                                                              | Проверка                                                                                                                                                                        |
 | --------- | --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TRANS-050 | P0        | Disable/rotate/recovery встречает пустое raw дерево от предыдущего codec | Полный inventory без file descendants разрешает оставить пустые directories без decode/delete; target bytes, canonical, baseline и queues сходятся. Нечитаемые file descendants не считаются пустотой: transition остаётся в cleanup, файл не удаляется, success запрещён | auto: `disable cleanup ignores empty old-mode directories without treating undecodable files as empty`; extended `authoritative cleanup resumes after restart in its new epoch` |
+
+## Устаревший ответ скачивания индекса
+
+**INDEX-003 (P0).** После edit/rename на одном устройстве metadata индекса
+актуальны, но download возвращает прежние bytes. При наличии server SHA-256
+raw read отвергает несовпадающее тело и один раз получает новую link с повторной
+проверкой metadata в прежнем budget и с исходной content identity. Верный повтор
+разрешает обычное завершение canonical/local/physical rename; повторная ошибка
+сохраняет durable work и файлы без ACK.
+
+Проверка: auto: `stable raw reads retry stale bytes once without accepting a mismatched body`;
+manual-required: edit/rename на mobile Obsidian с реальным Yandex Disk.

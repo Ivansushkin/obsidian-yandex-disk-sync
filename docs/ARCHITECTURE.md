@@ -112,7 +112,11 @@ Service content identity: SHA-256 → MD5 → server modified + size; `resource_
 helper и принимают сохранённые SHA-256, MD5, resource ID и modified без migration.
 Raw canonical/lock/manifest и logical user paths не смешиваются.
 
-Stable raw/logical read проверяет metadata до и после download. Invocation-owned
+Stable raw/logical read проверяет metadata до и после download и связывает bytes
+с server SHA-256, когда он доступен. Raw read при несовпадении хеша один раз заново
+получает download link и проверяет metadata в прежнем budget, сохраняя исходную
+content identity; повторное несовпадение или смена версии — ошибка.
+Invocation-owned
 `CanonicalReadSession` хранит только собственный verified snapshot; caller не может
 seed-ить её desired index. Fresh scope/root/lock/hash checks обязательны на каждом
 reuse. Matching SHA-256/MD5 позволяет reuse bytes; no-hash/drift требует нового stable

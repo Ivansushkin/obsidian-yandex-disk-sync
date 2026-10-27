@@ -6,6 +6,7 @@ import type { VaultAdapter } from "../src/api/vault-adapter";
 import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
 import { MemoryDisk, bytes } from "./helpers/sync-flow";
 import { deferred } from "./helpers/deferred";
+import { computeSha256 } from "../src/utils/hash-utils";
 
 import {
 	createClient,
@@ -98,7 +99,8 @@ class StableReadClient extends YandexDiskClient {
 
 test("stable raw reads require unchanged content identity with optional caller observations", async () => {
 	const same = fileResource("vault/index", { md5: "same" });
-	const stronger = { ...same, sha256: "strong" };
+	const sha256 = await computeSha256(new Uint8Array([1, 2, 3, 4]).buffer);
+	const stronger = { ...same, sha256 };
 	const changed = { ...same, md5: "after" };
 	const unprovable = {
 		...same,
@@ -130,9 +132,53 @@ test("stable raw reads require unchanged content identity with optional caller o
 		} else {
 			const snapshot = await read;
 			assert.ok(snapshot, label);
-			assert.equal(snapshot.fingerprint, "sha256:strong", label);
+			assert.equal(snapshot.fingerprint, `sha256:${sha256}`, label);
 			assert.equal(snapshot.raw.byteLength, 4, label);
 		}
+	}
+});
+
+test("stable raw reads retry stale bytes once without accepting a mismatched body", async () => {
+	for (const [failures, changed] of [
+		[1, false],
+		[2, false],
+		[1, true],
+	] as const) {
+		const disk = new MemoryDisk();
+		const current = bytes("current index");
+		disk.files.set("vault/index", current);
+		let downloads = 0;
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			const result = await disk.request(params);
+			if (
+				new URL(params.url).pathname === "/download" &&
+				++downloads <= failures
+			) {
+				return { ...result, arrayBuffer: bytes("previous index") };
+			}
+			if (
+				changed &&
+				downloads === 1 &&
+				params.url.includes("/resources?")
+			) {
+				disk.files.set("vault/index", bytes("successor index"));
+			}
+			return result;
+		};
+		const read = createClient().downloadStableRawFile("vault/index");
+		if (failures === 1 && !changed) {
+			assert.deepEqual((await read)?.raw, current);
+		} else {
+			await assert.rejects(
+				read,
+				changed ? /changed while being read/ : /content hash/,
+			);
+		}
+		assert.equal(downloads, 2);
+		assert.deepEqual(
+			disk.files.get("vault/index"),
+			changed ? bytes("successor index") : current,
+		);
 	}
 });
 
