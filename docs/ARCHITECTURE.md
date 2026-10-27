@@ -279,6 +279,19 @@ Force/encryption foreground reservation охватывает промежутк�
 сессиями. Success появляется после verification и coherent persistence; idle не
 доказывает отсутствие deferred work на других устройствах.
 
+Настройки применяют одну UI-политику поверх существующих activity sources: startup/full,
+realtime, configuration update, Force, backup и encryption отключают действия и поля.
+Собственные ограничения компонентов сохраняются после busy. Loader и `aria-busy`
+принадлежат выполняемому действию, включая повторное открытие экрана; обновления
+прогресса не пересоздают поля. Весь раздел логов доступен во время работы, кроме
+собственных migration/lifecycle ограничений. Logging patches идут через общую
+persistence queue без remote recheck и не инвалидируют backup context.
+
+Создание ручного backup и очистка журнала требуют явного подтверждения. Закрытие
+диалога означает отказ; UI повторно проверяет lifecycle, конфигурацию и busy перед
+запуском. Парольный submit допускает одну проверку; ответ закрытого окна не продолжает
+workflow. Это UI-admission, а не новый coordinator или persisted operation.
+
 `OperationFailure` хранит cause только в памяти; наружу идёт очищенная summary с
 этапом и безопасным code. Root/canonical/local identity/mandatory backup ошибки имеют
 приоритет над вложенной сетью. Signed-link 404 не доказывает absence API resource.

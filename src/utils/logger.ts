@@ -235,6 +235,8 @@ export class Logger {
 		(() => Record<string, unknown> | undefined) | null = null;
 
 	private buffer: string[] = [];
+	private retryEntries: string[] = [];
+	private clearGeneration = 0;
 	private flushTimeout: ReturnType<typeof setTimeout> | null = null;
 	private flushChain: Promise<void> = Promise.resolve();
 
@@ -373,10 +375,10 @@ export class Logger {
 			globalThis.clearTimeout(this.flushTimeout);
 			this.flushTimeout = null;
 		}
-		this.flushChain = this.flushChain.then(
-			async () => await this.flushBufferedEntries(),
-			async () => await this.flushBufferedEntries(),
-		);
+		const entries = this.buffer.splice(0);
+		const generation = this.clearGeneration;
+		const write = () => this.flushBufferedEntries(entries, generation);
+		this.flushChain = this.flushChain.then(write, write);
 		await this.flushChain;
 	}
 
@@ -384,38 +386,49 @@ export class Logger {
 	 * Serialize file writes so overlapping timers cannot overwrite newer
 	 * diagnostic entries with an older read-modify-write snapshot.
 	 */
-	private async flushBufferedEntries(): Promise<void> {
-		if (!this.app) {
+	private async flushBufferedEntries(
+		entries: string[],
+		generation: number,
+	): Promise<void> {
+		if (generation === this.clearGeneration) {
+			entries = [...this.retryEntries, ...entries];
+			this.retryEntries = [];
+		}
+		if (!this.app || entries.length === 0) {
 			return;
 		}
 		const adapter = this.app.vault.adapter;
 		const logPath = this.getResolvedLogPath();
 
-		while (this.buffer.length > 0) {
-			const entries = this.buffer.splice(0, this.buffer.length);
-			const content = entries.join("\n") + "\n";
-			try {
-				const exists = await adapter.exists(logPath);
-				if (!exists) {
-					await this.ensureDirectory(logPath);
-					await adapter.write(logPath, this.trimLog(content));
-					continue;
-				}
-				const stat = await adapter.stat(logPath);
-				const contentSize = new TextEncoder().encode(
-					content,
-				).byteLength;
-				if (stat && stat.size + contentSize <= this.maxFileSize) {
-					await adapter.append(logPath, content);
-					continue;
-				}
-				const existing = await adapter.read(logPath);
-				await adapter.write(logPath, this.trimLog(existing + content));
-			} catch (e) {
-				this.buffer.unshift(...entries);
-				console.error(`${LOG_PREFIX} Failed to write log file:`, e);
+		const content = entries.join("\n") + "\n";
+		try {
+			const exists = await adapter.exists(logPath);
+			if (!exists) {
+				await this.ensureDirectory(logPath);
+				await adapter.write(logPath, this.trimLog(content));
 				return;
 			}
+			const stat = await adapter.stat(logPath);
+			const contentSize = new TextEncoder().encode(content).byteLength;
+			if (stat && stat.size + contentSize <= this.maxFileSize) {
+				await adapter.append(logPath, content);
+				return;
+			}
+			const existing = await adapter.read(logPath);
+			await adapter.write(logPath, this.trimLog(existing + content));
+		} catch (e) {
+			if (generation === this.clearGeneration) {
+				this.retryEntries = entries;
+			}
+			console.error(
+				`${LOG_PREFIX} Failed to write log file:`,
+				sanitizeString(
+					e instanceof Error
+						? describeFailureCause(e)
+						: "Log write failed",
+				),
+			);
+			return;
 		}
 	}
 
@@ -466,13 +479,8 @@ export class Logger {
 		}
 		const adapter = this.app.vault.adapter;
 		const logPath = this.getResolvedLogPath();
-		try {
-			const exists = await adapter.exists(logPath);
-			if (exists) {
-				return await adapter.read(logPath);
-			}
-		} catch (e) {
-			console.error(`${LOG_PREFIX} Failed to read log file:`, e);
+		if (await adapter.exists(logPath)) {
+			return sanitizeString(await adapter.read(logPath));
 		}
 		return "";
 	}
@@ -481,29 +489,24 @@ export class Logger {
 	 * Clear the log file and buffer.
 	 */
 	async clearLogs(): Promise<void> {
+		this.clearGeneration++;
 		this.buffer = [];
+		this.retryEntries = [];
 		if (this.flushTimeout !== null) {
 			globalThis.clearTimeout(this.flushTimeout);
 			this.flushTimeout = null;
 		}
-		if (!this.app) {
-			return;
-		}
-		this.flushChain = this.flushChain.then(async () => {
+		const clear = async () => {
 			if (!this.app) {
 				return;
 			}
 			const adapter = this.app.vault.adapter;
 			const logPath = this.getResolvedLogPath();
-			try {
-				const exists = await adapter.exists(logPath);
-				if (exists) {
-					await adapter.write(logPath, "");
-				}
-			} catch (e) {
-				console.error(`${LOG_PREFIX} Failed to clear log file:`, e);
+			if (await adapter.exists(logPath)) {
+				await adapter.write(logPath, "");
 			}
-		});
+		};
+		this.flushChain = this.flushChain.then(clear, clear);
 		await this.flushChain;
 	}
 

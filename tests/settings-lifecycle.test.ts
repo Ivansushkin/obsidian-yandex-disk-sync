@@ -80,9 +80,29 @@ test("runtime settings preserve admitted storage and durable state without remot
 			assert.equal(scheduler["intervalId"], timer);
 			assert.equal(a.engine.getState().status, "idle");
 		}
+
 		assert.equal(plugin.settings.maxConcurrency, 7);
 		assert.deepEqual(disk.files, remote);
 		assert.deepEqual(a.index.captureLocalCausalState(), local);
+		disk.beforeRequest = undefined;
+		const entered = deferred();
+		const release = deferred();
+		disk.beforeRequest = async () => {
+			entered.resolve();
+			await release.promise;
+		};
+		const syncing = a.full();
+		await entered.promise;
+		try {
+			assert.equal(plugin.isConfigurationBusy(), true);
+			await update({ enableDebugLogging: true });
+			assert.equal(scheduler["intervalId"], timer);
+		} finally {
+			disk.beforeRequest = undefined;
+			release.resolve();
+		}
+		await syncing;
+		assert.equal(plugin.settings.enableDebugLogging, true);
 		plugin["setHistoricalBlock"]("synthetic existing block");
 		await update({ maxConcurrency: 8 });
 		assert.equal(

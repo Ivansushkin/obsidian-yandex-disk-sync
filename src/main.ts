@@ -557,7 +557,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				() => ({
 					sync: this.syncEngine.getState(),
 					force: this.forceSyncController?.getState() ?? null,
-					foreground: this.foregroundOperation,
+					foreground: this.getForegroundOperation(),
 					fullSyncInProgress: this.isFullSyncInProgress(),
 					syncUnavailable: this.isConfigurationBusy(),
 				}),
@@ -1658,8 +1658,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	onSyncActivityChange(callback: () => void): () => void {
 		this.manualActivityListeners.add(callback);
 		const unsubscribe = this.syncEngine.onStateChange(callback);
+		const unsubscribeForce =
+			this.getForceSyncController().subscribe(callback);
 		return () => {
 			unsubscribe();
+			unsubscribeForce();
 			this.manualActivityListeners.delete(callback);
 		};
 	}
@@ -1992,7 +1995,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private configurationUpdatePending = false;
-	private foregroundOperation: "encryption" | "backup" | null = null;
+	private foregroundOperation:
+		"encryption" | "encryption-password" | "backup" | null = null;
 	private unloaded = false;
 	private storageBinding!: StorageBindingController;
 
@@ -2085,9 +2089,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		);
 	}
 
+	/** Expose the existing foreground owner for settings progress presentation. */
+	getForegroundOperation(): "encryption" | "backup" | null {
+		return this.foregroundOperation === "encryption-password"
+			? "encryption"
+			: this.foregroundOperation;
+	}
+
+	/** Identify the initiating encryption control when settings are reopened. */
+	isEncryptionPasswordChangeInProgress(): boolean {
+		return this.foregroundOperation === "encryption-password";
+	}
+
 	/** Reserve manual preflight through completion without nesting coordinator sessions. */
 	private async withForegroundOperation<T>(
-		kind: "encryption" | "backup",
+		kind: "encryption" | "encryption-password" | "backup",
 		operation: () => Promise<T>,
 	): Promise<T> {
 		this.assertForceIdle();
@@ -2289,40 +2305,43 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Rotate the encryption password and re-upload all files with a new key.
 	 */
 	async rotateEncryptionPassword(newPassword: string): Promise<void> {
-		return await this.withForegroundOperation("encryption", async () => {
-			this.assertForceIdle();
-			if (this.migrationBlockReason) {
-				throw new LegacyIndexFormatError();
-			}
-			const choice = await this.confirmOperationBackup();
-			if (choice === "cancel") {
-				return;
-			}
-			if (this.unloaded) {
-				throw new Error("Plugin was unloaded");
-			}
-			this.beginSyncNotice(
-				t("notice.encryption_password_rotating"),
-				true,
-				t("notice.encryption_replacement_warning"),
-			);
-			try {
-				await this.syncEngine.runExclusiveMaintenance(async () => {
-					await this.encryptionWorkflow.rotateEncryptionPasswordNow(
-						newPassword,
-						choice,
-					);
-				});
-				await this.restoreAutomationAfterEncryption();
-				this.finishSyncNotice(
-					t("notice.encryption_password_changed"),
-					5000,
+		return await this.withForegroundOperation(
+			"encryption-password",
+			async () => {
+				this.assertForceIdle();
+				if (this.migrationBlockReason) {
+					throw new LegacyIndexFormatError();
+				}
+				const choice = await this.confirmOperationBackup();
+				if (choice === "cancel") {
+					return;
+				}
+				if (this.unloaded) {
+					throw new Error("Plugin was unloaded");
+				}
+				this.beginSyncNotice(
+					t("notice.encryption_password_rotating"),
+					true,
+					t("notice.encryption_replacement_warning"),
 				);
-			} catch (error) {
-				this.finishEncryptionError(error);
-				throw error;
-			}
-		});
+				try {
+					await this.syncEngine.runExclusiveMaintenance(async () => {
+						await this.encryptionWorkflow.rotateEncryptionPasswordNow(
+							newPassword,
+							choice,
+						);
+					});
+					await this.restoreAutomationAfterEncryption();
+					this.finishSyncNotice(
+						t("notice.encryption_password_changed"),
+						5000,
+					);
+				} catch (error) {
+					this.finishEncryptionError(error);
+					throw error;
+				}
+			},
+		);
 	}
 
 	/**

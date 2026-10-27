@@ -57,6 +57,7 @@ export class BackupManager {
 	private settings: YandexDiskSyncSettings;
 	private readonly pluginVersion: string;
 	private configurationGeneration = 0;
+	private configurationSnapshot = "";
 
 	constructor(
 		yandexClient: YandexDiskClient,
@@ -66,7 +67,7 @@ export class BackupManager {
 	) {
 		this.yandexClient = yandexClient;
 		this.vaultAdapter = vaultAdapter;
-		this.settings = settings;
+		this.updateSettings(settings);
 		this.pluginVersion = pluginVersion;
 	}
 
@@ -411,7 +412,25 @@ export class BackupManager {
 	 * Update settings
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
-		this.configurationGeneration++;
+		const contextKeys = [
+			"yandexTokenSecret",
+			"remotePath",
+			"enableEncryption",
+			"encryptionPassword",
+			"encryptionSalt",
+			"encryptionRevision",
+			"encryptionProfileId",
+			"syncPatterns",
+			"excludePatterns",
+			"syncDotObsidian",
+		] as const;
+		const snapshot = JSON.stringify(
+			contextKeys.map((key) => settings[key]),
+		);
+		if (snapshot !== this.configurationSnapshot) {
+			this.configurationGeneration++;
+			this.configurationSnapshot = snapshot;
+		}
 		this.settings = settings;
 	}
 

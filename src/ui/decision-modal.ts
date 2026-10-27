@@ -7,7 +7,12 @@ export class DecisionModal<T extends string | null> extends Modal {
 		app: App,
 		private readonly title: string,
 		private readonly description: string,
-		private readonly choices: { label: string; value: T }[],
+		private readonly choices: {
+			label: string;
+			value: T;
+			cta?: boolean;
+			warning?: boolean;
+		}[],
 		private readonly fallback: T,
 		private readonly resolve: (value: T) => void,
 	) {
@@ -19,12 +24,20 @@ export class DecisionModal<T extends string | null> extends Modal {
 		const row = new Setting(this.contentEl);
 		row.settingEl.addClass("sync-modal-actions");
 		for (const choice of this.choices) {
-			row.addButton((button) =>
-				button.setButtonText(choice.label).onClick(() => {
+			row.addButton((button) => {
+				button.setButtonText(choice.label);
+				if (choice.cta) {
+					button.setCta();
+				}
+				if (choice.warning) {
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
+					button.setWarning();
+				}
+				button.onClick(() => {
 					this.finish(choice.value);
 					this.close();
-				}),
-			);
+				});
+			});
 		}
 	}
 	onClose(): void {

@@ -19,8 +19,19 @@ export class BackupListModal extends Modal {
 	private renderGeneration = 0;
 	private configurationGeneration: number;
 	private backups: BackupInfo[] = [];
+	private downloadButtons: HTMLButtonElement[] = [];
+	private downloading = false;
+	private unsubscribe: (() => void) | null = null;
 
-	constructor(app: App, backupManager: BackupManager) {
+	constructor(
+		app: App,
+		backupManager: BackupManager,
+		private readonly activity?: {
+			isUnavailable(): boolean;
+			isCurrent(): boolean;
+			subscribe(update: () => void): () => void;
+		},
+	) {
 		super(app);
 		this.backupManager = backupManager;
 		this.configurationGeneration =
@@ -30,14 +41,28 @@ export class BackupListModal extends Modal {
 
 	async onOpen(): Promise<void> {
 		this.closed = false;
+		this.downloading = false;
+		this.unsubscribe =
+			this.activity?.subscribe(() => this.updateActivity()) ?? null;
 		const { contentEl } = this;
 		contentEl.empty();
 
 		await this.renderContent();
 	}
 
+	private updateActivity(): void {
+		for (const button of this.downloadButtons) {
+			button.disabled =
+				this.downloading || (this.activity?.isUnavailable() ?? false);
+		}
+	}
+
 	private assertCurrentSelection(generation = this.renderGeneration): void {
-		if (this.closed || generation !== this.renderGeneration) {
+		if (
+			this.closed ||
+			generation !== this.renderGeneration ||
+			this.activity?.isCurrent() === false
+		) {
 			throw new Error("Backup list was closed");
 		}
 		this.backupManager.assertConfigurationGeneration(
@@ -47,6 +72,7 @@ export class BackupListModal extends Modal {
 
 	private async renderContent(): Promise<void> {
 		const generation = ++this.renderGeneration;
+		this.downloadButtons = [];
 		const { contentEl } = this;
 		contentEl.empty();
 
@@ -75,9 +101,21 @@ export class BackupListModal extends Modal {
 			const actions = contentEl.createDiv({ cls: "sync-modal-actions" });
 			const retryButton = actions.createEl("button", {
 				cls: "mod-cta",
-				text: t("settings.backup_button"),
+				text: t("force.retry"),
 			});
-			retryButton.onclick = () => this.renderContent();
+			this.downloadButtons.push(retryButton);
+			this.updateActivity();
+			retryButton.onclick = () => {
+				if (
+					retryButton.disabled ||
+					this.closed ||
+					this.activity?.isUnavailable()
+				) {
+					return;
+				}
+				retryButton.disabled = true;
+				void this.renderContent();
+			};
 
 			return;
 		}
@@ -119,24 +157,33 @@ export class BackupListModal extends Modal {
 				cls: "mod-cta backup-download-btn",
 				text: t("backup_list.download"),
 			});
+			this.downloadButtons.push(downloadBtn);
 
 			downloadBtn.onclick = async () => {
 				await this.handleDownload(backup, downloadBtn);
 			};
 		}
+		this.updateActivity();
 	}
 
 	private async handleDownload(
 		backup: BackupInfo,
 		button: HTMLButtonElement,
 	): Promise<void> {
-		if (button.disabled) {
+		if (
+			button.disabled ||
+			this.downloading ||
+			this.activity?.isUnavailable()
+		) {
 			return;
 		}
 		const generation = this.renderGeneration;
 		try {
 			this.assertCurrentSelection(generation);
-			button.disabled = true;
+			this.downloading = true;
+			this.updateActivity();
+			button.setAttribute("aria-busy", "true");
+			button.addClass("sync-button-active");
 			button.setText(t("settings.backup_in_progress"));
 
 			new Notice(t("notice.backup_download_started"));
@@ -152,7 +199,11 @@ export class BackupListModal extends Modal {
 				}
 				this.assertCurrentSelection(generation);
 				const password = await this.promptBackupPassword();
-				if (!password || this.closed) {
+				if (
+					!password ||
+					this.closed ||
+					this.activity?.isUnavailable()
+				) {
 					return;
 				}
 				this.assertCurrentSelection(generation);
@@ -195,7 +246,10 @@ export class BackupListModal extends Modal {
 			new Notice(message);
 		} finally {
 			if (!this.closed && generation === this.renderGeneration) {
-				button.disabled = false;
+				this.downloading = false;
+				this.updateActivity();
+				button.setAttribute("aria-busy", "false");
+				button.removeClass("sync-button-active");
 				button.setText(t("backup_list.download"));
 			}
 		}
@@ -231,6 +285,9 @@ export class BackupListModal extends Modal {
 
 	onClose(): void {
 		this.closed = true;
+		this.unsubscribe?.();
+		this.unsubscribe = null;
+		this.downloadButtons = [];
 		this.renderGeneration++;
 		const { contentEl } = this;
 		contentEl.empty();

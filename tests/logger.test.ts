@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { App } from "obsidian";
 import { DEFAULT_LOG_RELATIVE_PATH, Logger } from "../src/utils/logger";
+import { deferred } from "./helpers/deferred";
 
 function createLogger(maxFileSize?: number) {
 	const files = new Map<string, string>();
@@ -51,6 +52,7 @@ function createLogger(maxFileSize?: number) {
 	});
 	return {
 		instance,
+		adapter,
 		contents: () =>
 			files.get(`.custom-config/${DEFAULT_LOG_RELATIVE_PATH}`) ?? "",
 	};
@@ -128,6 +130,46 @@ test("logger writes correlated sanitized diagnostics to plugin data", async () =
 	}
 });
 
+test("clearing during an admitted flush discards old entries and preserves later entries", async () => {
+	const { instance, adapter, contents } = createLogger();
+	const entered = deferred();
+	const release = deferred();
+	const write = adapter.write.bind(adapter);
+	adapter.write = async (path, content) => {
+		if (content.includes("before-clear")) {
+			entered.resolve();
+			await release.promise;
+		}
+		await write(path, content);
+	};
+	instance.info("before-clear");
+	const flushing = instance.flush();
+	await entered.promise;
+	const clearing = instance.clearLogs();
+	instance.info("after-clear");
+	release.resolve();
+	await Promise.all([flushing, clearing]);
+	await instance.flush();
+	assert.doesNotMatch(contents(), /before-clear/);
+	assert.match(contents(), /after-clear/);
+});
+
+test("clear failure is reported and does not prevent later log writes", async () => {
+	const { instance, adapter, contents } = createLogger();
+	instance.info("retained");
+	await instance.flush();
+	const write = adapter.write.bind(adapter);
+	adapter.write = async () => {
+		throw new Error("synthetic clear failure");
+	};
+	await assert.rejects(instance.clearLogs(), /synthetic clear failure/);
+	adapter.write = write;
+	instance.info("later-entry");
+	await instance.flush();
+	assert.match(contents(), /retained/);
+	assert.match(contents(), /later-entry/);
+});
+
 test("logger serializes concurrent flushes without losing entries", async () => {
 	const { instance, contents } = createLogger();
 
@@ -143,6 +185,34 @@ test("logger serializes concurrent flushes without losing entries", async () => 
 			1,
 		);
 	}
+});
+
+test("failed log batches retain FIFO before queued writes and rotation", async () => {
+	const { instance, adapter, contents } = createLogger(100);
+	instance.configure({ baseContext: {}, contextProvider: () => undefined });
+	const entered = deferred();
+	const release = deferred();
+	const write = adapter.write.bind(adapter);
+	let first = true;
+	adapter.write = async (path, content) => {
+		if (first) {
+			first = false;
+			entered.resolve();
+			await release.promise;
+			throw new Error("synthetic write failure");
+		}
+		await write(path, content);
+	};
+	instance.info("old-entry");
+	const older = instance.flush();
+	await entered.promise;
+	instance.info("new-entry");
+	const newer = instance.flush();
+	release.resolve();
+	await Promise.all([older, newer]);
+	await instance.flush();
+	assert.match(contents(), /new-entry/);
+	assert.doesNotMatch(contents(), /old-entry/);
 });
 
 test("logger rotates by UTF-8 byte size and keeps newest entries", async () => {

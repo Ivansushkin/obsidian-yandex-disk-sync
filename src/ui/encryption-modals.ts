@@ -1,5 +1,6 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import { t } from "../i18n";
+import { createSyncFailure, formatOperationFailure } from "../sync/errors";
 
 /** Resolve a modal promise exactly once and provide a close fallback. */
 abstract class ResolvableModal<T> extends Modal {
@@ -21,6 +22,10 @@ abstract class ResolvableModal<T> extends Modal {
 		this.resolveResult(value);
 	}
 
+	protected isSettled(): boolean {
+		return this.resolved;
+	}
+
 	onClose(): void {
 		this.finish(this.closeFallback);
 		this.contentEl.empty();
@@ -32,6 +37,7 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 	private passwordInput!: HTMLInputElement;
 	private confirmInput: HTMLInputElement | null = null;
 	private errorEl: HTMLElement | null = null;
+	private submitting = false;
 
 	constructor(app: App, resolve: (value: string | null) => void) {
 		super(app, resolve, null);
@@ -79,19 +85,63 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 		onSubmit: (password: string) => boolean | Promise<boolean>,
 	): void {
 		const setting = new Setting(this.contentEl)
-			.addButton((button) =>
+			.addButton((button) => {
 				button
 					.setButtonText(buttonText)
 					.setCta()
 					.onClick(async () => {
-						const password = this.getPassword();
-						if (!password || !(await onSubmit(password))) {
+						if (this.submitting || this.isSettled()) {
 							return;
 						}
-						this.finish(password);
-						this.close();
-					}),
-			)
+						const password = this.getPassword();
+						if (!password) {
+							return;
+						}
+						this.submitting = true;
+						button.setDisabled(true);
+						button.buttonEl.setAttribute("aria-busy", "true");
+						button.buttonEl.addClass("sync-button-active");
+						this.passwordInput.disabled = true;
+						if (this.confirmInput) {
+							this.confirmInput.disabled = true;
+						}
+						try {
+							const accepted = await onSubmit(password);
+							if (!this.isSettled() && accepted) {
+								this.finish(password);
+								this.close();
+							}
+						} catch (error) {
+							if (!this.isSettled()) {
+								new Notice(
+									formatOperationFailure(
+										createSyncFailure(error, {
+											stage: "preflight",
+											action: "read",
+										}).summary,
+									),
+								);
+							}
+						} finally {
+							this.submitting = false;
+							if (!this.isSettled()) {
+								button.setDisabled(false);
+								button.buttonEl.setAttribute(
+									"aria-busy",
+									"false",
+								);
+								button.buttonEl.removeClass(
+									"sync-button-active",
+								);
+								this.passwordInput.disabled = false;
+								if (this.confirmInput) {
+									this.confirmInput.disabled = false;
+								}
+								this.passwordInput.focus();
+							}
+						}
+					});
+			})
 			.addButton((button) =>
 				button
 					.setButtonText(t("modal.cancel_button"))
@@ -203,7 +253,11 @@ export class VerifyPasswordModal extends PasswordModal {
 		this.renderPasswordFields(false);
 		this.getPasswordInput().oninput = () => this.clearError();
 		this.addSubmitButtons(t("generic.confirm"), async (password) => {
-			if (await this.verifyPassword(password)) {
+			const valid = await this.verifyPassword(password);
+			if (this.isSettled()) {
+				return false;
+			}
+			if (valid) {
 				return true;
 			}
 			this.setError();

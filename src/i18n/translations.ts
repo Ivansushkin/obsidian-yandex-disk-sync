@@ -6,6 +6,17 @@ export type Language = "en" | "ru";
 
 export const translations: Record<Language, Record<string, string>> = {
 	en: {
+		"settings.operation_in_progress": "In progress…",
+		"modal.create_backup_title": "Create a backup?",
+		"modal.create_backup_description":
+			"Create an archive of the local vault files selected by your sync filters, including configuration when enabled. Save to: {path}. Format: {mode}.",
+		"modal.backup_mode_encrypted":
+			"encrypted archive using the current vault password",
+		"modal.backup_mode_plaintext": "unencrypted ZIP archive",
+		"modal.clear_logs_title": "Clear logs?",
+		"modal.clear_logs_description":
+			"Delete the current plugin log. New events will continue to be recorded when file logging is enabled.",
+
 		"force.scope_conflict":
 			"Replacement would affect excluded or protected destination data",
 		"failure.next.force-scope-conflict":
@@ -512,6 +523,17 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"settings.operation_in_progress": "Выполняется…",
+		"modal.create_backup_title": "Создать резервную копию?",
+		"modal.create_backup_description":
+			"Создать архив локальных файлов хранилища, выбранных фильтрами синхронизации, включая конфигурацию, если её синхронизация включена. Сохранить в: {path}. Формат: {mode}.",
+		"modal.backup_mode_encrypted":
+			"зашифрованный архив с текущим паролем хранилища",
+		"modal.backup_mode_plaintext": "ZIP-архив без шифрования",
+		"modal.clear_logs_title": "Очистить журнал?",
+		"modal.clear_logs_description":
+			"Удалить текущий журнал плагина. Новые события продолжат записываться, если включена запись логов в файл.",
+
 		"force.scope_conflict":
 			"Замена затронет исключённые или защищённые данные назначения",
 		"failure.next.force-scope-conflict":

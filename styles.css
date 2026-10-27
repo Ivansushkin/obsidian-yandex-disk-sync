@@ -716,3 +716,15 @@
 		animation: none;
 	}
 }
+
+.encryption-toggle-spinner[hidden] {
+	display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.sync-button-active::before,
+	.force-sync-button-active::before,
+	.encryption-toggle-spinner {
+		animation: none;
+	}
+}

@@ -15,6 +15,7 @@ import type { YandexResource } from "../src/types";
 import { fileResource } from "./helpers/client-fixtures";
 import { DEFAULT_SETTINGS } from "../src/types";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
+import { deferred } from "./helpers/deferred";
 
 class FakeBackupClient {
 	files = new Map<string, ArrayBuffer>();
@@ -140,6 +141,40 @@ test("backup retains its destination and encryption password across a settings u
 	}
 	const opened = await manager.downloadBackup(path, "backup-password");
 	assert.equal(new Uint8Array(opened)[0], 0x50);
+});
+
+test("logging changes preserve an admitted backup download but connection changes invalidate it", async () => {
+	const { manager, client, settings } = createManager();
+	const created = await manager.createBackup();
+	assert.equal(created.success, true);
+	const path = client.uploadedPaths[0]!;
+	const read = client.downloadFile.bind(client);
+	let current = settings;
+	for (const changesConnection of [false, true]) {
+		const entered = deferred();
+		const release = deferred();
+		client.downloadFile = async (selected) => {
+			entered.resolve();
+			await release.promise;
+			return await read(selected);
+		};
+		const downloading = manager.downloadBackup(path);
+		await entered.promise;
+		current = changesConnection
+			? Object.assign(current, { remotePath: "other" })
+			: { ...current, logToFile: true, enableDebugLogging: true };
+		manager.updateSettings(current);
+		release.resolve();
+		if (changesConnection) {
+			await assert.rejects(downloading, /configuration changed/);
+		} else {
+			const opened = await downloading;
+			assert.deepEqual(
+				[...new Uint8Array(opened).slice(0, 2)],
+				[0x50, 0x4b],
+			);
+		}
+	}
 });
 
 test("Force backup proof binds the exact logical and remote snapshots", async () => {

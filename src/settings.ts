@@ -5,6 +5,7 @@ import type { UserSettingsPatch } from "./settings-workflow";
 
 import {
 	App,
+	type BaseComponent,
 	ButtonComponent,
 	Notice,
 	PluginSettingTab,
@@ -18,7 +19,10 @@ import { t } from "./i18n/index";
 import { logger } from "./utils/logger";
 import { createSyncFailure, formatOperationFailure } from "./sync/errors";
 import { BackupListModal } from "./ui/backup-list-modal";
-import { LogViewerModal } from "./ui/log-viewer-modal";
+import {
+	LogViewerModal,
+	clearLogsWithConfirmation,
+} from "./ui/log-viewer-modal";
 import {
 	ChangePasswordModal,
 	ConnectEncryptedVaultModal,
@@ -29,6 +33,7 @@ import {
 import type { BackupInfo, RemoteEncryptionManifest } from "./types";
 import { YandexApiError } from "./api/yandex-client";
 import { UnsupportedHistoricalDataError } from "./compatibility-errors";
+import { DecisionModal } from "./ui/decision-modal";
 import type { ForceDirection } from "./sync/workflows/force-controller";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
@@ -40,7 +45,19 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		button: ButtonComponent;
 		direction: ForceDirection;
 	}[] = [];
-	private controlsEl: HTMLFieldSetElement | null = null;
+	private controlsEl: HTMLElement | null = null;
+	private controls: {
+		component: BaseComponent;
+		diagnostic: boolean;
+		disabled: boolean;
+	}[] = [];
+	private backupButton: ButtonComponent | null = null;
+	private encryptionButton: ButtonComponent | null = null;
+	private clearLogsButton: ButtonComponent | null = null;
+	private clearingLogs = false;
+	private encryptionToggle: ToggleComponent | null = null;
+	private encryptionSpinner: HTMLElement | null = null;
+	private pendingAction = false;
 	private renderGeneration = 0;
 	private displayed = false;
 
@@ -97,30 +114,154 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.activityUnsubscribers = [];
 	}
 
-	/** Update existing controls without rebuilding focused settings on every progress event. */
-	private updateActivity(): void {
-		const busy = this.plugin.isConfigurationBusy();
-		if (this.controlsEl) {
-			this.controlsEl.disabled = busy;
-			this.controlsEl.setAttribute("aria-busy", String(busy));
+	/** Retain each control's own admission restrictions while applying activity locks. */
+	private trackControl(component: BaseComponent, diagnostic = false): void {
+		this.controls.push({
+			component,
+			diagnostic,
+			disabled: component.disabled,
+		});
+		this.updateActivity();
+	}
+
+	private isActionUnavailable(): boolean {
+		return (
+			this.pendingAction ||
+			this.plugin.isConfigurationBusy() ||
+			this.plugin.isPluginUnloaded()
+		);
+	}
+
+	/** Use the same accessible running state for every operation button. */
+	private setButtonActivity(
+		button: ButtonComponent | null,
+		active: boolean,
+		label: string,
+	): void {
+		if (!button) {
+			return;
 		}
-		if (this.syncButton) {
-			const active = this.plugin.isFullSyncInProgress();
-			this.syncButton.setDisabled(busy);
-			this.syncButton.setButtonText(
-				t(active ? "settings.syncing_button" : "settings.sync_button"),
+		button.setButtonText(label);
+		button.buttonEl.setAttribute("aria-busy", String(active));
+		button.buttonEl.toggleClass("sync-button-active", active);
+	}
+
+	/** Update controls in place so progress never replaces focused settings. */
+	private updateActivity(): void {
+		const busy = this.isActionUnavailable();
+		this.controlsEl?.setAttribute("aria-busy", String(busy));
+		for (const { component, diagnostic, disabled } of this.controls) {
+			component.setDisabled(
+				disabled ||
+					this.plugin.isPluginUnloaded() ||
+					(!diagnostic && busy),
 			);
-			this.syncButton.buttonEl.setAttribute("aria-busy", String(active));
-			this.syncButton.buttonEl.toggleClass("sync-button-active", active);
 		}
 		const state = this.plugin.getForceSyncController().getState();
-		const forceUnavailable = this.plugin.isForceSyncUnavailable();
+		const foreground = this.plugin.getForegroundOperation();
+		const fullActive =
+			this.plugin.isFullSyncInProgress() && !state?.active && !foreground;
+		this.setButtonActivity(
+			this.syncButton,
+			fullActive,
+			t(fullActive ? "settings.syncing_button" : "settings.sync_button"),
+		);
 		for (const { button, direction } of this.forceButtons) {
 			const active =
 				state?.active === true && state.direction === direction;
-			button.setDisabled(forceUnavailable);
-			button.buttonEl.setAttribute("aria-busy", String(active));
-			button.buttonEl.toggleClass("force-sync-button-active", active);
+			button.setDisabled(busy || this.plugin.isForceSyncUnavailable());
+			this.setButtonActivity(
+				button,
+				active,
+				t(
+					active
+						? "settings.operation_in_progress"
+						: direction === "from_local"
+							? "settings.force_sync_from_local_button"
+							: "settings.force_sync_from_remote_button",
+				),
+			);
+		}
+		const passwordChange =
+			this.plugin.isEncryptionPasswordChangeInProgress();
+		this.encryptionToggle?.toggleEl.setAttribute(
+			"aria-busy",
+			String(foreground === "encryption" && !passwordChange),
+		);
+		if (this.encryptionSpinner) {
+			this.encryptionSpinner.hidden =
+				foreground !== "encryption" || passwordChange;
+		}
+		this.setButtonActivity(
+			this.backupButton,
+			foreground === "backup",
+			t(
+				foreground === "backup"
+					? "settings.backup_in_progress"
+					: "settings.backup_button",
+			),
+		);
+		this.setButtonActivity(
+			this.encryptionButton,
+			passwordChange,
+			t(
+				passwordChange
+					? "settings.operation_in_progress"
+					: "settings.encryption_change_password",
+			),
+		);
+		if (this.clearLogsButton) {
+			this.clearLogsButton.setDisabled(
+				this.clearingLogs || this.plugin.isPluginUnloaded(),
+			);
+			this.setButtonActivity(
+				this.clearLogsButton,
+				this.clearingLogs,
+				t(
+					this.clearingLogs
+						? "settings.operation_in_progress"
+						: "settings.clear_logs_button",
+				),
+			);
+		}
+	}
+
+	/** Keep one settings flow alive across its dialogs; recheck context after each prompt. */
+	private async runSettingsAction(
+		action: (isCurrent: () => boolean) => Promise<void>,
+	): Promise<void> {
+		if (this.isActionUnavailable()) {
+			return;
+		}
+		const generation = this.renderGeneration;
+		const configuration = this.plugin
+			.getBackupManager()
+			.getConfigurationGeneration();
+		this.pendingAction = true;
+		this.updateActivity();
+		const isCurrent = () =>
+			this.displayed &&
+			generation === this.renderGeneration &&
+			!this.plugin.isPluginUnloaded() &&
+			!this.plugin.isConfigurationBusy() &&
+			configuration ===
+				this.plugin.getBackupManager().getConfigurationGeneration();
+		try {
+			await action(isCurrent);
+		} catch (error) {
+			if (this.displayed && !this.plugin.isPluginUnloaded()) {
+				new Notice(
+					formatOperationFailure(
+						createSyncFailure(error, {
+							stage: "preflight",
+							action: "local",
+						}).summary,
+					),
+				);
+			}
+		} finally {
+			this.pendingAction = false;
+			this.updateActivity();
 		}
 	}
 
@@ -143,41 +284,35 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 	}
 
-	private showToggleSpinner(tgl: ToggleComponent): HTMLElement {
-		tgl.setDisabled(true);
-		tgl.toggleEl.addClass("encryption-toggle-hidden");
-		return tgl.toggleEl.parentElement!.createSpan({
-			cls: "encryption-toggle-spinner",
-		});
-	}
-
-	private hideToggleSpinner(
-		tgl: ToggleComponent,
-		spinner: HTMLElement,
-	): void {
-		spinner.remove();
-		tgl.toggleEl.removeClass("encryption-toggle-hidden");
-		tgl.setDisabled(false);
-	}
-
-	private async enableEncryptionFlow(): Promise<void> {
+	private async enableEncryptionFlow(
+		isCurrent: () => boolean,
+	): Promise<void> {
 		let remoteManifest: RemoteEncryptionManifest | null = null;
 		try {
 			remoteManifest = await this.plugin.getRemoteEncryptionManifest();
-		} catch (e) {
+		} catch (error) {
+			if (!isCurrent()) {
+				return;
+			}
 			new Notice(
-				e instanceof UnsupportedHistoricalDataError
+				error instanceof UnsupportedHistoricalDataError
 					? t("notice.unsupported_historical_data")
-					: e instanceof Error
-						? e.message
-						: String(e),
+					: formatOperationFailure(
+							createSyncFailure(error, {
+								stage: "preflight",
+								action: "read",
+							}).summary,
+						),
 			);
 			return;
 		}
 
+		if (!isCurrent()) {
+			return;
+		}
 		if (remoteManifest) {
 			const password = await this.promptConnectEncryptionPassword();
-			if (!password) {
+			if (!password || !isCurrent()) {
 				return;
 			}
 
@@ -186,15 +321,26 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					password,
 					remoteManifest,
 				);
-				new Notice(t("notice.encryption_connected"));
-			} catch (e) {
-				new Notice(e instanceof Error ? e.message : String(e));
+				if (!this.plugin.isPluginUnloaded()) {
+					new Notice(t("notice.encryption_connected"));
+				}
+			} catch (error) {
+				if (!this.plugin.isPluginUnloaded()) {
+					new Notice(
+						formatOperationFailure(
+							createSyncFailure(error, {
+								stage: "preflight",
+								action: "read",
+							}).summary,
+						),
+					);
+				}
 			}
 			return;
 		}
 
 		const password = await this.promptNewEncryptionPassword();
-		if (!password) {
+		if (!password || !isCurrent()) {
 			return;
 		}
 
@@ -205,16 +351,18 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 	}
 
-	private async disableEncryptionFlow(): Promise<void> {
+	private async disableEncryptionFlow(
+		isCurrent: () => boolean,
+	): Promise<void> {
 		const currentPassword = await this.promptCurrentEncryptionPassword();
-		if (!currentPassword) {
+		if (!currentPassword || !isCurrent()) {
 			return;
 		}
 
 		const confirmed = await new Promise<boolean>((resolve) => {
 			new DisableEncryptionModal(this.app, resolve).open();
 		});
-		if (!confirmed) {
+		if (!confirmed || !isCurrent()) {
 			return;
 		}
 
@@ -263,21 +411,31 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.detachActivity();
 		this.renderGeneration++;
 		this.syncButton = null;
+		this.backupButton = null;
+		this.encryptionButton = null;
+		this.clearLogsButton = null;
+		this.encryptionToggle = null;
+		this.encryptionSpinner = null;
+		this.controls = [];
 		this.forceButtons = [];
 		this.plugin.encryptionStateChangeCallback = () => {
 			this.renderSettings();
 		};
 		const { containerEl } = this;
 		containerEl.empty();
-		this.controlsEl = containerEl.createEl("fieldset", {
+		this.controlsEl = containerEl.createEl("div", {
 			cls: "force-settings-controls",
 		});
-		// Obsidian toggles are custom elements; native fieldset disabling alone is insufficient.
+		// Guard stale native/custom events as well as disabling each Obsidian component.
 		for (const event of ["click", "keydown", "input", "change"]) {
 			this.controlsEl.addEventListener(
 				event,
 				(e) => {
-					if (!this.plugin.isForceSyncBusy()) {
+					if (
+						!this.isActionUnavailable() ||
+						(e.target instanceof Element &&
+							e.target.closest(".sync-diagnostic-controls"))
+					) {
 						return;
 					}
 					if (e instanceof KeyboardEvent && e.key === "Tab") {
@@ -290,9 +448,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			);
 		}
 		this.activityUnsubscribers = [
-			this.plugin
-				.getForceSyncController()
-				.subscribe(() => this.updateActivity()),
 			this.plugin.onSyncActivityChange(() => this.updateActivity()),
 		];
 		this.updateActivity();
@@ -332,7 +487,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		new ButtonComponent(controlEl)
 			.setButtonText(t("settings.manage_clients"))
 			.setCta()
+			.then((control) => this.trackControl(control))
 			.onClick(() => {
+				if (this.isActionUnavailable()) {
+					return;
+				}
 				window.open("https://oauth.yandex.ru/", "_blank");
 			});
 
@@ -340,8 +499,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		new TextComponent(controlEl)
 			.setPlaceholder(t("settings.client_id_placeholder"))
 			.setValue(this.plugin.settings.clientId)
+			.then((control) => this.trackControl(control))
 			.onChange(async (value) => {
-				if (this.plugin.isForceSyncBusy()) {
+				if (this.isActionUnavailable()) {
 					return;
 				}
 				await this.applyDraft({ clientId: value });
@@ -351,7 +511,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		new ButtonComponent(controlEl)
 			.setButtonText(t("settings.get_token"))
 			.setDisabled(!this.plugin.settings.clientId?.trim())
+			.then((control) => this.trackControl(control))
 			.onClick(() => {
+				if (this.isActionUnavailable()) {
+					return;
+				}
 				const clientId = this.plugin.settings.clientId?.trim();
 				if (clientId) {
 					const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
@@ -363,8 +527,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		new TextComponent(controlEl)
 			.setPlaceholder(t("settings.oauth_token_placeholder"))
 			.setValue(this.plugin.settings.yandexTokenSecret)
+			.then((control) => this.trackControl(control))
 			.onChange(async (value) => {
-				if (this.plugin.isForceSyncBusy()) {
+				if (this.isActionUnavailable()) {
 					return;
 				}
 				await this.applyDraft({ yandexTokenSecret: value });
@@ -373,8 +538,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.syncButton = new ButtonComponent(controlEl)
 			.setButtonText(t("settings.sync_button"))
 			.setCta();
+		this.trackControl(this.syncButton);
 		this.syncButton.onClick(async () => {
-			if (this.plugin.isConfigurationBusy()) {
+			if (this.isActionUnavailable()) {
 				return;
 			}
 			try {
@@ -393,8 +559,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				text
 					.setPlaceholder(t("settings.remote_path_placeholder"))
 					.setValue(this.plugin.settings.remotePath)
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({ remotePath: value });
@@ -413,8 +580,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.enableRealtimeSync)
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({ enableRealtimeSync: value });
@@ -431,8 +599,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.syncInterval)
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({ syncInterval: value });
@@ -449,8 +618,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.debounceDelay)
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({ debounceDelay: value });
@@ -467,8 +637,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.maxConcurrency)
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setDynamicTooltip()
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({ maxConcurrency: value });
@@ -487,7 +658,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				return button
 					.setButtonText(t("settings.force_sync_from_local_button"))
 					.setCta()
+					.then((control) => this.trackControl(control))
 					.onClick(() => {
+						if (this.isActionUnavailable()) {
+							return;
+						}
 						void this.plugin.runForceSyncFromLocal();
 					});
 			})
@@ -496,7 +671,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				return button
 					.setButtonText(t("settings.force_sync_from_remote_button"))
 					.setCta()
+					.then((control) => this.trackControl(control))
 					.onClick(() => {
+						if (this.isActionUnavailable()) {
+							return;
+						}
 						void this.plugin.runForceSyncFromRemote();
 					});
 			});
@@ -526,36 +705,43 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			});
 		}
 
-		let encryptionToggle: ToggleComponent | null = null;
-
 		new Setting(containerEl)
 			.setName(t("settings.encryption_desc"))
 			.addToggle((toggle) => {
-				encryptionToggle = toggle;
+				this.encryptionToggle = toggle;
+				this.encryptionSpinner =
+					toggle.toggleEl.parentElement!.createSpan({
+						cls: "encryption-toggle-spinner",
+					});
+				this.encryptionSpinner.hidden = true;
 				return toggle
 					.setValue(this.plugin.settings.enableEncryption)
 					.setDisabled(migrationPending)
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						toggle.setValue(this.plugin.settings.enableEncryption);
+						if (this.isActionUnavailable()) {
 							return;
 						}
-						const spinner = this.showToggleSpinner(toggle);
-						try {
-							if (
-								value &&
-								!this.plugin.settings.enableEncryption
-							) {
-								await this.enableEncryptionFlow();
-							} else if (
-								!value &&
-								this.plugin.settings.enableEncryption
-							) {
-								await this.disableEncryptionFlow();
+						await this.runSettingsAction(async (isCurrent) => {
+							try {
+								if (
+									value &&
+									!this.plugin.settings.enableEncryption
+								) {
+									await this.enableEncryptionFlow(isCurrent);
+								} else if (
+									!value &&
+									this.plugin.settings.enableEncryption
+								) {
+									await this.disableEncryptionFlow(isCurrent);
+								}
+							} finally {
+								toggle.setValue(
+									this.plugin.settings.enableEncryption,
+								);
 							}
-						} finally {
-							this.hideToggleSpinner(toggle, spinner);
-							this.renderSettings();
-						}
+						});
 					});
 			});
 
@@ -565,21 +751,21 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				.addButton((button) =>
 					button
 						.setButtonText(t("settings.encryption_change_password"))
+						.then((control) => {
+							this.encryptionButton = control;
+							this.trackControl(control);
+						})
 						.onClick(async () => {
-							if (this.plugin.isForceSyncBusy()) {
+							if (this.isActionUnavailable()) {
 								return;
 							}
-							const spinner = encryptionToggle
-								? this.showToggleSpinner(encryptionToggle)
-								: null;
-							try {
+							await this.runSettingsAction(async (isCurrent) => {
 								const currentPassword =
 									await this.promptCurrentEncryptionPassword();
-								if (!currentPassword) {
+								if (!currentPassword || !isCurrent()) {
 									return;
 								}
-
-								const newPassword = await new Promise<
+								const password = await new Promise<
 									string | null
 								>((resolve) =>
 									new ChangePasswordModal(
@@ -587,26 +773,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 										resolve,
 									).open(),
 								);
-								if (!newPassword) {
+								if (!password || !isCurrent()) {
 									return;
 								}
-
 								try {
 									await this.plugin.rotateEncryptionPassword(
-										newPassword,
+										password,
 									);
 								} catch {
 									// The plugin owns the single progress and result Notice.
 								}
-							} finally {
-								if (spinner && encryptionToggle) {
-									this.hideToggleSpinner(
-										encryptionToggle,
-										spinner,
-									);
-								}
-								this.renderSettings();
-							}
+							});
 						}),
 				);
 		}
@@ -623,8 +800,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.syncDotObsidian)
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({ syncDotObsidian: value });
@@ -639,8 +817,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				textArea
 					.setPlaceholder(t("settings.include_patterns_placeholder"))
 					.setValue(this.plugin.settings.syncPatterns.join("\n"))
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({
@@ -662,8 +841,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				textArea
 					.setPlaceholder(t("settings.exclude_patterns_placeholder"))
 					.setValue(this.plugin.settings.excludePatterns.join("\n"))
+					.then((control) => this.trackControl(control))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.isActionUnavailable()) {
 							return;
 						}
 						await this.applyDraft({
@@ -677,21 +857,25 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				textArea.inputEl.cols = 30;
 			});
 
-		// Logging section
-		new Setting(containerEl)
+		// Logging remains available during every synchronization operation.
+		const loggingEl = containerEl.createDiv({
+			cls: "sync-diagnostic-controls",
+		});
+		new Setting(loggingEl)
 			.setName(t("settings.logging_section"))
 			.setHeading();
 
 		// Enable debug logging
-		new Setting(containerEl)
+		new Setting(loggingEl)
 			.setName(t("settings.enable_debug_logging"))
 			.setDesc(t("settings.enable_debug_logging_desc"))
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.enableDebugLogging)
 					.setDisabled(migrationPending)
+					.then((control) => this.trackControl(control, true))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.plugin.isPluginUnloaded()) {
 							return;
 						}
 						await this.applyDraft({ enableDebugLogging: value });
@@ -699,15 +883,16 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			);
 
 		// Write logs to file
-		new Setting(containerEl)
+		new Setting(loggingEl)
 			.setName(t("settings.log_to_file"))
 			.setDesc(t("settings.log_to_file_desc"))
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.logToFile)
 					.setDisabled(migrationPending)
+					.then((control) => this.trackControl(control, true))
 					.onChange(async (value) => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (this.plugin.isPluginUnloaded()) {
 							return;
 						}
 						await this.applyDraft({ logToFile: value });
@@ -715,13 +900,20 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			);
 
 		// View logs button
-		new Setting(containerEl)
+		new Setting(loggingEl)
 			.addButton((button) =>
 				button
 					.setButtonText(t("settings.view_logs_button"))
 					.setCta()
+					.then((control) => this.trackControl(control, true))
 					.onClick(() => {
-						new LogViewerModal(this.app).open();
+						if (this.plugin.isPluginUnloaded()) {
+							return;
+						}
+						new LogViewerModal(
+							this.app,
+							() => !this.plugin.isPluginUnloaded(),
+						).open();
 					}),
 			)
 			.addButton((button) =>
@@ -729,12 +921,32 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setButtonText(t("settings.clear_logs_button"))
 					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					.setWarning()
+					.then((control) => {
+						this.clearLogsButton = control;
+						this.trackControl(control, true);
+					})
 					.onClick(async () => {
-						if (this.plugin.isForceSyncBusy()) {
+						if (
+							this.clearingLogs ||
+							this.plugin.isPluginUnloaded()
+						) {
 							return;
 						}
-						await logger.clearLogs();
-						new Notice(t("notice.logs_cleared"));
+						const generation = this.renderGeneration;
+						this.clearingLogs = true;
+						this.updateActivity();
+						try {
+							await clearLogsWithConfirmation(
+								this.app,
+								() =>
+									this.displayed &&
+									generation === this.renderGeneration &&
+									!this.plugin.isPluginUnloaded(),
+							);
+						} finally {
+							this.clearingLogs = false;
+							this.updateActivity();
+						}
 					}),
 			);
 
@@ -768,44 +980,79 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.addButton((button) =>
 				button
 					.setButtonText(t("settings.backup_button"))
+					.then((control) => {
+						this.backupButton = control;
+						this.trackControl(control);
+					})
 					.onClick(async () => {
-						if (this.plugin.isForceSyncBusy()) {
-							return;
-						}
-						button.setDisabled(true);
-						button.setButtonText(t("settings.backup_in_progress"));
-
-						try {
+						await this.runSettingsAction(async (isCurrent) => {
+							const confirmed = await new Promise<boolean>(
+								(resolve) =>
+									new DecisionModal(
+										this.app,
+										t("modal.create_backup_title"),
+										t("modal.create_backup_description", {
+											path: `${this.plugin.settings.remotePath}/.backup`,
+											mode: t(
+												this.plugin.settings
+													.enableEncryption
+													? "modal.backup_mode_encrypted"
+													: "modal.backup_mode_plaintext",
+											),
+										}),
+										[
+											{
+												label: t("modal.cancel_button"),
+												value: "cancel",
+											},
+											{
+												label: t(
+													"settings.backup_button",
+												),
+												value: "create",
+												cta: true,
+											},
+										],
+										"cancel",
+										(choice) =>
+											resolve(choice === "create"),
+									).open(),
+							);
+							if (!confirmed || !isCurrent()) {
+								return;
+							}
 							const result = await this.plugin.createBackup();
-
+							if (this.plugin.isPluginUnloaded()) {
+								return;
+							}
 							if (result.success) {
-								button.setButtonText(
-									t("settings.backup_success"),
-								);
 								this.renderSettings();
 							} else {
-								button.setButtonText(
-									t("settings.backup_error"),
+								new Notice(
+									result.error ?? t("settings.backup_error"),
 								);
 							}
-						} catch (error) {
-							button.setButtonText(t("settings.backup_error"));
-							logger.error("Backup failed:", { error });
-						}
-
-						setTimeout(() => {
-							button.setDisabled(false);
-							button.setButtonText(t("settings.backup_button"));
-						}, 3000);
+						});
 					}),
 			)
 			.addButton((button) =>
 				button
 					.setButtonText(t("settings.backup_show_all"))
+					.then((control) => this.trackControl(control))
 					.onClick(() => {
+						if (this.isActionUnavailable()) {
+							return;
+						}
 						new BackupListModal(
 							this.app,
 							this.plugin.getBackupManager(),
+							{
+								isUnavailable: () => this.isActionUnavailable(),
+								isCurrent: () =>
+									!this.plugin.isPluginUnloaded(),
+								subscribe: (update) =>
+									this.plugin.onSyncActivityChange(update),
+							},
 						).open();
 					}),
 			);
