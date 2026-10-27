@@ -1,3 +1,4 @@
+import { EncryptionReplacementRevokedError } from "../crypto/replacement";
 import type { RemoteAuthorityObservation } from "./canonical/manager";
 import { VaultAdapter } from "../api/vault-adapter";
 import { YandexDiskClient } from "../api/yandex-client";
@@ -191,9 +192,6 @@ export class SyncEngine {
 			},
 			get isCancelled() {
 				return readPorts().isCancelled;
-			},
-			get chooseSourceMode() {
-				return readPorts().chooseSourceMode;
 			},
 			get watcherCutoff() {
 				return readPorts().watcherCutoff;
@@ -794,8 +792,8 @@ export class SyncEngine {
 
 	/**
 	 * Rewrite only the physical representation of every live canonical file
-	 * while preserving epoch, logical revisions, tombstones, moves, and
-	 * mutation watermarks.
+	 * preserving causal history for legacy guarded rewrites; an explicit
+	 * authoritative transition publishes its own replacement epoch.
 	 */
 	async reencodeRemoteFiles(options?: SyncRunOptions): Promise<SyncResult> {
 		if (!options?.verifyPhysicalRewriteUpload) {
@@ -807,10 +805,36 @@ export class SyncEngine {
 			await this.runSyncSession(
 				options,
 				async (result) => {
-					return await encryptionRewrite.rewriteRemoteFiles(
-						this.encryptionRewriteDependencies(),
-						options,
-						result,
+					const lifetime = this.createReadLifetimeGuard();
+					const configuration =
+						this.yandexClient.getReadConfigurationVersion();
+					return await this.yandexClient.withWriteGuard(
+						() => {
+							try {
+								lifetime();
+								if (
+									this.yandexClient.getReadConfigurationVersion() !==
+									configuration
+								) {
+									throw new Error(
+										"Encryption rewrite configuration changed",
+									);
+								}
+							} catch (error) {
+								if (options.authoritativeEncryption) {
+									throw new EncryptionReplacementRevokedError(
+										"Encryption rewrite lifetime or configuration ended",
+									);
+								}
+								throw error;
+							}
+						},
+						() =>
+							encryptionRewrite.rewriteRemoteFiles(
+								this.encryptionRewriteDependencies(),
+								options,
+								result,
+							),
 					);
 				},
 				(result) =>
@@ -1007,10 +1031,18 @@ export class SyncEngine {
 						);
 					deps.readCanonical = lifetime;
 					deps.assertCurrent = () => lifetime.assertCurrent();
-					return await this.yandexClient.withWriteGuard(
-						() => lifetime.assertCurrent(),
-						() => realtimeSync.reconcileRealtimeBatch(deps, events),
-					);
+					try {
+						return await this.yandexClient.withWriteGuard(
+							() => lifetime.assertCurrent(),
+							() =>
+								realtimeSync.reconcileRealtimeBatch(
+									deps,
+									events,
+								),
+						);
+					} finally {
+						lifetime.close();
+					}
 				},
 				{
 					settle: async (outcome, session) => {
@@ -1417,7 +1449,9 @@ export class SyncEngine {
 			}
 			result.success = result.errors.length === 0;
 			if (result.success) {
-				this.indexManager.markRemoteObserved();
+				if (!options?.authoritativeEncryption) {
+					this.indexManager.markRemoteObserved();
+				}
 				if (this.indexSaveCallback) {
 					await this.indexSaveCallback();
 				}
@@ -1638,6 +1672,8 @@ export class SyncEngine {
 
 	private getExternalBlockCode(kind: ExternalSyncBlockKind): string {
 		switch (kind) {
+			case "persistence":
+				return "local-persistence";
 			case "force":
 				return "force-recovery-pending";
 			case "local-state":
@@ -1669,6 +1705,7 @@ export class SyncEngine {
 		include: (block: ExternalSyncBlock) => boolean = () => true,
 	): ExternalSyncBlock | null {
 		for (const kind of [
+			"persistence",
 			"local-state",
 			"force",
 			"historical",
@@ -1778,6 +1815,7 @@ export class SyncEngine {
 			this.epochReplacementPending = value;
 		};
 		return {
+			createReadLifetimeGuard: () => this.createReadLifetimeGuard(),
 			indexManager: this.indexManager,
 			get indexSaveCallback() {
 				return getIndexSaveCallback();

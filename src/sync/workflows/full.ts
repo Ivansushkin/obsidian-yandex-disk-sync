@@ -1,3 +1,4 @@
+import { receiveEncryptionReplacement } from "./encryption-adoption";
 import { YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
 import type {
@@ -220,6 +221,9 @@ export async function reconcileFullSync(
 	validationToken?: string,
 ): Promise<void> {
 	if (!(await loadFullCanonical(deps, options, result, validationToken))) {
+		return;
+	}
+	if (await receiveEncryptionReplacement(deps, adoption, result)) {
 		return;
 	}
 	const admission = await prepareFullReconciliation(

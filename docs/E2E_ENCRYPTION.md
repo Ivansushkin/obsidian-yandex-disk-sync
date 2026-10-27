@@ -40,8 +40,9 @@ ciphertext или UTF-8 блокирует sync до обращения к Vault
 `.obsidian-encrypt.json` всегда читается и записывается raw.
 
 - Numeric и иные historical encryption formats блокируют обычный sync и
-  чтение зашифрованного Force source. Подтверждённый Force local заменяет
-  destination metadata raw, без старого пароля и compatibility decode.
+  чтение зашифрованного Force source и классификацию encrypted destination.
+  Force local не доверяет старому canonical, но scoped cleanup требует читаемый
+  текущий manifest и проверенный codec.
 - Current manifest обязан содержать semantic marker и полностью, точно
   объявлять `profileId`, KDF, HKDF, content cipher и filename cipher.
 - Unknown format/profile/algorithm блокирует watcher, scheduler, upload,
@@ -51,8 +52,9 @@ Manifest transitional state содержит secret-free source/target descripto
 profile IDs. Устройство не выбирает codec по локальной догадке. Manifest,
 canonical maintenance и local transition принимаются только с точным набором
 полей; ID, initiator, phase, mode descriptors, profile IDs и revisions должны
-быть согласованы. Cleanup paths нормализованы, уникальны, не protected и всегда
-имеют expected fingerprint.
+быть согласованы. Legacy cleanup paths нормализованы, уникальны, не protected и имеют expected
+fingerprint. Новые переходы вместо них используют explicit replacement descriptor
+и durable recursive deletion cover; см. [политику переходов](#orchestration-и-admission).
 
 ## Локальное состояние
 
@@ -80,32 +82,12 @@ Conflict reconciliation сравнивает plaintext SHA, подтвержда
 upload, read-back и canonical confirmation. Проверки повторяют manifest/codec
 guards; plaintext buffers существуют только внутри операции и не журналируются.
 
-Обычный full передаёт manifest validation token из admission в upload guards.
-Неизменный manifest читается body один раз за full; свежая token validation перед
-операциями сохраняется. Missing SHA-256/MD5 не разрешает content reuse: прежний
-stable body read остаётся fallback. Canonical bytes принадлежат только explicit
-read session startup/full invocation, с fresh root/locks/hash и config/transition generation.
-Scope, manifest-token и canonical validators одной initial/full evaluation используют
-одну свежую stable raw root pair, включая manifest и lock identities. Opaque observation
-истекает после callback; следующий write/retry получает новую. Неизвестная root/service
-identity или неполная pagination блокирует sync. Standalone
-writeGuard остаётся независимым. Startup classification, recovery detection и admission
-передают full одну explicit service-read session; standalone refresh закрывает её.
-Manifest/canonical reuse требует fresh unlocked stable root и SHA-256/MD5, no-hash
-повторяет stable body read. Recovery и codec/config drift инвалидируют observations. Snapshot и token не разрешают corrective write: repair повторяет canonical,
-manifest и physical authority. Realtime и Direct Force сохраняют свои пути.
-Initial identical admission может повторно использовать raw physical metadata свежего
-root observation. Общий targeted collector сохраняет active codec conversion и
-shared filters; remote SHA относится к physical ciphertext, local SHA — к plaintext.
-Ни cached listing, ни missing entry не разрешают overwrite/deletion. После bulk
-обновляются только missing stamps, включая старые; service/write guards прежние
-(`SYNC-044`).
-Ordinary baseline-only reception не двигает canonical в lock: canonical JSON и все
-unpublished causal effects проверяются отдельно от local baseline. После coherent
-partial save fresh final evaluation снова проверяет scope/manifest/canonical и
-config generation; совпавший ciphertext hash позволяет reuse bytes, но не обход
-validation. Failure не продвигает observed revision/time или ACK. Imported physical
-stamps и pending watermarks по-прежнему commit-ятся (`SYNC-045/046`).
+Обычные startup/full read-sessions и manifest tokens переиспользуют только verified
+bytes после fresh scope/root/lock/hash checks. Они не разрешают physical write;
+corrective repair повторяет canonical/manifest/physical authority. Ciphertext hash
+не сравнивается с plaintext SHA. Подробности общих read/lifetime/ACK boundaries —
+[ARCHITECTURE.md](ARCHITECTURE.md#чтение-snapshots-и-lifetime) и
+[PARALLELIZATION.md](PARALLELIZATION.md).
 
 Current `data.json` содержит `format: "plugin-data"`. Encryption и transition
 snapshots обязаны иметь явный `profileId`. Загрузчик принимает только:
@@ -185,12 +167,97 @@ local transition, manifest и canonical maintenance должны совпаст�
 initiator, revisions и descriptors с учётом единственного разрешённого окна,
 когда manifest следующей phase уже опубликован, а canonical commit ещё нет.
 
-Офлайн-устройство сначала подключает `hardened` codec, принимает canonical через full
-reconcile и только затем воспроизводит durable logical mutations. Старые
-physical actions применяются только при актуальном epoch/canonical/fingerprint
-proof.
+Офлайн-устройство сначала аутентифицирует target codec и принимает canonical.
+Stable replacement receipt требует authoritative reception до ordinary merge: old
+mutations не replay-ятся. У checkpoint без replacement сохраняются прежнее
+reconciliation и fresh epoch/canonical/fingerprint guards для physical actions.
 
 ## Orchestration и admission
+
+Новые переходы используют **initiator-wins**: frozen local reference в текущих
+sync filters, fresh target epoch и stable replacement receipt. Чужие old-generation
+PUT/mutation не сливаются в эталон. Верхнеуровневая папка удаляется одним DELETE,
+если весь наблюдаемый subtree removable и фильтры покрывают его целиком. Смешанная
+папка разбивается до безопасных descendants; root, service paths, `.backup`, plugin
+state, исключённые объекты и live target paths не входят в cover. Excluded raw
+inventory сохраняется после cleanup, до любого декодирования новым codec.
+
+Durable cover находится в `maintenance.replacement.deletions`; дополнительные
+fingerprint actions для него не создаются. Каждая попытка проверяет свежую canonical
+replacement authority и отсутствие retained targets, а после отправки — authority
+и отсутствие subtree. Изменившийся source fingerprint намеренно не блокирует purge.
+Healthy workers переиспользуют каждый свою verified read-session, сохраняя fresh
+root/hash/lock checks. Failed guard не ACK даже уже отсутствующего объекта.
+Неоднозначный отправленный DELETE разрешается свежим absence proof. Первая ошибка
+останавливает admissions, все sent requests joined до recovery. Config ABA/unload
+закрывает invocation, автоматический retry под новой configuration запрещён.
+
+После purge весь target проверяется по canonical fingerprints, а drift — по
+read-back plaintext SHA. Metadata читается до четырёх запросов между свежими
+проверками authority/reference. Collector выбирает fresh parent listing после
+DELETE только при известной меньшей стоимости страниц; pre-delete scan служит
+только cost hint. Missing entry требует GET; type/pagination drift блокирует finish.
+Hashless metadata не заменяет bytes; fallback сохраняет исходный read budget.
+Repair и stamps последовательны, с per-attempt authority и mandatory read-back;
+stamps берутся из verified snapshot. Failed reads joined до recovery, а lifetime/
+config ABA запрещает поздние writes и успех даже после более ранней сетевой ошибки.
+Инициатор может восстановить target только из сохранённых
+reference hashes. Не более четырёх sweep/repair passes; нет сходимости — нет success.
+Local drift не меняет эталон и блокирует завершение. Foreign target-only recovery
+использует уже durable raw cover и target codec. Если после crash обнаружился новый
+неидентифицируемый source object вне cover, recovery fail closed: нужны source-capable
+owner и его ключ; исключения нельзя расширять предположением.
+
+Обычный sync не хранит состояние пустых папок. Complete raw inventory может содержать
+пустые деревья от прежнего codec, включая plaintext после enable. Cleanup оставляет
+такие деревья нетронутыми и не пытается расшифровать их имена. Непустое дерево
+определяется по file descendants полного inventory; retained/protected paths по-прежнему
+защищены. Ошибка чтения/listing или нечитаемый file не превращаются в пустое дерево
+и сохраняют recovery без success (`TRANS-050`).
+
+Старое устройство автоматически принимает stable target epoch до ordinary baseline
+merge и не возвращает offline edits/старые queues на сервер. Выбранные local extras
+удаляются, baseline и очереди заменяются только после проверенных bytes и coherent
+save. При failed save старые causal IDs сохраняются для повторного приёма. После
+foreign completion владелец снимает checkpoint только read-only: matching operation,
+reference canonical/local hashes, target read-back, отсутствие source cover и свежая
+стабильная authority. Failed save восстанавливает transition и causal snapshot.
+
+Следующие fingerprint/unchanged-epoch правила относятся к **старым guarded
+checkpoints без replacement descriptor**, а также к неизменённому pre-commit rollback:
+
+Post-commit cleanup enable/disable/rotate и foreign recovery использует до
+`min(maxConcurrency, 4)` исполнителей. У каждого своя invocation-bound canonical
+read-session: тело переиспользуется только после свежих root/hash/lock checks.
+Каждый DELETE/retry сохраняет порядок canonical authority → разрешённый action и
+live-path exclusion → physical fingerprint → canonical authority. Отказ guard
+не является неоднозначным ответом DELETE и не подтверждается отсутствием объекта.
+После отправленного DELETE повторно проверяются authority и отсутствие source,
+затем action завершается через прежнюю coherent persistence queue (`TRANS-042`).
+
+Первая ошибка останавливает выдачу новых paths. Уже начатые задачи завершаются до
+recovery, смены codec или снятия maintenance; сохраняется первая ошибка. Readers
+закрываются в `finally`, configuration/host lifetime проверяется перед dispatch.
+Pre-commit rollback остаётся последовательным со всеми source checks (`TRANS-041`).
+
+Если foreign device уже завершил transition, initiator может снять старые local
+cleanup receipts без remote writes: нужны тот же observed epoch, стабильный
+canonical без maintenance, принадлежащие transition fingerprints, отсутствие
+соответствующих source objects и повторная target/manifest coherence. Появившийся
+source блокирует retirement; failed persistence восстанавливает local causal state
+и transition. Committed disable после удаления manifest восстанавливается по
+plaintext target без исходного пароля (`TRANS-041`).
+Retirement использует явно read-only canonical session: lock или missing canonical
+блокируют checkpoint без stale-lock repair, MOVE или DELETE.
+
+Rewrite готовит папки параллельно внутри одной глубины, до четырёх siblings,
+и дожидается всей глубины перед дочерними путями. Остальные callers сохраняют
+default concurrency 1. Ошибка подготовки не запускает transfers. Target codec
+переиспользуется только при exact manager-owned profile/salt/password; исходный
+codec применяется к source descriptor. Hardened, verifier и полный read-back
+targets/выбранного архива неизменны (`PERF-015`). Диагностика:
+`npm run check:sync-efficiency -- --encryption-transitions --out <fresh.json>`.
+Counts и synthetic timings не доказывают latency реального Диска или Obsidian/mobile.
 
 Все операции используют `EncryptionTransitionController` и одну схему recovery:
 
@@ -235,12 +302,14 @@ evidence файла `release-evidence/2.0.0.json`.
 
 Enable/disable/rotate предлагают архив, продолжение без архива или отмену.
 `backupProof` в local transition обязателен и nullable; отсутствие поля не означает
-отказ от архива. Все source/canonical/codec/fingerprint проверки сохраняются.
+отказ от архива. Source/canonical/codec proofs сохраняются; cleanup policy выбирается по explicit
+replacement descriptor, а не по наличию архива.
 Пароль архива: target для enable/rotate, source для disable. Recovery и connect
 не создают архив повторно; source drift завершает текущую попытку.
 
-При потере initiator target-capable устройство завершает post-commit recovery без
-source password. Оно сверяет ID, initiator, source/target
+При потере initiator target-capable устройство может завершить post-commit recovery
+без source password по durable cover. Неидентифицируемый late source object вне
+cover требует source-capable owner; recovery не расширяет scope предположением. Оно сверяет ID, initiator, source/target
 descriptors, profile и post-commit phase. Для enable/rotate оно аутентифицирует
 verifier и явно читает target canonical новым codec; для disable — plaintext
 внутри matching IndexManager recovery scope. Отсутствующий manifest допустим
@@ -248,16 +317,17 @@ verifier и явно читает target canonical новым codec; для disa
 
 Foreign target recovery сначала доказывает target canonical и matching descriptors,
 затем публикует stable target manifest или удаляет manifest для plaintext, переводит
-canonical в cleanup, выполняет guarded удаления и завершает maintenance. Старое окно
+canonical в cleanup, выполняет cleanup по explicit replacement policy либо legacy guarded удаления и завершает maintenance. Старое окно
 canonical cleanup + manifest index-committed допускается только с той же identity
 и descriptors. Manifest перечитывается после recovery. Wrong password и Cancel
 не сохраняют candidate credentials и не делают remote mutations.
 
-На каждом delete/retry свежие authority, action, live target mapping и fingerprint
+Для legacy guarded cleanup на каждом delete/retry свежие authority, action, live target mapping и fingerprint
 обязательны. Timeout/202/успешный ответ без проверки отсутствия не завершают action.
 Старый worker не возвращает completed maintenance сохранением устаревшего снимка.
-Matching target recovery нового epoch не принимает его как local baseline и не
-replay старые mutations; обычный full затем обрабатывает offline changes.
+Target recovery не принимает epoch как local baseline и не replay старые mutations.
+Следующий full для replacement receipt получает эталон без старых offline edits;
+для legacy checkpoint действует прежнее reconciliation.
 
 ## Admission и настройки
 
@@ -272,30 +342,33 @@ Internal сохранение target snapshot и очередей не прох�
 
 [Полный direct Force](FORCE_SYNC.md) не выполняет enable/disable/rotate как фиктивный
 переход и не меняет semantic markers или hardened profile. Локальное → Диск
-очищает назначение raw без старого ключа и создаёт согласованные новые user bytes,
-canonical и manifest со свежей salt. Для plaintext target старый manifest удаляется.
+применяет frozen filters и к source, и к destination. Для encrypted destination
+проверяет прежний пароль и классифицирует logical paths без чтения старых contents.
+Если шифрование сохраняется, сохраняется и codec/salt: исключённые ciphertext
+остаются читаемыми. Fresh salt создаётся только для нового encrypted назначения.
+Удаление codec при исключённых encrypted остатках блокируется до writes; сначала
+нужен отдельный disable через настройки. Повреждённый manifest назначения блокирует
+scoped cleanup. Canonical пересоздаётся независимо от прежней index history.
 
-Диск → локальное сначала аутентифицирует все физические source paths и bytes.
-Рабочий manifest и его salt/profile сохраняются. Если manifest утрачен/неверен,
-сохранённые codec parameters можно использовать только с успешным чтением всего
-источника. Один пароль не заменяет потерянные salt/profile. Mixed source, который
-нельзя однозначно прочитать, не разрешает очистку локального назначения.
+Диск → локальное при наличии manifest сначала аутентифицирует выбранные
+source paths и bytes; raw exclusions/protected paths пропускаются до decoding. Рабочий manifest и его salt/profile сохраняются. Пароль
+проверяется в том же окне Force с повторным вводом при ошибке. Отсутствующий
+manifest выбирает обычное чтение имён/bytes даже при прежних локальных encryption
+settings; автоматического восстановления потерянных параметров в этом Force нет.
+Повреждённый/неподдерживаемый manifest и ошибка его загрузки блокируют подготовку,
+не разрешая plaintext fallback. Для зашифрованного источника ошибка чтения или
+аутентификации не разрешает очистку локального назначения.
 
 Force не использует временные файлы и не обеспечивает server fencing. Обычный
 sync сначала завершает direct-v1 remainder, затем использует прежние encryption
 guards. Незавершённый старый scoped Force требует новой явной полной замены.
 Реальные два профиля Obsidian/Yandex проверяются отдельно от functional harness.
 
-## Rename/edit optimization guards
+## Обычный sync при шифровании
 
-SYNC-050/051 and PERF-014 apply in plaintext and hardened encrypted mode. Unchanged
-realtime detection compares plaintext SHA plus causal identity; physical ciphertext
-SHA/MD5 only pins a previously verified logical snapshot. The reusable proof binds actual raw ciphertext bytes to server SHA-256 before
-decryption. Resource ID or MD5-only metadata cannot reuse that proof; those paths
-require a fresh stable logical download/decryption.
-
-Startup raw canonical prefetch grants no authentication or write authority. Manifest
-parsing, verifier/candidate checks and canonical decoding retain their existing
-owners; a failed or invalidated invocation cannot install late bytes. Config/codec
-changes discard invocation caches, while recovery starts an independent observation.
-Force and encryption transitions do not use the published-local-tombstone fast path.
+`SYNC-050/051` и `PERF-014` сохраняют plaintext semantics: unchanged receipt требует
+causal identity и fresh physical proof. Reusable proof связывает реальные raw
+ciphertext bytes с server SHA-256 до decrypt; MD5/resource ID не заменяют это
+доказательство. Startup raw prefetch не разрешает decode до authentication или
+late install после config/codec drift. Force и transitions не используют
+published-local-tombstone fast path обычного full.

@@ -1,4 +1,5 @@
 import { t } from "./i18n/index";
+import { withFailureContext } from "./errors";
 import type { StartupInvocation, StartupState } from "./plugin-startup";
 import type { SyncResult } from "./types";
 import type { SyncEngine } from "./sync/engine";
@@ -73,6 +74,12 @@ export function prepareSettingsPatch(
 		"excludePatterns",
 		"syncDotObsidian",
 	];
+	const changesConnection = changed.some(
+		(key) => key === "remotePath" || key === "yandexTokenSecret",
+	);
+	const changesFileScope = changed.some(
+		(key) => key !== "remotePath" && scopeKeys.includes(key),
+	);
 	return {
 		settings: {
 			...current,
@@ -82,25 +89,29 @@ export function prepareSettingsPatch(
 				...(patch.excludePatterns ?? current.excludePatterns),
 			],
 		},
-		changesScope: changed.some(
+		hasChanges: changed.length > 0,
+		requiresIdle: changed.some(
 			(key) => key !== "enableDebugLogging" && key !== "logToFile",
 		),
+		changesConnection,
+		changesFileScope,
+		changesAutomation: changed.some(
+			(key) => key === "syncInterval" || key === "enableRealtimeSync",
+		),
 		changesDestination: changed.includes("remotePath"),
-		changesTransitionScope: changed.some(
-			(key) => scopeKeys.includes(key) || key === "clientId",
-		),
-		needsFull: changed.some(
-			(key) =>
-				scopeKeys.includes(key) ||
-				key === "yandexTokenSecret" ||
-				key === "clientId",
-		),
+		changesTransitionScope: changed.some((key) => scopeKeys.includes(key)),
+		needsFull: changesConnection || changesFileScope,
 	};
 }
+
+export type SettingsUpdateStage =
+	"watcher-persistence" | "persisting" | "startup" | "sync";
 
 interface SettingsWorkflowPorts {
 	getSettings(): YandexDiskSyncSettings;
 	persistenceFailed(): boolean;
+	persistenceRecoveryGeneration?(): number | undefined;
+	completePersistenceRecovery?(generation: number): void;
 	isConfigurationBusy(): boolean;
 	hasTransition(): boolean;
 	hasDurableConfigurationWork(): boolean;
@@ -109,8 +120,8 @@ interface SettingsWorkflowPorts {
 	setUpdating(updating: boolean): void;
 	stopRegularSync(): void;
 	startAutomation(): void;
-	invalidateRemoteStateClassification(): void;
-	settingsSaveRejected(): void;
+	refreshAutomation?(): void;
+	settingsSaveRejected(error: unknown, stage: SettingsUpdateStage): void;
 	persistPluginData(patch: UserSettingsPatch): Promise<void>;
 	runStartupInvocation?<T>(
 		action: (invocation: StartupInvocation) => Promise<T>,
@@ -149,10 +160,16 @@ export async function applyUserSettingsPatch(
 			? { excludePatterns: [...patch.excludePatterns] }
 			: {}),
 	};
-	const recoveringPersistence = deps.persistenceFailed();
-	const changesScope = draft.changesScope || recoveringPersistence;
+	const recoveringPersistence =
+		deps.persistenceFailed() ||
+		deps.persistenceRecoveryGeneration?.() !== undefined;
+	if (!draft.hasChanges && !recoveringPersistence) {
+		return;
+	}
+	let requiresIdle = draft.requiresIdle || recoveringPersistence;
+	let stopsAutomation = draft.needsFull || recoveringPersistence;
 	if (
-		changesScope &&
+		requiresIdle &&
 		(deps.isConfigurationBusy() ||
 			(deps.hasTransition() && draft.changesTransitionScope))
 	) {
@@ -161,18 +178,19 @@ export async function applyUserSettingsPatch(
 	if (draft.changesDestination && deps.hasDurableConfigurationWork()) {
 		throw new Error(t("notice.configuration_busy"));
 	}
-	if (changesScope) {
+	if (requiresIdle) {
 		deps.setUpdating(true);
+	}
+	if (stopsAutomation) {
 		deps.stopRegularSync();
-		deps.engine?.setExternalBlock(
-			"authentication",
-			t("notice.configuration_busy"),
-		);
 	}
 	let automationReady = false;
+	let stage: SettingsUpdateStage = "watcher-persistence";
 	try {
-		if (changesScope) {
-			await deps.watcher?.waitForPendingPersistence();
+		if (stopsAutomation) {
+			await deps.watcher?.waitForPendingPersistence(
+				recoveringPersistence,
+			);
 			if (
 				deps.engine?.hasPendingWork() ||
 				(draft.changesDestination && deps.hasDurableConfigurationWork())
@@ -180,12 +198,42 @@ export async function applyUserSettingsPatch(
 				throw new Error(t("notice.configuration_busy"));
 			}
 		}
+		if (deps.isUnloaded()) {
+			return;
+		}
+		stage = "persisting";
 		await deps.persistPluginData(patch);
 		if (deps.isUnloaded()) {
 			return;
 		}
-		if (changesScope) {
-			deps.invalidateRemoteStateClassification();
+		const recoveryGeneration = deps.persistenceRecoveryGeneration?.();
+		const repairingPersistence =
+			recoveringPersistence || recoveryGeneration !== undefined;
+		if (repairingPersistence && !stopsAutomation) {
+			// The shared queue may have failed after this draft was accepted.
+			if (
+				deps.engine?.hasPendingWork() ||
+				(!requiresIdle && deps.isConfigurationBusy())
+			) {
+				return;
+			}
+			if (!requiresIdle) {
+				requiresIdle = true;
+				deps.setUpdating(true);
+			}
+			stopsAutomation = true;
+			deps.stopRegularSync();
+			stage = "watcher-persistence";
+			await deps.watcher?.waitForPendingPersistence(true);
+			if (deps.isUnloaded()) {
+				return;
+			}
+		}
+		if (repairingPersistence && !deps.persistenceFailed()) {
+			deps.engine?.setExternalBlock("persistence", null);
+		}
+		if (stopsAutomation) {
+			stage = "startup";
 			const ready = await deps.refreshRemoteStartupState(
 				false,
 				false,
@@ -197,26 +245,44 @@ export async function applyUserSettingsPatch(
 				deps.isLayoutReady() &&
 				!deps.engine?.isSyncPaused()
 			) {
-				if (draft.needsFull || recoveringPersistence) {
+				if (draft.needsFull || repairingPersistence) {
+					stage = "sync";
 					const result = await deps.reconcile(invocation);
 					if (!result?.success) {
 						return;
+					}
+					if (recoveryGeneration !== undefined) {
+						deps.completePersistenceRecovery?.(recoveryGeneration);
 					}
 				}
 				automationReady = true;
 			}
 		}
 	} catch (error) {
-		if (changesScope || deps.persistenceFailed()) {
-			deps.settingsSaveRejected();
+		withFailureContext(error, {
+			stage,
+			action: stage === "persisting" ? "local" : "unknown",
+		});
+		if (
+			!deps.isUnloaded() &&
+			(stopsAutomation || deps.persistenceFailed())
+		) {
+			deps.settingsSaveRejected(error, stage);
 		}
 		throw error;
 	} finally {
-		if (changesScope) {
+		if (requiresIdle) {
 			deps.setUpdating(false);
 		}
 		if (automationReady) {
 			deps.startAutomation();
+		} else if (
+			!stopsAutomation &&
+			draft.changesAutomation &&
+			!deps.isUnloaded() &&
+			!deps.persistenceFailed()
+		) {
+			deps.refreshAutomation?.();
 		}
 	}
 }

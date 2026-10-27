@@ -386,3 +386,44 @@ test("Force presentation errors cannot interrupt commit or keep buttons busy", a
 	assert.equal(h.controller.getState()?.outcome, "success");
 	assert.equal(h.controller.isBusy(), false);
 });
+
+test("Force opens before source reads and cancellation joins preparation before releasing its reservation", async () => {
+	const entered = deferred();
+	const release = deferred();
+	let attempts = 0;
+	let published = false;
+	const h = harness({
+		open: () => {
+			h.calls.push("open");
+		},
+		retryPreparation: async () => {
+			const state = h.controller.getState();
+			published = !!state?.failure && !state.sourceProgress;
+			return true;
+		},
+		preflight: async (_direction, preparation) => {
+			if (++attempts === 1) {
+				preparation.progress(0, 91);
+				throw new Error("Synthetic unreadable source");
+			}
+			entered.resolve();
+			assert.deepEqual(h.calls, ["open"]);
+			await release.promise;
+			assert.equal(preparation.isCancelled(), true);
+			return { migration: false, canonical: { state: "absent" } };
+		},
+	});
+	const pending = h.controller.run("from_remote");
+	await entered.promise;
+	assert.equal(h.controller.cancel(), true);
+	assert.equal(h.controller.isBusy(), true);
+	release.resolve();
+	await pending;
+	assert.equal(h.controller.getState()?.outcome, "cancelled");
+	assert.deepEqual(h.calls, ["open"]);
+	assert.equal(
+		published,
+		true,
+		"Preparation failure must replace stale source progress",
+	);
+});

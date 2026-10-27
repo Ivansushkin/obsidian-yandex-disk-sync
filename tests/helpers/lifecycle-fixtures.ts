@@ -10,6 +10,13 @@ export function lifecyclePlugin() {
 	// The test Obsidian base class has no constructor side effects.
 	plugin.app = app;
 	plugin.manifest = manifest;
+	Object.assign(plugin, {
+		openForceSyncModal: () => ({
+			render: () => {},
+			close: () => {},
+			confirm: async () => "cancel",
+		}),
+	});
 	return plugin;
 }
 

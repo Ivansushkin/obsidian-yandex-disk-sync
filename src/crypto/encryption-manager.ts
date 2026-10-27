@@ -135,24 +135,7 @@ export class EncryptionManager {
 		candidate?: EncryptionCodec | null,
 		assertCurrent: () => void = () => {},
 	): Promise<EncryptionCodec | null> {
-		const prepared = candidate
-			? this.preparedCodecs.get(candidate)
-			: undefined;
-		const matches =
-			prepared &&
-			prepared.profileId === snapshot.profileId &&
-			prepared.salt === snapshot.salt &&
-			prepared.password === snapshot.password;
-		const codec =
-			snapshot.enabled && snapshot.salt && snapshot.password
-				? matches
-					? candidate!
-					: await this.createCodec(
-							requireProfileId(snapshot.profileId),
-							snapshot.salt,
-							snapshot.password,
-						)
-				: null;
+		const codec = await this.resolveSnapshotCodec(snapshot, candidate);
 		assertCurrent();
 		settings.enableEncryption = snapshot.enabled;
 		settings.encryptionSalt = snapshot.salt;
@@ -164,8 +147,33 @@ export class EncryptionManager {
 		return codec;
 	}
 
+	/** Reuse only an exact codec prepared by this manager; plaintext has no key. */
+	private async resolveSnapshotCodec(
+		snapshot: LocalEncryptionSnapshot,
+		candidate?: EncryptionCodec | null,
+	): Promise<EncryptionCodec | null> {
+		const prepared = candidate
+			? this.preparedCodecs.get(candidate)
+			: undefined;
+		const matches =
+			prepared &&
+			prepared.profileId === snapshot.profileId &&
+			prepared.salt === snapshot.salt &&
+			prepared.password === snapshot.password;
+		return snapshot.enabled && snapshot.salt && snapshot.password
+			? matches
+				? candidate!
+				: await this.createCodec(
+						requireProfileId(snapshot.profileId),
+						snapshot.salt,
+						snapshot.password,
+					)
+			: null;
+	}
+
 	async createModeDescriptor(
 		snapshot: LocalEncryptionSnapshot,
+		candidate?: EncryptionCodec | null,
 	): Promise<EncryptionModeDescriptor> {
 		if (!snapshot.enabled || !snapshot.salt || !snapshot.password) {
 			return {
@@ -175,11 +183,7 @@ export class EncryptionManager {
 				verifier: null,
 			};
 		}
-		const codec = await this.createCodec(
-			requireProfileId(snapshot.profileId),
-			snapshot.salt,
-			snapshot.password,
-		);
+		const codec = (await this.resolveSnapshotCodec(snapshot, candidate))!;
 		return {
 			enabled: true,
 			revision: snapshot.revision,

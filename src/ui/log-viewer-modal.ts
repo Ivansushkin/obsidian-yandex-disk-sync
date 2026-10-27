@@ -22,7 +22,7 @@ export class LogViewerModal extends Modal {
 
 		this.logContent = await logger.getLogContents();
 
-		new Setting(contentEl)
+		const field = new Setting(contentEl)
 			.setName(t("modal.log_viewer_label"))
 			.setDesc(t("modal.log_viewer_desc"))
 			.addTextArea((textArea: TextAreaComponent) => {
@@ -31,8 +31,9 @@ export class LogViewerModal extends Modal {
 				textArea.inputEl.rows = 24;
 				textArea.inputEl.addClass("log-viewer-textarea");
 			});
+		field.settingEl.addClass("log-viewer-field");
 
-		new Setting(contentEl)
+		const buttons = new Setting(contentEl)
 			.addButton((button) =>
 				button
 					.setButtonText(t("modal.log_viewer_refresh"))
@@ -63,6 +64,7 @@ export class LogViewerModal extends Modal {
 						}
 					}),
 			);
+		buttons.settingEl.addClass("sync-modal-actions");
 	}
 
 	onClose(): void {

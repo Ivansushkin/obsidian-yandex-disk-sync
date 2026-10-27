@@ -15,7 +15,7 @@ baseline. Клиентские часы не выбирают победител
 | Folder delete против нового/изменённого descendant                                  | Descendant сохраняется                                                                                    |
 | Folder move против отличающегося target                                             | Операция блокируется до mutations; частичный overwrite запрещён                                           |
 | Последовательные edits одной установки                                              | Непрерывный mutation watermark предотвращает ложный конфликт                                              |
-| Replacement epoch и offline edit                                                    | До явного выбора accept/preserve/later старые изменения не отправляются; local bytes и queues сохраняются |
+| Force epoch и offline edit                                                          | До явного выбора accept/preserve/later старые изменения не отправляются; local bytes и queues сохраняются |
 
 ## Первое подключение устройства
 
@@ -164,11 +164,15 @@ SHA с baseline/canonical и epoch adoption. Эти признаки не зам
 bytes; read timeout указывает API/transfer и сохраняет код ошибки. Progress
 подтверждает завершённые попытки, а не начало conflict flow.
 
-## Полный Force
+## Замена поколения
 
-[Direct Force](FORCE_SYNC.md) не разрешает конфликты по старым baseline/tombstones
-или чужой canonical authority. Он удаляет всё назначение с перечисленными
-исключениями и пишет выбранный источник. Include/exclude не применяются,
-protective/conflict copies не создаются. Читаемость источника обязательна.
-Ошибки отдельных операций сохраняются для ordinary full retry до normal merge.
-Обычная синхронизация сохраняет описанные выше правила конфликтов и защитных копий.
+[Direct Force](FORCE_SYNC.md) заменяет выбранное фильтрами назначение без обычных conflict/protective
+copies и использует выбранный per-run archive. При offline delta другое устройство
+выбирает accept/preserve/later до старых uploads; после завершения Force обычные
+conflict rules снова действуют; filters действуют и во время Force.
+
+Новые [enable/disable/rotate](E2E_ENCRYPTION.md) имеют другую явную политику:
+frozen local reference инициатора становится fresh epoch. Stable replacement receipt
+автоматически заменяет выбранные local bytes и старые queues до ordinary merge;
+remote-only и offline edits не становятся конфликтными копиями. Protected/excluded
+paths сохраняются. Checkpoints без replacement descriptor сохраняют прежние правила.

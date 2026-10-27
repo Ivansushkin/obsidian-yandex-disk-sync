@@ -9,6 +9,9 @@ import { repairMissingAcceptedUploads } from "../src/sync/reconciliation/accepte
 import { type Dependencies } from "../src/sync/reconciliation/context";
 import type { SyncIndex } from "../src/types";
 import { computeSha256 } from "../src/utils/hash-utils";
+import { deferred } from "./helpers/deferred";
+import { afterTest } from "./helpers/test-context";
+import { reconciliationDependencies } from "./helpers/realtime-fixtures";
 import {
 	MemoryDisk,
 	bytes,
@@ -153,6 +156,103 @@ test("initial exact deletion resumes its durable action after restart", async (t
 });
 
 for (const encrypted of [false, true]) {
+	test(`${encrypted ? "encrypted" : "plain"} accepted metadata overlaps and revoked reads cannot repair`, async (t) => {
+		const createDevice = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = createDevice(disk, "a", codec);
+		const expected = Object.fromEntries(
+			Array.from({ length: 6 }, (_, i) => [
+				`Note${i}.md`,
+				`reference${i}`,
+			]),
+		);
+		for (const [path, content] of Object.entries(expected)) {
+			a.vault.put(path, bytes(content));
+		}
+		await a.full();
+		a.settings.maxConcurrency = 4;
+		const get = a.client.getLogicalResource.bind(a.client);
+		const paths = Object.keys(expected);
+		for (const interruption of [
+			"healthy",
+			"lifetime",
+			"canonical",
+		] as const) {
+			const revoke = interruption !== "healthy";
+			const entered = deferred();
+			const release = deferred();
+			afterTest(t, () => release.resolve());
+			let active = 0;
+			let peak = 0;
+			let writes = 0;
+			const before = structuredClone(a.index.captureLocalCausalState());
+			const canonicalBytes = disk.files.get(
+				"vault/.obsidian-sync-index.json",
+			)!;
+			a.client.getLogicalResource = async (...args) => {
+				active++;
+				peak = Math.max(peak, active);
+				entered.resolve();
+				try {
+					await release.promise;
+					return interruption === "lifetime"
+						? null
+						: await get(...args);
+				} finally {
+					active--;
+				}
+			};
+			disk.beforeRequest = async (method) => {
+				writes += Number(method !== "GET");
+			};
+			const operation = repairMissingAcceptedUploads(
+				reconciliationDependencies(a.engine),
+				paths,
+			);
+			const outcome = revoke ? assert.rejects(operation) : operation;
+			await Promise.race([
+				entered.promise,
+				operation.then(() => {
+					throw new Error("No accepted metadata reads");
+				}),
+			]);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			const observedPeak = peak;
+			if (interruption === "canonical") {
+				const latest = await a.canonical();
+				latest.revision++;
+				latest.files[paths[0]!]!.sha256 = await computeSha256(
+					bytes("new winner"),
+				);
+				latest.files[paths[0]!]!.changedRevision = latest.revision;
+				const content = bytes(JSON.stringify(latest));
+				disk.files.set(
+					"vault/.obsidian-sync-index.json",
+					codec ? await codec.encrypt(content) : content,
+				);
+			} else if (revoke) {
+				if (encrypted) {
+					a.client.setEncryptionService(null);
+					a.client.setEncryptionService(codec);
+				} else {
+					a.engine.pause();
+					a.engine.resume();
+				}
+			}
+			release.resolve();
+			await outcome;
+			assert.equal(observedPeak, 4);
+			assert.ok(peak <= 4);
+			assert.equal(writes, 0);
+			assert.deepEqual(a.index.captureLocalCausalState(), before);
+			a.client.getLogicalResource = get;
+			disk.beforeRequest = undefined;
+			disk.files.set("vault/.obsidian-sync-index.json", canonicalBytes);
+		}
+		await a.assertSettled(expected);
+	});
+
 	const mode = encrypted ? "encrypted" : "plaintext";
 
 	test(`${mode} new device receives cloud versions before uploading local-only files`, async (t) => {

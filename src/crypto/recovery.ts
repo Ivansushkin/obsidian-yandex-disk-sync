@@ -3,6 +3,9 @@ import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import { t } from "../i18n/index";
 import type { IndexMaintenance, RemoteEncryptionManifest } from "../types";
 import { logger } from "../utils/logger";
+import { computeSha256 } from "../utils/hash-utils";
+import { sameIndexValue } from "../sync/canonical/transaction-rules";
+import { joinPath } from "../utils/path-utils";
 import { UnreadableRemoteIndexError } from "../sync/canonical/errors";
 import type { EncryptionContext } from "./context";
 import { type EncryptionCodec } from "./encryption";
@@ -338,6 +341,60 @@ export class EncryptionRecovery {
 
 	async recoverEncryptionTransition(): Promise<void> {
 		const transition = this.context.getTransition();
+		if (!transition?.replacement) {
+			return this.recoverTransition();
+		}
+		const replacement = transition.replacement;
+		let codec: EncryptionCodec | null = null;
+		if (transition.target.enabled) {
+			codec = await this.context.manager.createCodec(
+				transition.target.profileId!,
+				transition.target.salt!,
+				transition.target.password!,
+			);
+		}
+		let target;
+		try {
+			target =
+				await this.context.index.readCanonicalIndexWithCodecIfPresent(
+					codec,
+				);
+		} catch (error) {
+			if (!(error instanceof UnreadableRemoteIndexError)) {
+				throw error;
+			}
+		}
+		if (target?.epoch === replacement.targetEpoch) {
+			if (
+				target.epochAdoption?.operationId !== transition.id ||
+				target.epochAdoption.initiatedBy !==
+					this.context.getSettings().deviceId ||
+				(target.maintenance &&
+					target.maintenance.replacement?.sourceEpoch !==
+						replacement.sourceEpoch)
+			) {
+				throw new Error("Replacement target recovery identity changed");
+			}
+			this.context.index.beginEpochAdoption(target.epoch, false);
+			try {
+				if (target.maintenance) {
+					await this.context.index.runTargetMaintenanceRecovery(
+						transition.id,
+						() => this.recoverTransition(),
+					);
+				} else {
+					await this.recoverTransition();
+				}
+			} finally {
+				this.context.index.endEpochAdoption();
+			}
+			return;
+		}
+		return this.recoverTransition();
+	}
+
+	private async recoverTransition(): Promise<void> {
+		const transition = this.context.getTransition();
 		if (!transition) {
 			return;
 		}
@@ -385,13 +442,19 @@ export class EncryptionRecovery {
 				authoritativeService: this.context.getService(),
 			});
 			if (!maintenance) {
-				if (this.workflow.hasPendingGuardedCleanup()) {
-					throw new Error(
-						"Stable encryption recovery still has pending cleanup",
-					);
+				const previous = this.context.index.captureLocalCausalState();
+				try {
+					await this.retireCompletedTargetCleanup(transition);
+					if (transition.replacement) {
+						this.context.index.finishEncryptionReplacement();
+					}
+					this.context.setTransition(null);
+					await this.context.persist();
+				} catch (error) {
+					this.context.index.restoreLocalCausalState(previous);
+					this.context.setTransition(transition);
+					throw error;
 				}
-				this.context.setTransition(null);
-				await this.context.persist();
 				this.context.ui.setBlock(null);
 				return;
 			}
@@ -431,6 +494,7 @@ export class EncryptionRecovery {
 				transition.targetRawByLogicalPath,
 			)) {
 				const metadata =
+					transition.referenceFiles?.[logicalPath] ??
 					this.context.index.getRemoteIndex().files[logicalPath];
 				if (!metadata || metadata.deleted) {
 					throw new Error(
@@ -465,6 +529,7 @@ export class EncryptionRecovery {
 				await this.assertCompletedSourceRollback(transition);
 			}
 		}
+
 		if (this.context.getTransition() !== transition) {
 			throw new Error("Local encryption recovery authority changed");
 		}
@@ -476,5 +541,173 @@ export class EncryptionRecovery {
 			throw error;
 		}
 		this.context.ui.setBlock(null);
+	}
+	/** Retire local receipts after foreign completion, without acquiring DELETE authority. */
+	private async retireCompletedTargetCleanup(
+		transition: LocalEncryptionTransition,
+	): Promise<void> {
+		if (transition.replacement) {
+			const reader = this.context.index.createCanonicalReadSession(
+				this.context.engine.createReadLifetimeGuard(),
+				true,
+			);
+			try {
+				const current = await reader();
+				if (
+					current.epoch !== transition.replacement.targetEpoch ||
+					current.maintenance ||
+					current.epochAdoption?.operationId !== transition.id ||
+					current.epochAdoption.initiatedBy !==
+						this.context.getSettings().deviceId ||
+					!sameIndexValue(
+						Object.keys(current.files).sort(),
+						Object.keys(transition.referenceFiles ?? {}).sort(),
+					)
+				) {
+					throw new Error(
+						"Completed replacement has no stable reference authority",
+					);
+				}
+				const local = await this.context.index.buildLocalIndex();
+				for (const [path, file] of Object.entries(current.files)) {
+					if (
+						file.deleted ||
+						file.sha256 !==
+							transition.referenceFiles?.[path]?.sha256 ||
+						local.get(path)?.sha256 !== file.sha256
+					) {
+						throw new Error(
+							"Completed replacement reference changed",
+						);
+					}
+					const raw = await this.context.client.getPhysicalPath(
+						joinPath(this.context.getSettings().remotePath, path),
+					);
+					const snapshot =
+						await this.context.client.downloadStableRawFile(raw);
+					const content =
+						snapshot &&
+						(this.context.getService()
+							? await this.context
+									.getService()!
+									.decrypt(snapshot.raw)
+							: snapshot.raw);
+					if (
+						!content ||
+						(await computeSha256(content)) !== file.sha256
+					) {
+						throw new Error(
+							"Completed replacement target is unverified",
+						);
+					}
+				}
+				for (const action of transition.replacement.deletions) {
+					if (
+						await this.context.client.getResource(
+							joinPath(
+								this.context.getSettings().remotePath,
+								action.path,
+							),
+							1,
+							0,
+							true,
+						)
+					) {
+						throw new Error(
+							"Completed replacement retains a source subtree",
+						);
+					}
+				}
+				if (
+					!sameIndexValue(current, await reader()) ||
+					this.context.getTransition() !== transition
+				) {
+					throw new Error(
+						"Completed replacement changed during retirement",
+					);
+				}
+				reader.assertCurrent();
+			} finally {
+				reader.close();
+			}
+			return;
+		}
+		if (!this.workflow.hasPendingGuardedCleanup()) {
+			return;
+		}
+		const epoch = this.context.index.getRemoteIndex().epoch;
+		const pending = this.context.index
+			.getPendingPhysicalActions()
+			.filter(
+				(action) =>
+					action.epoch === epoch &&
+					action.origin === "encryption-cleanup" &&
+					action.type === "guarded-cleanup",
+			);
+		const reader = this.context.index.createCanonicalReadSession(
+			this.context.engine.createReadLifetimeGuard(),
+			true,
+		);
+		try {
+			const current = await reader();
+			if (
+				current.epoch !== this.context.index.getObservedEpoch() ||
+				current.maintenance ||
+				current.revision <= transition.sourceCanonicalRevision
+			) {
+				throw new Error(
+					"Completed target cleanup has no stable canonical authority",
+				);
+			}
+			for (const action of pending) {
+				if (
+					!transition.sourceFingerprints[action.path] ||
+					action.expectedFingerprint !==
+						transition.sourceFingerprints[action.path]
+				) {
+					throw new Error(
+						"Completed target cleanup has an unrelated local action",
+					);
+				}
+				if (
+					await this.context.client.getResource(
+						joinPath(
+							this.context.getSettings().remotePath,
+							action.path,
+						),
+						1,
+						0,
+						true,
+					)
+				) {
+					throw new Error(
+						"Completed target cleanup still has a physical source",
+					);
+				}
+			}
+			const latest = await reader();
+			if (
+				latest.epoch !== current.epoch ||
+				latest.revision !== current.revision ||
+				latest.maintenance ||
+				this.context.getTransition() !== transition
+			) {
+				throw new Error("Completed target cleanup authority changed");
+			}
+			await this.controller.assertLocalRecoveryCoherence({
+				transition,
+				manifest: await this.context.index.downloadEncryptionManifest(),
+				maintenance: undefined,
+				deviceId: this.context.getSettings().deviceId,
+				authority: "target",
+				authoritativeService: this.context.getService(),
+			});
+			reader.assertCurrent();
+			for (const action of pending) {
+				this.context.index.completePhysicalAction(action.id);
+			}
+		} finally {
+			reader.close();
+		}
 	}
 }

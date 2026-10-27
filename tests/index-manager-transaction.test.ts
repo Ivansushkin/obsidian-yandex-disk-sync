@@ -1367,11 +1367,12 @@ test("foreign target recovery survives restart at each persistent step without r
 
 				const controller = new EncryptionTransitionController(
 					manager,
-					{} as never,
+					{ createReadLifetimeGuard: () => () => {} } as never,
 					{} as never,
 					{
 						client,
 						getRemotePath: () => "vault",
+						getConcurrency: () => 1,
 						completeAction: () => {},
 						persist: async () => {},
 					},

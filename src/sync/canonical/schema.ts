@@ -1,3 +1,4 @@
+import { sameIndexValue } from "./transaction-rules";
 import type {
 	EncryptionModeDescriptor,
 	FileMetadata,
@@ -8,6 +9,11 @@ import { isProtectedPath } from "../../utils/path-utils";
 import { isJsonRecord } from "../../utils/record-utils";
 import { isFileModificationTime } from "../../utils/timestamp-utils";
 import { InvalidCurrentIndexError } from "./errors";
+
+import {
+	validateEncryptionEpochAdoption,
+	validateEncryptionReplacement,
+} from "../../crypto/replacement";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -121,7 +127,14 @@ export function validateCurrentIndexShape(
 		"moves",
 		"appliedMutationSeq",
 	];
-	const allowedRootKeys = new Set([...requiredRootKeys, "maintenance"]);
+	if (data.epochAdoption !== undefined) {
+		validateEncryptionEpochAdoption(data.epochAdoption);
+	}
+	const allowedRootKeys = new Set([
+		...requiredRootKeys,
+		"maintenance",
+		"epochAdoption",
+	]);
 	assertIndexSection(
 		Object.keys(data).every((key) => allowedRootKeys.has(key)) &&
 			requiredRootKeys.every((key) => key in data),
@@ -372,6 +385,10 @@ export function validateCurrentIndexShape(
 		"target",
 		"cleanup",
 	];
+	if (maintenance.replacement !== undefined) {
+		validateEncryptionReplacement(maintenance.replacement);
+		maintenanceKeys.push("replacement");
+	}
 	assertIndexSection(
 		Object.keys(maintenance).length === maintenanceKeys.length &&
 			maintenanceKeys.every((key) => key in maintenance),
@@ -437,6 +454,30 @@ export function validateCurrentIndexShape(
 		"maintenance.targetRevision",
 		"must agree with the maintenance phase",
 	);
+	if (maintenance.replacement !== undefined) {
+		const replacement = maintenance.replacement;
+		assertIndexSection(
+			data.epoch ===
+				(preCommit ? replacement.sourceEpoch : replacement.targetEpoch),
+			"maintenance.replacement",
+			"epoch must agree with the commit phase",
+		);
+		if (!preCommit) {
+			const receipt = data.epochAdoption;
+			assertIndexSection(
+				isJsonRecord(receipt) &&
+					receipt.operationId === maintenance.id &&
+					receipt.initiatedBy === maintenance.initiatedBy &&
+					sameIndexValue(receipt.scope, replacement.scope) &&
+					sameIndexValue(
+						receipt.preservedRawPaths,
+						replacement.preservedRawPaths,
+					),
+				"epochAdoption",
+				"receipt must agree with committed replacement authority",
+			);
+		}
+	}
 	if (!preCommit) {
 		const targetRevision = maintenance.targetRevision;
 		assertIndexSection(
@@ -446,7 +487,9 @@ export function validateCurrentIndexShape(
 				(maintenance.phase !== "index-committed" ||
 					targetRevision === data.revision) &&
 				(maintenance.phase !== "cleanup" ||
-					targetRevision + 1 === data.revision) &&
+					(maintenance.replacement !== undefined
+						? targetRevision + 1 <= data.revision
+						: targetRevision + 1 === data.revision)) &&
 				(maintenance.phase !== "stable" ||
 					targetRevision < data.revision),
 			"maintenance.targetRevision",

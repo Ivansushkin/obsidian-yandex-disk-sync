@@ -1,3 +1,5 @@
+import { EncryptionReplacementRevokedError } from "../../crypto/replacement";
+import { findErrorCause } from "../../utils/error-utils";
 import { VaultAdapter } from "../../api/vault-adapter";
 import { YandexApiError, YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
@@ -40,10 +42,28 @@ export async function uploadPhysicalRewriteTarget(
 	remotePath: string,
 	content: ArrayBuffer,
 	verify: () => Promise<PhysicalRewriteUploadProof>,
+	overwrite = false,
 ): Promise<PhysicalRewriteUploadProof> {
 	try {
-		await deps.yandexClient.uploadFileExclusive(remotePath, content, true);
+		if (overwrite) {
+			await deps.yandexClient.uploadFile(remotePath, content, true);
+		} else {
+			await deps.yandexClient.uploadFileExclusive(
+				remotePath,
+				content,
+				true,
+			);
+		}
 	} catch (error) {
+		if (
+			findErrorCause(
+				error,
+				(candidate) =>
+					candidate instanceof EncryptionReplacementRevokedError,
+			)
+		) {
+			throw error;
+		}
 		logger.warn("Encryption target upload response was not conclusive", {
 			status: error instanceof YandexApiError ? error.status : undefined,
 			error,
@@ -80,6 +100,7 @@ export async function rewriteRemoteFiles(
 			path,
 			reason: "Encryption transition",
 		})),
+		Math.max(1, Math.min(deps.settings.maxConcurrency || 1, 4)),
 	);
 
 	const tasks = liveCanonical.map(([path, logicalMetadata]) => async () => {
@@ -96,6 +117,7 @@ export async function rewriteRemoteFiles(
 			content,
 			async () =>
 				await options.verifyPhysicalRewriteUpload!(path, sha256),
+			options.authoritativeEncryption,
 		);
 		const rewritten: FileMetadata = {
 			...logicalMetadata,
@@ -135,10 +157,10 @@ export async function rewriteRemoteFiles(
 		return;
 	}
 	deps.setSyncPhase("saving-index");
-	await options?.beforeIndexCommit?.();
-	deps.indexManager.updateSyncTime();
-	deps.indexManager.beginPhysicalRewriteCommit();
 	try {
+		await options?.beforeIndexCommit?.();
+		deps.indexManager.updateSyncTime();
+		deps.indexManager.beginPhysicalRewriteCommit();
 		await syncReconciliation.saveRemoteIndexOrAbort(
 			deps.syncReconciliation,
 			result,

@@ -15,7 +15,10 @@ import type { RemoteEncryptionManifest, YandexDiskSyncSettings } from "./types";
 import { logger } from "./utils/logger";
 
 export type StartupState = "ready" | "migration" | "blocked";
-export type StartupBlockKind = Exclude<ExternalSyncBlockKind, "local-state">;
+export type StartupBlockKind = Exclude<
+	ExternalSyncBlockKind,
+	"local-state" | "persistence"
+>;
 export type StartupBlocks = Record<
 	Exclude<StartupBlockKind, "force">,
 	string | null

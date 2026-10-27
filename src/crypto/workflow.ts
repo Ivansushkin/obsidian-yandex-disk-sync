@@ -32,10 +32,16 @@ export class EncryptionWorkflow {
 			context.index,
 			context.engine,
 			{
-				claim: (transition) =>
-					this.maintenance.claimEncryptionMaintenance(transition),
-				applyTarget: (snapshot) =>
-					this.maintenance.applyEncryptionSnapshot(snapshot),
+				claim: (transition, targetCandidate) =>
+					this.maintenance.claimEncryptionMaintenance(
+						transition,
+						targetCandidate,
+					),
+				applyTarget: (snapshot, candidate) =>
+					this.maintenance.applyEncryptionSnapshot(
+						snapshot,
+						candidate,
+					),
 				resolveTargetPaths: (transition) =>
 					this.maintenance.resolveTransitionTargetPaths(transition),
 				assertSourceUnchanged: (transition) =>
@@ -102,8 +108,19 @@ export class EncryptionWorkflow {
 						transition,
 					),
 				clearLocalTransition: async () => {
+					const transition = context.getTransition();
+					const causal = context.index.captureLocalCausalState();
+					if (transition?.replacement) {
+						context.index.finishEncryptionReplacement();
+					}
 					context.setTransition(null);
-					await context.persist();
+					try {
+						await context.persist();
+					} catch (error) {
+						context.index.restoreLocalCausalState(causal);
+						context.setTransition(transition);
+						throw error;
+					}
 				},
 				recover: () => this.recovery.recoverEncryptionTransition(),
 				clearBlock: () => context.ui.setBlock(null),
@@ -117,6 +134,7 @@ export class EncryptionWorkflow {
 			{
 				client: context.client,
 				getRemotePath: () => context.getSettings().remotePath,
+				getConcurrency: () => context.getSettings().maxConcurrency,
 				completeAction: (path) =>
 					this.maintenance.completeGuardedCleanup(path),
 				persist: () => context.persist(),
@@ -225,8 +243,7 @@ export class EncryptionWorkflow {
 		const saltBytes = EncryptionService.generateSalt();
 		const saltBase64 = EncryptionService.bytesToBase64(saltBytes);
 		const revision = 1;
-		const service = createEncryptionCodec("hardened", saltBytes);
-		await service.initializeKey(password);
+		const service = await this.prepareTransitionCodec(saltBase64, password);
 		const target: LocalEncryptionSnapshot = {
 			enabled: true,
 			salt: saltBase64,
@@ -257,6 +274,7 @@ export class EncryptionWorkflow {
 		await this.controller.execute({
 			transition,
 			sourceService: null,
+			targetService: service,
 			beforeApplyTarget: publishEnablingManifest,
 			publishFilesCopied: publishEnablingManifest,
 			publishIndexCommitted: publishEnablingManifest,
@@ -424,8 +442,10 @@ export class EncryptionWorkflow {
 				currentManifest?.revision ?? 1,
 				this.context.getSettings().encryptionRevision ?? 1,
 			) + 1;
-		const service = createEncryptionCodec("hardened", saltBytes);
-		await service.initializeKey(newPassword);
+		const service = await this.prepareTransitionCodec(
+			saltBase64,
+			newPassword,
+		);
 		const target: LocalEncryptionSnapshot = {
 			enabled: true,
 			salt: saltBase64,
@@ -457,6 +477,7 @@ export class EncryptionWorkflow {
 		await this.controller.execute({
 			transition,
 			sourceService,
+			targetService: service,
 			beforeApplyTarget: publishRotatingManifest,
 			publishFilesCopied: publishRotatingManifest,
 			publishIndexCommitted: publishRotatingManifest,
@@ -656,6 +677,29 @@ export class EncryptionWorkflow {
 		return profileId;
 	}
 
+	/** Prepare a transition key without accepting a late configuration or host change. */
+	private async prepareTransitionCodec(
+		salt: string,
+		password: string,
+	): Promise<EncryptionCodec> {
+		const lifetime = this.context.engine.createReadLifetimeGuard();
+		const reads = this.context.index.createStartupReadSession(() => {
+			lifetime();
+			this.context.assertConnectionAllowed();
+		});
+		try {
+			const service = await this.context.manager.createCodec(
+				"hardened",
+				salt,
+				password,
+			);
+			reads.assertCurrent();
+			return service;
+		} finally {
+			reads.close();
+		}
+	}
+
 	/** Bind the archive choice to the current canonical source. */
 	private async createSelectedEncryptionBackup(
 		choice: OperationBackupChoice | undefined,
@@ -673,19 +717,16 @@ export class EncryptionWorkflow {
 		// nesting is bypassed; encryption and canonical-maintenance guards remain
 		// authoritative until this orchestrator acquires its own claim.
 		await this.context.index.downloadEncryptionManifest();
-		const result = await this.context.engine.fullSync({
-			skipMaintenanceGuard: true,
-			requireStableCanonical: true,
-			validateThroughExternalEncryptionBlock: Boolean(
-				this.context.getTransition(),
-			),
-		});
-		if (!result.success) {
+		const canonical = await this.context.index.loadRemoteIndex(
+			false,
+			false,
+			true,
+		);
+		if (canonical.maintenance) {
 			throw new Error(
-				t("notice.encryption_sync_failed", {
-					errors: result.errors.length,
-				}),
+				"Encryption preflight requires a stable canonical index",
 			);
 		}
+		await this.context.index.buildLocalIndex();
 	}
 }

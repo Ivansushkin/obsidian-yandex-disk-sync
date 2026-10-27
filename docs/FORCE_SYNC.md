@@ -2,17 +2,18 @@
 
 ## User contract
 
-Force reads the chosen source, clears the destination and copies directly to final
-paths. It covers the entire vault, including hidden files, configuration, other
-plugins and empty directories, regardless of normal include/exclude settings.
-A successfully read empty source explicitly clears the destination. A missing remote
-source is unavailable, not empty; only local-to-Disk may create a missing destination.
+Force replaces the selected destination with the chosen readable source, directly
+at final paths. Both directions use the shared protected-path rules, current
+include/exclude patterns and the Obsidian configuration switch. Hidden files and
+empty directories participate only within that selection. A successfully read
+empty selection clears only selected destination files after explicit confirmation.
+A missing remote root is unavailable, not empty.
 
-The root .backup is preserved and is not a payload source. Local sync-plugin
-installations, credentials, state and old logs are preserved and never uploaded.
-Old remote copies of those plugin directories are deleted by local-to-remote
-replacement. Root canonical, manifest and lock names are service metadata, not
-payload; nested service-like names are literal user paths.
+Protected paths, excluded files, .backup and this plugin's credentials/state/logs
+are preserved and never treated as payload. Existing excluded remote copies are
+not silently cleaned up. Canonical, manifest and old root locks are managed as
+service metadata through their existing owners. Nested protected service names
+also follow shared path-utils policy.
 
 Force creates no payload staging, locks, leases, MOVE operations, protective
 copies or trash. Local deletion is permanent. An optional archive is a final
@@ -21,20 +22,35 @@ transaction, filtering and protective-copy rules.
 
 ## Direction and encryption
 
-Local to Disk uses actual local bytes. It deletes old remote payloads and all
-old locks without decoding the old index or proving destination fingerprints.
-It deletes the old canonical and writes a new sync-index epoch. Local encryption
-settings select the output mode. Encrypted output gets fresh hardened salt and
-a matching manifest; plaintext output removes the manifest. The old destination
-key is not needed.
+Local to Disk uses actual selected local bytes and inventories the destination
+without reading old user contents or trusting old canonical history. A valid
+existing encrypted destination requires its verified password to classify logical
+paths safely. Keeping encryption reuses that codec/salt so excluded ciphertext
+remains readable. New encrypted destinations receive fresh hardened parameters.
+Disabling encryption is blocked before writes if excluded encrypted resources
+would lose their codec; use the dedicated encryption settings first. Corrupt or
+unsupported destination manifests cannot authorize a scoped purge. Output mode
+still follows local settings; the canonical is rebuilt with a fresh Force epoch.
 
 Disk to local reads the physical remote tree, not old canonical history.
 Before deleting anything locally it reads every selected source and authenticates
-encrypted paths/content. A valid manifest is preserved. A lost or corrupt manifest
-may be rebuilt only from saved salt/profile/password authenticated by the source.
-A password alone cannot replace lost encryption parameters. An ambiguous mixed
-source, unreadable source, impossible portable name or file occupying a preserved
-plugin ancestor stops preparation without clearing the destination.
+encrypted paths/content when a valid manifest exists. A valid manifest is preserved.
+A missing manifest selects plaintext, including empty sources and devices with stale
+local encryption settings. Names and bytes are then copied as ordinary files; Force
+does not reconstruct lost encryption parameters. A corrupt/unsupported manifest or
+failed manifest request blocks preparation rather than selecting plaintext. A late
+404 after manifest metadata was found is a read failure, not proof of absence.
+The selected source mode is checked again around the final pre-purge source scan;
+a changed manifest or read failure stops replacement before local deletion.
+Raw excluded/protected directories are pruned before decryption. Candidate encrypted
+names are decoded first, then logical filters select which contents may be read.
+A .agents directory is excluded only by actual user settings; the configured
+Obsidian directory follows its switch. Neither name is hardcoded as extra protection.
+Included undecodable names/content stop with force-source-format without a plaintext
+fallback. The progress Notice changes to preparation failed instead of retaining 0/N.
+File/folder collisions that would erase excluded descendants block preparation.
+An unreadable source, impossible portable name or file occupying a preserved plugin
+ancestor stops preparation without clearing the destination.
 Remote user bytes are not replaced; the index is rebuilt from the actual source
 and old service locks are removed. Local files are decrypted. Configuration
 replacement requires an Obsidian restart to apply application/plugin settings.
@@ -54,7 +70,12 @@ verification; missing source bytes or failed requests are never reported as succ
 
 A local checkpoint retains existing Force fields plus direct:
 format direct-v1, config directory, stage (purging, copying, publishing),
-source directories and remaining deletions/transfers. Canonical maintenance keeps
+source directories and remaining deletions/transfers. The persisted schema is
+unchanged: frozen selection is ephemeral until confirmation; applying checkpoints
+already contain explicit selected sources/deletes, so recovery never recomputes or
+widens them under new settings. Filter changes before applying invalidate the plan.
+Older unfiltered direct-v1 remainders retain their admitted explicit actions; a new
+scoped Force requires confirmation. Canonical maintenance keeps
 kind force with the current semantic markers and existing phases; its cleanup
 array is empty because direct deletion does not use fingerprint-fenced actions.
 Passwords remain exclusively in local plugin data.
@@ -69,7 +90,10 @@ confirmed source is read again before initial deletion. The checkpoint is saved
 before destructive work. After deletion starts, each independent failure is
 recorded while other actions continue. Completed actions are retired durably.
 A failed subtree deletion requeues affected copies before retrying that deletion.
-A continuation never repeats the completed broad purge.
+A continuation never repeats the completed broad purge. Copy/mkdir never implicitly
+delete new file/folder blockers; only explicit pending deletes authorize removal.
+New blockers retain the remainder and require resolving the collision or confirming
+a newly prepared Force. Even raw-pruned encrypted exclusions block codec removal.
 
 Ordinary manual, startup and scheduled full sessions resume a direct checkpoint
 before normal admission/merge. If the remainder cannot finish, the session reports
@@ -82,11 +106,33 @@ entries into deletions.
 
 ## Confirmation and results
 
-One modal shows direction, actual paths, count, output encryption, preserved
-exceptions, ignored filters and an explicit empty-source warning. Archive creation
-is off by default. Buttons explicitly clear and replace the selected destination.
-The chosen archive must be verified before clearing anything; errors stay in the
-same modal, where the user can retry, uncheck the archive or cancel.
+One modal opens before source reads and stays through preparation, password entry,
+destructive confirmation, optional archive, replacement and result. Preparation is
+read-only and reports actual verified objects; password candidates are checked in
+that same modal and never appear in published state. Wrong passwords can be retried;
+manifest/source failures offer retry or cancel without authorizing replacement.
+A spinner accompanies the source-checking message until password entry,
+confirmation, an error or the final result replaces it. Reduced-motion preferences
+disable the animation while retaining the status text.
+
+After successful source verification the modal shows direction, actual paths, count,
+source/output encryption, applied filters, preserved exceptions and an explicit
+empty-source warning. Remote encryption is distinguished from decrypted local files.
+The archive toggle and action buttons stay in a fixed footer; only the description
+scrolls. Plain paragraphs group source details and consequences without separate
+decorative panels. Archive controls have a distinct gap before the action row.
+Active progress is shown by the Notice without a duplicate modal status.
+Failures and the final result remain in the dialog.
+Archive creation is off by default. Remote-to-local archives the entire local vault
+to remote .backup; local-to-remote archives the old remote contents. The existing
+archive encryption policy is unchanged. Only the explicit destructive button permits
+replacement. A chosen archive must be verified before clearing anything; errors stay
+in that modal, where the user can retry, uncheck the archive or cancel.
+
+Cancel during preparation prevents later reads/writes after admitted work settles.
+Closing the modal during archiving cancels replacement and keeps the reservation
+until the archive request settles. After destructive confirmation and entry into
+replacement, closing the modal only hides it; the persistent Notice retains progress.
 
 One Notice spans preparation, optional archive, purge, copies, canonical and local
 persistence. Activity stays in the selected direction button. Closing settings does

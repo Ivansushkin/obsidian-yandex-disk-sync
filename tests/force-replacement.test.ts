@@ -12,52 +12,29 @@ import {
 } from "../src/sync/workflows/force-state";
 import { bytes, managedDevices, MemoryDisk } from "./helpers/sync-flow";
 
-test("Force authenticates restricted encrypted targets and replaces old ciphertext without its key in full scope", async (context) => {
+test("scoped Force rejects unreadable destination encryption instead of deleting unknown excluded paths", async (context) => {
 	const disk = new MemoryDisk();
-	const make = managedDevices(context);
-	const source = make(disk, "restricted-encrypted", null);
-	source.settings.syncPatterns = ["*.md", "**/*.md"];
-	source.settings.enableEncryption = true;
-	source.settings.encryptionPassword = "synthetic-old-password";
-	source.vault.put("note.md", bytes("old encrypted source"));
-	const sourceDeps = {
-		client: source.client,
-		adapter: source.adapter,
-		index: source.index,
-		settings: source.settings,
-		persist: async () => {},
-		password: async () => null,
-	};
-	const seed = await prepareForceReplacement(sourceDeps, "from_local");
-	assert.ok(seed?.codec);
-	await applyForceReplacement(sourceDeps, seed, "without-backup");
-	const oldPath = `vault/${await seed.codec.encryptFilename("note.md")}`;
-	assert.equal(disk.files.has(oldPath), true);
-	const owner = make(disk, "keyless-plaintext", null);
-	owner.settings.syncPatterns = [];
+	const owner = managedDevices(context)(disk, "scoped-destination", null);
+	owner.settings.syncPatterns = ["*.md"];
 	owner.vault.put("note.md", bytes("new plaintext source"));
-	disk.files.set(
-		"vault/.obsidian-sync-index.json",
-		bytes("corrupt canonical"),
-	);
+	disk.files.set("vault/unknown-ciphertext", bytes("keep"));
 	disk.files.set("vault/.obsidian-encrypt.json", bytes("corrupt manifest"));
-	const deps = {
-		...sourceDeps,
-		client: owner.client,
-		adapter: owner.adapter,
-		index: owner.index,
-		settings: owner.settings,
-	};
-	const plan = await prepareForceReplacement(deps, "from_local");
-	assert.ok(plan);
-	await applyForceReplacement(deps, plan, "without-backup");
-	assert.equal(disk.files.has(oldPath), false);
-	assert.equal(disk.files.has("vault/.obsidian-encrypt.json"), false);
-	assert.deepEqual(
-		disk.files.get("vault/note.md"),
-		bytes("new plaintext source"),
+	const before = new Map(disk.files);
+	await assert.rejects(
+		prepareForceReplacement(
+			{
+				client: owner.client,
+				adapter: owner.adapter,
+				index: owner.index,
+				settings: owner.settings,
+				persist: async () => {},
+				password: async () => null,
+			},
+			"from_local",
+		),
 	);
-	assert.deepEqual(Object.keys((await owner.canonical()).files), ["note.md"]);
+	assert.deepEqual(disk.files, before);
+	owner.assertLocal("note.md", "new plaintext source");
 });
 
 for (const encrypted of [false, true]) {
@@ -79,7 +56,6 @@ for (const encrypted of [false, true]) {
 						settings: owner.settings,
 						persist: async () => {},
 						password: async () => "matrix-password",
-						chooseSourceMode: async () => "plaintext" as const,
 					};
 					if (direction === "from_remote") {
 						if (!sourceEmpty) {
@@ -245,7 +221,7 @@ for (const encrypted of [false, true]) {
 			index: owner.index,
 			settings: owner.settings,
 			persist: async () => {},
-			password: async () => "replacement-password",
+			password: async () => "first-password",
 			watcherCutoff: () =>
 				owner.watcher
 					.getDeferredEvents()
@@ -278,9 +254,7 @@ for (const encrypted of [false, true]) {
 				createdAt: 1,
 			},
 		]);
-		owner.settings.encryptionPassword = encrypted
-			? "replacement-password"
-			: null;
+		owner.settings.encryptionPassword = encrypted ? "first-password" : null;
 		disk.files.set(
 			"vault/.obsidian-sync-index.json",
 			bytes("corrupt index"),
@@ -299,6 +273,7 @@ for (const encrypted of [false, true]) {
 		disk.beforeRequest = async (_method, endpoint, path) => {
 			if (
 				endpoint === "/download" &&
+				!path.endsWith("/.obsidian-encrypt.json") &&
 				oldBytes.has(disk.files.get(path)!)
 			) {
 				throw new Error(
@@ -328,8 +303,8 @@ for (const encrypted of [false, true]) {
 		});
 		assert.equal(result.success, true, JSON.stringify(result.errors));
 		assert.equal(owner.engine.isSyncPaused(), true);
-		assert.equal(disk.files.has("vault/workspace.json"), false);
-		assert.equal(disk.files.has("vault/" + excludedLongName), false);
+		assert.equal(disk.files.has("vault/workspace.json"), true);
+		assert.equal(disk.files.has("vault/" + excludedLongName), true);
 		assert.deepEqual(owner.index.getPendingMutations(), []);
 		assert.deepEqual(owner.watcher.getDeferredEvents(), []);
 		disk.beforeRequest = undefined;
@@ -397,7 +372,6 @@ for (const encrypted of [false, true]) {
 			settings: receiving.settings,
 			persist: async () => {},
 			password: async () => "source-password",
-			chooseSourceMode: async () => "plaintext" as const,
 		};
 		const plan = await prepareForceReplacement(deps, "from_remote");
 		assert.ok(plan);
@@ -428,7 +402,6 @@ test("Force source failure cancellation and storage drift cannot clear the desti
 		settings: owner.settings,
 		persist: async () => {},
 		password: async () => null,
-		chooseSourceMode: async () => "plaintext" as const,
 	};
 	const plan = await prepareForceReplacement(deps, "from_local");
 	assert.ok(plan);
@@ -618,7 +591,7 @@ for (const encrypted of [false, true]) {
 	});
 }
 
-test("Force encrypted source requires authenticated parameters and Cancel preserves the local destination", async (context) => {
+test("Force source manifest controls decoding and password retry without changing the destination", async (context) => {
 	const disk = new MemoryDisk();
 	const make = managedDevices(context);
 	const source = make(disk, "encrypted-source", null);
@@ -639,9 +612,6 @@ test("Force encrypted source requires authenticated parameters and Cancel preser
 	const target = make(disk, "source-reader", null);
 	target.vault.put("local.md", bytes("keep local"));
 	target.settings.enableEncryption = true;
-	target.settings.encryptionSalt = source.settings.encryptionSalt;
-	target.settings.encryptionProfileId = "hardened";
-	target.settings.encryptionRevision = source.settings.encryptionRevision;
 	target.settings.encryptionPassword = "incorrect-password";
 	const deps = {
 		client: target.client,
@@ -649,32 +619,62 @@ test("Force encrypted source requires authenticated parameters and Cancel preser
 		index: target.index,
 		settings: target.settings,
 		persist: async () => {},
-		password: async () => null,
-		chooseSourceMode: async () => "encrypted" as const,
+		password: async (): Promise<string | null> => null,
 	};
 	assert.equal(await prepareForceReplacement(deps, "from_remote"), null);
+	let attempts = 0;
+	deps.password = async () =>
+		++attempts === 1 ? "wrong-again" : "source-password";
+	const authenticated = await prepareForceReplacement(deps, "from_remote");
+	assert.ok(authenticated?.codec);
+	assert.equal(attempts, 2);
+	assert.equal(authenticated.recovery.source[0]?.path, "note.md");
 	target.assertLocal("local.md", "keep local");
-	disk.files.delete("vault/.obsidian-encrypt.json");
-	target.settings.enableEncryption = false;
-	target.settings.encryptionPassword = null;
-	target.settings.encryptionSalt = null;
-	target.settings.encryptionProfileId = null;
-	target.settings.encryptionRevision = null;
+
+	const manifestPath = "vault/.obsidian-encrypt.json";
+	const manifestBytes = disk.files.get(manifestPath)!;
+	disk.files.delete(manifestPath);
+	deps.password = async () => {
+		throw new Error("Plaintext must not ask for a password");
+	};
+	const plain = await prepareForceReplacement(deps, "from_remote");
+	assert.ok(plain);
+	assert.equal(plain.codec, null);
+	assert.equal(plain.recovery.target.enabled, false);
+	assert.equal(target.settings.enableEncryption, true);
+	target.assertLocal("local.md", "keep local");
+
+	disk.files.set(manifestPath, bytes("invalid JSON"));
+	await assert.rejects(applyForceReplacement(deps, plain, "without-backup"));
+	target.assertLocal("local.md", "keep local");
+	await assert.rejects(prepareForceReplacement(deps, "from_remote"));
+	const readManifest = target.index.downloadEncryptionManifest.bind(
+		target.index,
+	);
+	const unavailable = new Error("Synthetic manifest transport unavailable");
+	target.index.downloadEncryptionManifest = async () => {
+		throw unavailable;
+	};
 	await assert.rejects(
 		prepareForceReplacement(deps, "from_remote"),
-		/salt\/profile/,
+		unavailable,
 	);
-	target.settings.enableEncryption = true;
-	target.settings.encryptionPassword = "source-password";
-	target.settings.encryptionSalt = source.settings.encryptionSalt;
-	target.settings.encryptionProfileId = "hardened";
-	target.settings.encryptionRevision = source.settings.encryptionRevision;
-	const recovered = await prepareForceReplacement(deps, "from_remote");
-	assert.ok(recovered);
+	target.index.downloadEncryptionManifest = readManifest;
 	target.assertLocal("local.md", "keep local");
-	await applyForceReplacement(deps, recovered, "without-backup");
-	target.assertLocal("local.md");
-	target.assertLocal("note.md", "encrypted source");
+	disk.files.clear();
+	const empty = await prepareForceReplacement(deps, "from_remote");
+	assert.ok(empty);
+	assert.equal(empty.recovery.source.length, 0);
+	assert.equal(empty.recovery.target.enabled, false);
+	target.assertLocal("local.md", "keep local");
+	disk.files.set(manifestPath, manifestBytes);
+	disk.beforeRequest = async (_method, endpoint, path) => {
+		if (endpoint.endsWith("/resources/download") && path === manifestPath) {
+			disk.files.delete(manifestPath);
+		}
+	};
+	await assert.rejects(prepareForceReplacement(deps, "from_remote"));
+	target.assertLocal("local.md", "keep local");
 });
 
 test("Force refuses an unreadable local source before preparation and after confirmation", async (context) => {

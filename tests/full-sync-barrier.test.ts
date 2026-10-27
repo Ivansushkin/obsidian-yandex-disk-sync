@@ -57,6 +57,7 @@ class FullSyncIndexFake extends MemoryIndex {
 			return await this.readCanonicalIndex();
 		};
 		return Object.assign(read, {
+			close: () => {},
 			assertCurrent: assertActive,
 			load: async () => {
 				assertActive();

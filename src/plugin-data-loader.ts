@@ -1,4 +1,10 @@
 import {
+	validateEncryptionReplacement,
+	isReplacementPath,
+} from "./crypto/replacement";
+import { validateCurrentIndexShape } from "./sync/canonical/schema";
+import { createEmptyIndex } from "./types";
+import {
 	assertForceRecovery,
 	type ForceRecovery,
 } from "./sync/workflows/force-state";
@@ -311,9 +317,38 @@ function assertCurrentTransition(transition: LocalEncryptionTransition): void {
 			"targetFingerprints",
 			"sourceCanonicalRevision",
 			"backupProof",
+			...(transition.replacement !== undefined
+				? ["replacement", "referenceFiles"]
+				: []),
 		]),
 		"current encryption transition",
 	);
+	if (transition.replacement !== undefined) {
+		validateEncryptionReplacement(transition.replacement);
+		if (!isRecord(transition.referenceFiles)) {
+			throw new UnsupportedHistoricalDataError(
+				"Replacement reference is missing",
+			);
+		}
+		const reference = createEmptyIndex(
+			"validation",
+			transition.replacement.sourceEpoch,
+		);
+		reference.files = transition.referenceFiles;
+		validateCurrentIndexShape(
+			reference as unknown as Record<string, unknown>,
+		);
+		if (
+			Object.keys(reference.files).some(
+				(path) =>
+					!isReplacementPath(path, transition.replacement!.scope),
+			)
+		) {
+			throw new UnsupportedHistoricalDataError(
+				"Replacement reference exceeds its scope",
+			);
+		}
+	}
 	assertCurrentSnapshot(transition.source, "source");
 	assertCurrentSnapshot(transition.target, "target");
 	if (

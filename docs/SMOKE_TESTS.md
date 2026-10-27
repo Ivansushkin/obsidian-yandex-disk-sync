@@ -2,7 +2,7 @@
 
 Практический release smoke для проверки наиболее опасных регрессий: возврата
 удалённых файлов, быстрых rename/move, folder delete, multi-device, Force-loop
-и шифрования. TC-01–TC-09 проверяют алгоритмы и recovery; отдельные mobile,
+и шифрования. TC-01–TC-10 проверяют алгоритмы и recovery; отдельные mobile,
 desktop и indicator cases — UI. Объём расширенного fault/load прогона учитывается
 отдельно: это не обещание короткой проверки всех release gates.
 
@@ -78,7 +78,7 @@ ID/counts/hashes; не прикладывать plugin data, credentials, сод
   создаётся current `plugin-data`.
 
 Покрывает: `INIT-001`, `INIT-002`, `INIT-003`, `INIT-013`, `INIT-027`,
-`SYNC-002`, `SYNC-003`, `UI-001`, `UI-003`, `UI-005`.
+`SYNC-002`, `SYNC-003`, `UI-001`, `UI-003`, `UI-005`, `UI-017`.
 
 Дополнительная проверка кнопки синхронизации на desktop и mobile (`UI-017`):
 
@@ -293,8 +293,10 @@ physical, несмотря на короткий интервал; запозд�
    Проверить новые epoch, coherent baseline/queues и сохранность поздних edits.
 
 Новый direct Force не использует locks/MOVE, destination fingerprints или scope
-ambiguity для допуска удаления. Старые FORCE-001—FORCE-053 заменены
-FORCE-DIRECT-001—FORCE-DIRECT-016; старые scoped/staged ожидания не применять.
+ambiguity для допуска удаления. Актуальные сценарии: FORCE-DIRECT-001—FORCE-DIRECT-028; старые scoped/staged
+ожидания не применять.
+
+Покрывает: `INIT-014`, `INIT-028`, `MULTI-012`.
 
 ## TC-08. Шифрование: fresh hardened и unsupported historical data
 
@@ -328,11 +330,11 @@ conflict/backup-файлы, если они мешают проверке.
 
 1. При `syncDotObsidian=true` поместить на remote fixture metadata для
    `*/plugins/yandex-disk-sync/**`, не раскрывая содержимое.
-2. Normal legacy/internal migration и remote-raw backup блокируются по metadata
-   без download plugin data. Remediation требует удалить remote plugin directory
-   и заменить OAuth token вне agent context. Public directed Force without-backup
-   не читает/не удаляет protected directory и не создаёт destination snapshot;
-   это не разрешение читать или архивировать credentials.
+2. Normal legacy/internal migration и обычный remote-raw backup блокируются по
+   metadata без download plugin data. Remediation требует удалить remote plugin
+   directory и заменить OAuth token вне agent context. Direct Force local пропускает
+   такие bytes в source/archive и удаляет старые remote plugin copies без чтения;
+   Force remote сохраняет local running plugin. Credentials не читать и не архивировать.
 3. Отдельно проверить user path с current service name: требуется ручное
    переименование, silent skip запрещён. Повторить для legacy имени с `\`, которое
    current normalization преобразовало бы в другой logical path.
@@ -387,7 +389,8 @@ canonical commit, но до публикации stable manifest:
    verifier до cleanup; при несовпадении Device 2 должен остановиться без
    удаления.
 5. После recovery выполнить full на обоих устройствах и проверить `0/0/0`,
-   отсутствие source ciphertext в Vault и только fingerprint-matching cleanup.
+   отсутствие source ciphertext в Vault. Новый переход использует durable replacement
+   cover; legacy checkpoint — только fingerprint-matching cleanup.
 6. Повторить enable/rotate/disable с fault injection после отдельного target
    upload, но до persistence его fingerprint. Recovery обязан повторно скачать
    raw object, сверить decoded logical path и plaintext SHA-256.
@@ -395,7 +398,7 @@ canonical commit, но до публикации stable manifest:
    остаться заблокированным, не удалить объект и не показать success.
 8. Подготовить collision двух logical paths в один target raw path, protected
    target и пересечение source/target. Ни один target upload не должен начаться.
-9. Внести extra field, mismatched phase/ID/descriptors и cleanup без fingerprint
+9. Внести extra field, mismatched phase/ID/descriptors и legacy cleanup без fingerprint
    по очереди в manifest/canonical/local transition. До lock/upload/delete не
    должно быть remote writes.
 
@@ -414,8 +417,10 @@ checkpoint без нового права удаления и без post-commit
 2. На Device 1 полностью завершить transition и создать local edit на Device 2
    в offline-режиме.
 3. Вернуть Device 2 online, пройти password prompt там, где он нужен.
-4. Убедиться, что Device 2 сначала принимает manifest/canonical и выполняет
-   full reconcile, затем причинно воспроизводит durable logical mutations.
+4. Для нового перехода Device 2 сначала принимает target manifest/canonical и
+   replacement epoch: выбранные bytes становятся эталоном Device 1, old-generation
+   offline edits/queues не replay-ятся. Для legacy checkpoint без replacement
+   отдельно проверить прежнее reconciliation с сохранением causal work.
 5. Старые physical actions без matching epoch/canonical/fingerprint proof не
    должны удалять source или target objects.
 6. Финальный full на обоих устройствах: `0/0/0`.
@@ -451,7 +456,9 @@ checkpoint без нового права удаления и без post-commit
 
 - Неверный/старый пароль не позволяет upload, delete или cleanup.
 - Правильный пароль открывает canonical и файлы.
-- После enable/rotate/disable все logical paths и содержимое сохранены.
+- После нового enable/rotate/disable selected paths/bytes совпадают с local reference
+  инициатора; remote-only и старые offline edits не добавляются обратно. Protected/
+  excluded paths сохранены. Legacy checkpoint сохраняет прежнюю policy.
 - После смены codec upload использует target physical directories и не
   полагается на folder observations предыдущего режима.
 - Старый ciphertext не скачивается как пользовательский файл.
@@ -463,7 +470,7 @@ checkpoint без нового права удаления и без post-commit
 Покрывает: `ENC-001`, `ENC-002`, `ENC-005`, `ENC-010`, `TRANS-001`,
 `TRANS-002`, `TRANS-003`, `TRANS-015`, `TRANS-016`, `TRANS-020`,
 `TRANS-028`, `TRANS-029`, `TRANS-030`, `TRANS-031`, `TRANS-032`,
-`TRANS-033`, `TRANS-039`, `MULTI-015`, `INIT-029`, `MIG-004`, `FORCE-022`, `SAFE-004`,
+`TRANS-033`, `TRANS-039`, `MULTI-015`, `INIT-029`, `INIT-022`, `INIT-030`, `INIT-031`, `MIG-004`, `ENC-014`, `SAFE-004`,
 `SAFE-013`, `UI-007`, `UI-008`.
 
 ## Расширенные обязательные release gates
@@ -516,7 +523,7 @@ TC:
 conflict, Force-loop, неочищенная очередь или второй full не равен `0/0/0`,
 релиз следует блокировать.
 
-## TC-09. Конкурентные изменения и восстановление — PENDING
+## TC-09. Конкурентные изменения и восстановление
 
 Дополнительно для `SYNC-043`: root с 1001+ объектами, замена root между страницами,
 manifest/canonical/lock drift между проходами и config ABA при позднем ответе.
@@ -564,11 +571,21 @@ pre-write/retry требуется новая stable root pair; общая obser
 ### Maintenance, snapshots и UI
 
 1. Force local/remote и enable/disable/rotate: with-backup / without-backup /
-   cancel; при отказе нет ZIP/upload/readback фаз, но stale source/canonical
-   блокирует операцию. Ошибка выбранного архива не вызывает fallback/повтор.
+   cancel. Без архива нет archive ZIP/upload/readback фаз; source read/auth и
+   действующие guards сохраняются. Ошибка архива не включает автоматический
+   without-backup. У Force retry/uncheck/cancel остаются в том же dialog.
+   В обоих направлениях проверить светлую/тёмную тему и узкое окно (320–390 px):
+   пустой блок ошибки скрыт, кнопки одинаковой ширины и по центру, длинные
+   пути и подписи переносятся без горизонтального скролла. Ошибка архива
+   появляется в этом же окне; повторная попытка убирает старое сообщение.
+   В остальных диалогах (статус, выбор архива, привязка хранилища, решения,
+   пароли и журнал) проверить такое же центрирование и перенос подписей кнопок.
+   В списке архивов retry расположен по центру окна, download — по центру
+   своей ячейки; поле журнала помещается в узкое окно без горизонтального скролла.
 2. A: enable, пауза cleanup; B: завершение, затем disable; A: продолжение.
    Даже одинаковые bytes нового plaintext объекта не разрешают старое удаление.
-   Повторить changed/missing fingerprint, timeout/202 и пустые папки.
+   Для legacy checkpoint повторить changed/missing fingerprint; для replacement —
+   durable cover и target/exclusion guards. Проверить timeout/202 и пустые папки.
 3. Crash после target commit, stable manifest, canonical cleanup и physical delete.
    Другой профиль завершает recovery с target password; wrong password/Cancel
    не сохраняют credentials и не пишут remote. Затем manifest перечитывается.
@@ -585,13 +602,14 @@ pre-write/retry требуется новая stable root pair; общая obser
    через UI и программный settings workflow: live memory и persistence неизменны.
    Внутренние baseline/queues сохраняются; после освобождения busy настройки доступны.
 8. Проверить один постоянный Notice, double click, reopen settings, отсутствие
-   backup-фаз без архива и success только после persistence/full/cleanup.
+   backup-фаз без архива и success только после verification/persistence/cleanup.
+   Direct Force не требует дополнительного ordinary full для success.
 9. Restore encrypted backup до/после rotate/disable, desktop/mobile, offline
    return, crash/restart; в конце два full дают `0/0/0` без pending queues.
 
 Автоматические regression tests не переводят эти пункты в PASS.
 
-Покрывает: `SYNC-041`, `SYNC-042`, `SYNC-043`, `SYNC-039`, `ERROR-007`, `INIT-037`, `SYNC-038`, `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `FORCE-032`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`.
+Покрывает: `SYNC-041`, `SYNC-042`, `SYNC-043`, `SYNC-039`, `ERROR-007`, `INIT-037`, `SYNC-038`, `STATE-006`, `STATE-007`, `CONF-007`, `CONF-008`, `CONF-009`, `SYNC-036`, `CONF-001`, `CONF-002`, `CONF-003`, `CONF-004`, `CONF-005`, `CONF-006`, `STATE-005`, `STATE-001`, `STATE-002`, `STATE-003`, `STATE-004`, `MOVE-034`, `MOVE-032`, `MOVE-033`, `DEL-018`, `TRANS-037`, `TRANS-005`, `TRANS-034`, `TRANS-035`, `TRANS-036`, `SYNC-032`, `PATH-006`, `SAFE-014`, `SYNC-033`, `SYNC-034`, `DEL-016`, `DEL-017`, `FDEL-018`, `MOVE-031`, `SAFE-015`, `SAFE-016`, `SAFE-017`, `SAFE-019`, `SAFE-020`.
 
 ### Local apply, settings и persistence
 
@@ -752,7 +770,7 @@ checks группы не растут с числом файлов. Эти пр�
 проверяются обычными критериями workflow. Зафиксировать устройство, ОС, версию
 Obsidian и тему; отсутствующие устройства оставить явно непроверенными.
 
-Покрывает: `UI-004`, `UI-005`, `UI-010`, `UI-011`, `UI-012`, `UI-013`, `UI-014`, `UI-015`, `UI-019`.
+Покрывает: `UI-004`, `UI-005`, `UI-010`, `UI-011`, `UI-012`, `UI-013`, `UI-014`, `UI-015`, `UI-016`, `UI-019`, `NET-017`, `NET-018`.
 
 ## TC-DESKTOP-01. Общая плашка над status bar
 
@@ -778,7 +796,7 @@ Obsidian и тему; отсутствующие устройства остав
    сохранено. Проверить обе темы, reduced motion и screen reader.
 
 Раскрытие само не меняет canonical/local/physical и не запускает sync.
-Покрывает `UI-018`; реальный прогон и окружение фиксируются отдельно.
+Покрывает: `UI-018`; реальный прогон и окружение фиксируются отдельно.
 
 ## TC-INDICATOR-ACTIONS-01. Кнопки раскрытой плашки
 
@@ -810,7 +828,7 @@ Obsidian и тему; отсутствующие устройства остав
 6. Сменить состояние, восстановить workspace после background/remount,
    выключить/включить плагин: один экземпляр плашки, без оставшихся обработчиков.
 
-Покрывает `UI-020`, `UI-021`. Зафиксировать устройство, ОС, Obsidian и тему;
+Покрывает: `UI-020`, `UI-021`. Зафиксировать устройство, ОС, Obsidian и тему;
 отсутствующие платформы оставить явно непроверенными.
 
 ## TC-FORCE-REPLACE-01 — полный direct Force, два профиля и реальный Диск
@@ -821,17 +839,45 @@ vault не использовать. Повторить plaintext/encrypted и �
 1. Заполнить source скрытыми/исключёнными файлами, конфигурацией, пустыми каталогами
    и zero-byte файлами. Добавить destination-only garbage, corrupt canonical,
    старые locks, file/folder blockers и .backup.
-2. Local → Disk: одно подтверждение с off-by-default archive и явными исключениями.
-   Проверить полный replacement, удаление garbage/old plugin copies, сохранность
-   .backup, новый canonical и соответствующий manifest. Старый ключ не запрашивается.
+2. Local → Disk: одно окно от source pre-read до результата; после подготовки —
+   подтверждение с off-by-default archive и явными исключениями.
+   На desktop и узком mobile-экране переключатель архива и кнопки остаются видны
+   при прокрутке описания; проверить также длинные пути и увеличенный шрифт.
+   Между архивом и кнопками есть заметный отступ; описание читается обычными
+   абзацами, без отдельных декоративных плашек для каждой строки.
+   Прогресс показан в Notice без дублирующего статуса в окне; ошибки и итог — в окне.
+   Проверить замену только включённых файлов, сохранность excluded/protected paths,
+   .backup, новый canonical и manifest. Для encrypted destination нужен проверенный
+   пароль; при сохранении encryption codec/salt не меняются. Исключённые ciphertext
+   после Force читаются прежним ключом. Disable с такими остатками блокируется.
    Во всём trace нет новых временных файлов, leases или MOVE.
-3. Disk → local: после полного source pre-read permanent delete заменяет всё,
-   включая ранее исключённые файлы. Собственный sync-плагин и .backup сохранены;
+3. Disk → local: окно появляется до чтения файлов и сообщает, что destination
+   пока не меняется. Рядом с сообщением проверки вращается небольшой spinner;
+   при password/confirmation/error он исчезает. Проверить reduced motion:
+   spinner остаётся статичным, текст статуса доступен screen reader.
+   Во время pre-read показан реальный прогресс. Пароль encrypted
+   source вводится здесь же; неверный пароль допускает повтор без нового окна.
+   После проверки всегда отдельное подтверждение с выключенным архивом полного
+   local vault в remote `.backup`. Только destructive click разрешает replacement.
+   При encrypted source добавить обычную .agents и настроить исключение .agents/**;
+   конфигурацию отключить через её switch. Эти raw paths не читаются/не декодируются,
+   исключённые local files сохраняются. In-scope undecodable имя или content дают
+   force-source-format до изменений; Notice показывает остановку вместо 0/N.
+   .backup никогда не попадает в расшифровку. Проверить nested includes и custom configDir.
+   После selected source pre-read permanent delete заменяет только выбранные файлы,
+   исключённые не удаляются. File/folder blocker с excluded descendants блокирует
+   оба направления до записи; изменение filters после подготовки требует нового запуска. Собственный sync-плагин и .backup сохранены;
    source manifest/bytes не изменены, canonical перестроен. Перезапустить Obsidian.
-4. Wrong/missing password, потерянные salt/profile, нечитаемый file, partial listing
-   и Cancel до очистки не меняют destination. Пустой успешно прочитанный source
-   очищает destination с явными исключениями.
+4. Без manifest нет выбора «с/без шифрования»: source читается как обычные файлы,
+   даже при старых local encryption settings и пустом source. Повреждённый manifest,
+   401/403/timeout, wrong/missing password, нечитаемый file и partial listing не
+   меняют destination; retry остаётся в том же окне. Cancel во время download
+   прекращает дальнейшие действия после settlement. Пустой успешно прочитанный
+   selection очищает только selected destination после явного подтверждения с исключениями.
 5. Ошибка выбранного archive остаётся в той же модалке; retry/uncheck/cancel.
+   Отмена доступна во время архива; reservation держится до settlement, purge не
+   начинается. Проверить, что локальные данные действительно находятся в ZIP.
+   После начала replacement закрытие окна только скрывает его; Notice остаётся.
    Без архива нет protective/conflict copies, локального .trash и snapshot старого
    destination. Не журналировать tokens/passwords/content/ciphertext.
 6. Прервать DELETE/upload/canonical/persistence. Независимые действия продолжаются,
@@ -839,7 +885,9 @@ vault не использовать. Повторить plaintext/encrypted и �
    не очищает заново успешно заменённое дерево и не удаляет источник из-за недокопии.
 7. Повторить с failed subtree delete, JSON restart, late source edit, pause,
    Settings close и duplicate click. Новый Force повторно подтверждает новый source;
-   старый scoped checkpoint не получает полный purge автоматически.
+   старый scoped checkpoint не получает полный purge автоматически. После partial
+   добавить directory blocker с excluded descendant и parent-file blocker; continuation
+   не удаляет их через write/mkdir и сохраняет честный partial remainder.
 8. Вернуть B с offline edits: проверить обычный epoch-bound accept/preserve/later.
    После Force full с прежними ограниченными фильтрами не удаляет out-of-scope files.
 9. Чужие поздние запросы не блокируют Force. Зафиксировать наблюдавшийся результат,
@@ -847,6 +895,12 @@ vault не использовать. Повторить plaintext/encrypted и �
 
 Записать revision, safe counts/hashes, local/canonical/physical результат и остаток
 checkpoint. Автоматическая suite не доказывает выполнение этого manual smoke.
+
+Покрывает: `FORCE-DIRECT-001`–`FORCE-DIRECT-028`, `INIT-012`, `INIT-019`,
+`INIT-023`, `INIT-029`, `TRANS-040`, `PATH-006`, `SAFE-002`, `SAFE-004`,
+`SAFE-009`, `SAFE-013`, `UI-006`.
+
+## Проверки чтения и realtime
 
 ### Ordinary baseline-only reception (SYNC-045/046)
 
@@ -888,3 +942,41 @@ these boundaries; it does not complete this native smoke. Repeat
 plaintext and hardened encryption with a valid manifest, then native Obsidian,
 Android and real Yandex Disk. The existing new-unsynced-source handoff passes a
 different branch and cannot establish this tracked-source result.
+
+## TC-10. Authoritative encryption replacement
+
+Два независимых профиля и disposable реальный remote. Для enable, rotate и disable
+использовать отдельные исходные snapshots; повторить с выбранным архивом и без него.
+До конца перехода не редактировать устройства, кроме явно контролируемой fault fixture.
+
+1. На A подготовить local reference; на Диск добавить remote-only файл, а на
+   отключённом B — stale edit, new child и queued rename. В filters оставить
+   selected и excluded subtree; сохранить безопасные path/count/hash ожидания.
+2. На A запустить переход. Проверить предупреждение о локальном эталоне и одном
+   Notice до verification/persistence. Target canonical получает fresh epoch и
+   replacement receipt; selected bytes совпадают с A. Remote-only selected extras
+   удалены, `.backup`, plugin state и excluded raw descendants сохранены.
+3. Прервать post-commit cleanup и перезапустить A. На отдельной fixture завершить
+   его через B с target password, включая disable без source key/manifest.
+   Проверить тот же operation/target epoch и durable cover; broad reset не повторяется.
+   Unknown late old-codec object вне cover без source-capable owner оставляет recovery.
+4. Через контролируемую задержку отправить stale full/realtime PUT и изменить target.
+   Следующая попытка старой сессии блокируется maintenance/epoch guard. Cleanup удаляет
+   selected extras, target repair использует pinned A reference и read-back. Local
+   drift, отсутствие сходимости либо guard revocation не показывают success.
+5. Вернуть offline B: после authentication он автоматически получает selected target
+   до ordinary merge, старые queues не отправляются. Failed local save/restart не
+   превращает старые offline edits в новый push. Retained excluded descendants,
+   включая поздний child, запрещают destructive structural collision cleanup.
+6. Сменить connection и обратно либо unload во время DELETE. Новые dispatch/retry
+   запрещены; sent requests joined, guard отказ не ACK отсутствие. После restart
+   действуют сохранённые policy и scope. Старый checkpoint без replacement отдельно
+   сохраняет fingerprint guards и прежний epoch.
+7. Проверить скачивание/restore выбранного архива его собственным паролем и переход
+   enable → rotate → disable с retained old-codec exclusions. На обоих профилях два
+   full завершаются без новых conflicts/queues. Сохранить реальное elapsed time и
+   mobile memory отдельно от synthetic request counts; fencing не заявлять.
+
+Покрывает: `TRANS-004`, `TRANS-008`, `TRANS-013`, `TRANS-017`, `TRANS-022`,
+`TRANS-041`, `TRANS-042`, `TRANS-043`, `TRANS-044`, `TRANS-045`, `TRANS-046`,
+`TRANS-047`, `TRANS-048`, `TRANS-049`, `PERF-015`.

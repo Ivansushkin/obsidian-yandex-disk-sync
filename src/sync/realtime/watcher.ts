@@ -128,6 +128,9 @@ export class FileWatcher {
 	 */
 	updateSettings(settings: YandexDiskSyncSettings): void {
 		this.settings = settings;
+		if (!settings.enableRealtimeSync) {
+			this.stop();
+		}
 	}
 
 	loadDeferredEvents(events: DeferredWatcherEvent[] | undefined): void {
@@ -613,6 +616,9 @@ export class FileWatcher {
 
 		this.isEnabled = true;
 		logger.info("FileWatcher started");
+		if (this.deferredEvents.length > 0) {
+			this.scheduleDeferredReplay();
+		}
 	}
 
 	/**
@@ -1437,7 +1443,10 @@ export class FileWatcher {
 	}
 
 	/** Drain stopped watcher persistence before changing its connection context. */
-	async waitForPendingPersistence(): Promise<void> {
+	async waitForPendingPersistence(retryFailed = false): Promise<void> {
+		if (retryFailed && this.persistFailure) {
+			this.persistDeferredEvents();
+		}
 		await this.waitForPersistence();
 		if (this.deferredDrainPromise) {
 			await this.deferredDrainPromise;

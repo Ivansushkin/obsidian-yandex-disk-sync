@@ -72,11 +72,12 @@ export class SyncStatusModal extends Modal {
 			});
 		}
 
-		new Setting(contentEl).addButton((btn) =>
+		const buttons = new Setting(contentEl).addButton((btn) =>
 			btn.setButtonText(t("modal.close_button")).onClick(() => {
 				this.close();
 			}),
 		);
+		buttons.settingEl.addClass("sync-modal-actions");
 	}
 
 	onClose(): void {

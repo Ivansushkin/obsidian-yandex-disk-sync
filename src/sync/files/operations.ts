@@ -551,6 +551,7 @@ export async function prepareOperationFolders(
 export async function ensureFoldersExist(
 	deps: Dependencies,
 	operations: SyncOperation[],
+	concurrency = 1,
 ): Promise<void> {
 	const folders = new Set<string>();
 
@@ -575,7 +576,7 @@ export async function ensureFoldersExist(
 		folders.forEach((folder: string) => {
 			folderPaths.push(folder);
 		});
-		await deps.yandexClient.ensureFoldersExist(folderPaths);
+		await deps.yandexClient.ensureFoldersExist(folderPaths, concurrency);
 	}
 }
 

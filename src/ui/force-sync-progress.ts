@@ -5,6 +5,12 @@ import { formatSyncActivity } from "./sync-status-presentation";
 
 /** Format the current Force phase for the foreground Notice. */
 export function formatForceActivity(state: ForceFlowState): string {
+	if (state.phase === "preflight" && state.failure) {
+		return t("force.preparation_failed");
+	}
+	if (state.phase === "preflight" && state.sourceProgress) {
+		return t("force.source_progress", state.sourceProgress);
+	}
 	const stage = t(`notice.force_phase_${state.phase}`);
 	return state.activity?.status === "syncing"
 		? `${stage}: ${formatSyncActivity(state.activity)}`
