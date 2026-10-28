@@ -20,6 +20,7 @@ import {
 } from "./encryption-transition";
 import { EncryptionMaintenance } from "./maintenance";
 import { EncryptionRecovery } from "./recovery";
+import { getNewEncryptionPasswordError } from "./password-policy";
 
 /** Bound a credential connection to its original operation and recovery permission. */
 export interface EncryptionConnectionOptions {
@@ -244,6 +245,10 @@ export class EncryptionWorkflow {
 			return;
 		}
 
+		const passwordError = getNewEncryptionPasswordError(password);
+		if (passwordError) {
+			throw new Error(passwordError);
+		}
 		await this.runEncryptionPreflight();
 		const backupProof = await this.createSelectedEncryptionBackup(
 			choice,
@@ -421,6 +426,10 @@ export class EncryptionWorkflow {
 		newPassword: string,
 		choice?: OperationBackupChoice,
 	): Promise<void> {
+		const passwordError = getNewEncryptionPasswordError(newPassword);
+		if (passwordError) {
+			throw new Error(passwordError);
+		}
 		const currentManifest =
 			await this.context.index.downloadEncryptionManifest();
 		if (currentManifest && currentManifest.state !== "enabled") {

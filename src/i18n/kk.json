@@ -312,6 +312,7 @@
 	"modal.encryption_password_label": "Құпиясөз",
 	"modal.encryption_confirm_label": "Құпиясөзді растау",
 	"modal.encryption_password_mismatch": "Құпиясөздер сәйкес келмейді",
+	"modal.encryption_password_length": "Құпиясөз {min}–{max} таңбадан тұруы керек.",
 	"modal.encryption_enter_password": "Шифрлау құпиясөзін енгізіңіз",
 	"modal.encryption_disable_title": "Шифрлауды өшіру",
 	"modal.encryption_change_password_title": "Шифрлау құпиясөзін өзгерту",

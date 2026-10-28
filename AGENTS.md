@@ -157,7 +157,7 @@
   local checkpoint and a separate canonical maintenance kind; never impersonate
   an encryption transition. Preserve its operation ID and epoch across recovery.
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
-  `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
+  `versions.json`, `CHANGELOG.md`, architecture docs,
   translations, and migration messages.
 - Release metadata retains stable 1.1.0 compatibility and published 2.0.0
   history, plus the current 2.1.0 entry. Do not add development entries or
@@ -165,6 +165,10 @@
 
 ## Documentation and testing
 
+- Keep `README.md` and `README_RU.md` focused on stable product presentation
+  and essential setup. Do not copy changelog entries or release-specific details
+  into them. Put release changes in `CHANGELOG.md` and detailed behavior in `docs/`;
+  update READMEs only when their stable overview or setup actually changes.
 - Bulk generation of unit tests is prohibited. Do not add a test for every
   function, branch, or change, or increase test counts to chase coverage.
 - Unit tests are allowed only for complex algorithms in functions or their

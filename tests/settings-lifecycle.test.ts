@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { getActiveLanguage, setLanguagePreference } from "../src/i18n";
 import type { UserSettingsPatch } from "../src/settings-workflow";
-import type { Notice } from "obsidian";
 import type { PluginData } from "../src/plugin-persistence";
 import test, { type TestContext } from "node:test";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
 import { deferred } from "./helpers/deferred";
 import { afterTest } from "./helpers/test-context";
-import { encryptionFlow } from "./helpers/encryption-flow";
+import { encryptionFlow, startupFlow } from "./helpers/encryption-flow";
 import { transition } from "./helpers/encryption-scenarios";
 import { SyncScheduler } from "../src/sync/scheduler";
 
@@ -70,6 +69,96 @@ async function settingsHost(
 	const update = plugin.applySettingsPatch.bind(plugin);
 	return { plugin, persistence, a, disk, scheduler, update, flow };
 }
+
+test(
+	"host activity opens a rotated password after full settlement and revokes an open prompt on save failure",
+	{ timeout: 10_000 },
+	async (t) => {
+		const { plugin, a, disk, flow, persistence, scheduler } =
+			await settingsHost(t, true);
+		const source = device(disk, "rotating-source", null);
+		afterTest(t, () => source.stop());
+		const remote = encryptionFlow(source);
+		await remote.workflow.connectForSync("synthetic-password");
+		await source.full();
+		flow.context.getSettings = () => plugin.settings;
+		flow.context.persist = () => plugin.saveSettings();
+		flow.context.ui.setBlock = (reason, notice) =>
+			plugin["setEncryptionBlock"](reason, notice);
+		const install = flow.context.setService.bind(flow.context);
+		flow.context.setService = (service) => {
+			install(service);
+			plugin["encryptionService"] = service;
+		};
+		startupFlow(a, flow);
+		afterTest(t, plugin["bindAutomaticPasswordRequests"]());
+		let shown = 0;
+		let fulls = 0;
+		const full = a.engine.fullSync.bind(a.engine);
+		a.engine.fullSync = (...args) => {
+			fulls++;
+			return full(...args);
+		};
+		let answer = deferred<string>();
+		let entered = deferred();
+		flow.context.ui.requestPassword = () => {
+			assert.equal(a.engine.hasPendingWork(), false);
+			assert.equal(plugin.isFullSyncInProgress(), false);
+			assert.equal(plugin.isEncryptionPasswordChangeInProgress(), true);
+			shown++;
+			entered.resolve();
+			return answer.promise;
+		};
+		const oldWindow = globalThis.window;
+		Object.assign(globalThis, { window: globalThis });
+		try {
+			await transition(source, remote, "rotate", "new-password");
+			assert.equal(
+				(await plugin.runFullSync({ trigger: "automatic" }, false))
+					?.success,
+				false,
+			);
+			await entered.promise;
+			assert.equal(shown, 1);
+			assert.equal(fulls, 1);
+			answer.resolve("new-password");
+			await Promise.all([
+				flow.workflow.admission.flushAutomaticPasswordRequest(),
+				flow.workflow.admission.flushAutomaticPasswordRequest(),
+			]);
+			assert.equal(shown, 1);
+			assert.equal(fulls, 2);
+			assert.equal(plugin.isEncryptionPasswordChangeInProgress(), false);
+			assert.equal(plugin.settings.encryptionPassword, "new-password");
+			assert.equal(scheduler["isRunning"], true);
+			await a.assertSettled({ "note.md": "unchanged" });
+
+			answer = deferred<string>();
+			entered = deferred();
+			await transition(source, remote, "rotate", "next-password");
+			await plugin.runFullSync({ trigger: "automatic" }, false);
+			await entered.promise;
+			assert.equal(shown, 2);
+			plugin.saveData = async () => {
+				throw new Error("synthetic save failure");
+			};
+			await assert.rejects(
+				plugin.saveSettings(),
+				/synthetic save failure/,
+			);
+			assert.equal(persistence.failed, true);
+			answer.resolve("next-password");
+			await flow.workflow.admission.flushAutomaticPasswordRequest();
+			assert.equal(plugin.settings.encryptionPassword, "new-password");
+			assert.equal(fulls, 3);
+			assert.equal(scheduler["isRunning"], false);
+		} finally {
+			answer.resolve("next-password");
+			await flow.workflow.admission.flushAutomaticPasswordRequest();
+			Object.assign(globalThis, { window: oldWindow });
+		}
+	},
+);
 
 test("connection settings wait across restart for manual plaintext or encrypted full sync", async (t) => {
 	for (const outcome of [
@@ -189,7 +278,6 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 				outcome !== "cancel" && outcome !== "wrong",
 			);
 		} finally {
-			plugin["disposeSyncNotice"]();
 			Object.assign(globalThis, { window: oldWindow });
 		}
 		assert.equal(prompts, outcome === "plaintext" ? 0 : 1);
@@ -260,7 +348,6 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 				try {
 					assert.equal((await plugin.runFullSync())?.success, true);
 				} finally {
-					plugin["disposeSyncNotice"]();
 					Object.assign(globalThis, { window: oldWindow });
 				}
 				assert.equal(prompts, 2);
@@ -489,11 +576,15 @@ test("settings drain errors preserve the rejected draft and allow a normal full 
 	);
 	assert.equal(plugin.settings, previous);
 	assert.equal(plugin["authenticationBlockReason"], null);
-	assert.equal(plugin["blockingNotice"]?.code, "settings-update");
+	assert.equal(plugin["operationIssue"]?.code, "settings-update");
+	assert.match(
+		plugin["getSyncIndicatorContext"]().operationError ?? "",
+		/synthetic watcher drain failure/,
+	);
 	assert.deepEqual(disk.files, remote);
 	a.watcher.waitForPendingPersistence = wait;
 	assert.equal((await plugin.runFullSync(undefined, false))?.success, true);
-	assert.equal(plugin["blockingNotice"], null);
+	assert.equal(plugin["operationIssue"], undefined);
 	const failures: string[] = [];
 	const unsubscribe = a.engine.onStateChange((state) => {
 		if (state.status === "error") {
@@ -502,9 +593,8 @@ test("settings drain errors preserve the rejected draft and allow a normal full 
 	});
 	afterTest(t, unsubscribe);
 	plugin["setAuthenticationBlock"]("synthetic missing token");
-	const oldNotice = (plugin["blockingNotice"] as { notice: Notice } | null)
-		?.notice;
-	assert.ok(oldNotice);
+	assert.equal(a.engine.getState().status, "error");
+	assert.equal(a.engine.getState().errorMessage, "synthetic missing token");
 	const entered = deferred();
 	const release = deferred();
 	afterTest(t, release.resolve);
@@ -521,7 +611,7 @@ test("settings drain errors preserve the rejected draft and allow a normal full 
 		assert.equal(plugin.getConnectionActivity()?.errorMessage, undefined);
 		assert.equal(plugin.isFullSyncInProgress(), true);
 		assert.equal(plugin["authenticationBlockReason"], null);
-		assert.equal(oldNotice.messageEl.isConnected, false);
+		assert.equal(plugin["operationIssue"], undefined);
 		assert.equal(a.watcher["isEnabled"], false);
 		await assert.rejects(
 			update({ remotePath: "another-vault" }),
@@ -538,7 +628,7 @@ test("settings drain errors preserve the rejected draft and allow a normal full 
 		[],
 	);
 	assert.equal(plugin["remoteStateValidated"], true);
-	assert.equal(plugin["blockingNotice"], null);
+	assert.equal(plugin["operationIssue"], undefined);
 	assert.equal(a.watcher["isEnabled"], true);
 });
 
@@ -559,7 +649,7 @@ test("unload rejects a late settings publication without recreating notices or a
 	await rejected;
 	await persistence.idle();
 	assert.equal(plugin.settings, previous);
-	assert.equal(plugin["blockingNotice"], null);
+	assert.equal(plugin["operationIssue"], undefined);
 	assert.equal(a.watcher["isEnabled"], false);
 	assert.equal(scheduler["isRunning"], false);
 });

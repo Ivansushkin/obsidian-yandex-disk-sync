@@ -494,6 +494,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_password_label": "Password",
 		"modal.encryption_confirm_label": "Confirm password",
 		"modal.encryption_password_mismatch": "Passwords do not match",
+		"modal.encryption_password_length":
+			"Password must contain between {min} and {max} characters.",
 		"modal.encryption_enter_password": "Enter encryption password",
 		"modal.encryption_disable_title": "Disable encryption",
 		"modal.encryption_change_password_title": "Change encryption password",
@@ -1076,6 +1078,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.encryption_password_label": "Пароль",
 		"modal.encryption_confirm_label": "Подтверждение пароля",
 		"modal.encryption_password_mismatch": "Пароли не совпадают",
+		"modal.encryption_password_length":
+			"Пароль должен содержать от {min} до {max} символов.",
 		"modal.encryption_enter_password": "Введите пароль шифрования",
 		"modal.encryption_disable_title": "Отключение шифрования",
 		"modal.encryption_change_password_title": "Смена пароля шифрования",

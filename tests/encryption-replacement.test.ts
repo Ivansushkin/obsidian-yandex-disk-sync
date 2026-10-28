@@ -13,6 +13,192 @@ import {
 import { deferred } from "./helpers/deferred";
 import { afterTest } from "./helpers/test-context";
 
+test("manual admission rechecks rotated credentials after cached startup validation", async (t) => {
+	const make = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = make(disk, "rotation-a", null);
+	const b = make(disk, "rotation-b", null);
+	const ea = encryptionFlow(a);
+	const eb = encryptionFlow(b);
+	a.vault.put("Note.md", bytes("preserved content"));
+	await a.full();
+	await transition(a, ea, "enable", "old-password");
+	await eb.workflow.connectForSync("old-password");
+	await b.full();
+	const startup = startupFlow(b, eb);
+	assert.equal(await startup.refresh(true), "ready");
+	let shown = 0;
+	eb.context.ui.requestPassword = async (_manifest, mode) => {
+		assert.equal(mode, "rotated");
+		shown++;
+		return "new-password";
+	};
+	await transition(a, ea, "rotate", "new-password");
+	assert.equal(await startup.refresh(true), "ready");
+	assert.equal(shown, 1);
+	await b.full();
+	await b.assertSettled({ "Note.md": "preserved content" });
+});
+
+test("automatic password cancellation stays blocked and stale deferred requests cannot prompt", async (t) => {
+	const make = managedDevices(t);
+	for (const interruption of [
+		"cancel",
+		"wrong",
+		"pause",
+		"configuration",
+		"unload",
+	] as const) {
+		const disk = new MemoryDisk();
+		const a = make(disk, "rotation-a", null);
+		const b = make(disk, "rotation-b", null);
+		const ea = encryptionFlow(a);
+		const eb = encryptionFlow(b);
+		a.vault.put("Note.md", bytes("kept"));
+		await a.full();
+		await transition(a, ea, "enable", "old-password");
+		await eb.workflow.connectForSync("old-password");
+		await b.full();
+		const startup = startupFlow(b, eb);
+		await startup.refresh(true);
+		await transition(a, ea, "rotate", "new-password");
+		let shown = 0;
+		eb.context.ui.requestPassword = async () => {
+			shown++;
+			return interruption === "cancel" ? null : "wrong-password";
+		};
+		eb.workflow.admission.configureAutomaticPasswordRequests({
+			isAllowed: () => true,
+			isBusy: () => b.engine.hasPendingWork(),
+			runExclusive: async (action) => await action(),
+			resume: async () => {
+				throw new Error("Rejected credentials must not resume");
+			},
+		});
+		assert.equal(
+			await eb.workflow.admission.ensureEncryptionReady({
+				prompt: false,
+			}),
+			false,
+		);
+		const remote = structuredClone(disk.files);
+		const saved = await eb.saved();
+		if (interruption === "pause") {
+			b.engine.pause();
+			b.engine.resume();
+		} else if (interruption === "configuration") {
+			b.client.setToken("replacement-synthetic-token");
+		} else if (interruption === "unload") {
+			eb.cancel();
+		}
+		await eb.workflow.admission.flushAutomaticPasswordRequest();
+		await eb.workflow.admission.flushAutomaticPasswordRequest();
+		const canRetry = interruption === "cancel" || interruption === "wrong";
+		assert.equal(shown, canRetry ? 1 : 0);
+		assert.deepEqual(disk.files, remote);
+		assert.deepEqual(await eb.saved(), saved);
+		if (canRetry) {
+			await eb.workflow.admission.ensureEncryptionReady({
+				prompt: false,
+			});
+			await eb.workflow.admission.flushAutomaticPasswordRequest();
+			assert.equal(shown, 1);
+			eb.context.ui.requestPassword = async () => {
+				shown++;
+				return "new-password";
+			};
+			assert.equal(await startup.refresh(true), "ready");
+			assert.equal(shown, 2);
+			await b.full();
+			await b.assertSettled({ "Note.md": "kept" });
+		}
+	}
+});
+
+test("late verifier results cannot recreate a revoked automatic password request", async (t) => {
+	const a = managedDevices(t)(new MemoryDisk(), "verifier-owner", null);
+	const flow = encryptionFlow(a);
+	await a.full();
+	await transition(a, flow, "enable", "password");
+	const manifest = await a.index.downloadEncryptionManifest();
+	assert.ok(manifest);
+	let shown = 0;
+	flow.context.ui.requestPassword = async () => {
+		shown++;
+		return null;
+	};
+	flow.workflow.admission.configureAutomaticPasswordRequests({
+		isAllowed: () => true,
+		isBusy: () => false,
+		runExclusive: async (action) => await action(),
+		resume: async () => {
+			throw new Error("Revoked validation must not resume");
+		},
+	});
+	for (const boundary of ["pause", "configuration"] as const) {
+		flow.workflow.admission.resetAutomaticPasswordRequests();
+		const entered = deferred();
+		const verifier = deferred<boolean>();
+		const service = flow.context.getService()!;
+		service.verifyVerifier = async () => {
+			entered.resolve();
+			return await verifier.promise;
+		};
+		const checking = flow.workflow.admission.ensureEncryptionReady(
+			{ prompt: false },
+			{ manifest },
+		);
+		await entered.promise;
+		if (boundary === "pause") {
+			a.engine.pause();
+			a.engine.resume();
+		} else {
+			a.client.setToken("replacement-synthetic-token");
+			flow.workflow.admission.resetAutomaticPasswordRequests();
+		}
+		verifier.resolve(false);
+		assert.equal(await checking, false);
+		await flow.workflow.admission.flushAutomaticPasswordRequest();
+		assert.equal(shown, 0);
+	}
+});
+
+test("new password rejection preserves transition sources before backup", async (t) => {
+	const make = managedDevices(t);
+	const disk = new MemoryDisk();
+	const owner = make(disk, "password-owner", null);
+	const flow = encryptionFlow(owner);
+	owner.vault.put("Заметка.md", bytes("preserved content"));
+	await owner.full();
+	for (const kind of ["enable", "rotate"] as const) {
+		const before = await flow.saved();
+		const remote = structuredClone(disk.files);
+		const local = structuredClone(owner.vault.files);
+		const password = kind === "enable" ? "abc" : "🔐".repeat(31);
+		await assert.rejects(
+			owner.engine.runExclusiveMaintenance(() =>
+				kind === "enable"
+					? flow.workflow.enableEncryptionNow(password, "with-backup")
+					: flow.workflow.rotateEncryptionPasswordNow(
+							password,
+							"with-backup",
+						),
+			),
+			/4.*30/,
+		);
+		assert.deepEqual(disk.files, remote);
+		assert.deepEqual(owner.vault.files, local);
+		assert.deepEqual(await flow.saved(), before);
+		await transition(
+			owner,
+			flow,
+			kind,
+			"🔐".repeat(kind === "enable" ? 4 : 30),
+		);
+		await owner.assertSettled({ "Заметка.md": "preserved content" });
+	}
+});
+
 test("authoritative transitions keep the local reference and replace stale device work", async (t) => {
 	const createDevice = managedDevices(t);
 	for (const kind of ["enable", "disable", "rotate"] as TransitionKind[]) {

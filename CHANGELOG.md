@@ -14,6 +14,10 @@ Changes since `2.0.0`.
 
 ### Changed
 
+- Connected devices request rotated passwords after sync settles and resume once
+  connected. Cancel/wrong password waits for manual retry or a new target.
+- New encryption passwords require 4–30 Unicode code points, with localized
+  validation. Existing passwords remain usable; encryption formats are unchanged.
 - Moved remote folder selection to the first step of Connection settings and
   clarified the required Yandex OAuth permissions. Masked the token input.
   Connection controls adapt to the panel width, and the Synchronize button keeps

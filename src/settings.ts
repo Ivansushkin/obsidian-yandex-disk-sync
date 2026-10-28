@@ -349,22 +349,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					password,
 					remoteManifest,
 				);
-				if (!this.plugin.isPluginUnloaded()) {
-					this.plugin.showOperationNotice(
-						t("notice.encryption_connected"),
-					);
-				}
-			} catch (error) {
-				if (!this.plugin.isPluginUnloaded()) {
-					new Notice(
-						formatOperationFailure(
-							createSyncFailure(error, {
-								stage: "preflight",
-								action: "read",
-							}).summary,
-						),
-					);
-				}
+			} catch {
+				// The shared status owns operation progress and errors.
 			}
 			return;
 		}
@@ -377,7 +363,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		try {
 			await this.plugin.enableEncryption(password);
 		} catch {
-			// The plugin owns the single progress and result Notice.
+			// The shared status owns operation progress and errors.
 		}
 	}
 
@@ -399,7 +385,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		try {
 			await this.plugin.disableEncryption({ reuploadPlaintext: true });
 		} catch {
-			// The plugin owns the single progress and result Notice.
+			// The shared status owns operation progress and errors.
 		}
 	}
 
@@ -819,7 +805,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			try {
 				await this.plugin.runFullSync();
 			} catch {
-				// errors are surfaced via Notice inside runFullSync
+				// The shared status owns synchronization errors.
 			}
 		});
 		this.updateActivity();
@@ -1037,7 +1023,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 										password,
 									);
 								} catch {
-									// The plugin owns the single progress and result Notice.
+									// The shared status owns operation progress and errors.
 								}
 							});
 						}),
@@ -1216,15 +1202,14 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 								return;
 							}
 							const result = await this.plugin.createBackup();
-							if (this.plugin.isPluginUnloaded()) {
+							if (
+								!this.displayed ||
+								this.plugin.isPluginUnloaded()
+							) {
 								return;
 							}
 							if (result.success) {
 								this.renderSettings();
-							} else {
-								new Notice(
-									result.error ?? t("settings.backup_error"),
-								);
 							}
 						});
 					}),

@@ -47,7 +47,7 @@ names are decoded first, then logical filters select which contents may be read.
 A .agents directory is excluded only by actual user settings; the configured
 Obsidian directory follows its switch. Neither name is hardcoded as extra protection.
 Included undecodable names/content stop with force-source-format without a plaintext
-fallback. The progress Notice changes to preparation failed instead of retaining 0/N.
+fallback. The indicator shows preparation failed instead of retaining 0/N.
 File/folder collisions that would erase excluded descendants block preparation.
 An unreadable source, impossible portable name or file occupying a preserved plugin
 ancestor stops preparation without clearing the destination.
@@ -121,8 +121,9 @@ empty-source warning. Remote encryption is distinguished from decrypted local fi
 The archive toggle and action buttons stay in a fixed footer; only the description
 scrolls. Plain paragraphs group source details and consequences without separate
 decorative panels. Archive controls have a distinct gap before the action row.
-Active progress is shown by the Notice without a duplicate modal status.
-Failures and the final result remain in the dialog.
+The shared indicator shows progress without a duplicate modal status;
+failures and the final result remain in the dialog. Notification policy follows
+[the shared UI contract](ARCHITECTURE.md#диагностика-ui-и-проверки).
 Archive creation is off by default. Remote-to-local archives the entire local vault
 to remote .backup; local-to-remote archives the old remote contents. The existing
 archive encryption policy is unchanged. Only the explicit destructive button permits
@@ -132,11 +133,10 @@ in that modal, where the user can retry, uncheck the archive or cancel.
 Cancel during preparation prevents later reads/writes after admitted work settles.
 Closing the modal during archiving cancels replacement and keeps the reservation
 until the archive request settles. After destructive confirmation and entry into
-replacement, closing the modal only hides it; the persistent Notice retains progress.
-
-One Notice spans preparation, optional archive, purge, copies, canonical and local
-persistence. Activity stays in the selected direction button. Closing settings does
-not cancel a confirmed run; duplicate clicks share the active operation. Unload
+replacement, closing the modal only hides it; the indicator retains progress
+through preparation, archive, purge, copies, canonical and local persistence.
+Activity stays in the selected direction button. Closing settings does not cancel
+a confirmed run; duplicate clicks share the active operation. Unload
 prevents further writes, including local writes after awaited downloads and directory
 checks. Cancellation before replacement preserves user data. Closing confirmation
 during archiving prevents replacement and retains the workflow reservation until
