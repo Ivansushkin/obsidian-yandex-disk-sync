@@ -17,6 +17,7 @@ Yandex Disk. The plugin works on Windows, macOS, Linux, iOS and Android.
 not send your files, OAuth token or encryption password to the author. The author
 has no access to your vault through the plugin.
 
+**Interface languages:** English · Русский · Қазақша · Беларуская · O‘zbekcha.
 The interface follows Obsidian's language. You can choose another language in
 the plugin settings.
 
