@@ -1,6 +1,10 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import { t } from "../i18n";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
+import {
+	getNewEncryptionPasswordError,
+	NEW_ENCRYPTION_PASSWORD_LIMITS,
+} from "../crypto/password-policy";
 
 /** Resolve a modal promise exactly once and provide a close fallback. */
 abstract class ResolvableModal<T> extends Modal {
@@ -44,6 +48,14 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 	}
 
 	protected renderPasswordFields(confirm: boolean): void {
+		if (confirm) {
+			this.contentEl.createEl("p", {
+				text: t(
+					"modal.encryption_password_length",
+					NEW_ENCRYPTION_PASSWORD_LIMITS,
+				),
+			});
+		}
 		this.passwordInput = this.contentEl.createEl("input", {
 			type: "password",
 			placeholder: t("modal.encryption_password_label"),
@@ -66,10 +78,19 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 
 	protected getPassword(): string | null {
 		const password = this.passwordInput.value;
+		const passwordError = this.confirmInput
+			? getNewEncryptionPasswordError(password)
+			: null;
+		if (passwordError && this.errorEl) {
+			this.errorEl.setText(passwordError);
+			this.errorEl.addClass("is-visible");
+			return null;
+		}
 		if (
 			!password ||
 			(this.confirmInput !== null && password !== this.confirmInput.value)
 		) {
+			this.errorEl?.setText(t("modal.encryption_password_mismatch"));
 			this.errorEl?.addClass("is-visible");
 			return null;
 		}

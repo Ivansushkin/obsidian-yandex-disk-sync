@@ -260,7 +260,7 @@ export class SyncIndicator extends Component {
 		try {
 			await this.actions.synchronize();
 		} catch {
-			new Notice(t("status.actions.sync_failed"));
+			// The synchronization workflow publishes failures in the shared status.
 		} finally {
 			this.syncRequested = false;
 			this.update();

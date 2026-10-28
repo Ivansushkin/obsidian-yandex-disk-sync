@@ -11,6 +11,7 @@ import type { VaultAdapter } from "../../api/vault-adapter";
 import type { YandexDiskClient } from "../../api/yandex-client";
 import type { EncryptionCodec } from "../../crypto/encryption";
 import { EncryptionManager } from "../../crypto/encryption-manager";
+import { getNewEncryptionPasswordError } from "../../crypto/password-policy";
 import { parseEncryptionManifest } from "../../crypto/manifest-schema";
 import {
 	isReplacementPath,
@@ -435,9 +436,15 @@ export async function prepareForceReplacement(
 							deviceId: deps.settings.deviceId,
 						});
 		} else {
-			password ||= await deps.password(true);
 			if (!password) {
-				return null;
+				password = await deps.password(true);
+				if (!password) {
+					return null;
+				}
+				const passwordError = getNewEncryptionPasswordError(password);
+				if (passwordError) {
+					throw new Error(passwordError);
+				}
 			}
 			const { snapshot } = encryption.createTargetSnapshot(
 				password,

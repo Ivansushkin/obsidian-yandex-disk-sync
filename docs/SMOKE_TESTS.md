@@ -10,7 +10,9 @@ desktop и indicator cases — UI. Объём расширенного fault/loa
 проверяет сложные алгоритмы по [AGENTS.md](../AGENTS.md#documentation-and-testing),
 а UI и пользовательский результат проверяются здесь на реальном приложении.
 Зелёный `npm test` не является свидетельством прохождения smoke. Пока прогон
-не выполнен, ручные сценарии остаются непроверенными.
+не выполнен, ручные сценарии остаются непроверенными. Общая presentation следует
+[UI-контракту](ARCHITECTURE.md#диагностика-ui-и-проверки); зеркало статуса
+проверяется в `TC-SETTINGS-UI-01`.
 
 ## Допущения
 
@@ -68,10 +70,7 @@ ID/counts/hashes; не прикладывать plugin data, credentials, сод
 
 Ожидание:
 
-- При открытых настройках Notice повторяет плашку с начала manual full; вне настроек
-  сохраняется обычное уведомление ручного запуска.
-- Settings Notice не исчезает посреди операции, обновляется на месте и исчезает
-  при idle или закрытии настроек; UI-025 проверяется также при reopen.
+- Плашка показывает этапы manual full; зеркало проверяется по `UI-025`.
 - Нет искусственного `0%`.
 - `Старт.md` появляется на Device 2 с правильным содержимым.
 - Повторные full дают `0/0/0`.
@@ -369,7 +368,7 @@ conflict/backup-файлы, если они мешают проверке.
 ### Fresh enable
 
 1. На Device 1 включить шифрование.
-2. Проверить единый progress Notice.
+2. Проверить прогресс в общей плашке.
 3. На Device 2 выполнить full.
 4. Сначала ввести неверный пароль.
 5. Отменить следующий prompt и перезапустить plugin.
@@ -469,7 +468,7 @@ checkpoint без нового права удаления и без post-commit
   полагается на folder observations предыдущего режима.
 - Старый ciphertext не скачивается как пользовательский файл.
 - Rename/move/delete в encrypted-режиме дают тот же результат, что plaintext.
-- Каждый transition использует один Notice и не сообщает ложный успех.
+- Каждый transition показывает реальный этап без ложного успеха.
 - После disable файлы доступны plaintext.
 - Финальные full — `0/0/0`.
 
@@ -607,7 +606,7 @@ pre-write/retry требуется новая stable root pair; общая obser
 7. На паузах full/realtime/Force/maintenance изменить token/client/path/filters
    через UI и программный settings workflow: live memory и persistence неизменны.
    Внутренние baseline/queues сохраняются; после освобождения busy настройки доступны.
-8. Проверить один постоянный Notice, double click, reopen settings, отсутствие
+8. Проверить плашку, double click, reopen settings, отсутствие
    backup-фаз без архива и success только после verification/persistence/cleanup.
    Direct Force не требует дополнительного ordinary full для success.
 9. Restore encrypted backup до/после rotate/disable, desktop/mobile, offline
@@ -715,7 +714,7 @@ Pause failure не допускает remote work; ACK failure не показы
    прокрутку с автоскрытием/возвратом кнопок, смену safe area и поворот.
 3. Выполнить Force в обоих направлениях с архивом и без; отменить подтверждение;
    выполнить encryption enable/disable/rotate и ручной backup. Между внутренними
-   сессиями нет ложного idle, Notice сохранены. Быстрый следующий запуск не
+   сессиями нет ложного idle. Быстрый следующий запуск не
    получает фазу или прогресс предыдущего.
 4. Проверить паузу, отключение сети, восстановление, неверный пароль и отсутствие
    токена. Плашка показывает реальное состояние/причину движка; она не выводит
@@ -723,7 +722,7 @@ Pause failure не допускает remote work; ACK failure не показы
    свёрнутой плашке, не раскрывает её автоматически; при раскрытии видны operation/code
    и сообщение причины вместо одного счётчика. Через команду «Показать статус
    синхронизации» открыть полный selectable текст ошибки, включая переносы строк;
-   credentials замаскированы. Blocking Notice сохранён. Во время download оборвать
+   credentials замаскированы. Блокировка видна в плашке. Во время download оборвать
    сеть, затем восстановить: transient обрыв получает ограниченные повторы. При
    полном отказе исходные local bytes остаются; после restart без правок заметки
    успешный повтор скачивает remote update без conflict copy (`NET-017`).
@@ -820,7 +819,7 @@ Obsidian и тему; отсутствующие устройства остав
    Tab и видимый focus.
    Enter/Space на YD раскрывает/сворачивает; на кнопках выполняет действие
    без изменения раскрытия. Touch targets трёх кнопок не меньше 44 × 44 px.
-3. Sync запускает обычный manual full с прежними Notice и защитными проверками.
+3. Sync запускает обычный manual full с защитными проверками и общей presentation.
    Повторное нажатие не создаёт второй запуск; кнопка недоступна от начала
    validation до конца persistence. Realtime/Force/backup/encryption и
    изменение конфигурации также блокируют её. Копирование и открытие логов доступны.
@@ -858,7 +857,7 @@ vault не использовать. Повторить plaintext/encrypted и �
    при прокрутке описания; проверить также длинные пути и увеличенный шрифт.
    Между архивом и кнопками есть заметный отступ; описание читается обычными
    абзацами, без отдельных декоративных плашек для каждой строки.
-   Прогресс показан в Notice без дублирующего статуса в окне; ошибки и итог — в окне.
+   Плашка показывает прогресс без дублирования в окне; ошибки и итог — в окне.
    Проверить замену только включённых файлов, сохранность excluded/protected paths,
    .backup, новый canonical и manifest. Для encrypted destination нужен проверенный
    пароль; при сохранении encryption codec/salt не меняются. Исключённые ciphertext
@@ -875,7 +874,7 @@ vault не использовать. Повторить plaintext/encrypted и �
    При encrypted source добавить обычную .agents и настроить исключение .agents/**;
    конфигурацию отключить через её switch. Эти raw paths не читаются/не декодируются,
    исключённые local files сохраняются. In-scope undecodable имя или content дают
-   force-source-format до изменений; Notice показывает остановку вместо 0/N.
+   force-source-format до изменений; плашка показывает остановку вместо 0/N.
    .backup никогда не попадает в расшифровку. Проверить nested includes и custom configDir.
    После selected source pre-read permanent delete заменяет только выбранные файлы,
    исключённые не удаляются. File/folder blocker с excluded descendants блокирует
@@ -890,7 +889,7 @@ vault не использовать. Повторить plaintext/encrypted и �
 5. Ошибка выбранного archive остаётся в той же модалке; retry/uncheck/cancel.
    Отмена доступна во время архива; reservation держится до settlement, purge не
    начинается. Проверить, что локальные данные действительно находятся в ZIP.
-   После начала replacement закрытие окна только скрывает его; Notice остаётся.
+   После начала replacement закрытие окна только скрывает его; плашка сохраняет прогресс.
    Без архива нет protective/conflict copies, локального .trash и snapshot старого
    destination. Не журналировать tokens/passwords/content/ciphertext.
 6. Прервать DELETE/upload/canonical/persistence. Независимые действия продолжаются,
@@ -965,8 +964,8 @@ different branch and cannot establish this tracked-source result.
 1. На A подготовить local reference; на Диск добавить remote-only файл, а на
    отключённом B — stale edit, new child и queued rename. В filters оставить
    selected и excluded subtree; сохранить безопасные path/count/hash ожидания.
-2. На A запустить переход. Проверить предупреждение о локальном эталоне и одном
-   Notice до verification/persistence. Target canonical получает fresh epoch и
+2. На A запустить переход. Проверить предупреждение о локальном эталоне и прогресс
+   до verification/persistence. Target canonical получает fresh epoch и
    replacement receipt; selected bytes совпадают с A. Remote-only selected extras
    удалены, `.backup`, plugin state и excluded raw descendants сохранены.
 3. Прервать post-commit cleanup и перезапустить A. На отдельной fixture завершить
@@ -1062,14 +1061,46 @@ prefers-reduced-motion. Использовать тестовые plaintext/encr
    записи логгера не вызывают повторных чтений для подсказки. Закрытие во время read
    не обновляет DOM. На узкой панели кнопки переносятся без горизонтального скролла;
    нативные стили темы, Tab, Enter/Space и видимый focus сохраняются.
-9. При открытых настройках сравнить тост и раскрытую плашку во время full/realtime,
-   Force, backup, enable/disable/rotate, retry, pause/offline/error. Text, progress и
-   подробности совпадают. В settings idle нет тоста успеха. Закрытие настроек скрывает
-   зеркало; reopen сразу отражает актуальный статус; повторная отрисовка не создаёт
-   дубликатов. Вне настроек прежние operation Notices сохраняются.
+9. Сравнить text/progress/detail зеркала и плашки при full/realtime/Force/backup/
+   encryption/retry/error. Re-render не дублирует Notice; idle, закрытие или другая
+   вкладка снимают его. Завершить операцию после hide: тост не возвращается, reopen
+   показывает live state. Повторить full вне настроек без тостов. Ошибку backup или
+   preflight сверить также с командой «Показать статус»; clipboard feedback остаётся
+   отдельным уведомлением.
 
 Покрывает: `UI-022`, `UI-023`, `UI-024`, `UI-025`. Автоматические проверки не заменяют
 этот прогон в Obsidian и не устанавливают готовность к релизу.
+
+## TC-ROTATED-PASSWORD-01. Автоматический ввод нового пароля
+
+Два подключённых профиля против реального Диска, второй — Android.
+
+1. Сменить пароль на первом; на втором дождаться scheduled full: после settlement
+   открывается одно окно, верный пароль запускает один full и сходимость bytes/queues.
+   Повторить после restart второго профиля и с первым ручным Sync после rotation.
+2. Cancel/wrong сохраняет block без повторного окна при idle/reopen; manual Sync
+   повторяет ввод. Новый target или restart разрешает новую автоматическую попытку.
+3. Повторные запуски не дублируют prompt/resume. Pause/resume, token/path change,
+   unload и failed persistence при ожидании/вводе запрещают поздние install/writes/resume.
+   Fresh connection до manual Sync, historical/auth/network errors и transitional
+   manifest не запускают automatic rotated prompt.
+
+Покрывает: `ENC-016`, `ENC-003`, `ENC-014`.
+
+## TC-PASSWORD-LENGTH-01. Длина нового пароля
+
+Synthetic passwords в desktop/mobile; enable, rotate и Force create.
+
+1. Подсказка и ошибки доступны на en/ru/kk/be/uz. 3/31 символ и длинная вставка
+   отклоняются без обрезания ввода, archive/state/canonical/local/physical изменений.
+   4/30 принимаются, включая кириллицу и эмодзи; combining mark — отдельная точка.
+   При допустимой длине несовпадающее подтверждение даёт ошибку несовпадения.
+2. Завершить enable/rotate, подключить второй профиль и перезапустить: имена/bytes
+   сохранены. Legacy-пароли короче 4 и длиннее 30 работают при restart/connect/
+   verification/recovery, Force authentication/reuse и открытии backup.
+   Новый выбор снова проверяет 4–30; ввод нигде не журналируется.
+
+Покрывает: `ENC-015`. Эти cases требуют реального прогона; synthetic tests его не заменяют.
 
 ## TC-READ-RETRY-01. Ограниченное восстановление API GET
 

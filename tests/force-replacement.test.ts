@@ -11,6 +11,59 @@ import {
 	type ForceRecovery,
 } from "../src/sync/workflows/force-state";
 import { bytes, managedDevices, MemoryDisk } from "./helpers/sync-flow";
+import { encryptionFlow } from "./helpers/encryption-flow";
+
+test("Force rejects invalid new passwords and preserves saved legacy credentials", async (context) => {
+	const make = managedDevices(context);
+	for (const savedPassword of [null, "x", "я".repeat(40)]) {
+		const disk = new MemoryDisk();
+		const owner = make(disk, "password-owner", null);
+		owner.settings.enableEncryption = true;
+		owner.settings.encryptionPassword = savedPassword;
+		owner.vault.put("Заметка.md", bytes("preserved content"));
+		const deps = {
+			client: owner.client,
+			adapter: owner.adapter,
+			index: owner.index,
+			settings: owner.settings,
+			persist: async () => {},
+			password: async () => "🔐".repeat(4),
+		};
+		if (savedPassword === null) {
+			const remote = structuredClone(disk.files);
+			const local = structuredClone(owner.vault.files);
+			const settings = structuredClone(owner.settings);
+			await assert.rejects(
+				prepareForceReplacement(
+					{ ...deps, password: async () => "🔐".repeat(31) },
+					"from_local",
+				),
+				/4.*30/,
+			);
+			assert.deepEqual(disk.files, remote);
+			assert.deepEqual(owner.vault.files, local);
+			assert.deepEqual(owner.settings, settings);
+		}
+		const plan = await prepareForceReplacement(deps, "from_local");
+		assert.ok(plan);
+		await applyForceReplacement(deps, plan, "without-backup");
+		await owner.assertSettled({ "Заметка.md": "preserved content" });
+		if (savedPassword?.length === 40) {
+			const restarted = make(
+				disk,
+				"password-owner",
+				null,
+				owner.vault,
+				await owner.saved(),
+			);
+			Object.assign(restarted.settings, structuredClone(owner.settings));
+			await encryptionFlow(restarted).workflow.initEncryption();
+			await restarted.assertSettled({
+				"Заметка.md": "preserved content",
+			});
+		}
+	}
+});
 
 test("scoped Force rejects unreadable destination encryption instead of deleting unknown excluded paths", async (context) => {
 	const disk = new MemoryDisk();
@@ -596,7 +649,7 @@ test("Force source manifest controls decoding and password retry without changin
 	const make = managedDevices(context);
 	const source = make(disk, "encrypted-source", null);
 	source.settings.enableEncryption = true;
-	source.settings.encryptionPassword = "source-password";
+	source.settings.encryptionPassword = "x";
 	source.vault.put("note.md", bytes("encrypted source"));
 	const sourceDeps = {
 		client: source.client,
@@ -604,7 +657,7 @@ test("Force source manifest controls decoding and password retry without changin
 		index: source.index,
 		settings: source.settings,
 		persist: async () => {},
-		password: async () => "source-password",
+		password: async () => "x",
 	};
 	const seed = await prepareForceReplacement(sourceDeps, "from_local");
 	assert.ok(seed);
@@ -623,8 +676,7 @@ test("Force source manifest controls decoding and password retry without changin
 	};
 	assert.equal(await prepareForceReplacement(deps, "from_remote"), null);
 	let attempts = 0;
-	deps.password = async () =>
-		++attempts === 1 ? "wrong-again" : "source-password";
+	deps.password = async () => (++attempts === 1 ? "wrong-again" : "x");
 	const authenticated = await prepareForceReplacement(deps, "from_remote");
 	assert.ok(authenticated?.codec);
 	assert.equal(attempts, 2);

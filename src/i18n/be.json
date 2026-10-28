@@ -312,6 +312,7 @@
 	"modal.encryption_password_label": "Пароль",
 	"modal.encryption_confirm_label": "Пацвердзіць пароль",
 	"modal.encryption_password_mismatch": "Паролі не супадаюць",
+	"modal.encryption_password_length": "Пароль павінен змяшчаць ад {min} да {max} сімвалаў.",
 	"modal.encryption_enter_password": "Увядзіце пароль шыфравання",
 	"modal.encryption_disable_title": "Адключыць шыфраванне",
 	"modal.encryption_change_password_title": "Змяніць пароль шыфравання",

@@ -85,7 +85,6 @@ function createStartupPlugin() {
 	plugin["authenticationBlockReason"] = null;
 	plugin["encryptionBlockReason"] = null;
 	plugin["encryptionTransition"] = null;
-	plugin["blockingNotice"] = null;
 	plugin["regularSyncStarted"] = false;
 	Object.assign(plugin, {
 		syncEngine: {

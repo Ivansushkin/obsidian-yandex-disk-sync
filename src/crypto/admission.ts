@@ -19,11 +19,33 @@ export interface EncryptionReadyOptions {
 	allowRecovery?: boolean;
 	/** Drop invocation observations before changing codec or entering recovery. */
 	invalidateReads?(): void;
+	/** Reject a revoked deferred request before accepting credentials. */
+	assertCurrent?(): void;
+}
+
+interface AutomaticPasswordRequest {
+	kind: "rotated";
+	target: string;
+	configuration: number;
+	assertLifetime(): void;
+}
+
+/** Host lifecycle capabilities; credential decisions remain in admission. */
+export interface AutomaticPasswordPorts {
+	isAllowed(): boolean;
+	isBusy(): boolean;
+	runExclusive(action: () => Promise<boolean>): Promise<boolean>;
+	resume(): Promise<void>;
 }
 
 /** Validates current remote encryption and serializes explicit password prompts. */
 export class EncryptionAdmission {
 	private encryptionPromptPromise: Promise<boolean> | null = null;
+	private automaticPorts?: AutomaticPasswordPorts;
+	private automaticRequest: AutomaticPasswordRequest | null = null;
+	private automaticRequestPromise: Promise<void> | null = null;
+	private readonly attemptedAutomaticTargets = new Set<string>();
+	private automaticGeneration = 0;
 	constructor(
 		private readonly context: EncryptionContext,
 		private readonly workflow: Pick<
@@ -37,6 +59,148 @@ export class EncryptionAdmission {
 		private readonly controller: EncryptionTransitionController,
 	) {}
 
+	configureAutomaticPasswordRequests(ports: AutomaticPasswordPorts): void {
+		this.automaticPorts = ports;
+	}
+
+	/** Retire all deferred work when the connection changes or the host unloads. */
+	resetAutomaticPasswordRequests(): void {
+		this.automaticGeneration++;
+		this.automaticRequest = null;
+		this.attemptedAutomaticTargets.clear();
+	}
+
+	/** Drain after both coordinator settlement and the outer host operation finish. */
+	flushAutomaticPasswordRequest(): Promise<void> {
+		if (this.automaticRequestPromise) {
+			return this.automaticRequestPromise;
+		}
+		const ports = this.automaticPorts;
+		if (!ports || !this.automaticRequest) {
+			return Promise.resolve();
+		}
+		if (!ports.isAllowed()) {
+			this.automaticRequest = null;
+			return Promise.resolve();
+		}
+		if (ports.isBusy()) {
+			return Promise.resolve();
+		}
+		const task = Promise.resolve()
+			.then(() => this.runAutomaticPasswordRequest(ports))
+			.catch((error: unknown) => {
+				logger.warn("Deferred encryption password request stopped", {
+					error,
+				});
+			})
+			.finally(() => {
+				this.automaticRequestPromise = null;
+				if (this.automaticRequest) {
+					void this.flushAutomaticPasswordRequest();
+				}
+			});
+		this.automaticRequestPromise = task;
+		return task;
+	}
+
+	private async runAutomaticPasswordRequest(
+		ports: AutomaticPasswordPorts,
+	): Promise<void> {
+		if (!ports.isAllowed() || ports.isBusy()) {
+			return;
+		}
+		const request = this.automaticRequest;
+		this.automaticRequest = null;
+		if (!request || this.attemptedAutomaticTargets.has(request.target)) {
+			return;
+		}
+		const generation = this.automaticGeneration;
+		const assertCurrent = () => {
+			request.assertLifetime();
+			this.context.assertConnectionAllowed();
+			if (
+				this.context.isCancelled() ||
+				!ports.isAllowed() ||
+				generation !== this.automaticGeneration ||
+				request.configuration !==
+					this.context.client.getReadConfigurationVersion()
+			) {
+				throw new Error(
+					"Deferred encryption password request was revoked",
+				);
+			}
+		};
+		assertCurrent();
+		const connected = await ports.runExclusive(async () => {
+			assertCurrent();
+			const manifest =
+				await this.context.index.downloadEncryptionManifest();
+			assertCurrent();
+			if (
+				!manifest ||
+				manifest.state !== "enabled" ||
+				this.attemptedAutomaticTargets.has(
+					this.passwordTarget(manifest),
+				)
+			) {
+				return false;
+			}
+			return await this.ensureEncryptionReady(
+				{ prompt: true, allowRecovery: false, assertCurrent },
+				{ manifest },
+			);
+		});
+		request.assertLifetime();
+		if (
+			connected &&
+			generation === this.automaticGeneration &&
+			ports.isAllowed() &&
+			!this.context.isCancelled()
+		) {
+			await ports.resume();
+		}
+	}
+
+	private passwordTarget(manifest: RemoteEncryptionManifest): string {
+		return JSON.stringify([
+			manifest.profileId,
+			manifest.salt,
+			manifest.revision,
+		]);
+	}
+
+	/** Keep only an advisory target; processing always reads the current manifest again. */
+	private deferRotatedPassword(
+		manifest: RemoteEncryptionManifest,
+		origin: Omit<AutomaticPasswordRequest, "kind" | "target"> & {
+			generation: number;
+		},
+	): void {
+		try {
+			origin.assertLifetime();
+		} catch {
+			return;
+		}
+		if (
+			this.context.isCancelled() ||
+			origin.generation !== this.automaticGeneration ||
+			origin.configuration !==
+				this.context.client.getReadConfigurationVersion()
+		) {
+			return;
+		}
+		const target = this.passwordTarget(manifest);
+		if (this.attemptedAutomaticTargets.has(target)) {
+			return;
+		}
+		this.automaticRequest = {
+			kind: "rotated",
+			target,
+			configuration: origin.configuration,
+			assertLifetime: origin.assertLifetime,
+		};
+	}
+
 	/**
 	 * Ensure local encryption settings match the remote manifest before sync.
 	 */
@@ -44,12 +208,19 @@ export class EncryptionAdmission {
 		options: EncryptionReadyOptions,
 		knownManifest?: { manifest: RemoteEncryptionManifest | null },
 	): Promise<boolean> {
+		const origin = {
+			generation: this.automaticGeneration,
+			configuration: this.context.client.getReadConfigurationVersion(),
+			assertLifetime: this.context.engine.createReadLifetimeGuard(),
+		};
 		try {
+			options.assertCurrent?.();
 			const manifest =
 				knownManifest !== undefined
 					? knownManifest.manifest
 					: await this.context.index.downloadEncryptionManifest();
 			if (!manifest) {
+				this.automaticRequest = null;
 				if (this.context.getSettings().enableEncryption) {
 					if (options.allowRecovery === false) {
 						this.context.ui.setBlock(
@@ -105,6 +276,7 @@ export class EncryptionAdmission {
 			}
 
 			if (manifest.state !== "enabled") {
+				this.automaticRequest = null;
 				this.context.ui.setBlock(t("notice.encryption_remote_busy"));
 				if (!options.prompt || options.allowRecovery === false) {
 					return false;
@@ -135,6 +307,9 @@ export class EncryptionAdmission {
 				localRevision === manifest.revision;
 
 			if (!matchesRemote) {
+				if (hasLocalEncryption && !options.prompt) {
+					this.deferRotatedPassword(manifest, origin);
+				}
 				const reason = hasLocalEncryption
 					? t("notice.encryption_password_changed_remote")
 					: t("notice.encryption_password_required");
@@ -157,6 +332,9 @@ export class EncryptionAdmission {
 						throw new Error(t("notice.encryption_wrong_password"));
 					}
 				} catch {
+					if (!options.prompt) {
+						this.deferRotatedPassword(manifest, origin);
+					}
 					this.context.ui.setBlock(
 						t("notice.encryption_password_changed_remote"),
 					);
@@ -172,9 +350,11 @@ export class EncryptionAdmission {
 				}
 			}
 
+			this.automaticRequest = null;
 			this.context.ui.setBlock(null);
 			return true;
 		} catch (e) {
+			this.automaticRequest = null;
 			if (e instanceof ForceRecoveryPendingError) {
 				throw e;
 			}
@@ -210,6 +390,10 @@ export class EncryptionAdmission {
 			return await this.encryptionPromptPromise;
 		}
 
+		this.automaticRequest = null;
+		if (mode === "rotated") {
+			this.attemptedAutomaticTargets.add(this.passwordTarget(manifest));
+		}
 		this.encryptionPromptPromise =
 			this.promptForRemoteEncryptionPasswordOnce(
 				manifest,
@@ -228,6 +412,7 @@ export class EncryptionAdmission {
 	): Promise<boolean> {
 		const assertLifetime = this.context.engine.createReadLifetimeGuard();
 		const reads = this.context.index.createStartupReadSession(() => {
+			options.assertCurrent?.();
 			assertLifetime();
 			this.context.assertConnectionAllowed();
 		}, true);
@@ -243,7 +428,10 @@ export class EncryptionAdmission {
 			reads.assertCurrent();
 			await this.workflow.connectForSync(password, manifest, {
 				allowRecovery: options.allowRecovery,
-				assertCurrent: () => reads.assertCurrent(),
+				assertCurrent: () => {
+					options.assertCurrent?.();
+					reads.assertCurrent();
+				},
 			});
 			assertLifetime();
 			if (this.context.isCancelled()) {

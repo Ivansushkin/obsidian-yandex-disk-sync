@@ -242,7 +242,7 @@ DELETE; pre-delete scan сообщает только стоимость стр�
 GET, no-hash/drift — stable plaintext read-back; resource ID не заменяет content hash.
 
 Force и authoritative encryption replacement не дают server fencing: уже отправленный
-чужой запрос может завершиться после проверки. Для encryption Notice требует не
+чужой запрос может завершиться после проверки. Предупреждение encryption transition требует не
 редактировать ни одно устройство до завершения. Остановка других устройств не является
 допуском direct Force. Архивы и их exact verification — [BACKUP.md](BACKUP.md).
 
@@ -310,7 +310,7 @@ realtime, configuration update, Force, backup и encryption отключают �
 прогресса не пересоздают поля.
 Кнопка Sync сохраняет постоянную подпись для раскладки и доступного имени; во время
 проверки подключения и full подпись скрыта, по центру виден только loader.
-Статусы отображаются в плашке и Notice, размеры кнопки не зависят от этапа.
+Статусы используют общую presentation; размеры кнопки не зависят от этапа.
 Весь раздел логов доступен во время работы, кроме собственных migration/lifecycle
 ограничений. Logging patches идут через общую
 persistence queue без remote recheck и не инвалидируют backup context.
@@ -318,6 +318,7 @@ persistence queue без remote recheck и не инвалидируют backup 
 password prompt или full. Оно атомарно устанавливает локальный settings-флаг
 `manualSyncRequired` вместе с новым подключением. Fresh install устанавливает его;
 существующие данные без поля используют false. Маркер `plugin-data` не меняется.
+
 Пока флаг установлен, startup, watcher, scheduler, queued automatic full и passive
 backup listing не начинают удалённую работу, в том числе после restart. Другие
 settings patches не обходят ожидание. Успешный manual full сохраняет snapshot со
@@ -331,14 +332,22 @@ maintenance независимо от Notice policy. Admitted filter changes и 
 repair используют обычный full после освобождения settings lock, без отдельного
 admission и busy bypass.
 
+`EncryptionAdmission` владеет отложенным запросом пароля после rotation; host
+запускает его после settlement coordinator и outer operation, затем один full.
+Ручной admission перепроверяет cached startup state. Дедупликация и отзыв
+контекста описаны в [E2E_ENCRYPTION.md](E2E_ENCRYPTION.md#orchestration-и-admission).
+
 `getSyncPresentation` вычисляет один приоритет и текст для плашки и settings Notice:
 Force → engine activity → foreground → connection → full → terminal/idle.
-Settings tab подписывается на live sources при display, обновляет один Notice и
-снимает его при idle/hide/unload. Re-render не пересоздаёт подписку зеркала.
-Старые operation status Notices подавлены внутри настроек; самостоятельные action
-errors и clipboard feedback остаются отдельными. За пределами настроек сохранена
-прежняя Notice policy. Общие password admission, invocation-owned read session и
-recovery guards используются обычным manual full без settings-only preflight.
+Плашка показывает все статусы; один `SettingsStatusNotice` зеркалит её только
+в открытой вкладке настроек плагина. Idle/hide/другая вкладка/unload снимают зеркало;
+reopen читает live state, re-render и поздние результаты не создают дубликатов.
+Ошибки preflight, settings drain и backup вне engine state хранятся в памяти как
+presentation issue: admission не меняется, ошибка очищается при следующем запуске
+или разрешении причины, но не при открытии настроек. Команда статуса также читает
+эту ошибку. Самостоятельные action errors, clipboard feedback и ошибка загрузки
+до создания плашки остаются отдельными. Manual full использует общие admission,
+invocation-owned reads и recovery guards без settings-only preflight.
 
 Общие `copyLogTail` и `openLogFile` обслуживают настройки и плашку. Копирование
 сохраняет clipboard activation/fallback, ограничивает очищенный хвост 4000 символами

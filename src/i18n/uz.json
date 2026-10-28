@@ -312,6 +312,7 @@
 	"modal.encryption_password_label": "Parol",
 	"modal.encryption_confirm_label": "Parolni tasdiqlash",
 	"modal.encryption_password_mismatch": "Parollar mos emas",
+	"modal.encryption_password_length": "Parol {min} tadan {max} tagacha belgidan iborat bo‘lishi kerak.",
 	"modal.encryption_enter_password": "Shifrlash parolini kiriting",
 	"modal.encryption_disable_title": "Shifrlashni o‘chirish",
 	"modal.encryption_change_password_title": "Shifrlash parolini o‘zgartirish",

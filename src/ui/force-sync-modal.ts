@@ -6,6 +6,10 @@ import { App, Modal, Setting, type ButtonComponent } from "obsidian";
 import { t } from "../i18n";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
 import { formatForceResult } from "./force-sync-progress";
+import {
+	getNewEncryptionPasswordError,
+	NEW_ENCRYPTION_PASSWORD_LIMITS,
+} from "../crypto/password-policy";
 
 export type ForceSyncDirection = "from_local" | "from_remote";
 
@@ -87,6 +91,14 @@ export class ForceSyncModal extends Modal {
 		this.bodyEl.createEl("p", {
 			text: t(create ? "force.password_create" : "force.source_password"),
 		});
+		if (create) {
+			this.bodyEl.createEl("p", {
+				text: t(
+					"modal.encryption_password_length",
+					NEW_ENCRYPTION_PASSWORD_LIMITS,
+				),
+			});
+		}
 		const input = this.bodyEl.createEl("input", {
 			type: "password",
 			cls: "encryption-password-input",
@@ -115,6 +127,13 @@ export class ForceSyncModal extends Modal {
 		return new Promise((resolve) => {
 			this.passwordResult = resolve;
 			this.renderActions(t("force.check_password"), () => {
+				const passwordError = create
+					? getNewEncryptionPasswordError(input.value)
+					: null;
+				if (passwordError) {
+					errorEl.setText(passwordError);
+					return;
+				}
 				if (
 					!input.value ||
 					(confirmation && input.value !== confirmation.value)

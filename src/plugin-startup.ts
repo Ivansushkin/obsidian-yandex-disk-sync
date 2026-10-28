@@ -153,7 +153,7 @@ export class PluginStartup {
 					) {
 						return "blocked";
 					}
-					if (!deps.getBlocks().encryption) {
+					if (!deps.getBlocks().encryption && !prompt) {
 						return "ready";
 					}
 					if (!prompt) {

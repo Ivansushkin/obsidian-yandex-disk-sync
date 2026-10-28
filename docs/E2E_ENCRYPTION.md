@@ -13,6 +13,20 @@
 - До canonical commit авторитетен source codec. После commit rollback запрещён,
   авторитетен target codec.
 
+## Новые и существующие пароли
+
+Enable, rotate и Force create принимают 4–30 кодовых точек Unicode без trim,
+нормализации или обрезания; составной символ может содержать несколько точек.
+HTML password-поле не сохраняет CR/LF. Общая `crypto/password-policy.ts` отклоняет
+новый пароль в UI и domain preparation до архива, persistence и remote writes;
+локализованная ошибка сохраняет ввод для исправления.
+
+Существующие пароли любой поддерживаемой длины сохраняют точные bytes при
+restart, connect, current-password verification, recovery, Force reuse и открытии
+backup. Форматы и размеры ключей не меняются, миграция не нужна. Четыре символа
+дают слабую защиту от подбора; предпочтителен длинный случайный пароль.
+Проверки: `ENC-015`, manual `TC-PASSWORD-LENGTH-01`.
+
 ## Codec profile: `hardened`
 
 - PBKDF2-HMAC-SHA256, ровно 600 000 итераций, случайная salt 16 bytes;
@@ -277,19 +291,30 @@ coherent очередью вместе с baseline и pending work.
 `crypto/admission.ts` сохраняет порядок manifest/verifier checks и единственный
 ожидающий password prompt. `prompt` разрешает ввод credentials, а
 `allowRecovery: false` независимо запрещает mutating recovery и смену remote mode.
-После успешного сохранения изменённого token/path settings workflow использует
-`prompt: true, allowRecovery: false`, если layout готов и sync не на паузе.
-Подключение допускается только к stable enabled manifest без canonical maintenance;
-manifest и canonical перечитываются до сохранения candidate credentials, без
-восстановления locks или cleanup. Runtime/scope settings, persistence repair и reopen
-сами пароль не запрашивают. Cancel/wrong password оставляют admission block и
-не запускают automation; следующий ручной Sync позволяет повторить ввод.
-Lifetime и configuration capture до prompt сохраняются через очередь и derivation.
-Token/path/codec change, pause/resume и unload отвергают поздний ответ без
-подключения codec или изменения credentials. UI и foreground reservation принадлежат `main.ts`;
-после подключения watcher/scheduler запускаются только после успешного full
-и повторных lifecycle/pause checks. Подтверждение нового пароля в Force modal
-сохраняет `confirmPassword`; recovery по-прежнему не создаёт новый архив.
+Смена ключа уже подключённого устройства при `prompt: false` создаёт неперсистентный
+`rotated` request с profile/salt/revision и захваченными до первого await
+configuration/generation/lifetime guards. Поздний verifier не восстанавливает
+отозванный request. Host activity запускает его после coordinator и outer owner;
+очередь и решения остаются в admission, `main.ts` содержит wiring.
+
+Перед prompt admission перечитывает stable enabled manifest; общий connect с
+`allowRecovery: false` проверяет verifier, canonical и fresh authority до install.
+После освобождения foreground owner запускается один full; automation возвращается
+только после reconciliation и persistence. Каждый target автоматически запрашивается
+один раз за экземпляр plugin, включая учёт startup/manual prompts. Cancel/wrong
+сохраняет block; manual Sync повторяет ввод, новый target или restart разрешает
+новую автоматическую попытку. Token/path change и unload сбрасывают request;
+pause/config ABA/persistence failure запрещают поздние install и resume.
+
+Token/path save устанавливает `manualSyncRequired`: до успешного manual full нет
+автоматических проверок и prompts, включая restart. Ручной admission проверяет
+свежее encryption state через reads текущего invocation вместо cached `validated`.
+Connect требует stable manifest без canonical maintenance; manifest/canonical
+перечитываются до сохранения credentials без lock recovery и cleanup. Runtime/scope
+settings, persistence repair и reopen сами пароль не запрашивают. Guards действуют
+через prompt, очередь и derivation, включая codec change. Force сохраняет
+`confirmPassword`; recovery не создаёт новый архив. Проверки: `ENC-016`,
+manual `TC-ROTATED-PASSWORD-01`.
 
 Публичные методы плагина сохранены:
 `enableEncryption`, `disableEncryption`, `rotateEncryptionPassword`,

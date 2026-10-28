@@ -105,6 +105,7 @@ export interface SyncIndicatorContext {
 	connection?: { errorMessage?: string; retry?: RetryProgress };
 	syncUnavailable: boolean;
 	manualSyncRequired?: boolean;
+	operationError?: string;
 }
 
 export interface SyncPresentation {
@@ -191,6 +192,20 @@ export function getSyncPresentation(
 		detail = sync.failure
 			? formatOperationFailure(sync.failure)
 			: (sync.errorMessage ?? "");
+	}
+	if (context.operationError && state.status !== "syncing") {
+		const wasIdle =
+			state.status === "idle" || state.status === "initializing";
+		state = {
+			...state,
+			status: wasIdle ? "error" : state.status,
+			errorMessage: context.operationError,
+			failure: undefined,
+		};
+		if (wasIdle) {
+			text = t("status.mobile.error");
+		}
+		detail = context.operationError;
 	}
 	const busy = state.status === "syncing" || state.status === "initializing";
 	let icon = busy ? "cloud" : getSyncStatusIcon(state.status);
