@@ -47,6 +47,8 @@ export interface PhysicalRewriteUploadProof {
 }
 
 export interface SyncRunOptions {
+	/** Identify activation requests independently of progress notification policy. */
+	trigger?: "manual" | "automatic" | "maintenance";
 	/** One explicit, epoch-bound choice; never retained across replacement generations. */
 	epochAdoption?: { epoch: string; decision: "accept" | "preserve" };
 	/** Direction-verified replacement, created before the destructive confirmation. */

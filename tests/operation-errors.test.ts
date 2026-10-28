@@ -8,7 +8,9 @@ import {
 	decideRecovery,
 	withFailureContext,
 } from "../src/errors";
-import { createSyncFailure } from "../src/sync/errors";
+import { setLanguagePreference } from "../src/i18n";
+import { translations } from "../src/i18n/translations";
+import { createSyncFailure, formatOperationFailure } from "../src/sync/errors";
 import {
 	AmbiguousRemoteIndexStateError,
 	RemoteIndexRolledBackError,
@@ -90,6 +92,36 @@ test("domain safety outranks nested transport failures and diagnostics exclude p
 		);
 		if (error === changed) {
 			assert.equal(failure.cause, changed);
+			const before = structuredClone(failure.summary);
+			try {
+				for (const language of [
+					"en",
+					"ru",
+					"kk",
+					"be",
+					"uz",
+				] as const) {
+					setLanguagePreference(language);
+					assert.ok(
+						formatOperationFailure(failure.summary).includes(
+							translations[language][
+								"notice.force_source_changed"
+							]!,
+						),
+					);
+					assert.deepEqual(failure.summary, before);
+					assert.equal(failure.cause, changed);
+					assert.deepEqual(
+						decideRecovery(failure, {
+							attemptsRemaining: 3,
+							remainingMs: 100,
+						}),
+						{ retry: false, confirm: false },
+					);
+				}
+			} finally {
+				setLanguagePreference("system");
+			}
 		}
 	}
 	for (const cause of [

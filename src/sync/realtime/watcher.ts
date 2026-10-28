@@ -587,6 +587,9 @@ export class FileWatcher {
 	 * Start tracking
 	 */
 	start(): void {
+		if (this.settings.manualSyncRequired) {
+			return;
+		}
 		logger.info("[FileWatcher] Attempting to start FileWatcher");
 
 		if (this.isEnabled) {

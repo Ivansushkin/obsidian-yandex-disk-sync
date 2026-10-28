@@ -1,5 +1,8 @@
+import { formatOperationFailure } from "../sync/errors";
+import type { RetryProgress } from "../errors";
+import type { ForceFlowState } from "../sync/workflows/force-controller";
 import type { SyncState, SyncStatus } from "../types";
-import { t } from "../i18n";
+import { getActiveLanguage, t } from "../i18n";
 
 /**
  * Get status icon
@@ -71,7 +74,7 @@ export function getSyncStatusText(state: SyncState): string {
  */
 function formatTime(timestamp: number): string {
 	const date = new Date(timestamp);
-	return date.toLocaleTimeString("en-US", {
+	return date.toLocaleTimeString(getActiveLanguage(), {
 		hour: "2-digit",
 		minute: "2-digit",
 	});
@@ -91,5 +94,121 @@ export function formatSyncActivity(state: SyncState): string {
 export function formatSyncRetry(state: SyncState): string {
 	return state.retry
 		? ` · ${t("failure.retry", { attempt: state.retry.attempt, maxAttempts: state.retry.maxAttempts })}`
+		: "";
+}
+
+export interface SyncIndicatorContext {
+	sync: SyncState;
+	force: ForceFlowState | null;
+	foreground: "encryption" | "backup" | null;
+	fullSyncInProgress: boolean;
+	connection?: { errorMessage?: string; retry?: RetryProgress };
+	syncUnavailable: boolean;
+	manualSyncRequired?: boolean;
+}
+
+export interface SyncPresentation {
+	state: SyncState;
+	text: string;
+	detail: string;
+	progress: string;
+	busy: boolean;
+	icon: string;
+}
+
+/** Resolve one display priority for the indicator and settings status Notice. */
+export function getSyncPresentation(
+	context: SyncIndicatorContext,
+): SyncPresentation {
+	const {
+		sync,
+		force,
+		foreground,
+		fullSyncInProgress,
+		connection,
+		manualSyncRequired,
+	} = context;
+	let state = sync;
+	let text: string;
+	let detail = "";
+	let progress = "";
+
+	if (force?.active) {
+		state = { ...sync, status: "syncing" };
+		text = t(`notice.force_phase_${force.phase}`);
+		if (force.activity?.status === "syncing") {
+			text += `: ${force.activity.currentOperation ?? t("status.syncing")}`;
+			progress =
+				progressText(force.activity) + formatSyncRetry(force.activity);
+			detail = force.activity.failure
+				? formatOperationFailure(force.activity.failure)
+				: (force.activity.errorMessage ?? "");
+		}
+	} else if (sync.status === "syncing") {
+		text = sync.currentOperation ?? t("status.syncing");
+		progress = progressText(sync) + formatSyncRetry(sync);
+		detail = sync.failure
+			? formatOperationFailure(sync.failure)
+			: (sync.errorMessage ?? "");
+	} else if (foreground) {
+		state = { ...sync, status: "syncing" };
+		text = t(`status.mobile.${foreground}`);
+	} else if (connection) {
+		state = { ...sync, status: "syncing", retry: connection.retry };
+		text = t("status.checking_connection");
+		detail = connection.errorMessage ?? "";
+		progress = formatSyncRetry(state);
+	} else if (
+		fullSyncInProgress &&
+		(sync.status === "idle" || sync.status === "initializing")
+	) {
+		state = { ...sync, status: "syncing" };
+		text = t("status.syncing");
+	} else if (
+		manualSyncRequired &&
+		(sync.status === "idle" || sync.status === "initializing")
+	) {
+		state = { ...sync, status: "idle" };
+		text = t("status.manual_sync_required");
+	} else if (sync.status === "idle") {
+		text = t("status.mobile.ready");
+		if (sync.lastSyncTime) {
+			const time = new Date(sync.lastSyncTime).toLocaleTimeString(
+				getActiveLanguage(),
+				{
+					hour: "2-digit",
+					minute: "2-digit",
+					hour12: false,
+				},
+			);
+			text = `${t("status.mobile.last_sync")} ${time}`;
+		}
+	} else {
+		text =
+			sync.status === "paused" || sync.status === "error"
+				? t(`status.mobile.${sync.status}`)
+				: getSyncStatusText(sync);
+		detail = sync.failure
+			? formatOperationFailure(sync.failure)
+			: (sync.errorMessage ?? "");
+	}
+	const busy = state.status === "syncing" || state.status === "initializing";
+	let icon = busy ? "cloud" : getSyncStatusIcon(state.status);
+	if (busy && force?.active) {
+		icon = "replace";
+	}
+	if (busy && foreground) {
+		icon = foreground === "encryption" ? "lock-keyhole" : "archive";
+	}
+	if (busy && detail) {
+		icon = "triangle-alert";
+	}
+	return { state, text, detail, progress, busy, icon };
+}
+
+/** Format known progress without inventing totals for preparation phases. */
+function progressText(state: SyncState): string {
+	return state.progress && state.progress.total > 0
+		? `${state.progress.completed}/${state.progress.total}`
 		: "";
 }

@@ -3,7 +3,7 @@
  */
 
 import { App, Modal, Setting } from "obsidian";
-import { t } from "../i18n";
+import { getActiveLanguage, t } from "../i18n";
 
 export class SyncStatusModal extends Modal {
 	private lastSyncTime: number | undefined;
@@ -44,7 +44,7 @@ export class SyncStatusModal extends Modal {
 			const date = new Date(this.lastSyncTime);
 			statsEl.createEl("p", {
 				text: t("modal.status_last_sync", {
-					time: date.toLocaleString(),
+					time: date.toLocaleString(getActiveLanguage()),
 				}),
 			});
 		} else {

@@ -40,6 +40,7 @@ interface PersistencePorts {
 	save(data: PluginData): Promise<void>;
 	snapshot(): PluginData;
 	publish(patch: UserSettingsPatch): void;
+	connectionActivated(): void;
 	isUnloaded(): boolean;
 	failed(failure: FailureSummary): void;
 }
@@ -130,9 +131,16 @@ export class PluginPersistence {
 		await this.enqueue(patch, false);
 	}
 
+	/** Activate this connection only after the successful full snapshot is durable. */
+	async completeManualSync(assertCurrent: () => void): Promise<void> {
+		this.requireLoaded();
+		await this.enqueue(undefined, false, assertCurrent);
+	}
+
 	private async enqueue(
 		patch: UserSettingsPatch | undefined,
 		unloading: boolean,
+		activateConnection?: () => void,
 	): Promise<void> {
 		const generation = this.generation;
 		const persistence = this.tail.then(async () => {
@@ -144,6 +152,7 @@ export class PluginPersistence {
 			if (patch && this.ports.isUnloaded()) {
 				throw new Error("Plugin was unloaded before settings save");
 			}
+			activateConnection?.();
 			const current = this.ports.snapshot();
 			if (patch) {
 				current.settings = prepareSettingsPatch(
@@ -151,29 +160,39 @@ export class PluginPersistence {
 					patch,
 				).settings;
 			}
+			if (activateConnection) {
+				current.settings = {
+					...current.settings,
+					manualSyncRequired: false,
+				};
+			}
 			// Storage owns immutable bytes even if live encryption advances during the await.
 			const snapshot = JSON.parse(JSON.stringify(current)) as PluginData;
-			try {
-				await this.ports.save(snapshot);
-			} catch (error) {
-				if (generation === this.generation) {
-					this.saveFailed = true;
-					this.failureGeneration++;
-					this.saveFailure = new OperationFailure(
-						error,
-						{
-							stage: "persisting",
-							action: "local",
-							outcome: "unknown",
+			await this.saveSnapshot(snapshot, generation);
+			if (activateConnection) {
+				try {
+					this.assertGeneration(generation);
+					activateConnection();
+				} catch (error) {
+					const pending = {
+						...snapshot,
+						settings: {
+							...snapshot.settings,
+							manualSyncRequired: true,
 						},
-						{ category: "local", code: "local-persistence" },
-					).summary;
-					this.ports.failed(this.saveFailure);
+					};
+					await this.saveSnapshot(pending, generation);
+					if (generation === this.generation) {
+						this.data = pending;
+					}
+					throw error;
 				}
-				throw error;
 			}
 			this.assertGeneration(generation);
 			this.data = snapshot;
+			if (activateConnection && !this.ports.isUnloaded()) {
+				this.ports.connectionActivated();
+			}
 			if (patch) {
 				if (this.ports.isUnloaded()) {
 					throw new Error("Plugin was unloaded during settings save");
@@ -187,6 +206,32 @@ export class PluginPersistence {
 			() => undefined,
 		);
 		await persistence;
+	}
+
+	/** Classify storage failures identically for ordinary and revoked activation snapshots. */
+	private async saveSnapshot(
+		snapshot: PluginData,
+		generation: number,
+	): Promise<void> {
+		try {
+			await this.ports.save(snapshot);
+		} catch (error) {
+			if (generation === this.generation) {
+				this.saveFailed = true;
+				this.failureGeneration++;
+				this.saveFailure = new OperationFailure(
+					error,
+					{
+						stage: "persisting",
+						action: "local",
+						outcome: "unknown",
+					},
+					{ category: "local", code: "local-persistence" },
+				).summary;
+				this.ports.failed(this.saveFailure);
+			}
+			throw error;
+		}
 	}
 
 	/** A failed read must never turn defaults or stale memory into persisted data. */

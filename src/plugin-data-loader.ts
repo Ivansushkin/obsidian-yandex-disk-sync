@@ -183,6 +183,14 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 			"Current settings are missing",
 		);
 	}
+	if (
+		settings.manualSyncRequired !== undefined &&
+		typeof settings.manualSyncRequired !== "boolean"
+	) {
+		throw new UnsupportedHistoricalDataError(
+			"Invalid manual sync admission state",
+		);
+	}
 	const encryptedSettingsInvalid =
 		settings.enableEncryption === true &&
 		(settings.encryptionProfileId !== "hardened" ||

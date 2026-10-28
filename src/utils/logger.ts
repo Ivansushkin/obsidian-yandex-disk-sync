@@ -243,7 +243,7 @@ export class Logger {
 	/**
 	 * Resolve the final log file path inside the vault's config directory.
 	 */
-	private getResolvedLogPath(): string {
+	getLogFilePath(): string {
 		if (!this.app) {
 			return this.logFilePath;
 		}
@@ -398,7 +398,7 @@ export class Logger {
 			return;
 		}
 		const adapter = this.app.vault.adapter;
-		const logPath = this.getResolvedLogPath();
+		const logPath = this.getLogFilePath();
 
 		const content = entries.join("\n") + "\n";
 		try {
@@ -478,7 +478,7 @@ export class Logger {
 			return "";
 		}
 		const adapter = this.app.vault.adapter;
-		const logPath = this.getResolvedLogPath();
+		const logPath = this.getLogFilePath();
 		if (await adapter.exists(logPath)) {
 			return sanitizeString(await adapter.read(logPath));
 		}
@@ -501,7 +501,7 @@ export class Logger {
 				return;
 			}
 			const adapter = this.app.vault.adapter;
-			const logPath = this.getResolvedLogPath();
+			const logPath = this.getLogFilePath();
 			if (await adapter.exists(logPath)) {
 				await adapter.write(logPath, "");
 			}

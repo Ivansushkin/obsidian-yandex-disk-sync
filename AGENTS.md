@@ -159,8 +159,9 @@
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, README, README_RU, architecture docs,
   translations, and migration messages.
-- Release metadata retains stable 1.1.0 compatibility and one current 2.0.0
-  entry. Do not add historical development entries or remove the stable fallback.
+- Release metadata retains stable 1.1.0 compatibility and published 2.0.0
+  history, plus the current 2.1.0 entry. Do not add development entries or
+  remove historical stable releases.
 
 ## Documentation and testing
 

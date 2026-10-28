@@ -37,7 +37,7 @@ export class SyncScheduler {
 	 * Start scheduler
 	 */
 	start(): void {
-		if (this.isRunning) {
+		if (this.isRunning || this.settings.manualSyncRequired) {
 			return;
 		}
 
@@ -85,6 +85,9 @@ export class SyncScheduler {
 	 * Run scheduled synchronization
 	 */
 	private async runScheduledSync(): Promise<void> {
+		if (this.settings.manualSyncRequired) {
+			return;
+		}
 		if (this.syncEngine.isSyncInProgress()) {
 			logger.debug(
 				"Skipping scheduled synchronization: already in progress",
@@ -100,7 +103,9 @@ export class SyncScheduler {
 		logger.info("Starting scheduled synchronization...");
 
 		try {
-			const result = await this.syncEngine.fullSync();
+			const result = await this.syncEngine.fullSync({
+				trigger: "automatic",
+			});
 
 			if (result.success) {
 				logger.info("Scheduled synchronization completed successfully");

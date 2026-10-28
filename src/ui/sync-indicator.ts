@@ -1,4 +1,9 @@
-import { formatSyncRetry } from "./sync-status-presentation";
+import { copyLogTail, openLogFile } from "./log-actions";
+import {
+	getSyncPresentation,
+	getSyncStatusText,
+	type SyncIndicatorContext,
+} from "./sync-status-presentation";
 import {
 	App,
 	Component,
@@ -8,22 +13,6 @@ import {
 	setTooltip,
 } from "obsidian";
 import { t } from "../i18n";
-import type { SyncState } from "../types";
-import type { RetryProgress } from "../errors";
-import type { ForceFlowState } from "../sync/workflows/force-controller";
-import {
-	getSyncStatusIcon,
-	getSyncStatusText,
-} from "./sync-status-presentation";
-
-interface SyncIndicatorContext {
-	sync: SyncState;
-	force: ForceFlowState | null;
-	foreground: "encryption" | "backup" | null;
-	fullSyncInProgress: boolean;
-	connection?: { errorMessage?: string; retry?: RetryProgress };
-	syncUnavailable: boolean;
-}
 
 interface SyncIndicatorActions {
 	synchronize: () => Promise<void>;
@@ -37,8 +26,10 @@ export class SyncIndicator extends Component {
 	private loaderEl!: HTMLElement;
 	private syncButton!: HTMLButtonElement;
 	private copyButton!: HTMLButtonElement;
+	private openLogsButton!: HTMLButtonElement;
 	private syncRequested = false;
 	private copyingLogs = false;
+	private openingLogs = false;
 	private accessibleStatus = "";
 	private iconEl!: HTMLElement;
 	private textEl!: HTMLElement;
@@ -110,6 +101,20 @@ export class SyncIndicator extends Component {
 		});
 		this.registerDomEvent(this.copyButton, "click", () => {
 			void this.copyLogs();
+		});
+		this.openLogsButton = actions.createEl("button", {
+			cls: "clickable-icon yandex-sync-indicator-action",
+			attr: {
+				type: "button",
+				"aria-label": t("settings.open_logs_button"),
+			},
+		});
+		setIcon(this.openLogsButton, "external-link");
+		setTooltip(this.openLogsButton, t("settings.open_logs_button"), {
+			placement: "top",
+		});
+		this.registerDomEvent(this.openLogsButton, "click", () => {
+			void this.openLogs();
 		});
 		const content = this.element.createDiv({
 			cls: "yandex-sync-indicator-content",
@@ -199,14 +204,16 @@ export class SyncIndicator extends Component {
 			return;
 		}
 		this.ensureMounted();
-		const {
-			sync,
-			force,
-			foreground,
-			fullSyncInProgress,
-			syncUnavailable,
-			connection,
-		} = this.readContext();
+		for (const [button, key] of [
+			[this.syncButton, "command.sync_now"],
+			[this.copyButton, "status.actions.copy_logs"],
+			[this.openLogsButton, "settings.open_logs_button"],
+		] as const) {
+			button.setAttribute("aria-label", t(key));
+			setTooltip(button, t(key), { placement: "top" });
+		}
+		const context = this.readContext();
+		const { fullSyncInProgress, syncUnavailable, connection } = context;
 		this.syncButton.disabled = syncUnavailable || this.syncRequested;
 		this.syncButton.setAttribute(
 			"aria-busy",
@@ -214,73 +221,10 @@ export class SyncIndicator extends Component {
 				fullSyncInProgress || Boolean(connection) || this.syncRequested,
 			),
 		);
-		let state = sync;
-		let text: string;
-		let detail = "";
-		let progress = "";
-
-		if (force?.active) {
-			state = { ...sync, status: "syncing" };
-			text = t(`notice.force_phase_${force.phase}`);
-			if (force.activity?.status === "syncing") {
-				text += `: ${force.activity.currentOperation ?? t("status.syncing")}`;
-				progress =
-					this.progressText(force.activity) +
-					formatSyncRetry(force.activity);
-				detail = force.activity.errorMessage ?? "";
-			}
-		} else if (sync.status === "syncing") {
-			text = sync.currentOperation ?? t("status.syncing");
-			progress = this.progressText(sync) + formatSyncRetry(sync);
-			detail = sync.errorMessage ?? "";
-		} else if (foreground) {
-			state = { ...sync, status: "syncing" };
-			text = t(`status.mobile.${foreground}`);
-		} else if (connection) {
-			state = { ...sync, status: "syncing", retry: connection.retry };
-			text = t("status.checking_connection");
-			detail = connection.errorMessage ?? "";
-			progress = formatSyncRetry(state);
-		} else if (
-			fullSyncInProgress &&
-			(sync.status === "idle" || sync.status === "initializing")
-		) {
-			state = { ...sync, status: "syncing" };
-			text = t("status.syncing");
-		} else if (sync.status === "idle") {
-			text = t("status.mobile.ready");
-			if (sync.lastSyncTime) {
-				const time = new Date(sync.lastSyncTime).toLocaleTimeString(
-					[],
-					{
-						hour: "2-digit",
-						minute: "2-digit",
-						hour12: false,
-					},
-				);
-				text = `${t("status.mobile.last_sync")} ${time}`;
-			}
-		} else {
-			text =
-				sync.status === "paused" || sync.status === "error"
-					? t(`status.mobile.${sync.status}`)
-					: getSyncStatusText(sync);
-			detail = sync.errorMessage ?? "";
-		}
+		const { state, text, detail, progress, busy, icon } =
+			getSyncPresentation(context);
 		this.element.className = `yandex-sync-indicator sync-${state.status}${detail && state.status === "syncing" ? " has-error" : ""}`;
-		const busy =
-			state.status === "syncing" || state.status === "initializing";
 		this.loaderEl.hidden = !busy;
-		let icon = busy ? "cloud" : getSyncStatusIcon(state.status);
-		if (busy && force?.active) {
-			icon = "replace";
-		}
-		if (busy && foreground) {
-			icon = foreground === "encryption" ? "lock-keyhole" : "archive";
-		}
-		if (busy && detail) {
-			icon = "triangle-alert";
-		}
 		if (this.iconEl.dataset.icon !== icon) {
 			setIcon(this.iconEl, icon);
 			this.iconEl.dataset.icon = icon;
@@ -323,64 +267,63 @@ export class SyncIndicator extends Component {
 		}
 	}
 
-	/** Preserve WebKit tap activation, falling back to Obsidian's text clipboard bridge. */
+	/** Copy the shared diagnostic tail while this indicator is still mounted. */
 	private async copyLogs(): Promise<void> {
-		if (this.copyingLogs) {
+		if (this.copyingLogs || this.disposed) {
 			return;
 		}
 		this.copyingLogs = true;
 		this.copyButton.disabled = true;
-		this.copyButton.setAttribute("aria-busy", "true");
-		let empty = false;
-		const content = this.actions.readLogs().then((logs) => {
-			empty = !logs.trim();
-			if (empty) {
-				throw new Error("No log entries");
-			}
-			return logs.slice(-4000);
-		});
 		try {
-			const clipboard = this.win.navigator.clipboard;
-			if (typeof ClipboardItem !== "undefined" && clipboard?.write) {
-				const data = content.then(
-					(text) => new Blob([text], { type: "text/plain" }),
-				);
-				// A host may reject write before consuming the deferred data.
-				void data.catch(() => undefined);
-				try {
-					await clipboard.write([
-						new ClipboardItem({
-							"text/plain": data,
-						}),
-					]);
-				} catch {
-					await clipboard.writeText(await content);
-				}
-			} else {
-				await clipboard.writeText(await content);
-			}
-			new Notice(t("status.actions.logs_copied"));
-		} catch {
-			await content.catch(() => undefined);
-			new Notice(
-				t(
-					empty
-						? "status.actions.logs_empty"
-						: "status.actions.copy_failed",
-				),
+			const count = await copyLogTail(
+				this.win,
+				this.actions.readLogs,
+				() => !this.disposed,
 			);
+			if (count !== null && !this.disposed) {
+				new Notice(
+					t(
+						count === 0
+							? "status.actions.logs_empty"
+							: "status.actions.logs_copied",
+					),
+				);
+			}
+		} catch {
+			if (!this.disposed) {
+				new Notice(t("status.actions.copy_failed"));
+			}
 		} finally {
 			this.copyingLogs = false;
-			this.copyButton.disabled = false;
-			this.copyButton.setAttribute("aria-busy", "false");
+			if (!this.disposed) {
+				this.copyButton.disabled = false;
+			}
+		}
+	}
+
+	/** Keep the local diagnostic action available independently of synchronization. */
+	private async openLogs(): Promise<void> {
+		if (this.openingLogs || this.disposed) {
+			return;
+		}
+		this.openingLogs = true;
+		this.openLogsButton.disabled = true;
+		try {
+			await openLogFile(this.app, () => !this.disposed);
+		} finally {
+			this.openingLogs = false;
+			if (!this.disposed) {
+				this.openLogsButton.disabled = false;
+			}
 		}
 	}
 
 	/** Keep the compact control understandable without putting details in its label. */
 	private updateDisclosureLabel(): void {
-		this.summaryEl.setAttribute(
-			"aria-label",
+		setTooltip(
+			this.summaryEl,
 			`Yandex Disk Sync: ${this.accessibleStatus} · ${t(this.element?.open ? "status.mobile.collapse" : "status.mobile.expand")}`,
+			{ placement: "top" },
 		);
 	}
 
@@ -390,12 +333,6 @@ export class SyncIndicator extends Component {
 		if (this.element && this.element.parentElement !== host) {
 			host.appendChild(this.element);
 		}
-	}
-
-	private progressText(state: SyncState): string {
-		return state.progress && state.progress.total > 0
-			? `${state.progress.completed}/${state.progress.total}`
-			: "";
 	}
 
 	private schedulePosition(): void {

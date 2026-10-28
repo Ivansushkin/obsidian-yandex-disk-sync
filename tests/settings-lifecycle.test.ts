@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { getActiveLanguage, setLanguagePreference } from "../src/i18n";
+import type { UserSettingsPatch } from "../src/settings-workflow";
 import type { Notice } from "obsidian";
+import type { PluginData } from "../src/plugin-persistence";
 import test, { type TestContext } from "node:test";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
@@ -68,7 +71,7 @@ async function settingsHost(
 	return { plugin, persistence, a, disk, scheduler, update, flow };
 }
 
-test("connection settings request the encrypted vault password and finish initial sync", async (t) => {
+test("connection settings wait across restart for manual plaintext or encrypted full sync", async (t) => {
 	for (const outcome of [
 		"plaintext",
 		"connect",
@@ -76,6 +79,7 @@ test("connection settings request the encrypted vault password and finish initia
 		"cancel",
 		"wrong",
 		"save-failure",
+		"paused",
 	] as const) {
 		const disk = new MemoryDisk();
 		const source = device(disk, "source", null);
@@ -118,6 +122,9 @@ test("connection settings request the encrypted vault password and finish initia
 					? "wrong"
 					: "password";
 		};
+		if (outcome === "paused") {
+			a.engine.pause();
+		}
 		if (outcome === "save-failure") {
 			plugin.saveData = async () => {
 				throw new Error("synthetic save failure");
@@ -135,16 +142,67 @@ test("connection settings request the encrypted vault password and finish initia
 		} else {
 			await update({ yandexTokenSecret: "new-token" });
 		}
-		assert.equal(
-			prompts,
-			outcome === "plaintext" || outcome === "save-failure" ? 0 : 1,
-			outcome,
-		);
+		assert.equal(prompts, 0, outcome);
 		assert.equal(plugin.isConfigurationBusy(), false);
+		assert.equal(scheduler["isRunning"], false, outcome);
+		assert.equal(a.watcher["isEnabled"], false, outcome);
+		assert.deepEqual(disk.files, remote);
+		assert.deepEqual(a.index.captureLocalCausalState(), local);
+		if (outcome === "save-failure") {
+			continue;
+		}
+		assert.equal(plugin.settings.manualSyncRequired, true);
+		await update({ excludePatterns: ["ignored/**"] });
+		assert.equal(prompts, 0);
+		const saved = structuredClone(plugin["persistence"].current);
+		plugin.loadData = async () => saved;
+		await plugin.loadSettings();
+		assert.equal(plugin.settings.manualSyncRequired, true);
+		let automaticReads = 0;
+		disk.beforeRequest = async () => {
+			automaticReads++;
+			throw new Error("Remote access before manual synchronization");
+		};
+		await plugin["onLayoutReady"]();
+		await plugin["startSync"](true);
+		assert.equal(
+			await plugin.runFullSync({ trigger: "automatic" }, false),
+			null,
+		);
+		plugin["startAutomationIfReady"](true);
+		assert.equal(scheduler["isRunning"], false);
+		assert.equal(a.watcher["isEnabled"], false);
+		assert.equal(prompts, 0);
+		assert.equal(automaticReads, 0);
+		assert.deepEqual(disk.files, remote);
+		disk.beforeRequest = undefined;
+		const oldWindow = globalThis.window;
+		Object.assign(globalThis, { window: globalThis });
+		try {
+			if (outcome === "paused") {
+				assert.equal(a.engine.isSyncPaused(), true);
+				assert.equal(await plugin["resumeSyncIfReady"](), true);
+			}
+			const result = await plugin.runFullSync(undefined, false);
+			assert.equal(
+				result?.success === true,
+				outcome !== "cancel" && outcome !== "wrong",
+			);
+		} finally {
+			plugin["disposeSyncNotice"]();
+			Object.assign(globalThis, { window: oldWindow });
+		}
+		assert.equal(prompts, outcome === "plaintext" ? 0 : 1);
 		const connected =
 			outcome === "connect" ||
 			outcome === "path" ||
-			outcome === "plaintext";
+			outcome === "plaintext" ||
+			outcome === "paused";
+		assert.equal(plugin.settings.manualSyncRequired, !connected);
+		assert.equal(
+			plugin["persistence"].current?.settings.manualSyncRequired,
+			!connected,
+		);
 		assert.equal(scheduler["isRunning"], connected, outcome);
 		assert.equal(a.watcher["isEnabled"], connected, outcome);
 		if (connected) {
@@ -157,22 +215,27 @@ test("connection settings request the encrypted vault password and finish initia
 				"remote.md": "remote content",
 				"offline.md": "offline addition",
 			});
-			const restarted = device(
-				disk,
-				"settings-device",
-				null,
-				a.vault,
-				await a.saved(),
-			);
-			afterTest(t, () => restarted.stop());
-			Object.assign(restarted.settings, plugin.settings);
-			await encryptionFlow(restarted).workflow.initEncryption();
-			restarted.vault.put("offline.md", bytes("offline after restart"));
-			await restarted.full();
-			await restarted.assertSettled({
-				"remote.md": "remote content",
-				"offline.md": "offline after restart",
-			});
+			if (outcome === "plaintext" || outcome === "connect") {
+				const restarted = device(
+					disk,
+					"settings-device",
+					null,
+					a.vault,
+					await a.saved(),
+				);
+				afterTest(t, () => restarted.stop());
+				Object.assign(restarted.settings, plugin.settings);
+				await encryptionFlow(restarted).workflow.initEncryption();
+				restarted.vault.put(
+					"offline.md",
+					bytes("offline after restart"),
+				);
+				await restarted.full();
+				await restarted.assertSettled({
+					"remote.md": "remote content",
+					"offline.md": "offline after restart",
+				});
+			}
 		} else {
 			assert.equal(flow.context.getService(), null);
 			assert.equal(Boolean(plugin.settings.encryptionPassword), false);
@@ -182,7 +245,7 @@ test("connection settings request the encrypted vault password and finish initia
 				a.vault.getAbstractFileByPath("remote.md") !== null,
 				false,
 			);
-			if (outcome !== "save-failure") {
+			if (outcome === "cancel" || outcome === "wrong") {
 				await update({ maxConcurrency: 7 });
 				await update({ excludePatterns: ["ignored/**"] });
 				await update({ yandexTokenSecret: "new-token" });
@@ -266,6 +329,41 @@ test("runtime settings preserve admitted storage and durable state without remot
 		assert.equal(a.watcher["isEnabled"], false);
 		assert.equal(scheduler["isRunning"], false);
 	}
+});
+
+test("language preference is durable without activating a pending connection or publishing a failed save", async (t) => {
+	const { plugin, persistence, a, disk, update } = await settingsHost(t);
+	plugin.settings.manualSyncRequired = true;
+	const remote = structuredClone(disk.files);
+	const local = a.index.captureLocalCausalState();
+	disk.beforeRequest = async () => {
+		throw new Error("Language change must not access Disk");
+	};
+	afterTest(t, () => {
+		setLanguagePreference("system");
+	});
+	await assert.rejects(
+		update({ language: "unsupported" } as unknown as UserSettingsPatch),
+		/Invalid language/,
+	);
+	await update({ language: "kk" });
+	assert.equal(getActiveLanguage(), "kk");
+	assert.equal(plugin.settings.language, "kk");
+	assert.equal(plugin.settings.manualSyncRequired, true);
+	assert.deepEqual(disk.files, remote);
+	assert.deepEqual(a.index.captureLocalCausalState(), local);
+	const restored = persistenceHarness(persistence.current);
+	await restored.plugin.loadSettings();
+	assert.equal(restored.plugin.settings.language, "kk");
+	assert.equal(restored.plugin.settings.manualSyncRequired, true);
+	const previous = plugin.settings;
+	plugin.saveData = async () => {
+		throw new Error("synthetic language save failure");
+	};
+	await assert.rejects(update({ language: "be" }), /language save failure/);
+	assert.equal(plugin.settings, previous);
+	assert.equal(getActiveLanguage(), "kk");
+	assert.equal(persistence.current!.settings.language, "kk");
 });
 
 test("realtime settings retain queued events across disable and restart without stopping the scheduler", async (t) => {
@@ -414,16 +512,15 @@ test("settings drain errors preserve the rejected draft and allow a normal full 
 		entered.resolve();
 		await release.promise;
 	};
-	const reconnecting = update({ yandexTokenSecret: "synthetic-replacement" });
+	await update({ yandexTokenSecret: "synthetic-replacement" });
+	assert.equal(plugin.getConnectionActivity(), undefined);
+	const reconnecting = plugin.runFullSync(undefined, false);
 	await entered.promise;
 	try {
 		assert.ok(plugin.getConnectionActivity());
 		assert.equal(plugin.getConnectionActivity()?.errorMessage, undefined);
-		assert.equal(plugin.isFullSyncInProgress(), false);
-		assert.equal(
-			plugin["authenticationBlockReason"],
-			"synthetic missing token",
-		);
+		assert.equal(plugin.isFullSyncInProgress(), true);
+		assert.equal(plugin["authenticationBlockReason"], null);
 		assert.equal(oldNotice.messageEl.isConnected, false);
 		assert.equal(a.watcher["isEnabled"], false);
 		await assert.rejects(
@@ -500,4 +597,72 @@ test("a settings save queued before an internal failure still completes persiste
 	await update({ maxConcurrency: plugin.settings.maxConcurrency });
 	assert.equal(attempts, saved);
 	await a.assertSettled({ "note.md": "unchanged" });
+});
+
+test("manual connection activation remains pending after failed save or pause", async (t) => {
+	for (const failure of ["save", "pause"] as const) {
+		const { plugin, a, persistence, scheduler, update } =
+			await settingsHost(t);
+		await update({ yandexTokenSecret: "replacement" });
+		const save = plugin.saveData.bind(plugin);
+		plugin.saveData = async (data: PluginData) => {
+			if (!data.settings.manualSyncRequired) {
+				if (failure === "save") {
+					throw new Error("synthetic activation save failure");
+				}
+				a.engine.pause();
+			}
+			await save(data);
+		};
+		assert.equal(await plugin.runFullSync(undefined, false), null);
+		assert.equal(plugin.settings.manualSyncRequired, true);
+		assert.equal(persistence.current?.settings.manualSyncRequired, true);
+		assert.equal(persistence.failed, failure === "save");
+		assert.equal(a.watcher["isEnabled"], false);
+		assert.equal(scheduler["isRunning"], false);
+		const saved = structuredClone(persistence.current);
+		assert.equal(saved?.settings.manualSyncRequired, true);
+		plugin.saveData = save;
+		await update({ yandexTokenSecret: "replacement" });
+		assert.equal(plugin.settings.manualSyncRequired, true);
+		assert.equal(scheduler["isRunning"], false);
+		a.engine.resume();
+		assert.equal(
+			(await plugin.runFullSync(undefined, false))?.success,
+			true,
+		);
+		assert.equal(plugin.settings.manualSyncRequired, false);
+		assert.equal(persistence.current?.settings.manualSyncRequired, false);
+		await a.assertSettled({ "note.md": "unchanged" });
+	}
+});
+
+test("connection changes revoke queued manual epoch retries across token ABA", async (t) => {
+	const { plugin, disk, scheduler, update } = await settingsHost(t);
+	const oldWindow = globalThis.window;
+	let retry = () => {};
+	Object.assign(globalThis, {
+		window: {
+			setTimeout: (callback: () => void) => {
+				retry = callback;
+				return 1;
+			},
+			clearTimeout: () => {},
+		},
+	});
+	afterTest(t, () => {
+		Object.assign(globalThis, { window: oldWindow });
+	});
+	plugin["queueEpochRecoveryFull"]({ trigger: "manual" });
+	await update({ yandexTokenSecret: "replacement" });
+	await update({ yandexTokenSecret: "synthetic" });
+	let reads = 0;
+	disk.beforeRequest = async () => {
+		reads++;
+	};
+	retry();
+	await plugin["activeFullPromise"];
+	assert.equal(reads, 0);
+	assert.equal(plugin.settings.manualSyncRequired, true);
+	assert.equal(scheduler["isRunning"], false);
 });

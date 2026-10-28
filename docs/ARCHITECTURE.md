@@ -248,6 +248,26 @@ Force и authoritative encryption replacement не дают server fencing: уж
 
 ## Startup, settings и остановка
 
+Локальная настройка `language` принимает `system`, `en`, `ru`, `kk`, `be`, `uz`.
+`system` сохраняет существующий источник Obsidian `localStorage["language"]`;
+неизвестный системный язык даёт English. Отсутствующее/неизвестное сохранённое
+предпочтение нормализуется в `system` до coherent save, без изменения format.
+Ручной выбор применяется через `UserSettingsPatch` только после успешного save;
+он не меняет admission, `manualSyncRequired`, causal state или очереди и не
+запускает remote work. Селектор подчиняется общему busy-guard.
+
+i18n владеет активным языком; `main.ts` только обновляет зарегистрированные commands,
+ribbon, indicator и существующий settings Notice. Перерисовка настроек сохраняет
+generation guards для подсказок логов и не добавляет подписок зеркала. Copy/open/clear
+сохраняют иконки, подписи и отсутствие loader; удалённый viewer не восстанавливается.
+Последний backup хранится в settings UI как наблюдённая дата: смена языка
+переформатирует её без нового remote listing. Известные failure codes переводятся
+при presentation; исходная причина остаётся в локализованном блоке технических
+подробностей. Это сохраняет исходные sanitized
+summary/cause, classification и recovery policy. Даты и размеры используют активный
+язык. Ключи, placeholders и конечные динамические семейства проверяет `check:i18n`;
+это проверка ресурсов, а не доказательство работы Obsidian.
+
 Local state загружается и lifecycle callbacks регистрируются до token/remote checks.
 Load/format/initial-save failure закрывает persistence и automation; unload не
 перезаписывает исходные данные defaults и не повторяет failed save. Stable plaintext
@@ -287,20 +307,45 @@ Force/encryption foreground reservation охватывает промежутк�
 realtime, configuration update, Force, backup и encryption отключают действия и поля.
 Собственные ограничения компонентов сохраняются после busy. Loader и `aria-busy`
 принадлежат выполняемому действию, включая повторное открытие экрана; обновления
-прогресса не пересоздают поля. Весь раздел логов доступен во время работы, кроме
-собственных migration/lifecycle ограничений. Logging patches идут через общую
+прогресса не пересоздают поля.
+Кнопка Sync сохраняет постоянную подпись для раскладки и доступного имени; во время
+проверки подключения и full подпись скрыта, по центру виден только loader.
+Статусы отображаются в плашке и Notice, размеры кнопки не зависят от этапа.
+Весь раздел логов доступен во время работы, кроме собственных migration/lifecycle
+ограничений. Logging patches идут через общую
 persistence queue без remote recheck и не инвалидируют backup context.
-Settings-triggered full показывает «Проверка подключения» и loader уже во время
-save/admission до engine session. UI временно заменяет прежнюю ошибку, но не снимает
-admission block. После сохранения token устаревший authentication Notice скрывается;
-новая причина, password prompt и pause остаются видимыми. Reopen читает live activity,
-а `finally` снимает её. Runtime-only save не изображает подключение.
-После save изменённого token/path интерактивный admission автоматически запрашивает
-пароль stable encrypted vault при готовом layout и отсутствии pause, затем продолжает
-full. Разрешение prompt не разрешает recovery: canonical maintenance или переходный
-manifest блокируют candidate до сохранения credentials. Lifetime/configuration
-capture до prompt действует через maintenance queue и derivation. Cancel/wrong
-password завершают текущую попытку без automation; reopen не создаёт новый prompt.
+Сохранение token/path не создаёт startup invocation и не запускает admission,
+password prompt или full. Оно атомарно устанавливает локальный settings-флаг
+`manualSyncRequired` вместе с новым подключением. Fresh install устанавливает его;
+существующие данные без поля используют false. Маркер `plugin-data` не меняется.
+Пока флаг установлен, startup, watcher, scheduler, queued automatic full и passive
+backup listing не начинают удалённую работу, в том числе после restart. Другие
+settings patches не обходят ожидание. Успешный manual full сохраняет snapshot со
+снятым флагом через общую persistence queue и лишь затем публикует activation.
+Pause/unload во время финального save отзывает activation: до settlement очередь
+сохраняет coherent pending snapshot, не публикуя снятие ожидания. Epoch retry
+привязан к поколению подключения и отменяется при token/path change, включая ABA.
+Failed save/cancel/error не запускают automation; Force/encryption maintenance
+не снимают ожидание. `trigger` full invocation явно различает manual/automatic/
+maintenance независимо от Notice policy. Admitted filter changes и persistence
+repair используют обычный full после освобождения settings lock, без отдельного
+admission и busy bypass.
+
+`getSyncPresentation` вычисляет один приоритет и текст для плашки и settings Notice:
+Force → engine activity → foreground → connection → full → terminal/idle.
+Settings tab подписывается на live sources при display, обновляет один Notice и
+снимает его при idle/hide/unload. Re-render не пересоздаёт подписку зеркала.
+Старые operation status Notices подавлены внутри настроек; самостоятельные action
+errors и clipboard feedback остаются отдельными. За пределами настроек сохранена
+прежняя Notice policy. Общие password admission, invocation-owned read session и
+recovery guards используются обычным manual full без settings-only preflight.
+
+Общие `copyLogTail` и `openLogFile` обслуживают настройки и плашку. Копирование
+сохраняет clipboard activation/fallback, ограничивает очищенный хвост 4000 символами
+и игнорирует поздние чтения после закрытия UI. Счётчик подсказки читается только при
+наведении/фокусе, обновляется после copy/clear и не подписывается на flush логгера.
+Внешнее открытие использует optional `app.openWithDefaultApp` с lifecycle guards;
+возврат метода не доказывает успех ОС. Встроенного viewer нет.
 
 Создание ручного backup и очистка журнала требуют явного подтверждения. Закрытие
 диалога означает отказ; UI повторно проверяет lifecycle, конфигурацию и busy перед
@@ -336,5 +381,5 @@ Capacity timeout отличается от native timeout; late reply помеч
 
 Команды разработки и проверок — [README.md](README.md#разработка-и-проверки), реальный
 двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Machine-readable
-[release evidence](release-evidence/2.0.0.json) сохраняет фактический статус ручной
+[release evidence](release-evidence/2.1.0.json) сохраняет фактический статус ручной
 приёмки и не обновляется автоматически из unit results.

@@ -1,76 +1,78 @@
-/**
- * Internationalization service for Yandex Disk Sync plugin
- * Detects language from Obsidian settings and provides translation functions
- */
+/** Local interface language selection, independent of synchronization state. */
+import { translations, type Language } from "./translations";
 
-import { translations, Language } from "./translations";
-import { logger } from "../utils/logger";
-
+export type LanguagePreference = "system" | Language;
+export const LANGUAGE_NAMES: Record<Language, string> = {
+	en: "English",
+	ru: "Русский",
+	kk: "Қазақша",
+	be: "Беларуская",
+	uz: "O‘zbekcha",
+};
 let currentLanguage: Language = "en";
-let isInitialized = false;
 
-/**
- * Detect language from Obsidian settings
- */
+/** Normalize persisted preferences without rejecting otherwise valid plugin data. */
+export function normalizeLanguagePreference(
+	value: unknown,
+): LanguagePreference {
+	return value === "system" ||
+		(typeof value === "string" &&
+			Object.prototype.hasOwnProperty.call(LANGUAGE_NAMES, value))
+		? (value as LanguagePreference)
+		: "system";
+}
+
+/** Retain the existing Obsidian localStorage source for automatic selection. */
 function detectLanguage(): Language {
 	try {
-		// Use official method getLanguage() from Obsidian API via localStorage
-		const obsidianLang = window.localStorage.getItem("language");
-
-		if (obsidianLang && typeof obsidianLang === "string") {
-			const lang = obsidianLang.toLowerCase();
-
-			if (lang.startsWith("ru")) {
-				return "ru";
-			}
+		const value = globalThis.localStorage
+			?.getItem("language")
+			?.toLowerCase()
+			.split(/[-_]/)[0];
+		if (
+			value &&
+			Object.prototype.hasOwnProperty.call(LANGUAGE_NAMES, value)
+		) {
+			return value as Language;
 		}
-	} catch (e) {
-		// Log error but don't crash
-		logger.warn("[YandexSync i18n] Error detecting language:", {
-			error: e,
-		});
+	} catch {
+		// An unavailable application preference falls back to English.
 	}
-
-	// Default to English
 	return "en";
 }
 
-/**
- * Initialize i18n service
- */
+/** Publish a successfully saved preference; report whether visible text changed. */
+export function setLanguagePreference(preference: LanguagePreference): boolean {
+	const language = preference === "system" ? detectLanguage() : preference;
+	const changed = currentLanguage !== language;
+	currentLanguage = language;
+	return changed;
+}
+
+export function getActiveLanguage(): Language {
+	return currentLanguage;
+}
+
+/** Initialize fallback text before local plugin data is available. */
 export function initI18n(): void {
-	if (isInitialized) {
-		return;
-	}
-
-	currentLanguage = detectLanguage();
-	isInitialized = true;
-
-	// Make global t() function available
+	setLanguagePreference("system");
 	(window as { t?: typeof t }).t = t;
 }
 
-/**
- * Get translated string by key
- */
+/** Translate interface text while retaining literal parameter values. */
 export function translate(
 	key: string,
 	params?: Record<string, string | number>,
 ): string {
 	const dict = translations[currentLanguage] || translations.en;
 	let text = dict[key] || translations.en[key] || key;
-
-	// Replace parameters
 	if (params) {
-		for (const [param, value] of Object.entries(params)) {
-			text = text.replace(new RegExp(`{${param}}`, "g"), String(value));
-		}
+		text = text.replace(/\{([^{}]+)\}/g, (placeholder, param: string) =>
+			Object.prototype.hasOwnProperty.call(params, param)
+				? String(params[param])
+				: placeholder,
+		);
 	}
-
 	return text;
 }
-
-/**
- * Alias for translate function
- */
 export const t = translate;

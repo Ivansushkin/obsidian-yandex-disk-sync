@@ -16,8 +16,8 @@
 | [Шифрование](E2E_ENCRYPTION.md)                     | Wire formats, manifest, local-reference replacement, legacy checkpoints и recovery. |
 | [Резервное копирование](BACKUP.md)                  | ZIP/envelope, archive choice, passwords и exact verification.                       |
 | [Ручные проверки](SMOKE_TESTS.md)                   | Два профиля Obsidian, реальный Диск, desktop/mobile и release gates.                |
-| [Release evidence](release-evidence/2.0.0.json)     | Машиночитаемый статус фактически выполненной ручной приёмки.                        |
-| [Changelog](../CHANGELOG.md)                        | Изменения относительно stable 1.1.0.                                                |
+| [Release evidence](release-evidence/2.1.0.json)     | Машиночитаемый статус фактически выполненной ручной приёмки.                        |
+| [Changelog](../CHANGELOG.md)                        | Изменения 2.1.0 и история stable 2.0.0/1.1.0.                                       |
 
 Каталог задаёт поведение, архитектура — границы реализации, тематические документы —
 детали своих областей. При изменении алгоритма обновляйте сценарии и документ
@@ -70,7 +70,7 @@ latency реального Диска или mobile heap. Результаты �
 
 `auto:` и `manual:` в каталоге обозначают способ проверки, а не её результат.
 Перед выпуском нужен [реальный прогон](SMOKE_TESTS.md) на двух независимых профилях,
-в plaintext/encrypted и на требуемых платформах. `release-evidence/2.0.0.json`
+в plaintext/encrypted и на требуемых платформах. `release-evidence/2.1.0.json`
 остаётся `PENDING`, пока нет фактического evidence для всех P0/P1 и проверенного SHA.
 Автоматические tests не переводят его в `PASS`.
 
@@ -85,3 +85,6 @@ parser не оправдывает изменение корректных сц�
 сильными preservation expectations. Она не входит в default suite и не подтверждает
 server fencing; direct Force такой гарантии не даёт. Контракт и реальные проверки
 находятся в [FORCE_SYNC.md](FORCE_SYNC.md).
+
+Проверка локализации: `npm run check:i18n` (ключи, placeholders и ссылки);
+ручное переключение языков: `TC-I18N-01` в [SMOKE_TESTS.md](SMOKE_TESTS.md#tc-i18n-01-языки-интерфейса).

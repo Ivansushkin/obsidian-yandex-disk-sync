@@ -75,85 +75,6 @@ test("logging persistence does not replace an internal encryption update queued 
 	assert.equal(saved.enableDebugLogging, true);
 });
 
-test("accepted connection settings reconcile before automation and preserve a user pause", async () => {
-	for (let paused of [false, true]) {
-		const { plugin, writes } = harness();
-		await plugin.loadSettings();
-		plugin.settings = { ...plugin.settings, logToFile: false };
-		const order: string[] = [];
-		Object.assign(plugin, {
-			app: { ...plugin.app, workspace: { layoutReady: true } },
-			localStateRestored: true,
-			syncLifecycleRegistered: true,
-			fileWatcher: {
-				stop: () => order.push("stop"),
-				updateSettings: () => {},
-				waitForPendingPersistence: async () => {
-					// Watcher persistence awaits the same queue as the settings draft.
-					await plugin.saveSettings();
-					order.push("watcher-saved");
-				},
-				getDeferredEvents: () => [],
-				start: () => order.push("watcher-start"),
-			},
-			syncScheduler: {
-				stop: () => {},
-				updateSettings: () => {},
-				start: () => order.push("scheduler-start"),
-			},
-			syncEngine: {
-				hasPendingWork: () => false,
-				isSyncPaused: () => paused,
-				resume: () => {
-					paused = false;
-				},
-				setExternalBlock: () => {},
-				updateSettings: () => {},
-				fullSync: async () => {
-					assert.equal(
-						plugin.settings.yandexTokenSecret,
-						"synthetic",
-					);
-					order.push("full");
-					return {
-						success: true,
-						errors: [],
-						uploaded: 0,
-						downloaded: 0,
-						deleted: 0,
-						conflicts: 0,
-						startTime: 1,
-						endTime: 2,
-					};
-				},
-			},
-			refreshRemoteStartupState: async () => {
-				order.push("recheck");
-				plugin["authenticationBlockReason"] = null;
-				return "ready";
-			},
-		});
-		await plugin.applySettingsPatch({ yandexTokenSecret: "synthetic" });
-		assert.equal(
-			(writes.at(-1) as { settings: typeof DEFAULT_SETTINGS }).settings
-				.yandexTokenSecret,
-			"synthetic",
-		);
-		assert.ok(order.indexOf("watcher-saved") < order.indexOf("recheck"));
-		assert.equal(order.includes("full"), !paused);
-		if (paused) {
-			assert.equal(order.includes("watcher-start"), false);
-		} else {
-			assert.ok(order.indexOf("full") < order.indexOf("watcher-start"));
-		}
-		assert.equal(plugin.isConfigurationBusy(), false);
-		if (paused) {
-			assert.equal(await plugin["resumeSyncIfReady"](), true);
-			assert.ok(order.indexOf("full") < order.indexOf("watcher-start"));
-		}
-	}
-});
-
 test("failed plugin load never overwrites storage on save or unload", async () => {
 	const oldWindow = globalThis.window;
 	Object.assign(globalThis, {
@@ -429,6 +350,7 @@ test("manual full retry restores automation after startup or settings failure", 
 		plugin.settings = {
 			...plugin.settings,
 			yandexTokenSecret: entry === "settings" ? "" : "synthetic",
+			manualSyncRequired: false,
 			logToFile: false,
 		};
 		let calls = 0,
@@ -465,6 +387,7 @@ test("manual full retry restores automation after startup or settings failure", 
 				updateSettings: () => {},
 			},
 			syncEngine: {
+				createReadLifetimeGuard: () => () => {},
 				setExternalBlock: () => {},
 				hasPendingWork: () => false,
 				isSyncPaused: () => paused,
@@ -506,6 +429,8 @@ test("manual full retry restores automation after startup or settings failure", 
 		});
 		if (entry === "settings") {
 			await plugin.applySettingsPatch({ yandexTokenSecret: "synthetic" });
+			assert.equal(calls, 0);
+			await plugin.runFullSync(undefined, false);
 		} else {
 			await plugin["startSync"](true, true);
 		}

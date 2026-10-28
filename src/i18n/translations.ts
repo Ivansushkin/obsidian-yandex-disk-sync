@@ -2,10 +2,72 @@
  * Translation dictionaries for Yandex Disk Sync plugin
  */
 
-export type Language = "en" | "ru";
+import kk from "./kk.json";
+import be from "./be.json";
+import uz from "./uz.json";
+
+export type Language = "en" | "ru" | "kk" | "be" | "uz";
 
 export const translations: Record<Language, Record<string, string>> = {
+	kk,
+	be,
+	uz,
 	en: {
+		"failure.details": "Technical details: {message}",
+		"failure.reason.mandatory-backup-failed":
+			"A required protective copy could not be saved. Local replacement was blocked.",
+		"failure.reason.watcher-rename-unresolved":
+			"A local rename could not be resolved safely. Run full synchronization.",
+		"failure.reason.epoch-decision-required":
+			"Choose how to handle your offline edits before accepting the replaced remote storage.",
+		"failure.reason.folder-delete-causality-unresolved":
+			"The folder deletion could not be confirmed safely. Synchronization must check its current state.",
+		"failure.reason.pending-physical-action-unresolved":
+			"A pending file operation could not be confirmed. Its recovery remains unfinished.",
+		"settings.language": "Interface language",
+		"settings.language_desc":
+			"Follow Obsidian’s language or choose a language for this plugin. Changes apply immediately.",
+		"settings.language_system": "System default",
+		"modal.status_last_sync": "Last synchronization: {time}",
+		"units.byte": "B",
+		"units.kilobyte": "KB",
+		"units.megabyte": "MB",
+		"units.gigabyte": "GB",
+		"failure.stage.unknown": "operation",
+		"failure.stage.sync": "synchronization",
+		"failure.stage.transport": "network request",
+		"failure.stage.canonical-initialize": "index initialization",
+		"failure.stage.acquired": "index lock acquired",
+		"failure.stage.written": "index write",
+		"failure.stage.verified": "index verification",
+		"failure.stage.move-attempted": "index publication",
+		"failure.stage.committed": "index committed",
+		"failure.reason.sync-interrupted":
+			"Synchronization was interrupted because its operation context changed.",
+		"failure.reason.local-file-changed":
+			"The local file changed while it was being read. Its new contents have been preserved.",
+		"failure.reason.epoch-replaced-during-sync":
+			"The remote storage was replaced during synchronization. Read its new state before continuing.",
+		"failure.reason.remote-maintenance":
+			"Remote maintenance is in progress. Wait for it to finish.",
+		"failure.reason.portable-path-collision":
+			"File paths collide after Unicode normalization or case folding. Rename the conflicting files.",
+		"failure.reason.index-content-mismatch":
+			"The remote index changed or its contents could not be verified. Publication was stopped.",
+		"failure.reason.remote-index-locked":
+			"The remote index is locked by another operation. Wait and retry synchronization.",
+		"failure.reason.canonical-concurrent":
+			"Another device changed the remote index. Synchronization must read the current version before retrying.",
+		"failure.reason.canonical-rolled-back":
+			"The index transaction was rolled back. Check the reported outcome before retrying synchronization.",
+		"failure.reason.canonical-ambiguous":
+			"The index transaction outcome could not be confirmed. Verify the remote state before further changes.",
+		"failure.reason.canonical-committed":
+			"The index was committed, but the operation did not finish. Continue normal synchronization to complete recovery.",
+		"failure.reason.remote-read-timeout":
+			"The remote read timed out. Its result was not accepted.",
+		"failure.reason.network":
+			"The network request failed. Check your connection.",
 		"settings.operation_in_progress": "In progress…",
 		"modal.create_backup_title": "Create a backup?",
 		"modal.create_backup_description":
@@ -167,7 +229,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Saving synchronization state…",
 		"notice.force_phase_reconciling": "Final synchronization check",
 		"notice.force_migration_completed":
-			"Upgrade to 2.0.0 completed. Synchronization finished.",
+			"Upgrade to 2.1.0 completed. Synchronization finished.",
 		"notice.force_backup_failed":
 			"Backup could not be verified. Force synchronization was not started.",
 		"notice.force_finalization_pending":
@@ -320,25 +382,22 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.status_downloaded": "Downloaded: {count}",
 		"modal.status_deleted": "Deleted: {count}",
 		"modal.status_errors": "Errors: {count}",
-		"modal.log_viewer_title": "Debug logs",
-		"modal.log_viewer_label": "Log contents",
-		"modal.log_viewer_desc": "Recent log entries for troubleshooting",
-		"modal.log_viewer_refresh": "Refresh",
-		"modal.log_viewer_copy": "Copy to clipboard",
-		"modal.log_viewer_clear": "Clear logs",
 
 		// Settings
 		"settings.connection_section": "Connection",
-		"settings.oauth_instruction_1": "1. Click 'Manage clients'",
-		"settings.oauth_instruction_2":
-			"2. Create and open a new Yandex OAuth app",
+		"settings.oauth_instruction_1":
+			"1. Choose a folder on Yandex Disk for synchronization",
+		"status.manual_sync_required": "Click Synchronize to connect",
+		"settings.oauth_instruction_2": "2. Click 'Manage clients'",
 		"settings.oauth_instruction_3":
-			"3. Copy Client ID from the app settings",
-		"settings.oauth_instruction_4": "4. Paste Client ID in the input below",
-		"settings.oauth_instruction_5": "5. Click 'Get token'",
-		"settings.oauth_instruction_6":
-			"6. Copy the received token and paste it in the input below",
-		"settings.oauth_instruction_7": "7. Click 'Synchronize'",
+			"3. Create and open a new Yandex OAuth app. Grant read and write access to Disk and access to the app folder on Disk",
+		"settings.oauth_instruction_4":
+			"4. Copy Client ID from the app settings",
+		"settings.oauth_instruction_5": "5. Paste Client ID in the input below",
+		"settings.oauth_instruction_6": "6. Click 'Get token'",
+		"settings.oauth_instruction_7":
+			"7. Copy the received token and paste it in the input below",
+		"settings.oauth_instruction_8": "8. Click 'Synchronize'",
 		"settings.manage_clients": "Manage clients",
 		"settings.get_token": "Get token",
 		"settings.client_id": "Client ID",
@@ -346,8 +405,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.oauth_token": "OAuth token",
 		"settings.oauth_token_placeholder": "Enter token",
 		"settings.remote_path": "Remote path",
-		"settings.remote_path_desc":
-			"Folder on Yandex Disk for storing synchronized files",
 		"settings.remote_path_placeholder": "obsidian-sync/my-vault",
 		"settings.automatic_sync_section": "Automatic sync",
 		"settings.realtime_sync": "Real-time sync",
@@ -381,13 +438,22 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.log_to_file": "Write logs to file",
 		"settings.log_to_file_desc":
 			"Save logs to the plugin data folder for troubleshooting",
-		"settings.view_logs_button": "View logs",
-		"settings.clear_logs_button": "Clear logs",
+		"settings.copy_logs_button": "Copy logs",
+		"settings.copy_logs_desc":
+			"Will copy {count} characters — latest entries, up to {limit}",
+		"settings.logs_loading": "Reading log size…",
+		"settings.logs_unavailable":
+			"Log size unavailable. You can retry copying.",
+		"notice.logs_copied_count":
+			"Copied {count} log characters to clipboard",
+		"settings.open_logs_button": "Open log file",
+		"settings.log_file_missing": "The log file has not been created yet",
+		"settings.open_logs_failed": "Could not open the log file",
+		"settings.clear_logs_button": "Clear log file",
 		"settings.information_section": "Information",
 		"settings.device_id": "Device ID",
 		"settings.device_id_desc": "Unique identifier for this device",
 		"settings.sync_button": "Synchronize",
-		"settings.syncing_button": "Syncing...",
 		"settings.backup_section": "Backup",
 		"settings.backup_desc":
 			"Backup will be saved as a ZIP archive in the .backup folder on disk",
@@ -524,6 +590,61 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"failure.details": "Технические подробности: {message}",
+		"failure.reason.mandatory-backup-failed":
+			"Не удалось сохранить обязательную защитную копию. Локальная замена заблокирована.",
+		"failure.reason.watcher-rename-unresolved":
+			"Не удалось безопасно обработать локальное переименование. Запустите полную синхронизацию.",
+		"failure.reason.epoch-decision-required":
+			"Перед принятием заменённого удалённого хранилища выберите, что делать с офлайн-изменениями.",
+		"failure.reason.folder-delete-causality-unresolved":
+			"Безопасность удаления папки не подтверждена. Синхронизация должна проверить её актуальное состояние.",
+		"failure.reason.pending-physical-action-unresolved":
+			"Результат отложенной файловой операции не подтверждён. Её восстановление остаётся незавершённым.",
+		"settings.language": "Язык интерфейса",
+		"settings.language_desc":
+			"Следовать языку Obsidian или выбрать язык плагина. Изменение применяется сразу.",
+		"settings.language_system": "Системный",
+		"modal.status_last_sync": "Последняя синхронизация: {time}",
+		"units.byte": "Б",
+		"units.kilobyte": "КБ",
+		"units.megabyte": "МБ",
+		"units.gigabyte": "ГБ",
+		"failure.stage.unknown": "операция",
+		"failure.stage.sync": "синхронизация",
+		"failure.stage.transport": "сетевой запрос",
+		"failure.stage.canonical-initialize": "инициализация индекса",
+		"failure.stage.acquired": "получение блокировки индекса",
+		"failure.stage.written": "запись индекса",
+		"failure.stage.verified": "проверка индекса",
+		"failure.stage.move-attempted": "публикация индекса",
+		"failure.stage.committed": "индекс опубликован",
+		"failure.reason.sync-interrupted":
+			"Синхронизация прервана из-за изменения контекста операции.",
+		"failure.reason.local-file-changed":
+			"Локальный файл изменился во время чтения. Его новое содержимое сохранено.",
+		"failure.reason.epoch-replaced-during-sync":
+			"Удалённое хранилище заменено во время синхронизации. Перед продолжением необходимо прочитать новое состояние.",
+		"failure.reason.remote-maintenance":
+			"В удалённом хранилище выполняется обслуживание. Дождитесь завершения.",
+		"failure.reason.portable-path-collision":
+			"Пути файлов совпадают после нормализации Unicode или без учёта регистра. Переименуйте конфликтующие файлы.",
+		"failure.reason.index-content-mismatch":
+			"Удалённый индекс изменился или его содержимое не удалось проверить. Публикация остановлена.",
+		"failure.reason.remote-index-locked":
+			"Удалённый индекс заблокирован другой операцией. Подождите и повторите синхронизацию.",
+		"failure.reason.canonical-concurrent":
+			"Другое устройство изменило удалённый индекс. Перед повтором синхронизации необходимо прочитать актуальную версию.",
+		"failure.reason.canonical-rolled-back":
+			"Транзакция индекса отменена. Перед повтором синхронизации проверьте указанный результат операции.",
+		"failure.reason.canonical-ambiguous":
+			"Результат транзакции индекса не подтверждён. Перед дальнейшими изменениями необходимо проверить удалённое состояние.",
+		"failure.reason.canonical-committed":
+			"Индекс опубликован, но операция не завершена. Продолжите обычную синхронизацию для завершения восстановления.",
+		"failure.reason.remote-read-timeout":
+			"Превышено время ожидания удалённого чтения. Его результат не принят.",
+		"failure.reason.network":
+			"Сетевой запрос не выполнен. Проверьте подключение.",
 		"settings.operation_in_progress": "Выполняется…",
 		"modal.create_backup_title": "Создать резервную копию?",
 		"modal.create_backup_description":
@@ -687,7 +808,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
 		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
 		"notice.force_migration_completed":
-			"Переход на 2.0.0 завершён. Синхронизация выполнена.",
+			"Переход на 2.1.0 завершён. Синхронизация выполнена.",
 		"notice.force_backup_failed":
 			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
 		"notice.force_finalization_pending":
@@ -842,26 +963,23 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.status_downloaded": "Скачано: {count}",
 		"modal.status_deleted": "Удалено: {count}",
 		"modal.status_errors": "Ошибок: {count}",
-		"modal.log_viewer_title": "Отладочные логи",
-		"modal.log_viewer_label": "Содержимое логов",
-		"modal.log_viewer_desc":
-			"Последние записи логов для диагностики проблем",
-		"modal.log_viewer_refresh": "Обновить",
-		"modal.log_viewer_copy": "Копировать в буфер",
-		"modal.log_viewer_clear": "Очистить логи",
 
 		// Settings
 		"settings.connection_section": "Подключение",
-		"settings.oauth_instruction_1": "1. Нажмите 'Управление клиентами'",
-		"settings.oauth_instruction_2":
-			"2. Создайте и откройте новое приложение Yandex OAuth",
+		"settings.oauth_instruction_1":
+			"1. Выберите папку на Яндекс Диске для синхронизации",
+		"status.manual_sync_required":
+			"Нажмите «Синхронизировать» для подключения",
+		"settings.oauth_instruction_2": "2. Нажмите 'Управление клиентами'",
 		"settings.oauth_instruction_3":
-			"3. Скопируйте Client ID из настроек приложения",
-		"settings.oauth_instruction_4": "4. Вставьте Client ID в инпут ниже",
-		"settings.oauth_instruction_5": "5. Нажмите 'Получить токен'",
-		"settings.oauth_instruction_6":
-			"6. Скопируйте полученный токен и вставьте его в инпут ниже",
-		"settings.oauth_instruction_7": "7. Нажмите на Синхронизировать",
+			"3. Создайте и откройте новое приложение Яндекс OAuth. Выдайте ему права на чтение и редактирование Диска, а также «Доступ к папке приложения на Диске»",
+		"settings.oauth_instruction_4":
+			"4. Скопируйте Client ID из настроек приложения",
+		"settings.oauth_instruction_5": "5. Вставьте Client ID в инпут ниже",
+		"settings.oauth_instruction_6": "6. Нажмите 'Получить токен'",
+		"settings.oauth_instruction_7":
+			"7. Скопируйте полученный токен и вставьте его в инпут ниже",
+		"settings.oauth_instruction_8": "8. Нажмите на Синхронизировать",
 		"settings.manage_clients": "Управление клиентами",
 		"settings.get_token": "Получить токен",
 		"settings.client_id": "Client ID",
@@ -869,8 +987,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.oauth_token": "OAuth токен",
 		"settings.oauth_token_placeholder": "Введите токен",
 		"settings.remote_path": "Путь на диске",
-		"settings.remote_path_desc":
-			"Папка на Яandex Disk для хранения синхронизируемых файлов",
 		"settings.remote_path_placeholder": "obsidian-sync/my-vault",
 		"settings.automatic_sync_section": "Автоматическая синхронизация",
 		"settings.realtime_sync": "Реал-тайм синхронизация",
@@ -904,13 +1020,22 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.log_to_file": "Писать логи в файл",
 		"settings.log_to_file_desc":
 			"Сохранять логи в папку данных плагина для диагностики",
-		"settings.view_logs_button": "Посмотреть логи",
-		"settings.clear_logs_button": "Очистить логи",
+		"settings.copy_logs_button": "Копировать логи",
+		"settings.copy_logs_desc":
+			"Будет скопировано {count} символов — последние записи, максимум {limit}",
+		"settings.logs_loading": "Читаем размер журнала…",
+		"settings.logs_unavailable":
+			"Размер журнала недоступен. Можно повторить копирование.",
+		"notice.logs_copied_count":
+			"В буфер скопировано {count} символов журнала",
+		"settings.open_logs_button": "Открыть файл логов",
+		"settings.log_file_missing": "Файл логов пока не создан",
+		"settings.open_logs_failed": "Не удалось открыть файл логов",
+		"settings.clear_logs_button": "Очистить файл логов",
 		"settings.information_section": "Информация",
 		"settings.device_id": "ID устройства",
 		"settings.device_id_desc": "Уникальный идентификатор этого устройства",
 		"settings.sync_button": "Синхронизировать",
-		"settings.syncing_button": "Синхронизация...",
 		"settings.backup_section": "Резервное копирование",
 		"settings.backup_desc":
 			"Бекап будет сохранен как zip архив в папку .backup на диске",

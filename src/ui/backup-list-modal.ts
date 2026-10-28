@@ -8,7 +8,7 @@ import {
 	BackupManager,
 	BackupPasswordRequiredError,
 } from "../backup/backup-manager";
-import { t } from "../i18n";
+import { getActiveLanguage, t } from "../i18n";
 import { logger } from "../utils/logger";
 import { ConnectEncryptedVaultModal } from "./encryption-modals";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
@@ -268,19 +268,28 @@ export class BackupListModal extends Modal {
 	}
 
 	private formatDate(date: Date): string {
-		return date.toLocaleString();
+		return date.toLocaleString(getActiveLanguage());
 	}
 
 	private formatSize(bytes: number): string {
 		if (bytes === 0) {
-			return "0 B";
+			return `${(0).toLocaleString(getActiveLanguage())} ${t("units.byte")}`;
 		}
 
 		const k = 1024;
-		const sizes = ["B", "KB", "MB", "GB"];
-		const i = Math.floor(Math.log(bytes) / Math.log(k));
+		const sizes = ["byte", "kilobyte", "megabyte", "gigabyte"];
+		const i = Math.min(
+			sizes.length - 1,
+			Math.floor(Math.log(bytes) / Math.log(k)),
+		);
 
-		return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+		return (
+			(bytes / Math.pow(k, i)).toLocaleString(getActiveLanguage(), {
+				maximumFractionDigits: 2,
+			}) +
+			" " +
+			t(`units.${sizes[i]}`)
+		);
 	}
 
 	onClose(): void {

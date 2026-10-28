@@ -42,13 +42,39 @@ export function formatOperationFailure(
 	const location = failure.path ? ` · ${failure.path}` : "";
 	const stageKey = `failure.stage.${failure.stage}`;
 	const translated = t(stageKey);
-	const stage = translated === stageKey ? failure.stage : translated;
+	const stage =
+		translated === stageKey ? t("failure.stage.unknown") : translated;
+	const reasons: Record<string, string> = {
+		"force-recovery-pending": "force.recovery_pending",
+		"local-state-blocked": "storage.blocked",
+		"unsupported-historical": "notice.unsupported_historical_data",
+		"legacy-index": "notice.legacy_index_blocked",
+		"unreadable-index": "notice.unreadable_index_blocked",
+		"invalid-index": "notice.invalid_index_blocked",
+		"ambiguous-index-lock": "notice.ambiguous_index_blocked",
+		"force-backup-stale": "notice.force_backup_stale",
+		"force-source-changed": "notice.force_source_changed",
+		"ambiguous-index-state": "failure.reason.canonical-ambiguous",
+		"legacy-plugin-data-exposure": "notice.legacy_plugin_data_exposure",
+		"legacy-service-path-collision": "notice.legacy_service_collision",
+		"local-persistence": "notice.local_persistence_failed",
+		"encryption-state-changed": "notice.encryption_state_changed",
+		authentication: "failure.category.access",
+	};
+	const reasonKey = reasons[failure.code] ?? `failure.reason.${failure.code}`;
+	const reason = t(reasonKey);
 	const message =
 		failure.code === "force-source-format"
 			? t("force.source_format_error")
 			: failure.code === "force-scope-conflict"
 				? t("force.scope_conflict")
-				: failure.message;
+				: reason !== reasonKey
+					? reason
+					: failure.message;
+	const details =
+		message !== failure.message && failure.message
+			? ` ${t("failure.details", { message: failure.message })}`
+			: "";
 	const nextKey =
 		failure.code === "force-source-format"
 			? "force-source-format"
@@ -57,7 +83,7 @@ export function formatOperationFailure(
 				: failure.code === "local-persistence"
 					? "local-persistence"
 					: failure.category;
-	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${message}. ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${nextAction ?? t(`failure.next.${nextKey}`)}`;
+	return `${t(`failure.category.${failure.category}`)} [${failure.code}] · ${t("failure.stage", { stage })}${location}: ${message}${details} ${t(`failure.outcome.${failure.outcome ?? "unknown"}`)} ${nextAction ?? t(`failure.next.${nextKey}`)}`;
 }
 
 /** Preserve the first reason and total failures without exposing raw exceptions. */

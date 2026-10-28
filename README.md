@@ -2,9 +2,28 @@
 
 A plugin for synchronizing Obsidian notes with Yandex Disk. Allows automatic synchronization of vault between multiple devices through Yandex's cloud storage.
 
+**Interface languages:** English · Русский · Қазақша · Беларуская · O‘zbekcha.
+The plugin follows Obsidian’s language by default. Choose an explicit language
+at the top of plugin settings to apply it immediately.
+
 Connection and scope changes take effect only after a coherent local save.
 Active operations and unfinished recovery can block changes. See the
 [documentation guide](docs/README.md) for architecture, scenarios and release checks.
+
+## Connection setup
+
+Choose the remote folder, configure OAuth and click **Synchronize**. Saving a
+new token or remote folder waits for a successful manual full sync before starting
+automatic synchronization, including after restarting Obsidian. Existing 2.0.0
+connections keep automatic startup until these settings change. The token input
+is masked; credentials remain stored locally.
+
+While settings are open, one notification mirrors the synchronization status and
+hides when idle or when settings close. Settings offer **Copy logs**, **Open log
+file** and **Clear log file**; the indicator also offers copy and open. Copying
+uses the latest 4,000 sanitized characters, with the count shown on hover or focus.
+Clearing requires confirmation. External opening depends on Obsidian support;
+the built-in log viewer has been removed.
 
 ## Upgrading from 1.1.0 to 2.0.0
 
@@ -84,7 +103,7 @@ repeat Force local with an explicit archive choice.
 ### Getting OAuth Token
 
 1. Go to [Yandex OAuth](https://oauth.yandex.ru/)
-2. Create an application with read and write access to the selected Yandex Disk storage; grant only the permissions needed for synchronization
+2. Create an application with read and write access to Yandex Disk and access to the app folder on Disk
 3. Get OAuth token
 4. Paste token in plugin settings
 

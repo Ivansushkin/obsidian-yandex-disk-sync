@@ -302,7 +302,6 @@ function admission(current: Device, codec: EncryptionCodec | null) {
 					isLayoutReady: () => true,
 					setUpdating: () => {},
 					stopRegularSync: () => current.watcher.stop(),
-					startAutomation: () => {},
 					settingsSaveRejected: unexpected,
 					persistPluginData: async (patch) => {
 						// Fixture has coherent JSON persistence; the actual PluginPersistence queue is covered by the suite.
@@ -311,16 +310,14 @@ function admission(current: Device, codec: EncryptionCodec | null) {
 						current.client.setToken("synthetic");
 						startup.validated = false;
 					},
-					runStartupInvocation: (action) =>
-						startup.runInvocation(action),
-					refreshRemoteStartupState: (prompt, recovery, invocation) =>
-						startup.refresh(prompt, recovery, invocation),
-					reconcile: (invocation) => full(true, invocation),
+					reconcile: () => full(true),
 					watcher: current.watcher,
 					engine: current.engine,
 				},
 				{ yandexTokenSecret: "synthetic" },
 			);
+			assert.equal(startup.validated, false);
+			await full(true);
 			assert.equal(startup.validated, true);
 		},
 	};

@@ -13,16 +13,25 @@ import {
 	TextAreaComponent,
 	TextComponent,
 	ToggleComponent,
+	setIcon,
+	setTooltip,
 } from "obsidian";
 import type YandexDiskSyncPlugin from "./main";
-import { t } from "./i18n/index";
+import {
+	LANGUAGE_NAMES,
+	normalizeLanguagePreference,
+	getActiveLanguage,
+	t,
+} from "./i18n/index";
 import { logger } from "./utils/logger";
+import {
+	clearLogsWithConfirmation,
+	copyLogTail,
+	LOG_COPY_LIMIT,
+	openLogFile,
+} from "./ui/log-actions";
 import { createSyncFailure, formatOperationFailure } from "./sync/errors";
 import { BackupListModal } from "./ui/backup-list-modal";
-import {
-	LogViewerModal,
-	clearLogsWithConfirmation,
-} from "./ui/log-viewer-modal";
 import {
 	ChangePasswordModal,
 	ConnectEncryptedVaultModal,
@@ -38,7 +47,8 @@ import type { ForceDirection } from "./sync/workflows/force-controller";
 
 export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	plugin: YandexDiskSyncPlugin;
-	private backupStatusPromise: Promise<string> | null = null;
+	private backupStatusPromise: Promise<Date | null | undefined> | null = null;
+	private lastBackupDate: Date | null | undefined;
 	private activityUnsubscribers: (() => void)[] = [];
 	private syncButton: ButtonComponent | null = null;
 	private forceButtons: {
@@ -55,6 +65,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private encryptionButton: ButtonComponent | null = null;
 	private clearLogsButton: ButtonComponent | null = null;
 	private clearingLogs = false;
+	private copyLogsButton: ButtonComponent | null = null;
+	private openLogsButton: ButtonComponent | null = null;
+	private copyingLogs = false;
+	private openingLogs = false;
 	private encryptionToggle: ToggleComponent | null = null;
 	private encryptionSpinner: HTMLElement | null = null;
 	private pendingAction = false;
@@ -64,30 +78,42 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, plugin: YandexDiskSyncPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+		this.plugin.register(() => {
+			this.displayed = false;
+			this.renderGeneration++;
+			this.detachActivity();
+		});
 	}
 
-	private async getLastBackupText(): Promise<string> {
-		if (!this.plugin.settings.yandexTokenSecret.trim()) {
+	/** Reformat observed backup data locally when only the interface language changes. */
+	private async getLastBackupText(refresh = true): Promise<string> {
+		if (
+			this.plugin.settings.manualSyncRequired ||
+			!this.plugin.settings.yandexTokenSecret.trim()
+		) {
+			this.lastBackupDate = undefined;
 			return t("settings.backup_unavailable");
 		}
-		if (this.backupStatusPromise) {
-			return await this.backupStatusPromise;
+		if (refresh && !this.backupStatusPromise) {
+			this.backupStatusPromise = this.loadLastBackupDate().finally(() => {
+				this.backupStatusPromise = null;
+			});
 		}
-		this.backupStatusPromise = this.loadLastBackupText().finally(() => {
-			this.backupStatusPromise = null;
-		});
-		return await this.backupStatusPromise;
+		if (this.backupStatusPromise) {
+			this.lastBackupDate = await this.backupStatusPromise;
+		}
+		return this.lastBackupDate === undefined
+			? t("settings.backup_unavailable")
+			: (this.lastBackupDate?.toLocaleString(getActiveLanguage()) ??
+					t("settings.backup_never"));
 	}
 
-	private async loadLastBackupText(): Promise<string> {
+	private async loadLastBackupDate(): Promise<Date | null | undefined> {
 		try {
 			const backups: BackupInfo[] = await this.plugin
 				.getBackupManager()
 				.listBackups();
-			return (
-				backups[0]?.created.toLocaleString() ??
-				t("settings.backup_never")
-			);
+			return backups[0]?.created ?? null;
 		} catch (error) {
 			if (
 				!(error instanceof YandexApiError) ||
@@ -95,12 +121,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			) {
 				logger.debug("Passive backup status is unavailable", { error });
 			}
-			return t("settings.backup_unavailable");
+			return undefined;
 		}
 	}
 
 	hide(): void {
 		this.displayed = false;
+		this.plugin.setSettingsStatusVisible(false);
 		this.detachActivity();
 		this.renderGeneration++;
 		this.plugin.encryptionStateChangeCallback = null;
@@ -132,7 +159,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		);
 	}
 
-	/** Use the same accessible running state for every operation button. */
+	/** Update an operation button's label and accessible running state. */
 	private setButtonActivity(
 		button: ButtonComponent | null,
 		active: boolean,
@@ -164,17 +191,16 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			(this.plugin.isFullSyncInProgress() || checkingConnection) &&
 			!state?.active &&
 			!foreground;
-		this.setButtonActivity(
-			this.syncButton,
-			fullActive,
-			t(
-				checkingConnection
-					? "status.checking_connection"
-					: fullActive
-						? "settings.syncing_button"
-						: "settings.sync_button",
-			),
-		);
+		if (this.syncButton) {
+			this.syncButton.buttonEl.setAttribute(
+				"aria-busy",
+				String(fullActive),
+			);
+			this.syncButton.buttonEl.toggleClass(
+				"sync-button-active",
+				fullActive,
+			);
+		}
 		for (const { button, direction } of this.forceButtons) {
 			const active =
 				state?.active === true && state.direction === direction;
@@ -219,19 +245,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					: "settings.encryption_change_password",
 			),
 		);
-		if (this.clearLogsButton) {
-			this.clearLogsButton.setDisabled(
-				this.clearingLogs || this.plugin.isPluginUnloaded(),
-			);
-			this.setButtonActivity(
-				this.clearLogsButton,
-				this.clearingLogs,
-				t(
-					this.clearingLogs
-						? "settings.operation_in_progress"
-						: "settings.clear_logs_button",
-				),
-			);
+		for (const [button, active] of [
+			[this.clearLogsButton, this.clearingLogs],
+			[this.copyLogsButton, this.copyingLogs],
+			[this.openLogsButton, this.openingLogs],
+		] as const) {
+			button?.setDisabled(active || this.plugin.isPluginUnloaded());
 		}
 	}
 
@@ -289,7 +308,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					}).summary,
 				),
 			);
-			this.renderSettings();
+			this.renderSettings(patch.language === undefined);
 		}
 	}
 
@@ -331,7 +350,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					remoteManifest,
 				);
 				if (!this.plugin.isPluginUnloaded()) {
-					new Notice(t("notice.encryption_connected"));
+					this.plugin.showOperationNotice(
+						t("notice.encryption_connected"),
+					);
 				}
 			} catch (error) {
 				if (!this.plugin.isPluginUnloaded()) {
@@ -408,12 +429,193 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		});
 	}
 
+	/** Render local log actions and read their copy count only on hover or focus. */
+	private renderLogActions(loggingEl: HTMLElement, generation: number): void {
+		const isLogActionCurrent = () =>
+			this.displayed &&
+			generation === this.renderGeneration &&
+			!this.plugin.isPluginUnloaded();
+		const logActions = new Setting(loggingEl);
+		logActions.settingEl.addClass("sync-log-actions");
+		logActions.infoEl.remove();
+		const updateCopyTooltip = (details: string) => {
+			if (this.copyLogsButton && isLogActionCurrent()) {
+				setTooltip(
+					this.copyLogsButton.buttonEl,
+					`${t("settings.copy_logs_button")}: ${details}`,
+					{ placement: "top" },
+				);
+			}
+		};
+		let tooltipGeneration = 0;
+		const updateCopyCount = (count: number) => {
+			updateCopyTooltip(
+				t("settings.copy_logs_desc", { count, limit: LOG_COPY_LIMIT }),
+			);
+		};
+		logActions.addButton((button) => {
+			this.copyLogsButton = button.setButtonText(
+				t("settings.copy_logs_button"),
+			);
+			setTooltip(button.buttonEl, t("settings.copy_logs_button"), {
+				placement: "top",
+			});
+			this.trackControl(button, true);
+			button.onClick(async () => {
+				if (this.copyingLogs || !isLogActionCurrent()) {
+					return;
+				}
+				this.copyingLogs = true;
+				this.updateActivity();
+				try {
+					const win = loggingEl.ownerDocument.defaultView ?? window;
+					const count = await copyLogTail(
+						win,
+						() => logger.getLogContents(),
+						isLogActionCurrent,
+					);
+					if (count !== null && isLogActionCurrent()) {
+						tooltipGeneration++;
+						updateCopyCount(count);
+						new Notice(
+							count === 0
+								? t("status.actions.logs_empty")
+								: t("notice.logs_copied_count", { count }),
+						);
+					}
+				} catch {
+					if (isLogActionCurrent()) {
+						new Notice(t("status.actions.copy_failed"));
+					}
+				} finally {
+					this.copyingLogs = false;
+					if (!this.plugin.isPluginUnloaded()) {
+						this.updateActivity();
+					}
+				}
+			});
+		});
+		let countRead: Promise<void> | null = null;
+		const refreshLogCount = () => {
+			if (!isLogActionCurrent() || countRead) {
+				return;
+			}
+			const currentTooltip = tooltipGeneration;
+			updateCopyTooltip(t("settings.logs_loading"));
+			countRead = logger
+				.getLogContents()
+				.then(
+					(content) => {
+						if (currentTooltip === tooltipGeneration) {
+							updateCopyCount(
+								content.trim()
+									? Math.min(content.length, LOG_COPY_LIMIT)
+									: 0,
+							);
+						}
+					},
+					() => {
+						if (currentTooltip === tooltipGeneration) {
+							updateCopyTooltip(t("settings.logs_unavailable"));
+						}
+					},
+				)
+				.finally(() => {
+					countRead = null;
+				});
+		};
+		this.copyLogsButton?.buttonEl.addEventListener(
+			"mouseenter",
+			refreshLogCount,
+		);
+		this.copyLogsButton?.buttonEl.addEventListener(
+			"focus",
+			refreshLogCount,
+		);
+
+		logActions.addButton((button) => {
+			this.openLogsButton = button.setButtonText(
+				t("settings.open_logs_button"),
+			);
+			this.trackControl(button, true);
+			button.onClick(async () => {
+				if (this.openingLogs || !isLogActionCurrent()) {
+					return;
+				}
+				this.openingLogs = true;
+				this.updateActivity();
+				try {
+					await openLogFile(this.app, isLogActionCurrent);
+				} finally {
+					this.openingLogs = false;
+					if (!this.plugin.isPluginUnloaded()) {
+						this.updateActivity();
+					}
+				}
+			});
+		});
+
+		logActions.addButton((button) =>
+			button
+				.setButtonText(t("settings.clear_logs_button"))
+				// eslint-disable-next-line @typescript-eslint/no-deprecated
+				.setWarning()
+				.then((control) => {
+					this.clearLogsButton = control;
+					this.trackControl(control, true);
+				})
+				.onClick(async () => {
+					if (this.clearingLogs || !isLogActionCurrent()) {
+						return;
+					}
+					this.clearingLogs = true;
+					this.updateActivity();
+					try {
+						const cleared = await clearLogsWithConfirmation(
+							this.app,
+							isLogActionCurrent,
+						);
+						if (cleared && isLogActionCurrent()) {
+							tooltipGeneration++;
+							updateCopyCount(0);
+						}
+					} finally {
+						this.clearingLogs = false;
+						if (!this.plugin.isPluginUnloaded()) {
+							this.updateActivity();
+						}
+					}
+				}),
+		);
+
+		for (const [button, icon] of [
+			[this.copyLogsButton, "copy"],
+			[this.openLogsButton, "external-link"],
+			[this.clearLogsButton, "trash-2"],
+		] as const) {
+			if (!button) {
+				continue;
+			}
+			const label = button.buttonEl.textContent ?? "";
+			button.buttonEl.empty();
+			const iconEl = button.buttonEl.createSpan({
+				cls: "sync-log-button-icon",
+				attr: { "aria-hidden": "true" },
+			});
+			setIcon(iconEl, icon);
+			button.buttonEl.createSpan({
+				text: label,
+			});
+		}
+	}
+
 	display(): void {
 		this.displayed = true;
+		this.plugin.setSettingsStatusVisible(true);
 		this.renderSettings();
 	}
 
-	private renderSettings(): void {
+	private renderSettings(refreshBackup = true): void {
 		if (!this.displayed) {
 			return;
 		}
@@ -423,6 +625,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.backupButton = null;
 		this.encryptionButton = null;
 		this.clearLogsButton = null;
+		this.copyLogsButton = null;
+		this.openLogsButton = null;
 		this.encryptionToggle = null;
 		this.encryptionSpinner = null;
 		this.controls = [];
@@ -460,13 +664,40 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			this.plugin.onSyncActivityChange(() => this.updateActivity()),
 		];
 		this.updateActivity();
-		void this.renderDisplay(this.controlsEl, this.renderGeneration);
+		void this.renderDisplay(
+			this.controlsEl,
+			this.renderGeneration,
+			refreshBackup,
+		);
 	}
 
 	private async renderDisplay(
 		containerEl: HTMLElement,
 		generation: number,
+		refreshBackup: boolean,
 	): Promise<void> {
+		new Setting(containerEl)
+			.setName(t("settings.language"))
+			.setDesc(t("settings.language_desc"))
+			.addDropdown((dropdown) => {
+				dropdown.addOption("system", t("settings.language_system"));
+				for (const [code, label] of Object.entries(LANGUAGE_NAMES)) {
+					dropdown.addOption(code, label);
+				}
+				dropdown.setValue(this.plugin.settings.language);
+				this.trackControl(dropdown);
+				dropdown.onChange(async (value) => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					await this.applyDraft({
+						language: normalizeLanguagePreference(value),
+					});
+					if (!this.plugin.isPluginUnloaded()) {
+						this.renderSettings(false);
+					}
+				});
+			});
 		const migrationPending = this.plugin.isStableMigrationPending();
 
 		// Connection section
@@ -490,8 +721,27 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_5") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_6") });
 		instructionDiv.createDiv({ text: t("settings.oauth_instruction_7") });
+		instructionDiv.createDiv({ text: t("settings.oauth_instruction_8") });
 
 		const controlEl = oauthSetting.controlEl;
+
+		controlEl.createEl("label", { text: t("settings.remote_path") });
+		new TextComponent(controlEl)
+			.setPlaceholder(t("settings.remote_path_placeholder"))
+			.setValue(this.plugin.settings.remotePath)
+			.then((control) => {
+				control.inputEl.setAttribute(
+					"aria-label",
+					t("settings.remote_path"),
+				);
+				this.trackControl(control);
+			})
+			.onChange(async (value) => {
+				if (this.isActionUnavailable()) {
+					return;
+				}
+				await this.applyDraft({ remotePath: value });
+			});
 
 		new ButtonComponent(controlEl)
 			.setButtonText(t("settings.manage_clients"))
@@ -534,6 +784,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		controlEl.createEl("label", { text: t("settings.oauth_token") });
 		new TextComponent(controlEl)
+			.then((control) => {
+				control.inputEl.type = "password";
+				control.inputEl.autocomplete = "off";
+				control.inputEl.spellcheck = false;
+				control.inputEl.setAttribute("autocapitalize", "off");
+				control.inputEl.setAttribute("autocorrect", "off");
+			})
 			.setPlaceholder(t("settings.oauth_token_placeholder"))
 			.setValue(this.plugin.settings.yandexTokenSecret)
 			.then((control) => this.trackControl(control))
@@ -544,9 +801,16 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				await this.applyDraft({ yandexTokenSecret: value });
 			});
 
-		this.syncButton = new ButtonComponent(controlEl)
-			.setButtonText(t("settings.sync_button"))
-			.setCta();
+		this.syncButton = new ButtonComponent(controlEl).setCta();
+		this.syncButton.buttonEl.addClass("connection-sync-button");
+		this.syncButton.buttonEl.setAttribute(
+			"aria-label",
+			t("settings.sync_button"),
+		);
+		this.syncButton.buttonEl.createSpan({
+			cls: "connection-sync-button-label",
+			text: t("settings.sync_button"),
+		});
 		this.trackControl(this.syncButton);
 		this.syncButton.onClick(async () => {
 			if (this.isActionUnavailable()) {
@@ -559,23 +823,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			}
 		});
 		this.updateActivity();
-
-		// Remote path
-		new Setting(containerEl)
-			.setName(t("settings.remote_path"))
-			.setDesc(t("settings.remote_path_desc"))
-			.addText((text) =>
-				text
-					.setPlaceholder(t("settings.remote_path_placeholder"))
-					.setValue(this.plugin.settings.remotePath)
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({ remotePath: value });
-					}),
-			);
 
 		// Automatic sync section
 		new Setting(containerEl)
@@ -908,69 +1155,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		// View logs button
-		new Setting(loggingEl)
-			.addButton((button) =>
-				button
-					.setButtonText(t("settings.view_logs_button"))
-					.setCta()
-					.then((control) => this.trackControl(control, true))
-					.onClick(() => {
-						if (this.plugin.isPluginUnloaded()) {
-							return;
-						}
-						new LogViewerModal(
-							this.app,
-							() => !this.plugin.isPluginUnloaded(),
-						).open();
-					}),
-			)
-			.addButton((button) =>
-				button
-					.setButtonText(t("settings.clear_logs_button"))
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					.setWarning()
-					.then((control) => {
-						this.clearLogsButton = control;
-						this.trackControl(control, true);
-					})
-					.onClick(async () => {
-						if (
-							this.clearingLogs ||
-							this.plugin.isPluginUnloaded()
-						) {
-							return;
-						}
-						const generation = this.renderGeneration;
-						this.clearingLogs = true;
-						this.updateActivity();
-						try {
-							await clearLogsWithConfirmation(
-								this.app,
-								() =>
-									this.displayed &&
-									generation === this.renderGeneration &&
-									!this.plugin.isPluginUnloaded(),
-							);
-						} finally {
-							this.clearingLogs = false;
-							this.updateActivity();
-						}
-					}),
-			);
-
-		// Information section
-		new Setting(containerEl)
-			.setName(t("settings.information_section"))
-			.setHeading();
-
-		// Device ID
-		new Setting(containerEl)
-			.setName(t("settings.device_id"))
-			.setDesc(t("settings.device_id_desc"))
-			.addText((text) =>
-				text.setValue(this.plugin.settings.deviceId).setDisabled(true),
-			);
+		this.renderLogActions(loggingEl, generation);
 
 		// Backup section
 		new Setting(containerEl)
@@ -979,7 +1164,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.setHeading();
 
 		// Combined backup status and button
-		const lastBackupText = await this.getLastBackupText();
+		const lastBackupText = await this.getLastBackupText(refreshBackup);
 		if (generation !== this.renderGeneration) {
 			return;
 		}
@@ -1064,6 +1249,19 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 							},
 						).open();
 					}),
+			);
+
+		// Information section
+		new Setting(containerEl)
+			.setName(t("settings.information_section"))
+			.setHeading();
+
+		// Device ID
+		new Setting(containerEl)
+			.setName(t("settings.device_id"))
+			.setDesc(t("settings.device_id_desc"))
+			.addText((text) =>
+				text.setValue(this.plugin.settings.deviceId).setDisabled(true),
 			);
 
 		this.updateActivity();

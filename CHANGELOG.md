@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.1.0
+
+Changes since `2.0.0`.
+
+### Added
+
+- Kazakh, Belarusian and Uzbek (Latin) interface translations alongside English
+  and Russian. The language selector defaults to Obsidian's language and applies
+  a saved manual override immediately, including commands, tooltips and status.
+- Localized domain failure explanations and date/size formatting. Added a
+  dictionary/reference/placeholder check with `npm run check:i18n`.
+
+### Changed
+
+- Moved remote folder selection to the first step of Connection settings and
+  clarified the required Yandex OAuth permissions. Masked the token input.
+  Connection controls adapt to the panel width, and the Synchronize button keeps
+  its size while displaying the connection or synchronization loader.
+- New connections and token or remote folder changes now wait for an explicit
+  **Synchronize** action. Connection checks, encrypted-vault password prompts and
+  automatic sync wait until a manual full sync succeeds and its state is saved,
+  including after restarting Obsidian. Existing connections keep automatic startup
+  until their token or remote folder changes.
+- While settings are open, one notification mirrors the indicator's status,
+  progress, retries and errors; it hides when idle or when settings close.
+- Replaced the built-in log viewer with a responsive group of **Copy logs**,
+  **Open log file** and **Clear log file** buttons. Copying uses the latest 4,000
+  sanitized characters; the tooltip updates the count on hover, focus and copy.
+  Clearing requires confirmation. External opening reports missing files,
+  unsupported Obsidian versions and opening errors.
+- Added **Open log file** beside **Copy logs** in the expanded indicator. Log
+  actions remain available during synchronization and prevent duplicate clicks
+  without changing their labels or showing loaders. Indicator tooltips appear
+  above the controls.
+- Moved device information below the backup settings.
+
 ## 2.0.0
 
 Changes since stable `1.1.0`.

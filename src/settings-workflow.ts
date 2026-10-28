@@ -1,12 +1,12 @@
-import { t } from "./i18n/index";
+import { normalizeLanguagePreference, t } from "./i18n/index";
 import { withFailureContext } from "./errors";
-import type { StartupInvocation, StartupState } from "./plugin-startup";
 import type { SyncResult } from "./types";
 import type { SyncEngine } from "./sync/engine";
 import type { FileWatcher } from "./sync/realtime/watcher";
 import type { YandexDiskSyncSettings } from "./types";
 
 const USER_SETTING_KEYS = [
+	"language",
 	"clientId",
 	"yandexTokenSecret",
 	"remotePath",
@@ -63,6 +63,12 @@ export function prepareSettingsPatch(
 	) {
 		throw new Error("Invalid scheduling setting");
 	}
+	if (
+		patch.language !== undefined &&
+		normalizeLanguagePreference(patch.language) !== patch.language
+	) {
+		throw new Error("Invalid language preference");
+	}
 	const changed = USER_SETTING_KEYS.filter(
 		(key) =>
 			key in patch &&
@@ -84,6 +90,7 @@ export function prepareSettingsPatch(
 		settings: {
 			...current,
 			...patch,
+			manualSyncRequired: current.manualSyncRequired || changesConnection,
 			syncPatterns: [...(patch.syncPatterns ?? current.syncPatterns)],
 			excludePatterns: [
 				...(patch.excludePatterns ?? current.excludePatterns),
@@ -100,56 +107,38 @@ export function prepareSettingsPatch(
 		),
 		changesDestination: changed.includes("remotePath"),
 		changesTransitionScope: changed.some((key) => scopeKeys.includes(key)),
-		needsFull: changesConnection || changesFileScope,
 	};
 }
 
-export type SettingsUpdateStage =
-	"watcher-persistence" | "persisting" | "startup" | "sync";
+export type SettingsUpdateStage = "watcher-persistence" | "persisting";
 
 interface SettingsWorkflowPorts {
 	getSettings(): YandexDiskSyncSettings;
 	persistenceFailed(): boolean;
 	persistenceRecoveryGeneration?(): number | undefined;
-	completePersistenceRecovery?(generation: number): void;
 	isConfigurationBusy(): boolean;
 	hasTransition(): boolean;
 	hasDurableConfigurationWork(): boolean;
 	isUnloaded(): boolean;
 	isLayoutReady(): boolean;
-	setUpdating(updating: boolean, synchronizing?: boolean): void;
+	setUpdating(updating: boolean): void;
 	stopRegularSync(): void;
-	startAutomation(): void;
 	refreshAutomation?(): void;
 	settingsSaveRejected(error: unknown, stage: SettingsUpdateStage): void;
 	persistPluginData(patch: UserSettingsPatch): Promise<void>;
-	runStartupInvocation?<T>(
-		action: (invocation: StartupInvocation) => Promise<T>,
-	): Promise<T>;
-	refreshRemoteStartupState(
-		prompt: boolean,
-		recovery: boolean,
-		invocation?: StartupInvocation,
-	): Promise<StartupState>;
-	reconcile(invocation?: StartupInvocation): Promise<SyncResult | null>;
-	watcher?: Pick<FileWatcher, "waitForPendingPersistence" | "start">;
+	reconcile(): Promise<SyncResult | null>;
+	watcher?: Pick<FileWatcher, "waitForPendingPersistence">;
 	engine?: Pick<
 		SyncEngine,
 		"hasPendingWork" | "setExternalBlock" | "isSyncPaused"
 	>;
 }
 
-/** Drain watcher work before enqueueing a draft; publish and reclassify after save. */
+/** Persist a draft locally; reconcile admitted scope changes after releasing the settings lock. */
 export async function applyUserSettingsPatch(
 	deps: SettingsWorkflowPorts,
 	patch: UserSettingsPatch,
-	invocation?: StartupInvocation,
 ): Promise<void> {
-	if (!invocation && deps.runStartupInvocation) {
-		return await deps.runStartupInvocation((owned) =>
-			applyUserSettingsPatch(deps, patch, owned),
-		);
-	}
 	const draft = prepareSettingsPatch(deps.getSettings(), patch);
 	patch = {
 		...patch,
@@ -167,7 +156,10 @@ export async function applyUserSettingsPatch(
 		return;
 	}
 	let requiresIdle = draft.requiresIdle || recoveringPersistence;
-	let stopsAutomation = draft.needsFull || recoveringPersistence;
+	let stopsAutomation =
+		draft.changesConnection ||
+		draft.changesFileScope ||
+		recoveringPersistence;
 	if (
 		requiresIdle &&
 		(deps.isConfigurationBusy() ||
@@ -179,12 +171,12 @@ export async function applyUserSettingsPatch(
 		throw new Error(t("notice.configuration_busy"));
 	}
 	if (requiresIdle) {
-		deps.setUpdating(true, stopsAutomation);
+		deps.setUpdating(true);
 	}
 	if (stopsAutomation) {
 		deps.stopRegularSync();
 	}
-	let automationReady = false;
+	let reconcile = false;
 	let stage: SettingsUpdateStage = "watcher-persistence";
 	try {
 		if (stopsAutomation) {
@@ -220,7 +212,7 @@ export async function applyUserSettingsPatch(
 			if (!requiresIdle) {
 				requiresIdle = true;
 			}
-			deps.setUpdating(true, true);
+			deps.setUpdating(true);
 			stopsAutomation = true;
 			deps.stopRegularSync();
 			stage = "watcher-persistence";
@@ -232,34 +224,12 @@ export async function applyUserSettingsPatch(
 		if (repairingPersistence && !deps.persistenceFailed()) {
 			deps.engine?.setExternalBlock("persistence", null);
 		}
-		if (stopsAutomation) {
-			stage = "startup";
-			const ready = await deps.refreshRemoteStartupState(
-				draft.changesConnection &&
-					deps.isLayoutReady() &&
-					!deps.engine?.isSyncPaused(),
-				false,
-				invocation,
-			);
-			if (
-				ready === "ready" &&
-				!deps.isUnloaded() &&
-				deps.isLayoutReady() &&
-				!deps.engine?.isSyncPaused()
-			) {
-				if (draft.needsFull || repairingPersistence) {
-					stage = "sync";
-					const result = await deps.reconcile(invocation);
-					if (!result?.success) {
-						return;
-					}
-					if (recoveryGeneration !== undefined) {
-						deps.completePersistenceRecovery?.(recoveryGeneration);
-					}
-				}
-				automationReady = true;
-			}
-		}
+		reconcile =
+			stopsAutomation &&
+			!deps.getSettings().manualSyncRequired &&
+			!deps.isUnloaded() &&
+			deps.isLayoutReady() &&
+			!deps.engine?.isSyncPaused();
 	} catch (error) {
 		withFailureContext(error, {
 			stage,
@@ -276,9 +246,7 @@ export async function applyUserSettingsPatch(
 		if (requiresIdle) {
 			deps.setUpdating(false);
 		}
-		if (automationReady) {
-			deps.startAutomation();
-		} else if (
+		if (
 			!stopsAutomation &&
 			draft.changesAutomation &&
 			!deps.isUnloaded() &&
@@ -286,5 +254,8 @@ export async function applyUserSettingsPatch(
 		) {
 			deps.refreshAutomation?.();
 		}
+	}
+	if (reconcile) {
+		await deps.reconcile();
 	}
 }

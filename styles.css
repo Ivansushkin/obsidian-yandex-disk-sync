@@ -127,7 +127,7 @@
 }
 
 .yandex-sync-indicator[open] .yandex-sync-indicator-summary {
-	max-width: calc(100% - 100px);
+	max-width: calc(100% - 146px);
 }
 
 .yandex-sync-indicator-actions {
@@ -329,10 +329,24 @@
 /* Connection setup block */
 .connection-block {
 	margin-bottom: 24px;
+	container-type: inline-size;
 }
 
 .connection-block .setting-item {
 	border-top: none;
+}
+
+.connection-block .setting-item-info {
+	min-width: 0;
+}
+
+.connection-block .setting-item-control {
+	flex: 0 0 22ch;
+	min-width: 0;
+}
+
+.is-phone .connection-block .setting-item-control {
+	flex-basis: auto;
 }
 
 .connection-block .setting-item-control input {
@@ -347,22 +361,47 @@
 	color: var(--text-muted);
 }
 
-/* Log viewer modal */
-.log-viewer-field {
-	flex-direction: column;
-	align-items: stretch;
+@container (max-width: 34em) {
+	.connection-block .setting-item {
+		flex-direction: column;
+		align-items: stretch;
+	}
+
+	.connection-block .setting-item-info {
+		margin-inline-end: 0;
+	}
+
+	.connection-block .setting-item-control {
+		flex-basis: auto;
+		width: 100%;
+	}
 }
 
-.log-viewer-field .setting-item-control {
+.sync-log-actions.setting-item {
+	display: block;
+	border-bottom: 0;
+	padding: var(--size-4-4, 16px);
+}
+
+.sync-log-actions.setting-item .setting-item-control {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: wrap;
+	justify-content: flex-start;
+	gap: 8px;
 	width: 100%;
+	margin: 0;
+}
+
+.sync-log-actions.setting-item .setting-item-control button {
+	flex: 1 1 180px;
+	gap: var(--size-4-2);
 	min-width: 0;
 }
 
-.log-viewer-textarea {
-	width: 100%;
-	min-width: 0;
-	font-family: var(--font-monospace);
-	font-size: 11px;
+.sync-log-button-icon {
+	display: flex;
+	flex-shrink: 0;
 }
 
 /* OAuth instruction */
@@ -707,6 +746,20 @@
 	flex-shrink: 0;
 	vertical-align: middle;
 	animation: encryption-spin 0.8s linear infinite;
+}
+
+.connection-sync-button {
+	position: relative;
+}
+
+.connection-sync-button.sync-button-active .connection-sync-button-label {
+	visibility: hidden;
+}
+
+.connection-sync-button.sync-button-active::before {
+	position: absolute;
+	inset: 0;
+	margin: auto;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1,3 +1,4 @@
+import type { LanguagePreference } from "./i18n";
 import type { FailureSummary, OperationFailure, RetryProgress } from "./errors";
 /**
  * Types and interfaces for Yandex Disk synchronization plugin
@@ -11,8 +12,12 @@ import { createSafeRecord } from "./utils/record-utils";
 // ============================================================================
 
 export interface YandexDiskSyncSettings {
+	/** Local interface override; system follows Obsidian language. */
+	language: LanguagePreference;
 	/** OAuth token stored only in local plugin data */
 	yandexTokenSecret: string;
+	/** Require an explicit full sync before automation can use this connection. */
+	manualSyncRequired: boolean;
 	/** Client ID for Yandex OAuth application */
 	clientId: string;
 	/** Path to folder on Yandex Disk */
@@ -54,7 +59,9 @@ export interface YandexDiskSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
+	language: "system",
 	yandexTokenSecret: "",
+	manualSyncRequired: false,
 	clientId: "",
 	remotePath: "obsidian-sync",
 	syncInterval: 5,
