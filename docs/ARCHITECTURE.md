@@ -392,3 +392,52 @@ Capacity timeout отличается от native timeout; late reply помеч
 двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Machine-readable
 [release evidence](release-evidence/2.1.0.json) сохраняет фактический статус ручной
 приёмки и не обновляется автоматически из unit results.
+
+## Mobile lifecycle recovery
+
+`MobileSyncRecovery` управляет только admission и одним runtime recovery request
+на Android/iOS (`Platform.isMobileApp`). `main.ts` связывает browser events и live
+ports с существующим full; единственный `SyncCoordinator`, persistence и canonical
+protocol не меняются. Desktop не получает новую lifecycle policy.
+
+Hidden запрещает новые automatic workflows, но admitted workflow, включая full
+preparation, завершается по прежним guards. Watcher остаётся подписан и сохраняет
+события; его automatic drain и scheduler ждут восстановления. Explicit full
+preparation/settlement не блокируются этим admission. Debounce/ready references
+уже представлены в durable queue: drain снимает scheduling references, не
+реинжектит старые события поверх более новых. Ручная pause и
+`manualSyncRequired` независимы от visibility; realtime off плюс interval 0
+сохраняют ручной режим. Холодный запуск использует обычный startup.
+
+Visibility return, online, persisted pageshow и optional freeze/resume — hints,
+не доказательство состояния ОС. Видимый runtime проверяет execution gap каждые
+5 s; gap >=30 s или сдвиг часов назад запрашивает recheck без causal выводов.
+Hidden heartbeat выключен. Сигналы объединяются за 500 ms. Recovery ждёт coordinator,
+outer full/configuration/foreground settlement и фактического settlement всех native
+requests; старый full promise не используется как новая попытка. Свежий full,
+начатый после request, может закрыть его только после coherent persistence
+и подтверждения своей engine session через owned activity; coalesced результат
+старого scheduled full не подтверждает новый request.
+
+Recovery использует новую invocation, manifest/canonical observations и budgets.
+После transient transport failure — до трёх outer retries через 5/15/60 s после
+settlement, только в visible состоянии. Повторные hints не обнуляют текущий budget;
+после исчерпания нужны новый return/online/schedule или manual full. Access, local,
+unknown и semantic/safety failures не получают automatic retry. Pending запрос
+отзывается при смене configuration generation (включая ABA), pause, отключении
+автоматики и unload; позднее завершение не закрывает request нового поколения.
+
+`YandexDiskClient` хранит только runtime count/start time native reads/writes до
+их реального settlement. Отмена caller wait не освобождает native permit и не
+отменяет PUT/MOVE/DELETE. Зависший native request оставляет recovery ожидающим;
+после 60 s общая presentation поясняет неизвестный результат без terminal success,
+отдельного Notice или утверждения, что телефон был заблокирован. Автосброс клиента,
+coordinator и повтор неразрешённой записи запрещены. Существующие Force/encryption
+checkpoint/recovery и irreversible commit boundary сохраняются.
+
+Persisted formats/metadata не расширяются. Корректность crash/restart опирается на
+сохранённое до side effects намерение, прежние ID/FIFO и проверку результата; ни
+freeze, ни unload callback не считаются гарантированными. Потеря доступа к local
+storage/remote read никогда не означает пустое дерево. Новые правила проверяются
+в `tests/mobile-recovery.test.ts`; реальная Android/iOS приёмка —
+`TC-MOBILE-RECOVERY-01`, до неё release evidence остаётся pending.

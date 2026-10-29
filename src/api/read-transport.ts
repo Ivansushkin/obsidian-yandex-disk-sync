@@ -2,6 +2,13 @@ import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { RemoteReadTimeoutError, RemoteReadInterruptedError } from "../errors";
 import { logger } from "../utils/logger";
 
+/** Aggregate native occupancy; never carries request parameters or service data. */
+export interface NativeRequestActivity {
+	reads: number;
+	writes: number;
+	oldestStartedAt: number | null;
+}
+
 export interface RemoteReadBudget {
 	deadline: number;
 	timeoutMs: number;

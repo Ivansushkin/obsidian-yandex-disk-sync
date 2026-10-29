@@ -78,7 +78,9 @@ export class RemoteReadTimeoutError extends Error {
 		readonly requestState: "unresolved" | "not-started" = "unresolved",
 	) {
 		super(
-			`Remote read timed out after ${timeoutMs / 1000}s (${operation})`,
+			timeoutMs > 0
+				? `Remote read timed out after ${timeoutMs / 1000}s (${operation})`
+				: `Remote read timed out: deadline exhausted (${operation})`,
 		);
 		this.name = "RemoteReadTimeoutError";
 	}

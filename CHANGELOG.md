@@ -14,6 +14,15 @@ Changes since `2.0.0`.
 
 ### Changed
 
+- Mobile synchronization now rechecks storage after returning to Obsidian or an
+  execution gap. Lifecycle hints share one bounded recovery request; hidden
+  applications retain local events and defer new automatic workflows. Already
+  admitted work can finish. Recovery waits for actual native request settlement
+  and preserves manual-only mode, pauses and connection activation requirements.
+- Native request diagnostics distinguish pending reads and writes without
+  cancelling server operations. Exhausted read deadlines no longer report a
+  misleading zero-second timeout.
+
 - Connected devices request rotated passwords after sync settles and resume once
   connected. Cancel/wrong password waits for manual retry or a new target.
 - New encryption passwords require 4–30 Unicode code points, with localized

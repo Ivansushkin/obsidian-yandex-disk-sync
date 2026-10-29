@@ -74,6 +74,11 @@ import { createSyncFailure, formatOperationFailure } from "./sync/errors";
 import { FileWatcher } from "./sync/realtime/watcher";
 import { SyncScheduler } from "./sync/scheduler";
 import {
+	MobileSyncRecovery,
+	mobileRecoveryOutcome,
+	isMobileRetryableFailure,
+} from "./sync/mobile-recovery";
+import {
 	ForceSyncController,
 	type ForceDirection,
 	type ForceFlowState,
@@ -83,6 +88,7 @@ import {
 	DEFAULT_SETTINGS,
 	RemoteEncryptionManifest,
 	SyncResult,
+	type SyncState,
 	YandexDiskSyncSettings,
 } from "./types";
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
@@ -120,6 +126,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private syncEngine!: SyncEngine;
 	private fileWatcher!: FileWatcher;
 	private syncScheduler!: SyncScheduler;
+	private mobileRecovery: MobileSyncRecovery | null = null;
+	private lastFullFailure?: FailureSummary;
 	private backupManager!: BackupManager;
 	private syncIndicator: SyncIndicator | null = null;
 	private sidebarButton: HTMLElement | null = null;
@@ -247,6 +255,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.createSyncIndicator();
 		this.createSyncSidebarButton();
 
+		this.initializeMobileRecovery();
+
 		// Wait for layout ready to start synchronization
 		this.app.workspace.onLayoutReady(() => {
 			void this.onLayoutReady();
@@ -257,6 +267,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.unloaded = true;
+		this.mobileRecovery?.dispose();
 		this.encryptionWorkflow?.admission.resetAutomaticPasswordRequests();
 		this.setSettingsStatusVisible(false);
 		this.yandexClient?.stopReads();
@@ -556,11 +567,109 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.register(this.bindAutomaticPasswordRequests());
 	}
 
+	/** Wire browser lifecycle hints to the existing full-sync and activity owners on mobile only. */
+	private initializeMobileRecovery(): void {
+		if (!Platform.isMobileApp) {
+			return;
+		}
+		const doc = this.app.workspace.containerEl.ownerDocument;
+		const win = doc.defaultView ?? window;
+		this.mobileRecovery = new MobileSyncRecovery({
+			read: () => ({
+				generation:
+					this.connectionGeneration +
+					this.yandexClient.getReadConfigurationVersion(),
+				enabled: Boolean(
+					!this.unloaded &&
+					!this.persistence.failed &&
+					!this.settings.manualSyncRequired &&
+					this.settings.yandexTokenSecret &&
+					this.app.workspace.layoutReady &&
+					!this.syncEngine.isSyncPaused() &&
+					(this.settings.enableRealtimeSync ||
+						this.settings.syncInterval > 0),
+				),
+				visible: doc.visibilityState === "visible",
+				busy:
+					this.isConfigurationBusy() ||
+					this.activeFullPromise !== null ||
+					this.activeManualFullPromise !== null,
+				blocked: Boolean(
+					this.migrationBlockReason ||
+					this.historicalBlockReason ||
+					this.encryptionBlockReason ||
+					(this.forceBlockReason && !this.forceRecovery?.direct) ||
+					(this.authenticationBlockReason &&
+						!isMobileRetryableFailure(
+							this.syncEngine.getState().failure,
+						)),
+				),
+				native: this.yandexClient.getNativeRequestActivity(),
+			}),
+			run: async () => {
+				const result = await this.getStartup().runInvocation(
+					(invocation) =>
+						this.runFullSync(
+							{ trigger: "automatic" },
+							false,
+							false,
+							invocation,
+							true,
+						),
+				);
+				return mobileRecoveryOutcome(result, this.lastFullFailure);
+			},
+			changed: () => {
+				this.fileWatcher.notifyAutomaticAdmissionChanged();
+				this.notifyManualActivity();
+				this.updateSettingsStatusNotice();
+			},
+		});
+		this.fileWatcher.setAutomaticAdmission(
+			() => this.mobileRecovery?.canStartAutomatic() ?? true,
+		);
+		this.syncScheduler.setAutomaticAdmission(
+			() => this.mobileRecovery?.canStartAutomatic() ?? true,
+			() => this.mobileRecovery?.request("schedule"),
+		);
+		this.registerDomEvent(doc, "visibilitychange", () =>
+			this.mobileRecovery?.notifyActivityChanged(),
+		);
+		this.registerDomEvent(win, "online", () =>
+			this.mobileRecovery?.request("online"),
+		);
+		this.registerDomEvent(win, "pageshow", (event) => {
+			if (event.persisted) {
+				this.mobileRecovery?.request("pageshow");
+			}
+		});
+		for (const event of ["freeze", "resume"] as const) {
+			const listener = () => this.mobileRecovery?.request(event);
+			doc.addEventListener(event, listener);
+			this.register(() => doc.removeEventListener(event, listener));
+		}
+		this.register(
+			this.syncEngine.onStateChange(() =>
+				this.mobileRecovery?.notifyActivityChanged(),
+			),
+		);
+		this.register(
+			this.yandexClient.onNativeActivityChange(() =>
+				this.mobileRecovery?.notifyActivityChanged(),
+			),
+		);
+		this.register(() => this.mobileRecovery?.dispose());
+		this.mobileRecovery.notifyActivityChanged();
+	}
+
 	/** Wire settled host activity to admission without holding a sync session. */
 	private bindAutomaticPasswordRequests(): () => void {
 		this.encryptionWorkflow.admission.configureAutomaticPasswordRequests({
 			isAllowed: () =>
 				Boolean(
+					(!Platform.isMobileApp ||
+						this.app.workspace.containerEl.ownerDocument
+							.visibilityState === "visible") &&
 					!this.unloaded &&
 					!this.persistence.failed &&
 					!this.settings.manualSyncRequired &&
@@ -626,6 +735,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			syncUnavailable: this.isConfigurationBusy(),
 			manualSyncRequired: this.settings.manualSyncRequired,
 			operationError: this.operationIssue?.message,
+			mobileRecovery: this.mobileRecovery?.getPresentation(),
 		};
 	}
 
@@ -785,6 +895,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	 * Callback when layout is ready
 	 */
 	private async onLayoutReady(invocation?: StartupInvocation): Promise<void> {
+		if (this.mobileRecovery && !this.mobileRecovery.canStartAutomatic()) {
+			this.mobileRecovery.request("schedule");
+			return;
+		}
 		if (!invocation) {
 			logger.info("Startup layout ready", {
 				elapsedSincePluginLoadMs: Date.now() - this.pluginLoadStartedAt,
@@ -1043,6 +1157,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		showProgressNotice = !options?.startup,
 		forceFinalization = false,
 		invocation?: StartupInvocation,
+		mobileRecovery = false,
 	): Promise<SyncResult | null> {
 		if (!invocation) {
 			return await this.getStartup().runInvocation((owned) =>
@@ -1051,11 +1166,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					showProgressNotice,
 					forceFinalization,
 					owned,
+					mobileRecovery,
 				),
 			);
 		}
 		const trigger =
 			options?.trigger ?? (options?.startup ? "automatic" : "manual");
+		if (
+			trigger === "automatic" &&
+			!mobileRecovery &&
+			this.mobileRecovery &&
+			!this.mobileRecovery.canStartAutomatic()
+		) {
+			this.mobileRecovery.request("schedule");
+			return null;
+		}
 		if (this.settings.manualSyncRequired && trigger === "automatic") {
 			return null;
 		}
@@ -1075,6 +1200,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (showProgressNotice && this.activeManualFullPromise) {
 			return await this.activeManualFullPromise;
 		}
+		const recoveryTicket = this.mobileRecovery?.beginFull();
+		let fullSucceeded = false;
+		let ownFullAdmitted = false;
+		const fullOptions = this.mobileRecovery
+			? {
+					...options,
+					onActivity: (state: SyncState) => {
+						ownFullAdmitted = true;
+						options?.onActivity?.(state);
+					},
+				}
+			: options;
+		this.lastFullFailure = undefined;
 		this.beginConnectionCheck();
 		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
 		this.notifyManualActivity();
@@ -1097,11 +1235,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							invocation,
 						);
 				if (startupState !== "ready" || this.unloaded) {
+					this.lastFullFailure = this.syncEngine.getState().failure;
 					return null;
 				}
 				const recoveryGeneration = this.persistence.recoveryGeneration;
 				const result = await this.syncEngine.fullSync(
-					options,
+					fullOptions,
 					this.forceRecovery?.direct ? undefined : invocation.reads,
 				);
 
@@ -1137,12 +1276,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					return result;
 				}
 				if (result.success) {
+					fullSucceeded = ownFullAdmitted;
 					this.automationReady = true;
 					this.clearOperationIssue();
 				}
 				return result;
 			} catch (e) {
 				logger.error("Sync error:", { error: e });
+				this.lastFullFailure = createSyncFailure(e, {
+					stage: "sync",
+					action: "unknown",
+				}).summary;
 				this.presentOperationIssue(
 					"sync",
 					formatOperationFailure(
@@ -1159,6 +1303,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		const promise = run().finally(() => {
 			if (this.activeFullPromise === promise) {
 				this.activeFullPromise = null;
+			}
+			if (recoveryTicket) {
+				this.mobileRecovery?.completeFull(
+					recoveryTicket,
+					fullSucceeded,
+				);
 			}
 			this.activeFullRuns--;
 			this.notifyManualActivity();
@@ -1594,6 +1744,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private notifyManualActivity(): void {
+		this.mobileRecovery?.notifyActivityChanged();
 		this.syncIndicator?.update();
 		for (const callback of this.manualActivityListeners ?? []) {
 			try {
@@ -1672,6 +1823,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		remoteReady = false,
 		invocation?: StartupInvocation,
 	): Promise<void> {
+		if (this.mobileRecovery && !this.mobileRecovery.canStartAutomatic()) {
+			this.mobileRecovery.request("schedule");
+			return;
+		}
 		if (!invocation) {
 			return await this.getStartup().runInvocation((owned) =>
 				this.startSync(startup, remoteReady, owned),
@@ -2155,6 +2310,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.backupManager) {
 			this.backupManager.updateSettings(this.settings);
 		}
+		this.mobileRecovery?.notifyActivityChanged();
 		if (remoteConfigurationChanged) {
 			this.encryptionWorkflow?.admission.resetAutomaticPasswordRequests();
 			this.setAuthenticationBlock(null);

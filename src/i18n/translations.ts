@@ -13,6 +13,10 @@ export const translations: Record<Language, Record<string, string>> = {
 	be,
 	uz,
 	en: {
+		"status.mobile.waiting_native":
+			"Waiting for a sent network request to finish. Its result is not yet known; synchronization will continue after it finishes.",
+		"status.mobile.recovery_backoff":
+			"Synchronization will retry after a short wait while the application is visible.",
 		"failure.details": "Technical details: {message}",
 		"failure.reason.mandatory-backup-failed":
 			"A required protective copy could not be saved. Local replacement was blocked.",
@@ -592,6 +596,10 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"status.mobile.waiting_native":
+			"Ожидаем завершения отправленного сетевого запроса. Его результат пока неизвестен; синхронизация продолжится после его завершения.",
+		"status.mobile.recovery_backoff":
+			"Синхронизация повторится после небольшой паузы, пока приложение открыто.",
 		"failure.details": "Технические подробности: {message}",
 		"failure.reason.mandatory-backup-failed":
 			"Не удалось сохранить обязательную защитную копию. Локальная замена заблокирована.",

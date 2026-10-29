@@ -55,6 +55,7 @@ export class FileWatcher {
 	private deferredDrainPromise: Promise<void> | null = null;
 	private deferredReplayRequested = false;
 	private startGeneration = 0;
+	private canStartAutomatic: () => boolean = () => true;
 	private isEnabled = false;
 	private isLayoutReady = false;
 	private isPausedForSync = false;
@@ -154,6 +155,20 @@ export class FileWatcher {
 		this.acknowledgeEvents(cutoff);
 		this.epochReplacementObserved = false;
 		await this.waitForPersistence();
+	}
+
+	/** Gate automatic drains while continuing to observe and durably queue local changes. */
+	setAutomaticAdmission(canStart: () => boolean): void {
+		this.canStartAutomatic = canStart;
+	}
+
+	/** Resume queued events after recovery, without bypassing explicit full preparation. */
+	notifyAutomaticAdmissionChanged(): void {
+		if (!this.canStartAutomatic()) {
+			this.drainPendingFileEvents();
+		} else if (this.isEnabled && this.deferredEvents.length > 0) {
+			this.scheduleDeferredReplay();
+		}
 	}
 
 	setPersistCallback(callback: () => void | Promise<void>): void {
@@ -394,7 +409,7 @@ export class FileWatcher {
 			);
 			return;
 		}
-		if (replayIds.size === 0) {
+		if (replayIds.size === 0 || !this.canStartAutomatic()) {
 			return;
 		}
 		void this.flushDeferredEvents(replayIds).catch((e) => {
@@ -734,16 +749,12 @@ export class FileWatcher {
 		this.scheduleSync(file.path, "upload");
 	}
 
-	/** Move queued file events into durable storage and cancel drain timers. */
+	/** Retire scheduling references; their events were already queued for persistence before debounce. */
 	private drainPendingFileEvents(): void {
 		for (const pending of this.debounceTimers.values()) {
 			clearTimeout(pending.timer);
-			this.deferEvent(pending.event);
 		}
 		this.debounceTimers.clear();
-		for (const event of this.readyFileEvents.values()) {
-			this.deferEvent(event);
-		}
 		this.readyFileEvents.clear();
 		if (this.batchFlushTimer) {
 			clearTimeout(this.batchFlushTimer);
@@ -1556,6 +1567,10 @@ export class FileWatcher {
 		}
 		this.batchFlushTimer = setTimeout(() => {
 			this.batchFlushTimer = null;
+			if (!this.canStartAutomatic()) {
+				this.drainPendingFileEvents();
+				return;
+			}
 			void this.flushDeferredEvents().catch((error) => {
 				logger.error("Error synchronizing realtime watcher drain:", {
 					error,
@@ -1574,7 +1589,7 @@ export class FileWatcher {
 		}
 		this.deferredReplayTimer = setTimeout(() => {
 			this.deferredReplayTimer = null;
-			if (!this.isEnabled) {
+			if (!this.isEnabled || !this.canStartAutomatic()) {
 				return;
 			}
 			void this.flushDeferredEvents().catch((error) => {
@@ -1740,6 +1755,7 @@ export class FileWatcher {
 
 	private isWatcherFrozen(): boolean {
 		return (
+			!this.canStartAutomatic() ||
 			this.epochReplacementObserved ||
 			this.isPausedForSync ||
 			this.isPreparingFullSync ||

@@ -1,4 +1,6 @@
 {
+	"status.mobile.waiting_native": "Yuborilgan tarmoq so‘rovining tugashi kutilmoqda. Uning natijasi hali noma’lum; sinxronlash u tugagandan keyin davom etadi.",
+	"status.mobile.recovery_backoff": "Ilova ko‘rinib turganda sinxronlash qisqa tanaffusdan keyin qayta urinadi.",
 	"settings.operation_in_progress": "Bajarilmoqda…",
 	"modal.create_backup_title": "Zaxira nusxa yaratilsinmi?",
 	"modal.create_backup_description": "Sinxronlash filtrlari tanlagan mahalliy ombor fayllarining arxivini yarating. Sozlamalar sinxronlash yoqilgan bo‘lsa, ular ham kiritiladi. Saqlash joyi: {path}. Format: {mode}.",

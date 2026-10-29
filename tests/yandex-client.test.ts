@@ -1095,3 +1095,56 @@ test("paginated inventory rejects a changing total instead of accepting a partia
 	assert.equal(observed.get("vault/missing.md"), null);
 	assert.equal(observed.get("vault/present.md")?.type, "file");
 });
+
+test("native activity retains timed out reads and pending writes until actual settlement", async () => {
+	const read = deferred<ReturnType<typeof response>>();
+	const write = deferred<ReturnType<typeof response>>();
+	const writeEntered = deferred();
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		if (params.method === "PUT") {
+			writeEntered.resolve();
+			return write.promise;
+		}
+		if (params.url.includes("/resources/upload?")) {
+			return response(200, { href: "https://synthetic.invalid/upload" });
+		}
+		return read.promise;
+	};
+	const client = createClient({
+		apiReadAttemptTimeoutMs: 5,
+		downloadTimeoutMs: 20,
+	});
+	const uploading = client.uploadFile(
+		"vault/note.md",
+		"synthetic",
+		true,
+		true,
+	);
+	const reading = assert.rejects(
+		client.getResource("vault/other.md"),
+		/timed out/,
+	);
+	try {
+		await writeEntered.promise;
+		await reading;
+		client.interruptReads();
+		const activity = client.getNativeRequestActivity();
+		assert.equal(activity.reads, 1);
+		assert.equal(activity.writes, 1);
+		assert.equal(typeof activity.oldestStartedAt, "number");
+		read.resolve(response(200, fileResource("vault/other.md")));
+		write.resolve(response(201));
+		await uploading;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(client.getNativeRequestActivity(), {
+			reads: 0,
+			writes: 0,
+			oldestStartedAt: null,
+		});
+	} finally {
+		read.resolve(response(200));
+		write.resolve(response(201));
+		await uploading.catch(() => {});
+		delete requestGlobal.__obsidianRequestUrl;
+	}
+});

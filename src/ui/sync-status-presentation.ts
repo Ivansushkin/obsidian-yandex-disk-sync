@@ -1,3 +1,4 @@
+import type { MobileRecoveryPresentation } from "../sync/mobile-recovery";
 import { formatOperationFailure } from "../sync/errors";
 import type { RetryProgress } from "../errors";
 import type { ForceFlowState } from "../sync/workflows/force-controller";
@@ -106,6 +107,7 @@ export interface SyncIndicatorContext {
 	syncUnavailable: boolean;
 	manualSyncRequired?: boolean;
 	operationError?: string;
+	mobileRecovery?: MobileRecoveryPresentation;
 }
 
 export interface SyncPresentation {
@@ -206,6 +208,14 @@ export function getSyncPresentation(
 			text = t("status.mobile.error");
 		}
 		detail = context.operationError;
+	}
+	if (context.mobileRecovery) {
+		const recoveryDetail = t(
+			context.mobileRecovery.phase === "waiting-native"
+				? "status.mobile.waiting_native"
+				: "status.mobile.recovery_backoff",
+		);
+		detail = [detail, recoveryDetail].filter(Boolean).join("\n");
 	}
 	const busy = state.status === "syncing" || state.status === "initializing";
 	let icon = busy ? "cloud" : getSyncStatusIcon(state.status);

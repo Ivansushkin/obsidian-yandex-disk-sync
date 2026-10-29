@@ -13,10 +13,21 @@ export class SyncScheduler {
 	private intervalId: ReturnType<typeof setInterval> | null = null;
 	private isRunning = false;
 	private generation = 0;
+	private canStartAutomatic: () => boolean = () => true;
+	private deferred: () => void = () => {};
 
 	constructor(syncEngine: SyncEngine, settings: YandexDiskSyncSettings) {
 		this.syncEngine = syncEngine;
 		this.settings = settings;
+	}
+
+	/** Gate scheduled entry without changing the user's interval or an admitted session. */
+	setAutomaticAdmission(
+		canStart: () => boolean,
+		deferred: () => void = () => {},
+	): void {
+		this.canStartAutomatic = canStart;
+		this.deferred = deferred;
 	}
 
 	/**
@@ -85,6 +96,10 @@ export class SyncScheduler {
 	 * Run scheduled synchronization
 	 */
 	private async runScheduledSync(): Promise<void> {
+		if (!this.canStartAutomatic()) {
+			this.deferred();
+			return;
+		}
 		if (this.settings.manualSyncRequired) {
 			return;
 		}

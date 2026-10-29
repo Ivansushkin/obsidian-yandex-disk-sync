@@ -1,3 +1,4 @@
+import type { NativeRequestActivity } from "./read-transport";
 /**
  * HTTP client for Yandex Disk API
  */
@@ -95,6 +96,48 @@ export class YandexDiskClient {
 	private readConfigurationVersion = 0;
 	private writeGuard: (() => Promise<void>) | null = null;
 	private readonly invocationWriteGuards = new Set<() => void>();
+	private readonly nativeRequests = new Map<
+		symbol,
+		{ read: boolean; startedAt: number }
+	>();
+	private readonly nativeActivityListeners = new Set<() => void>();
+
+	/** Observe real native occupancy without exposing URLs, credentials or request bodies. */
+	getNativeRequestActivity(): NativeRequestActivity {
+		let reads = 0;
+		let writes = 0;
+		let oldestStartedAt: number | null = null;
+		for (const request of this.nativeRequests.values()) {
+			if (request.read) {
+				reads++;
+			} else {
+				writes++;
+			}
+			oldestStartedAt =
+				oldestStartedAt === null
+					? request.startedAt
+					: Math.min(oldestStartedAt, request.startedAt);
+		}
+		return { reads, writes, oldestStartedAt };
+	}
+
+	/** Notify mobile recovery after native settlement independently of the abandoned caller. */
+	onNativeActivityChange(callback: () => void): () => void {
+		this.nativeActivityListeners.add(callback);
+		return () => {
+			this.nativeActivityListeners.delete(callback);
+		};
+	}
+
+	private notifyNativeActivity(): void {
+		for (const callback of this.nativeActivityListeners) {
+			try {
+				callback();
+			} catch {
+				logger.warn("Native activity observer failed");
+			}
+		}
+	}
 
 	/** Check storage ownership again for each physical write or retry. */
 	setWriteGuard(guard: () => Promise<void>): void {
@@ -1884,6 +1927,15 @@ export class YandexDiskClient {
 		params: RequestUrlParam,
 	): Promise<RequestUrlResponse> {
 		const startedAt = Date.now();
+		const nativeId = Symbol();
+		this.nativeRequests.set(nativeId, {
+			read:
+				!params.method ||
+				params.method === "GET" ||
+				params.method === "HEAD",
+			startedAt,
+		});
+		this.notifyNativeActivity();
 		this.transportMetrics.requests++;
 		if (params.url.startsWith(API_BASE_URL + "/")) {
 			this.transportMetrics.apiRequests++;
@@ -1908,6 +1960,8 @@ export class YandexDiskClient {
 			throw new NetworkRequestError(error);
 		} finally {
 			this.transportMetrics.requestMs += Date.now() - startedAt;
+			this.nativeRequests.delete(nativeId);
+			this.notifyNativeActivity();
 		}
 	}
 

@@ -7,6 +7,7 @@
 		"The exact 2.1.0 test commit and per-scenario manual evidence have not been recorded",
 		"Two independent Obsidian profiles against real Yandex Disk in plaintext and encrypted modes have not been verified for 2.1.0",
 		"Settings layout, persistent manual connection activation and mirrored status notifications require desktop/mobile acceptance",
-		"Historical 2.0.0 evidence does not establish acceptance of 2.1.0"
+		"Historical 2.0.0 evidence does not establish acceptance of 2.1.0",
+		"Mobile lifecycle recovery requires separate Android and iOS real-device acceptance with two independent states in plaintext and encrypted modes"
 	]
 }
