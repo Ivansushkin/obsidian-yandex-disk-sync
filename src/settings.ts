@@ -52,7 +52,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private activityUnsubscribers: (() => void)[] = [];
 	private syncButton: ButtonComponent | null = null;
 	private authorizationButton: ButtonComponent | null = null;
-	private manualLogoutButton: ButtonComponent | null = null;
+	private manualAuthorizationButton: ButtonComponent | null = null;
 	private forceButtons: {
 		button: ButtonComponent;
 		direction: ForceDirection;
@@ -196,13 +196,21 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private updateActivity(): void {
 		const busy = this.isActionUnavailable();
 		this.controlsEl?.setAttribute("aria-busy", String(busy));
-		this.manualLogoutButton?.setDisabled(
+		const manualAuthorized =
+			this.plugin.settings.authMethod === "manual" &&
+			Boolean(this.plugin.settings.yandexTokenSecret.trim()) &&
+			!this.plugin.settings.manualSyncRequired;
+		this.manualAuthorizationButton?.setButtonText(
+			t(
+				manualAuthorized
+					? "settings.auth_logout"
+					: "settings.auth_sign_in",
+			),
+		);
+		this.manualAuthorizationButton?.setDisabled(
 			busy ||
 				this.plugin.settings.authMethod !== "manual" ||
-				!(
-					this.plugin.settings.clientId.trim() ||
-					this.plugin.settings.yandexTokenSecret.trim()
-				),
+				!this.plugin.settings.yandexTokenSecret.trim(),
 		);
 		this.authorizationButton?.setDisabled(
 			busy ||
@@ -654,7 +662,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.renderGeneration++;
 		this.syncButton = null;
 		this.authorizationButton = null;
-		this.manualLogoutButton = null;
+		this.manualAuthorizationButton = null;
 		this.backupButton = null;
 		this.encryptionButton = null;
 		this.clearLogsButton = null;
@@ -887,12 +895,24 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						return;
 					}
 					await this.applyDraft({ yandexTokenSecret: value });
+					this.updateActivity();
 				});
-			this.manualLogoutButton = new ButtonComponent(controlEl)
-				.setButtonText(t("settings.auth_logout"))
-				.onClick(async () => {
+			this.manualAuthorizationButton = new ButtonComponent(
+				controlEl,
+			).onClick(async () => {
+				if (
+					this.plugin.settings.authMethod !== "manual" ||
+					this.isRemoteActionUnavailable()
+				) {
+					return;
+				}
+				if (this.plugin.settings.manualSyncRequired) {
+					await this.runFullSyncFromSettings();
+				} else {
 					await this.signOut();
-				});
+				}
+			});
+			this.updateActivity();
 		}
 
 		const syncSetting = new Setting(connectionBlock);
@@ -909,15 +929,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			text: t("settings.sync_button"),
 		});
 		this.trackControl(this.syncButton);
-		this.syncButton.onClick(async () => {
-			if (this.isActionUnavailable()) {
-				return;
-			}
-			try {
-				await this.plugin.runFullSync();
-			} catch {
-				// The shared status owns synchronization errors.
-			}
+		this.syncButton.onClick(() => {
+			void this.runFullSyncFromSettings();
 		});
 		this.updateActivity();
 
@@ -1374,6 +1387,22 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			await this.plugin.logoutAuthorization();
 		});
 		this.renderSettings(false);
+	}
+
+	/** Both manual connection actions use the same guarded full synchronization. */
+	private async runFullSyncFromSettings(): Promise<void> {
+		if (this.isRemoteActionUnavailable()) {
+			return;
+		}
+		try {
+			await this.plugin.runFullSync();
+		} catch {
+			// The shared status owns synchronization errors.
+		} finally {
+			if (this.displayed && !this.plugin.isPluginUnloaded()) {
+				this.updateActivity();
+			}
+		}
 	}
 
 	/** Show one sign-in message beside the controls without implying synchronization success. */

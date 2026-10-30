@@ -17,11 +17,13 @@ async function host() {
 	const listeners = new Set<() => void>();
 	let busy = false;
 	let nativeWrites = 0;
+	let sensitiveRecovery = false;
 	let root: RemoteStorageScope | null = expected;
 	const deps = {
 		getSettings: () => plugin.settings,
 		getExpectedScope: () => expected,
 		hasHistory: () => true,
+		hasSensitiveRecovery: () => sensitiveRecovery,
 		isBusy: () => busy,
 		isUnloaded: () => plugin.isPluginUnloaded(),
 		nativeWrites: () => nativeWrites,
@@ -68,8 +70,28 @@ async function host() {
 				listener();
 			}
 		},
+		setSensitiveRecovery: (value: boolean) => {
+			sensitiveRecovery = value;
+		},
 	};
 }
+
+test("logout rejects recovery that appears while waiting for native writes", async () => {
+	const h = await host();
+	h.setNativeWrites(1);
+	const logout = applyAuthenticationUpdate(
+		h.deps,
+		{ kind: "logout" },
+		h.attempt,
+	);
+	h.setSensitiveRecovery(true);
+	h.setNativeWrites(0);
+	await assert.rejects(logout, /recovery/i);
+	assert.equal(
+		h.persistence.current?.settings.yandexTokenSecret,
+		"synthetic-old",
+	);
+});
 
 test("authorization adoption waits for native writes and owns its reservation without blocking itself", async () => {
 	const h = await host();

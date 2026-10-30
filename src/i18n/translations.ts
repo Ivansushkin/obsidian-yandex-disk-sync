@@ -256,6 +256,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Synchronization is stopped. Check the remote folder and confirm its connection with manual synchronization. Pending operations must remain in their original storage.",
 		"notice.configuration_busy":
 			"The operation cannot start while synchronization, backup, or recovery work is pending.",
+		"notice.logout_recovery_pending":
+			"Finish encryption or Force recovery before signing out.",
 		"notice.force_busy": "Force synchronization is already in progress.",
 		"notice.force_phase_preflight": "Checking before synchronization…",
 		"notice.force_phase_confirming":
@@ -875,6 +877,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Синхронизация остановлена. Проверьте удалённую папку и подтвердите подключение ручной синхронизацией. Ожидающие операции должны оставаться в исходном хранилище.",
 		"notice.configuration_busy":
 			"Операция недоступна, пока не завершены синхронизация, архивирование или восстановление.",
+		"notice.logout_recovery_pending":
+			"Завершите восстановление шифрования или Force перед выходом.",
 		"notice.force_busy": "Принудительная синхронизация уже выполняется.",
 		"notice.force_phase_preflight": "Проверка перед синхронизацией…",
 		"notice.force_phase_confirming":

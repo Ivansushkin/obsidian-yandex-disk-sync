@@ -23,7 +23,12 @@ export interface AuthenticationUpdate {
 }
 
 export type AuthenticationChange =
-	AuthenticationUpdate | { kind: "logout"; method?: "manual" | "oauth" };
+	| AuthenticationUpdate
+	| {
+			kind: "logout";
+			method?: "manual" | "oauth";
+			preserveEncryptionPassword?: boolean;
+	  };
 
 /** Validate additive metadata without reclassifying a legacy token as a managed grant. */
 export function normalizeAuthentication(
@@ -92,7 +97,7 @@ export function captureAuthentication(
 export function prepareAuthenticationUpdate(
 	current: YandexDiskSyncSettings,
 	update: AuthenticationChange,
-): AuthenticationSettings {
+): AuthenticationSettings & { encryptionPassword?: null } {
 	if (update.kind === "logout") {
 		return {
 			clientId: "",
@@ -100,6 +105,9 @@ export function prepareAuthenticationUpdate(
 			authMethod: update.method ?? current.authMethod,
 			oauthAuthorization: null,
 			manualSyncRequired: true,
+			...(update.preserveEncryptionPassword
+				? {}
+				: { encryptionPassword: null }),
 		};
 	}
 	if (!update.token.trim() || !isOAuthAuthorization(update.authorization)) {

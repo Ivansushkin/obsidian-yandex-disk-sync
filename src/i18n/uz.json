@@ -110,6 +110,7 @@
 	"storage.new": "Boshqa omborni ulash",
 	"storage.blocked": "Sinxronlash to‘xtatildi. Masofaviy papkani tekshiring va qo‘lda sinxronlash bilan ulanishni tasdiqlang. Kutilayotgan amallar o‘z omborida qolishi kerak.",
 	"notice.configuration_busy": "Sinxronlash, zaxiralash yoki tiklash tugallanmaguncha amalni boshlab bo‘lmaydi.",
+	"notice.logout_recovery_pending": "Chiqishdan oldin shifrlash yoki Force tiklashni yakunlang.",
 	"notice.force_busy": "Majburiy sinxronlash allaqachon bajarilmoqda.",
 	"notice.force_phase_preflight": "Sinxronlashdan oldin tekshirilmoqda…",
 	"notice.force_phase_confirming": "Majburiy sinxronlash tasdig‘i kutilmoqda…",

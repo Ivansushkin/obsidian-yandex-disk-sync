@@ -16,6 +16,7 @@ interface AuthenticationWorkflowPorts {
 	getSettings(): YandexDiskSyncSettings;
 	getExpectedScope(): RemoteStorageScope | null;
 	hasHistory(): boolean;
+	hasSensitiveRecovery(): boolean;
 	isBusy(): boolean;
 	isUnloaded(): boolean;
 	nativeWrites(): number;
@@ -54,6 +55,12 @@ export async function applyAuthenticationUpdate(
 			throw new AuthorizationError("revoked");
 		}
 		if (update.kind === "logout") {
+			if (
+				!update.preserveEncryptionPassword &&
+				deps.hasSensitiveRecovery()
+			) {
+				throw new Error(t("notice.logout_recovery_pending"));
+			}
 			await deps.persist(update, () => {
 				attempt.assertCurrent();
 			});

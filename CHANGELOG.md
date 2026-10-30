@@ -11,7 +11,9 @@ Changes since `2.1.0`.
   a confirmation code. Each attempt has an isolated state, verifier and timeout.
 - A local **Sign out** action for shared and manual connections clears credentials
   while retaining the remote folder, synchronization history, offline work,
-  encryption settings and files.
+  encryption parameters and files. It also clears the saved encryption password
+  and active codec; encrypted vaults request the password again after sign-in.
+  Sign-out waits until any pending encryption or Force recovery is complete.
 
 ### Changed
 
@@ -27,6 +29,8 @@ Changes since `2.1.0`.
   and the manual token input does not display a shared OAuth token.
 - After sign-out, status prompts for sign-in or a manual token. Sync, Force,
   backup and encryption actions stay unavailable until access is configured.
+- In manual connection settings, **Sign in** starts normal synchronization after a
+  token is entered. **Sign out** appears after the first successful full sync.
 
 ## 2.1.0
 

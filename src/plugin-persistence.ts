@@ -46,7 +46,10 @@ interface PersistencePorts {
 	save(data: PluginData): Promise<void>;
 	snapshot(): PluginData;
 	publish(patch: UserSettingsPatch): void;
-	publishAuthentication?(authentication: AuthenticationSettings): void;
+	publishAuthentication?(
+		authentication: AuthenticationSettings,
+		clearEncryptionPassword: boolean,
+	): void;
 	connectionActivated(): void;
 	isUnloaded(): boolean;
 	failed(failure: FailureSummary): void;
@@ -62,6 +65,7 @@ export class PluginPersistence {
 	private failureGeneration = 0;
 	private data: PluginData | null = null;
 	private authenticationCommitted = false;
+	private sensitiveLogoutCommitted = false;
 
 	constructor(private readonly ports: PersistencePorts) {}
 
@@ -108,6 +112,7 @@ export class PluginPersistence {
 	): Promise<void> {
 		this.loaded = false;
 		this.authenticationCommitted = false;
+		this.sensitiveLogoutCommitted = false;
 		const generation = ++this.generation;
 		await this.tail;
 		this.assertGeneration(generation);
@@ -190,6 +195,10 @@ export class PluginPersistence {
 				current.settings = {
 					...current.settings,
 					...captureAuthentication(this.data.settings),
+					...(this.sensitiveLogoutCommitted &&
+					!this.data.settings.yandexTokenSecret
+						? { encryptionPassword: null }
+						: {}),
 				};
 			}
 			if (patch) {
@@ -243,6 +252,12 @@ export class PluginPersistence {
 			) {
 				this.authenticationCommitted = true;
 			}
+			if (
+				authentication?.update.kind === "logout" &&
+				!authentication.update.preserveEncryptionPassword
+			) {
+				this.sensitiveLogoutCommitted = true;
+			}
 			if (activateConnection && !this.ports.isUnloaded()) {
 				this.ports.connectionActivated();
 			}
@@ -262,6 +277,8 @@ export class PluginPersistence {
 				authentication.assertCurrent();
 				this.ports.publishAuthentication?.(
 					captureAuthentication(snapshot.settings),
+					authentication.update.kind === "logout" &&
+						!authentication.update.preserveEncryptionPassword,
 				);
 				this.saveFailed = false;
 			}

@@ -378,6 +378,39 @@ test("logout removes credentials durably without contacting Disk or losing offli
 	}
 });
 
+test("logout waits for secret-bearing recovery to finish", async (t) => {
+	const { plugin, persistence } = await settingsHost(t);
+	const before = structuredClone(persistence.current);
+	Object.assign(plugin, {
+		encryptionTransition: { source: { password: "synthetic-password" } },
+	});
+	await assert.rejects(plugin.logoutAuthorization(), /recovery/i);
+	assert.deepEqual(persistence.current, before);
+});
+
+test("encrypted logout requires the vault password after reauthorization", async (t) => {
+	const { plugin, persistence, a, flow } = await settingsHost(t, true);
+	plugin["encryptionService"] = flow.context.getService();
+	flow.context.getSettings = () => plugin.settings;
+	flow.context.getService = () => plugin["encryptionService"];
+	let passwordRequests = 0;
+	flow.context.ui.requestPassword = async () => {
+		passwordRequests++;
+		return null;
+	};
+	await plugin.logoutAuthorization();
+	assert.equal(persistence.current?.settings.encryptionPassword, null);
+	assert.equal(plugin.settings.encryptionPassword, null);
+	assert.equal(plugin["encryptionService"], null);
+	assert.equal(a.client.hasEncryptionService(), false);
+	await plugin.applySettingsPatch({ yandexTokenSecret: "synthetic-return" });
+	assert.equal(
+		await flow.workflow.admission.ensureEncryptionReady({ prompt: true }),
+		false,
+	);
+	assert.equal(passwordRequests, 1);
+});
+
 test("failed logout keeps the saved grant and blocks automation until a durable retry", async (t) => {
 	const { plugin, persistence, a } = await settingsHost(t);
 	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(

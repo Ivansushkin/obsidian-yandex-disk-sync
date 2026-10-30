@@ -82,6 +82,30 @@ test("authorization defaults preserve existing manual connections and incomplete
 	}
 });
 
+test("logout clears encryption password from durable data and later snapshots", async () => {
+	const { plugin, persistence, writes } = persistenceHarness();
+	await plugin.loadSettings();
+	Object.assign(plugin.settings, {
+		authMethod: "manual",
+		yandexTokenSecret: "synthetic-token",
+		enableEncryption: true,
+		encryptionSalt: "synthetic-salt",
+		encryptionPassword: "synthetic-password",
+		encryptionRevision: 1,
+		encryptionProfileId: "hardened",
+	});
+	await plugin.saveSettings();
+	await persistence.persistAuthentication({ kind: "logout" }, () => {});
+	assert.equal(persistence.current?.settings.encryptionPassword, null);
+	assert.equal(plugin.settings.encryptionPassword, null);
+	plugin.settings.encryptionPassword = "stale-password";
+	await plugin.saveSettings();
+	assert.equal(persistence.current?.settings.encryptionPassword, null);
+	const restored = persistenceHarness(writes.at(-1));
+	await restored.plugin.loadSettings();
+	assert.equal(restored.plugin.settings.encryptionPassword, null);
+});
+
 test("accepted authorization survives unload publication revocation and later snapshot writes", async () => {
 	for (const logout of [false, true]) {
 		const { plugin, persistence, writes } = persistenceHarness();
@@ -100,6 +124,14 @@ test("accepted authorization survives unload publication revocation and later sn
 				},
 				() => {},
 			);
+			Object.assign(plugin.settings, {
+				enableEncryption: true,
+				encryptionSalt: "synthetic-salt",
+				encryptionPassword: "synthetic-password",
+				encryptionRevision: 1,
+				encryptionProfileId: "hardened",
+			});
+			await plugin.saveSettings();
 		}
 		plugin.settings.clientId = "stale-manual-client";
 		const entered = deferred();
@@ -144,6 +176,7 @@ test("accepted authorization survives unload publication revocation and later sn
 			logout ? undefined : "grant",
 		);
 		assert.equal(stored.manualSyncRequired, true);
+		assert.equal(stored.encryptionPassword, null);
 		const restored = persistenceHarness(writes.at(-1));
 		await restored.plugin.loadSettings();
 		assert.equal(
@@ -151,6 +184,7 @@ test("accepted authorization survives unload publication revocation and later sn
 			logout ? undefined : "grant",
 		);
 		assert.equal(restored.plugin.settings.manualSyncRequired, true);
+		assert.equal(restored.plugin.settings.encryptionPassword, null);
 	}
 });
 

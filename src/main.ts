@@ -180,8 +180,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.settings = { ...this.settings, manualSyncRequired: false };
 			this.publishSettingsToComponents();
 		},
-		publishAuthentication: (authentication) => {
+		publishAuthentication: (authentication, clearEncryptionPassword) => {
 			this.settings = { ...this.settings, ...authentication };
+			if (clearEncryptionPassword) {
+				this.settings.encryptionPassword = null;
+				this.encryptionService = null;
+				this.yandexClient?.setEncryptionService(null);
+				this.indexManager?.clearIndexTransitionServices();
+				this.legacyExposedTokenInSession = null;
+			}
 			this.publishSettingsToComponents();
 		},
 		isUnloaded: () => this.unloaded,
@@ -719,6 +726,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.encryptionTransition !== null ||
 					Object.keys(this.indexManager.getLocalIndex().files)
 						.length > 0,
+				hasSensitiveRecovery: () =>
+					this.encryptionTransition !== null ||
+					this.forceRecovery !== null,
 				isBusy: () => this.isConfigurationBusy(),
 				isUnloaded: () => this.unloaded,
 				nativeWrites: () =>
@@ -807,7 +817,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.settings.authMethod === "manual" &&
 			(this.settings.clientId || this.settings.yandexTokenSecret)
 		) {
-			await this.clearAuthentication("oauth");
+			await this.clearAuthentication("oauth", true);
 		}
 		this.authorizationUrl = await this.authorization.begin(mode);
 		this.notifyManualActivity();
@@ -830,6 +840,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			throw new AuthorizationError("revoked");
 		}
+		if (this.encryptionTransition || this.forceRecovery) {
+			throw new Error(t("notice.logout_recovery_pending"));
+		}
 		this.stopRegularSync();
 		await this.clearAuthentication(this.settings.authMethod);
 		this.authorization?.cancel();
@@ -838,10 +851,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/** Clear both manual fields through the guarded queue, retaining watcher observation during sign-in. */
 	private async clearAuthentication(
 		method: "manual" | "oauth",
+		preserveEncryptionPassword = false,
 	): Promise<void> {
 		const connection = this.connectionGeneration;
 		await this.updateAuthentication(
-			{ kind: "logout", method },
+			{ kind: "logout", method, preserveEncryptionPassword },
 			{
 				assertCurrent: () => {
 					if (
