@@ -1,4 +1,10 @@
 import type { LocalEncryptionTransition } from "./crypto/encryption-transition";
+import {
+	captureAuthentication,
+	prepareAuthenticationUpdate,
+	type AuthenticationSettings,
+	type AuthenticationUpdate,
+} from "./auth/authentication-state";
 import { OperationFailure, type FailureSummary } from "./errors";
 import {
 	loadPluginDataWithSource,
@@ -40,6 +46,7 @@ interface PersistencePorts {
 	save(data: PluginData): Promise<void>;
 	snapshot(): PluginData;
 	publish(patch: UserSettingsPatch): void;
+	publishAuthentication?(authentication: AuthenticationSettings): void;
 	connectionActivated(): void;
 	isUnloaded(): boolean;
 	failed(failure: FailureSummary): void;
@@ -54,6 +61,7 @@ export class PluginPersistence {
 	private saveFailure: FailureSummary | undefined;
 	private failureGeneration = 0;
 	private data: PluginData | null = null;
+	private authenticationCommitted = false;
 
 	constructor(private readonly ports: PersistencePorts) {}
 
@@ -99,6 +107,7 @@ export class PluginPersistence {
 		initialize: (loaded: PluginDataLoadResult<PluginData>) => void,
 	): Promise<void> {
 		this.loaded = false;
+		this.authenticationCommitted = false;
 		const generation = ++this.generation;
 		await this.tail;
 		this.assertGeneration(generation);
@@ -131,6 +140,21 @@ export class PluginPersistence {
 		await this.enqueue(patch, false);
 	}
 
+	/** Save a validated credential bundle before publishing it to running components. */
+	async persistAuthentication(
+		update: AuthenticationUpdate,
+		assertCurrent: () => void,
+	): Promise<void> {
+		this.requireLoaded();
+		if (!this.ports.publishAuthentication) {
+			throw new Error("Authorization publication is unavailable");
+		}
+		await this.enqueue(undefined, false, undefined, {
+			update: { ...update, authorization: { ...update.authorization } },
+			assertCurrent,
+		});
+	}
+
 	/** Activate this connection only after the successful full snapshot is durable. */
 	async completeManualSync(assertCurrent: () => void): Promise<void> {
 		this.requireLoaded();
@@ -141,6 +165,10 @@ export class PluginPersistence {
 		patch: UserSettingsPatch | undefined,
 		unloading: boolean,
 		activateConnection?: () => void,
+		authentication?: {
+			update: AuthenticationUpdate;
+			assertCurrent(): void;
+		},
 	): Promise<void> {
 		const generation = this.generation;
 		const persistence = this.tail.then(async () => {
@@ -149,11 +177,18 @@ export class PluginPersistence {
 			}
 			this.requireLoaded();
 			this.assertGeneration(generation);
-			if (patch && this.ports.isUnloaded()) {
+			if ((patch || authentication) && this.ports.isUnloaded()) {
 				throw new Error("Plugin was unloaded before settings save");
 			}
 			activateConnection?.();
+			authentication?.assertCurrent();
 			const current = this.ports.snapshot();
+			if (this.authenticationCommitted && this.data) {
+				current.settings = {
+					...current.settings,
+					...captureAuthentication(this.data.settings),
+				};
+			}
 			if (patch) {
 				current.settings = prepareSettingsPatch(
 					current.settings,
@@ -167,6 +202,15 @@ export class PluginPersistence {
 				};
 			}
 			// Storage owns immutable bytes even if live encryption advances during the await.
+			if (authentication) {
+				current.settings = {
+					...current.settings,
+					...prepareAuthenticationUpdate(
+						current.settings,
+						authentication.update,
+					),
+				};
+			}
 			const snapshot = JSON.parse(JSON.stringify(current)) as PluginData;
 			await this.saveSnapshot(snapshot, generation);
 			if (activateConnection) {
@@ -190,6 +234,9 @@ export class PluginPersistence {
 			}
 			this.assertGeneration(generation);
 			this.data = snapshot;
+			if (authentication || (patch && "yandexTokenSecret" in patch)) {
+				this.authenticationCommitted = true;
+			}
 			if (activateConnection && !this.ports.isUnloaded()) {
 				this.ports.connectionActivated();
 			}
@@ -198,6 +245,18 @@ export class PluginPersistence {
 					throw new Error("Plugin was unloaded during settings save");
 				}
 				this.ports.publish(patch);
+				this.saveFailed = false;
+			}
+			if (authentication) {
+				if (this.ports.isUnloaded()) {
+					throw new Error(
+						"Plugin was unloaded during authorization save",
+					);
+				}
+				authentication.assertCurrent();
+				this.ports.publishAuthentication?.(
+					captureAuthentication(snapshot.settings),
+				);
 				this.saveFailed = false;
 			}
 		});

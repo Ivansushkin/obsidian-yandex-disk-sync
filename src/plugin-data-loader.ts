@@ -1,3 +1,4 @@
+import { normalizeAuthentication } from "./auth/authentication-state";
 import {
 	validateEncryptionReplacement,
 	isReplacementPath,
@@ -181,6 +182,13 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 	if (!settings || typeof settings !== "object") {
 		throw new UnsupportedHistoricalDataError(
 			"Current settings are missing",
+		);
+	}
+	try {
+		normalizeAuthentication(settings);
+	} catch {
+		throw new UnsupportedHistoricalDataError(
+			"Current authorization state is invalid",
 		);
 	}
 	if (

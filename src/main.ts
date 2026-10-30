@@ -1,3 +1,4 @@
+import { normalizeAuthentication } from "./auth/authentication-state";
 import type { StartupReadSession } from "./sync/canonical/manager";
 import type { RetryProgress } from "./errors";
 import { SYNC_BUILD_ID } from "./build-info";
@@ -151,6 +152,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		},
 		connectionActivated: () => {
 			this.settings = { ...this.settings, manualSyncRequired: false };
+			this.publishSettingsToComponents();
+		},
+		publishAuthentication: (authentication) => {
+			this.settings = { ...this.settings, ...authentication };
 			this.publishSettingsToComponents();
 		},
 		isUnloaded: () => this.unloaded,
@@ -1922,6 +1927,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		await this.persistence.load((loaded) => {
 			const data = loaded.data;
 			this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
+			Object.assign(
+				this.settings,
+				normalizeAuthentication(data?.settings ?? {}),
+			);
 			this.settings.language = normalizeLanguagePreference(
 				this.settings.language,
 			);

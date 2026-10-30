@@ -31,6 +31,7 @@ async function settingsHost(
 	await plugin.loadSettings();
 	plugin.settings = {
 		...a.settings,
+		authMethod: "manual",
 		yandexTokenSecret: remote ? "" : "synthetic",
 	};
 	const scheduler = new SyncScheduler(a.engine, plugin.settings);

@@ -80,9 +80,11 @@ export function prepareSettingsPatch(
 		"excludePatterns",
 		"syncDotObsidian",
 	];
-	const changesConnection = changed.some(
-		(key) => key === "remotePath" || key === "yandexTokenSecret",
-	);
+	const changesConnection =
+		changed.some(
+			(key) => key === "remotePath" || key === "yandexTokenSecret",
+		) ||
+		("yandexTokenSecret" in patch && current.authMethod === "oauth");
 	const changesFileScope = changed.some(
 		(key) => key !== "remotePath" && scopeKeys.includes(key),
 	);
@@ -90,16 +92,21 @@ export function prepareSettingsPatch(
 		settings: {
 			...current,
 			...patch,
+			...("yandexTokenSecret" in patch
+				? { authMethod: "manual" as const, oauthAuthorization: null }
+				: {}),
 			manualSyncRequired: current.manualSyncRequired || changesConnection,
 			syncPatterns: [...(patch.syncPatterns ?? current.syncPatterns)],
 			excludePatterns: [
 				...(patch.excludePatterns ?? current.excludePatterns),
 			],
 		},
-		hasChanges: changed.length > 0,
-		requiresIdle: changed.some(
-			(key) => key !== "enableDebugLogging" && key !== "logToFile",
-		),
+		hasChanges: changed.length > 0 || changesConnection,
+		requiresIdle:
+			changesConnection ||
+			changed.some(
+				(key) => key !== "enableDebugLogging" && key !== "logToFile",
+			),
 		changesConnection,
 		changesFileScope,
 		changesAutomation: changed.some(
