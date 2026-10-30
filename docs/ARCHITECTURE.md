@@ -302,7 +302,9 @@ listeners/timers и запрещает новые writes; lifecycle settlement �
 memory-only PKCE attempt, state/verifier, timeout и native token POST occupancy.
 `main.ts` связывает transport, lifecycle, UI и существующий full; не выполняет
 обмен или принятие credentials самостоятельно. `auth/configuration.ts` содержит
-только публичные проверенные capabilities; без общего приложения login недоступен.
+публичные параметры приложения и выбранные callback-платформы; перед выпуском
+каждая включённая платформа требует native приёмки. Без общего приложения login
+недоступен.
 
 `applyAuthenticationUpdate` в `settings-workflow.ts` ждёт settlement текущей работы
 и native Disk writes вне SyncCoordinator, затем занимает существующий configuration

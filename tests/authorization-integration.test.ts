@@ -14,12 +14,24 @@ import { StorageBindingController } from "../src/sync/local/storage-binding";
 function wireAuthorization(
 	t: TestContext,
 	plugin: Awaited<ReturnType<typeof settingsHost>>["plugin"],
+	callbackSupported = false,
 ) {
 	const cleanups: (() => void)[] = [];
 	plugin.register = (cleanup) => {
 		cleanups.push(cleanup);
 	};
-	plugin.registerObsidianProtocolHandler = () => {};
+	let protocolHandler: (params: Record<string, string>) => void = () => {
+		throw new Error("handler not registered");
+	};
+	plugin.registerObsidianProtocolHandler = (_action, handler) => {
+		protocolHandler = (params) => {
+			handler({ ...params, action: "yandex-disk-sync-auth" });
+		};
+	};
+	const oldPlatforms = SHARED_YANDEX_OAUTH.callbackPlatforms;
+	SHARED_YANDEX_OAUTH.callbackPlatforms = callbackSupported
+		? ["desktop"]
+		: [];
 	const oldClient = SHARED_YANDEX_OAUTH.clientId;
 	SHARED_YANDEX_OAUTH.clientId = "public-test-client";
 	const transport = globalThis as unknown as {
@@ -37,19 +49,28 @@ function wireAuthorization(
 				}
 			: previousRequest(params);
 	const oldWindow = globalThis.window;
+	let browserUrl = "";
 	globalThis.window = {
 		...oldWindow,
-		open: () => null,
+		open: (url?: string | URL) => {
+			browserUrl = String(url ?? "");
+			return null;
+		},
 	} as unknown as Window & typeof globalThis;
 	afterTest(t, () => {
 		for (const cleanup of cleanups.reverse()) {
 			cleanup();
 		}
 		SHARED_YANDEX_OAUTH.clientId = oldClient;
+		SHARED_YANDEX_OAUTH.callbackPlatforms = oldPlatforms;
 		transport.__obsidianRequestUrl = previousRequest;
 		globalThis.window = oldWindow;
 	});
 	plugin["initializeAuthorization"]();
+	return {
+		callback: (params: Record<string, string>) => protocolHandler(params),
+		browserUrl: () => new URL(browserUrl),
+	};
 }
 
 for (const encrypted of [false, true]) {
@@ -79,7 +100,7 @@ for (const encrypted of [false, true]) {
 			plugin["encryptionService"] = flow.context.getService();
 			await plugin.saveSettings();
 			a.watcher.setPersistCallback(() => plugin["persistPluginData"]());
-			wireAuthorization(t, plugin);
+			const browser = wireAuthorization(t, plugin, !encrypted);
 			await plugin.beginAuthorization();
 			assert.equal(plugin.isAuthorizationPending(), true);
 			const actor = plugin.settings.deviceId;
@@ -90,7 +111,47 @@ for (const encrypted of [false, true]) {
 			assert.equal(disk.files.has("vault/local.md"), false);
 			peer.vault.put("remote.md", bytes("peer offline"));
 			await peer.full();
-			await plugin.submitAuthorizationCode("synthetic-code");
+			if (encrypted) {
+				await plugin.submitAuthorizationCode("synthetic-code");
+			} else {
+				assert.equal(
+					new URL(
+						browser.browserUrl().searchParams.get("redirect_uri")!,
+					).protocol,
+					"obsidian:",
+				);
+				let unsubscribe = () => {};
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await new Promise<void>((resolve, reject) => {
+						timer = setTimeout(
+							() =>
+								reject(
+									new Error("authorization did not finish"),
+								),
+							5000,
+						);
+						unsubscribe = plugin.onAuthorizationStateChange(() => {
+							const state = plugin.getAuthorizationState();
+							if (state.phase === "connected") {
+								resolve();
+							}
+							if (state.phase === "error") {
+								reject(new Error("authorization failed"));
+							}
+						});
+						browser.callback({
+							state: browser
+								.browserUrl()
+								.searchParams.get("state")!,
+							code: "synthetic-code",
+						});
+					});
+				} finally {
+					unsubscribe();
+					clearTimeout(timer);
+				}
+			}
 			assert.equal(plugin.getAuthorizationState().phase, "connected");
 			assert.equal(plugin.settings.authMethod, "oauth");
 			assert.equal(plugin.settings.manualSyncRequired, false);
