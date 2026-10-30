@@ -233,6 +233,7 @@
 	"settings.connection_section": "Қосылым",
 	"settings.oauth_instruction_1": "1. Синхрондау үшін Яндекс Дискідегі қалтаны таңдаңыз",
 	"status.manual_sync_required": "Қосылу үшін «Синхрондау» түймесін басыңыз",
+	"status.authorization_required": "Қосылу үшін кіріңіз немесе токенді енгізіңіз",
 	"settings.oauth_instruction_2": "2. «Клиенттерді басқару» түймесін басыңыз",
 	"settings.oauth_instruction_3": "3. Жаңа Яндекс OAuth қолданбасын жасап, ашыңыз. Дискіні оқу және өзгерту, сондай-ақ Дискідегі қолданба қалтасына қол жеткізу құқықтарын беріңіз",
 	"settings.oauth_instruction_4": "4. Қолданба баптауларынан Client ID көшіріңіз",

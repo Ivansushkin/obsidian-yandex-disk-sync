@@ -105,6 +105,7 @@ export interface SyncIndicatorContext {
 	fullSyncInProgress: boolean;
 	connection?: { errorMessage?: string; retry?: RetryProgress };
 	syncUnavailable: boolean;
+	hasAuthorization: boolean;
 	manualSyncRequired?: boolean;
 	operationError?: string;
 	mobileRecovery?: MobileRecoveryPresentation;
@@ -167,6 +168,9 @@ export function getSyncPresentation(
 	) {
 		state = { ...sync, status: "syncing" };
 		text = t("status.syncing");
+	} else if (!context.hasAuthorization) {
+		state = { ...sync, status: "idle" };
+		text = t("status.authorization_required");
 	} else if (
 		manualSyncRequired &&
 		(sync.status === "idle" || sync.status === "initializing")

@@ -233,6 +233,7 @@
 	"settings.connection_section": "Падключэнне",
 	"settings.oauth_instruction_1": "1. Выберыце папку на Яндекс Дыску для сінхранізацыі",
 	"status.manual_sync_required": "Націсніце «Сінхранізаваць» для падключэння",
+	"status.authorization_required": "Увайдзіце або ўвядзіце токен для падключэння",
 	"settings.oauth_instruction_2": "2. Націсніце «Кіраванне кліентамі»",
 	"settings.oauth_instruction_3": "3. Стварыце і адкрыйце новую праграму Яндекс OAuth. Дайце правы на чытанне і рэдагаванне Дыска, а таксама доступ да папкі праграмы на Дыску",
 	"settings.oauth_instruction_4": "4. Скапіруйце Client ID з налад праграмы",

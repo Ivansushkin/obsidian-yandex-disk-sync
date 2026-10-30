@@ -25,6 +25,8 @@ Changes since `2.1.0`.
 - Connection settings separate the remote folder, authorization controls and
   synchronization action. The shared sign-in state is shown next to its controls,
   and the manual token input does not display a shared OAuth token.
+- After sign-out, status prompts for sign-in or a manual token. Sync, Force,
+  backup and encryption actions stay unavailable until access is configured.
 
 ## 2.1.0
 

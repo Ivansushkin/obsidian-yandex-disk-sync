@@ -239,6 +239,10 @@ test("encrypted current local state cannot Force a plaintext stable migration", 
 
 test("post-commit Force failure resumes cleanup without repeating migration", async () => {
 	const plugin = lifecyclePlugin();
+	plugin.settings = {
+		...DEFAULT_SETTINGS,
+		yandexTokenSecret: "configured",
+	};
 	let cleanupStarts = 0;
 	let migrationReason: string | null = "migration required";
 	plugin["remoteStateValidated"] = true;
@@ -361,6 +365,14 @@ test("Force remains available while ordinary full preflight is pending", async (
 		await full;
 		assert.equal(plugin.isForceSyncUnavailable(), false);
 	}
+});
+
+test("Force cannot start without saved authorization", async () => {
+	const plugin = lifecyclePlugin();
+	plugin.settings = { ...DEFAULT_SETTINGS, yandexTokenSecret: "" };
+	assert.equal(plugin.isForceSyncUnavailable(), true);
+	await plugin.runForceSyncFromLocal();
+	assert.equal(plugin["getForceSyncController"]().getState(), null);
 });
 
 test("encrypted Force permits owned authentication but blocks independent encryption actions", async () => {

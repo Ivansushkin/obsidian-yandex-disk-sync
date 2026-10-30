@@ -233,6 +233,7 @@
 	"settings.connection_section": "Ulanish",
 	"settings.oauth_instruction_1": "1. Sinxronlash uchun Yandex Diskdagi papkani tanlang",
 	"status.manual_sync_required": "Ulanish uchun «Sinxronlash» tugmasini bosing",
+	"status.authorization_required": "Ulanish uchun tizimga kiring yoki token kiriting",
 	"settings.oauth_instruction_2": "2. «Mijozlarni boshqarish» tugmasini bosing",
 	"settings.oauth_instruction_3": "3. Yangi Yandex OAuth ilovasini yarating va oching. Diskni o‘qish va tahrirlash, shuningdek Diskdagi ilova papkasiga kirish huquqlarini bering",
 	"settings.oauth_instruction_4": "4. Ilova sozlamalaridan Client ID ni nusxalang",

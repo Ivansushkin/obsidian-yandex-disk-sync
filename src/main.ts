@@ -1017,7 +1017,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			foreground: this.getForegroundOperation(),
 			fullSyncInProgress: this.isFullSyncInProgress(),
 			connection: this.getConnectionActivity(),
-			syncUnavailable: this.isConfigurationBusy(),
+			syncUnavailable:
+				this.isConfigurationBusy() ||
+				this.isAuthorizationPending() ||
+				!this.settings.yandexTokenSecret.trim(),
+			hasAuthorization: Boolean(this.settings.yandexTokenSecret.trim()),
 			manualSyncRequired: this.settings.manualSyncRequired,
 			operationError: this.operationIssue?.message,
 			mobileRecovery: this.mobileRecovery?.getPresentation(),
@@ -2011,6 +2015,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	isForceSyncUnavailable(): boolean {
 		return Boolean(
+			!this.settings.yandexTokenSecret.trim() ||
 			this.isAuthorizationPending() ||
 			this.configurationUpdatePending ||
 			this.isForceSyncBusy() ||

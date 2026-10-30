@@ -426,6 +426,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.oauth_instruction_1":
 			"1. Choose a folder on Yandex Disk for synchronization",
 		"status.manual_sync_required": "Click Synchronize to connect",
+		"status.authorization_required": "Sign in or enter a token to connect",
 		"settings.oauth_instruction_2": "2. Click 'Manage clients'",
 		"settings.oauth_instruction_3":
 			"3. Create and open a new Yandex OAuth app. Grant read and write access to Disk and access to the app folder on Disk",
@@ -1047,6 +1048,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"1. Выберите папку на Яндекс Диске для синхронизации",
 		"status.manual_sync_required":
 			"Нажмите «Синхронизировать» для подключения",
+		"status.authorization_required":
+			"Войдите или укажите токен для подключения",
 		"settings.oauth_instruction_2": "2. Нажмите 'Управление клиентами'",
 		"settings.oauth_instruction_3":
 			"3. Создайте и откройте новое приложение Яндекс OAuth. Выдайте ему права на чтение и редактирование Диска, а также «Доступ к папке приложения на Диске»",

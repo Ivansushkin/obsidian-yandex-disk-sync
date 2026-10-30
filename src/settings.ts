@@ -62,6 +62,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		component: BaseComponent;
 		diagnostic: boolean;
 		disabled: boolean;
+		requiresAuthorization: boolean;
 	}[] = [];
 	private backupButton: ButtonComponent | null = null;
 	private encryptionButton: ButtonComponent | null = null;
@@ -147,11 +148,16 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	/** Retain each control's own admission restrictions while applying activity locks. */
-	private trackControl(component: BaseComponent, diagnostic = false): void {
+	private trackControl(
+		component: BaseComponent,
+		diagnostic = false,
+		requiresAuthorization = false,
+	): void {
 		this.controls.push({
 			component,
 			diagnostic,
 			disabled: component.disabled,
+			requiresAuthorization,
 		});
 		this.updateActivity();
 	}
@@ -162,6 +168,13 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			this.plugin.isAuthorizationPending() ||
 			this.plugin.isConfigurationBusy() ||
 			this.plugin.isPluginUnloaded()
+		);
+	}
+
+	private isRemoteActionUnavailable(): boolean {
+		return (
+			this.isActionUnavailable() ||
+			!this.plugin.settings.yandexTokenSecret.trim()
 		);
 	}
 
@@ -199,10 +212,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				) &&
 					!this.plugin.isAuthorizationAvailable()),
 		);
-		for (const { component, diagnostic, disabled } of this.controls) {
+		for (const {
+			component,
+			diagnostic,
+			disabled,
+			requiresAuthorization,
+		} of this.controls) {
 			component.setDisabled(
 				disabled ||
 					this.plugin.isPluginUnloaded() ||
+					(requiresAuthorization &&
+						!this.plugin.settings.yandexTokenSecret.trim()) ||
 					(!diagnostic && busy),
 			);
 		}
@@ -993,7 +1013,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setCta()
 					.then((control) => this.trackControl(control))
 					.onClick(() => {
-						if (this.isActionUnavailable()) {
+						if (this.isRemoteActionUnavailable()) {
 							return;
 						}
 						void this.plugin.runForceSyncFromLocal();
@@ -1006,7 +1026,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setCta()
 					.then((control) => this.trackControl(control))
 					.onClick(() => {
-						if (this.isActionUnavailable()) {
+						if (this.isRemoteActionUnavailable()) {
 							return;
 						}
 						void this.plugin.runForceSyncFromRemote();
@@ -1050,10 +1070,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				return toggle
 					.setValue(this.plugin.settings.enableEncryption)
 					.setDisabled(migrationPending)
-					.then((control) => this.trackControl(control))
+					.then((control) => this.trackControl(control, false, true))
 					.onChange(async (value) => {
 						toggle.setValue(this.plugin.settings.enableEncryption);
-						if (this.isActionUnavailable()) {
+						if (this.isRemoteActionUnavailable()) {
 							return;
 						}
 						await this.runSettingsAction(async (isCurrent) => {
@@ -1086,10 +1106,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						.setButtonText(t("settings.encryption_change_password"))
 						.then((control) => {
 							this.encryptionButton = control;
-							this.trackControl(control);
+							this.trackControl(control, false, true);
 						})
 						.onClick(async () => {
-							if (this.isActionUnavailable()) {
+							if (this.isRemoteActionUnavailable()) {
 								return;
 							}
 							await this.runSettingsAction(async (isCurrent) => {
@@ -1253,9 +1273,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					.setButtonText(t("settings.backup_button"))
 					.then((control) => {
 						this.backupButton = control;
-						this.trackControl(control);
+						this.trackControl(control, false, true);
 					})
 					.onClick(async () => {
+						if (this.isRemoteActionUnavailable()) {
+							return;
+						}
 						await this.runSettingsAction(async (isCurrent) => {
 							const confirmed = await new Promise<boolean>(
 								(resolve) =>
@@ -1308,16 +1331,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			.addButton((button) =>
 				button
 					.setButtonText(t("settings.backup_show_all"))
-					.then((control) => this.trackControl(control))
+					.then((control) => this.trackControl(control, false, true))
 					.onClick(() => {
-						if (this.isActionUnavailable()) {
+						if (this.isRemoteActionUnavailable()) {
 							return;
 						}
 						new BackupListModal(
 							this.app,
 							this.plugin.getBackupManager(),
 							{
-								isUnavailable: () => this.isActionUnavailable(),
+								isUnavailable: () =>
+									this.isRemoteActionUnavailable(),
 								isCurrent: () =>
 									!this.plugin.isPluginUnloaded(),
 								subscribe: (update) =>
