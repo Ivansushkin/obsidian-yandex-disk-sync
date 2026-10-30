@@ -1382,11 +1382,37 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 	/** Use the same guarded logout for both authorization forms. */
 	private async signOut(): Promise<void> {
-		this.authorizationCode = "";
-		await this.runSettingsAction(async () => {
+		let signedOut = false;
+		await this.runSettingsAction(async (isCurrent) => {
+			const confirmed = await new Promise<boolean>((resolve) => {
+				const modal = new DecisionModal(
+					this.app,
+					t("modal.logout_title"),
+					t("modal.logout_description"),
+					[
+						{ label: t("modal.cancel_button"), value: "cancel" },
+						{
+							label: t("settings.auth_logout"),
+							value: "logout",
+							warning: true,
+						},
+					],
+					"cancel",
+					(choice) => resolve(choice === "logout"),
+				);
+				modal.modalEl.addClass("logout-confirm-modal");
+				modal.open();
+			});
+			if (!confirmed || !isCurrent()) {
+				return;
+			}
 			await this.plugin.logoutAuthorization();
+			this.authorizationCode = "";
+			signedOut = true;
 		});
-		this.renderSettings(false);
+		if (signedOut) {
+			this.renderSettings(false);
+		}
 	}
 
 	/** Both manual connection actions use the same guarded full synchronization. */
@@ -1459,11 +1485,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			if (this.isActionUnavailable()) {
 				return;
 			}
-			this.authorizationCode = "";
 			if (authorized) {
 				await this.signOut();
 				return;
 			}
+			this.authorizationCode = "";
 			try {
 				await this.plugin.beginAuthorization();
 			} catch {

@@ -45,6 +45,9 @@
 		"@noble/ciphers": "2.2.0",
 		"jszip": "3.10.1"
 	},
+	"overrides": {
+		"moment": "2.31.0"
+	},
 	"lint-staged": {
 		"*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}": [
 			"eslint --fix --max-warnings 0 --no-warn-ignored",

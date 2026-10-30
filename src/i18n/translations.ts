@@ -22,6 +22,9 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Yandex sign-in is not configured for this build yet. You can connect using a manual token.",
 		"settings.auth_sign_in": "Sign in",
 		"settings.auth_logout": "Sign out",
+		"modal.logout_title": "Sign out?",
+		"modal.logout_description":
+			"Saved access tokens and the encryption password (if present) will be removed from this device. To sync again, you will need to sign in and enter the password if needed. Files and sync history will stay. The app's access in Yandex will not be revoked.",
 		"settings.auth_cancel": "Cancel sign-in",
 		"settings.auth_code": "Confirmation code",
 		"settings.auth_submit": "Confirm and synchronize",
@@ -642,6 +645,9 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Вход через Яндекс ещё не настроен для этой сборки. Можно подключиться с помощью ручного токена.",
 		"settings.auth_sign_in": "Войти",
 		"settings.auth_logout": "Выйти",
+		"modal.logout_title": "Выйти?",
+		"modal.logout_description":
+			"Сохранённые на этом устройстве токены доступа и пароль шифрования (если есть) будут удалены. Чтобы снова синхронизировать файлы, потребуется войти и при необходимости ввести пароль. Файлы и история синхронизации сохранятся. Доступ приложения на стороне Яндекса не отзывается.",
 		"settings.auth_cancel": "Отменить вход",
 		"settings.auth_code": "Код подтверждения",
 		"settings.auth_submit": "Подтвердить и синхронизировать",

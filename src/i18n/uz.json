@@ -416,6 +416,8 @@
 	"settings.auth_unavailable": "Bu tuzilmada Yandex orqali kirish hali sozlanmagan. Tokenni qo‘lda kiritib ulanish mumkin.",
 	"settings.auth_sign_in": "Kirish",
 	"settings.auth_logout": "Chiqish",
+	"modal.logout_title": "Chiqilsinmi?",
+	"modal.logout_description": "Ushbu qurilmada saqlangan kirish tokenlari va shifrlash paroli (agar bo‘lsa) o‘chiriladi. Fayllarni qayta sinxronlash uchun yana kirish va zarur bo‘lsa, parolni kiritish kerak. Fayllar va sinxronlash tarixi saqlanadi. Yandex tomonidagi ilova ruxsati bekor qilinmaydi.",
 	"settings.auth_cancel": "Kirishni bekor qilish",
 	"settings.auth_code": "Tasdiqlash kodi",
 	"settings.auth_submit": "Tasdiqlash va sinxronlash",
