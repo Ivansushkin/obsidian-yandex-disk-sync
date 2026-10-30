@@ -7,6 +7,7 @@ import { logger } from "../utils/logger";
 import type { EncryptionContext, EncryptionPromptMode } from "./context";
 import type { EncryptionTransitionController } from "./encryption-transition";
 import type { EncryptionRecovery } from "./recovery";
+import { InvalidEncryptionPasswordError } from "./password-policy";
 import type {
 	EncryptionConnectionOptions,
 	EncryptionWorkflow,
@@ -411,49 +412,54 @@ export class EncryptionAdmission {
 		options: EncryptionConnectionOptions,
 	): Promise<boolean> {
 		const assertLifetime = this.context.engine.createReadLifetimeGuard();
-		const reads = this.context.index.createStartupReadSession(() => {
-			options.assertCurrent?.();
-			assertLifetime();
-			this.context.assertConnectionAllowed();
-		}, true);
-		try {
-			reads.assertCurrent();
-			const password = await this.context.ui.requestPassword(
-				manifest,
-				mode,
-			);
-			if (!password || this.context.isCancelled()) {
-				return false;
-			}
-			reads.assertCurrent();
-			await this.workflow.connectForSync(password, manifest, {
-				allowRecovery: options.allowRecovery,
-				assertCurrent: () => {
-					options.assertCurrent?.();
-					reads.assertCurrent();
-				},
-			});
-			assertLifetime();
-			if (this.context.isCancelled()) {
-				return false;
-			}
-			this.context.ui.connected();
-			this.context.ui.stateChanged();
-			return true;
-		} catch (error) {
+		for (;;) {
+			const reads = this.context.index.createStartupReadSession(() => {
+				options.assertCurrent?.();
+				assertLifetime();
+				this.context.assertConnectionAllowed();
+			}, true);
 			try {
 				reads.assertCurrent();
-			} catch {
-				return false;
-			}
-			if (!this.context.isCancelled()) {
-				this.context.ui.setBlock(
-					error instanceof Error ? error.message : String(error),
+				const password = await this.context.ui.requestPassword(
+					manifest,
+					mode,
 				);
+				if (!password || this.context.isCancelled()) {
+					return false;
+				}
+				reads.assertCurrent();
+				await this.workflow.connectForSync(password, manifest, {
+					allowRecovery: options.allowRecovery,
+					assertCurrent: () => {
+						options.assertCurrent?.();
+						reads.assertCurrent();
+					},
+				});
+				assertLifetime();
+				if (this.context.isCancelled()) {
+					return false;
+				}
+				this.context.ui.connected();
+				this.context.ui.stateChanged();
+				return true;
+			} catch (error) {
+				try {
+					reads.assertCurrent();
+				} catch {
+					return false;
+				}
+				if (!this.context.isCancelled()) {
+					this.context.ui.setBlock(
+						error instanceof Error ? error.message : String(error),
+					);
+					if (error instanceof InvalidEncryptionPasswordError) {
+						continue;
+					}
+				}
+				return false;
+			} finally {
+				reads.close();
 			}
-			return false;
-		} finally {
-			reads.close();
 		}
 	}
 }

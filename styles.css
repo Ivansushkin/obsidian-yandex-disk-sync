@@ -345,6 +345,10 @@
 	gap: 8px;
 }
 
+.connection-block .authorization-pending-hidden {
+	display: none;
+}
+
 .sync-auth-controls button {
 	height: auto;
 	min-height: var(--input-height);

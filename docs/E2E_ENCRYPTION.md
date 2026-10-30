@@ -301,9 +301,11 @@ configuration/generation/lifetime guards. Поздний verifier не восс�
 `allowRecovery: false` проверяет verifier, canonical и fresh authority до install.
 После освобождения foreground owner запускается один full; automation возвращается
 только после reconciliation и persistence. Каждый target автоматически запрашивается
-один раз за экземпляр plugin, включая учёт startup/manual prompts. Cancel/wrong
-сохраняет block; manual Sync повторяет ввод, новый target или restart разрешает
-новую автоматическую попытку. Token/path change и unload сбрасывают request;
+один раз за экземпляр plugin, включая учёт startup/manual prompts. Неверный
+пароль повторно открывает окно ввода в той же попытке без сохранения candidate;
+Cancel сохраняет block, manual Sync повторяет ввод, новый target или restart
+разрешает новую автоматическую попытку. Другие ошибки подключения завершают
+попытку без повторного окна. Token/path change и unload сбрасывают request;
 pause/config ABA/persistence failure запрещают поздние install и resume.
 
 Token/path save устанавливает `manualSyncRequired`: до успешного manual full нет

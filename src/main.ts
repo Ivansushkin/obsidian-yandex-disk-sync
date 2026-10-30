@@ -610,15 +610,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Compose credential acquisition with the existing configuration and full-sync owners. */
 	private initializeAuthorization(): void {
-		const platform = Platform.isIosApp
-			? "ios"
-			: Platform.isAndroidApp
-				? "android"
-				: "desktop";
 		this.authorization = new YandexAuthorization({
 			clientId: SHARED_YANDEX_OAUTH.clientId,
-			callbackSupported:
-				SHARED_YANDEX_OAUTH.callbackPlatforms.includes(platform),
 			vaultName: () => this.app.vault.getName(),
 			deviceId: () => this.settings.deviceId,
 			request: async (body) => {
@@ -794,9 +787,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/** Preserve normal explicit binding for older local histories before starting a migration. */
-	async beginAuthorization(
-		mode: "callback" | "code" = "callback",
-	): Promise<void> {
+	async beginAuthorization(): Promise<void> {
 		if (!this.authorization?.available) {
 			throw new AuthorizationError("unavailable");
 		}
@@ -819,14 +810,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			await this.clearAuthentication("oauth", true);
 		}
-		this.authorizationUrl = await this.authorization.begin(mode);
+		this.authorizationUrl = await this.authorization.begin();
 		this.notifyManualActivity();
 		window.open(this.authorizationUrl, "_blank");
 	}
 
-	async submitAuthorizationCode(code: string): Promise<void> {
-		await this.authorization?.submitCode(code);
-	}
 	cancelAuthorization(): void {
 		this.authorization?.cancel();
 	}

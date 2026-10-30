@@ -76,7 +76,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private encryptionSpinner: HTMLElement | null = null;
 	private pendingAction = false;
 	private connectionMethod: "manual" | "oauth" | null = null;
-	private authorizationCode = "";
 	private renderGeneration = 0;
 	private displayed = false;
 
@@ -917,6 +916,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		const syncSetting = new Setting(connectionBlock);
 		syncSetting.settingEl.addClass("connection-subblock");
+		syncSetting.settingEl.toggleClass(
+			"authorization-pending-hidden",
+			this.isAuthorizationFlowActive(),
+		);
 		syncSetting.infoEl.remove();
 		this.syncButton = new ButtonComponent(syncSetting.controlEl).setCta();
 		this.syncButton.buttonEl.addClass("connection-sync-button");
@@ -1407,7 +1410,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				return;
 			}
 			await this.plugin.logoutAuthorization();
-			this.authorizationCode = "";
 			signedOut = true;
 		});
 		if (signedOut) {
@@ -1455,6 +1457,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				sync: t("settings.auth_sync_failed"),
 				denied: t("settings.auth_denied"),
 				expired: t("settings.auth_expired"),
+				timeout: t("settings.auth_expired"),
 				unavailable: t("settings.auth_unavailable"),
 			};
 			setting.setDesc(
@@ -1474,31 +1477,38 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				),
 			);
 		}
-		this.authorizationButton = new ButtonComponent(controls).setButtonText(
-			t(authorized ? "settings.auth_logout" : "settings.auth_sign_in"),
-		);
-		if (!authorized) {
-			this.authorizationButton.setCta();
-		}
-		this.updateActivity();
-		this.authorizationButton.onClick(async () => {
-			if (this.isActionUnavailable()) {
-				return;
+		if (!this.isAuthorizationFlowActive()) {
+			this.authorizationButton = new ButtonComponent(
+				controls,
+			).setButtonText(
+				t(
+					authorized
+						? "settings.auth_logout"
+						: "settings.auth_sign_in",
+				),
+			);
+			if (!authorized) {
+				this.authorizationButton.setCta();
 			}
-			if (authorized) {
-				await this.signOut();
-				return;
-			}
-			this.authorizationCode = "";
-			try {
-				await this.plugin.beginAuthorization();
-			} catch {
-				if (this.plugin.getAuthorizationState().phase === "idle") {
-					new Notice(t("settings.auth_failed"));
+			this.updateActivity();
+			this.authorizationButton.onClick(async () => {
+				if (this.isActionUnavailable()) {
+					return;
 				}
-			}
-			this.renderSettings(false);
-		});
+				if (authorized) {
+					await this.signOut();
+					return;
+				}
+				try {
+					await this.plugin.beginAuthorization();
+				} catch {
+					if (this.plugin.getAuthorizationState().phase === "idle") {
+						new Notice(t("settings.auth_failed"));
+					}
+				}
+				this.renderSettings(false);
+			});
+		}
 		const url = this.plugin.getAuthorizationUrl();
 		if (url) {
 			controls.createEl("a", {
@@ -1507,56 +1517,18 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				attr: { target: "_blank", rel: "noopener noreferrer" },
 			});
 		}
-		if (state.phase === "waiting-browser" && state.returnMode === "code") {
-			controls.createEl("label", { text: t("settings.auth_code") });
-			const submit = new ButtonComponent(controls)
-				.setButtonText(t("settings.auth_submit"))
-				.setDisabled(!this.authorizationCode.trim());
-			const input = new TextComponent(controls)
-				.setValue(this.authorizationCode)
-				.onChange((value) => {
-					this.authorizationCode = value;
-					submit.setDisabled(!value.trim());
-				});
-			input.inputEl.type = "password";
-			input.inputEl.autocomplete = "off";
-			input.inputEl.spellcheck = false;
-			input.inputEl.setAttribute("aria-label", t("settings.auth_code"));
-			submit.onClick(async () => {
-				try {
-					await this.plugin.submitAuthorizationCode(
-						this.authorizationCode,
-					);
-				} catch {
-					/* The controller presents only safe failure categories. */
-				}
-				this.authorizationCode = "";
-				this.renderSettings(false);
-			});
-		}
-		if (
-			state.phase === "waiting-browser" &&
-			state.returnMode === "callback"
-		) {
-			new ButtonComponent(controls)
-				.setButtonText(t("settings.auth_fallback"))
-				.onClick(async () => {
-					this.authorizationCode = "";
-					try {
-						await this.plugin.beginAuthorization("code");
-					} catch {
-						/* The current attempt retains its own presentation. */
-					}
-					this.renderSettings(false);
-				});
-		}
 		if (this.plugin.canCancelAuthorization()) {
 			new ButtonComponent(controls)
 				.setButtonText(t("settings.auth_cancel"))
 				.onClick(() => {
-					this.authorizationCode = "";
 					this.plugin.cancelAuthorization();
 				});
 		}
+	}
+
+	private isAuthorizationFlowActive(): boolean {
+		return !["idle", "connected", "error"].includes(
+			this.plugin.getAuthorizationState().phase,
+		);
 	}
 }

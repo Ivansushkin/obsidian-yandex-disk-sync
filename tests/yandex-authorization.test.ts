@@ -22,7 +22,6 @@ async function authorization(
 	let revision = 0;
 	const controller = new YandexAuthorization({
 		clientId: "public-test-client",
-		callbackSupported: true,
 		vaultName: () => "test vault",
 		deviceId: () => plugin.settings.deviceId,
 		request,
@@ -71,7 +70,7 @@ test("PKCE authorization ignores foreign callbacks and activates one persisted g
 		return tokenResponse("synthetic-access");
 	});
 	afterTest(t, () => h.controller.dispose());
-	authUrl = new URL(await h.controller.begin("callback"));
+	authUrl = new URL(await h.controller.begin());
 	assert.equal(
 		new URL(authUrl.searchParams.get("redirect_uri")!).searchParams.get(
 			"vault",
@@ -111,7 +110,7 @@ test("revoked native exchanges cannot publish or admit another POST before real 
 		return tokenResponse("synthetic-current");
 	});
 	afterTest(t, () => h.controller.dispose());
-	const first = new URL(await h.controller.begin("callback"));
+	const first = new URL(await h.controller.begin());
 	const old = h.controller.acceptCallback({
 		state: first.searchParams.get("state")!,
 		code: "first",
@@ -124,7 +123,7 @@ test("revoked native exchanges cannot publish or admit another POST before real 
 	await firstEntered.promise;
 	h.controller.cancel();
 	await rejected;
-	const second = new URL(await h.controller.begin("callback"));
+	const second = new URL(await h.controller.begin());
 	const current = h.controller.acceptCallback({
 		state: second.searchParams.get("state")!,
 		code: "second",
@@ -136,7 +135,7 @@ test("revoked native exchanges cannot publish or admit another POST before real 
 	assert.equal(h.plugin.settings.yandexTokenSecret, "synthetic-current");
 });
 
-test("manual-code fallback rejects stale contexts and provider errors without exposing response data", async (t) => {
+test("callback rejects stale contexts and provider errors without exposing response data", async (t) => {
 	const response = deferred<OAuthResponse>();
 	const entered = deferred();
 	const h = await authorization(async () => {
@@ -144,12 +143,15 @@ test("manual-code fallback rejects stale contexts and provider errors without ex
 		return response.promise;
 	});
 	afterTest(t, () => h.controller.dispose());
-	const url = new URL(await h.controller.begin("code"));
+	const url = new URL(await h.controller.begin());
 	assert.equal(
-		url.searchParams.get("redirect_uri"),
-		"https://oauth.yandex.ru/verification_code",
+		new URL(url.searchParams.get("redirect_uri")!).protocol,
+		"obsidian:",
 	);
-	const stale = h.controller.submitCode("synthetic-code");
+	const stale = h.controller.acceptCallback({
+		state: url.searchParams.get("state")!,
+		code: "synthetic-code",
+	});
 	const rejected = assert.rejects(
 		stale,
 		(error) =>
@@ -165,9 +167,12 @@ test("manual-code fallback rejects stale contexts and provider errors without ex
 		json: { error: "invalid_grant", error_description: "private-sentinel" },
 	}));
 	afterTest(t, () => denied.controller.dispose());
-	await denied.controller.begin("code");
+	const deniedUrl = new URL(await denied.controller.begin());
 	await assert.rejects(
-		denied.controller.submitCode("bad"),
+		denied.controller.acceptCallback({
+			state: deniedUrl.searchParams.get("state")!,
+			code: "bad",
+		}),
 		(error) =>
 			error instanceof AuthorizationError &&
 			error.code === "invalid-code" &&
@@ -184,9 +189,12 @@ test("failed accepted credential save releases authorization admission without p
 	h.plugin.saveData = async () => {
 		throw new Error("synthetic storage failure");
 	};
-	await h.controller.begin("code");
+	const url = new URL(await h.controller.begin());
 	await assert.rejects(
-		h.controller.submitCode("synthetic-code"),
+		h.controller.acceptCallback({
+			state: url.searchParams.get("state")!,
+			code: "synthetic-code",
+		}),
 		(error) =>
 			error instanceof AuthorizationError && error.code === "storage",
 	);

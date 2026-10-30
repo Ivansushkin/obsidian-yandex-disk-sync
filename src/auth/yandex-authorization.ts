@@ -37,7 +37,6 @@ export type AuthorizationPhase =
 	| "error";
 export interface AuthorizationState {
 	phase: AuthorizationPhase;
-	returnMode?: "callback" | "code";
 	failure?: AuthorizationFailure;
 }
 export interface OAuthResponse {
@@ -51,7 +50,6 @@ export interface AuthorizationAttempt {
 }
 interface Options {
 	clientId: string;
-	callbackSupported: boolean;
 	vaultName(): string;
 	deviceId(): string;
 	request(body: URLSearchParams): Promise<OAuthResponse>;
@@ -109,7 +107,7 @@ export class YandexAuthorization {
 	}
 
 	/** Create fresh proof material before opening the external consent page. */
-	async begin(mode: "callback" | "code" = "callback"): Promise<string> {
+	async begin(): Promise<string> {
 		if (!this.available) {
 			throw new AuthorizationError("unavailable");
 		}
@@ -129,11 +127,7 @@ export class YandexAuthorization {
 			waiters: new Set(),
 		};
 		this.pending = attempt;
-		mode =
-			mode === "callback" && this.options.callbackSupported
-				? "callback"
-				: "code";
-		this.update({ phase: "preparing", returnMode: mode });
+		this.update({ phase: "preparing" });
 		attempt.timer = setTimeout(
 			() => this.retire(attempt, "expired"),
 			600_000,
@@ -142,10 +136,7 @@ export class YandexAuthorization {
 			const challenge = await digest(attempt.verifier);
 			attempt.deviceId = `oyds-${await digest(this.options.deviceId())}`;
 			this.assertAttempt(attempt);
-			const redirect =
-				mode === "callback"
-					? `obsidian://yandex-disk-sync-auth?vault=${encodeURIComponent(this.options.vaultName())}`
-					: "https://oauth.yandex.ru/verification_code";
+			const redirect = `obsidian://yandex-disk-sync-auth?vault=${encodeURIComponent(this.options.vaultName())}`;
 			const query = new URLSearchParams({
 				response_type: "code",
 				client_id: this.options.clientId,
@@ -158,7 +149,7 @@ export class YandexAuthorization {
 				device_id: attempt.deviceId,
 				device_name: "Obsidian Yandex Disk Sync",
 			});
-			this.update({ phase: "waiting-browser", returnMode: mode });
+			this.update({ phase: "waiting-browser" });
 			return `https://oauth.yandex.ru/authorize?${query}`;
 		} catch (error) {
 			throw this.fail(attempt, error);
@@ -171,7 +162,6 @@ export class YandexAuthorization {
 		if (
 			!attempt ||
 			this.state.phase !== "waiting-browser" ||
-			this.state.returnMode !== "callback" ||
 			params.state !== attempt.state
 		) {
 			return false;
@@ -182,17 +172,6 @@ export class YandexAuthorization {
 		}
 		await this.exchange(attempt, params.code ?? "");
 		return true;
-	}
-
-	async submitCode(code: string): Promise<void> {
-		if (
-			!this.pending ||
-			this.state.phase !== "waiting-browser" ||
-			this.state.returnMode !== "code"
-		) {
-			throw new AuthorizationError("revoked");
-		}
-		await this.exchange(this.pending, code);
 	}
 
 	cancel(): void {
@@ -221,7 +200,7 @@ export class YandexAuthorization {
 			throw new AuthorizationError("invalid-code");
 		}
 		this.assertAttempt(attempt);
-		this.update({ phase: "exchanging", returnMode: this.state.returnMode });
+		this.update({ phase: "exchanging" });
 		try {
 			if (this.native) {
 				await this.wait(this.native, attempt);

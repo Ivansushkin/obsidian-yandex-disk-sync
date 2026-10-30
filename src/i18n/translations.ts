@@ -26,12 +26,9 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.logout_description":
 			"Saved access tokens and the encryption password (if present) will be removed from this device. To sync again, you will need to sign in and enter the password if needed. Files and sync history will stay. The app's access in Yandex will not be revoked.",
 		"settings.auth_cancel": "Cancel sign-in",
-		"settings.auth_code": "Confirmation code",
-		"settings.auth_submit": "Confirm and synchronize",
-		"settings.auth_fallback": "Use a confirmation code instead",
 		"settings.auth_open_browser": "Open the sign-in page",
 		"settings.auth_waiting":
-			"Allow access in your browser. If a code is shown, enter it here.",
+			"Allow access in your browser, then return to Obsidian.",
 		"settings.auth_waiting_idle":
 			"Waiting for the current operation to finish…",
 		"settings.auth_working": "Connecting to Yandex…",
@@ -39,7 +36,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.auth_failed":
 			"Sign-in could not finish. Check your connection and start sign-in again.",
 		"settings.auth_root_mismatch":
-			"This sign-in opens a different folder. Your existing connection is kept. Choose the original Yandex account.",
+			"This sign-in does not match the previously connected Disk folder. Your sync history is preserved. Check the Yandex account and folder.",
 		"settings.auth_root_unavailable":
 			"The Disk folder could not be verified. Check the connection and folder access.",
 		"settings.auth_storage_failed":
@@ -47,7 +44,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.auth_sync_failed":
 			"Yandex access is saved, but synchronization has not finished. Resolve the reported issue and click Synchronize.",
 		"settings.auth_denied":
-			"Access was not granted. Your existing connection is kept.",
+			"Access was not granted. Sign in again or enter a manual token.",
 		"settings.auth_expired":
 			"This sign-in attempt expired. Start sign-in again.",
 		"status.mobile.waiting_native":
@@ -649,19 +646,16 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.logout_description":
 			"Сохранённые на этом устройстве токены доступа и пароль шифрования (если есть) будут удалены. Чтобы снова синхронизировать файлы, потребуется войти и при необходимости ввести пароль. Файлы и история синхронизации сохранятся. Доступ приложения на стороне Яндекса не отзывается.",
 		"settings.auth_cancel": "Отменить вход",
-		"settings.auth_code": "Код подтверждения",
-		"settings.auth_submit": "Подтвердить и синхронизировать",
-		"settings.auth_fallback": "Войти с кодом подтверждения",
 		"settings.auth_open_browser": "Открыть страницу входа",
 		"settings.auth_waiting":
-			"Разрешите доступ в браузере. Если появился код, введите его здесь.",
+			"Разрешите доступ в браузере, затем вернитесь в Obsidian.",
 		"settings.auth_waiting_idle": "Ожидаем завершения текущей операции…",
 		"settings.auth_working": "Подключение к Яндексу…",
 		"settings.auth_connected": "Авторизация выполнена",
 		"settings.auth_failed":
 			"Не удалось завершить вход. Проверьте соединение и начните вход заново.",
 		"settings.auth_root_mismatch":
-			"Этот вход открывает другую папку. Прежнее подключение сохранено. Выберите исходный аккаунт Яндекса.",
+			"Этот вход не совпадает с ранее подключённой папкой на Диске. История синхронизации сохранена. Проверьте аккаунт Яндекса и папку.",
 		"settings.auth_root_unavailable":
 			"Не удалось проверить папку на Диске. Проверьте соединение и доступ к папке.",
 		"settings.auth_storage_failed":
@@ -669,7 +663,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.auth_sync_failed":
 			"Доступ к Яндексу сохранён, но синхронизация не завершена. Устраните указанную ошибку и нажмите «Синхронизировать».",
 		"settings.auth_denied":
-			"Доступ не предоставлен. Прежнее подключение сохранено.",
+			"Доступ не предоставлен. Повторите вход или укажите ручной токен.",
 		"settings.auth_expired":
 			"Время ожидания входа истекло. Начните вход заново.",
 		"status.mobile.waiting_native":

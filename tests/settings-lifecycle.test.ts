@@ -147,7 +147,7 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 			prompts++;
 			assert.equal(plugin.isConfigurationBusy(), true);
 			await assert.rejects(update({ yandexTokenSecret: "second-token" }));
-			return outcome === "cancel"
+			return outcome === "cancel" || (outcome === "wrong" && prompts > 1)
 				? null
 				: outcome === "wrong"
 					? "wrong"
@@ -222,7 +222,10 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 		} finally {
 			Object.assign(globalThis, { window: oldWindow });
 		}
-		assert.equal(prompts, outcome === "plaintext" ? 0 : 1);
+		assert.equal(
+			prompts,
+			outcome === "plaintext" ? 0 : outcome === "wrong" ? 2 : 1,
+		);
 		const connected =
 			outcome === "connect" ||
 			outcome === "path" ||
@@ -279,7 +282,7 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 				await update({ maxConcurrency: 7 });
 				await update({ excludePatterns: ["ignored/**"] });
 				await update({ yandexTokenSecret: "new-token" });
-				assert.equal(prompts, 1);
+				assert.equal(prompts, outcome === "wrong" ? 2 : 1);
 				assert.deepEqual(disk.files, remote);
 				flow.context.ui.requestPassword = async () => {
 					prompts++;
@@ -292,7 +295,7 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 				} finally {
 					Object.assign(globalThis, { window: oldWindow });
 				}
-				assert.equal(prompts, 2);
+				assert.equal(prompts, outcome === "wrong" ? 3 : 2);
 				await a.assertSettled({
 					"remote.md": "remote content",
 					"offline.md": "offline addition",

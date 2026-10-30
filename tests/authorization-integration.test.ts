@@ -14,7 +14,6 @@ import { StorageBindingController } from "../src/sync/local/storage-binding";
 function wireAuthorization(
 	t: TestContext,
 	plugin: Awaited<ReturnType<typeof settingsHost>>["plugin"],
-	callbackSupported = false,
 ) {
 	const cleanups: (() => void)[] = [];
 	plugin.register = (cleanup) => {
@@ -28,10 +27,6 @@ function wireAuthorization(
 			handler({ ...params, action: "yandex-disk-sync-auth" });
 		};
 	};
-	const oldPlatforms = SHARED_YANDEX_OAUTH.callbackPlatforms;
-	SHARED_YANDEX_OAUTH.callbackPlatforms = callbackSupported
-		? ["desktop"]
-		: [];
 	const oldClient = SHARED_YANDEX_OAUTH.clientId;
 	SHARED_YANDEX_OAUTH.clientId = "public-test-client";
 	const transport = globalThis as unknown as {
@@ -62,7 +57,6 @@ function wireAuthorization(
 			cleanup();
 		}
 		SHARED_YANDEX_OAUTH.clientId = oldClient;
-		SHARED_YANDEX_OAUTH.callbackPlatforms = oldPlatforms;
 		transport.__obsidianRequestUrl = previousRequest;
 		globalThis.window = oldWindow;
 	});
@@ -70,6 +64,11 @@ function wireAuthorization(
 	return {
 		callback: (params: Record<string, string>) => protocolHandler(params),
 		browserUrl: () => new URL(browserUrl),
+		submit: (code: string) =>
+			plugin["authorization"]!.acceptCallback({
+				state: new URL(browserUrl).searchParams.get("state")!,
+				code,
+			}),
 	};
 }
 
@@ -100,7 +99,7 @@ for (const encrypted of [false, true]) {
 			plugin["encryptionService"] = flow.context.getService();
 			await plugin.saveSettings();
 			a.watcher.setPersistCallback(() => plugin["persistPluginData"]());
-			const browser = wireAuthorization(t, plugin, !encrypted);
+			const browser = wireAuthorization(t, plugin);
 			await plugin.beginAuthorization();
 			assert.equal(plugin.isAuthorizationPending(), true);
 			const actor = plugin.settings.deviceId;
@@ -111,46 +110,36 @@ for (const encrypted of [false, true]) {
 			assert.equal(disk.files.has("vault/local.md"), false);
 			peer.vault.put("remote.md", bytes("peer offline"));
 			await peer.full();
-			if (encrypted) {
-				await plugin.submitAuthorizationCode("synthetic-code");
-			} else {
-				assert.equal(
-					new URL(
-						browser.browserUrl().searchParams.get("redirect_uri")!,
-					).protocol,
-					"obsidian:",
-				);
-				let unsubscribe = () => {};
-				let timer: ReturnType<typeof setTimeout> | undefined;
-				try {
-					await new Promise<void>((resolve, reject) => {
-						timer = setTimeout(
-							() =>
-								reject(
-									new Error("authorization did not finish"),
-								),
-							5000,
-						);
-						unsubscribe = plugin.onAuthorizationStateChange(() => {
-							const state = plugin.getAuthorizationState();
-							if (state.phase === "connected") {
-								resolve();
-							}
-							if (state.phase === "error") {
-								reject(new Error("authorization failed"));
-							}
-						});
-						browser.callback({
-							state: browser
-								.browserUrl()
-								.searchParams.get("state")!,
-							code: "synthetic-code",
-						});
+			assert.equal(
+				new URL(browser.browserUrl().searchParams.get("redirect_uri")!)
+					.protocol,
+				"obsidian:",
+			);
+			let unsubscribe = () => {};
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await new Promise<void>((resolve, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("authorization did not finish")),
+						5000,
+					);
+					unsubscribe = plugin.onAuthorizationStateChange(() => {
+						const state = plugin.getAuthorizationState();
+						if (state.phase === "connected") {
+							resolve();
+						}
+						if (state.phase === "error") {
+							reject(new Error("authorization failed"));
+						}
 					});
-				} finally {
-					unsubscribe();
-					clearTimeout(timer);
-				}
+					browser.callback({
+						state: browser.browserUrl().searchParams.get("state")!,
+						code: "synthetic-code",
+					});
+				});
+			} finally {
+				unsubscribe();
+				clearTimeout(timer);
 			}
 			assert.equal(plugin.getAuthorizationState().phase, "connected");
 			assert.equal(plugin.settings.authMethod, "oauth");
@@ -198,7 +187,7 @@ test(
 				persist: () => plugin.saveSettings(),
 				confirm: async () => "new",
 			});
-			wireAuthorization(t, plugin);
+			const browser = wireAuthorization(t, plugin);
 			const entered = deferred();
 			const release = deferred();
 			plugin.saveData = async () => {
@@ -209,7 +198,7 @@ test(
 				a.engine.pause();
 			}
 			await plugin.beginAuthorization();
-			const result = plugin.submitAuthorizationCode("synthetic-code");
+			const result = browser.submit("synthetic-code");
 			const rejected = assert.rejects(result);
 			await entered.promise;
 			if (timing !== "before") {
@@ -262,9 +251,9 @@ test(
 			"vault",
 		);
 		await plugin.saveSettings();
-		wireAuthorization(t, plugin);
+		const browser = wireAuthorization(t, plugin);
 		await plugin.beginAuthorization();
-		await plugin.submitAuthorizationCode("synthetic-code");
+		await browser.submit("synthetic-code");
 		const doc = Object.assign(new EventTarget(), {
 			visibilityState: "visible",
 			defaultView: new EventTarget(),
@@ -323,10 +312,10 @@ test("logout removes credentials durably without contacting Disk or losing offli
 		await plugin.applySettingsPatch({
 			clientId: "synthetic-manual-client",
 		});
-		wireAuthorization(t, plugin);
+		const browser = wireAuthorization(t, plugin);
 		if (method === "oauth") {
 			await plugin.beginAuthorization();
-			await plugin.submitAuthorizationCode("synthetic-code");
+			await browser.submit("synthetic-code");
 		}
 		a.watcher.setPersistCallback(() => plugin["persistPluginData"]());
 		a.engine.pause();
@@ -370,7 +359,7 @@ test("logout removes credentials durably without contacting Disk or losing offli
 		disk.beforeRequest = undefined;
 		a.engine.resume();
 		await plugin.beginAuthorization();
-		await plugin.submitAuthorizationCode("synthetic-code");
+		await browser.submit("synthetic-code");
 		assert.equal(plugin.getAuthorizationState().phase, "connected");
 		assert.equal(plugin.settings.manualSyncRequired, false);
 		assert.equal(disk.files.has("vault/offline.md"), true);
@@ -417,9 +406,9 @@ test("failed logout keeps the saved grant and blocks automation until a durable 
 		a.client,
 		"vault",
 	);
-	wireAuthorization(t, plugin);
+	const browser = wireAuthorization(t, plugin);
 	await plugin.beginAuthorization();
-	await plugin.submitAuthorizationCode("synthetic-code");
+	await browser.submit("synthetic-code");
 	const previous = structuredClone(plugin.settings);
 	const save = plugin.saveData.bind(plugin);
 	plugin.saveData = async () => {

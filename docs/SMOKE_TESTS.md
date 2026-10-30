@@ -1211,7 +1211,7 @@ Synthetic histories не заменяют этот прогон и не подт
    удалёнными, history и файлы сохраняются. В отдельном прогоне повторить после
    удаления и пересоздания прежнего root: кандидат также отклонён. Нет нового
    remote root или записи canonical от попытки принятия кандидата.
-4. Cancel, отказ consent, неверный/просроченный code, сеть при POST, delayed POST
+4. Cancel, отказ consent, неверный/просроченный callback code, сеть при POST, delayed POST
    после timeout/cancel; новая попытка не отправляет второй POST до settlement
    первого. Поздние ответы, replay и foreign-state link не меняют подключение.
    Во время попытки проверить запрет Force/backup/encryption и сохранение watcher
@@ -1220,8 +1220,9 @@ Synthetic histories не заменяют этот прогон и не подт
 5. Закрыть/reopen Settings, затем убить Obsidian и вернуться по старому callback.
    Живая попытка сохраняется только в первом случае; cold callback не принимается.
    Повторить на desktop/Android/iOS и двух одноимённых vault: чужой state игнорируется.
-   Непроверенная платформа использует code route; callback fallback начинает новый
-   PKCE, старый callback не обменивается.
+   На Android/iOS consent должен вернуть в Obsidian и завершить вход без ручного
+   ввода кода. Если возврат не сработал или попытка истекла, новый вход создаёт
+   новый PKCE; старый callback не обменивается.
 6. Pause/unload на root read, перед save и во время save; failed local save и failed
    full final save. Нет ложного connected/automation. Принятые credentials переживают
    unload; pending manual activation возобновляется обычным Sync после restart.
@@ -1229,10 +1230,17 @@ Synthetic histories не заменяют этот прогон и не подт
    нет overlap смены token и старой записи, нет deadlock reservation. Запрос пароля
    или failure полного sync виден штатным UI; новый grant не требует нового consent
    только ради повторения full.
-8. Проверить ручной fallback и обратное сохранение manual token. После первой
+8. Проверить ручной способ и обратное сохранение manual token. После первой
    вставки токена Sync доступен без закрытия/reopen Settings. OAuth access token
    не показывается рядом с legacy Client ID. В логах плагина нет credentials/codes/
    verifier/URL/raw provider errors; host/browser logs оценивать отдельно.
+9. На Android/iOS открыть вход во внешнем браузере и вернуться по callback:
+   подключение завершается без поля для кода. Пока попытка активна, общая кнопка
+   Sync скрыта; ссылка повторно открывает страницу входа, а «Отменить вход»
+   завершает попытку. Проверить истечение попытки во время пребывания в браузере:
+   поздний callback не принимается, новый вход создаёт новый PKCE. Повторить после
+   закрытия/reopen Settings и на узком экране. На desktop также проверить callback
+   и отсутствие кодового варианта.
 
 Покрывает `AUTH-001`–`AUTH-020`. Реальные профили/платформы, аккаунты и результаты
 фиксировать отдельно; synthetic green не является подтверждением этого smoke.

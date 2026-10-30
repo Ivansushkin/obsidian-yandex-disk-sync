@@ -13,7 +13,7 @@ import {
 import { deferred } from "./helpers/deferred";
 import { afterTest } from "./helpers/test-context";
 
-test("manual admission rechecks rotated credentials after cached startup validation", async (t) => {
+test("manual admission retries a wrong rotated password after cached startup validation", async (t) => {
 	const make = managedDevices(t);
 	const disk = new MemoryDisk();
 	const a = make(disk, "rotation-a", null);
@@ -31,11 +31,11 @@ test("manual admission rechecks rotated credentials after cached startup validat
 	eb.context.ui.requestPassword = async (_manifest, mode) => {
 		assert.equal(mode, "rotated");
 		shown++;
-		return "new-password";
+		return shown === 1 ? "wrong-password" : "new-password";
 	};
 	await transition(a, ea, "rotate", "new-password");
 	assert.equal(await startup.refresh(true), "ready");
-	assert.equal(shown, 1);
+	assert.equal(shown, 2);
 	await b.full();
 	await b.assertSettled({ "Note.md": "preserved content" });
 });
@@ -65,7 +65,10 @@ test("automatic password cancellation stays blocked and stale deferred requests 
 		let shown = 0;
 		eb.context.ui.requestPassword = async () => {
 			shown++;
-			return interruption === "cancel" ? null : "wrong-password";
+			return interruption === "cancel" ||
+				(interruption === "wrong" && shown > 1)
+				? null
+				: "wrong-password";
 		};
 		eb.workflow.admission.configureAutomaticPasswordRequests({
 			isAllowed: () => true,
@@ -94,7 +97,7 @@ test("automatic password cancellation stays blocked and stale deferred requests 
 		await eb.workflow.admission.flushAutomaticPasswordRequest();
 		await eb.workflow.admission.flushAutomaticPasswordRequest();
 		const canRetry = interruption === "cancel" || interruption === "wrong";
-		assert.equal(shown, canRetry ? 1 : 0);
+		assert.equal(shown, interruption === "wrong" ? 2 : canRetry ? 1 : 0);
 		assert.deepEqual(disk.files, remote);
 		assert.deepEqual(await eb.saved(), saved);
 		if (canRetry) {
@@ -102,13 +105,13 @@ test("automatic password cancellation stays blocked and stale deferred requests 
 				prompt: false,
 			});
 			await eb.workflow.admission.flushAutomaticPasswordRequest();
-			assert.equal(shown, 1);
+			assert.equal(shown, interruption === "wrong" ? 2 : 1);
 			eb.context.ui.requestPassword = async () => {
 				shown++;
 				return "new-password";
 			};
 			assert.equal(await startup.refresh(true), "ready");
-			assert.equal(shown, 2);
+			assert.equal(shown, interruption === "wrong" ? 3 : 2);
 			await b.full();
 			await b.assertSettled({ "Note.md": "kept" });
 		}
