@@ -7,30 +7,44 @@ Changes since `2.1.0`.
 ### Added
 
 - Shared Yandex sign-in uses an authorization code with PKCE S256 and a public
-  Client ID. Desktop can return through an Obsidian callback; Android and iOS use
-  a confirmation code. Each attempt has an isolated state, verifier and timeout.
-- A local **Sign out** action for shared and manual connections clears credentials
-  while retaining the remote folder, synchronization history, offline work,
-  encryption parameters and files. It also clears the saved encryption password
-  and active codec; encrypted vaults request the password again after sign-in.
-  Sign-out waits until any pending encryption or Force recovery is complete.
+  Client ID. The flow uses an Obsidian callback on desktop, Android and iOS;
+  real provider and device acceptance still requires manual verification. Each
+  attempt has an isolated state, verifier and timeout.
+- A local **Sign out** action for shared and manual connections removes saved
+  credentials and the encryption password, then clears the active codec. It
+  preserves the remote folder, synchronization history, offline work, encryption
+  parameters and files. Encrypted vaults request the password after sign-in.
+  Sign-out requires confirmation and is unavailable during unfinished encryption
+  or Force recovery; it does not revoke access on Yandex's side.
 
 ### Changed
 
 - Existing manual connections remain available after updating. Starting shared
   sign-in explicitly clears their Client ID and token before opening the browser;
   cancellation does not restore them.
-- A new token is accepted only after the selected remote root matches the saved
-  connection. Credential changes use the existing persistence queue and wait for
-  active synchronization and native writes to settle. The first successful full
-  sync after sign-in enables automatic synchronization.
+- For an existing connection, a new token is accepted only after the selected
+  remote root matches its saved identity. Credential changes use the existing
+  persistence queue and wait for active synchronization and native writes to
+  settle. The first successful full sync after sign-in enables automatic
+  synchronization.
 - Connection settings separate the remote folder, authorization controls and
   synchronization action. The shared sign-in state is shown next to its controls,
-  and the manual token input does not display a shared OAuth token.
+  the sync button is hidden during sign-in, and the manual token input does not
+  display a shared OAuth token. Controls adapt to narrow settings panels.
 - After sign-out, status prompts for sign-in or a manual token. Sync, Force,
   backup and encryption actions stay unavailable until access is configured.
 - In manual connection settings, **Sign in** starts normal synchronization after a
   token is entered. **Sign out** appears after the first successful full sync.
+- Release validation no longer requires machine-readable scenario evidence files.
+  Manual acceptance with two Obsidian profiles against real Yandex Disk remains
+  required before release.
+
+### Fixed
+
+- An incorrect encryption password reopens the password dialog in the same
+  connection attempt. Cancel closes it; other connection errors do not reopen it.
+- An encryption password left in local data without a connection is cleared on
+  load, and later snapshots cannot restore credentials after sign-out.
 
 ## 2.1.0
 
@@ -181,7 +195,7 @@ Changes since stable `1.1.0`.
   modules. Browser runtime dependencies are pinned and Obsidian is a
   development-only dependency. CI runs tests on Node 20 and 22, lint, formatting,
   build and bundle checks; release workflows additionally check dependency
-  audits, exact assets, and published asset hashes.
+  audits, release evidence, exact assets, and published asset hashes.
 
 ### Fixed
 
