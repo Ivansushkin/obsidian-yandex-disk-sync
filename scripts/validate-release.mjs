@@ -38,9 +38,11 @@ if (versions["1.1.0"] !== "0.15.0") {
 }
 if (
 	JSON.stringify(Object.keys(versions).sort()) !==
-	JSON.stringify(["1.1.0", "2.0.0", "2.1.0"])
+	JSON.stringify(["1.1.0", "2.0.0", "2.1.0", "2.2.0"])
 ) {
-	fail("versions.json must retain stable 1.1.0, 2.0.0 and current 2.1.0");
+	fail(
+		"versions.json must retain stable 1.1.0, 2.0.0, 2.1.0 and current 2.2.0",
+	);
 }
 const changelog = readFileSync("CHANGELOG.md", "utf8");
 const changelogVersions = [...changelog.matchAll(/^## (.+)$/gm)].map(
@@ -48,10 +50,10 @@ const changelogVersions = [...changelog.matchAll(/^## (.+)$/gm)].map(
 );
 if (
 	JSON.stringify(changelogVersions) !==
-	JSON.stringify(["2.1.0", "2.0.0", "1.1.0"])
+	JSON.stringify(["2.2.0", "2.1.0", "2.0.0", "1.1.0"])
 ) {
 	fail(
-		"changelog must contain current 2.1.0 and historical 2.0.0/1.1.0 sections",
+		"changelog must contain current 2.2.0 and historical 2.1.0/2.0.0/1.1.0 sections",
 	);
 }
 if (/\b(?:beta|prerelease)\b/i.test(changelog)) {
@@ -122,8 +124,8 @@ if (scenarioErrors.length > 0) {
 }
 
 if (stable) {
-	if (version !== "2.1.0") {
-		fail("only 2.1.0 is approved as the next stable");
+	if (version !== "2.2.0") {
+		fail("only 2.2.0 is approved as the next stable");
 	}
 	if (evidence.status !== "PASS" || evidence.releaseVersion !== version) {
 		fail("manual P0/P1 evidence is not complete");

@@ -1,0 +1,13 @@
+{
+	"releaseVersion": "2.2.0",
+	"status": "PENDING",
+	"testedCommit": null,
+	"scenarios": [],
+	"blockers": [
+		"The exact 2.2.0 test commit and per-scenario manual evidence have not been recorded",
+		"Two independent Obsidian profiles against real Yandex Disk in plaintext and encrypted modes have not been verified for 2.2.0",
+		"Shared Yandex OAuth PKCE exchange, desktop callback and Android/iOS confirmation-code sign-in require real-provider acceptance",
+		"Authorization migration, local sign-out, restart and offline return require manual acceptance on real Obsidian profiles",
+		"Historical 2.1.0 evidence does not establish acceptance of 2.2.0"
+	]
+}

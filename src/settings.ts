@@ -51,6 +51,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private lastBackupDate: Date | null | undefined;
 	private activityUnsubscribers: (() => void)[] = [];
 	private syncButton: ButtonComponent | null = null;
+	private authorizationButton: ButtonComponent | null = null;
+	private manualLogoutButton: ButtonComponent | null = null;
 	private forceButtons: {
 		button: ButtonComponent;
 		direction: ForceDirection;
@@ -181,6 +183,22 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private updateActivity(): void {
 		const busy = this.isActionUnavailable();
 		this.controlsEl?.setAttribute("aria-busy", String(busy));
+		this.manualLogoutButton?.setDisabled(
+			busy ||
+				this.plugin.settings.authMethod !== "manual" ||
+				!(
+					this.plugin.settings.clientId.trim() ||
+					this.plugin.settings.yandexTokenSecret.trim()
+				),
+		);
+		this.authorizationButton?.setDisabled(
+			busy ||
+				(!(
+					this.plugin.settings.authMethod === "oauth" &&
+					this.plugin.settings.yandexTokenSecret.trim()
+				) &&
+					!this.plugin.isAuthorizationAvailable()),
+		);
 		for (const { component, diagnostic, disabled } of this.controls) {
 			component.setDisabled(
 				disabled ||
@@ -615,6 +633,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.detachActivity();
 		this.renderGeneration++;
 		this.syncButton = null;
+		this.authorizationButton = null;
+		this.manualLogoutButton = null;
 		this.backupButton = null;
 		this.encryptionButton = null;
 		this.clearLogsButton = null;
@@ -706,9 +726,32 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		const connectionBlock = containerEl.createDiv({
 			cls: "connection-block",
 		});
+		const pathSetting = new Setting(connectionBlock)
+			.setName(t("settings.remote_path"))
+			.addText((control) => {
+				control
+					.setPlaceholder(t("settings.remote_path_placeholder"))
+					.setValue(this.plugin.settings.remotePath);
+				control.inputEl.setAttribute(
+					"aria-label",
+					t("settings.remote_path"),
+				);
+				this.trackControl(control);
+				control.onChange(async (value) => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					await this.applyDraft({ remotePath: value });
+				});
+			});
+		pathSetting.settingEl.addClass("connection-subblock");
+
+		const authorizationBlock = connectionBlock.createDiv({
+			cls: "connection-subblock connection-authorization",
+		});
 		const connectionMethod =
 			this.connectionMethod ?? this.plugin.settings.authMethod;
-		new Setting(connectionBlock)
+		new Setting(authorizationBlock)
 			.setName(t("settings.auth_method"))
 			.addDropdown((control) => {
 				control.addOption("oauth", t("settings.auth_oauth"));
@@ -725,12 +768,14 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				});
 			});
 
-		const oauthSetting = new Setting(connectionBlock);
+		const oauthSetting = new Setting(authorizationBlock);
 
 		const descEl = oauthSetting.descEl;
 		descEl.empty();
-		const instructionDiv = descEl.createDiv({ cls: "oauth-instruction" });
 		if (connectionMethod === "manual") {
+			const instructionDiv = descEl.createDiv({
+				cls: "oauth-instruction",
+			});
 			instructionDiv.createDiv({
 				text: t("settings.oauth_instruction_1"),
 			});
@@ -755,32 +800,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			instructionDiv.createDiv({
 				text: t("settings.oauth_instruction_8"),
 			});
-		} else {
-			instructionDiv.createDiv({ text: t("settings.auth_description") });
 		}
 
 		const controlEl = oauthSetting.controlEl;
 
-		controlEl.createEl("label", { text: t("settings.remote_path") });
-		new TextComponent(controlEl)
-			.setPlaceholder(t("settings.remote_path_placeholder"))
-			.setValue(this.plugin.settings.remotePath)
-			.then((control) => {
-				control.inputEl.setAttribute(
-					"aria-label",
-					t("settings.remote_path"),
-				);
-				this.trackControl(control);
-			})
-			.onChange(async (value) => {
-				if (this.isActionUnavailable()) {
-					return;
-				}
-				await this.applyDraft({ remotePath: value });
-			});
-
 		if (connectionMethod === "oauth") {
-			this.renderOAuthConnection(controlEl);
+			this.renderOAuthConnection(oauthSetting);
 		} else {
 			new ButtonComponent(controlEl)
 				.setButtonText(t("settings.manage_clients"))
@@ -843,9 +868,17 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					}
 					await this.applyDraft({ yandexTokenSecret: value });
 				});
+			this.manualLogoutButton = new ButtonComponent(controlEl)
+				.setButtonText(t("settings.auth_logout"))
+				.onClick(async () => {
+					await this.signOut();
+				});
 		}
 
-		this.syncButton = new ButtonComponent(controlEl).setCta();
+		const syncSetting = new Setting(connectionBlock);
+		syncSetting.settingEl.addClass("connection-subblock");
+		syncSetting.infoEl.remove();
+		this.syncButton = new ButtonComponent(syncSetting.controlEl).setCta();
 		this.syncButton.buttonEl.addClass("connection-sync-button");
 		this.syncButton.buttonEl.setAttribute(
 			"aria-label",
@@ -1310,16 +1343,31 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.updateActivity();
 	}
 
-	/** Present acquisition separately from the existing synchronization status and activation gate. */
-	private renderOAuthConnection(parent: HTMLElement): void {
-		const controls = parent.createDiv({ cls: "sync-auth-controls" });
+	/** Use the same guarded logout for both authorization forms. */
+	private async signOut(): Promise<void> {
+		this.authorizationCode = "";
+		await this.runSettingsAction(async () => {
+			await this.plugin.logoutAuthorization();
+		});
+		this.renderSettings(false);
+	}
+
+	/** Show one sign-in message beside the controls without implying synchronization success. */
+	private renderOAuthConnection(setting: Setting): void {
+		const controls = setting.controlEl.createDiv({
+			cls: "sync-auth-controls",
+		});
 		const state = this.plugin.getAuthorizationState();
-		if (!this.plugin.isAuthorizationAvailable()) {
-			controls.createDiv({
-				text: t("settings.auth_unavailable"),
-				cls: "setting-item-description",
-			});
-		}
+		const authorized =
+			this.plugin.settings.authMethod === "oauth" &&
+			Boolean(this.plugin.settings.yandexTokenSecret.trim());
+		setting.setDesc(
+			t(
+				authorized
+					? "settings.auth_connected"
+					: "settings.auth_description",
+			),
+		);
 		if (state.failure) {
 			const messages = {
 				"root-mismatch": t("settings.auth_root_mismatch"),
@@ -1330,47 +1378,39 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				expired: t("settings.auth_expired"),
 				unavailable: t("settings.auth_unavailable"),
 			};
-			controls.createDiv({
-				text:
-					messages[state.failure as keyof typeof messages] ??
+			setting.setDesc(
+				messages[state.failure as keyof typeof messages] ??
 					t("settings.auth_failed"),
-				cls: "setting-item-description",
-			});
+			);
+		} else if (!authorized && !this.plugin.isAuthorizationAvailable()) {
+			setting.setDesc(t("settings.auth_unavailable"));
 		} else if (state.phase === "waiting-browser") {
-			controls.createDiv({ text: t("settings.auth_waiting") });
+			setting.setDesc(t("settings.auth_waiting"));
 		} else if (this.plugin.isAuthorizationPending()) {
-			controls.createDiv({
-				text: t(
+			setting.setDesc(
+				t(
 					state.phase === "waiting-idle"
 						? "settings.auth_waiting_idle"
 						: "settings.auth_working",
 				),
-			});
-		} else if (
-			this.plugin.settings.authMethod === "oauth" &&
-			this.plugin.settings.yandexTokenSecret
-		) {
-			controls.createDiv({ text: t("settings.auth_connected") });
-		}
-		const signIn = new ButtonComponent(controls)
-			.setButtonText(
-				t(
-					this.plugin.settings.authMethod === "oauth" &&
-						this.plugin.settings.yandexTokenSecret
-						? "settings.auth_sign_in_again"
-						: "settings.auth_sign_in",
-				),
-			)
-			.setCta()
-			.setDisabled(
-				!this.plugin.isAuthorizationAvailable() ||
-					this.isActionUnavailable(),
 			);
-		signIn.onClick(async () => {
+		}
+		this.authorizationButton = new ButtonComponent(controls).setButtonText(
+			t(authorized ? "settings.auth_logout" : "settings.auth_sign_in"),
+		);
+		if (!authorized) {
+			this.authorizationButton.setCta();
+		}
+		this.updateActivity();
+		this.authorizationButton.onClick(async () => {
 			if (this.isActionUnavailable()) {
 				return;
 			}
 			this.authorizationCode = "";
+			if (authorized) {
+				await this.signOut();
+				return;
+			}
 			try {
 				await this.plugin.beginAuthorization();
 			} catch {

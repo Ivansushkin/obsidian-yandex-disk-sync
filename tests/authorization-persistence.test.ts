@@ -8,24 +8,42 @@ import type { PluginData } from "../src/plugin-persistence";
 test("authorization defaults preserve existing manual connections and incomplete setup", async () => {
 	const seed = persistenceHarness();
 	await seed.plugin.loadSettings();
-	for (const previous of ["fresh", "token", "client"] as const) {
+	for (const previous of ["fresh", "token", "client", "oauth"] as const) {
 		const data = structuredClone(seed.writes.at(-1)) as PluginData;
 		Reflect.deleteProperty(data.settings, "authMethod");
 		Reflect.deleteProperty(data.settings, "oauthAuthorization");
 		data.settings.yandexTokenSecret =
-			previous === "token" ? "synthetic-old" : "";
+			previous === "token" || previous === "oauth" ? "synthetic-old" : "";
 		data.settings.clientId =
-			previous === "client" ? "synthetic-client" : "";
+			previous === "client" || previous === "oauth"
+				? "synthetic-client"
+				: "";
+		if (previous === "oauth") {
+			data.settings.authMethod = "oauth";
+			data.settings.oauthAuthorization = {
+				clientId: "shared-client",
+				grantId: "saved-grant",
+				refreshToken: null,
+				expiresAt: null,
+			};
+		}
 		data.settings.manualSyncRequired = false;
-		const { plugin } = persistenceHarness(
+		const { plugin, persistence } = persistenceHarness(
 			previous === "fresh" ? null : data,
 		);
 		await plugin.loadSettings();
 		assert.equal(
 			plugin.settings.authMethod,
-			previous === "fresh" ? "oauth" : "manual",
+			previous === "fresh" || previous === "oauth" ? "oauth" : "manual",
 		);
-		assert.equal(plugin.settings.oauthAuthorization, null);
+		assert.deepEqual(
+			plugin.settings.oauthAuthorization,
+			data.settings.oauthAuthorization ?? null,
+		);
+		assert.equal(
+			persistence.current?.settings.clientId,
+			previous === "client" ? "synthetic-client" : "",
+		);
 		assert.equal(plugin.settings.manualSyncRequired, previous === "fresh");
 		assert.equal(
 			plugin.settings.yandexTokenSecret,
@@ -65,45 +83,75 @@ test("authorization defaults preserve existing manual connections and incomplete
 });
 
 test("accepted authorization survives unload publication revocation and later snapshot writes", async () => {
-	const { plugin, persistence, writes } = persistenceHarness();
-	await plugin.loadSettings();
-	const entered = deferred();
-	const release = deferred();
-	plugin.saveData = async (data) => {
-		writes.push(structuredClone(data));
-		entered.resolve();
-		await release.promise;
-	};
-	const update = persistence.persistAuthentication(
-		{
-			kind: "interactive",
-			token: "synthetic-new",
-			authorization: {
-				clientId: "public-client",
-				grantId: "grant",
-				refreshToken: null,
-				expiresAt: null,
-			},
-		},
-		() => {},
-	);
-	const rejected = assert.rejects(update, /unloaded/);
-	await entered.promise;
-	logger.configure({ consoleEnabled: false, fileEnabled: false });
-	plugin.onunload();
-	release.resolve();
-	await rejected;
-	await persistence.idle();
-	assert.equal(plugin.settings.yandexTokenSecret, "");
-	const stored = (writes.at(-1) as PluginData).settings;
-	assert.equal(stored.yandexTokenSecret, "synthetic-new");
-	assert.equal(stored.authMethod, "oauth");
-	assert.equal(stored.oauthAuthorization?.grantId, "grant");
-	assert.equal(stored.manualSyncRequired, true);
-	const restored = persistenceHarness(writes.at(-1));
-	await restored.plugin.loadSettings();
-	assert.equal(restored.plugin.settings.oauthAuthorization?.grantId, "grant");
-	assert.equal(restored.plugin.settings.manualSyncRequired, true);
+	for (const logout of [false, true]) {
+		const { plugin, persistence, writes } = persistenceHarness();
+		await plugin.loadSettings();
+		if (logout) {
+			await persistence.persistAuthentication(
+				{
+					kind: "interactive",
+					token: "synthetic-old",
+					authorization: {
+						clientId: "public-client",
+						grantId: "old-grant",
+						refreshToken: null,
+						expiresAt: null,
+					},
+				},
+				() => {},
+			);
+		}
+		plugin.settings.clientId = "stale-manual-client";
+		const entered = deferred();
+		const release = deferred();
+		plugin.saveData = async (data) => {
+			writes.push(structuredClone(data));
+			entered.resolve();
+			await release.promise;
+		};
+		const update = persistence.persistAuthentication(
+			logout
+				? { kind: "logout" }
+				: {
+						kind: "interactive",
+						token: "synthetic-new",
+						authorization: {
+							clientId: "public-client",
+							grantId: "grant",
+							refreshToken: null,
+							expiresAt: null,
+						},
+					},
+			() => {},
+		);
+		const rejected = assert.rejects(update, /unloaded/);
+		await entered.promise;
+		logger.configure({ consoleEnabled: false, fileEnabled: false });
+		plugin.onunload();
+		release.resolve();
+		await rejected;
+		await persistence.idle();
+		assert.equal(
+			plugin.settings.yandexTokenSecret,
+			logout ? "synthetic-old" : "",
+		);
+		const stored = (writes.at(-1) as PluginData).settings;
+		assert.equal(stored.yandexTokenSecret, logout ? "" : "synthetic-new");
+		assert.equal(stored.authMethod, "oauth");
+		assert.equal(stored.clientId, "");
+		assert.equal(
+			stored.oauthAuthorization?.grantId,
+			logout ? undefined : "grant",
+		);
+		assert.equal(stored.manualSyncRequired, true);
+		const restored = persistenceHarness(writes.at(-1));
+		await restored.plugin.loadSettings();
+		assert.equal(
+			restored.plugin.settings.oauthAuthorization?.grantId,
+			logout ? undefined : "grant",
+		);
+		assert.equal(restored.plugin.settings.manualSyncRequired, true);
+	}
 });
 
 test("authorization guard and failed persistence cannot publish a candidate or acknowledge activation", async () => {
@@ -138,30 +186,59 @@ test("authorization guard and failed persistence cannot publish a candidate or a
 });
 
 test("refresh retains activation and manual credentials retire the managed grant atomically", async () => {
-	const { plugin, persistence } = persistenceHarness();
-	await plugin.loadSettings();
-	const authorization = {
-		clientId: "public-client",
-		grantId: "grant",
-		refreshToken: "synthetic-refresh",
-		expiresAt: null,
-	};
-	await persistence.persistAuthentication(
-		{ kind: "interactive", token: "synthetic-access", authorization },
-		() => {},
-	);
-	await persistence.completeManualSync(() => {});
-	await persistence.persistAuthentication(
-		{ kind: "refresh", token: "synthetic-renewed", authorization },
-		() => {},
-	);
-	assert.equal(plugin.settings.manualSyncRequired, false);
-	await plugin.applySettingsPatch({ yandexTokenSecret: "synthetic-manual" });
-	assert.equal(plugin.settings.authMethod, "manual");
-	assert.equal(plugin.settings.oauthAuthorization, null);
-	assert.equal(
-		persistence.current?.settings.yandexTokenSecret,
-		"synthetic-manual",
-	);
-	assert.equal(persistence.current?.settings.manualSyncRequired, true);
+	for (const route of ["client-first", "token-only"]) {
+		const { plugin, persistence } = persistenceHarness();
+		await plugin.loadSettings();
+		const authorization = {
+			clientId: "public-client",
+			grantId: "grant",
+			refreshToken: "synthetic-refresh",
+			expiresAt: null,
+		};
+		await persistence.persistAuthentication(
+			{ kind: "interactive", token: "synthetic-access", authorization },
+			() => {},
+		);
+		await persistence.completeManualSync(() => {});
+		await persistence.persistAuthentication(
+			{ kind: "refresh", token: "synthetic-renewed", authorization },
+			() => {},
+		);
+		assert.equal(plugin.settings.manualSyncRequired, false);
+		if (route === "client-first") {
+			await plugin.applySettingsPatch({ clientId: "own-client" });
+			assert.equal(plugin.settings.authMethod, "manual");
+			assert.equal(plugin.settings.yandexTokenSecret, "");
+			assert.equal(plugin.settings.oauthAuthorization, null);
+			assert.equal(persistence.current?.settings.clientId, "own-client");
+			assert.equal(persistence.current?.settings.yandexTokenSecret, "");
+			assert.equal(
+				persistence.current?.settings.oauthAuthorization,
+				null,
+			);
+		}
+		await plugin.applySettingsPatch({
+			yandexTokenSecret: "synthetic-manual",
+		});
+		assert.equal(plugin.settings.authMethod, "manual");
+		assert.equal(plugin.settings.oauthAuthorization, null);
+		assert.equal(
+			persistence.current?.settings.yandexTokenSecret,
+			"synthetic-manual",
+		);
+		assert.equal(persistence.current?.settings.manualSyncRequired, true);
+		await plugin.saveSettings();
+		const restored = persistenceHarness(persistence.current);
+		await restored.plugin.loadSettings();
+		assert.equal(restored.plugin.settings.authMethod, "manual");
+		assert.equal(restored.plugin.settings.oauthAuthorization, null);
+		assert.equal(
+			restored.plugin.settings.yandexTokenSecret,
+			"synthetic-manual",
+		);
+		assert.equal(
+			restored.plugin.settings.clientId,
+			route === "client-first" ? "own-client" : "",
+		);
+	}
 });

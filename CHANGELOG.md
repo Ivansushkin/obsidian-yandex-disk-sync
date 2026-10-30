@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.2.0
+
+Changes since `2.1.0`.
+
+### Added
+
+- Shared Yandex sign-in uses an authorization code with PKCE S256 and a public
+  Client ID. Desktop can return through an Obsidian callback; Android and iOS use
+  a confirmation code. Each attempt has an isolated state, verifier and timeout.
+- A local **Sign out** action for shared and manual connections clears credentials
+  while retaining the remote folder, synchronization history, offline work,
+  encryption settings and files.
+
+### Changed
+
+- Existing manual connections remain available after updating. Starting shared
+  sign-in explicitly clears their Client ID and token before opening the browser;
+  cancellation does not restore them.
+- A new token is accepted only after the selected remote root matches the saved
+  connection. Credential changes use the existing persistence queue and wait for
+  active synchronization and native writes to settle. The first successful full
+  sync after sign-in enables automatic synchronization.
+- Connection settings separate the remote folder, authorization controls and
+  synchronization action. The shared sign-in state is shown next to its controls,
+  and the manual token input does not display a shared OAuth token.
+
 ## 2.1.0
 
 Changes since `2.0.0`.

@@ -343,6 +343,7 @@
 .connection-block .setting-item-control {
 	flex: 0 0 22ch;
 	min-width: 0;
+	margin-inline-start: auto;
 }
 
 .connection-block .sync-auth-controls {

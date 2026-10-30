@@ -52,15 +52,16 @@ Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) and add
 2. Open the plugin settings, choose a dedicated Disk folder, for example
    `obsidian-sync/my-vault`, and review the synchronization filters.
 3. “Sign in with Yandex” is selected by default. When shared sign-in is configured
-   in the build, click “Sign in and sync”, approve access in your browser, then
+   in the build, click “Sign in”, approve access in your browser, then
    return to Obsidian or paste the displayed code. Wait for the full sync to finish.
 4. If shared sign-in is unavailable or you use your own application, choose manual
    setup: create an application through [Yandex OAuth](https://oauth.yandex.ru/)
    with Disk read and write permissions, obtain and paste its token, then run a
    full sync. Use a separate remote folder for each vault.
 
-Existing manual connections keep working after an update. Moving to shared
-sign-in is optional and verifies that the remote folder is the same. After new
+Starting shared sign-in clears the previous manual Client ID and token; canceling
+does not restore them. Existing manual connections keep working after an update.
+Moving to shared sign-in is optional and verifies that the remote folder is the same. After new
 credentials are saved, a successful manual full sync enables automation; a failed
 full can be retried without another sign-in. Manual token or folder changes also
 require a successful manual full sync.

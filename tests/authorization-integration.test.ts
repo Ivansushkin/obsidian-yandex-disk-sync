@@ -263,6 +263,8 @@ test(
 		);
 		await plugin.saveSettings();
 		wireAuthorization(t, plugin);
+		await plugin.beginAuthorization();
+		await plugin.submitAuthorizationCode("synthetic-code");
 		const doc = Object.assign(new EventTarget(), {
 			visibilityState: "visible",
 			defaultView: new EventTarget(),
@@ -307,6 +309,120 @@ test(
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
 		assert.equal(recovery.canStartAutomatic(), true);
-		assert.equal(plugin.settings.authMethod, "manual");
+		assert.equal(plugin.settings.authMethod, "oauth");
 	},
 );
+
+test("logout removes credentials durably without contacting Disk or losing offline history", async (t) => {
+	for (const method of ["manual", "oauth"] as const) {
+		const { plugin, persistence, a, disk } = await settingsHost(t);
+		a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+			a.client,
+			"vault",
+		);
+		await plugin.applySettingsPatch({
+			clientId: "synthetic-manual-client",
+		});
+		wireAuthorization(t, plugin);
+		if (method === "oauth") {
+			await plugin.beginAuthorization();
+			await plugin.submitAuthorizationCode("synthetic-code");
+		}
+		a.watcher.setPersistCallback(() => plugin["persistPluginData"]());
+		a.engine.pause();
+		a.vault.put("offline.md", bytes("offline edit"));
+		await a.watcher.waitForPendingPersistence();
+		const before = structuredClone(persistence.current!);
+		assert.equal(before.pendingWatcherEvents.length, 1);
+		const remote = structuredClone(disk.files);
+		disk.beforeRequest = async () => {
+			throw new Error("Logout must not contact Disk");
+		};
+		await plugin.logoutAuthorization();
+		const after = persistence.current!;
+		assert.equal(after.settings.yandexTokenSecret, "");
+		assert.equal(after.settings.oauthAuthorization, null);
+		assert.equal(after.settings.authMethod, method);
+		assert.equal(after.settings.clientId, "");
+		assert.equal(after.settings.manualSyncRequired, true);
+		assert.deepEqual({ ...after, settings: before.settings }, before);
+		assert.deepEqual(
+			{
+				...after.settings,
+				clientId: before.settings.clientId,
+				yandexTokenSecret: before.settings.yandexTokenSecret,
+				oauthAuthorization: before.settings.oauthAuthorization,
+				manualSyncRequired: before.settings.manualSyncRequired,
+			},
+			before.settings,
+		);
+		assert.deepEqual(disk.files, remote);
+		assert.equal(plugin.getAuthorizationState().phase, "idle");
+		assert.equal(plugin["regularSyncStarted"], false);
+		assert.equal(a.engine.isSyncPaused(), true);
+		assert.equal(a.vault.entries.has("offline.md"), true);
+		const { persistenceHarness } =
+			await import("./helpers/lifecycle-fixtures");
+		const restored = persistenceHarness(after);
+		await restored.plugin.loadSettings();
+		assert.equal(restored.plugin.settings.yandexTokenSecret, "");
+		assert.equal(restored.plugin.settings.oauthAuthorization, null);
+		disk.beforeRequest = undefined;
+		a.engine.resume();
+		await plugin.beginAuthorization();
+		await plugin.submitAuthorizationCode("synthetic-code");
+		assert.equal(plugin.getAuthorizationState().phase, "connected");
+		assert.equal(plugin.settings.manualSyncRequired, false);
+		assert.equal(disk.files.has("vault/offline.md"), true);
+		assert.equal(persistence.current?.pendingWatcherEvents.length, 0);
+	}
+});
+
+test("failed logout keeps the saved grant and blocks automation until a durable retry", async (t) => {
+	const { plugin, persistence, a } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await plugin.submitAuthorizationCode("synthetic-code");
+	const previous = structuredClone(plugin.settings);
+	const save = plugin.saveData.bind(plugin);
+	plugin.saveData = async () => {
+		throw new Error("synthetic logout storage failure");
+	};
+	await assert.rejects(plugin.logoutAuthorization(), /storage failure/);
+	assert.deepEqual(plugin.settings, previous);
+	assert.equal(persistence.failed, true);
+	assert.equal(plugin["regularSyncStarted"], false);
+	plugin.saveData = save;
+	await plugin.logoutAuthorization();
+	assert.equal(persistence.current?.settings.yandexTokenSecret, "");
+	assert.equal(persistence.current?.settings.oauthAuthorization, null);
+	assert.equal(persistence.failed, false);
+});
+
+test("starting shared sign-in durably clears manual credentials and cancellation cannot restore them", async (t) => {
+	const { plugin, persistence, a } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	await plugin.applySettingsPatch({ clientId: "synthetic-manual-client" });
+	const before = structuredClone(a.index.getLocalIndex());
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	assert.equal(browser.browserUrl().hostname, "oauth.yandex.ru");
+	assert.equal(plugin.settings.authMethod, "oauth");
+	assert.equal(plugin.settings.clientId, "");
+	assert.equal(plugin.settings.yandexTokenSecret, "");
+	assert.equal(persistence.current?.settings.clientId, "");
+	assert.equal(persistence.current?.settings.yandexTokenSecret, "");
+	plugin.cancelAuthorization();
+	await plugin.saveSettings();
+	assert.equal(persistence.current?.settings.clientId, "");
+	assert.equal(persistence.current?.settings.yandexTokenSecret, "");
+	assert.equal(plugin.settings.manualSyncRequired, true);
+	assert.deepEqual(a.index.getLocalIndex(), before);
+});

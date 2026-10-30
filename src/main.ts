@@ -1,8 +1,12 @@
-import { normalizeAuthentication } from "./auth/authentication-state";
+import {
+	normalizeAuthentication,
+	type AuthenticationChange,
+} from "./auth/authentication-state";
 import {
 	YandexAuthorization,
 	AuthorizationError,
 	type AuthorizationState,
+	type AuthorizationAttempt,
 } from "./auth/yandex-authorization";
 import { SHARED_YANDEX_OAUTH } from "./auth/configuration";
 import type { StartupReadSession } from "./sync/canonical/manager";
@@ -653,68 +657,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				};
 			},
 			adopt: (update, attempt) =>
-				applyAuthenticationUpdate(
-					{
-						getSettings: () => this.settings,
-						getExpectedScope: () =>
-							this.indexManager.getLocalIndex().remoteScope,
-						hasHistory: () =>
-							this.indexManager.getLocalIndex().observedEpoch !==
-								null ||
-							this.hasDurableConfigurationWork() ||
-							this.encryptionTransition !== null ||
-							Object.keys(this.indexManager.getLocalIndex().files)
-								.length > 0,
-						isBusy: () => this.isConfigurationBusy(),
-						isUnloaded: () => this.unloaded,
-						nativeWrites: () =>
-							this.yandexClient.getNativeRequestActivity().writes,
-						subscribeActivity: (listener) => {
-							const activity =
-								this.onSyncActivityChange(listener);
-							const native =
-								this.yandexClient.onNativeActivityChange(
-									listener,
-								);
-							const authorization =
-								this.authorization?.subscribe(listener);
-							return () => {
-								activity();
-								native();
-								authorization?.();
-							};
-						},
-						setUpdating: (updating) => {
-							this.configurationUpdatePending = updating;
-							this.notifyManualActivity();
-						},
-						waitForWatcherPersistence: () =>
-							this.fileWatcher.waitForPendingPersistence(),
-						readCandidateRoot: async (token, path) => {
-							const candidate = new YandexDiskClient({ token });
-							this.authorizationCandidate = candidate;
-							candidate.setRemotePath(path);
-							try {
-								return await readRemoteStorageScope(
-									candidate,
-									path,
-								);
-							} finally {
-								candidate.stopReads();
-								if (this.authorizationCandidate === candidate) {
-									this.authorizationCandidate = null;
-								}
-							}
-						},
-						persist: (credentials, guard) =>
-							this.persistence.persistAuthentication(
-								credentials,
-								guard,
-							),
-					},
-					update,
-					attempt,
-				),
+				this.updateAuthentication(update, attempt),
 			synchronize: async () => {
 				const result = await this.runFullSync({ trigger: "manual" });
 				if (!result?.success) {
@@ -760,6 +703,65 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 	}
 
+	/** Share the existing authentication reservation and snapshot owner for sign-in and logout. */
+	private async updateAuthentication(
+		update: AuthenticationChange,
+		attempt: AuthorizationAttempt,
+	): Promise<void> {
+		await applyAuthenticationUpdate(
+			{
+				getSettings: () => this.settings,
+				getExpectedScope: () =>
+					this.indexManager.getLocalIndex().remoteScope,
+				hasHistory: () =>
+					this.indexManager.getLocalIndex().observedEpoch !== null ||
+					this.hasDurableConfigurationWork() ||
+					this.encryptionTransition !== null ||
+					Object.keys(this.indexManager.getLocalIndex().files)
+						.length > 0,
+				isBusy: () => this.isConfigurationBusy(),
+				isUnloaded: () => this.unloaded,
+				nativeWrites: () =>
+					this.yandexClient.getNativeRequestActivity().writes,
+				subscribeActivity: (listener) => {
+					const activity = this.onSyncActivityChange(listener);
+					const native =
+						this.yandexClient.onNativeActivityChange(listener);
+					const authorization =
+						this.authorization?.subscribe(listener);
+					return () => {
+						activity();
+						native();
+						authorization?.();
+					};
+				},
+				setUpdating: (updating) => {
+					this.configurationUpdatePending = updating;
+					this.notifyManualActivity();
+				},
+				waitForWatcherPersistence: () =>
+					this.fileWatcher.waitForPendingPersistence(),
+				readCandidateRoot: async (token, path) => {
+					const candidate = new YandexDiskClient({ token });
+					this.authorizationCandidate = candidate;
+					candidate.setRemotePath(path);
+					try {
+						return await readRemoteStorageScope(candidate, path);
+					} finally {
+						candidate.stopReads();
+						if (this.authorizationCandidate === candidate) {
+							this.authorizationCandidate = null;
+						}
+					}
+				},
+				persist: (credentials, guard) =>
+					this.persistence.persistAuthentication(credentials, guard),
+			},
+			update,
+			attempt,
+		);
+	}
+
 	getAuthorizationState(): AuthorizationState {
 		return this.authorization?.getState() ?? { phase: "idle" };
 	}
@@ -801,6 +803,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		) {
 			throw new AuthorizationError("root-unavailable");
 		}
+		if (
+			this.settings.authMethod === "manual" &&
+			(this.settings.clientId || this.settings.yandexTokenSecret)
+		) {
+			await this.clearAuthentication("oauth");
+		}
 		this.authorizationUrl = await this.authorization.begin(mode);
 		this.notifyManualActivity();
 		window.open(this.authorizationUrl, "_blank");
@@ -811,6 +819,42 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 	cancelAuthorization(): void {
 		this.authorization?.cancel();
+	}
+
+	/** Remove local credentials durably while retaining the vault's synchronization history. */
+	async logoutAuthorization(): Promise<void> {
+		if (
+			this.isAuthorizationPending() ||
+			this.isConfigurationBusy() ||
+			this.unloaded
+		) {
+			throw new AuthorizationError("revoked");
+		}
+		this.stopRegularSync();
+		await this.clearAuthentication(this.settings.authMethod);
+		this.authorization?.cancel();
+	}
+
+	/** Clear both manual fields through the guarded queue, retaining watcher observation during sign-in. */
+	private async clearAuthentication(
+		method: "manual" | "oauth",
+	): Promise<void> {
+		const connection = this.connectionGeneration;
+		await this.updateAuthentication(
+			{ kind: "logout", method },
+			{
+				assertCurrent: () => {
+					if (
+						this.unloaded ||
+						connection !== this.connectionGeneration
+					) {
+						throw new AuthorizationError("revoked");
+					}
+				},
+				accept: () => {},
+				phase: () => {},
+			},
+		);
 	}
 
 	/** Wire browser lifecycle hints to the existing full-sync and activity owners on mobile only. */

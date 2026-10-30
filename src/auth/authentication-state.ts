@@ -9,6 +9,7 @@ export interface OAuthAuthorization {
 
 export type AuthenticationSettings = Pick<
 	YandexDiskSyncSettings,
+	| "clientId"
 	| "yandexTokenSecret"
 	| "authMethod"
 	| "oauthAuthorization"
@@ -21,10 +22,16 @@ export interface AuthenticationUpdate {
 	authorization: OAuthAuthorization;
 }
 
+export type AuthenticationChange =
+	AuthenticationUpdate | { kind: "logout"; method?: "manual" | "oauth" };
+
 /** Validate additive metadata without reclassifying a legacy token as a managed grant. */
 export function normalizeAuthentication(
 	settings: Partial<YandexDiskSyncSettings>,
-): Pick<YandexDiskSyncSettings, "authMethod" | "oauthAuthorization"> {
+): Pick<
+	YandexDiskSyncSettings,
+	"authMethod" | "oauthAuthorization" | "clientId"
+> {
 	const method =
 		settings.authMethod === undefined
 			? settings.yandexTokenSecret || settings.clientId
@@ -44,6 +51,7 @@ export function normalizeAuthentication(
 		throw new Error("Invalid local authorization state");
 	}
 	return {
+		clientId: method === "manual" ? (settings.clientId ?? "") : "",
 		authMethod: method,
 		oauthAuthorization: authorization ? { ...authorization } : null,
 	};
@@ -80,11 +88,20 @@ export function captureAuthentication(
 	};
 }
 
-/** Restrict refresh to the grant already committed on this installation. */
+/** Prepare local credential changes; refresh cannot switch the committed grant. */
 export function prepareAuthenticationUpdate(
 	current: YandexDiskSyncSettings,
-	update: AuthenticationUpdate,
+	update: AuthenticationChange,
 ): AuthenticationSettings {
+	if (update.kind === "logout") {
+		return {
+			clientId: "",
+			yandexTokenSecret: "",
+			authMethod: update.method ?? current.authMethod,
+			oauthAuthorization: null,
+			manualSyncRequired: true,
+		};
+	}
 	if (!update.token.trim() || !isOAuthAuthorization(update.authorization)) {
 		throw new Error("Invalid authorization response");
 	}
@@ -99,6 +116,7 @@ export function prepareAuthenticationUpdate(
 		throw new Error("Authorization grant changed");
 	}
 	return {
+		clientId: "",
 		yandexTokenSecret: update.token,
 		authMethod: "oauth",
 		oauthAuthorization: { ...update.authorization },

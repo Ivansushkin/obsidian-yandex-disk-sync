@@ -17,8 +17,8 @@
 | [Резервное копирование](BACKUP.md)                  | ZIP/envelope, archive choice, passwords и exact verification.                       |
 | [Авторизация](AUTHORIZATION.md)                     | Общий вход, optional manual setup, сохранение подключения и внешний provider gate.  |
 | [Ручные проверки](SMOKE_TESTS.md)                   | Два профиля Obsidian, реальный Диск, desktop/mobile и release gates.                |
-| [Release evidence](release-evidence/2.1.0.json)     | Машиночитаемый статус фактически выполненной ручной приёмки.                        |
-| [Changelog](../CHANGELOG.md)                        | Изменения 2.1.0 и история stable 2.0.0/1.1.0.                                       |
+| [Release evidence](release-evidence/2.2.0.json)     | Машиночитаемый статус фактически выполненной ручной приёмки.                        |
+| [Changelog](../CHANGELOG.md)                        | Изменения 2.2.0 и история stable 2.1.0/2.0.0/1.1.0.                                 |
 
 Каталог задаёт поведение, архитектура — границы реализации, тематические документы —
 детали своих областей. При изменении алгоритма обновляйте сценарии и документ
@@ -71,7 +71,7 @@ latency реального Диска или mobile heap. Результаты �
 
 `auto:` и `manual:` в каталоге обозначают способ проверки, а не её результат.
 Перед выпуском нужен [реальный прогон](SMOKE_TESTS.md) на двух независимых профилях,
-в plaintext/encrypted и на требуемых платформах. `release-evidence/2.1.0.json`
+в plaintext/encrypted и на требуемых платформах. `release-evidence/2.2.0.json`
 остаётся `PENDING`, пока нет фактического evidence для всех P0/P1 и проверенного SHA.
 Автоматические tests не переводят его в `PASS`.
 

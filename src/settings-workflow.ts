@@ -5,7 +5,7 @@ import type { SyncEngine } from "./sync/engine";
 import type { FileWatcher } from "./sync/realtime/watcher";
 import type { YandexDiskSyncSettings } from "./types";
 import type { RemoteStorageScope } from "./types";
-import type { AuthenticationUpdate } from "./auth/authentication-state";
+import type { AuthenticationChange } from "./auth/authentication-state";
 import {
 	AuthorizationError,
 	type AuthorizationAttempt,
@@ -27,15 +27,15 @@ interface AuthenticationWorkflowPorts {
 		path: string,
 	): Promise<RemoteStorageScope | null>;
 	persist(
-		update: AuthenticationUpdate,
+		update: AuthenticationChange,
 		assertCurrent: () => void,
 	): Promise<void>;
 }
 
-/** Adopt one checked candidate without changing the old connection's admission on a read failure. */
+/** Serialize credential changes; logout preserves local history and needs no remote access. */
 export async function applyAuthenticationUpdate(
 	deps: AuthenticationWorkflowPorts,
-	update: AuthenticationUpdate,
+	update: AuthenticationChange,
 	attempt: AuthorizationAttempt,
 ): Promise<void> {
 	attempt.phase("waiting-idle");
@@ -52,6 +52,12 @@ export async function applyAuthenticationUpdate(
 		attempt.assertCurrent();
 		if (deps.isUnloaded()) {
 			throw new AuthorizationError("revoked");
+		}
+		if (update.kind === "logout") {
+			await deps.persist(update, () => {
+				attempt.assertCurrent();
+			});
+			return;
 		}
 		const path = deps.getSettings().remotePath;
 		const expected = deps.getExpectedScope();
@@ -208,7 +214,8 @@ export function prepareSettingsPatch(
 		changed.some(
 			(key) => key === "remotePath" || key === "yandexTokenSecret",
 		) ||
-		("yandexTokenSecret" in patch && current.authMethod === "oauth");
+		(("yandexTokenSecret" in patch || "clientId" in patch) &&
+			current.authMethod === "oauth");
 	const changesFileScope = changed.some(
 		(key) => key !== "remotePath" && scopeKeys.includes(key),
 	);
@@ -216,8 +223,16 @@ export function prepareSettingsPatch(
 		settings: {
 			...current,
 			...patch,
-			...("yandexTokenSecret" in patch
-				? { authMethod: "manual" as const, oauthAuthorization: null }
+			...("yandexTokenSecret" in patch || "clientId" in patch
+				? {
+						authMethod: "manual" as const,
+						oauthAuthorization: null,
+						yandexTokenSecret:
+							patch.yandexTokenSecret ??
+							(current.authMethod === "manual"
+								? current.yandexTokenSecret
+								: ""),
+					}
 				: {}),
 			manualSyncRequired: current.manualSyncRequired || changesConnection,
 			syncPatterns: [...(patch.syncPatterns ?? current.syncPatterns)],

@@ -298,7 +298,10 @@ listeners/timers и запрещает новые writes; lifecycle settlement �
 
 `auth/authentication-state.ts` нормализует совместимые additive local metadata;
 старые token/client ID означают manual, новая установка — oauth. Access token
-остаётся в единственном `yandexTokenSecret`. `auth/yandex-authorization.ts` владеет
+остаётся в единственном `yandexTokenSecret`; ручной Client ID входит в auth tuple
+и очищается в OAuth-режиме при загрузке и credential save. Явное начало общего входа
+удаляет ручные credentials до браузера без сброса history; отмена их не возвращает.
+`auth/yandex-authorization.ts` владеет
 memory-only PKCE attempt, state/verifier, timeout и native token POST occupancy.
 `main.ts` связывает transport, lifecycle, UI и существующий full; не выполняет
 обмен или принятие credentials самостоятельно. `auth/configuration.ts` содержит
@@ -309,7 +312,8 @@ memory-only PKCE attempt, state/verifier, timeout и native token POST occupancy
 `applyAuthenticationUpdate` в `settings-workflow.ts` ждёт settlement текущей работы
 и native Disk writes вне SyncCoordinator, затем занимает существующий configuration
 reservation, дожидается watcher persistence и сверяет raw root с remoteScope.
-Неверный кандидат не изменяет живое подключение. Локальное наблюдение продолжается,
+Неверный кандидат не публикуется; предварительное удаление ручных credentials
+не откатывается. Локальное наблюдение продолжается,
 новые автоматические sends приостановлены общим допуском watcher/scheduler.
 
 `PluginPersistence.persistAuthentication` проверяет generation/attempt до write и
@@ -418,7 +422,7 @@ Capacity timeout отличается от native timeout; late reply помеч
 
 Команды разработки и проверок — [README.md](README.md#разработка-и-проверки), реальный
 двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Machine-readable
-[release evidence](release-evidence/2.1.0.json) сохраняет фактический статус ручной
+[release evidence](release-evidence/2.2.0.json) сохраняет фактический статус ручной
 приёмки и не обновляется автоматически из unit results.
 
 ## Mobile lifecycle recovery

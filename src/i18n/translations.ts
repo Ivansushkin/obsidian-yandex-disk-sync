@@ -17,11 +17,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.auth_oauth": "Sign in with Yandex",
 		"settings.auth_manual": "Manual token (advanced)",
 		"settings.auth_description":
-			"Sign in to Yandex, allow access, and return here. Your selected folder and sync settings are kept.",
+			"Sign in to Yandex to synchronize your folder.",
 		"settings.auth_unavailable":
 			"Yandex sign-in is not configured for this build yet. You can connect using a manual token.",
-		"settings.auth_sign_in": "Sign in and synchronize",
-		"settings.auth_sign_in_again": "Sign in again and synchronize",
+		"settings.auth_sign_in": "Sign in",
+		"settings.auth_logout": "Sign out",
 		"settings.auth_cancel": "Cancel sign-in",
 		"settings.auth_code": "Confirmation code",
 		"settings.auth_submit": "Confirm and synchronize",
@@ -32,8 +32,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.auth_waiting_idle":
 			"Waiting for the current operation to finish…",
 		"settings.auth_working": "Connecting to Yandex…",
-		"settings.auth_connected":
-			"Yandex access is saved. Synchronization status is shown separately.",
+		"settings.auth_connected": "Yandex access is saved.",
 		"settings.auth_failed":
 			"Sign-in could not finish. Check your connection and start sign-in again.",
 		"settings.auth_root_mismatch":
@@ -268,7 +267,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Saving synchronization state…",
 		"notice.force_phase_reconciling": "Final synchronization check",
 		"notice.force_migration_completed":
-			"Upgrade to 2.1.0 completed. Synchronization finished.",
+			"Upgrade to 2.2.0 completed. Synchronization finished.",
 		"notice.force_backup_failed":
 			"Backup could not be verified. Force synchronization was not started.",
 		"notice.force_finalization_pending":
@@ -631,15 +630,15 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
-		"settings.auth_method": "Способ входа",
+		"settings.auth_method": "Способ авторизации",
 		"settings.auth_oauth": "Войти через Яндекс",
-		"settings.auth_manual": "Токен вручную (дополнительно)",
+		"settings.auth_manual": "Войти через свое приложение и токен",
 		"settings.auth_description":
-			"Войдите в Яндекс, разрешите доступ и вернитесь сюда. Выбранная папка и настройки синхронизации сохранятся.",
+			"Войдите в Яндекс, чтобы синхронизировать папку.",
 		"settings.auth_unavailable":
 			"Вход через Яндекс ещё не настроен для этой сборки. Можно подключиться с помощью ручного токена.",
-		"settings.auth_sign_in": "Войти и синхронизировать",
-		"settings.auth_sign_in_again": "Войти заново и синхронизировать",
+		"settings.auth_sign_in": "Войти",
+		"settings.auth_logout": "Выйти",
 		"settings.auth_cancel": "Отменить вход",
 		"settings.auth_code": "Код подтверждения",
 		"settings.auth_submit": "Подтвердить и синхронизировать",
@@ -649,8 +648,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Разрешите доступ в браузере. Если появился код, введите его здесь.",
 		"settings.auth_waiting_idle": "Ожидаем завершения текущей операции…",
 		"settings.auth_working": "Подключение к Яндексу…",
-		"settings.auth_connected":
-			"Доступ к Яндексу сохранён. Результат синхронизации отображается отдельно.",
+		"settings.auth_connected": "Авторизация выполнена",
 		"settings.auth_failed":
 			"Не удалось завершить вход. Проверьте соединение и начните вход заново.",
 		"settings.auth_root_mismatch":
@@ -887,7 +885,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
 		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
 		"notice.force_migration_completed":
-			"Переход на 2.1.0 завершён. Синхронизация выполнена.",
+			"Переход на 2.2.0 завершён. Синхронизация выполнена.",
 		"notice.force_backup_failed":
 			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
 		"notice.force_finalization_pending":

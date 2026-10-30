@@ -3,7 +3,7 @@ import {
 	captureAuthentication,
 	prepareAuthenticationUpdate,
 	type AuthenticationSettings,
-	type AuthenticationUpdate,
+	type AuthenticationChange,
 } from "./auth/authentication-state";
 import { OperationFailure, type FailureSummary } from "./errors";
 import {
@@ -142,7 +142,7 @@ export class PluginPersistence {
 
 	/** Save a validated credential bundle before publishing it to running components. */
 	async persistAuthentication(
-		update: AuthenticationUpdate,
+		update: AuthenticationChange,
 		assertCurrent: () => void,
 	): Promise<void> {
 		this.requireLoaded();
@@ -150,7 +150,10 @@ export class PluginPersistence {
 			throw new Error("Authorization publication is unavailable");
 		}
 		await this.enqueue(undefined, false, undefined, {
-			update: { ...update, authorization: { ...update.authorization } },
+			update:
+				update.kind === "logout"
+					? { ...update }
+					: { ...update, authorization: { ...update.authorization } },
 			assertCurrent,
 		});
 	}
@@ -166,7 +169,7 @@ export class PluginPersistence {
 		unloading: boolean,
 		activateConnection?: () => void,
 		authentication?: {
-			update: AuthenticationUpdate;
+			update: AuthenticationChange;
 			assertCurrent(): void;
 		},
 	): Promise<void> {
@@ -234,7 +237,10 @@ export class PluginPersistence {
 			}
 			this.assertGeneration(generation);
 			this.data = snapshot;
-			if (authentication || (patch && "yandexTokenSecret" in patch)) {
+			if (
+				authentication ||
+				(patch && ("yandexTokenSecret" in patch || "clientId" in patch))
+			) {
 				this.authenticationCommitted = true;
 			}
 			if (activateConnection && !this.ports.isUnloaded()) {
