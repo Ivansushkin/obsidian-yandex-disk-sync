@@ -498,11 +498,8 @@ mobile; fresh install, stable 1.0/1.1 plaintext migration, fresh `hardened` и
 fail-closed historical formats; два независимых
 профиля; 409/423/429 и ambiguous upload; offline return; 10 000 descendants;
 PERF-006; PBKDF2 p95 не более 3 секунд; финальный full обоих профилей `0/0/0`.
-Результаты записываются в `release-evidence/2.2.0.json` без secret и полных
-remote paths. Верхнеуровневый `testedCommit` и одноимённое поле каждой записи
-сценария должны указывать на один и тот же 40-символьный SHA проверенного
-коммита `2.2.0`. После этого коммита до release-tag разрешено менять только
-сам evidence-файл.
+Зафиксировать результаты ручного прогона и проверенную ревизию без secret и полных
+remote paths. После изменения кода повторить затронутые проверки до release-tag.
 
 ## Итоговая карточка прогона
 
@@ -1157,8 +1154,8 @@ Synthetic histories не заменяют этот прогон и не подт
    отсутствуют. Проверить desktop: новой политики visibility/admission нет.
 
 Сохранить только безопасные IDs/counts/short hashes, platform/app versions и
-фактически пройденные шаги. До реального прогона Android/iOS оставить pending в
-release evidence 2.2.0. Покрывает MOBILE-RECOVERY-001–007.
+фактически пройденные шаги. До реального прогона Android/iOS не считать mobile
+приёмку завершённой. Покрывает MOBILE-RECOVERY-001–007.
 
 ## TC-AUTH-01. Общий вход и переход с ручного токена
 

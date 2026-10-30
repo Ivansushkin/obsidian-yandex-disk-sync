@@ -421,9 +421,8 @@ canonical. Build ID и request/byte counters помогают сравниват
 Capacity timeout отличается от native timeout; late reply помечается ignored.
 
 Команды разработки и проверок — [README.md](README.md#разработка-и-проверки), реальный
-двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Machine-readable
-[release evidence](release-evidence/2.2.0.json) сохраняет фактический статус ручной
-приёмки и не обновляется автоматически из unit results.
+двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Unit results не
+подтверждают ручную приёмку.
 
 ## Mobile lifecycle recovery
 
@@ -472,4 +471,4 @@ Persisted formats/metadata не расширяются. Корректность
 freeze, ни unload callback не считаются гарантированными. Потеря доступа к local
 storage/remote read никогда не означает пустое дерево. Новые правила проверяются
 в `tests/mobile-recovery.test.ts`; реальная Android/iOS приёмка —
-`TC-MOBILE-RECOVERY-01`, до неё release evidence остаётся pending.
+`TC-MOBILE-RECOVERY-01`; до неё ручная приёмка остаётся невыполненной.

@@ -175,7 +175,7 @@ Changes since stable `1.1.0`.
   modules. Browser runtime dependencies are pinned and Obsidian is a
   development-only dependency. CI runs tests on Node 20 and 22, lint, formatting,
   build and bundle checks; release workflows additionally check dependency
-  audits, release evidence, exact assets, and published asset hashes.
+  audits, exact assets, and published asset hashes.
 
 ### Fixed
 

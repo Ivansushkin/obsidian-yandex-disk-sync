@@ -329,8 +329,7 @@ manual `TC-ROTATED-PASSWORD-01`.
 Нормативные сценарии находятся в
 [`SYNC_USER_SCENARIOS.md`](./SYNC_USER_SCENARIOS.md), ручной multi-device
 прогон — в [`SMOKE_TESTS.md`](./SMOKE_TESTS.md). Stable запрещён без реального
-двухпрофильного прогона, mobile PERF-006/PBKDF2 evidence и полного P0/P1
-evidence файла `release-evidence/2.0.0.json`.
+двухпрофильного прогона, проверки mobile PERF-006/PBKDF2 и P0/P1 сценариев.
 
 ## Архивы и завершение другим устройством
 
