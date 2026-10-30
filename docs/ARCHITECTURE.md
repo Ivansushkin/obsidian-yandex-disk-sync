@@ -294,6 +294,30 @@ Snapshot собирается при исполнении save, а не пост
 listeners/timers и запрещает новые writes; lifecycle settlement уже принятой сессии
 завершается через прежнюю persistence queue, без нового replay.
 
+## Авторизация
+
+`auth/authentication-state.ts` нормализует совместимые additive local metadata;
+старые token/client ID означают manual, новая установка — oauth. Access token
+остаётся в единственном `yandexTokenSecret`. `auth/yandex-authorization.ts` владеет
+memory-only PKCE attempt, state/verifier, timeout и native token POST occupancy.
+`main.ts` связывает transport, lifecycle, UI и существующий full; не выполняет
+обмен или принятие credentials самостоятельно. `auth/configuration.ts` содержит
+только публичные проверенные capabilities; без общего приложения login недоступен.
+
+`applyAuthenticationUpdate` в `settings-workflow.ts` ждёт settlement текущей работы
+и native Disk writes вне SyncCoordinator, затем занимает существующий configuration
+reservation, дожидается watcher persistence и сверяет raw root с remoteScope.
+Неверный кандидат не изменяет живое подключение. Локальное наблюдение продолжается,
+новые автоматические sends приостановлены общим допуском watcher/scheduler.
+
+`PluginPersistence.persistAuthentication` проверяет generation/attempt до write и
+перед publication. Последний подтверждённый auth tuple участвует в последующих
+snapshots, в том числе при unload со старым runtime. Успешный interactive save
+требует обычного manual full и durable activation. После принятия save cancel не
+откатывает credentials. Pause/unload по-прежнему отзывают full и runtime publication.
+Детали протокола, bootstrap общего приложения и границы приёмки:
+[AUTHORIZATION.md](AUTHORIZATION.md). Форматы canonical и durable queues не меняются.
+
 ## Диагностика, UI и проверки
 
 `SyncState` содержит session ID/kind, фазу и известный progress; смена фазы снимает

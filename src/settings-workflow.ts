@@ -4,6 +4,130 @@ import type { SyncResult } from "./types";
 import type { SyncEngine } from "./sync/engine";
 import type { FileWatcher } from "./sync/realtime/watcher";
 import type { YandexDiskSyncSettings } from "./types";
+import type { RemoteStorageScope } from "./types";
+import type { AuthenticationUpdate } from "./auth/authentication-state";
+import {
+	AuthorizationError,
+	type AuthorizationAttempt,
+} from "./auth/yandex-authorization";
+import { sameRemoteStorageScope } from "./sync/local/storage-scope";
+
+interface AuthenticationWorkflowPorts {
+	getSettings(): YandexDiskSyncSettings;
+	getExpectedScope(): RemoteStorageScope | null;
+	hasHistory(): boolean;
+	isBusy(): boolean;
+	isUnloaded(): boolean;
+	nativeWrites(): number;
+	subscribeActivity(listener: () => void): () => void;
+	setUpdating(value: boolean): void;
+	waitForWatcherPersistence(): Promise<void>;
+	readCandidateRoot(
+		token: string,
+		path: string,
+	): Promise<RemoteStorageScope | null>;
+	persist(
+		update: AuthenticationUpdate,
+		assertCurrent: () => void,
+	): Promise<void>;
+}
+
+/** Adopt one checked candidate without changing the old connection's admission on a read failure. */
+export async function applyAuthenticationUpdate(
+	deps: AuthenticationWorkflowPorts,
+	update: AuthenticationUpdate,
+	attempt: AuthorizationAttempt,
+): Promise<void> {
+	attempt.phase("waiting-idle");
+	for (;;) {
+		await waitForAuthenticationIdle(deps, attempt);
+		attempt.assertCurrent();
+		if (!deps.isBusy() && deps.nativeWrites() === 0) {
+			break;
+		}
+	}
+	deps.setUpdating(true);
+	try {
+		await deps.waitForWatcherPersistence();
+		attempt.assertCurrent();
+		if (deps.isUnloaded()) {
+			throw new AuthorizationError("revoked");
+		}
+		const path = deps.getSettings().remotePath;
+		const expected = deps.getExpectedScope();
+		if (!expected && deps.hasHistory()) {
+			throw new AuthorizationError("root-unavailable");
+		}
+		attempt.phase("checking-root");
+		let root: RemoteStorageScope | null;
+		try {
+			root = await deps.readCandidateRoot(update.token, path);
+		} catch (error) {
+			throw error instanceof AuthorizationError
+				? error
+				: new AuthorizationError("root-unavailable");
+		}
+		attempt.assertCurrent();
+		if (expected && !root) {
+			throw new AuthorizationError("root-unavailable");
+		}
+		if (expected && !sameRemoteStorageScope(expected, root)) {
+			throw new AuthorizationError("root-mismatch");
+		}
+		let accepted = false;
+		await deps.persist(update, () => {
+			attempt.assertCurrent();
+			if (!accepted) {
+				attempt.accept();
+				accepted = true;
+			}
+		});
+	} finally {
+		deps.setUpdating(false);
+	}
+}
+
+/** Wake on settlement or cancellation; never hold a coordinator session while waiting. */
+function waitForAuthenticationIdle(
+	deps: AuthenticationWorkflowPorts,
+	attempt: AuthorizationAttempt,
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		let unsubscribe = () => {};
+		const check = () => {
+			if (finished) {
+				return;
+			}
+			try {
+				attempt.assertCurrent();
+				if (deps.isUnloaded()) {
+					throw new AuthorizationError("revoked");
+				}
+				if (deps.isBusy() || deps.nativeWrites() > 0) {
+					return;
+				}
+				finished = true;
+				unsubscribe();
+				resolve();
+			} catch (error) {
+				finished = true;
+				unsubscribe();
+				reject(
+					error instanceof Error
+						? error
+						: new AuthorizationError("revoked"),
+				);
+			}
+		};
+		unsubscribe = deps.subscribeActivity(check);
+		if (finished) {
+			unsubscribe();
+		} else {
+			check();
+		}
+	});
+}
 
 const USER_SETTING_KEYS = [
 	"language",

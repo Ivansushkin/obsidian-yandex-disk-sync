@@ -345,6 +345,22 @@
 	min-width: 0;
 }
 
+.connection-block .sync-auth-controls {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 8px;
+}
+
+.sync-auth-controls button {
+	height: auto;
+	min-height: var(--input-height);
+	white-space: normal;
+}
+
+.sync-auth-controls a {
+	overflow-wrap: anywhere;
+}
+
 .is-phone .connection-block .setting-item-control {
 	flex-basis: auto;
 }

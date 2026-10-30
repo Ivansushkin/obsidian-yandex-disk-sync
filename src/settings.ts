@@ -72,6 +72,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private encryptionToggle: ToggleComponent | null = null;
 	private encryptionSpinner: HTMLElement | null = null;
 	private pendingAction = false;
+	private connectionMethod: "manual" | "oauth" | null = null;
+	private authorizationCode = "";
 	private renderGeneration = 0;
 	private displayed = false;
 
@@ -89,6 +91,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private async getLastBackupText(refresh = true): Promise<string> {
 		if (
 			this.plugin.settings.manualSyncRequired ||
+			this.plugin.isAuthorizationPending() ||
 			!this.plugin.settings.yandexTokenSecret.trim()
 		) {
 			this.lastBackupDate = undefined;
@@ -154,6 +157,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private isActionUnavailable(): boolean {
 		return (
 			this.pendingAction ||
+			this.plugin.isAuthorizationPending() ||
 			this.plugin.isConfigurationBusy() ||
 			this.plugin.isPluginUnloaded()
 		);
@@ -633,7 +637,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					if (
 						!this.isActionUnavailable() ||
 						(e.target instanceof Element &&
-							e.target.closest(".sync-diagnostic-controls"))
+							e.target.closest(
+								".sync-diagnostic-controls, .sync-auth-controls",
+							))
 					) {
 						return;
 					}
@@ -648,6 +654,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 		this.activityUnsubscribers = [
 			this.plugin.onSyncActivityChange(() => this.updateActivity()),
+			this.plugin.onAuthorizationStateChange(() =>
+				this.renderSettings(false),
+			),
 		];
 		this.updateActivity();
 		void this.renderDisplay(
@@ -694,20 +703,58 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		const connectionBlock = containerEl.createDiv({
 			cls: "connection-block",
 		});
+		const connectionMethod =
+			this.connectionMethod ?? this.plugin.settings.authMethod;
+		new Setting(connectionBlock)
+			.setName(t("settings.auth_method"))
+			.addDropdown((control) => {
+				control.addOption("oauth", t("settings.auth_oauth"));
+				control.addOption("manual", t("settings.auth_manual"));
+				control.setValue(connectionMethod);
+				this.trackControl(control);
+				control.onChange((value) => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					this.connectionMethod =
+						value === "manual" ? "manual" : "oauth";
+					this.renderSettings(false);
+				});
+			});
 
 		const oauthSetting = new Setting(connectionBlock);
 
 		const descEl = oauthSetting.descEl;
 		descEl.empty();
 		const instructionDiv = descEl.createDiv({ cls: "oauth-instruction" });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_1") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_2") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_3") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_4") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_5") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_6") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_7") });
-		instructionDiv.createDiv({ text: t("settings.oauth_instruction_8") });
+		if (connectionMethod === "manual") {
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_1"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_2"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_3"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_4"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_5"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_6"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_7"),
+			});
+			instructionDiv.createDiv({
+				text: t("settings.oauth_instruction_8"),
+			});
+		} else {
+			instructionDiv.createDiv({ text: t("settings.auth_description") });
+		}
 
 		const controlEl = oauthSetting.controlEl;
 
@@ -729,65 +776,74 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				await this.applyDraft({ remotePath: value });
 			});
 
-		new ButtonComponent(controlEl)
-			.setButtonText(t("settings.manage_clients"))
-			.setCta()
-			.then((control) => this.trackControl(control))
-			.onClick(() => {
-				if (this.isActionUnavailable()) {
-					return;
-				}
-				window.open("https://oauth.yandex.ru/", "_blank");
-			});
+		if (connectionMethod === "oauth") {
+			this.renderOAuthConnection(controlEl);
+		} else {
+			new ButtonComponent(controlEl)
+				.setButtonText(t("settings.manage_clients"))
+				.setCta()
+				.then((control) => this.trackControl(control))
+				.onClick(() => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					window.open("https://oauth.yandex.ru/", "_blank");
+				});
 
-		controlEl.createEl("label", { text: t("settings.client_id") });
-		new TextComponent(controlEl)
-			.setPlaceholder(t("settings.client_id_placeholder"))
-			.setValue(this.plugin.settings.clientId)
-			.then((control) => this.trackControl(control))
-			.onChange(async (value) => {
-				if (this.isActionUnavailable()) {
-					return;
-				}
-				await this.applyDraft({ clientId: value });
-				this.renderSettings();
-			});
+			controlEl.createEl("label", { text: t("settings.client_id") });
+			new TextComponent(controlEl)
+				.setPlaceholder(t("settings.client_id_placeholder"))
+				.setValue(this.plugin.settings.clientId)
+				.then((control) => this.trackControl(control))
+				.onChange(async (value) => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					await this.applyDraft({ clientId: value });
+					this.renderSettings();
+				});
 
-		new ButtonComponent(controlEl)
-			.setButtonText(t("settings.get_token"))
-			.setDisabled(!this.plugin.settings.clientId?.trim())
-			.then((control) => this.trackControl(control))
-			.onClick(() => {
-				if (this.isActionUnavailable()) {
-					return;
-				}
-				const clientId = this.plugin.settings.clientId?.trim();
-				if (clientId) {
-					const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
-					window.open(authUrl, "_blank");
-				}
-			});
+			new ButtonComponent(controlEl)
+				.setButtonText(t("settings.get_token"))
+				.setDisabled(!this.plugin.settings.clientId?.trim())
+				.then((control) => this.trackControl(control))
+				.onClick(() => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					const clientId = this.plugin.settings.clientId?.trim();
+					if (clientId) {
+						const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
+						window.open(authUrl, "_blank");
+					}
+				});
 
-		controlEl.createEl("label", { text: t("settings.oauth_token") });
-		new TextComponent(controlEl)
-			.then((control) => {
-				control.inputEl.type = "password";
-				control.inputEl.autocomplete = "off";
-				control.inputEl.spellcheck = false;
-				control.inputEl.setAttribute("autocapitalize", "off");
-				control.inputEl.setAttribute("autocorrect", "off");
-			})
-			.setPlaceholder(t("settings.oauth_token_placeholder"))
-			.setValue(this.plugin.settings.yandexTokenSecret)
-			.then((control) => this.trackControl(control))
-			.onChange(async (value) => {
-				if (this.isActionUnavailable()) {
-					return;
-				}
-				await this.applyDraft({ yandexTokenSecret: value });
-			});
+			controlEl.createEl("label", { text: t("settings.oauth_token") });
+			new TextComponent(controlEl)
+				.then((control) => {
+					control.inputEl.type = "password";
+					control.inputEl.autocomplete = "off";
+					control.inputEl.spellcheck = false;
+					control.inputEl.setAttribute("autocapitalize", "off");
+					control.inputEl.setAttribute("autocorrect", "off");
+				})
+				.setPlaceholder(t("settings.oauth_token_placeholder"))
+				.setValue(
+					this.plugin.settings.authMethod === "manual"
+						? this.plugin.settings.yandexTokenSecret
+						: "",
+				)
+				.then((control) => this.trackControl(control))
+				.onChange(async (value) => {
+					if (this.isActionUnavailable()) {
+						return;
+					}
+					await this.applyDraft({ yandexTokenSecret: value });
+				});
+		}
 
 		this.syncButton = new ButtonComponent(controlEl).setCta();
+		this.syncButton.setDisabled(!this.plugin.settings.yandexTokenSecret);
 		this.syncButton.buttonEl.addClass("connection-sync-button");
 		this.syncButton.buttonEl.setAttribute(
 			"aria-label",
@@ -1250,5 +1306,136 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			);
 
 		this.updateActivity();
+	}
+
+	/** Present acquisition separately from the existing synchronization status and activation gate. */
+	private renderOAuthConnection(parent: HTMLElement): void {
+		const controls = parent.createDiv({ cls: "sync-auth-controls" });
+		const state = this.plugin.getAuthorizationState();
+		if (!this.plugin.isAuthorizationAvailable()) {
+			controls.createDiv({
+				text: t("settings.auth_unavailable"),
+				cls: "setting-item-description",
+			});
+		}
+		if (state.failure) {
+			const messages = {
+				"root-mismatch": t("settings.auth_root_mismatch"),
+				"root-unavailable": t("settings.auth_root_unavailable"),
+				storage: t("settings.auth_storage_failed"),
+				sync: t("settings.auth_sync_failed"),
+				denied: t("settings.auth_denied"),
+				expired: t("settings.auth_expired"),
+				unavailable: t("settings.auth_unavailable"),
+			};
+			controls.createDiv({
+				text:
+					messages[state.failure as keyof typeof messages] ??
+					t("settings.auth_failed"),
+				cls: "setting-item-description",
+			});
+		} else if (state.phase === "waiting-browser") {
+			controls.createDiv({ text: t("settings.auth_waiting") });
+		} else if (this.plugin.isAuthorizationPending()) {
+			controls.createDiv({
+				text: t(
+					state.phase === "waiting-idle"
+						? "settings.auth_waiting_idle"
+						: "settings.auth_working",
+				),
+			});
+		} else if (
+			this.plugin.settings.authMethod === "oauth" &&
+			this.plugin.settings.yandexTokenSecret
+		) {
+			controls.createDiv({ text: t("settings.auth_connected") });
+		}
+		const signIn = new ButtonComponent(controls)
+			.setButtonText(
+				t(
+					this.plugin.settings.authMethod === "oauth" &&
+						this.plugin.settings.yandexTokenSecret
+						? "settings.auth_sign_in_again"
+						: "settings.auth_sign_in",
+				),
+			)
+			.setCta()
+			.setDisabled(
+				!this.plugin.isAuthorizationAvailable() ||
+					this.isActionUnavailable(),
+			);
+		signIn.onClick(async () => {
+			if (this.isActionUnavailable()) {
+				return;
+			}
+			this.authorizationCode = "";
+			try {
+				await this.plugin.beginAuthorization();
+			} catch {
+				if (this.plugin.getAuthorizationState().phase === "idle") {
+					new Notice(t("settings.auth_failed"));
+				}
+			}
+			this.renderSettings(false);
+		});
+		const url = this.plugin.getAuthorizationUrl();
+		if (url) {
+			controls.createEl("a", {
+				text: t("settings.auth_open_browser"),
+				href: url,
+				attr: { target: "_blank", rel: "noopener noreferrer" },
+			});
+		}
+		if (state.phase === "waiting-browser" && state.returnMode === "code") {
+			controls.createEl("label", { text: t("settings.auth_code") });
+			const submit = new ButtonComponent(controls)
+				.setButtonText(t("settings.auth_submit"))
+				.setDisabled(!this.authorizationCode.trim());
+			const input = new TextComponent(controls)
+				.setValue(this.authorizationCode)
+				.onChange((value) => {
+					this.authorizationCode = value;
+					submit.setDisabled(!value.trim());
+				});
+			input.inputEl.type = "password";
+			input.inputEl.autocomplete = "off";
+			input.inputEl.spellcheck = false;
+			input.inputEl.setAttribute("aria-label", t("settings.auth_code"));
+			submit.onClick(async () => {
+				try {
+					await this.plugin.submitAuthorizationCode(
+						this.authorizationCode,
+					);
+				} catch {
+					/* The controller presents only safe failure categories. */
+				}
+				this.authorizationCode = "";
+				this.renderSettings(false);
+			});
+		}
+		if (
+			state.phase === "waiting-browser" &&
+			state.returnMode === "callback"
+		) {
+			new ButtonComponent(controls)
+				.setButtonText(t("settings.auth_fallback"))
+				.onClick(async () => {
+					this.authorizationCode = "";
+					try {
+						await this.plugin.beginAuthorization("code");
+					} catch {
+						/* The current attempt retains its own presentation. */
+					}
+					this.renderSettings(false);
+				});
+		}
+		if (this.plugin.canCancelAuthorization()) {
+			new ButtonComponent(controls)
+				.setButtonText(t("settings.auth_cancel"))
+				.onClick(() => {
+					this.authorizationCode = "";
+					this.plugin.cancelAuthorization();
+				});
+		}
 	}
 }

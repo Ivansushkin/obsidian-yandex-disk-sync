@@ -48,18 +48,22 @@ Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) and add
 
 ## First connection
 
-1. Create a backup of your local vault.
-2. Obtain a token through [Yandex OAuth](https://oauth.yandex.ru/): create an
-   application with the read and write permissions needed for Yandex Disk and
-   obtain its OAuth token.
-3. Open the plugin settings and paste the token.
-4. Choose a dedicated folder on Yandex Disk, for example `obsidian-sync/my-vault`.
-   Use a separate remote folder for each vault.
-5. Review the synchronization filters and whether to include Obsidian settings.
-6. Run a full synchronization and wait for it to finish before connecting another device.
+1. Back up your local vault.
+2. Open the plugin settings, choose a dedicated Disk folder, for example
+   `obsidian-sync/my-vault`, and review the synchronization filters.
+3. “Sign in with Yandex” is selected by default. When shared sign-in is configured
+   in the build, click “Sign in and sync”, approve access in your browser, then
+   return to Obsidian or paste the displayed code. Wait for the full sync to finish.
+4. If shared sign-in is unavailable or you use your own application, choose manual
+   setup: create an application through [Yandex OAuth](https://oauth.yandex.ru/)
+   with Disk read and write permissions, obtain and paste its token, then run a
+   full sync. Use a separate remote folder for each vault.
 
-After changing the token or remote folder, run a successful manual full sync to
-start automatic synchronization for that connection.
+Existing manual connections keep working after an update. Moving to shared
+sign-in is optional and verifies that the remote folder is the same. After new
+credentials are saved, a successful manual full sync enables automation; a failed
+full can be retried without another sign-in. Manual token or folder changes also
+require a successful manual full sync.
 
 If the remote folder is empty, local files are uploaded. If the local vault is
 empty, cloud files are downloaded. When a new device joins existing cloud data,
@@ -67,8 +71,8 @@ cloud versions are received first. Different local versions are preserved in
 `.obsidian/plugins/yandex-disk-sync/overwritten/`; local-only files are kept and
 uploaded after the initial receive.
 
-To connect another device, install the plugin and use the same OAuth token and
-remote folder. Run a full synchronization. For encrypted data, enter the same
+To connect another device, install the plugin, sign in to the same account (or
+paste a manual token), select the same remote folder and run a full sync. For encrypted data, enter the same
 encryption password when prompted.
 
 Use the same plugin version on all devices. Older and newer builds must not work

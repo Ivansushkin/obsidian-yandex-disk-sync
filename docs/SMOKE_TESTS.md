@@ -83,8 +83,7 @@ ID/counts/hashes; не прикладывать plugin data, credentials, сод
 
 Дополнительная проверка кнопки синхронизации на desktop и mobile (`UI-017`):
 
-1. На fresh install выбрать папку первым шагом OAuth-инструкции, затем сохранить
-   token. Сохранённый путь и дефолт прежние. После изменения локального файла,
+1. На fresh install выбрать ручной способ, выбрать папку и сохранить token. Сохранённый путь и дефолт прежние. После изменения локального файла,
    ожидания interval и restart до ручного Sync нет remote requests, password prompt
    или автоматической синхронизации. Затем нажать «Синхронизировать».
 2. Во время проверки подключения и full внутри кнопки виден только loader без
@@ -1160,3 +1159,45 @@ Synthetic histories не заменяют этот прогон и не подт
 Сохранить только безопасные IDs/counts/short hashes, platform/app versions и
 фактически пройденные шаги. До реального прогона Android/iOS оставить pending в
 release evidence 2.1.0. Покрывает MOBILE-RECOVERY-001–007.
+
+## TC-AUTH-01. Общий вход и переход с ручного токена
+
+До прогона зарегистрировать и проверить собственное приложение по
+[AUTHORIZATION.md](AUTHORIZATION.md). Пока Client ID пуст, проверить только явное
+сообщение о недоступности и рабочий optional manual setup. Не считать это успешной
+приёмкой OAuth. Реальные credentials настраивать вне agent context.
+
+1. Новый профиль по умолчанию предлагает вход через Яндекс. Выбрать dedicated path,
+   пройти consent и полный sync. На втором профиле войти в тот же аккаунт,
+   указать тот же path; проверить initial receive и protective copies. Повторить
+   для encrypted vault с запросом существующего пароля.
+2. Обновить существующий manual профиль. До явной смены способа токен, device ID,
+   baseline, queues, пароль, pause и автоматизация прежние. Выбрать OAuth, локально
+   изменить файл во время браузерного ожидания; второй профиль тоже меняет другой
+   файл offline. После login/full обе правки сходятся без reset epoch и копий.
+3. Войти в другой аккаунт с такой же папкой; затем удалить/пересоздать root старого
+   аккаунта. Оба кандидата отклонены; старые credentials и данные сохранены.
+   Нет нового remote root или записи canonical от попытки принятия кандидата.
+4. Cancel, отказ consent, неверный/просроченный code, сеть при POST, delayed POST
+   после timeout/cancel; новая попытка не отправляет второй POST до settlement
+   первого. Поздние ответы, replay и foreign-state link не меняют подключение.
+   Во время попытки проверить запрет Force/backup/encryption и сохранение watcher
+   events; после cancel старый допуск возвращается без обнуления очереди.
+5. Закрыть/reopen Settings, затем убить Obsidian и вернуться по старому callback.
+   Живая попытка сохраняется только в первом случае; cold callback не принимается.
+   Повторить на desktop/Android/iOS и двух одноимённых vault: чужой state игнорируется.
+   Непроверенная платформа использует code route; callback fallback начинает новый
+   PKCE, старый callback не обменивается.
+6. Pause/unload на root read, перед save и во время save; failed local save и failed
+   full final save. Нет ложного connected/automation. Принятые credentials переживают
+   unload; pending manual activation возобновляется обычным Sync после restart.
+7. Проверить active full/foreground/native Disk write во время возврата из браузера:
+   нет overlap смены token и старой записи, нет deadlock reservation. Запрос пароля
+   или failure полного sync виден штатным UI; новый grant не требует нового consent
+   только ради повторения full.
+8. Проверить ручной fallback и обратное сохранение manual token. OAuth access token
+   не показывается рядом с legacy Client ID. В логах плагина нет credentials/codes/
+   verifier/URL/raw provider errors; host/browser logs оценивать отдельно.
+
+Покрывает `AUTH-001`–`AUTH-016`. Реальные профили/платформы, аккаунты и результаты
+фиксировать отдельно; synthetic green не является подтверждением этого smoke.

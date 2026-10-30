@@ -2,74 +2,15 @@ import assert from "node:assert/strict";
 import { getActiveLanguage, setLanguagePreference } from "../src/i18n";
 import type { UserSettingsPatch } from "../src/settings-workflow";
 import type { PluginData } from "../src/plugin-persistence";
-import test, { type TestContext } from "node:test";
+import test from "node:test";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
 import { deferred } from "./helpers/deferred";
 import { afterTest } from "./helpers/test-context";
 import { encryptionFlow, startupFlow } from "./helpers/encryption-flow";
 import { transition } from "./helpers/encryption-scenarios";
-import { SyncScheduler } from "../src/sync/scheduler";
 
-/** Combine real settings publication and sync algorithms over synthetic storage. */
-async function settingsHost(
-	t: TestContext,
-	encrypted = false,
-	remote?: MemoryDisk,
-) {
-	const disk = remote ?? new MemoryDisk();
-	const a = device(disk, "settings-device", null);
-	if (!remote) {
-		a.vault.put("note.md", bytes("unchanged"));
-		await a.full();
-	}
-	const flow = encryptionFlow(a);
-	if (encrypted) {
-		await transition(a, flow, "enable", "synthetic-password");
-	}
-	const { plugin, persistence } = persistenceHarness();
-	await plugin.loadSettings();
-	plugin.settings = {
-		...a.settings,
-		authMethod: "manual",
-		yandexTokenSecret: remote ? "" : "synthetic",
-	};
-	const scheduler = new SyncScheduler(a.engine, plugin.settings);
-	Object.assign(plugin, {
-		app: { ...plugin.app, workspace: { layoutReady: true } },
-		yandexClient: a.client,
-		vaultAdapter: a.adapter,
-		indexManager: a.index,
-		syncEngine: a.engine,
-		fileWatcher: a.watcher,
-		syncScheduler: scheduler,
-		encryptionWorkflow: flow.workflow,
-		storageBinding: {
-			ensure: async () => {
-				await a.index.assertRemoteScope();
-				return true;
-			},
-		},
-		configuredToken: remote ? "" : "synthetic",
-		configuredRemotePath: "vault",
-		localStateRestored: true,
-		syncLifecycleRegistered: true,
-		automationReady: !remote,
-		regularSyncStarted: !remote,
-	});
-	plugin["remoteStateValidated"] = !remote;
-	if (!remote) {
-		a.watcher.start();
-		scheduler.start();
-	}
-	afterTest(t, async () => {
-		disk.beforeRequest = undefined;
-		scheduler.stop();
-		await a.stop();
-	});
-	const update = plugin.applySettingsPatch.bind(plugin);
-	return { plugin, persistence, a, disk, scheduler, update, flow };
-}
+import { settingsHost } from "./helpers/settings-host";
 
 test(
 	"host activity opens a rotated password after full settlement and revokes an open prompt on save failure",

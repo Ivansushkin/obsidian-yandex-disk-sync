@@ -15,6 +15,7 @@
 | [Force](FORCE_SYNC.md)                              | Полная замена назначения, direct-v1 recovery и ограничения конкурентности.          |
 | [Шифрование](E2E_ENCRYPTION.md)                     | Wire formats, manifest, local-reference replacement, legacy checkpoints и recovery. |
 | [Резервное копирование](BACKUP.md)                  | ZIP/envelope, archive choice, passwords и exact verification.                       |
+| [Авторизация](AUTHORIZATION.md)                     | Общий вход, optional manual setup, сохранение подключения и внешний provider gate.  |
 | [Ручные проверки](SMOKE_TESTS.md)                   | Два профиля Obsidian, реальный Диск, desktop/mobile и release gates.                |
 | [Release evidence](release-evidence/2.1.0.json)     | Машиночитаемый статус фактически выполненной ручной приёмки.                        |
 | [Changelog](../CHANGELOG.md)                        | Изменения 2.1.0 и история stable 2.0.0/1.1.0.                                       |

@@ -32,12 +32,36 @@ test("authorization defaults preserve existing manual connections and incomplete
 			data.settings.yandexTokenSecret,
 		);
 	}
-	const invalid = structuredClone(seed.writes.at(-1)) as PluginData;
-	Reflect.set(invalid.settings, "authMethod", null);
-	await assert.rejects(
-		persistenceHarness(invalid).plugin.loadSettings(),
-		/authorization state/,
-	);
+	for (const patch of [
+		{ authMethod: null },
+		{ authMethod: "oauth", yandexTokenSecret: "synthetic-partial" },
+		{
+			authMethod: "manual",
+			oauthAuthorization: {
+				clientId: "client",
+				grantId: "grant",
+				refreshToken: null,
+				expiresAt: null,
+			},
+		},
+		{
+			authMethod: "oauth",
+			yandexTokenSecret: "synthetic-access",
+			oauthAuthorization: {
+				clientId: "client",
+				grantId: "grant",
+				refreshToken: null,
+				expiresAt: -1,
+			},
+		},
+	]) {
+		const invalid = structuredClone(seed.writes.at(-1)) as PluginData;
+		Object.assign(invalid.settings, patch);
+		await assert.rejects(
+			persistenceHarness(invalid).plugin.loadSettings(),
+			/authorization state/,
+		);
+	}
 });
 
 test("accepted authorization survives unload publication revocation and later snapshot writes", async () => {

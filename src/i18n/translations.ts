@@ -13,6 +13,41 @@ export const translations: Record<Language, Record<string, string>> = {
 	be,
 	uz,
 	en: {
+		"settings.auth_method": "Sign-in method",
+		"settings.auth_oauth": "Sign in with Yandex",
+		"settings.auth_manual": "Manual token (advanced)",
+		"settings.auth_description":
+			"Sign in to Yandex, allow access, and return here. Your selected folder and sync settings are kept.",
+		"settings.auth_unavailable":
+			"Yandex sign-in is not configured for this build yet. You can connect using a manual token.",
+		"settings.auth_sign_in": "Sign in and synchronize",
+		"settings.auth_sign_in_again": "Sign in again and synchronize",
+		"settings.auth_cancel": "Cancel sign-in",
+		"settings.auth_code": "Confirmation code",
+		"settings.auth_submit": "Confirm and synchronize",
+		"settings.auth_fallback": "Use a confirmation code instead",
+		"settings.auth_open_browser": "Open the sign-in page",
+		"settings.auth_waiting":
+			"Allow access in your browser. If a code is shown, enter it here.",
+		"settings.auth_waiting_idle":
+			"Waiting for the current operation to finish…",
+		"settings.auth_working": "Connecting to Yandex…",
+		"settings.auth_connected":
+			"Yandex access is saved. Synchronization status is shown separately.",
+		"settings.auth_failed":
+			"Sign-in could not finish. Check your connection and start sign-in again.",
+		"settings.auth_root_mismatch":
+			"This sign-in opens a different folder. Your existing connection is kept. Choose the original Yandex account.",
+		"settings.auth_root_unavailable":
+			"The Disk folder could not be verified. Check the connection and folder access.",
+		"settings.auth_storage_failed":
+			"The connection could not be saved. Restore local storage access and try signing in again.",
+		"settings.auth_sync_failed":
+			"Yandex access is saved, but synchronization has not finished. Resolve the reported issue and click Synchronize.",
+		"settings.auth_denied":
+			"Access was not granted. Your existing connection is kept.",
+		"settings.auth_expired":
+			"This sign-in attempt expired. Start sign-in again.",
 		"status.mobile.waiting_native":
 			"Waiting for a sent network request to finish. Its result is not yet known; synchronization will continue after it finishes.",
 		"status.mobile.recovery_backoff":
@@ -596,6 +631,40 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"settings.auth_method": "Способ входа",
+		"settings.auth_oauth": "Войти через Яндекс",
+		"settings.auth_manual": "Токен вручную (дополнительно)",
+		"settings.auth_description":
+			"Войдите в Яндекс, разрешите доступ и вернитесь сюда. Выбранная папка и настройки синхронизации сохранятся.",
+		"settings.auth_unavailable":
+			"Вход через Яндекс ещё не настроен для этой сборки. Можно подключиться с помощью ручного токена.",
+		"settings.auth_sign_in": "Войти и синхронизировать",
+		"settings.auth_sign_in_again": "Войти заново и синхронизировать",
+		"settings.auth_cancel": "Отменить вход",
+		"settings.auth_code": "Код подтверждения",
+		"settings.auth_submit": "Подтвердить и синхронизировать",
+		"settings.auth_fallback": "Войти с кодом подтверждения",
+		"settings.auth_open_browser": "Открыть страницу входа",
+		"settings.auth_waiting":
+			"Разрешите доступ в браузере. Если появился код, введите его здесь.",
+		"settings.auth_waiting_idle": "Ожидаем завершения текущей операции…",
+		"settings.auth_working": "Подключение к Яндексу…",
+		"settings.auth_connected":
+			"Доступ к Яндексу сохранён. Результат синхронизации отображается отдельно.",
+		"settings.auth_failed":
+			"Не удалось завершить вход. Проверьте соединение и начните вход заново.",
+		"settings.auth_root_mismatch":
+			"Этот вход открывает другую папку. Прежнее подключение сохранено. Выберите исходный аккаунт Яндекса.",
+		"settings.auth_root_unavailable":
+			"Не удалось проверить папку на Диске. Проверьте соединение и доступ к папке.",
+		"settings.auth_storage_failed":
+			"Не удалось сохранить подключение. Восстановите доступ к локальному хранилищу и повторите вход.",
+		"settings.auth_sync_failed":
+			"Доступ к Яндексу сохранён, но синхронизация не завершена. Устраните указанную ошибку и нажмите «Синхронизировать».",
+		"settings.auth_denied":
+			"Доступ не предоставлен. Прежнее подключение сохранено.",
+		"settings.auth_expired":
+			"Время ожидания входа истекло. Начните вход заново.",
 		"status.mobile.waiting_native":
 			"Ожидаем завершения отправленного сетевого запроса. Его результат пока неизвестен; синхронизация продолжится после его завершения.",
 		"status.mobile.recovery_backoff":
