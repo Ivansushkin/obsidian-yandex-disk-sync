@@ -106,6 +106,34 @@ test("logout clears encryption password from durable data and later snapshots", 
 	assert.equal(restored.plugin.settings.encryptionPassword, null);
 });
 
+test("loading a previously signed-out profile removes its orphaned encryption password", async () => {
+	const seed = persistenceHarness();
+	await seed.plugin.loadSettings();
+	const oldData = structuredClone(seed.writes.at(-1)) as PluginData;
+	Object.assign(oldData.settings, {
+		authMethod: "oauth",
+		yandexTokenSecret: "",
+		enableEncryption: true,
+		encryptionSalt: "synthetic-salt",
+		encryptionPassword: "synthetic-old-password",
+		encryptionRevision: 1,
+		encryptionProfileId: "hardened",
+	});
+	const { plugin, persistence, writes } = persistenceHarness(oldData);
+	await plugin.loadSettings();
+	assert.equal(plugin.settings.encryptionPassword, null);
+	assert.equal(persistence.current?.settings.encryptionPassword, null);
+	assert.equal(
+		(writes.at(-1) as PluginData).settings.encryptionPassword,
+		null,
+	);
+	assert.equal(plugin.settings.encryptionSalt, "synthetic-salt");
+	assert.equal(plugin.settings.encryptionProfileId, "hardened");
+	plugin.settings.encryptionPassword = "stale-password";
+	await plugin.saveSettings();
+	assert.equal(persistence.current?.settings.encryptionPassword, null);
+});
+
 test("accepted authorization survives unload publication revocation and later snapshot writes", async () => {
 	for (const logout of [false, true]) {
 		const { plugin, persistence, writes } = persistenceHarness();

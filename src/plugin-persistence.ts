@@ -123,6 +123,19 @@ export class PluginPersistence {
 		if (this.ports.isUnloaded()) {
 			throw new Error("Plugin was unloaded during data load");
 		}
+		if (
+			loaded.data?.settings.encryptionPassword &&
+			!loaded.data.settings.yandexTokenSecret?.trim() &&
+			!loaded.data.encryptionTransition &&
+			!loaded.data.forceRecovery
+		) {
+			loaded.data = {
+				...loaded.data,
+				settings: { ...loaded.data.settings, encryptionPassword: null },
+			};
+			this.authenticationCommitted = true;
+			this.sensitiveLogoutCommitted = true;
+		}
 		this.data = loaded.data;
 		initialize(loaded);
 		this.loaded = true;
