@@ -47,6 +47,18 @@
   runs lint-staged: ESLint fixes code before Prettier formats staged files;
   unstaged hunks are preserved. Non-fixable lint errors block the commit.
 
+## Git workflow
+
+- Before editing repository files, check the active branch, worktree status,
+  and upstream. Use a dedicated branch for the task; do not work directly on
+  `master` unless the user explicitly requests it. Preserve unrelated changes.
+- Base a new task branch on the latest available `origin/master`, fetching it
+  when possible. Never set a task branch's upstream to `origin/master`. Leave
+  its upstream unset until publication, then track its own remote branch.
+- Do not create, amend, or rewrite commits unless the user explicitly asks for
+  that action or confirms a proposed commit. Implementing or validating a
+  change does not itself authorize a commit.
+
 ## Synchronization architecture
 
 - The remote source of truth is one canonical `.obsidian-sync-index.json` with
@@ -121,10 +133,13 @@
 
 ## Compatibility and versioning
 
-- Concurrent use of older builds and 2.0.0 is unsupported. Only plaintext
-  stable 1.0/1.1 local data and their numeric canonical formats are migratable;
-  encrypted legacy data and every other historical format fail closed.
-- Stable plaintext 1.0/1.1 local migration is irreversible. Persist one coherent
+- Do not put release numbers, current release labels, or release history in this
+  file. Read them from `manifest.json`, `versions.json`, `CHANGELOG.md`, and the
+  relevant migration documentation when needed.
+- Concurrent use of builds with incompatible sync formats is unsupported. Only
+  the documented stable plaintext legacy local data and canonical formats are
+  migratable; encrypted legacy data and other historical formats fail closed.
+- Stable plaintext legacy local migration is irreversible. Persist one coherent
   current snapshot after installation identity initialization and before automation.
   A failed initial save blocks sync and unload must not retry it.
 - Direct Force honors shared protected paths, user include/exclude filters and the
@@ -159,9 +174,9 @@
 - On version bump, update `manifest.json`, `package.json`, `package-lock.json`,
   `versions.json`, `CHANGELOG.md`, architecture docs,
   translations, and migration messages.
-- Release metadata retains stable 1.1.0 compatibility and the 2.0.0/2.1.0
-  history, plus the current 2.2.0 entry. Do not add development entries or
-  remove historical stable releases.
+- Preserve existing stable compatibility entries and release history in
+  `versions.json`; do not add development entries or remove historical stable
+  releases.
 
 ## Documentation and testing
 
