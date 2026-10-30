@@ -314,7 +314,9 @@ reservation, дожидается watcher persistence и сверяет raw root
 перед publication. Последний подтверждённый auth tuple участвует в последующих
 snapshots, в том числе при unload со старым runtime. Успешный interactive save
 требует обычного manual full и durable activation. После принятия save cancel не
-откатывает credentials. Pause/unload по-прежнему отзывают full и runtime publication.
+откатывает credentials. Отдельный lifetime guard продолжения проверяет pause/ABA/unload после credential save
+до startup preflight полного sync. Grant при этом не откатывается. Mobile recovery
+считает pending login занятым host и сохраняет lifecycle hint до его завершения.
 Детали протокола, bootstrap общего приложения и границы приёмки:
 [AUTHORIZATION.md](AUTHORIZATION.md). Форматы canonical и durable queues не меняются.
 

@@ -196,6 +196,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			!state?.active &&
 			!foreground;
 		if (this.syncButton) {
+			this.syncButton.setDisabled(
+				busy || !this.plugin.settings.yandexTokenSecret.trim(),
+			);
 			this.syncButton.buttonEl.setAttribute(
 				"aria-busy",
 				String(fullActive),
@@ -843,7 +846,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 
 		this.syncButton = new ButtonComponent(controlEl).setCta();
-		this.syncButton.setDisabled(!this.plugin.settings.yandexTokenSecret);
 		this.syncButton.buttonEl.addClass("connection-sync-button");
 		this.syncButton.buttonEl.setAttribute(
 			"aria-label",

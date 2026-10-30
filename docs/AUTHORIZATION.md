@@ -66,8 +66,10 @@ reservation, проверяет root и сохраняет credentials обще�
 обычный ручной full: merge, encryption admission и все защитные блоки сохраняются.
 
 Отмена до принятия save сохраняет старый доступ. После начала принятого save
-отмена недоступна: запись может уже состояться. Pause отзывает продолжение full,
-но принятые credentials сохраняются. Unload запрещает публикацию в runtime;
+отмена недоступна: запись может уже состояться. Pause отзывает продолжение full до startup preflight, включая pause/resume во
+время save; принятые credentials сохраняются. Resume во время browser attempt
+не запускает старое подключение; mobile recovery сохраняет ожидающий hint до
+отмены или окончания login. Unload запрещает публикацию в runtime;
 последующие snapshots сохраняют последний подтверждённый auth tuple, чтобы старый
 runtime не затёр его. Failed save не считается доказательством отсутствия записи:
 сохраняется persistence block, нужен явный retry/repair.

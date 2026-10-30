@@ -28,10 +28,13 @@ async function authorization(
 		request,
 		captureContext: () => {
 			const captured = revision;
-			return () => {
-				if (captured !== revision) {
-					throw new Error("context changed");
-				}
+			return {
+				assertCurrent: () => {
+					if (captured !== revision) {
+						throw new Error("context changed");
+					}
+				},
+				assertContinuation: () => {},
 			};
 		},
 		adopt: async (update, attempt) => {

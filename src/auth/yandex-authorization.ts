@@ -55,7 +55,10 @@ interface Options {
 	vaultName(): string;
 	deviceId(): string;
 	request(body: URLSearchParams): Promise<OAuthResponse>;
-	captureContext(): () => void;
+	captureContext(): {
+		assertCurrent: () => void;
+		assertContinuation: () => void;
+	};
 	adopt(
 		update: AuthenticationUpdate,
 		attempt: AuthorizationAttempt,
@@ -70,6 +73,7 @@ interface PendingAttempt {
 	deviceId: string;
 	deadline: number;
 	assertContext(): void;
+	assertContinuation(): void;
 	accepted: boolean;
 	waiters: Set<(error: AuthorizationError) => void>;
 	timer?: ReturnType<typeof setTimeout>;
@@ -113,12 +117,14 @@ export class YandexAuthorization {
 			throw new AuthorizationError("revoked");
 		}
 		this.cancel();
+		const context = this.options.captureContext();
 		const attempt: PendingAttempt = {
 			state: randomString(),
 			verifier: randomString(),
 			deviceId: "",
 			deadline: this.now() + 600_000,
-			assertContext: this.options.captureContext(),
+			assertContext: context.assertCurrent,
+			assertContinuation: context.assertContinuation,
 			accepted: false,
 			waiters: new Set(),
 		};
@@ -229,9 +235,10 @@ export class YandexAuthorization {
 				device_id: attempt.deviceId,
 				device_name: "Obsidian Yandex Disk Sync",
 			});
-			const request = Promise.resolve().then(() =>
-				this.options.request(body),
-			);
+			const request = Promise.resolve().then(() => {
+				this.assertAttempt(attempt);
+				return this.options.request(body);
+			});
 			const native = request.then(
 				() => undefined,
 				() => undefined,
@@ -262,6 +269,7 @@ export class YandexAuthorization {
 			this.assertAttempt(attempt);
 			this.update({ phase: "synchronizing" });
 			try {
+				attempt.assertContinuation();
 				await this.options.synchronize();
 			} catch {
 				throw new AuthorizationError("sync");

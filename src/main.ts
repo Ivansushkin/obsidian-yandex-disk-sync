@@ -631,17 +631,25 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				const scope = this.authorizationScopeGeneration;
 				const reads = this.yandexClient.getReadConfigurationVersion();
 				const lifetime = this.syncEngine.createReadLifetimeGuard();
-				return () => {
-					lifetime();
-					if (
-						this.unloaded ||
-						connection !== this.connectionGeneration ||
-						scope !== this.authorizationScopeGeneration ||
-						reads !==
-							this.yandexClient.getReadConfigurationVersion()
-					) {
-						throw new AuthorizationError("revoked");
-					}
+				return {
+					assertCurrent: () => {
+						lifetime();
+						if (
+							this.unloaded ||
+							connection !== this.connectionGeneration ||
+							scope !== this.authorizationScopeGeneration ||
+							reads !==
+								this.yandexClient.getReadConfigurationVersion()
+						) {
+							throw new AuthorizationError("revoked");
+						}
+					},
+					assertContinuation: () => {
+						lifetime();
+						if (this.unloaded || this.syncEngine.isSyncPaused()) {
+							throw new AuthorizationError("sync");
+						}
+					},
 				};
 			},
 			adopt: (update, attempt) =>
@@ -728,6 +736,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.registerObsidianProtocolHandler(
 			"yandex-disk-sync-auth",
 			(params) => {
+				if (
+					this.getAuthorizationState().phase === "idle" &&
+					params.state
+				) {
+					new Notice(t("settings.auth_expired"));
+					return;
+				}
 				void this.authorization?.acceptCallback(params).catch(() => {});
 			},
 		);
@@ -822,6 +837,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				),
 				visible: doc.visibilityState === "visible",
 				busy:
+					this.isAuthorizationPending() ||
 					this.isConfigurationBusy() ||
 					this.activeFullPromise !== null ||
 					this.activeManualFullPromise !== null,
@@ -905,7 +921,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					!this.historicalBlockReason &&
 					!this.authenticationBlockReason,
 				),
-			isBusy: () => this.isConfigurationBusy(),
+			isBusy: () =>
+				this.isAuthorizationPending() || this.isConfigurationBusy(),
 			runExclusive: (action) =>
 				this.withForegroundOperation("encryption-password", action),
 			resume: async () => {
@@ -1069,6 +1086,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			);
 		}
 		if (
+			this.isAuthorizationPending() ||
 			this.isConfigurationBusy() ||
 			this.persistence.failed ||
 			this.unloaded

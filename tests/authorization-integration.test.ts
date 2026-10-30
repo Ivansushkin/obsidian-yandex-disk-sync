@@ -1,12 +1,56 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import type { RequestUrlParam } from "obsidian";
+import test, { type TestContext } from "node:test";
+import { Platform, type RequestUrlParam } from "obsidian";
 import { SHARED_YANDEX_OAUTH } from "../src/auth/configuration";
 import { readRemoteStorageScope } from "../src/sync/local/storage-scope";
 import { settingsHost } from "./helpers/settings-host";
-import { bytes, device } from "./helpers/sync-flow";
+import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
 import { encryptionFlow } from "./helpers/encryption-flow";
 import { afterTest } from "./helpers/test-context";
+import { deferred } from "./helpers/deferred";
+import { StorageBindingController } from "../src/sync/local/storage-binding";
+
+/** Replace only native registration, browser opening and token HTTP for the real host workflow. */
+function wireAuthorization(
+	t: TestContext,
+	plugin: Awaited<ReturnType<typeof settingsHost>>["plugin"],
+) {
+	const cleanups: (() => void)[] = [];
+	plugin.register = (cleanup) => {
+		cleanups.push(cleanup);
+	};
+	plugin.registerObsidianProtocolHandler = () => {};
+	const oldClient = SHARED_YANDEX_OAUTH.clientId;
+	SHARED_YANDEX_OAUTH.clientId = "public-test-client";
+	const transport = globalThis as unknown as {
+		__obsidianRequestUrl: (params: RequestUrlParam) => Promise<unknown>;
+	};
+	const previousRequest = transport.__obsidianRequestUrl;
+	transport.__obsidianRequestUrl = async (params) =>
+		params.url === "https://oauth.yandex.ru/token"
+			? {
+					status: 200,
+					json: {
+						access_token: "synthetic-oauth",
+						token_type: "bearer",
+					},
+				}
+			: previousRequest(params);
+	const oldWindow = globalThis.window;
+	globalThis.window = {
+		...oldWindow,
+		open: () => null,
+	} as unknown as Window & typeof globalThis;
+	afterTest(t, () => {
+		for (const cleanup of cleanups.reverse()) {
+			cleanup();
+		}
+		SHARED_YANDEX_OAUTH.clientId = oldClient;
+		transport.__obsidianRequestUrl = previousRequest;
+		globalThis.window = oldWindow;
+	});
+	plugin["initializeAuthorization"]();
+}
 
 for (const encrypted of [false, true]) {
 	test(
@@ -35,43 +79,7 @@ for (const encrypted of [false, true]) {
 			plugin["encryptionService"] = flow.context.getService();
 			await plugin.saveSettings();
 			a.watcher.setPersistCallback(() => plugin["persistPluginData"]());
-			const cleanups: (() => void)[] = [];
-			plugin.register = (cleanup) => {
-				cleanups.push(cleanup);
-			};
-			plugin.registerObsidianProtocolHandler = () => {};
-			const oldClient = SHARED_YANDEX_OAUTH.clientId;
-			SHARED_YANDEX_OAUTH.clientId = "public-test-client";
-			const transport = globalThis as unknown as {
-				__obsidianRequestUrl: (
-					params: RequestUrlParam,
-				) => Promise<unknown>;
-			};
-			const previousRequest = transport.__obsidianRequestUrl;
-			transport.__obsidianRequestUrl = async (params) =>
-				params.url === "https://oauth.yandex.ru/token"
-					? {
-							status: 200,
-							json: {
-								access_token: "synthetic-oauth",
-								token_type: "bearer",
-							},
-						}
-					: previousRequest(params);
-			const oldWindow = globalThis.window;
-			globalThis.window = {
-				...oldWindow,
-				open: () => null,
-			} as unknown as Window & typeof globalThis;
-			afterTest(t, () => {
-				for (const cleanup of cleanups.reverse()) {
-					cleanup();
-				}
-				SHARED_YANDEX_OAUTH.clientId = oldClient;
-				transport.__obsidianRequestUrl = previousRequest;
-				globalThis.window = oldWindow;
-			});
-			plugin["initializeAuthorization"]();
+			wireAuthorization(t, plugin);
 			await plugin.beginAuthorization();
 			assert.equal(plugin.isAuthorizationPending(), true);
 			const actor = plugin.settings.deviceId;
@@ -107,3 +115,137 @@ for (const encrypted of [false, true]) {
 		},
 	);
 }
+
+test(
+	"Pause during accepted OAuth save preserves credentials without starting storage preflight",
+	{ timeout: 10_000 },
+	async (t) => {
+		for (const timing of ["before", "during", "pause-resume"] as const) {
+			const { plugin, a, disk, persistence, update } = await settingsHost(
+				t,
+				false,
+				new MemoryDisk(),
+			);
+			await update({ remotePath: "fresh-vault" });
+			plugin["storageBinding"] = new StorageBindingController({
+				client: a.client,
+				index: a.index,
+				getSettings: () => plugin.settings,
+				hasPendingWork: () => false,
+				hasTransition: () => false,
+				isUnloaded: () => plugin.isPluginUnloaded(),
+				persist: () => plugin.saveSettings(),
+				confirm: async () => "new",
+			});
+			wireAuthorization(t, plugin);
+			const entered = deferred();
+			const release = deferred();
+			plugin.saveData = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			if (timing === "before") {
+				a.engine.pause();
+			}
+			await plugin.beginAuthorization();
+			const result = plugin.submitAuthorizationCode("synthetic-code");
+			const rejected = assert.rejects(result);
+			await entered.promise;
+			if (timing !== "before") {
+				a.engine.pause();
+			}
+			if (timing === "pause-resume") {
+				a.engine.resume();
+			}
+			release.resolve();
+			await rejected;
+			assert.equal(plugin.settings.authMethod, "oauth");
+			assert.equal(
+				persistence.current?.settings.manualSyncRequired,
+				true,
+			);
+			assert.equal(disk.folders.has("fresh-vault"), false);
+			assert.equal(disk.files.size, 0);
+		}
+	},
+);
+
+test(
+	"Resume during browser authorization leaves the old connection paused",
+	{ timeout: 10_000 },
+	async (t) => {
+		const { plugin, a, disk } = await settingsHost(t);
+		a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+			a.client,
+			"vault",
+		);
+		await plugin.saveSettings();
+		a.engine.pause();
+		wireAuthorization(t, plugin);
+		await plugin.beginAuthorization();
+		const before = structuredClone(disk.files);
+		assert.equal(await plugin["resumeSyncIfReady"](), false);
+		assert.equal(a.engine.isSyncPaused(), true);
+		assert.deepEqual(disk.files, before);
+		plugin.cancelAuthorization();
+	},
+);
+
+test(
+	"Mobile browser return waits through authorization cancellation before actual recovery",
+	{ timeout: 10_000 },
+	async (t) => {
+		const { plugin, a } = await settingsHost(t);
+		a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+			a.client,
+			"vault",
+		);
+		await plugin.saveSettings();
+		wireAuthorization(t, plugin);
+		const doc = Object.assign(new EventTarget(), {
+			visibilityState: "visible",
+			defaultView: new EventTarget(),
+		});
+		Object.assign(plugin.app.workspace, {
+			containerEl: { ownerDocument: doc },
+		});
+		plugin.registerDomEvent = () => {};
+		const previousPlatform = Platform.isMobileApp;
+		Object.assign(Platform, { isMobileApp: true });
+		afterTest(t, () => {
+			Object.assign(Platform, { isMobileApp: previousPlatform });
+		});
+		plugin["initializeMobileRecovery"]();
+		await plugin.beginAuthorization();
+		const recovery = plugin["mobileRecovery"]!;
+		recovery.request("visible");
+		await new Promise((resolve) => setTimeout(resolve, 550));
+		plugin.cancelAuthorization();
+		const settled = deferred();
+		const full = a.engine.fullSync.bind(a.engine);
+		a.engine.fullSync = async (...args) => {
+			const result = await full(...args);
+			settled.resolve();
+			return result;
+		};
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				settled.promise,
+				new Promise<void>((_, reject) => {
+					timeout = setTimeout(
+						() => reject(new Error("recovery did not resume")),
+						5000,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timeout);
+		}
+		while (plugin.isFullSyncInProgress()) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		assert.equal(recovery.canStartAutomatic(), true);
+		assert.equal(plugin.settings.authMethod, "manual");
+	},
+);

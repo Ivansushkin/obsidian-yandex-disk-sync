@@ -1195,7 +1195,8 @@ release evidence 2.1.0. Покрывает MOBILE-RECOVERY-001–007.
    нет overlap смены token и старой записи, нет deadlock reservation. Запрос пароля
    или failure полного sync виден штатным UI; новый grant не требует нового consent
    только ради повторения full.
-8. Проверить ручной fallback и обратное сохранение manual token. OAuth access token
+8. Проверить ручной fallback и обратное сохранение manual token. После первой
+   вставки токена Sync доступен без закрытия/reopen Settings. OAuth access token
    не показывается рядом с legacy Client ID. В логах плагина нет credentials/codes/
    verifier/URL/raw provider errors; host/browser logs оценивать отдельно.
 
