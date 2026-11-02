@@ -16,6 +16,9 @@ Changes since `2.1.0`.
   parameters and files. Encrypted vaults request the password after sign-in.
   Sign-out requires confirmation and is unavailable during unfinished encryption
   or Force recovery; it does not revoke access on Yandex's side.
+- The expanded sync indicator has a pause/resume button alongside sync and log
+  actions. Pause stops automatic work; resume runs a full sync before automation
+  continues.
 
 ### Changed
 
@@ -35,6 +38,14 @@ Changes since `2.1.0`.
   backup and encryption actions stay unavailable until access is configured.
 - In manual connection settings, **Sign in** starts normal synchronization after a
   token is entered. **Sign out** appears after the first successful full sync.
+- Shared OAuth access is refreshed before it expires. After an HTTP 401, regular
+  sync can refresh the token and retry through its normal queue. Temporary
+  refresh failures retain pending work; a rejected grant requires sign-in again.
+  Backup and Force still require an explicit retry after an error.
+- Sync status and errors are shown in the shared indicator. The separate
+  **Show sync status** command and dialog have been removed.
+- Production builds require `YANDEX_OAUTH_CLIENT_SECRET` for token refresh. The
+  secret is embedded in the bundle and does not protect users' tokens.
 - Release validation no longer requires machine-readable scenario evidence files.
   Manual acceptance with two Obsidian profiles against real Yandex Disk remains
   required before release.

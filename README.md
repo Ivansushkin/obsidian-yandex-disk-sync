@@ -98,10 +98,10 @@ full sync manually whenever needed.
 The plugin's own data and the remote `.backup` folder are protected and excluded
 from synchronization.
 
-The command palette offers full sync, pause/resume, sync status and backup
-creation. Click or tap the `YD` indicator to see progress, the last successful
-sync and errors. An idle indicator does not mean that changes on another device
-have already reached this one.
+The command palette offers full sync, pause/resume and backup creation. Click or
+tap the `YD` indicator to see progress, the last successful sync and errors. Its
+expanded view also offers sync, pause/resume and log actions. An idle indicator
+does not mean that changes on another device have already reached this one.
 
 ### Conflicts and deletions
 
