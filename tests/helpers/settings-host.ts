@@ -29,7 +29,9 @@ export async function settingsHost(
 		authMethod: "manual",
 		yandexTokenSecret: remote ? "" : "synthetic",
 	};
-	const scheduler = new SyncScheduler(a.engine, plugin.settings);
+	const scheduler = new SyncScheduler(a.engine, plugin.settings, () =>
+		plugin.runFullSync({ trigger: "automatic" }, false),
+	);
 	Object.assign(plugin, {
 		app: { ...plugin.app, workspace: { layoutReady: true } },
 		yandexClient: a.client,

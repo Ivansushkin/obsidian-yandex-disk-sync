@@ -280,7 +280,6 @@ test("post-commit Force failure resumes cleanup without repeating migration", as
 	plugin["ensureEncryptionReady"] = async () => true;
 	plugin["captureForceSnapshot"] = async () => "snapshot-sha";
 	plugin["renderForceProgress"] = () => {};
-	plugin["updateLastSyncStats"] = () => {};
 	plugin["persistPluginData"] = async () => {};
 	plugin["setMigrationBlock"] = (reason) => {
 		migrationReason = reason;

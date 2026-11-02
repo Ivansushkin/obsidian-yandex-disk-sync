@@ -16,6 +16,19 @@ import {
 	response,
 } from "./helpers/client-fixtures";
 
+test("HTTP 401 requests renewal before a later API operation", async () => {
+	requestGlobal.__obsidianRequestUrl = async () =>
+		response(401, { error: "unauthorized" });
+	const client = createClient();
+	await assert.rejects(client.getResource("vault"));
+	assert.equal(client.hasAuthenticationRejection(), true);
+	client.clearAuthenticationRejection();
+	assert.equal(client.hasAuthenticationRejection(), false);
+	await assert.rejects(client.getResource("vault"));
+	client.setToken("synthetic-renewed");
+	assert.equal(client.hasAuthenticationRejection(), false);
+});
+
 test("remote snapshot retries server listing errors and preserves persistent failures", async () => {
 	for (const [status, failures, invalidBody] of [
 		[500, 1, false],

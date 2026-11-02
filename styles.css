@@ -121,7 +121,7 @@
 }
 
 .yandex-sync-indicator[open] .yandex-sync-indicator-summary {
-	max-width: calc(100% - 146px);
+	max-width: calc(100% - 190px);
 }
 
 .yandex-sync-indicator-actions {
@@ -257,12 +257,6 @@
 	color: var(--text-muted);
 }
 
-.sync-status-error-details {
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-	user-select: text;
-}
-
 .yandex-sync-indicator.sync-migration-required {
 	color: var(--text-warning);
 }
@@ -287,18 +281,6 @@
 	box-sizing: content-box;
 	visibility: hidden;
 	pointer-events: none;
-}
-
-/* Status modal */
-.sync-status-stats {
-	background: var(--background-secondary);
-	padding: 12px;
-	border-radius: 4px;
-	margin-bottom: 16px;
-}
-
-.sync-status-stats p {
-	margin: 8px 0;
 }
 
 /* Keep button controls within this plugin's settings layout. */

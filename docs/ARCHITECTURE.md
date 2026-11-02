@@ -302,7 +302,20 @@ listeners/timers и запрещает новые writes; lifecycle settlement �
 и очищается в OAuth-режиме при загрузке и credential save. Явное начало общего входа
 удаляет ручные credentials до браузера без сброса history; отмена их не возвращает.
 `auth/yandex-authorization.ts` владеет
-memory-only PKCE attempt, state/verifier, timeout и native token POST occupancy.
+memory-only PKCE attempt, state/verifier, timeout, сериализацией native token
+POST и single-flight refresh. Refresh token и срок действия сохраняются
+в локальном auth tuple через общую persistence queue; смена grant или
+connection запрещает публикацию старого ответа. Сборка получает общий Client
+Secret из локальной `.env` или CI и включает его в bundle. Перед сетевой
+работой истекающий OAuth-доступ обновляется, включая cold startup, mobile
+recovery и scheduled full; 401 в этих потоках и realtime вызывает отдельный
+refresh и один повторный запуск через существующую очередь с новой startup
+invocation. Временный сбой refresh сохраняет работу и через 30 s запускает
+автоматический full после успешного обновления, если допускают lifecycle и
+конфигурация. Временная ошибка Диска в этом full оставляет recovery pending
+до следующей попытки; mobile hidden откладывает её без OAuth POST. Resume обновляет token под сохранённой pause, а automation
+возобновляет только после успешного full. Backup и Force при ошибке остаются
+явными пользовательскими операциями.
 `main.ts` связывает transport, lifecycle, UI и существующий full; не выполняет
 обмен или принятие credentials самостоятельно. `auth/configuration.ts` содержит
 публичный Client ID приложения; callback используется на всех платформах, и перед
@@ -329,8 +342,8 @@ snapshots, в том числе при unload со старым runtime. Усп�
 ## Диагностика, UI и проверки
 
 `SyncState` содержит session ID/kind, фазу и известный progress; смена фазы снимает
-старый N/M. Один formatter обслуживает desktop/mobile `SyncIndicator`, Notice и
-selectable status dialog. Состояние UI не сохраняется и не выбирает causal winner.
+старый N/M. Один formatter обслуживает desktop/mobile `SyncIndicator` и Notice.
+Состояние UI не сохраняется и не выбирает causal winner.
 Force/encryption foreground reservation охватывает промежутки между внутренними
 сессиями. Success появляется после verification и coherent persistence; idle не
 доказывает отсутствие deferred work на других устройствах.

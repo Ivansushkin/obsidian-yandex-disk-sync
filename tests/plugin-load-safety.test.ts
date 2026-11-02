@@ -227,12 +227,6 @@ test("persisted actor and queue survive missing installation cache but reject a 
 				pendingPhysicalActions: [],
 				pendingWatcherEvents: [],
 				encryptionTransition: null,
-				lastSyncStats: {
-					uploaded: 0,
-					downloaded: 0,
-					deleted: 0,
-					errors: 0,
-				},
 			};
 			plugin.loadData = async () => structuredClone(source);
 			if (cached === "foreign") {

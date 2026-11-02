@@ -931,7 +931,6 @@ test("old current Force checkpoints normalize completion before persistence and 
 		format: "plugin-data",
 		settings: owner.settings,
 		...(await owner.saved()),
-		lastSyncStats: {},
 		encryptionTransition: null,
 		forceRecovery: legacy as ForceRecovery,
 	};

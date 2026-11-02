@@ -12,6 +12,96 @@ import { transition } from "./helpers/encryption-scenarios";
 
 import { settingsHost } from "./helpers/settings-host";
 
+test("toggle command restarts watcher and scheduler after a paused full sync", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	let toggle: (() => Promise<void>) | undefined;
+	Object.assign(plugin, {
+		addCommand: (command: {
+			id: string;
+			callback?: () => Promise<void>;
+		}) => {
+			if (command.id === "toggle-sync") {
+				toggle = command.callback;
+			}
+			return command;
+		},
+	});
+	plugin["registerCommands"]();
+	assert.ok(toggle);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+
+	await toggle();
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+
+	await toggle();
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
+
+test("intentional pause during full remains paused until resume", async (t) => {
+	const { plugin, a, disk, scheduler } = await settingsHost(t);
+	const entered = deferred();
+	const release = deferred();
+	let held = false;
+	disk.beforeRequest = async () => {
+		if (!held) {
+			held = true;
+			entered.resolve();
+			await release.promise;
+		}
+	};
+	const full = plugin.runFullSync();
+	await entered.promise;
+	try {
+		assert.equal(plugin.isFullSyncInProgress(), true);
+		assert.equal(plugin["getSyncIndicatorContext"]().pauseEnabled, true);
+		await plugin["toggleSync"]();
+		assert.equal(a.engine.isSyncPaused(), true);
+		assert.equal(a.watcher["isEnabled"], false);
+		assert.equal(scheduler["isRunning"], false);
+	} finally {
+		release.resolve();
+	}
+	await full;
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(plugin["getSyncIndicatorContext"]().paused, true);
+	assert.equal(plugin["getSyncIndicatorContext"]().pauseEnabled, false);
+	disk.beforeRequest = undefined;
+	await plugin["toggleSync"]();
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(plugin["getSyncIndicatorContext"]().pauseEnabled, false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
+
+test("failed resume keeps synchronization paused for a later retry", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	plugin["syncEngine"].pause();
+	plugin["stopRegularSync"]();
+	Object.assign(plugin, {
+		runFullSync: async () => ({ success: false }),
+	});
+	assert.equal(await plugin["resumeSyncIfReady"](), false);
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+});
+
+test("pause command does not interrupt an active Force replacement", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	Object.assign(plugin, {
+		forceSyncController: { isBusy: () => true },
+	});
+	await plugin["toggleSync"]();
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
+
 test(
 	"host activity opens a rotated password after full settlement and revokes an open prompt on save failure",
 	{ timeout: 10_000 },

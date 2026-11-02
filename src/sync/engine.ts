@@ -574,7 +574,9 @@ export class SyncEngine {
 				: (activeBlock?.failure ??
 					(failed ? this.state.failure : undefined));
 		this.updateState({
-			status: activeBlock?.status ?? (failed ? "error" : "idle"),
+			status: this.isPaused
+				? "paused"
+				: (activeBlock?.status ?? (failed ? "error" : "idle")),
 			failure: terminalFailure,
 			lastSyncTime:
 				!failed && !activeBlock ? Date.now() : this.state.lastSyncTime,

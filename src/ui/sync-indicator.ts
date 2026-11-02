@@ -16,6 +16,7 @@ import { t } from "../i18n";
 
 interface SyncIndicatorActions {
 	synchronize: () => Promise<void>;
+	toggleSync: () => Promise<void>;
 	readLogs: () => Promise<string>;
 }
 
@@ -25,9 +26,11 @@ export class SyncIndicator extends Component {
 	private summaryEl!: HTMLElement;
 	private loaderEl!: HTMLElement;
 	private syncButton!: HTMLButtonElement;
+	private toggleSyncButton!: HTMLButtonElement;
 	private copyButton!: HTMLButtonElement;
 	private openLogsButton!: HTMLButtonElement;
 	private syncRequested = false;
+	private toggleRequested = false;
 	private copyingLogs = false;
 	private openingLogs = false;
 	private accessibleStatus = "";
@@ -87,6 +90,13 @@ export class SyncIndicator extends Component {
 		});
 		this.registerDomEvent(this.syncButton, "click", () => {
 			void this.synchronize();
+		});
+		this.toggleSyncButton = actions.createEl("button", {
+			cls: "clickable-icon yandex-sync-indicator-action",
+			attr: { type: "button" },
+		});
+		this.registerDomEvent(this.toggleSyncButton, "click", () => {
+			void this.toggleSync();
 		});
 		this.copyButton = actions.createEl("button", {
 			cls: "clickable-icon yandex-sync-indicator-action",
@@ -213,8 +223,27 @@ export class SyncIndicator extends Component {
 			setTooltip(button, t(key), { placement: "top" });
 		}
 		const context = this.readContext();
-		const { fullSyncInProgress, syncUnavailable, connection } = context;
-		this.syncButton.disabled = syncUnavailable || this.syncRequested;
+		const {
+			fullSyncInProgress,
+			syncUnavailable,
+			connection,
+			paused,
+			pauseEnabled,
+		} = context;
+		this.syncButton.disabled =
+			syncUnavailable || paused || this.syncRequested;
+		const toggleLabel = t(
+			paused ? "status.actions.resume_sync" : "status.actions.pause_sync",
+		);
+		this.toggleSyncButton.setAttribute("aria-label", toggleLabel);
+		setTooltip(this.toggleSyncButton, toggleLabel, { placement: "top" });
+		const toggleIcon = paused ? "play" : "pause";
+		if (this.toggleSyncButton.dataset.icon !== toggleIcon) {
+			setIcon(this.toggleSyncButton, toggleIcon);
+			this.toggleSyncButton.dataset.icon = toggleIcon;
+		}
+		this.toggleSyncButton.disabled =
+			this.toggleRequested || (paused ? syncUnavailable : !pauseEnabled);
 		this.syncButton.setAttribute(
 			"aria-busy",
 			String(
@@ -250,9 +279,34 @@ export class SyncIndicator extends Component {
 		this.schedulePosition();
 	}
 
+	/** Reserve the toggle while a resume check or full sync is running. */
+	private async toggleSync(): Promise<void> {
+		const context = this.readContext();
+		if (
+			this.toggleRequested ||
+			this.disposed ||
+			(context.paused ? context.syncUnavailable : !context.pauseEnabled)
+		) {
+			return;
+		}
+		this.toggleRequested = true;
+		this.update();
+		try {
+			await this.actions.toggleSync();
+		} catch {
+			if (!this.disposed) {
+				new Notice(t("status.actions.toggle_failed"));
+			}
+		} finally {
+			this.toggleRequested = false;
+			this.update();
+		}
+	}
+
 	/** Reserve the control immediately while the existing workflow publishes its activity. */
 	private async synchronize(): Promise<void> {
-		if (this.syncRequested || this.readContext().syncUnavailable) {
+		const context = this.readContext();
+		if (this.syncRequested || context.syncUnavailable || context.paused) {
 			return;
 		}
 		this.syncRequested = true;

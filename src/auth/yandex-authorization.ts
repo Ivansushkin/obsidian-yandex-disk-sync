@@ -1,5 +1,8 @@
 import { EncryptionService } from "../crypto/encryption";
-import type { AuthenticationUpdate } from "./authentication-state";
+import type {
+	AuthenticationUpdate,
+	OAuthAuthorization,
+} from "./authentication-state";
 
 export type AuthorizationFailure =
 	| "unavailable"
@@ -43,6 +46,8 @@ export interface OAuthResponse {
 	status: number;
 	json: unknown;
 }
+export type RefreshDecision =
+	"fresh" | "refreshed" | "temporary" | "reauthorize" | "revoked";
 export interface AuthorizationAttempt {
 	assertCurrent(): void;
 	accept(): void;
@@ -50,6 +55,7 @@ export interface AuthorizationAttempt {
 }
 interface Options {
 	clientId: string;
+	clientSecret: string;
 	vaultName(): string;
 	deviceId(): string;
 	request(body: URLSearchParams): Promise<OAuthResponse>;
@@ -81,6 +87,9 @@ interface PendingAttempt {
 export class YandexAuthorization {
 	private pending: PendingAttempt | null = null;
 	private native: Promise<void> | null = null;
+	private refreshing: Promise<void> | null = null;
+	private refreshDeniedGrant: string | null = null;
+	private refreshRetryAt = 0;
 	private disposed = false;
 	private state: AuthorizationState = { phase: "idle" };
 	private readonly listeners = new Set<() => void>();
@@ -94,6 +103,179 @@ export class YandexAuthorization {
 	}
 	get available(): boolean {
 		return this.options.clientId.trim().length > 0;
+	}
+
+	needsRefresh(authorization: OAuthAuthorization, force: boolean): boolean {
+		return (
+			force ||
+			this.refreshDeniedGrant === authorization.grantId ||
+			(authorization.expiresAt !== null &&
+				authorization.expiresAt <= this.now() + 300_000)
+		);
+	}
+
+	/** Decide whether one grant needs renewal without looping on provider failures. */
+	async ensureFresh(
+		current: { token: string; authorization: OAuthAuthorization },
+		force: boolean,
+		assertCurrent: () => void,
+		adopt: (
+			update: AuthenticationUpdate,
+			assertCurrent: () => void,
+		) => Promise<void>,
+	): Promise<RefreshDecision> {
+		if (this.refreshDeniedGrant === current.authorization.grantId) {
+			return "reauthorize";
+		}
+		if (!this.needsRefresh(current.authorization, force)) {
+			return "fresh";
+		}
+		if (this.now() < this.refreshRetryAt) {
+			return "temporary";
+		}
+		try {
+			await this.refresh(current, assertCurrent, adopt);
+			this.refreshRetryAt = 0;
+			this.refreshDeniedGrant = null;
+			return "refreshed";
+		} catch (error) {
+			if (
+				error instanceof AuthorizationError &&
+				(error.code === "expired" || error.code === "permissions")
+			) {
+				this.refreshDeniedGrant = current.authorization.grantId;
+				return "reauthorize";
+			}
+			if (
+				error instanceof AuthorizationError &&
+				error.code === "revoked"
+			) {
+				return "revoked";
+			}
+			this.refreshRetryAt = this.now() + 30_000;
+			return "temporary";
+		}
+	}
+
+	resetRefreshState(): void {
+		this.refreshDeniedGrant = null;
+		this.refreshRetryAt = 0;
+	}
+
+	/** Coalesce refresh requests and publish only a still-current grant. */
+	refresh(
+		current: { token: string; authorization: OAuthAuthorization },
+		assertCurrent: () => void,
+		adopt: (
+			update: AuthenticationUpdate,
+			assertCurrent: () => void,
+		) => Promise<void>,
+	): Promise<void> {
+		if (this.refreshing) {
+			return this.refreshing;
+		}
+		const work = this.refreshOnce(current, assertCurrent, adopt);
+		this.refreshing = work;
+		void work.then(
+			() => {
+				if (this.refreshing === work) {
+					this.refreshing = null;
+				}
+			},
+			() => {
+				if (this.refreshing === work) {
+					this.refreshing = null;
+				}
+			},
+		);
+		return work;
+	}
+
+	private async refreshOnce(
+		current: { token: string; authorization: OAuthAuthorization },
+		assertCurrent: () => void,
+		adopt: (
+			update: AuthenticationUpdate,
+			assertCurrent: () => void,
+		) => Promise<void>,
+	): Promise<void> {
+		if (
+			this.disposed ||
+			this.pending ||
+			!this.options.clientSecret ||
+			!current.authorization.refreshToken
+		) {
+			throw new AuthorizationError("unavailable");
+		}
+		if (current.authorization.clientId !== this.options.clientId) {
+			throw new AuthorizationError("expired");
+		}
+		assertCurrent();
+		if (this.native) {
+			let waitTimer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([
+					this.native,
+					new Promise<never>((_, reject) => {
+						waitTimer = setTimeout(
+							() => reject(new AuthorizationError("timeout")),
+							this.options.requestTimeoutMs ?? 30_000,
+						);
+					}),
+				]);
+			} finally {
+				clearTimeout(waitTimer);
+			}
+		}
+		assertCurrent();
+		if (this.disposed || this.pending) {
+			throw new AuthorizationError("revoked");
+		}
+		const body = new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: current.authorization.refreshToken,
+			client_id: this.options.clientId,
+			client_secret: this.options.clientSecret,
+		});
+		const request = Promise.resolve().then(() => {
+			assertCurrent();
+			if (this.disposed || this.pending) {
+				throw new AuthorizationError("revoked");
+			}
+			return this.options.request(body);
+		});
+		const native = request.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.native = native;
+		void native.then(() => {
+			if (this.native === native) {
+				this.native = null;
+			}
+		});
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const response = await Promise.race([
+				request,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new AuthorizationError("timeout")),
+						this.options.requestTimeoutMs ?? 30_000,
+					);
+				}),
+			]);
+			assertCurrent();
+			const update = this.parseResponse(response, current.authorization);
+			await adopt(update, assertCurrent);
+		} catch (error) {
+			if (error instanceof AuthorizationError) {
+				throw error;
+			}
+			throw new AuthorizationError("network");
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 	get blocksOperations(): boolean {
 		return this.pending !== null && this.state.phase !== "synchronizing";
@@ -202,10 +384,6 @@ export class YandexAuthorization {
 		this.assertAttempt(attempt);
 		this.update({ phase: "exchanging" });
 		try {
-			if (this.native) {
-				await this.wait(this.native, attempt);
-			}
-			this.assertAttempt(attempt);
 			const body = new URLSearchParams({
 				grant_type: "authorization_code",
 				code: code.trim(),
@@ -214,21 +392,7 @@ export class YandexAuthorization {
 				device_id: attempt.deviceId,
 				device_name: "Obsidian Yandex Disk Sync",
 			});
-			const request = Promise.resolve().then(() => {
-				this.assertAttempt(attempt);
-				return this.options.request(body);
-			});
-			const native = request.then(
-				() => undefined,
-				() => undefined,
-			);
-			this.native = native;
-			void native.then(() => {
-				if (this.native === native) {
-					this.native = null;
-				}
-			});
-			const response = await this.wait(request, attempt);
+			const response = await this.post(body, attempt);
 			const candidate = this.parseResponse(response);
 			this.assertAttempt(attempt);
 			await this.options.adopt(candidate, {
@@ -260,7 +424,36 @@ export class YandexAuthorization {
 		}
 	}
 
-	private parseResponse(response: OAuthResponse): AuthenticationUpdate {
+	/** Keep native token requests serialized even after a logical timeout. */
+	private async post(
+		body: URLSearchParams,
+		attempt: PendingAttempt,
+	): Promise<OAuthResponse> {
+		if (this.native) {
+			await this.wait(this.native, attempt);
+		}
+		this.assertAttempt(attempt);
+		const request = Promise.resolve().then(() => {
+			this.assertAttempt(attempt);
+			return this.options.request(body);
+		});
+		const native = request.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.native = native;
+		void native.then(() => {
+			if (this.native === native) {
+				this.native = null;
+			}
+		});
+		return this.wait(request, attempt);
+	}
+
+	private parseResponse(
+		response: OAuthResponse,
+		prior?: OAuthAuthorization,
+	): AuthenticationUpdate {
 		const data =
 			response.json &&
 			typeof response.json === "object" &&
@@ -268,6 +461,15 @@ export class YandexAuthorization {
 				? (response.json as Record<string, unknown>)
 				: {};
 		if (response.status !== 200) {
+			if (prior) {
+				throw new AuthorizationError(
+					response.status >= 400 &&
+						response.status < 500 &&
+						response.status !== 429
+						? "expired"
+						: "network",
+				);
+			}
 			throw new AuthorizationError(
 				data.error === "invalid_grant" ||
 					data.error === "bad_verification_code"
@@ -294,6 +496,14 @@ export class YandexAuthorization {
 		) {
 			throw new AuthorizationError("permissions");
 		}
+		if (
+			prior &&
+			(typeof data.refresh_token !== "string" ||
+				!data.refresh_token.trim() ||
+				data.expires_in === undefined)
+		) {
+			throw new AuthorizationError("invalid-response");
+		}
 		let expiresAt: number | null = null;
 		if (data.expires_in !== undefined) {
 			if (
@@ -307,12 +517,16 @@ export class YandexAuthorization {
 			expiresAt = this.now() + data.expires_in * 1000;
 		}
 		return {
-			kind: "interactive",
+			kind: prior ? "refresh" : "interactive",
 			token: data.access_token,
 			authorization: {
 				clientId: this.options.clientId,
-				grantId: randomString(),
-				refreshToken: null,
+				grantId: prior?.grantId ?? randomString(),
+				refreshToken:
+					typeof data.refresh_token === "string" &&
+					data.refresh_token.trim()
+						? data.refresh_token
+						: null,
 				expiresAt,
 			},
 		};

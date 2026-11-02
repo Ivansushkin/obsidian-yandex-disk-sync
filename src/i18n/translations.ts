@@ -66,7 +66,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.language_desc":
 			"Follow Obsidian’s language or choose a language for this plugin. Changes apply immediately.",
 		"settings.language_system": "System default",
-		"modal.status_last_sync": "Last synchronization: {time}",
 		"units.byte": "B",
 		"units.kilobyte": "KB",
 		"units.megabyte": "MB",
@@ -194,6 +193,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.actions.logs_empty": "No log entries to copy",
 		"status.actions.copy_failed": "Could not copy logs to clipboard",
 		"status.actions.sync_failed": "Could not start synchronization",
+		"status.actions.pause_sync": "Pause synchronization",
+		"status.actions.resume_sync": "Resume synchronization",
+		"status.actions.toggle_failed":
+			"Could not change synchronization state",
 		"failure.stage.upload-verification": "upload result verification",
 		"failure.stage.preflight": "preflight",
 		"failure.stage.confirming": "confirmation",
@@ -281,7 +284,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Commands
 		"command.sync_now": "Sync with Yandex Disk now",
 		"command.toggle_sync": "Pause/Resume synchronization",
-		"command.show_status": "Show synchronization status",
 
 		// Status bar
 		"status.syncing": "Syncing...",
@@ -404,7 +406,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.backup_completed": "Backup created: {name}",
 
 		// Modal titles
-		"modal.status_title": "Synchronization status",
 
 		// Modal descriptions
 		"modal.operation_backup_title": "Backup before encryption change",
@@ -417,11 +418,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_legacy_devices_desc":
 			"Confirm that Obsidian with plugin 1.1 is disabled on every other device before Force migration.",
 		"modal.close_button": "Close",
-		"modal.status_no_sync": "Synchronization has not been performed yet",
-		"modal.status_uploaded": "Uploaded: {count}",
-		"modal.status_downloaded": "Downloaded: {count}",
-		"modal.status_deleted": "Deleted: {count}",
-		"modal.status_errors": "Errors: {count}",
 
 		// Settings
 		"settings.connection_section": "Connection",
@@ -685,7 +681,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.language_desc":
 			"Следовать языку Obsidian или выбрать язык плагина. Изменение применяется сразу.",
 		"settings.language_system": "Системный",
-		"modal.status_last_sync": "Последняя синхронизация: {time}",
 		"units.byte": "Б",
 		"units.kilobyte": "КБ",
 		"units.megabyte": "МБ",
@@ -814,6 +809,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.actions.copy_failed":
 			"Не удалось скопировать логи в буфер обмена",
 		"status.actions.sync_failed": "Не удалось запустить синхронизацию",
+		"status.actions.pause_sync": "Приостановить синхронизацию",
+		"status.actions.resume_sync": "Продолжить синхронизацию",
+		"status.actions.toggle_failed":
+			"Не удалось изменить состояние синхронизации",
 		"failure.stage.upload-verification": "проверка результата загрузки",
 		"failure.stage.preflight": "предварительная проверка",
 		"failure.stage.confirming": "подтверждение",
@@ -902,7 +901,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Commands
 		"command.sync_now": "Синхронизировать с Яндекс Диском сейчас",
 		"command.toggle_sync": "Приостановить/возобновить синхронизацию",
-		"command.show_status": "Показать статус синхронизации",
 
 		// Status bar
 		"status.syncing": "Синхронизация...",
@@ -1027,7 +1025,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.backup_completed": "Бекап создан: {name}",
 
 		// Modal titles
-		"modal.status_title": "Статус синхронизации",
 
 		// Modal descriptions
 		"modal.operation_backup_title": "Архив перед изменением шифрования",
@@ -1040,11 +1037,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_legacy_devices_desc":
 			"Подтвердите, что Obsidian с плагином 1.1 отключён на всех остальных устройствах до Force-миграции.",
 		"modal.close_button": "Закрыть",
-		"modal.status_no_sync": "Синхронизация ещё не выполнялась",
-		"modal.status_uploaded": "Загружено: {count}",
-		"modal.status_downloaded": "Скачано: {count}",
-		"modal.status_deleted": "Удалено: {count}",
-		"modal.status_errors": "Ошибок: {count}",
 
 		// Settings
 		"settings.connection_section": "Подключение",

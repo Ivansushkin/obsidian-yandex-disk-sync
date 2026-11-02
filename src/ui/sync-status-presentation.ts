@@ -103,6 +103,8 @@ export interface SyncIndicatorContext {
 	force: ForceFlowState | null;
 	foreground: "encryption" | "backup" | null;
 	fullSyncInProgress: boolean;
+	paused: boolean;
+	pauseEnabled: boolean;
 	connection?: { errorMessage?: string; retry?: RetryProgress };
 	syncUnavailable: boolean;
 	hasAuthorization: boolean;

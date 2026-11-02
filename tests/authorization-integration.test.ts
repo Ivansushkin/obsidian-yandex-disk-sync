@@ -9,6 +9,8 @@ import { encryptionFlow } from "./helpers/encryption-flow";
 import { afterTest } from "./helpers/test-context";
 import { deferred } from "./helpers/deferred";
 import { StorageBindingController } from "../src/sync/local/storage-binding";
+import { SyncScheduler } from "../src/sync/scheduler";
+import { NetworkRequestError } from "../src/errors";
 
 /** Replace only native registration, browser opening and token HTTP for the real host workflow. */
 function wireAuthorization(
@@ -33,15 +35,18 @@ function wireAuthorization(
 		__obsidianRequestUrl: (params: RequestUrlParam) => Promise<unknown>;
 	};
 	const previousRequest = transport.__obsidianRequestUrl;
+	let tokenResponder = async (_params: RequestUrlParam) => ({
+		status: 200,
+		json: {
+			access_token: "synthetic-oauth",
+			refresh_token: "synthetic-initial-refresh",
+			token_type: "bearer",
+			expires_in: 3600,
+		},
+	});
 	transport.__obsidianRequestUrl = async (params) =>
 		params.url === "https://oauth.yandex.ru/token"
-			? {
-					status: 200,
-					json: {
-						access_token: "synthetic-oauth",
-						token_type: "bearer",
-					},
-				}
+			? tokenResponder(params)
 			: previousRequest(params);
 	const oldWindow = globalThis.window;
 	let browserUrl = "";
@@ -62,6 +67,9 @@ function wireAuthorization(
 	});
 	plugin["initializeAuthorization"]();
 	return {
+		setTokenResponder: (responder: typeof tokenResponder) => {
+			tokenResponder = responder;
+		},
 		callback: (params: Record<string, string>) => protocolHandler(params),
 		browserUrl: () => new URL(browserUrl),
 		submit: (code: string) =>
@@ -70,6 +78,514 @@ function wireAuthorization(
 				code,
 			}),
 	};
+}
+
+test("OAuth full renews before expiry and resumes after HTTP 401", async (t) => {
+	const { plugin, a } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	assert.equal(
+		plugin.settings.oauthAuthorization?.refreshToken,
+		"synthetic-initial-refresh",
+	);
+	let refreshes = 0;
+	browser.setTokenResponder(async (params) => {
+		assert.equal(typeof params.body, "string");
+		const body = new URLSearchParams(params.body as string);
+		assert.equal(body.get("grant_type"), "refresh_token");
+		assert.equal(
+			body.get("client_secret"),
+			SHARED_YANDEX_OAUTH.clientSecret,
+		);
+		refreshes++;
+		return {
+			status: 200,
+			json: {
+				access_token: "renewed-1",
+				refresh_token: `rotated-${refreshes}`,
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	plugin.settings.oauthAuthorization.expiresAt = Date.now() + 1000;
+	assert.equal((await plugin.runFullSync())?.success, true);
+	assert.equal(refreshes, 1);
+	assert.equal(plugin.settings.oauthAuthorization?.refreshToken, "rotated-1");
+	const transport = globalThis as unknown as {
+		__obsidianRequestUrl: (params: RequestUrlParam) => Promise<unknown>;
+	};
+	const previous = transport.__obsidianRequestUrl;
+	let rejectOnce = true;
+	transport.__obsidianRequestUrl = async (params) => {
+		if (rejectOnce && params.url.includes("/v1/disk/resources")) {
+			rejectOnce = false;
+			return {
+				status: 401,
+				json: { error: "unauthorized" },
+				arrayBuffer: new ArrayBuffer(0),
+				text: "",
+				headers: {},
+			};
+		}
+		return previous(params);
+	};
+	try {
+		assert.equal((await plugin.runFullSync())?.success, true);
+		assert.equal(refreshes, 2);
+		assert.equal(
+			plugin.settings.oauthAuthorization?.refreshToken,
+			"rotated-2",
+		);
+	} finally {
+		transport.__obsidianRequestUrl = previous;
+	}
+});
+
+test("paused OAuth sync refreshes an expiring grant before resuming once", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		return {
+			status: 200,
+			json: {
+				access_token: "renewed-resume",
+				refresh_token: "rotated-resume",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	a.engine.pause();
+	plugin["stopRegularSync"]();
+	const [first, second] = await Promise.all([
+		plugin["resumeSyncIfReady"](),
+		plugin["resumeSyncIfReady"](),
+	]);
+	assert.equal(first, true);
+	assert.equal(second, true);
+	assert.equal(refreshes, 1);
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+
+	const entered = deferred();
+	const release = deferred();
+	browser.setTokenResponder(async () => {
+		entered.resolve();
+		await release.promise;
+		return {
+			status: 200,
+			json: {
+				access_token: "stale-resume",
+				refresh_token: "stale-rotation",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	a.engine.pause();
+	plugin["stopRegularSync"]();
+	const revoked = plugin["resumeSyncIfReady"]();
+	await entered.promise;
+	a.engine.resume();
+	a.engine.pause();
+	release.resolve();
+	assert.equal(await revoked, false);
+	assert.equal(
+		plugin.settings.oauthAuthorization?.refreshToken,
+		"rotated-resume",
+	);
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(a.watcher["isEnabled"], false);
+});
+
+test("temporary OAuth refresh retries after busy and Disk failures", async (t) => {
+	const { plugin, a, disk, scheduler } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const previousNow = Date.now;
+	let now = previousNow();
+	Date.now = () => now;
+	afterTest(t, () => {
+		Date.now = previousNow;
+	});
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		if (refreshes === 1) {
+			throw new Error("synthetic offline");
+		}
+		return {
+			status: 200,
+			json: {
+				access_token: "renewed-retry",
+				refresh_token: "rotated-retry",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	const testWindow = window;
+	const previousTimeout = testWindow.setTimeout;
+	let retry: (() => void) | undefined;
+	testWindow.setTimeout = ((callback: TimerHandler, delay?: number) => {
+		if (delay === 30_000 && typeof callback === "function") {
+			retry = callback as () => void;
+			return 1;
+		}
+		return previousTimeout(callback, delay);
+	}) as typeof window.setTimeout;
+	afterTest(t, () => {
+		testWindow.setTimeout = previousTimeout;
+	});
+	plugin.settings.oauthAuthorization!.expiresAt = now + 1000;
+	a.vault.put("recover.md", bytes("offline edit"));
+	assert.equal(
+		await plugin.runFullSync({ trigger: "automatic" }, false),
+		null,
+	);
+	assert.equal(refreshes, 1);
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+	assert.ok(retry);
+	assert.equal(plugin["refreshBlockActive"], true);
+	assert.equal(plugin["isConfigurationBusy"](), false);
+	assert.equal(plugin.isAuthorizationPending(), false);
+	plugin["activeFullRuns"] = 1;
+	now += 30_001;
+	const deferredRetry = retry;
+	retry();
+	assert.equal(refreshes, 1);
+	assert.notEqual(retry, deferredRetry);
+	plugin["activeFullRuns"] = 0;
+	disk.beforeRequest = async () => {
+		throw new NetworkRequestError(new Error("synthetic disk offline"));
+	};
+	now += 30_001;
+	const failedFullRetry = retry;
+	retry();
+	for (
+		let attempt = 0;
+		attempt < 30 && retry === failedFullRetry;
+		attempt++
+	) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.notEqual(retry, failedFullRetry);
+	assert.equal(a.watcher["isEnabled"], false);
+	disk.beforeRequest = undefined;
+	now += 30_001;
+	retry();
+	for (let attempt = 0; attempt < 30 && !a.watcher["isEnabled"]; attempt++) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.equal(refreshes, 2);
+	assert.equal(
+		new TextDecoder().decode(disk.files.get("vault/recover.md")),
+		"offline edit",
+	);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
+
+test("cold startup refreshes before Disk access and again after a 401", async (t) => {
+	const { plugin, a, disk, scheduler } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		return {
+			status: 200,
+			json: {
+				access_token: "startup-renewed",
+				refresh_token: "startup-rotated",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	const transport = globalThis as unknown as {
+		__obsidianRequestUrl: (params: RequestUrlParam) => Promise<unknown>;
+	};
+	const previous = transport.__obsidianRequestUrl;
+	let rejected = false;
+	let refreshesBeforeDisk = -1;
+	transport.__obsidianRequestUrl = async (params) => {
+		if (!rejected && params.url.includes("/v1/disk/resources")) {
+			rejected = true;
+			refreshesBeforeDisk = refreshes;
+			return {
+				status: 401,
+				json: { error: "unauthorized" },
+				arrayBuffer: new ArrayBuffer(0),
+				text: "",
+				headers: {},
+			};
+		}
+		return previous(params);
+	};
+	afterTest(t, () => {
+		transport.__obsidianRequestUrl = previous;
+	});
+	plugin["remoteStateValidated"] = false;
+	plugin["regularSyncStarted"] = false;
+	plugin["automationReady"] = false;
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	a.watcher.stop();
+	scheduler.stop();
+	a.vault.put("startup-401.md", bytes("startup edit"));
+	await plugin["onLayoutReady"]();
+	assert.equal(rejected, true);
+	assert.equal(refreshesBeforeDisk, 1);
+	assert.equal(refreshes, 2);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(
+		new TextDecoder().decode(disk.files.get("vault/startup-401.md")),
+		"startup edit",
+	);
+});
+
+test("cold startup with manual admission does not refresh OAuth", async (t) => {
+	const { plugin, a } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		throw new Error("unexpected refresh");
+	});
+	plugin.settings.manualSyncRequired = true;
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	await plugin["onLayoutReady"]();
+	assert.equal(refreshes, 0);
+});
+
+test("scheduled full refreshes OAuth before Disk access", async (t) => {
+	const { plugin, a, disk } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		return {
+			status: 200,
+			json: {
+				access_token: "scheduler-renewed",
+				refresh_token: "scheduler-rotated",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	a.vault.put("scheduled.md", bytes("scheduled edit"));
+	const scheduler = new SyncScheduler(a.engine, plugin.settings, () =>
+		plugin.runFullSync({ trigger: "automatic" }, false),
+	);
+	await scheduler["runScheduledSync"]();
+	assert.equal(refreshes, 1);
+	assert.equal(
+		new TextDecoder().decode(disk.files.get("vault/scheduled.md")),
+		"scheduled edit",
+	);
+});
+
+test("mobile recovery refreshes before Disk access and again after a 401", async (t) => {
+	const { plugin, a, disk } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		return {
+			status: 200,
+			json: {
+				access_token: "mobile-renewed",
+				refresh_token: "mobile-rotated",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	const transport = globalThis as unknown as {
+		__obsidianRequestUrl: (params: RequestUrlParam) => Promise<unknown>;
+	};
+	const previous = transport.__obsidianRequestUrl;
+	let rejected = false;
+	let refreshesBeforeDisk = -1;
+	transport.__obsidianRequestUrl = async (params) => {
+		if (!rejected && params.url.includes("/v1/disk/resources")) {
+			rejected = true;
+			refreshesBeforeDisk = refreshes;
+			return {
+				status: 401,
+				json: { error: "unauthorized" },
+				arrayBuffer: new ArrayBuffer(0),
+				text: "",
+				headers: {},
+			};
+		}
+		return previous(params);
+	};
+	const previousMobile = Platform.isMobileApp;
+	Platform.isMobileApp = true;
+	const doc = Object.assign(new EventTarget(), {
+		visibilityState: "visible",
+		defaultView: new EventTarget(),
+	});
+	plugin.app.workspace.containerEl = { ownerDocument: doc } as HTMLElement;
+	plugin.registerDomEvent = ((
+		target: EventTarget,
+		event: string,
+		listener: EventListener,
+	) => {
+		target.addEventListener(event, listener);
+	}) as typeof plugin.registerDomEvent;
+	afterTest(t, () => {
+		transport.__obsidianRequestUrl = previous;
+		Platform.isMobileApp = previousMobile;
+		plugin["mobileRecovery"]?.dispose();
+	});
+	plugin["initializeMobileRecovery"]();
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	a.vault.put("mobile-401.md", bytes("mobile edit"));
+	plugin["mobileRecovery"]!.request("schedule");
+	for (
+		let attempt = 0;
+		attempt < 100 &&
+		(!disk.files.has("vault/mobile-401.md") ||
+			plugin["mobileRecovery"]!["pending"]);
+		attempt++
+	) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.equal(rejected, true);
+	assert.equal(refreshesBeforeDisk, 1);
+	assert.equal(refreshes, 2);
+	assert.equal(plugin["mobileRecovery"]!["pending"], false);
+	assert.equal(
+		new TextDecoder().decode(disk.files.get("vault/mobile-401.md")),
+		"mobile edit",
+	);
+});
+
+test("hidden mobile automatic full does not refresh OAuth", async (t) => {
+	const { plugin, a } = await settingsHost(t);
+	a.index.getLocalIndex().remoteScope = await readRemoteStorageScope(
+		a.client,
+		"vault",
+	);
+	const browser = wireAuthorization(t, plugin);
+	await plugin.beginAuthorization();
+	await browser.submit("synthetic-code");
+	let refreshes = 0;
+	browser.setTokenResponder(async () => {
+		refreshes++;
+		throw new Error("unexpected hidden refresh");
+	});
+	const previousMobile = Platform.isMobileApp;
+	Platform.isMobileApp = true;
+	const doc = Object.assign(new EventTarget(), {
+		visibilityState: "hidden",
+		defaultView: new EventTarget(),
+	});
+	plugin.app.workspace.containerEl = { ownerDocument: doc } as HTMLElement;
+	plugin.registerDomEvent = ((
+		target: EventTarget,
+		event: string,
+		listener: EventListener,
+	) => {
+		target.addEventListener(event, listener);
+	}) as typeof plugin.registerDomEvent;
+	afterTest(t, () => {
+		Platform.isMobileApp = previousMobile;
+		plugin["mobileRecovery"]?.dispose();
+	});
+	plugin["initializeMobileRecovery"]();
+	plugin.settings.oauthAuthorization!.expiresAt = Date.now() + 1000;
+	assert.equal(
+		await plugin.runFullSync({ trigger: "automatic" }, false),
+		null,
+	);
+	assert.equal(refreshes, 0);
+});
+
+for (const method of ["manual", "legacy-oauth"] as const) {
+	test(`HTTP 401 does not replay full without refresh token: ${method}`, async (t) => {
+		const { plugin } = await settingsHost(t);
+		if (method === "legacy-oauth") {
+			plugin.settings.authMethod = "oauth";
+			plugin.settings.oauthAuthorization = {
+				clientId: SHARED_YANDEX_OAUTH.clientId,
+				grantId: "saved-old-grant",
+				refreshToken: null,
+				expiresAt: null,
+			};
+		}
+		const transport = globalThis as unknown as {
+			__obsidianRequestUrl: (params: RequestUrlParam) => Promise<unknown>;
+		};
+		const previous = transport.__obsidianRequestUrl;
+		let rejected = 0;
+		transport.__obsidianRequestUrl = async () => {
+			rejected++;
+			return {
+				status: 401,
+				json: { error: "unauthorized" },
+				arrayBuffer: new ArrayBuffer(0),
+				text: "",
+				headers: {},
+			};
+		};
+		try {
+			assert.equal((await plugin.runFullSync())?.success ?? false, false);
+			assert.equal(rejected, 1);
+		} finally {
+			transport.__obsidianRequestUrl = previous;
+		}
+	});
 }
 
 for (const encrypted of [false, true]) {

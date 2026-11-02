@@ -436,7 +436,6 @@ test("authoritative cleanup resumes after restart in its new epoch", async (t) =
 				...saved.device,
 				encryptionTransition: saved.transition,
 				forceRecovery: null,
-				lastSyncStats: {},
 			}),
 		);
 		assert.notEqual(

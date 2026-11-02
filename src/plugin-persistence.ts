@@ -33,12 +33,6 @@ export interface PluginData {
 	pendingWatcherEvents: DeferredWatcherEvent[];
 	encryptionTransition: LocalEncryptionTransition | null;
 	forceRecovery: ForceRecovery | null;
-	lastSyncStats: {
-		uploaded: number;
-		downloaded: number;
-		deleted: number;
-		errors: number;
-	};
 }
 
 interface PersistencePorts {

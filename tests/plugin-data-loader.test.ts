@@ -101,7 +101,6 @@ function currentData<T extends Record<string, unknown>>(
 		pendingWatcherEvents: [],
 		encryptionTransition: currentTransition(),
 		forceRecovery: null,
-		lastSyncStats: {},
 	};
 	return { ...data, ...overrides } as Omit<typeof data, keyof T> & T;
 }
@@ -164,7 +163,6 @@ test("plaintext stable 1.0/1.1 data becomes an unobserved baseline with empty qu
 		pendingWatcherEvents: [],
 		encryptionTransition: null,
 		forceRecovery: null,
-		lastSyncStats: source.lastSyncStats,
 	});
 });
 
@@ -197,8 +195,10 @@ test("current semantic format preserves causal data with explicit profiles", () 
 		lastSyncStats: { uploaded: 1 },
 	});
 	const migrated = loadPluginData(source);
+	const { lastSyncStats: retiredStats, ...activeSource } = source;
+	assert.equal(retiredStats.uploaded, 1);
 	assert.deepEqual(migrated, {
-		...source,
+		...activeSource,
 		localState: { ...source.localState, remoteScope: null },
 	});
 	assert.equal("remoteScope" in source.localState, false);

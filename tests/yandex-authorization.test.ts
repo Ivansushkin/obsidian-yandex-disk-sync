@@ -22,6 +22,7 @@ async function authorization(
 	let revision = 0;
 	const controller = new YandexAuthorization({
 		clientId: "public-test-client",
+		clientSecret: "synthetic-client-secret",
 		vaultName: () => "test vault",
 		deviceId: () => plugin.settings.deviceId,
 		request,
@@ -48,6 +49,7 @@ async function authorization(
 	return {
 		controller,
 		plugin,
+		persistence,
 		revoke: () => {
 			revision++;
 		},
@@ -95,6 +97,240 @@ test("PKCE authorization ignores foreign callbacks and activates one persisted g
 	assert.equal(h.plugin.settings.yandexTokenSecret, "synthetic-access");
 	assert.equal(h.plugin.settings.authMethod, "oauth");
 	assert.equal(h.plugin.settings.manualSyncRequired, false);
+});
+
+test("refresh saves rotated credentials once and preserves the grant", async (t) => {
+	const bodies: URLSearchParams[] = [];
+	const h = await authorization(async (body) => {
+		bodies.push(body);
+		if (body.get("grant_type") === "authorization_code") {
+			return {
+				status: 200,
+				json: {
+					access_token: "initial-access",
+					refresh_token: "initial-refresh",
+					token_type: "bearer",
+					expires_in: 3600,
+				},
+			};
+		}
+		return {
+			status: 200,
+			json: {
+				access_token: "initial-access",
+				refresh_token: "rotated-refresh",
+				token_type: "bearer",
+				expires_in: 7200,
+			},
+		};
+	});
+	afterTest(t, () => h.controller.dispose());
+	const url = new URL(await h.controller.begin());
+	await h.controller.acceptCallback({
+		state: url.searchParams.get("state")!,
+		code: "synthetic-code",
+	});
+	const initial = h.plugin.settings.oauthAuthorization;
+	assert.ok(initial);
+	assert.equal(initial.refreshToken, "initial-refresh");
+	const current = {
+		token: h.plugin.settings.yandexTokenSecret,
+		authorization: initial,
+	};
+	const adopt = (
+		update: Parameters<typeof h.persistence.persistAuthentication>[0],
+		guard: () => void,
+	) => h.persistence.persistAuthentication(update, guard);
+	await Promise.all([
+		h.controller.refresh(current, () => {}, adopt),
+		h.controller.refresh(current, () => {}, adopt),
+	]);
+	assert.equal(bodies.length, 2);
+	assert.equal(bodies[0]?.has("client_secret"), false);
+	assert.equal(bodies[1]?.get("client_secret"), "synthetic-client-secret");
+	assert.equal(bodies[1]?.get("refresh_token"), "initial-refresh");
+	assert.equal(h.plugin.settings.yandexTokenSecret, "initial-access");
+	assert.equal(
+		h.plugin.settings.oauthAuthorization?.refreshToken,
+		"rotated-refresh",
+	);
+	assert.equal(
+		h.plugin.settings.oauthAuthorization?.grantId,
+		initial.grantId,
+	);
+	assert.equal(h.plugin.settings.manualSyncRequired, false);
+});
+
+test("failed refresh and failed credential save retain the prior grant", async (t) => {
+	let refreshRequests = 0;
+	let refreshResponse: OAuthResponse | Error = {
+		status: 400,
+		json: {
+			error: "invalid_grant",
+			error_description: "private-provider-text",
+		},
+	};
+	const h = await authorization(async (body) => {
+		if (body.get("grant_type") === "authorization_code") {
+			return {
+				status: 200,
+				json: {
+					access_token: "initial-access",
+					refresh_token: "initial-refresh",
+					token_type: "bearer",
+					expires_in: 3600,
+				},
+			};
+		}
+		refreshRequests++;
+		if (refreshResponse instanceof Error) {
+			throw refreshResponse;
+		}
+		return refreshResponse;
+	});
+	afterTest(t, () => h.controller.dispose());
+	const url = new URL(await h.controller.begin());
+	await h.controller.acceptCallback({
+		state: url.searchParams.get("state")!,
+		code: "synthetic-code",
+	});
+	const initial = h.plugin.settings.oauthAuthorization;
+	assert.ok(initial);
+	const current = {
+		token: h.plugin.settings.yandexTokenSecret,
+		authorization: initial,
+	};
+	const adopt = (
+		update: Parameters<typeof h.persistence.persistAuthentication>[0],
+		guard: () => void,
+	) => h.persistence.persistAuthentication(update, guard);
+	assert.equal(
+		await h.controller.ensureFresh(current, true, () => {}, adopt),
+		"reauthorize",
+	);
+	assert.equal(
+		await h.controller.ensureFresh(current, true, () => {}, adopt),
+		"reauthorize",
+	);
+	assert.equal(refreshRequests, 1);
+	h.controller.resetRefreshState();
+	for (const refusal of [
+		{ status: 403, json: null },
+		{
+			status: 200,
+			json: {
+				access_token: "limited-access",
+				refresh_token: "limited-refresh",
+				token_type: "bearer",
+				expires_in: 3600,
+				scope: "cloud_api:disk.read",
+			},
+		},
+	]) {
+		refreshResponse = refusal;
+		const before: number = refreshRequests;
+		assert.equal(
+			await h.controller.ensureFresh(current, true, () => {}, adopt),
+			"reauthorize",
+		);
+		assert.equal(
+			await h.controller.ensureFresh(current, true, () => {}, adopt),
+			"reauthorize",
+		);
+		assert.equal(refreshRequests, before + 1);
+		h.controller.resetRefreshState();
+	}
+	refreshResponse = new Error("private-network-details");
+	assert.equal(
+		await h.controller.ensureFresh(current, true, () => {}, adopt),
+		"temporary",
+	);
+	assert.equal(
+		await h.controller.ensureFresh(current, true, () => {}, adopt),
+		"temporary",
+	);
+	assert.equal(refreshRequests, 4);
+	h.controller.resetRefreshState();
+	refreshResponse = {
+		status: 200,
+		json: {
+			access_token: "new-access",
+			refresh_token: "new-refresh",
+			token_type: "bearer",
+			expires_in: 3600,
+		},
+	};
+	h.plugin.saveData = async () => {
+		throw new Error("private-storage-details");
+	};
+	await assert.rejects(h.controller.refresh(current, () => {}, adopt));
+	assert.equal(h.plugin.settings.yandexTokenSecret, "initial-access");
+	assert.equal(
+		h.plugin.settings.oauthAuthorization?.refreshToken,
+		"initial-refresh",
+	);
+});
+
+test("revoked refresh response cannot replace saved credentials", async (t) => {
+	const refreshResponse = deferred<OAuthResponse>();
+	const entered = deferred();
+	const h = await authorization(async (body) => {
+		if (body.get("grant_type") === "refresh_token") {
+			entered.resolve();
+			return refreshResponse.promise;
+		}
+		return {
+			status: 200,
+			json: {
+				access_token: "initial-access",
+				refresh_token: "initial-refresh",
+				token_type: "bearer",
+				expires_in: 3600,
+			},
+		};
+	});
+	afterTest(t, () => h.controller.dispose());
+	const url = new URL(await h.controller.begin());
+	await h.controller.acceptCallback({
+		state: url.searchParams.get("state")!,
+		code: "synthetic-code",
+	});
+	const savedAuthorization = h.plugin.settings.oauthAuthorization;
+	assert.ok(savedAuthorization);
+	let current = true;
+	const refresh = h.controller.refresh(
+		{
+			token: h.plugin.settings.yandexTokenSecret,
+			authorization: savedAuthorization,
+		},
+		() => {
+			if (!current) {
+				throw new AuthorizationError("revoked");
+			}
+		},
+		(update, guard) => h.persistence.persistAuthentication(update, guard),
+	);
+	await entered.promise;
+	current = false;
+	refreshResponse.resolve({
+		status: 200,
+		json: {
+			access_token: "late-access",
+			refresh_token: "late-refresh",
+			token_type: "bearer",
+			expires_in: 3600,
+		},
+	});
+	await assert.rejects(
+		refresh,
+		(error) =>
+			error instanceof AuthorizationError && error.code === "revoked",
+	);
+	assert.equal(h.plugin.settings.yandexTokenSecret, "initial-access");
+	assert.equal(
+		h.plugin.settings.oauthAuthorization?.refreshToken,
+		"initial-refresh",
+	);
 });
 
 test("revoked native exchanges cannot publish or admit another POST before real settlement", async (t) => {

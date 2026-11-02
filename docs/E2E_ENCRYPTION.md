@@ -109,7 +109,11 @@ snapshots обязаны иметь явный `profileId`. Загрузчик �
 - полную current semantic shape, сохраняя baseline и очереди без перестановки;
 - точную plaintext stable 1.0/1.1 форму
   `settings + localIndex + lastSyncStats`, преобразуя `localIndex` в unobserved
-  baseline и создавая пустые очереди.
+  baseline и создавая пустые очереди. Историческое `lastSyncStats` проверяется
+  как часть старой формы, но не переносится в current snapshot.
+
+Current snapshots со старым полем `lastSyncStats` также загружаются; поле
+отбрасывается перед следующей записью. Маркер формата и causal state не меняются.
 
 Unmarked `localState`, historical queues, transition без profile metadata,
 unmarked settings с encryption-полями и любой другой format блокируют plugin

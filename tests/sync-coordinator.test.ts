@@ -7,8 +7,31 @@ import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import type { IndexManager } from "../src/sync/canonical/manager";
 import { logger } from "../src/utils/logger";
+import { deferred } from "./helpers/deferred";
 
 logger.configure({ consoleEnabled: false });
+
+test("pause remains visible after an admitted realtime session settles", async () => {
+	const engine = new SyncEngine(
+		{ interruptReads: () => {} } as unknown as YandexDiskClient,
+		{} as VaultAdapter,
+		{} as IndexManager,
+		DEFAULT_SETTINGS,
+	);
+	const entered = deferred();
+	const release = deferred();
+	const session = engine["enqueueRealtime"](async () => {
+		entered.resolve();
+		await release.promise;
+	});
+	await entered.promise;
+	engine.pause();
+	assert.equal(engine.getState().status, "paused");
+	release.resolve();
+	await session;
+	assert.equal(engine.isSyncPaused(), true);
+	assert.equal(engine.getState().status, "paused");
+});
 
 test("coordinator never overlaps sessions across kinds", async () => {
 	const coordinator = new SyncCoordinator();

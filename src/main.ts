@@ -116,7 +116,6 @@ import {
 import { ConnectEncryptedVaultModal } from "./ui/encryption-modals";
 import { ForceSyncModal } from "./ui/force-sync-modal";
 import { formatForceResult } from "./ui/force-sync-progress";
-import { SyncStatusModal } from "./ui/init-modal";
 import { SyncIndicator } from "./ui/sync-indicator";
 import {
 	getSyncPresentation,
@@ -157,6 +156,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private settingsStatusNotice: SettingsStatusNotice | null = null;
 	private settingsStatusUnsubscribe: (() => void) | null = null;
 	private activeManualFullPromise: Promise<SyncResult | null> | null = null;
+	private activeResumePromise: Promise<boolean> | null = null;
 	private readonly manualActivityListeners = new Set<() => void>();
 	private forceSyncController: ForceSyncController | null = null;
 	private forceRecovery: ForceRecovery | null = null;
@@ -165,6 +165,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private authorization: YandexAuthorization | null = null;
 	private authorizationCandidate: YandexDiskClient | null = null;
 	private authorizationUrl: string | null = null;
+	private refreshRetryTimer: number | null = null;
+	private refreshRetryContext: string | null = null;
+	private refreshBlockActive = false;
+	private refreshRecoveryPending = false;
 	private authorizationScopeGeneration = 0;
 	private configuredAuthorizationScope: string | null = null;
 	private operationIssue?: { code: string; message: string };
@@ -181,6 +185,15 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.publishSettingsToComponents();
 		},
 		publishAuthentication: (authentication, clearEncryptionPassword) => {
+			if (
+				this.settings.oauthAuthorization?.grantId !==
+				authentication.oauthAuthorization?.grantId
+			) {
+				this.clearRefreshRecovery();
+				this.authorization?.resetRefreshState();
+				this.refreshBlockActive = false;
+				this.yandexClient?.clearAuthenticationRejection();
+			}
 			this.settings = { ...this.settings, ...authentication };
 			if (clearEncryptionPassword) {
 				this.settings.encryptionPassword = null;
@@ -211,13 +224,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private forceBlockReason: string | null = null;
 	private legacyExposureRemediationPending = false;
 	private legacyExposedTokenInSession: string | null = null;
-
-	private lastSyncStats = {
-		uploaded: 0,
-		downloaded: 0,
-		deleted: 0,
-		errors: 0,
-	};
 
 	private regularSyncStarted = false;
 	private automationReady = false;
@@ -305,6 +311,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.unloaded = true;
+		if (this.refreshRetryTimer !== null) {
+			window.clearTimeout(this.refreshRetryTimer);
+			this.refreshRetryTimer = null;
+		}
 		this.authorization?.dispose();
 		this.authorizationCandidate?.stopReads();
 		this.mobileRecovery?.dispose();
@@ -593,9 +603,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.fileWatcher.setFullSyncRequestCallback(async () => {
 			await this.runFullSync({ trigger: "automatic" }, false);
 		});
+		this.fileWatcher.setAuthorizationPreflight(() =>
+			this.ensureFreshAuthorization(),
+		);
+		this.fileWatcher.setAuthorizationRecovery(async () =>
+			this.yandexClient.hasAuthenticationRejection()
+				? await this.ensureFreshAuthorization(true)
+				: false,
+		);
 
 		// Create sync scheduler
-		this.syncScheduler = new SyncScheduler(this.syncEngine, this.settings);
+		this.syncScheduler = new SyncScheduler(
+			this.syncEngine,
+			this.settings,
+			() => this.runFullSync({ trigger: "automatic" }, false),
+		);
 
 		// Create backup manager
 		this.backupManager = new BackupManager(
@@ -612,6 +634,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private initializeAuthorization(): void {
 		this.authorization = new YandexAuthorization({
 			clientId: SHARED_YANDEX_OAUTH.clientId,
+			clientSecret: SHARED_YANDEX_OAUTH.clientSecret,
 			vaultName: () => this.app.vault.getName(),
 			deviceId: () => this.settings.deviceId,
 			request: async (body) => {
@@ -765,6 +788,221 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		);
 	}
 
+	/** Bind OAuth renewal to the current plugin lifetime and durable auth snapshot. */
+	private async ensureFreshAuthorization(
+		force = false,
+		allowPausedResume = false,
+	): Promise<boolean> {
+		const authorization = this.settings.oauthAuthorization;
+		if (
+			this.settings.authMethod !== "oauth" ||
+			!authorization?.refreshToken
+		) {
+			return true;
+		}
+		const controller = this.authorization;
+		const rejected =
+			this.yandexClient?.hasAuthenticationRejection() ?? false;
+		if (!controller) {
+			return false;
+		}
+		if (!controller.needsRefresh(authorization, force || rejected)) {
+			return true;
+		}
+		if (
+			this.syncEngine.hasPendingWork() ||
+			this.yandexClient.getNativeRequestActivity().writes > 0
+		) {
+			return false;
+		}
+		const token = this.settings.yandexTokenSecret;
+		const expectedRefresh = authorization.refreshToken;
+		const connection = this.connectionGeneration;
+		const scope = this.authorizationScopeGeneration;
+		const pauseLifetime = allowPausedResume
+			? this.syncEngine.createReadLifetimeGuard()
+			: null;
+		const assertCurrent = () => {
+			if (
+				this.unloaded ||
+				this.isAuthorizationPending() ||
+				this.configurationUpdatePending ||
+				(allowPausedResume
+					? !this.syncEngine.isSyncPaused()
+					: this.syncEngine.isSyncPaused()) ||
+				this.connectionGeneration !== connection ||
+				this.authorizationScopeGeneration !== scope ||
+				this.settings.authMethod !== "oauth" ||
+				this.settings.yandexTokenSecret !== token ||
+				this.settings.oauthAuthorization?.grantId !==
+					authorization.grantId ||
+				this.settings.oauthAuthorization.refreshToken !==
+					expectedRefresh
+			) {
+				throw new AuthorizationError("revoked");
+			}
+			try {
+				pauseLifetime?.();
+			} catch {
+				throw new AuthorizationError("revoked");
+			}
+		};
+		const decision = await controller.ensureFresh(
+			{ token, authorization },
+			force || rejected,
+			assertCurrent,
+			(update, guard) =>
+				this.persistence.persistAuthentication(update, guard),
+		);
+		if (decision === "fresh" || decision === "refreshed") {
+			if (this.refreshRetryTimer !== null) {
+				window.clearTimeout(this.refreshRetryTimer);
+				this.refreshRetryTimer = null;
+				this.refreshRetryContext = null;
+			}
+			if (decision === "refreshed") {
+				this.yandexClient.clearAuthenticationRejection();
+				if (rejected) {
+					this.invalidateRemoteStateClassification();
+				}
+				if (this.refreshBlockActive || rejected) {
+					this.refreshBlockActive = false;
+					this.setAuthenticationBlock(null);
+				}
+				if (this.refreshRecoveryPending) {
+					this.scheduleRefreshRetry();
+				}
+			}
+			return true;
+		}
+		if (decision === "reauthorize") {
+			this.clearRefreshRecovery();
+			this.refreshBlockActive = true;
+			this.setAuthenticationBlock(t("notice.token_invalid"));
+		} else if (decision === "temporary") {
+			this.refreshRecoveryPending = true;
+			this.refreshBlockActive = true;
+			this.setAuthenticationBlock(t("failure.reason.network"));
+			this.scheduleRefreshRetry();
+		}
+		return false;
+	}
+
+	private clearRefreshRecovery(): void {
+		this.refreshRecoveryPending = false;
+		if (this.refreshRetryTimer !== null) {
+			window.clearTimeout(this.refreshRetryTimer);
+			this.refreshRetryTimer = null;
+		}
+		this.refreshRetryContext = null;
+	}
+
+	/** Retry a temporary OAuth failure through the normal full admission. */
+	private scheduleRefreshRetry(): void {
+		if (
+			!this.refreshRecoveryPending ||
+			this.unloaded ||
+			this.persistence.failed ||
+			this.settings.manualSyncRequired ||
+			this.syncEngine.isSyncPaused()
+		) {
+			this.clearRefreshRecovery();
+			return;
+		}
+		const connection = this.connectionGeneration;
+		const scope = this.authorizationScopeGeneration;
+		const grant = this.settings.oauthAuthorization?.grantId;
+		const context = JSON.stringify([connection, scope, grant]);
+		if (this.refreshRetryTimer !== null) {
+			if (this.refreshRetryContext === context) {
+				return;
+			}
+			window.clearTimeout(this.refreshRetryTimer);
+		}
+		this.refreshRetryContext = context;
+		this.refreshRetryTimer = window.setTimeout(() => {
+			if (this.refreshRetryContext !== context) {
+				return;
+			}
+			this.refreshRetryTimer = null;
+			this.refreshRetryContext = null;
+			if (!this.refreshRecoveryPending) {
+				return;
+			}
+			if (
+				this.unloaded ||
+				this.persistence.failed ||
+				this.syncEngine.isSyncPaused() ||
+				this.settings.manualSyncRequired ||
+				this.settings.authMethod !== "oauth" ||
+				this.settings.oauthAuthorization?.grantId !== grant ||
+				this.connectionGeneration !== connection ||
+				this.authorizationScopeGeneration !== scope
+			) {
+				this.clearRefreshRecovery();
+				return;
+			}
+			if (
+				this.mobileRecovery &&
+				this.app.workspace.containerEl.ownerDocument.visibilityState !==
+					"visible"
+			) {
+				this.scheduleRefreshRetry();
+				return;
+			}
+			if (
+				this.isAuthorizationPending() ||
+				this.isConfigurationBusy() ||
+				this.yandexClient.getNativeRequestActivity().writes > 0
+			) {
+				this.scheduleRefreshRetry();
+				return;
+			}
+			void this.runFullSync(
+				{ trigger: "automatic" },
+				false,
+				false,
+				undefined,
+				Boolean(this.mobileRecovery),
+			).then(
+				(result) => {
+					if (
+						!this.refreshRecoveryPending ||
+						this.refreshBlockActive
+					) {
+						return;
+					}
+					if (result?.success) {
+						this.clearRefreshRecovery();
+					} else if (this.mobileRecovery) {
+						if (
+							mobileRecoveryOutcome(
+								result,
+								this.lastFullFailure,
+							) === "retryable"
+						) {
+							this.mobileRecovery.request("schedule");
+						}
+						this.clearRefreshRecovery();
+					} else if (
+						mobileRecoveryOutcome(result, this.lastFullFailure) ===
+							"retryable" ||
+						(result === null && this.isConfigurationBusy())
+					) {
+						this.scheduleRefreshRetry();
+					} else {
+						this.clearRefreshRecovery();
+					}
+				},
+				() => {
+					if (this.refreshRecoveryPending) {
+						this.scheduleRefreshRetry();
+					}
+				},
+			);
+		}, 30_000);
+	}
+
 	getAuthorizationState(): AuthorizationState {
 		return this.authorization?.getState() ?? { phase: "idle" };
 	}
@@ -900,15 +1138,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				native: this.yandexClient.getNativeRequestActivity(),
 			}),
 			run: async () => {
-				const result = await this.getStartup().runInvocation(
-					(invocation) =>
-						this.runFullSync(
-							{ trigger: "automatic" },
-							false,
-							false,
-							invocation,
-							true,
-						),
+				const result = await this.runFullSync(
+					{ trigger: "automatic" },
+					false,
+					false,
+					undefined,
+					true,
 				);
 				return mobileRecoveryOutcome(result, this.lastFullFailure);
 			},
@@ -993,6 +1228,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							await this.runFullSync();
 						}
 					},
+					toggleSync: async () => await this.toggleSync(),
 					readLogs: async () =>
 						sanitizeDiagnosticMessage(
 							await logger.getLogContents(),
@@ -1013,11 +1249,19 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Read the same live activity sources for both status surfaces. */
 	private getSyncIndicatorContext(): SyncIndicatorContext {
+		const sync = this.syncEngine.getState();
+		const fullSyncInProgress = this.isFullSyncInProgress();
 		return {
-			sync: this.syncEngine.getState(),
+			sync,
 			force: this.forceSyncController?.getState() ?? null,
 			foreground: this.getForegroundOperation(),
-			fullSyncInProgress: this.isFullSyncInProgress(),
+			fullSyncInProgress,
+			paused: this.syncEngine.isSyncPaused(),
+			pauseEnabled:
+				!this.isPauseUnavailable() &&
+				(fullSyncInProgress ||
+					(sync.status === "syncing" &&
+						sync.sessionKind === "realtime")),
 			connection: this.getConnectionActivity(),
 			syncUnavailable:
 				this.isConfigurationBusy() ||
@@ -1089,41 +1333,33 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			command: this.addCommand({
 				id: "toggle-sync",
 				name: t("command.toggle_sync"),
-				callback: async () => {
-					if (this.syncEngine.isSyncPaused()) {
-						await this.resumeSyncIfReady();
-					} else {
-						this.syncEngine.pause();
-						this.fileWatcher.stop();
-						this.syncScheduler.stop();
-					}
-				},
+				callback: async () => await this.toggleSync(),
 			}),
 		});
+	}
 
-		// Show status
-		this.localizedCommands.push({
-			key: "command.show_status",
-			command: this.addCommand({
-				id: "show-status",
-				name: t("command.show_status"),
-				callback: () => {
-					const state = this.syncEngine.getState();
-					const errorMessage =
-						this.operationIssue?.message ??
-						(state.failure
-							? formatOperationFailure(state.failure)
-							: state.errorMessage);
-					new SyncStatusModal(this.app, {
-						lastSyncTime: state.lastSyncTime,
-						errorMessage: errorMessage
-							? sanitizeDiagnosticMessage(errorMessage)
-							: undefined,
-						...this.lastSyncStats,
-					}).open();
-				},
-			}),
-		});
+	/** Use one pause transition for the command and the shared indicator. */
+	private async toggleSync(): Promise<void> {
+		if (this.syncEngine.isSyncPaused()) {
+			await this.resumeSyncIfReady();
+		} else if (!this.isPauseUnavailable()) {
+			this.syncEngine.pause();
+			this.clearRefreshRecovery();
+			this.stopRegularSync();
+		}
+	}
+
+	/** Keep pause out of workflows that do not use the regular sync guards. */
+	private isPauseUnavailable(): boolean {
+		return Boolean(
+			this.unloaded ||
+			this.persistence.failed ||
+			!this.settings.yandexTokenSecret.trim() ||
+			this.isAuthorizationPending() ||
+			this.isForceSyncBusy() ||
+			this.foregroundOperation ||
+			this.configurationUpdatePending,
+		);
 	}
 
 	/** Resume automation only after a fresh startup-state classification. */
@@ -1131,9 +1367,38 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		invocation?: StartupInvocation,
 	): Promise<boolean> {
 		if (!invocation) {
-			return await this.getStartup().runInvocation((owned) =>
-				this.resumeSyncIfReady(owned),
-			);
+			if (this.activeResumePromise) {
+				return await this.activeResumePromise;
+			}
+			const run = async (): Promise<boolean> => {
+				for (let attempt = 0; attempt < 2; attempt++) {
+					if (
+						!(await this.ensureFreshAuthorization(
+							attempt > 0,
+							true,
+						))
+					) {
+						return false;
+					}
+					const resumed = await this.getStartup().runInvocation(
+						(owned) => this.resumeSyncIfReady(owned),
+					);
+					if (resumed) {
+						return true;
+					}
+					if (!this.yandexClient?.hasAuthenticationRejection()) {
+						return false;
+					}
+				}
+				return false;
+			};
+			const promise = run().finally(() => {
+				if (this.activeResumePromise === promise) {
+					this.activeResumePromise = null;
+				}
+			});
+			this.activeResumePromise = promise;
+			return await promise;
 		}
 		if (
 			this.isAuthorizationPending() ||
@@ -1146,6 +1411,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.beginConnectionCheck();
 		this.activeFullRuns = (this.activeFullRuns ?? 0) + 1;
 		this.notifyManualActivity();
+		let resumed = false;
+		let ready = false;
 		try {
 			if (
 				(await this.refreshRemoteStartupState(
@@ -1160,6 +1427,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				return false;
 			}
 			this.syncEngine.resume();
+			resumed = true;
 			const result = await this.runFullSync(
 				undefined,
 				false,
@@ -1175,8 +1443,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 			this.automationReady = true;
 			this.startAutomationIfReady();
+			ready = true;
 			return true;
 		} finally {
+			if (
+				resumed &&
+				!ready &&
+				!this.unloaded &&
+				!this.syncEngine.isSyncPaused()
+			) {
+				this.syncEngine.pause();
+			}
 			this.activeFullRuns--;
 			this.notifyManualActivity();
 			this.startAutomationIfReady();
@@ -1186,7 +1463,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/**
 	 * Callback when layout is ready
 	 */
-	private async onLayoutReady(invocation?: StartupInvocation): Promise<void> {
+	private async onLayoutReady(
+		invocation?: StartupInvocation,
+		refreshRetry = false,
+	): Promise<void> {
 		if (this.mobileRecovery && !this.mobileRecovery.canStartAutomatic()) {
 			this.mobileRecovery.request("schedule");
 			return;
@@ -1195,9 +1475,29 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			logger.info("Startup layout ready", {
 				elapsedSincePluginLoadMs: Date.now() - this.pluginLoadStartedAt,
 			});
-			return await this.getStartup().runInvocation((owned) =>
+			if (
+				this.unloaded ||
+				this.isConfigurationBusy() ||
+				this.settings.manualSyncRequired
+			) {
+				return;
+			}
+			if (!(await this.ensureFreshAuthorization())) {
+				return;
+			}
+			await this.getStartup().runInvocation((owned) =>
 				this.onLayoutReady(owned),
 			);
+			if (
+				!refreshRetry &&
+				this.yandexClient?.hasAuthenticationRejection() &&
+				this.settings.authMethod === "oauth" &&
+				Boolean(this.settings.oauthAuthorization?.refreshToken) &&
+				(await this.ensureFreshAuthorization(true))
+			) {
+				await this.onLayoutReady(undefined, true);
+			}
+			return;
 		}
 		if (
 			this.unloaded ||
@@ -1301,9 +1601,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			data?.pendingPhysicalActions,
 		);
 		this.fileWatcher.loadDeferredEvents(data?.pendingWatcherEvents);
-		if (data?.lastSyncStats) {
-			this.lastSyncStats = data.lastSyncStats;
-		}
 		this.localStateRestored = true;
 	}
 
@@ -1368,6 +1665,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		allowRecovery = true,
 		invocation?: StartupInvocation,
 	): Promise<StartupState> {
+		if (!invocation && !(await this.ensureFreshAuthorization())) {
+			return "blocked";
+		}
 		return await this.getStartup().refresh(
 			prompt,
 			allowRecovery,
@@ -1450,20 +1750,56 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		forceFinalization = false,
 		invocation?: StartupInvocation,
 		mobileRecovery = false,
+		refreshRetry = false,
 	): Promise<SyncResult | null> {
 		if (this.isAuthorizationPending()) {
 			return null;
 		}
 		if (!invocation) {
-			return await this.getStartup().runInvocation((owned) =>
+			if (this.activeFullPromise) {
+				return await this.activeFullPromise;
+			}
+			const trigger =
+				options?.trigger ?? (options?.startup ? "automatic" : "manual");
+			if (
+				trigger === "automatic" &&
+				!mobileRecovery &&
+				this.mobileRecovery &&
+				!this.mobileRecovery.canStartAutomatic()
+			) {
+				this.mobileRecovery.request("schedule");
+				return null;
+			}
+			if (!(await this.ensureFreshAuthorization())) {
+				return null;
+			}
+			const result = await this.getStartup().runInvocation((owned) =>
 				this.runFullSync(
 					options,
 					showProgressNotice,
 					forceFinalization,
 					owned,
 					mobileRecovery,
+					refreshRetry,
 				),
 			);
+			if (
+				!refreshRetry &&
+				this.yandexClient?.hasAuthenticationRejection() &&
+				this.settings.authMethod === "oauth" &&
+				Boolean(this.settings.oauthAuthorization?.refreshToken) &&
+				(await this.ensureFreshAuthorization(true))
+			) {
+				return await this.runFullSync(
+					options,
+					showProgressNotice,
+					forceFinalization,
+					undefined,
+					mobileRecovery,
+					true,
+				);
+			}
+			return result;
 		}
 		const trigger =
 			options?.trigger ?? (options?.startup ? "automatic" : "manual");
@@ -1539,8 +1875,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.forceRecovery?.direct ? undefined : invocation.reads,
 				);
 
-				this.updateLastSyncStats(result);
-
 				// Save updated index after sync
 				if (
 					result.success &&
@@ -1573,6 +1907,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				if (result.success) {
 					fullSucceeded = ownFullAdmitted;
 					this.automationReady = true;
+					this.clearRefreshRecovery();
 					this.clearOperationIssue();
 				}
 				return result;
@@ -1790,6 +2125,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		migration: boolean;
 		replacement?: NonNullable<SyncRunOptions["forceReplacement"]>;
 	} | null> {
+		if (!(await this.ensureFreshAuthorization())) {
+			return null;
+		}
 		if (!this.settings.yandexTokenSecret) {
 			throw new Error(t("notice.token_missing"));
 		}
@@ -1957,8 +2295,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					}
 					return result;
 				},
-				persist: async (result) => {
-					this.updateLastSyncStats(result);
+				persist: async () => {
 					await this.persistPluginData();
 				},
 				replacementCommitted: () => {
@@ -2229,9 +2566,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			setLanguagePreference(this.settings.language);
 			if (loaded.source === "empty") {
 				this.settings.manualSyncRequired = true;
-			}
-			if (data?.lastSyncStats) {
-				this.lastSyncStats = data.lastSyncStats;
 			}
 			this.encryptionTransition = data?.encryptionTransition ?? null;
 			this.forceRecovery = data?.forceRecovery ?? null;
@@ -2527,11 +2861,21 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.foregroundOperation = kind;
 		this.notifyManualActivity();
 		try {
+			if (!(await this.ensureFreshAuthorization())) {
+				throw new AuthorizationError("unavailable");
+			}
 			if (!(await this.ensureStorageBinding(true))) {
 				throw new StorageScopeError(t("storage.blocked"));
 			}
 			return await operation();
 		} catch (error) {
+			if (
+				this.yandexClient.hasAuthenticationRejection() &&
+				this.settings.authMethod === "oauth" &&
+				this.settings.oauthAuthorization?.refreshToken
+			) {
+				await this.ensureFreshAuthorization(true);
+			}
 			this.presentOperationIssue(
 				kind,
 				formatOperationFailure(
@@ -2638,6 +2982,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.mobileRecovery?.notifyActivityChanged();
 		if (remoteConfigurationChanged) {
 			this.encryptionWorkflow?.admission.resetAutomaticPasswordRequests();
+			this.refreshBlockActive = false;
 			this.setAuthenticationBlock(null);
 			this.connectionGeneration++;
 			if (this.epochRecoveryTimer !== null) {
@@ -3126,19 +3471,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				[],
 			encryptionTransition: this.encryptionTransition,
 			forceRecovery: this.forceRecovery,
-			lastSyncStats: this.lastSyncStats,
 		};
 		return data;
-	}
-
-	/** Update the UI summary from one completed synchronization result. */
-	private updateLastSyncStats(result: SyncResult): void {
-		this.lastSyncStats = {
-			uploaded: result.uploaded,
-			downloaded: result.downloaded,
-			deleted: result.deleted,
-			errors: result.errors.length,
-		};
 	}
 
 	/** Route every internal and user save through the same coherent queue. */

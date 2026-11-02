@@ -28,12 +28,6 @@ export interface Stable1xPluginData {
 		| "maxConcurrency"
 	>;
 	localIndex: Stable1xIndex | null;
-	lastSyncStats: {
-		uploaded: number;
-		downloaded: number;
-		deleted: number;
-		errors: number;
-	};
 }
 
 const INDEX_KEYS = ["version", "lastSyncTime", "deviceId", "files"] as const;
@@ -141,7 +135,6 @@ export function parseStable1xPluginData(value: unknown): Stable1xPluginData {
 	return {
 		settings: { ...value.settings },
 		localIndex,
-		lastSyncStats: { ...value.lastSyncStats },
 	};
 }
 
@@ -175,9 +168,7 @@ function isStable1xSettings(
 	);
 }
 
-function isStable1xStats(
-	value: unknown,
-): value is Stable1xPluginData["lastSyncStats"] {
+function isStable1xStats(value: unknown): boolean {
 	return (
 		isRecord(value) &&
 		hasExactKeys(value, STATS_KEYS) &&
