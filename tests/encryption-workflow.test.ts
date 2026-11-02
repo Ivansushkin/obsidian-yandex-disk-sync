@@ -1127,10 +1127,14 @@ test("startup invocation shares authenticated service bytes and expires before d
 					disk.beforeRequest = observeReads;
 				}
 				// Exercise the actual scheduler timer, whose admission goes directly through engine full.
-				const scheduler = new SyncScheduler(a.engine, {
-					...a.settings,
-					syncInterval: 0.001,
-				});
+				const scheduler = new SyncScheduler(
+					a.engine,
+					{
+						...a.settings,
+						syncInterval: 0.001,
+					},
+					() => a.engine.fullSync({ trigger: "automatic" }),
+				);
 				const full = a.engine.fullSync.bind(a.engine);
 				const tick = deferred<boolean>();
 				a.engine.fullSync = async (...args) => {

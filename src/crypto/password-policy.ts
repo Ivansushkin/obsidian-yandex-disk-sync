@@ -2,6 +2,14 @@ import { t } from "../i18n";
 
 export const NEW_ENCRYPTION_PASSWORD_LIMITS = { min: 4, max: 30 } as const;
 
+/** Distinguish a rejected password from other connection failures. */
+export class InvalidEncryptionPasswordError extends Error {
+	constructor() {
+		super(t("notice.encryption_wrong_password"));
+		this.name = "InvalidEncryptionPasswordError";
+	}
+}
+
 /** Validate new credentials only; existing passwords retain their exact bytes. */
 export function getNewEncryptionPasswordError(password: string): string | null {
 	const { min, max } = NEW_ENCRYPTION_PASSWORD_LIMITS;

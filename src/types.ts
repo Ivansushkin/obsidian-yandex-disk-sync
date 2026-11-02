@@ -1,4 +1,5 @@
 import type { LanguagePreference } from "./i18n";
+import type { OAuthAuthorization } from "./auth/authentication-state";
 import type { FailureSummary, OperationFailure, RetryProgress } from "./errors";
 /**
  * Types and interfaces for Yandex Disk synchronization plugin
@@ -16,6 +17,9 @@ export interface YandexDiskSyncSettings {
 	language: LanguagePreference;
 	/** OAuth token stored only in local plugin data */
 	yandexTokenSecret: string;
+	/** Credential provenance; legacy tokens remain explicitly manual. */
+	authMethod: "manual" | "oauth";
+	oauthAuthorization: OAuthAuthorization | null;
 	/** Require an explicit full sync before automation can use this connection. */
 	manualSyncRequired: boolean;
 	/** Client ID for Yandex OAuth application */
@@ -61,6 +65,8 @@ export interface YandexDiskSyncSettings {
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	language: "system",
 	yandexTokenSecret: "",
+	authMethod: "oauth",
+	oauthAuthorization: null,
 	manualSyncRequired: false,
 	clientId: "",
 	remotePath: "obsidian-sync",

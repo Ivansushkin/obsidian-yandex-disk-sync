@@ -205,7 +205,9 @@ test("mobile admission preserves hidden edits and a fresh full converges two dev
 		assert.equal((await a.canonical()).files["Phone.md"], undefined);
 		b.vault.put("Other.md", bytes("other device"));
 		await b.full();
-		const scheduler = new SyncScheduler(a.engine, a.settings);
+		const scheduler = new SyncScheduler(a.engine, a.settings, () =>
+			a.engine.fullSync({ trigger: "automatic" }),
+		);
 		scheduler.setAutomaticAdmission(() => allowed);
 		await scheduler["runScheduledSync"]();
 		assert.equal(a.vault.files.has("Other.md"), false);
@@ -263,7 +265,9 @@ test("mobile host waits for a real old full then uses a new invocation and saves
 			indexManager: a.index,
 			syncEngine: a.engine,
 			fileWatcher: a.watcher,
-			syncScheduler: new SyncScheduler(a.engine, a.settings),
+			syncScheduler: new SyncScheduler(a.engine, a.settings, () =>
+				a.engine.fullSync({ trigger: "automatic" }),
+			),
 			localStateRestored: true,
 			syncLifecycleRegistered: true,
 			automationReady: true,

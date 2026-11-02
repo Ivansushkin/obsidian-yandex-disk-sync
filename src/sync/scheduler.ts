@@ -4,6 +4,7 @@
 
 import type { SyncEngine } from "./engine";
 import type { YandexDiskSyncSettings } from "../types";
+import type { SyncResult } from "../types";
 import { logger } from "../utils/logger";
 
 export class SyncScheduler {
@@ -16,7 +17,11 @@ export class SyncScheduler {
 	private canStartAutomatic: () => boolean = () => true;
 	private deferred: () => void = () => {};
 
-	constructor(syncEngine: SyncEngine, settings: YandexDiskSyncSettings) {
+	constructor(
+		syncEngine: SyncEngine,
+		settings: YandexDiskSyncSettings,
+		private readonly runFullSync: () => Promise<SyncResult | null>,
+	) {
 		this.syncEngine = syncEngine;
 		this.settings = settings;
 	}
@@ -118,13 +123,11 @@ export class SyncScheduler {
 		logger.info("Starting scheduled synchronization...");
 
 		try {
-			const result = await this.syncEngine.fullSync({
-				trigger: "automatic",
-			});
+			const result = await this.runFullSync();
 
-			if (result.success) {
+			if (result?.success) {
 				logger.info("Scheduled synchronization completed successfully");
-			} else {
+			} else if (result) {
 				logger.warn(
 					`Scheduled synchronization completed with errors: ${result.errors.length}`,
 				);

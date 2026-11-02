@@ -15,9 +15,9 @@
 | [Force](FORCE_SYNC.md)                              | Полная замена назначения, direct-v1 recovery и ограничения конкурентности.          |
 | [Шифрование](E2E_ENCRYPTION.md)                     | Wire formats, manifest, local-reference replacement, legacy checkpoints и recovery. |
 | [Резервное копирование](BACKUP.md)                  | ZIP/envelope, archive choice, passwords и exact verification.                       |
+| [Авторизация](AUTHORIZATION.md)                     | Общий вход, optional manual setup, сохранение подключения и внешний provider gate.  |
 | [Ручные проверки](SMOKE_TESTS.md)                   | Два профиля Obsidian, реальный Диск, desktop/mobile и release gates.                |
-| [Release evidence](release-evidence/2.1.0.json)     | Машиночитаемый статус фактически выполненной ручной приёмки.                        |
-| [Changelog](../CHANGELOG.md)                        | Изменения 2.1.0 и история stable 2.0.0/1.1.0.                                       |
+| [Changelog](../CHANGELOG.md)                        | Изменения 2.2.0 и история stable 2.1.0/2.0.0/1.1.0.                                 |
 
 Каталог задаёт поведение, архитектура — границы реализации, тематические документы —
 детали своих областей. При изменении алгоритма обновляйте сценарии и документ
@@ -70,16 +70,16 @@ latency реального Диска или mobile heap. Результаты �
 
 `auto:` и `manual:` в каталоге обозначают способ проверки, а не её результат.
 Перед выпуском нужен [реальный прогон](SMOKE_TESTS.md) на двух независимых профилях,
-в plaintext/encrypted и на требуемых платформах. `release-evidence/2.1.0.json`
-остаётся `PENDING`, пока нет фактического evidence для всех P0/P1 и проверенного SHA.
-Автоматические tests не переводят его в `PASS`.
+в plaintext/encrypted и на требуемых платформах. Зафиксируйте результаты и ревизию
+проверенной сборки; автоматические tests не заменяют ручной прогон.
 
-`npm run validate:release` проверяет metadata, bundle assets, каталог и evidence;
-это gate выпуска, а не замена build или runtime smoke. Его статический parser
-ограничен ID вида `PREFIX-123`, numeric `TC-xx` и некоторыми шаблонами test names:
-составные `FORCE-DIRECT-*`, named smoke cases,
-вычисляемые имена и annotations нужно сверять с owning tests/docs. Несовместимость
-parser не оправдывает изменение корректных сценариев или понижение требований.
+`npm run validate:release` проверяет metadata, bundle assets и каталог;
+это gate выпуска, а не замена build или runtime smoke. Валидатор сверяет все строки каталога, включая составные ID, named smoke cases,
+диапазоны покрытия и статически определимые двухрежимные названия тестов.
+Произвольные вычисляемые имена и неструктурированные annotations требуют
+явной проверки по owning tests/docs; неизвестные ссылки не считаются evidence.
+`known-limitation; diagnostic:` фиксирует негарантируемое поведение и существующий
+диагностический script, но не считается успешным тестом.
 
 `npm run test:force-fencing` — отдельная диагностика поздних чужих запросов с более
 сильными preservation expectations. Она не входит в default suite и не подтверждает

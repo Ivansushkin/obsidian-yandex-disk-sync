@@ -1,3 +1,4 @@
+import { normalizeAuthentication } from "./auth/authentication-state";
 import {
 	validateEncryptionReplacement,
 	isReplacementPath,
@@ -112,11 +113,17 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 				localState: { ...data.localState, remoteScope: null },
 			};
 		}
-		assertExactKeys(data, CURRENT_PLUGIN_DATA_KEYS, "current plugin data");
+		const expectedKeys = new Set(CURRENT_PLUGIN_DATA_KEYS);
+		if (!("lastSyncStats" in data)) {
+			expectedKeys.delete("lastSyncStats");
+		}
+		assertExactKeys(data, expectedKeys, "current plugin data");
 		assertCurrentEncryptionState(data);
+		const current = { ...data };
+		delete current.lastSyncStats;
 		return {
 			source: "current",
-			data: data as T & { format: typeof PLUGIN_DATA_FORMAT },
+			data: current as T & { format: typeof PLUGIN_DATA_FORMAT },
 		};
 	}
 	if (data.format !== undefined || "schemaVersion" in data) {
@@ -139,7 +146,6 @@ export function loadPluginDataWithSource<T extends PersistedPluginData>(
 		pendingWatcherEvents: [],
 		encryptionTransition: null,
 		forceRecovery: null,
-		lastSyncStats: stable.lastSyncStats,
 	} as T & { format: typeof PLUGIN_DATA_FORMAT };
 	return {
 		source: "stable-1x",
@@ -181,6 +187,13 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 	if (!settings || typeof settings !== "object") {
 		throw new UnsupportedHistoricalDataError(
 			"Current settings are missing",
+		);
+	}
+	try {
+		normalizeAuthentication(settings);
+	} catch {
+		throw new UnsupportedHistoricalDataError(
+			"Current authorization state is invalid",
 		);
 	}
 	if (

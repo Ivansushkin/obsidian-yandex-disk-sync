@@ -72,6 +72,8 @@ export class FileWatcher {
 	private deferredEvents: WatcherQueueEvent[] = [];
 	private persistCallback: (() => void | Promise<void>) | null = null;
 	private fullSyncRequestCallback: (() => void | Promise<void>) | null = null;
+	private authorizationPreflight: (() => Promise<boolean>) | null = null;
+	private authorizationRecovery: (() => Promise<boolean>) | null = null;
 	private epochReplacementObserved = false;
 	private epochFullSyncRequest: Promise<void> | null = null;
 	private persistPromise: Promise<void> | null = null;
@@ -178,6 +180,15 @@ export class FileWatcher {
 	/** Request one coalesced full reconciliation after realtime sees a new epoch. */
 	setFullSyncRequestCallback(callback: () => void | Promise<void>): void {
 		this.fullSyncRequestCallback = callback;
+	}
+
+	/** Defer durable replay until the current access token is usable. */
+	setAuthorizationPreflight(callback: () => Promise<boolean>): void {
+		this.authorizationPreflight = callback;
+	}
+
+	setAuthorizationRecovery(callback: () => Promise<boolean>): void {
+		this.authorizationRecovery = callback;
 	}
 
 	/**
@@ -1178,6 +1189,12 @@ export class FileWatcher {
 	): Promise<void> {
 		await this.waitForPersistence();
 		if (
+			this.authorizationPreflight &&
+			!(await this.authorizationPreflight())
+		) {
+			return;
+		}
+		if (
 			this.epochReplacementObserved ||
 			this.syncEngine.isInitialRemoteReceivePending?.()
 		) {
@@ -1379,6 +1396,13 @@ export class FileWatcher {
 		}
 		await flushFileBatch();
 		this.persistDeferredEvents();
+		if (
+			replayResult.retry.length > 0 &&
+			this.authorizationRecovery &&
+			(await this.authorizationRecovery())
+		) {
+			this.scheduleDeferredReplay();
+		}
 		if (this.syncEngine.consumeEpochReplacementRequest?.()) {
 			this.epochReplacementObserved = true;
 			this.requestEpochFullSync();

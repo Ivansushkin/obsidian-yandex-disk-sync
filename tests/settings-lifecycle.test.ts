@@ -2,73 +2,105 @@ import assert from "node:assert/strict";
 import { getActiveLanguage, setLanguagePreference } from "../src/i18n";
 import type { UserSettingsPatch } from "../src/settings-workflow";
 import type { PluginData } from "../src/plugin-persistence";
-import test, { type TestContext } from "node:test";
+import test from "node:test";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
 import { deferred } from "./helpers/deferred";
 import { afterTest } from "./helpers/test-context";
 import { encryptionFlow, startupFlow } from "./helpers/encryption-flow";
 import { transition } from "./helpers/encryption-scenarios";
-import { SyncScheduler } from "../src/sync/scheduler";
 
-/** Combine real settings publication and sync algorithms over synthetic storage. */
-async function settingsHost(
-	t: TestContext,
-	encrypted = false,
-	remote?: MemoryDisk,
-) {
-	const disk = remote ?? new MemoryDisk();
-	const a = device(disk, "settings-device", null);
-	if (!remote) {
-		a.vault.put("note.md", bytes("unchanged"));
-		await a.full();
-	}
-	const flow = encryptionFlow(a);
-	if (encrypted) {
-		await transition(a, flow, "enable", "synthetic-password");
-	}
-	const { plugin, persistence } = persistenceHarness();
-	await plugin.loadSettings();
-	plugin.settings = {
-		...a.settings,
-		yandexTokenSecret: remote ? "" : "synthetic",
-	};
-	const scheduler = new SyncScheduler(a.engine, plugin.settings);
+import { settingsHost } from "./helpers/settings-host";
+
+test("toggle command restarts watcher and scheduler after a paused full sync", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	let toggle: (() => Promise<void>) | undefined;
 	Object.assign(plugin, {
-		app: { ...plugin.app, workspace: { layoutReady: true } },
-		yandexClient: a.client,
-		vaultAdapter: a.adapter,
-		indexManager: a.index,
-		syncEngine: a.engine,
-		fileWatcher: a.watcher,
-		syncScheduler: scheduler,
-		encryptionWorkflow: flow.workflow,
-		storageBinding: {
-			ensure: async () => {
-				await a.index.assertRemoteScope();
-				return true;
-			},
+		addCommand: (command: {
+			id: string;
+			callback?: () => Promise<void>;
+		}) => {
+			if (command.id === "toggle-sync") {
+				toggle = command.callback;
+			}
+			return command;
 		},
-		configuredToken: remote ? "" : "synthetic",
-		configuredRemotePath: "vault",
-		localStateRestored: true,
-		syncLifecycleRegistered: true,
-		automationReady: !remote,
-		regularSyncStarted: !remote,
 	});
-	plugin["remoteStateValidated"] = !remote;
-	if (!remote) {
-		a.watcher.start();
-		scheduler.start();
+	plugin["registerCommands"]();
+	assert.ok(toggle);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+
+	await toggle();
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+
+	await toggle();
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
+
+test("intentional pause during full remains paused until resume", async (t) => {
+	const { plugin, a, disk, scheduler } = await settingsHost(t);
+	const entered = deferred();
+	const release = deferred();
+	let held = false;
+	disk.beforeRequest = async () => {
+		if (!held) {
+			held = true;
+			entered.resolve();
+			await release.promise;
+		}
+	};
+	const full = plugin.runFullSync();
+	await entered.promise;
+	try {
+		assert.equal(plugin.isFullSyncInProgress(), true);
+		assert.equal(plugin["getSyncIndicatorContext"]().pauseEnabled, true);
+		await plugin["toggleSync"]();
+		assert.equal(a.engine.isSyncPaused(), true);
+		assert.equal(a.watcher["isEnabled"], false);
+		assert.equal(scheduler["isRunning"], false);
+	} finally {
+		release.resolve();
 	}
-	afterTest(t, async () => {
-		disk.beforeRequest = undefined;
-		scheduler.stop();
-		await a.stop();
+	await full;
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(plugin["getSyncIndicatorContext"]().paused, true);
+	assert.equal(plugin["getSyncIndicatorContext"]().pauseEnabled, false);
+	disk.beforeRequest = undefined;
+	await plugin["toggleSync"]();
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(plugin["getSyncIndicatorContext"]().pauseEnabled, false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
+
+test("failed resume keeps synchronization paused for a later retry", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	plugin["syncEngine"].pause();
+	plugin["stopRegularSync"]();
+	Object.assign(plugin, {
+		runFullSync: async () => ({ success: false }),
 	});
-	const update = plugin.applySettingsPatch.bind(plugin);
-	return { plugin, persistence, a, disk, scheduler, update, flow };
-}
+	assert.equal(await plugin["resumeSyncIfReady"](), false);
+	assert.equal(a.engine.isSyncPaused(), true);
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+});
+
+test("pause command does not interrupt an active Force replacement", async (t) => {
+	const { plugin, a, scheduler } = await settingsHost(t);
+	Object.assign(plugin, {
+		forceSyncController: { isBusy: () => true },
+	});
+	await plugin["toggleSync"]();
+	assert.equal(a.engine.isSyncPaused(), false);
+	assert.equal(a.watcher["isEnabled"], true);
+	assert.equal(scheduler["isRunning"], true);
+});
 
 test(
 	"host activity opens a rotated password after full settlement and revokes an open prompt on save failure",
@@ -205,7 +237,7 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 			prompts++;
 			assert.equal(plugin.isConfigurationBusy(), true);
 			await assert.rejects(update({ yandexTokenSecret: "second-token" }));
-			return outcome === "cancel"
+			return outcome === "cancel" || (outcome === "wrong" && prompts > 1)
 				? null
 				: outcome === "wrong"
 					? "wrong"
@@ -280,7 +312,10 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 		} finally {
 			Object.assign(globalThis, { window: oldWindow });
 		}
-		assert.equal(prompts, outcome === "plaintext" ? 0 : 1);
+		assert.equal(
+			prompts,
+			outcome === "plaintext" ? 0 : outcome === "wrong" ? 2 : 1,
+		);
 		const connected =
 			outcome === "connect" ||
 			outcome === "path" ||
@@ -337,7 +372,7 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 				await update({ maxConcurrency: 7 });
 				await update({ excludePatterns: ["ignored/**"] });
 				await update({ yandexTokenSecret: "new-token" });
-				assert.equal(prompts, 1);
+				assert.equal(prompts, outcome === "wrong" ? 2 : 1);
 				assert.deepEqual(disk.files, remote);
 				flow.context.ui.requestPassword = async () => {
 					prompts++;
@@ -350,7 +385,7 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 				} finally {
 					Object.assign(globalThis, { window: oldWindow });
 				}
-				assert.equal(prompts, 2);
+				assert.equal(prompts, outcome === "wrong" ? 3 : 2);
 				await a.assertSettled({
 					"remote.md": "remote content",
 					"offline.md": "offline addition",

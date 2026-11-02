@@ -23,6 +23,8 @@ jobs:
       - run: npm test
       - run: npm run lint
       - run: npm run build
+        env:
+          YANDEX_OAUTH_CLIENT_SECRET: ${{ secrets.YANDEX_OAUTH_CLIENT_SECRET_2_2_0 }}
       - run: npm run check:bundle
       - run: git diff --check
       - run: git diff --exit-code

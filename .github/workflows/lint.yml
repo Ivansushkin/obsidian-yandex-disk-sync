@@ -27,5 +27,7 @@ jobs:
       - run: npm run lint
       - run: npm run format:check
       - run: npm run build
+        env:
+          YANDEX_OAUTH_CLIENT_SECRET: synthetic-ci-build-secret
       - run: npm run check:bundle
       - run: git diff --check

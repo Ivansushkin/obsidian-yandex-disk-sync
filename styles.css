@@ -27,10 +27,7 @@
 	color: var(--text-error);
 }
 
-.yandex-sync-indicator.sync-paused {
-	color: var(--text-faint);
-}
-
+.yandex-sync-indicator.sync-paused,
 .yandex-sync-indicator.sync-offline {
 	color: var(--text-faint);
 }
@@ -81,7 +78,8 @@
 	pointer-events: auto;
 }
 
-.yandex-sync-indicator[data-placement="top"][open] {
+.yandex-sync-indicator[data-placement="top"][open],
+.yandex-sync-indicator[data-placement="bottom"][open] {
 	width: var(--yandex-sync-indicator-width, min(360px, calc(100vw - 24px)));
 }
 
@@ -93,10 +91,6 @@
 		--yandex-sync-indicator-bottom,
 		calc(var(--status-bar-height, 24px) + 8px)
 	);
-}
-
-.yandex-sync-indicator[data-placement="bottom"][open] {
-	width: var(--yandex-sync-indicator-width, min(360px, calc(100vw - 24px)));
 }
 
 .yandex-sync-indicator[data-placement="bottom"] .yandex-sync-indicator-summary {
@@ -127,7 +121,7 @@
 }
 
 .yandex-sync-indicator[open] .yandex-sync-indicator-summary {
-	max-width: calc(100% - 146px);
+	max-width: calc(100% - 190px);
 }
 
 .yandex-sync-indicator-actions {
@@ -263,12 +257,6 @@
 	color: var(--text-muted);
 }
 
-.sync-status-error-details {
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-	user-select: text;
-}
-
 .yandex-sync-indicator.sync-migration-required {
 	color: var(--text-warning);
 }
@@ -295,33 +283,20 @@
 	pointer-events: none;
 }
 
-@media (prefers-reduced-motion: reduce) {
-	.yandex-sync-indicator-loader svg {
-		animation: none;
-	}
-}
-
-/* Status modal */
-.sync-status-stats {
-	background: var(--background-secondary);
-	padding: 12px;
-	border-radius: 4px;
-	margin-bottom: 16px;
-}
-
-.sync-status-stats p {
-	margin: 8px 0;
-}
-
-/* OAuth buttons in settings - vertical layout for better responsiveness */
-.setting-item:has(button) .setting-item-control {
+/* Keep button controls within this plugin's settings layout. */
+:where(.force-settings-controls)
+	.setting-item:has(button)
+	.setting-item-control {
 	display: flex;
 	flex-direction: column;
 	gap: 8px;
 	align-items: stretch;
 }
 
-.setting-item:has(button) .setting-item-control button {
+:where(.force-settings-controls)
+	.setting-item:has(button)
+	.setting-item-control
+	button {
 	width: 100%;
 	flex-shrink: 0;
 }
@@ -343,6 +318,27 @@
 .connection-block .setting-item-control {
 	flex: 0 0 22ch;
 	min-width: 0;
+	margin-inline-start: auto;
+}
+
+.connection-block .sync-auth-controls {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 8px;
+}
+
+.connection-block .authorization-pending-hidden {
+	display: none;
+}
+
+.sync-auth-controls button {
+	height: auto;
+	min-height: var(--input-height);
+	white-space: normal;
+}
+
+.sync-auth-controls a {
+	overflow-wrap: anywhere;
 }
 
 .is-phone .connection-block .setting-item-control {
@@ -418,7 +414,8 @@
 }
 
 /* Backup list modal */
-.backup-list-loading {
+.backup-list-loading,
+.backup-list-empty {
 	text-align: center;
 	color: var(--text-muted);
 	padding: 16px;
@@ -431,13 +428,6 @@
 	background: var(--background-secondary);
 	border-radius: 4px;
 	margin-bottom: 12px;
-}
-
-.backup-list-empty {
-	text-align: center;
-	color: var(--text-muted);
-	padding: 16px;
-	font-style: italic;
 }
 
 .backup-list-table {
@@ -538,7 +528,7 @@
 	border: 2px solid var(--text-muted);
 	border-top-color: transparent;
 	border-radius: 50%;
-	animation: encryption-spin 0.8s linear infinite;
+	animation: yandex-sync-spin 0.8s linear infinite;
 }
 
 .force-sync-body > .force-sync-warning:not(:empty) {
@@ -680,6 +670,34 @@
 	display: none;
 }
 
+/* Keep sign-out confirmation compact and balanced at desktop and mobile widths. */
+.logout-confirm-modal .modal-content > h2 {
+	margin: 0 0 12px;
+}
+
+.logout-confirm-modal .modal-content > p {
+	margin: 0;
+	line-height: 1.45;
+}
+
+.logout-confirm-modal .sync-modal-actions.setting-item {
+	width: 100%;
+	max-width: none;
+	margin: 20px 0 0;
+	padding: 0;
+	border: 0;
+}
+
+.logout-confirm-modal .sync-modal-actions.setting-item .setting-item-control {
+	flex-direction: row;
+	gap: 8px;
+}
+
+.logout-confirm-modal .sync-modal-actions button {
+	flex: 1 1 0;
+	width: auto;
+}
+
 /* Encryption password modal */
 .encryption-password-input {
 	width: 100%;
@@ -706,10 +724,6 @@
 	font-weight: 600;
 }
 
-.encryption-toggle-hidden {
-	display: none;
-}
-
 .encryption-toggle-spinner {
 	display: inline-block;
 	width: 1em;
@@ -717,13 +731,7 @@
 	border: 2px solid var(--interactive-accent);
 	border-top-color: transparent;
 	border-radius: 50%;
-	animation: encryption-spin 0.6s linear infinite;
-}
-
-@keyframes encryption-spin {
-	to {
-		transform: rotate(360deg);
-	}
+	animation: yandex-sync-spin 0.6s linear infinite;
 }
 
 .force-settings-controls {
@@ -733,7 +741,6 @@
 	min-width: 0;
 }
 
-.force-sync-button-active::before,
 .sync-button-active::before {
 	content: "";
 	display: inline-block;
@@ -745,7 +752,7 @@
 	border-radius: 50%;
 	flex-shrink: 0;
 	vertical-align: middle;
-	animation: encryption-spin 0.8s linear infinite;
+	animation: yandex-sync-spin 0.8s linear infinite;
 }
 
 .connection-sync-button {
@@ -762,21 +769,14 @@
 	margin: auto;
 }
 
-@media (prefers-reduced-motion: reduce) {
-	.force-sync-button-active::before,
-	.sync-button-active::before,
-	.force-sync-checking-spinner {
-		animation: none;
-	}
-}
-
 .encryption-toggle-spinner[hidden] {
 	display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
+	.yandex-sync-indicator-loader svg,
 	.sync-button-active::before,
-	.force-sync-button-active::before,
+	.force-sync-checking-spinner,
 	.encryption-toggle-spinner {
 		animation: none;
 	}

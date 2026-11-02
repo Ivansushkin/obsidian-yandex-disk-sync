@@ -109,7 +109,11 @@ snapshots обязаны иметь явный `profileId`. Загрузчик �
 - полную current semantic shape, сохраняя baseline и очереди без перестановки;
 - точную plaintext stable 1.0/1.1 форму
   `settings + localIndex + lastSyncStats`, преобразуя `localIndex` в unobserved
-  baseline и создавая пустые очереди.
+  baseline и создавая пустые очереди. Историческое `lastSyncStats` проверяется
+  как часть старой формы, но не переносится в current snapshot.
+
+Current snapshots со старым полем `lastSyncStats` также загружаются; поле
+отбрасывается перед следующей записью. Маркер формата и causal state не меняются.
 
 Unmarked `localState`, historical queues, transition без profile metadata,
 unmarked settings с encryption-полями и любой другой format блокируют plugin
@@ -301,9 +305,11 @@ configuration/generation/lifetime guards. Поздний verifier не восс�
 `allowRecovery: false` проверяет verifier, canonical и fresh authority до install.
 После освобождения foreground owner запускается один full; automation возвращается
 только после reconciliation и persistence. Каждый target автоматически запрашивается
-один раз за экземпляр plugin, включая учёт startup/manual prompts. Cancel/wrong
-сохраняет block; manual Sync повторяет ввод, новый target или restart разрешает
-новую автоматическую попытку. Token/path change и unload сбрасывают request;
+один раз за экземпляр plugin, включая учёт startup/manual prompts. Неверный
+пароль повторно открывает окно ввода в той же попытке без сохранения candidate;
+Cancel сохраняет block, manual Sync повторяет ввод, новый target или restart
+разрешает новую автоматическую попытку. Другие ошибки подключения завершают
+попытку без повторного окна. Token/path change и unload сбрасывают request;
 pause/config ABA/persistence failure запрещают поздние install и resume.
 
 Token/path save устанавливает `manualSyncRequired`: до успешного manual full нет
@@ -329,8 +335,7 @@ manual `TC-ROTATED-PASSWORD-01`.
 Нормативные сценарии находятся в
 [`SYNC_USER_SCENARIOS.md`](./SYNC_USER_SCENARIOS.md), ручной multi-device
 прогон — в [`SMOKE_TESTS.md`](./SMOKE_TESTS.md). Stable запрещён без реального
-двухпрофильного прогона, mobile PERF-006/PBKDF2 evidence и полного P0/P1
-evidence файла `release-evidence/2.0.0.json`.
+двухпрофильного прогона, проверки mobile PERF-006/PBKDF2 и P0/P1 сценариев.
 
 ## Архивы и завершение другим устройством
 

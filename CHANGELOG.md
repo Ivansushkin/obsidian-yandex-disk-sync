@@ -1,5 +1,62 @@
 # Changelog
 
+## 2.2.0
+
+Changes since `2.1.0`.
+
+### Added
+
+- Shared Yandex sign-in uses an authorization code with PKCE S256 and a public
+  Client ID. The flow uses an Obsidian callback on desktop, Android and iOS;
+  real provider and device acceptance still requires manual verification. Each
+  attempt has an isolated state, verifier and timeout.
+- A local **Sign out** action for shared and manual connections removes saved
+  credentials and the encryption password, then clears the active codec. It
+  preserves the remote folder, synchronization history, offline work, encryption
+  parameters and files. Encrypted vaults request the password after sign-in.
+  Sign-out requires confirmation and is unavailable during unfinished encryption
+  or Force recovery; it does not revoke access on Yandex's side.
+- The expanded sync indicator has a pause/resume button alongside sync and log
+  actions. Pause stops automatic work; resume runs a full sync before automation
+  continues.
+
+### Changed
+
+- Existing manual connections remain available after updating. Starting shared
+  sign-in explicitly clears their Client ID and token before opening the browser;
+  cancellation does not restore them.
+- For an existing connection, a new token is accepted only after the selected
+  remote root matches its saved identity. Credential changes use the existing
+  persistence queue and wait for active synchronization and native writes to
+  settle. The first successful full sync after sign-in enables automatic
+  synchronization.
+- Connection settings separate the remote folder, authorization controls and
+  synchronization action. The shared sign-in state is shown next to its controls,
+  the sync button is hidden during sign-in, and the manual token input does not
+  display a shared OAuth token. Controls adapt to narrow settings panels.
+- After sign-out, status prompts for sign-in or a manual token. Sync, Force,
+  backup and encryption actions stay unavailable until access is configured.
+- In manual connection settings, **Sign in** starts normal synchronization after a
+  token is entered. **Sign out** appears after the first successful full sync.
+- Shared OAuth access is refreshed before it expires. After an HTTP 401, regular
+  sync can refresh the token and retry through its normal queue. Temporary
+  refresh failures retain pending work; a rejected grant requires sign-in again.
+  Backup and Force still require an explicit retry after an error.
+- Sync status and errors are shown in the shared indicator. The separate
+  **Show sync status** command and dialog have been removed.
+- Production builds require `YANDEX_OAUTH_CLIENT_SECRET` for token refresh. The
+  secret is embedded in the bundle and does not protect users' tokens.
+- Release validation no longer requires machine-readable scenario evidence files.
+  Manual acceptance with two Obsidian profiles against real Yandex Disk remains
+  required before release.
+
+### Fixed
+
+- An incorrect encryption password reopens the password dialog in the same
+  connection attempt. Cancel closes it; other connection errors do not reopen it.
+- An encryption password left in local data without a connection is cleared on
+  load, and later snapshots cannot restore credentials after sign-out.
+
 ## 2.1.0
 
 Changes since `2.0.0`.

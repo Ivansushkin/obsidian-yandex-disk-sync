@@ -13,6 +13,40 @@ export const translations: Record<Language, Record<string, string>> = {
 	be,
 	uz,
 	en: {
+		"settings.auth_method": "Sign-in method",
+		"settings.auth_oauth": "Sign in with Yandex",
+		"settings.auth_manual": "Manual token (advanced)",
+		"settings.auth_description":
+			"Sign in to Yandex to synchronize your folder.",
+		"settings.auth_unavailable":
+			"Yandex sign-in is not configured for this build yet. You can connect using a manual token.",
+		"settings.auth_sign_in": "Sign in",
+		"settings.auth_logout": "Sign out",
+		"modal.logout_title": "Sign out?",
+		"modal.logout_description":
+			"Saved access tokens and the encryption password (if present) will be removed from this device. To sync again, you will need to sign in and enter the password if needed. Files and sync history will stay. The app's access in Yandex will not be revoked.",
+		"settings.auth_cancel": "Cancel sign-in",
+		"settings.auth_open_browser": "Open the sign-in page",
+		"settings.auth_waiting":
+			"Allow access in your browser, then return to Obsidian.",
+		"settings.auth_waiting_idle":
+			"Waiting for the current operation to finish…",
+		"settings.auth_working": "Connecting to Yandex…",
+		"settings.auth_connected": "Yandex access is saved.",
+		"settings.auth_failed":
+			"Sign-in could not finish. Check your connection and start sign-in again.",
+		"settings.auth_root_mismatch":
+			"This sign-in does not match the previously connected Disk folder. Your sync history is preserved. Check the Yandex account and folder.",
+		"settings.auth_root_unavailable":
+			"The Disk folder could not be verified. Check the connection and folder access.",
+		"settings.auth_storage_failed":
+			"The connection could not be saved. Restore local storage access and try signing in again.",
+		"settings.auth_sync_failed":
+			"Yandex access is saved, but synchronization has not finished. Resolve the reported issue and click Synchronize.",
+		"settings.auth_denied":
+			"Access was not granted. Sign in again or enter a manual token.",
+		"settings.auth_expired":
+			"This sign-in attempt expired. Start sign-in again.",
 		"status.mobile.waiting_native":
 			"Waiting for a sent network request to finish. Its result is not yet known; synchronization will continue after it finishes.",
 		"status.mobile.recovery_backoff":
@@ -32,7 +66,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.language_desc":
 			"Follow Obsidian’s language or choose a language for this plugin. Changes apply immediately.",
 		"settings.language_system": "System default",
-		"modal.status_last_sync": "Last synchronization: {time}",
 		"units.byte": "B",
 		"units.kilobyte": "KB",
 		"units.megabyte": "MB",
@@ -160,6 +193,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.actions.logs_empty": "No log entries to copy",
 		"status.actions.copy_failed": "Could not copy logs to clipboard",
 		"status.actions.sync_failed": "Could not start synchronization",
+		"status.actions.pause_sync": "Pause synchronization",
+		"status.actions.resume_sync": "Resume synchronization",
+		"status.actions.toggle_failed":
+			"Could not change synchronization state",
 		"failure.stage.upload-verification": "upload result verification",
 		"failure.stage.preflight": "preflight",
 		"failure.stage.confirming": "confirmation",
@@ -222,6 +259,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Synchronization is stopped. Check the remote folder and confirm its connection with manual synchronization. Pending operations must remain in their original storage.",
 		"notice.configuration_busy":
 			"The operation cannot start while synchronization, backup, or recovery work is pending.",
+		"notice.logout_recovery_pending":
+			"Finish encryption or Force recovery before signing out.",
 		"notice.force_busy": "Force synchronization is already in progress.",
 		"notice.force_phase_preflight": "Checking before synchronization…",
 		"notice.force_phase_confirming":
@@ -233,7 +272,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Saving synchronization state…",
 		"notice.force_phase_reconciling": "Final synchronization check",
 		"notice.force_migration_completed":
-			"Upgrade to 2.1.0 completed. Synchronization finished.",
+			"Upgrade to 2.2.0 completed. Synchronization finished.",
 		"notice.force_backup_failed":
 			"Backup could not be verified. Force synchronization was not started.",
 		"notice.force_finalization_pending":
@@ -245,7 +284,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Commands
 		"command.sync_now": "Sync with Yandex Disk now",
 		"command.toggle_sync": "Pause/Resume synchronization",
-		"command.show_status": "Show synchronization status",
 
 		// Status bar
 		"status.syncing": "Syncing...",
@@ -368,7 +406,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.backup_completed": "Backup created: {name}",
 
 		// Modal titles
-		"modal.status_title": "Synchronization status",
 
 		// Modal descriptions
 		"modal.operation_backup_title": "Backup before encryption change",
@@ -381,17 +418,13 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_legacy_devices_desc":
 			"Confirm that Obsidian with plugin 1.1 is disabled on every other device before Force migration.",
 		"modal.close_button": "Close",
-		"modal.status_no_sync": "Synchronization has not been performed yet",
-		"modal.status_uploaded": "Uploaded: {count}",
-		"modal.status_downloaded": "Downloaded: {count}",
-		"modal.status_deleted": "Deleted: {count}",
-		"modal.status_errors": "Errors: {count}",
 
 		// Settings
 		"settings.connection_section": "Connection",
 		"settings.oauth_instruction_1":
 			"1. Choose a folder on Yandex Disk for synchronization",
 		"status.manual_sync_required": "Click Synchronize to connect",
+		"status.authorization_required": "Sign in or enter a token to connect",
 		"settings.oauth_instruction_2": "2. Click 'Manage clients'",
 		"settings.oauth_instruction_3":
 			"3. Create and open a new Yandex OAuth app. Grant read and write access to Disk and access to the app folder on Disk",
@@ -596,6 +629,39 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Force sync completed! ({successful} operations)",
 	},
 	ru: {
+		"settings.auth_method": "Способ авторизации",
+		"settings.auth_oauth": "Войти через Яндекс",
+		"settings.auth_manual": "Войти через свое приложение и токен",
+		"settings.auth_description":
+			"Войдите в Яндекс, чтобы синхронизировать папку.",
+		"settings.auth_unavailable":
+			"Вход через Яндекс ещё не настроен для этой сборки. Можно подключиться с помощью ручного токена.",
+		"settings.auth_sign_in": "Войти",
+		"settings.auth_logout": "Выйти",
+		"modal.logout_title": "Выйти?",
+		"modal.logout_description":
+			"Сохранённые на этом устройстве токены доступа и пароль шифрования (если есть) будут удалены. Чтобы снова синхронизировать файлы, потребуется войти и при необходимости ввести пароль. Файлы и история синхронизации сохранятся. Доступ приложения на стороне Яндекса не отзывается.",
+		"settings.auth_cancel": "Отменить вход",
+		"settings.auth_open_browser": "Открыть страницу входа",
+		"settings.auth_waiting":
+			"Разрешите доступ в браузере, затем вернитесь в Obsidian.",
+		"settings.auth_waiting_idle": "Ожидаем завершения текущей операции…",
+		"settings.auth_working": "Подключение к Яндексу…",
+		"settings.auth_connected": "Авторизация выполнена",
+		"settings.auth_failed":
+			"Не удалось завершить вход. Проверьте соединение и начните вход заново.",
+		"settings.auth_root_mismatch":
+			"Этот вход не совпадает с ранее подключённой папкой на Диске. История синхронизации сохранена. Проверьте аккаунт Яндекса и папку.",
+		"settings.auth_root_unavailable":
+			"Не удалось проверить папку на Диске. Проверьте соединение и доступ к папке.",
+		"settings.auth_storage_failed":
+			"Не удалось сохранить подключение. Восстановите доступ к локальному хранилищу и повторите вход.",
+		"settings.auth_sync_failed":
+			"Доступ к Яндексу сохранён, но синхронизация не завершена. Устраните указанную ошибку и нажмите «Синхронизировать».",
+		"settings.auth_denied":
+			"Доступ не предоставлен. Повторите вход или укажите ручной токен.",
+		"settings.auth_expired":
+			"Время ожидания входа истекло. Начните вход заново.",
 		"status.mobile.waiting_native":
 			"Ожидаем завершения отправленного сетевого запроса. Его результат пока неизвестен; синхронизация продолжится после его завершения.",
 		"status.mobile.recovery_backoff":
@@ -615,7 +681,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.language_desc":
 			"Следовать языку Obsidian или выбрать язык плагина. Изменение применяется сразу.",
 		"settings.language_system": "Системный",
-		"modal.status_last_sync": "Последняя синхронизация: {time}",
 		"units.byte": "Б",
 		"units.kilobyte": "КБ",
 		"units.megabyte": "МБ",
@@ -744,6 +809,10 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.actions.copy_failed":
 			"Не удалось скопировать логи в буфер обмена",
 		"status.actions.sync_failed": "Не удалось запустить синхронизацию",
+		"status.actions.pause_sync": "Приостановить синхронизацию",
+		"status.actions.resume_sync": "Продолжить синхронизацию",
+		"status.actions.toggle_failed":
+			"Не удалось изменить состояние синхронизации",
 		"failure.stage.upload-verification": "проверка результата загрузки",
 		"failure.stage.preflight": "предварительная проверка",
 		"failure.stage.confirming": "подтверждение",
@@ -807,6 +876,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Синхронизация остановлена. Проверьте удалённую папку и подтвердите подключение ручной синхронизацией. Ожидающие операции должны оставаться в исходном хранилище.",
 		"notice.configuration_busy":
 			"Операция недоступна, пока не завершены синхронизация, архивирование или восстановление.",
+		"notice.logout_recovery_pending":
+			"Завершите восстановление шифрования или Force перед выходом.",
 		"notice.force_busy": "Принудительная синхронизация уже выполняется.",
 		"notice.force_phase_preflight": "Проверка перед синхронизацией…",
 		"notice.force_phase_confirming":
@@ -818,7 +889,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
 		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
 		"notice.force_migration_completed":
-			"Переход на 2.1.0 завершён. Синхронизация выполнена.",
+			"Переход на 2.2.0 завершён. Синхронизация выполнена.",
 		"notice.force_backup_failed":
 			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
 		"notice.force_finalization_pending":
@@ -830,7 +901,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		// Commands
 		"command.sync_now": "Синхронизировать с Яндекс Диском сейчас",
 		"command.toggle_sync": "Приостановить/возобновить синхронизацию",
-		"command.show_status": "Показать статус синхронизации",
 
 		// Status bar
 		"status.syncing": "Синхронизация...",
@@ -955,7 +1025,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.backup_completed": "Бекап создан: {name}",
 
 		// Modal titles
-		"modal.status_title": "Статус синхронизации",
 
 		// Modal descriptions
 		"modal.operation_backup_title": "Архив перед изменением шифрования",
@@ -968,11 +1037,6 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_legacy_devices_desc":
 			"Подтвердите, что Obsidian с плагином 1.1 отключён на всех остальных устройствах до Force-миграции.",
 		"modal.close_button": "Закрыть",
-		"modal.status_no_sync": "Синхронизация ещё не выполнялась",
-		"modal.status_uploaded": "Загружено: {count}",
-		"modal.status_downloaded": "Скачано: {count}",
-		"modal.status_deleted": "Удалено: {count}",
-		"modal.status_errors": "Ошибок: {count}",
 
 		// Settings
 		"settings.connection_section": "Подключение",
@@ -980,6 +1044,8 @@ export const translations: Record<Language, Record<string, string>> = {
 			"1. Выберите папку на Яндекс Диске для синхронизации",
 		"status.manual_sync_required":
 			"Нажмите «Синхронизировать» для подключения",
+		"status.authorization_required":
+			"Войдите или укажите токен для подключения",
 		"settings.oauth_instruction_2": "2. Нажмите 'Управление клиентами'",
 		"settings.oauth_instruction_3":
 			"3. Создайте и откройте новое приложение Яндекс OAuth. Выдайте ему права на чтение и редактирование Диска, а также «Доступ к папке приложения на Диске»",

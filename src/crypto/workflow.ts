@@ -20,7 +20,10 @@ import {
 } from "./encryption-transition";
 import { EncryptionMaintenance } from "./maintenance";
 import { EncryptionRecovery } from "./recovery";
-import { getNewEncryptionPasswordError } from "./password-policy";
+import {
+	getNewEncryptionPasswordError,
+	InvalidEncryptionPasswordError,
+} from "./password-policy";
 
 /** Bound a credential connection to its original operation and recovery permission. */
 export interface EncryptionConnectionOptions {
@@ -672,10 +675,16 @@ export class EncryptionWorkflow {
 			if (await service.verifyVerifier(manifest.verifier)) {
 				return;
 			}
-		} catch {
-			throw new Error(t("notice.encryption_wrong_password"));
+		} catch (error) {
+			if (
+				error instanceof DOMException &&
+				error.name === "OperationError"
+			) {
+				throw new InvalidEncryptionPasswordError();
+			}
+			throw error;
 		}
-		throw new Error(t("notice.encryption_wrong_password"));
+		throw new InvalidEncryptionPasswordError();
 	}
 
 	/**

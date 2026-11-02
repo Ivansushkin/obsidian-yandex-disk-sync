@@ -5,13 +5,11 @@ import { parse } from "dotenv";
 
 export const LOCAL_ENV_FILE = ".env";
 
-/**
- * Read the local test-vault destination without inheriting shell variables.
- */
-export function readLocalPluginPath(rootDir = process.cwd()) {
+/** Parse only the local build configuration, without exposing its contents. */
+function readLocalEnvironment(rootDir) {
 	const envPath = path.join(rootDir, LOCAL_ENV_FILE);
 	if (!existsSync(envPath)) {
-		return null;
+		return {};
 	}
 
 	let localEnvironment;
@@ -39,7 +37,22 @@ export function readLocalPluginPath(rootDir = process.cwd()) {
 		throw new Error(`Cannot parse ${envPath}`, { cause: error });
 	}
 
-	const configuredPath = localEnvironment.YANDEX_PLUGIN_PATH?.trim();
+	return localEnvironment;
+}
+
+/** Read the build-time OAuth credential without logging its value. */
+export function readLocalOAuthSecret(rootDir = process.cwd()) {
+	return (
+		process.env.YANDEX_OAUTH_CLIENT_SECRET?.trim() ||
+		readLocalEnvironment(rootDir).YANDEX_OAUTH_CLIENT_SECRET?.trim() ||
+		""
+	);
+}
+
+/** Read the local test-vault destination without inheriting shell variables. */
+export function readLocalPluginPath(rootDir = process.cwd()) {
+	const configuredPath =
+		readLocalEnvironment(rootDir).YANDEX_PLUGIN_PATH?.trim();
 	if (!configuredPath) {
 		return null;
 	}

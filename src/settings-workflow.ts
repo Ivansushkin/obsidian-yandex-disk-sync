@@ -4,6 +4,143 @@ import type { SyncResult } from "./types";
 import type { SyncEngine } from "./sync/engine";
 import type { FileWatcher } from "./sync/realtime/watcher";
 import type { YandexDiskSyncSettings } from "./types";
+import type { RemoteStorageScope } from "./types";
+import type { AuthenticationChange } from "./auth/authentication-state";
+import {
+	AuthorizationError,
+	type AuthorizationAttempt,
+} from "./auth/yandex-authorization";
+import { sameRemoteStorageScope } from "./sync/local/storage-scope";
+
+interface AuthenticationWorkflowPorts {
+	getSettings(): YandexDiskSyncSettings;
+	getExpectedScope(): RemoteStorageScope | null;
+	hasHistory(): boolean;
+	hasSensitiveRecovery(): boolean;
+	isBusy(): boolean;
+	isUnloaded(): boolean;
+	nativeWrites(): number;
+	subscribeActivity(listener: () => void): () => void;
+	setUpdating(value: boolean): void;
+	waitForWatcherPersistence(): Promise<void>;
+	readCandidateRoot(
+		token: string,
+		path: string,
+	): Promise<RemoteStorageScope | null>;
+	persist(
+		update: AuthenticationChange,
+		assertCurrent: () => void,
+	): Promise<void>;
+}
+
+/** Serialize credential changes; logout preserves local history and needs no remote access. */
+export async function applyAuthenticationUpdate(
+	deps: AuthenticationWorkflowPorts,
+	update: AuthenticationChange,
+	attempt: AuthorizationAttempt,
+): Promise<void> {
+	attempt.phase("waiting-idle");
+	for (;;) {
+		await waitForAuthenticationIdle(deps, attempt);
+		attempt.assertCurrent();
+		if (!deps.isBusy() && deps.nativeWrites() === 0) {
+			break;
+		}
+	}
+	deps.setUpdating(true);
+	try {
+		await deps.waitForWatcherPersistence();
+		attempt.assertCurrent();
+		if (deps.isUnloaded()) {
+			throw new AuthorizationError("revoked");
+		}
+		if (update.kind === "logout") {
+			if (
+				!update.preserveEncryptionPassword &&
+				deps.hasSensitiveRecovery()
+			) {
+				throw new Error(t("notice.logout_recovery_pending"));
+			}
+			await deps.persist(update, () => {
+				attempt.assertCurrent();
+			});
+			return;
+		}
+		const path = deps.getSettings().remotePath;
+		const expected = deps.getExpectedScope();
+		if (!expected && deps.hasHistory()) {
+			throw new AuthorizationError("root-unavailable");
+		}
+		attempt.phase("checking-root");
+		let root: RemoteStorageScope | null;
+		try {
+			root = await deps.readCandidateRoot(update.token, path);
+		} catch (error) {
+			throw error instanceof AuthorizationError
+				? error
+				: new AuthorizationError("root-unavailable");
+		}
+		attempt.assertCurrent();
+		if (expected && !root) {
+			throw new AuthorizationError("root-unavailable");
+		}
+		if (expected && !sameRemoteStorageScope(expected, root)) {
+			throw new AuthorizationError("root-mismatch");
+		}
+		let accepted = false;
+		await deps.persist(update, () => {
+			attempt.assertCurrent();
+			if (!accepted) {
+				attempt.accept();
+				accepted = true;
+			}
+		});
+	} finally {
+		deps.setUpdating(false);
+	}
+}
+
+/** Wake on settlement or cancellation; never hold a coordinator session while waiting. */
+function waitForAuthenticationIdle(
+	deps: AuthenticationWorkflowPorts,
+	attempt: AuthorizationAttempt,
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		let unsubscribe = () => {};
+		const check = () => {
+			if (finished) {
+				return;
+			}
+			try {
+				attempt.assertCurrent();
+				if (deps.isUnloaded()) {
+					throw new AuthorizationError("revoked");
+				}
+				if (deps.isBusy() || deps.nativeWrites() > 0) {
+					return;
+				}
+				finished = true;
+				unsubscribe();
+				resolve();
+			} catch (error) {
+				finished = true;
+				unsubscribe();
+				reject(
+					error instanceof Error
+						? error
+						: new AuthorizationError("revoked"),
+				);
+			}
+		};
+		unsubscribe = deps.subscribeActivity(check);
+		if (finished) {
+			unsubscribe();
+		} else {
+			check();
+		}
+	});
+}
 
 const USER_SETTING_KEYS = [
 	"language",
@@ -80,9 +217,12 @@ export function prepareSettingsPatch(
 		"excludePatterns",
 		"syncDotObsidian",
 	];
-	const changesConnection = changed.some(
-		(key) => key === "remotePath" || key === "yandexTokenSecret",
-	);
+	const changesConnection =
+		changed.some(
+			(key) => key === "remotePath" || key === "yandexTokenSecret",
+		) ||
+		(("yandexTokenSecret" in patch || "clientId" in patch) &&
+			current.authMethod === "oauth");
 	const changesFileScope = changed.some(
 		(key) => key !== "remotePath" && scopeKeys.includes(key),
 	);
@@ -90,16 +230,29 @@ export function prepareSettingsPatch(
 		settings: {
 			...current,
 			...patch,
+			...("yandexTokenSecret" in patch || "clientId" in patch
+				? {
+						authMethod: "manual" as const,
+						oauthAuthorization: null,
+						yandexTokenSecret:
+							patch.yandexTokenSecret ??
+							(current.authMethod === "manual"
+								? current.yandexTokenSecret
+								: ""),
+					}
+				: {}),
 			manualSyncRequired: current.manualSyncRequired || changesConnection,
 			syncPatterns: [...(patch.syncPatterns ?? current.syncPatterns)],
 			excludePatterns: [
 				...(patch.excludePatterns ?? current.excludePatterns),
 			],
 		},
-		hasChanges: changed.length > 0,
-		requiresIdle: changed.some(
-			(key) => key !== "enableDebugLogging" && key !== "logToFile",
-		),
+		hasChanges: changed.length > 0 || changesConnection,
+		requiresIdle:
+			changesConnection ||
+			changed.some(
+				(key) => key !== "enableDebugLogging" && key !== "logToFile",
+			),
 		changesConnection,
 		changesFileScope,
 		changesAutomation: changed.some(

@@ -15,7 +15,10 @@ import {
 	type StartupBlocks,
 	type StartupInvocation,
 } from "../../src/plugin-startup";
-import { applyUserSettingsPatch } from "../../src/settings-workflow";
+import {
+	applyUserSettingsPatch,
+	prepareSettingsPatch,
+} from "../../src/settings-workflow";
 import type { SyncIndex, SyncResult } from "../../src/types";
 import {
 	MemoryDisk,
@@ -305,9 +308,13 @@ function admission(current: Device, codec: EncryptionCodec | null) {
 					settingsSaveRejected: unexpected,
 					persistPluginData: async (patch) => {
 						// Fixture has coherent JSON persistence; the actual PluginPersistence queue is covered by the suite.
+						const next = prepareSettingsPatch(
+							current.settings,
+							patch,
+						).settings;
 						await current.saved();
-						Object.assign(current.settings, patch);
-						current.client.setToken("synthetic");
+						Object.assign(current.settings, next);
+						current.client.setToken(next.yandexTokenSecret);
 						startup.validated = false;
 					},
 					reconcile: () => full(true),
@@ -317,8 +324,11 @@ function admission(current: Device, codec: EncryptionCodec | null) {
 				{ yandexTokenSecret: "synthetic" },
 			);
 			assert.equal(startup.validated, false);
+			assert.equal(current.settings.authMethod, "manual");
+			assert.equal(current.settings.manualSyncRequired, true);
 			await full(true);
 			assert.equal(startup.validated, true);
+			current.settings.manualSyncRequired = false;
 		},
 	};
 }

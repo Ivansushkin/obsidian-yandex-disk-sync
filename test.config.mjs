@@ -26,6 +26,9 @@ try {
 		outdir: outputDir,
 		outExtension: { ".js": ".mjs" },
 		logLevel: "silent",
+		define: {
+			YANDEX_OAUTH_CLIENT_SECRET: JSON.stringify("synthetic-test-secret"),
+		},
 		plugins: [obsidianStubPlugin],
 	});
 

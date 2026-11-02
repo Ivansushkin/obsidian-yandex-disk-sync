@@ -76,6 +76,16 @@ type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
 
 export class YandexDiskClient {
 	private token: string;
+	private authenticationRejected = false;
+
+	/** A completed API request rejected the currently configured access token. */
+	hasAuthenticationRejection(): boolean {
+		return this.authenticationRejected;
+	}
+
+	clearAuthenticationRejection(): void {
+		this.authenticationRejected = false;
+	}
 	private retryCallback?: (progress?: RetryProgress) => void;
 
 	/** Report existing backoff without opening a new session or Notice. */
@@ -227,6 +237,7 @@ export class YandexDiskClient {
 	 */
 	setToken(token: string): void {
 		if (this.token !== token) {
+			this.authenticationRejected = false;
 			this.clearFolderCache();
 			this.readConfigurationVersion++;
 			this.interruptReads();
@@ -1795,6 +1806,9 @@ export class YandexDiskClient {
 					return response;
 				}
 
+				if (response.status === 401) {
+					this.authenticationRejected = true;
+				}
 				const errorData = this.readProviderError(response);
 				const failure = new YandexApiError(
 					errorData?.description || `HTTP ${response.status}`,

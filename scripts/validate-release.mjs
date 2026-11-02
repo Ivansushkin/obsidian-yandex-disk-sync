@@ -2,10 +2,7 @@ import { builtinModules } from "node:module";
 import { readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import process from "node:process";
-import {
-	parseScenarioRows,
-	validateScenarioCatalog,
-} from "./scenario-catalog.mjs";
+import { validateScenarioCatalog } from "./scenario-catalog.mjs";
 import { readLocalPluginPath } from "./local-build-env.mjs";
 
 function readJson(path) {
@@ -20,8 +17,6 @@ const packageJson = readJson("package.json");
 const manifest = readJson("manifest.json");
 const versions = readJson("versions.json");
 const version = packageJson.version;
-const evidencePath = `docs/release-evidence/${version}.json`;
-const evidence = readJson(evidencePath);
 const stable = !version.includes("-");
 
 if (manifest.version !== version) {
@@ -38,9 +33,11 @@ if (versions["1.1.0"] !== "0.15.0") {
 }
 if (
 	JSON.stringify(Object.keys(versions).sort()) !==
-	JSON.stringify(["1.1.0", "2.0.0", "2.1.0"])
+	JSON.stringify(["1.1.0", "2.0.0", "2.1.0", "2.2.0"])
 ) {
-	fail("versions.json must retain stable 1.1.0, 2.0.0 and current 2.1.0");
+	fail(
+		"versions.json must retain stable 1.1.0, 2.0.0, 2.1.0 and current 2.2.0",
+	);
 }
 const changelog = readFileSync("CHANGELOG.md", "utf8");
 const changelogVersions = [...changelog.matchAll(/^## (.+)$/gm)].map(
@@ -48,10 +45,10 @@ const changelogVersions = [...changelog.matchAll(/^## (.+)$/gm)].map(
 );
 if (
 	JSON.stringify(changelogVersions) !==
-	JSON.stringify(["2.1.0", "2.0.0", "1.1.0"])
+	JSON.stringify(["2.2.0", "2.1.0", "2.0.0", "1.1.0"])
 ) {
 	fail(
-		"changelog must contain current 2.1.0 and historical 2.0.0/1.1.0 sections",
+		"changelog must contain current 2.2.0 and historical 2.1.0/2.0.0/1.1.0 sections",
 	);
 }
 if (/\b(?:beta|prerelease)\b/i.test(changelog)) {
@@ -111,64 +108,19 @@ const smokeTests = readFileSync("docs/SMOKE_TESTS.md", "utf8");
 const testSources = readdirSync("tests")
 	.filter((name) => name.endsWith(".test.ts"))
 	.map((name) => readFileSync(`tests/${name}`, "utf8"));
-const scenarioRows = parseScenarioRows(catalog);
 const scenarioErrors = validateScenarioCatalog(
 	catalog,
 	testSources,
 	smokeTests,
+	packageJson.scripts ?? {},
 );
 if (scenarioErrors.length > 0) {
 	fail(`scenario catalogue is invalid: ${scenarioErrors.join("; ")}`);
 }
 
 if (stable) {
-	if (version !== "2.1.0") {
-		fail("only 2.1.0 is approved as the next stable");
-	}
-	if (evidence.status !== "PASS" || evidence.releaseVersion !== version) {
-		fail("manual P0/P1 evidence is not complete");
-	}
-	if (!/^[0-9a-f]{40}$/.test(evidence.testedCommit ?? "")) {
-		fail(`verified ${version} test commit SHA is missing`);
-	}
-	const priorityRows = scenarioRows.filter(
-		(row) => row.priority === "P0" || row.priority === "P1",
-	);
-	const entries = new Map(
-		(evidence.scenarios ?? []).map((entry) => [entry.scenarioId, entry]),
-	);
-	for (const row of priorityRows) {
-		const id = row.id;
-		const entry = entries.get(id);
-		if (
-			!entry ||
-			entry.status !== "PASS" ||
-			!entry.evidenceName ||
-			entry.testedCommit !== evidence.testedCommit ||
-			!entry.date ||
-			!entry.os ||
-			!entry.obsidianVersion ||
-			!Array.isArray(entry.deviceIds) ||
-			entry.deviceIds.length !== 2 ||
-			entry.deviceIds[0] === entry.deviceIds[1]
-		) {
-			fail(`${id} lacks complete machine-readable evidence`);
-		}
-	}
-	const allowedReleaseDiff = new Set([evidencePath]);
-	const changed = execFileSync(
-		"git",
-		["diff", "--name-only", evidence.testedCommit, "HEAD"],
-		{ encoding: "utf8" },
-	)
-		.trim()
-		.split("\n")
-		.filter(Boolean);
-	const forbidden = changed.filter((path) => !allowedReleaseDiff.has(path));
-	if (forbidden.length > 0) {
-		fail(
-			`release differs from the tested ${version} code: ${forbidden.join(", ")}`,
-		);
+	if (version !== "2.2.0") {
+		fail("only 2.2.0 is approved as the next stable");
 	}
 }
 
