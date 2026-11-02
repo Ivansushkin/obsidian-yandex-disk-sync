@@ -1079,7 +1079,7 @@ prefers-reduced-motion. Использовать тестовые plaintext/encr
    preflight сверить также с командой «Показать статус»; clipboard feedback остаётся
    отдельным уведомлением.
 
-Покрывает: `UI-022`, `UI-023`, `UI-024`, `UI-025`. Автоматические проверки не заменяют
+Покрывает: `UI-022`, `UI-023`, `UI-024`, `UI-025`, `ENC-001`, `ENC-002`, `ENC-003`. Автоматические проверки не заменяют
 этот прогон в Obsidian и не устанавливают готовность к релизу.
 
 ## TC-ROTATED-PASSWORD-01. Автоматический ввод нового пароля
@@ -1096,7 +1096,7 @@ prefers-reduced-motion. Использовать тестовые plaintext/encr
    Fresh connection до manual Sync, historical/auth/network errors и transitional
    manifest не запускают automatic rotated prompt.
 
-Покрывает: `ENC-016`, `ENC-003`, `ENC-014`.
+Покрывает: `ENC-016`, `ENC-017`, `ENC-003`, `ENC-014`.
 
 ## TC-PASSWORD-LENGTH-01. Длина нового пароля
 
@@ -1135,7 +1135,8 @@ Synthetic passwords в desktop/mobile; enable, rotate и Force create.
    без потери bytes/queues и ложного observed revision. Сравнить реальный elapsed
    time и peak requests при `maxConcurrency` 1, 4 и 20.
 
-Покрывает `UI-022`, `ERROR-001`, `ERROR-005`, `ERROR-007`, `SYNC-042`.
+Покрывает `UI-022`, `ERROR-001`, `ERROR-005`, `ERROR-007`, `SYNC-042`,
+`NET-018`, `NET-019`.
 Synthetic histories не заменяют этот прогон и не подтверждают мобильную готовность.
 
 ## TC-MOBILE-RECOVERY-01. Возврат после приостановки
@@ -1170,7 +1171,9 @@ Synthetic histories не заменяют этот прогон и не подт
 
 Сохранить только безопасные IDs/counts/short hashes, platform/app versions и
 фактически пройденные шаги. До реального прогона Android/iOS не считать mobile
-приёмку завершённой. Покрывает MOBILE-RECOVERY-001–007.
+приёмку завершённой.
+
+Покрывает: `MOBILE-RECOVERY-001`–`MOBILE-RECOVERY-007`.
 
 ## TC-AUTH-01. Общий вход и переход с ручного токена
 
@@ -1256,6 +1259,14 @@ Synthetic histories не заменяют этот прогон и не подт
    поздний callback не принимается, новый вход создаёт новый PKCE. Повторить после
    закрытия/reopen Settings и на узком экране. На desktop также проверить callback
    и отсутствие кодового варианта.
+10. На подключённом OAuth-профиле дождаться обновления access token перед истечением
+    и повторить full, realtime, startup, scheduled full и mobile recovery. При
+    ответе Диска 401 текущая операция завершается без ложного успеха, после одного
+    сохранённого refresh запускается новая обычная попытка; backup и Force требуют
+    явного повтора. Временный сбой refresh сохраняет локальную работу для retry,
+    а pause, manual-only, скрытое mobile-приложение и выход не запускают запрещённую
+    автоматическую работу. Проверить, что credentials и ответы провайдера не
+    попадают в журнал плагина.
 
-Покрывает `AUTH-001`–`AUTH-020`. Реальные профили/платформы, аккаунты и результаты
+Покрывает `AUTH-001`–`AUTH-021`. Реальные профили/платформы, аккаунты и результаты
 фиксировать отдельно; synthetic green не является подтверждением этого smoke.

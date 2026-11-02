@@ -74,11 +74,12 @@ latency реального Диска или mobile heap. Результаты �
 проверенной сборки; автоматические tests не заменяют ручной прогон.
 
 `npm run validate:release` проверяет metadata, bundle assets и каталог;
-это gate выпуска, а не замена build или runtime smoke. Его статический parser
-ограничен ID вида `PREFIX-123`, numeric `TC-xx` и некоторыми шаблонами test names:
-составные `FORCE-DIRECT-*`, named smoke cases,
-вычисляемые имена и annotations нужно сверять с owning tests/docs. Несовместимость
-parser не оправдывает изменение корректных сценариев или понижение требований.
+это gate выпуска, а не замена build или runtime smoke. Валидатор сверяет все строки каталога, включая составные ID, named smoke cases,
+диапазоны покрытия и статически определимые двухрежимные названия тестов.
+Произвольные вычисляемые имена и неструктурированные annotations требуют
+явной проверки по owning tests/docs; неизвестные ссылки не считаются evidence.
+`known-limitation; diagnostic:` фиксирует негарантируемое поведение и существующий
+диагностический script, но не считается успешным тестом.
 
 `npm run test:force-fencing` — отдельная диагностика поздних чужих запросов с более
 сильными preservation expectations. Она не входит в default suite и не подтверждает

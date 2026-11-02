@@ -112,6 +112,7 @@ const scenarioErrors = validateScenarioCatalog(
 	catalog,
 	testSources,
 	smokeTests,
+	packageJson.scripts ?? {},
 );
 if (scenarioErrors.length > 0) {
 	fail(`scenario catalogue is invalid: ${scenarioErrors.join("; ")}`);
