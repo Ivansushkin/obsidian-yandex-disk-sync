@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.2.1
+
+Changes since `2.2.0`.
+
+### Changed
+
+- Ordinary full sync requests only the remote metadata needed for inventory and
+  physical fingerprints. An incomplete page or an HTTP 400/406 response is read
+  again without `fields`, and projection is disabled for the rest of that scan.
+  If the full response is also incomplete, sync stops before reconciliation;
+  Force, backup and encryption operations keep their full metadata responses.
+- Recovery after suspension now covers desktop focus as well as mobile return.
+  It waits for earlier native requests to settle before a fresh full sync.
+  Repeated network failures use bounded retries followed by a metadata probe
+  every five minutes; a successful probe resumes normal reconciliation.
+- Repeated manual sync requests join one pending run while an earlier native
+  write or OAuth refresh cooldown is outstanding. Pause, connection changes and
+  unload revoke that wait.
+
+### Fixed
+
+- Temporary startup or encryption-manifest read failures before a transition
+  starts no longer leave a permanent connection block. Once a transition has
+  started, its own recovery rules still apply.
+- OAuth refresh cooldown prevents repeated token requests during recovery.
+  A rejected grant still requires signing in again.
+- Unresolved realtime uploads, renames, folder operations and canonical commits
+  retain their work before reporting a transient failure to recovery. The sync
+  indicator shows the pending offline recovery without claiming success.
+
+### Diagnostics
+
+- Added read-only probes for Disk revision availability and projected resource
+  response size. Revision-based skipping of full sync is not enabled.
+
 ## 2.2.0
 
 Changes since `2.1.0`.

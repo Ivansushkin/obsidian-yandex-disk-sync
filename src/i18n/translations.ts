@@ -272,7 +272,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Saving synchronization state…",
 		"notice.force_phase_reconciling": "Final synchronization check",
 		"notice.force_migration_completed":
-			"Upgrade to 2.2.0 completed. Synchronization finished.",
+			"Upgrade to 2.2.1 completed. Synchronization finished.",
 		"notice.force_backup_failed":
 			"Backup could not be verified. Force synchronization was not started.",
 		"notice.force_finalization_pending":
@@ -889,7 +889,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
 		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
 		"notice.force_migration_completed":
-			"Переход на 2.2.0 завершён. Синхронизация выполнена.",
+			"Переход на 2.2.1 завершён. Синхронизация выполнена.",
 		"notice.force_backup_failed":
 			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
 		"notice.force_finalization_pending":

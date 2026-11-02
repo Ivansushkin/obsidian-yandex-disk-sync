@@ -444,7 +444,9 @@ async function scanFullReconciliation(
 	const scanStartedAt = Date.now();
 	const scans = await Promise.allSettled([
 		deps.indexManager.buildLocalIndex(),
-		deps.indexManager.getRemoteFiles(directoryPages),
+		deps.indexManager.getRemoteFiles(directoryPages, {
+			projectSyncInventory: true,
+		}),
 	]);
 	if (scans[0].status === "rejected") {
 		throw scans[0].reason;

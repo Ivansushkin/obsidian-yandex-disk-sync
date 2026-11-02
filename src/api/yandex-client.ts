@@ -46,6 +46,26 @@ import {
 } from "../utils/resource-fingerprint";
 
 const API_BASE_URL = "https://cloud-api.yandex.net/v1/disk";
+const SYNC_INVENTORY_FIELDS = [
+	"path",
+	"type",
+	"name",
+	"created",
+	"modified",
+	"resource_id",
+	"_embedded.total",
+	"_embedded.limit",
+	"_embedded.offset",
+	"_embedded.items.path",
+	"_embedded.items.type",
+	"_embedded.items.name",
+	"_embedded.items.created",
+	"_embedded.items.modified",
+	"_embedded.items.size",
+	"_embedded.items.md5",
+	"_embedded.items.sha256",
+	"_embedded.items.resource_id",
+].join(",");
 
 export interface YandexClientConfig {
 	token: string;
@@ -587,12 +607,16 @@ export class YandexDiskClient {
 		offset = 0,
 		raw = false,
 		budget?: DownloadReadBudget,
+		fields?: string,
 	): Promise<YandexResource | null> {
 		try {
 			const encodedPath = encodePathForUrl(path);
+			const projection = fields
+				? `&fields=${encodeURIComponent(fields)}`
+				: "";
 			const response = await this.request(
 				"GET",
-				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}`,
+				`/resources?path=${encodedPath}&limit=${limit}&offset=${offset}${projection}`,
 				undefined,
 				undefined,
 				budget,
@@ -799,12 +823,16 @@ export class YandexDiskClient {
 		inspectRawPath?: (path: string, type: "file" | "dir") => boolean,
 		allowMissingRoot = true,
 		onDirectoryPages?: (path: string, pages: number) => void,
+		projectSyncInventory = false,
 	): Promise<YandexResource[]> {
 		const startedAt = Date.now();
 		const results: YandexResource[] = [];
 		const visited = new Set<string>();
 		const queue = [path];
 		visited.add(normalizePath(path.replace(/^disk:\//, "")));
+		const projectionState = projectSyncInventory
+			? { enabled: true }
+			: undefined;
 		const limit = Math.max(1, Math.min(concurrency, 40));
 		let active = 0;
 		let failed = false;
@@ -820,6 +848,8 @@ export class YandexDiskClient {
 						allowMissingRoot && currentPath === path,
 						includeDirectories,
 						inspectRawPath,
+						undefined,
+						projectionState,
 					)
 						.then((batch) => {
 							results.push(...batch.files);
@@ -892,6 +922,7 @@ export class YandexDiskClient {
 		includeDirectories: boolean,
 		inspectRawPath?: (path: string, type: "file" | "dir") => boolean,
 		budget?: DownloadReadBudget,
+		projectionState?: { enabled: boolean },
 	): Promise<{
 		files: YandexResource[];
 		directories: string[];
@@ -906,13 +937,111 @@ export class YandexDiskClient {
 		const seen = new Set<string>();
 		const limit = 1000;
 		while (true) {
-			const resource = await this.getResource(
-				path,
-				limit,
-				offset,
-				true,
-				budget,
-			);
+			let resource: YandexResource | null;
+			let projectedResponse = projectionState?.enabled ?? false;
+			try {
+				resource = await this.getResource(
+					path,
+					limit,
+					offset,
+					true,
+					budget,
+					projectedResponse ? SYNC_INVENTORY_FIELDS : undefined,
+				);
+			} catch (error) {
+				if (
+					!projectedResponse ||
+					!(error instanceof YandexApiError) ||
+					![400, 406].includes(error.status)
+				) {
+					throw error;
+				}
+				if (projectionState) {
+					projectionState.enabled = false;
+				}
+				resource = await this.getResource(
+					path,
+					limit,
+					offset,
+					true,
+					budget,
+				);
+				if (!resource) {
+					throw new Error(
+						"Observed remote directory became unavailable during listing",
+					);
+				}
+				projectedResponse = false;
+			}
+			if (projectionState && resource) {
+				const hasRequiredFields = (
+					candidate: YandexResource,
+				): boolean =>
+					typeof candidate.path === "string" &&
+					(candidate.type === "file"
+						? typeof candidate.modified === "string" &&
+							typeof candidate.size === "number" &&
+							Number.isSafeInteger(candidate.size) &&
+							candidate.size >= 0
+						: candidate.type === "dir" &&
+							!!candidate._embedded &&
+							Array.isArray(candidate._embedded.items) &&
+							Number.isSafeInteger(candidate._embedded.total) &&
+							Number.isSafeInteger(candidate._embedded.limit) &&
+							Number.isSafeInteger(candidate._embedded.offset) &&
+							candidate._embedded.items.every(
+								(item) =>
+									item &&
+									typeof item.path === "string" &&
+									typeof item.name === "string" &&
+									["file", "dir"].includes(item.type) &&
+									(item.type !== "file" ||
+										(typeof item.modified === "string" &&
+											typeof item.size === "number" &&
+											Number.isSafeInteger(item.size) &&
+											item.size >= 0)),
+							));
+				const fieldsComplete = hasRequiredFields(resource);
+				const missingFingerprint =
+					fieldsComplete && resource.type === "file"
+						? !resource.sha256 && !resource.md5
+						: fieldsComplete &&
+							(resource._embedded?.items?.some(
+								(item) =>
+									item.type === "file" &&
+									!item.sha256 &&
+									!item.md5,
+							) ??
+								false);
+				if (!projectedResponse && !fieldsComplete) {
+					throw new Error("Remote directory listing is incomplete");
+				}
+				if (
+					projectedResponse &&
+					(!fieldsComplete ||
+						(resource.type === "dir" && !resource.resource_id) ||
+						missingFingerprint)
+				) {
+					projectionState.enabled = false;
+					resource = await this.getResource(
+						path,
+						limit,
+						offset,
+						true,
+						budget,
+					);
+					if (!resource) {
+						throw new Error(
+							"Observed remote directory became unavailable during listing",
+						);
+					}
+					if (!hasRequiredFields(resource)) {
+						throw new Error(
+							"Remote directory listing is incomplete",
+						);
+					}
+				}
+			}
 			pages++;
 			if (!resource) {
 				if (allowMissingRoot && offset === 0) {

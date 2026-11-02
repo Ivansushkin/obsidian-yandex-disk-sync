@@ -2297,6 +2297,7 @@ export class IndexManager {
 	 */
 	async getRemoteFiles(
 		directoryPages?: Map<string, number>,
+		options: { projectSyncInventory?: boolean } = {},
 	): Promise<Map<string, FileMetadata>> {
 		logger.info("Getting remote files list...");
 
@@ -2312,6 +2313,7 @@ export class IndexManager {
 						directoryPages.set(path, pages);
 					}
 				: undefined,
+			options.projectSyncInventory ?? false,
 		);
 
 		const result = await this.remoteResourcesToFiles(resources);

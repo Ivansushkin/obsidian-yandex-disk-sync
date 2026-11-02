@@ -149,6 +149,11 @@ observed-state save → resume/ACK до освобождения coordinator. Lo
 перекрываются, но обе ветви завершаются до classification. Любой неполный local
 read/hash или remote listing — ошибка, никогда не пустое дерево.
 
+Только ordinary full запрашивает проекцию metadata при remote inventory. Неполная
+страница или отказ API по `fields` перечитывается без проекции и отключает её до
+конца обхода. Повторно неполный ответ блокирует reconciliation; Force, backup и
+encryption используют полный ответ API.
+
 Pristine device сначала получает live cloud paths и exact tombstones с protective
 copies; partial baselines переживают restart, но не разрешают watcher publication.
 После coherent receive обычный full загружает unknown local-only файлы. Established
