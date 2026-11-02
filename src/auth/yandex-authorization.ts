@@ -3,6 +3,7 @@ import type {
 	AuthenticationUpdate,
 	OAuthAuthorization,
 } from "./authentication-state";
+import { logger } from "../utils/logger";
 
 export type AuthorizationFailure =
 	| "unavailable"
@@ -47,7 +48,13 @@ export interface OAuthResponse {
 	json: unknown;
 }
 export type RefreshDecision =
-	"fresh" | "refreshed" | "temporary" | "reauthorize" | "revoked";
+	| "fresh"
+	| "refreshed"
+	| "temporary"
+	| "cooldown"
+	| "reauthorize"
+	| "revoked"
+	| { kind: "failed"; reason: AuthorizationFailure };
 export interface AuthorizationAttempt {
 	assertCurrent(): void;
 	accept(): void;
@@ -87,6 +94,8 @@ interface PendingAttempt {
 export class YandexAuthorization {
 	private pending: PendingAttempt | null = null;
 	private native: Promise<void> | null = null;
+	private nativeStartedAt: number | null = null;
+	private readonly nativeListeners = new Set<() => void>();
 	private refreshing: Promise<void> | null = null;
 	private refreshDeniedGrant: string | null = null;
 	private refreshRetryAt = 0;
@@ -100,6 +109,16 @@ export class YandexAuthorization {
 
 	getState(): AuthorizationState {
 		return { ...this.state };
+	}
+	getRefreshRetryAt(): number {
+		return this.refreshRetryAt;
+	}
+	getNativeStartedAt(): number | null {
+		return this.nativeStartedAt;
+	}
+	onNativeActivityChange(listener: () => void): () => void {
+		this.nativeListeners.add(listener);
+		return () => this.nativeListeners.delete(listener);
 	}
 	get available(): boolean {
 		return this.options.clientId.trim().length > 0;
@@ -131,7 +150,7 @@ export class YandexAuthorization {
 			return "fresh";
 		}
 		if (this.now() < this.refreshRetryAt) {
-			return "temporary";
+			return "cooldown";
 		}
 		try {
 			await this.refresh(current, assertCurrent, adopt);
@@ -151,6 +170,18 @@ export class YandexAuthorization {
 				error.code === "revoked"
 			) {
 				return "revoked";
+			}
+			if (
+				!(error instanceof AuthorizationError) ||
+				(error.code !== "network" && error.code !== "timeout")
+			) {
+				return {
+					kind: "failed",
+					reason:
+						error instanceof AuthorizationError
+							? error.code
+							: "storage",
+				};
 			}
 			this.refreshRetryAt = this.now() + 30_000;
 			return "temporary";
@@ -244,19 +275,11 @@ export class YandexAuthorization {
 			}
 			return this.options.request(body);
 		});
-		const native = request.then(
-			() => undefined,
-			() => undefined,
-		);
-		this.native = native;
-		void native.then(() => {
-			if (this.native === native) {
-				this.native = null;
-			}
-		});
+		this.trackNative(request);
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let response: OAuthResponse;
 		try {
-			const response = await Promise.race([
+			response = await Promise.race([
 				request,
 				new Promise<never>((_, reject) => {
 					timer = setTimeout(
@@ -265,9 +288,6 @@ export class YandexAuthorization {
 					);
 				}),
 			]);
-			assertCurrent();
-			const update = this.parseResponse(response, current.authorization);
-			await adopt(update, assertCurrent);
 		} catch (error) {
 			if (error instanceof AuthorizationError) {
 				throw error;
@@ -276,6 +296,9 @@ export class YandexAuthorization {
 		} finally {
 			clearTimeout(timer);
 		}
+		assertCurrent();
+		const update = this.parseResponse(response, current.authorization);
+		await adopt(update, assertCurrent);
 	}
 	get blocksOperations(): boolean {
 		return this.pending !== null && this.state.phase !== "synchronizing";
@@ -437,17 +460,36 @@ export class YandexAuthorization {
 			this.assertAttempt(attempt);
 			return this.options.request(body);
 		});
+		this.trackNative(request);
+		return this.wait(request, attempt);
+	}
+
+	/** Observe native POST until actual settlement, including after caller timeout. */
+	private trackNative(request: Promise<OAuthResponse>): void {
 		const native = request.then(
 			() => undefined,
 			() => undefined,
 		);
 		this.native = native;
+		this.nativeStartedAt = this.now();
+		this.notifyNativeActivity();
 		void native.then(() => {
 			if (this.native === native) {
 				this.native = null;
+				this.nativeStartedAt = null;
+				this.notifyNativeActivity();
 			}
 		});
-		return this.wait(request, attempt);
+	}
+
+	private notifyNativeActivity(): void {
+		for (const listener of this.nativeListeners) {
+			try {
+				listener();
+			} catch {
+				logger.warn("Authorization native activity observer failed");
+			}
+		}
 	}
 
 	private parseResponse(

@@ -7,6 +7,9 @@ import type { SyncEngine } from "../engine";
 import type { SyncLifecycleContext, SyncLifecycleOutcome } from "../contracts";
 import type { SyncResult, YandexDiskSyncSettings } from "../../types";
 import { logger } from "../../utils/logger";
+import type { FailureSummary } from "../../errors";
+import { createSyncFailure } from "../errors";
+import { isMobileRetryableFailure } from "../mobile-recovery";
 import {
 	independentRenamePrefix,
 	MAX_RENAME_BATCH_EVENTS,
@@ -74,6 +77,8 @@ export class FileWatcher {
 	private fullSyncRequestCallback: (() => void | Promise<void>) | null = null;
 	private authorizationPreflight: (() => Promise<boolean>) | null = null;
 	private authorizationRecovery: (() => Promise<boolean>) | null = null;
+	private recoveryFailureObserver:
+		((failure: FailureSummary) => void) | null = null;
 	private epochReplacementObserved = false;
 	private epochFullSyncRequest: Promise<void> | null = null;
 	private persistPromise: Promise<void> | null = null;
@@ -162,6 +167,13 @@ export class FileWatcher {
 	/** Gate automatic drains while continuing to observe and durably queue local changes. */
 	setAutomaticAdmission(canStart: () => boolean): void {
 		this.canStartAutomatic = canStart;
+	}
+
+	/** Report only a retained, durably settled transient failure. */
+	setRecoveryFailureObserver(
+		callback: (failure: FailureSummary) => void,
+	): void {
+		this.recoveryFailureObserver = callback;
 	}
 
 	/** Resume queued events after recovery, without bypassing explicit full preparation. */
@@ -1387,6 +1399,11 @@ export class FileWatcher {
 				if (eventId && !replayResult.retry.includes(eventId)) {
 					replayResult.retry.push(eventId);
 				}
+				replayResult.retryFailure ??= createSyncFailure(e, {
+					stage: "realtime-watcher",
+					path: event.path,
+					action: "write",
+				}).summary;
 				logger.error(
 					`Deferred watcher event failed for ${event.path}:`,
 					{ error: e },
@@ -1396,12 +1413,21 @@ export class FileWatcher {
 		}
 		await flushFileBatch();
 		this.persistDeferredEvents();
-		if (
+		const retryableFailure =
+			replayResult.retry.length > 0 &&
+			isMobileRetryableFailure(replayResult.retryFailure);
+		if (retryableFailure) {
+			await this.waitForPersistence();
+		}
+		const authorizationRecovered =
 			replayResult.retry.length > 0 &&
 			this.authorizationRecovery &&
-			(await this.authorizationRecovery())
-		) {
+			(await this.authorizationRecovery());
+		if (authorizationRecovered) {
 			this.scheduleDeferredReplay();
+		}
+		if (!authorizationRecovered && retryableFailure) {
+			this.recoveryFailureObserver?.(replayResult.retryFailure!);
 		}
 		if (this.syncEngine.consumeEpochReplacementRequest?.()) {
 			this.epochReplacementObserved = true;

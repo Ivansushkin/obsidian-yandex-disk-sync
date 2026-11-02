@@ -1,5 +1,6 @@
 import type { MobileRecoveryPresentation } from "../sync/mobile-recovery";
 import { formatOperationFailure } from "../sync/errors";
+import { isMobileRetryableFailure } from "../sync/mobile-recovery";
 import type { RetryProgress } from "../errors";
 import type { ForceFlowState } from "../sync/workflows/force-controller";
 import type { SyncState, SyncStatus } from "../types";
@@ -221,7 +222,22 @@ export function getSyncPresentation(
 				? "status.mobile.waiting_native"
 				: "status.mobile.recovery_backoff",
 		);
-		detail = [detail, recoveryDetail].filter(Boolean).join("\n");
+		if (
+			!context.operationError &&
+			sync.status !== "syncing" &&
+			(isMobileRetryableFailure(sync.failure) || sync.status === "idle")
+		) {
+			state = {
+				...sync,
+				status: "offline",
+				failure: undefined,
+				errorMessage: undefined,
+			};
+			text = recoveryDetail;
+			detail = "";
+		} else {
+			detail = [detail, recoveryDetail].filter(Boolean).join("\n");
+		}
 	}
 	const busy = state.status === "syncing" || state.status === "initializing";
 	let icon = busy ? "cloud" : getSyncStatusIcon(state.status);

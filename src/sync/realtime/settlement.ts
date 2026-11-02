@@ -31,6 +31,7 @@ export class WatcherSettlement {
 		replayResult.completed.push(...result.completed);
 		replayResult.superseded.push(...result.superseded);
 		replayResult.retry.push(...result.retry);
+		replayResult.retryFailure ??= result.retryFailure;
 		await this.ports.waitForPersistence();
 		logger.debug("Realtime file batch settled in coordinator", {
 			sessionId: lifecycle?.sessionId ?? null,
@@ -102,6 +103,9 @@ export class WatcherSettlement {
 			if (!replayResult?.retry.includes(event.id)) {
 				replayResult?.retry.push(event.id);
 			}
+			if (replayResult) {
+				replayResult.retryFailure ??= outcome.retryFailure;
+			}
 			logger.warn("Watcher rename remains durable for retry", {
 				sessionId: lifecycle?.sessionId ?? null,
 				eventId: event.id,
@@ -149,6 +153,7 @@ export class WatcherSettlement {
 			if (!replayResult.retry.includes(id)) {
 				replayResult.retry.push(id);
 			}
+			replayResult.retryFailure ??= outcome.retryFailure;
 			logger.warn("Watcher folder event remains durable", {
 				eventId: id,
 				action: event.action,

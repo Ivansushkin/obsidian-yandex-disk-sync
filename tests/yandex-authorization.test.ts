@@ -247,7 +247,7 @@ test("failed refresh and failed credential save retain the prior grant", async (
 	);
 	assert.equal(
 		await h.controller.ensureFresh(current, true, () => {}, adopt),
-		"temporary",
+		"cooldown",
 	);
 	assert.equal(refreshRequests, 4);
 	h.controller.resetRefreshState();
@@ -263,7 +263,10 @@ test("failed refresh and failed credential save retain the prior grant", async (
 	h.plugin.saveData = async () => {
 		throw new Error("private-storage-details");
 	};
-	await assert.rejects(h.controller.refresh(current, () => {}, adopt));
+	assert.deepEqual(
+		await h.controller.ensureFresh(current, true, () => {}, adopt),
+		{ kind: "failed", reason: "storage" },
+	);
 	assert.equal(h.plugin.settings.yandexTokenSecret, "initial-access");
 	assert.equal(
 		h.plugin.settings.oauthAuthorization?.refreshToken,

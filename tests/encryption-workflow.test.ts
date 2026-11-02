@@ -7,7 +7,11 @@ import {
 	startupFlow,
 } from "./helpers/encryption-flow";
 import { MemoryDisk, bytes, device, managedDevices } from "./helpers/sync-flow";
-import { isRemoteReadTimeout, OperationFailure } from "../src/errors";
+import {
+	isRemoteReadTimeout,
+	NetworkRequestError,
+	OperationFailure,
+} from "../src/errors";
 import { SyncScheduler } from "../src/sync/scheduler";
 import { EncryptionManager } from "../src/crypto/encryption-manager";
 import type { StartupReadSession } from "../src/sync/canonical/manager";
@@ -23,6 +27,26 @@ import {
 	recoverTransition,
 	transitionSource,
 } from "./helpers/encryption-scenarios";
+
+test("transient manifest read leaves encryption admission unblocked", async () => {
+	const disk = new MemoryDisk();
+	const a = device(disk, "admission-offline", null);
+	const flow = encryptionFlow(a);
+	const failure = new YandexApiError("synthetic unavailable", 503);
+	disk.beforeRequest = async () => {
+		throw failure;
+	};
+	try {
+		await assert.rejects(
+			flow.workflow.admission.ensureEncryptionReady({ prompt: false }),
+			NetworkRequestError,
+		);
+		assert.equal(flow.block(), null);
+	} finally {
+		disk.beforeRequest = undefined;
+		await a.stop();
+	}
+});
 
 test("encryption recovery only falls back after a canonical decode mismatch", async (t) => {
 	const gate = deferred();

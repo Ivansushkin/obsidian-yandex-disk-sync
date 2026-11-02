@@ -5,6 +5,7 @@ import type {
 	YandexDiskSyncSettings,
 } from "../../types";
 import { logger } from "../../utils/logger";
+import type { FailureSummary } from "../../errors";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { IndexManager } from "../canonical/manager";
 import {
@@ -17,6 +18,7 @@ import {
 	type WatcherCausalContext,
 } from "../realtime/rules";
 import * as syncReconciliation from "../reconciliation/commits";
+import { createSyncFailure } from "../errors";
 import * as reconciliationContext from "../reconciliation/context";
 import * as reconcilePhysicalRecovery from "../reconciliation/physical-recovery";
 import * as fileOperations from "./operations";
@@ -38,6 +40,33 @@ export interface Dependencies {
 	fileOperations: fileOperations.Dependencies;
 	syncReconciliation: reconciliationContext.Dependencies;
 	remoteMoves: remoteMoves.Dependencies;
+}
+
+/** Preserve the first rejected physical cause without changing durable action shape. */
+function firstRejectedFailure(
+	results: readonly (
+		{ status: "fulfilled" } | { status: "rejected"; reason: unknown }
+	)[],
+	stage: string,
+): FailureSummary | undefined {
+	const rejected = results.find((result) => result.status === "rejected");
+	return rejected?.status === "rejected"
+		? createSyncFailure(rejected.reason, { stage, action: "write" }).summary
+		: undefined;
+}
+
+async function saveFolderIndex(
+	deps: Dependencies,
+): Promise<{ confirmed: boolean; retryFailure?: FailureSummary }> {
+	let retryFailure: FailureSummary | undefined;
+	const proof = await syncReconciliation.saveRemoteIndexBestEffort(
+		deps.syncReconciliation,
+		undefined,
+		(failure) => {
+			retryFailure = failure;
+		},
+	);
+	return { confirmed: Boolean(proof), retryFailure };
 }
 
 /** Reuse a durable folder mutation receipt after restart or allocate it once. */
@@ -123,6 +152,10 @@ export async function deleteFolderNow(
 			mutationId: context.mutationId,
 			mutationSeq: context.mutationSeq,
 			unresolved,
+			retryFailure: firstRejectedFailure(
+				results,
+				"folder-delete-recovery",
+			),
 			reason:
 				unresolved > 0 ||
 				results.some((result) => result.status === "rejected")
@@ -251,11 +284,8 @@ export async function deleteFolderNow(
 		await deps.indexSaveCallback();
 	}
 
-	if (
-		!(await syncReconciliation.saveRemoteIndexBestEffort(
-			deps.syncReconciliation,
-		))
-	) {
+	const intentCommit = await saveFolderIndex(deps);
+	if (!intentCommit.confirmed) {
 		return {
 			status: "retry",
 			canonicalRevision: canonical.revision,
@@ -263,6 +293,7 @@ export async function deleteFolderNow(
 			mutationId: mutation.id,
 			mutationSeq: mutation.seq,
 			reason: "folder-delete-intent-not-committed",
+			retryFailure: intentCommit.retryFailure,
 		};
 	}
 	deps.indexManager.confirmMutation(mutation.id);
@@ -343,6 +374,10 @@ export async function deleteFolderNow(
 			unresolved: Math.max(
 				remainingActions + failedActions,
 				acceptedPaths.length - committedPaths.length,
+			),
+			retryFailure: firstRejectedFailure(
+				deletionResults,
+				"folder-delete-physical",
 			),
 			reason: "folder-delete-physical-work-unresolved",
 		};
@@ -606,11 +641,8 @@ export async function renameFolderNow(
 		mutation,
 		plannedPairs,
 	);
-	if (
-		!(await syncReconciliation.saveRemoteIndexBestEffort(
-			deps.syncReconciliation,
-		))
-	) {
+	const intentCommit = await saveFolderIndex(deps);
+	if (!intentCommit.confirmed) {
 		return {
 			status: "retry",
 			canonicalRevision: canonical.revision,
@@ -618,15 +650,17 @@ export async function renameFolderNow(
 			mutationId: mutation.id,
 			mutationSeq: mutation.seq,
 			reason: "folder-move-intent-not-committed",
+			retryFailure: intentCommit.retryFailure,
 		};
 	}
-	const { committedPairs, unresolved } = await materializeFolderRename(
-		deps,
-		canonical,
-		mutation,
-		plannedPairs,
-		targetHashes,
-	);
+	const { committedPairs, unresolved, retryFailure } =
+		await materializeFolderRename(
+			deps,
+			canonical,
+			mutation,
+			plannedPairs,
+			targetHashes,
+		);
 	if (unresolved > 0) {
 		if (deps.indexSaveCallback) {
 			await deps.indexSaveCallback();
@@ -640,15 +674,21 @@ export async function renameFolderNow(
 			conflicts,
 			survivors,
 			unresolved,
+			retryFailure,
 			reason: "folder-move-physical-work-unresolved",
 		};
 	}
 	deps.indexManager.completeMove(id);
+	let completionFailure: FailureSummary | undefined;
 	if (
 		!(await syncReconciliation.saveMoveCompletionBestEffort(
 			deps.syncReconciliation,
+			(failure) => {
+				completionFailure = failure;
+			},
 		))
 	) {
+		await deps.indexSaveCallback?.();
 		return {
 			status: "retry",
 			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
@@ -656,6 +696,7 @@ export async function renameFolderNow(
 			mutationId: mutation.id,
 			mutationSeq: mutation.seq,
 			reason: "folder-move-completion-not-committed",
+			retryFailure: completionFailure,
 		};
 	}
 	deps.indexManager.confirmMutation(mutation.id);
@@ -703,11 +744,16 @@ async function recoverFolderRename(
 		};
 	}
 	deps.indexManager.completeMove(pendingMove.id);
+	let completionFailure: FailureSummary | undefined;
 	if (
 		!(await syncReconciliation.saveMoveCompletionBestEffort(
 			deps.syncReconciliation,
+			(failure) => {
+				completionFailure = failure;
+			},
 		))
 	) {
+		await deps.indexSaveCallback?.();
 		return {
 			status: "retry",
 			canonicalRevision: canonicalRevision,
@@ -715,6 +761,7 @@ async function recoverFolderRename(
 			mutationId: pendingMove.id,
 			mutationSeq: pendingMove.mutationSeq,
 			reason: "folder-move-recovery-completion-not-committed",
+			retryFailure: completionFailure,
 		};
 	}
 	deps.indexManager.confirmMutation(pendingMove.id);
@@ -738,7 +785,11 @@ async function materializeFolderRename(
 	mutation: PendingMutation,
 	plannedPairs: ReturnType<typeof planFolderMove>["plannedPairs"],
 	targetHashes: Map<string, string>,
-): Promise<{ committedPairs: typeof plannedPairs; unresolved: number }> {
+): Promise<{
+	committedPairs: typeof plannedPairs;
+	unresolved: number;
+	retryFailure?: FailureSummary;
+}> {
 	const committedPairs = plannedPairs.filter(({ fromPath, toPath }) => {
 		const source = deps.indexManager.getRemoteIndex().files[fromPath];
 		const target = deps.indexManager.getRemoteIndex().files[toPath];
@@ -779,5 +830,9 @@ async function materializeFolderRename(
 		plannedPairs.length -
 		committedPairs.length +
 		moveResults.filter((result) => result.status === "rejected").length;
-	return { committedPairs, unresolved };
+	return {
+		committedPairs,
+		unresolved,
+		retryFailure: firstRejectedFailure(moveResults, "folder-move-physical"),
+	};
 }

@@ -307,13 +307,13 @@ POST и single-flight refresh. Refresh token и срок действия сох
 в локальном auth tuple через общую persistence queue; смена grant или
 connection запрещает публикацию старого ответа. Сборка получает общий Client
 Secret из локальной `.env` или CI и включает его в bundle. Перед сетевой
-работой истекающий OAuth-доступ обновляется, включая cold startup, mobile
+работой истекающий OAuth-доступ обновляется, включая cold startup, lifecycle
 recovery и scheduled full; 401 в этих потоках и realtime вызывает отдельный
 refresh и один повторный запуск через существующую очередь с новой startup
-invocation. Временный сбой refresh сохраняет работу и через 30 s запускает
-автоматический full после успешного обновления, если допускают lifecycle и
-конфигурация. Временная ошибка Диска в этом full оставляет recovery pending
-до следующей попытки; mobile hidden откладывает её без OAuth POST. Resume обновляет token под сохранённой pause, а automation
+invocation. Временный сбой refresh сохраняет работу и передаёт cooldown общему
+recovery-контроллеру; до его истечения новый OAuth POST не создаётся. Временная
+ошибка Диска в последующем full оставляет recovery pending. Hidden откладывает
+автоматическую попытку без OAuth POST. Resume обновляет token под сохранённой pause, а automation
 возобновляет только после успешного full. Backup и Force при ошибке остаются
 явными пользовательскими операциями.
 `main.ts` связывает transport, lifecycle, UI и существующий full; не выполняет
@@ -437,12 +437,12 @@ Capacity timeout отличается от native timeout; late reply помеч
 двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Unit results не
 подтверждают ручную приёмку.
 
-## Mobile lifecycle recovery
+## Lifecycle recovery
 
-`MobileSyncRecovery` управляет только admission и одним runtime recovery request
-на Android/iOS (`Platform.isMobileApp`). `main.ts` связывает browser events и live
+`MobileSyncRecovery` управляет admission и одним runtime recovery request
+на desktop и Android/iOS. `main.ts` связывает browser events и live
 ports с существующим full; единственный `SyncCoordinator`, persistence и canonical
-protocol не меняются. Desktop не получает новую lifecycle policy.
+protocol не меняются. Desktop focus после длинной паузы также запускает проверку.
 
 Hidden запрещает новые automatic workflows, но admitted workflow, включая full
 preparation, завершается по прежним guards. Watcher остаётся подписан и сохраняет
@@ -466,10 +466,19 @@ requests; старый full promise не используется как нов�
 Recovery использует новую invocation, manifest/canonical observations и budgets.
 После transient transport failure — до трёх outer retries через 5/15/60 s после
 settlement, только в visible состоянии. Повторные hints не обнуляют текущий budget;
-после исчерпания нужны новый return/online/schedule или manual full. Access, local,
+после исчерпания выполняется редкий metadata GET через 5 минут; полный sync
+возобновляется только после успешного probe. Новый return/online может ускорить
+проверку. Access, local,
 unknown и semantic/safety failures не получают automatic retry. Pending запрос
 отзывается при смене configuration generation (включая ABA), pause, отключении
 автоматики и unload; позднее завершение не закрывает request нового поколения.
+Ручной full допускается и при отключённой автоматике, но ожидает прежний native
+write и OAuth cooldown. Повторные нажатия объединяются; смена конфигурации,
+pause и unload отзывают ожидание. Realtime сообщает контроллеру причину только
+после сохранения неразрешённого события в durable queue; семантический retry
+не считается сетевой ошибкой. Временный startup/manifest read до начала
+transition не устанавливает постоянный block; ошибка после начала transition
+остаётся в его отдельном recovery.
 
 `YandexDiskClient` хранит только runtime count/start time native reads/writes до
 их реального settlement. Отмена caller wait не освобождает native permit и не

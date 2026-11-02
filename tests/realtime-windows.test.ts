@@ -116,6 +116,16 @@ for (const encrypted of [false, true]) {
 		}
 		const ids = a.watcher.getDeferredEvents().map((event) => event.id);
 		const failedPath = await a.client.getPhysicalPath("vault/Note40.md");
+		const retryableFailures: string[] = [];
+		a.watcher.setRecoveryFailureObserver((failure) => {
+			assert.equal(
+				a
+					.lastSaved()
+					.pendingWatcherEvents.some((event) => event.id === ids[40]),
+				true,
+			);
+			retryableFailures.push(failure.category);
+		});
 		let lostResponse = false;
 		disk.afterRequest = async (method, endpoint, path) => {
 			if (
@@ -137,6 +147,7 @@ for (const encrypted of [false, true]) {
 		await a.stop();
 		disk.afterRequest = undefined;
 		assert.equal(lostResponse, true);
+		assert.deepEqual(retryableFailures, ["unavailable"]);
 		assert.equal(reads.includes("Note64.md"), false);
 		const saved = await a.saved();
 		assert.deepEqual(

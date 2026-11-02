@@ -13,8 +13,13 @@ import { createSyncFailure, formatOperationFailure } from "./sync/errors";
 import type { FailureSummary } from "./errors";
 import type { RemoteEncryptionManifest, YandexDiskSyncSettings } from "./types";
 import { logger } from "./utils/logger";
+import { isMobileRetryableFailure } from "./sync/mobile-recovery";
 
-export type StartupState = "ready" | "migration" | "blocked";
+export type StartupState =
+	| "ready"
+	| "migration"
+	| "blocked"
+	| { kind: "unavailable"; failure: FailureSummary };
 export type StartupBlockKind = Exclude<
 	ExternalSyncBlockKind,
 	"local-state" | "persistence"
@@ -49,6 +54,7 @@ interface StartupPorts {
 	recoverEncryptionTransition(): Promise<void>;
 	tryRecoverRemoteTargetTransition(
 		reads?: StartupReadSession,
+		onMutationStart?: () => void,
 	): Promise<boolean>;
 	ensureEncryptionReady(
 		options: EncryptionReadyOptions,
@@ -121,6 +127,10 @@ export class PluginStartup {
 			);
 		}
 		const { deps } = this;
+		let maintenanceStarted = false;
+		const markMaintenance = () => {
+			maintenanceStarted = true;
+		};
 		const admissionStartedAt = Date.now();
 		if (deps.isStopped()) {
 			return "blocked";
@@ -211,6 +221,7 @@ export class PluginStartup {
 			if (allowRecovery) {
 				if (deps.hasTransition()) {
 					invocation.invalidate();
+					markMaintenance();
 					await deps.engine.runExclusiveMaintenance(async () => {
 						if (!deps.isStopped()) {
 							await deps.recoverEncryptionTransition();
@@ -220,6 +231,7 @@ export class PluginStartup {
 				} else {
 					recovered = await deps.tryRecoverRemoteTargetTransition(
 						invocation.reads,
+						markMaintenance,
 					);
 				}
 			} else if (deps.hasTransition()) {
@@ -245,6 +257,7 @@ export class PluginStartup {
 					prompt,
 					allowRecovery,
 					invalidateReads: () => invocation.invalidate(),
+					onMutationStart: markMaintenance,
 				},
 				{ manifest: currentManifest },
 			);
@@ -291,12 +304,18 @@ export class PluginStartup {
 			}
 			const failure = createSyncFailure(error, {
 				stage: "startup",
-				action: "read",
+				action: maintenanceStarted ? "write" : "read",
 				outcome: "unknown",
 			});
 			logger.warn("Remote startup validation failed", { error: failure });
+			if (
+				!maintenanceStarted &&
+				isMobileRetryableFailure(failure.summary)
+			) {
+				return { kind: "unavailable", failure: failure.summary };
+			}
 			deps.setBlock(
-				"authentication",
+				maintenanceStarted ? "encryption" : "authentication",
 				formatOperationFailure(failure.summary),
 				failure.summary,
 			);
