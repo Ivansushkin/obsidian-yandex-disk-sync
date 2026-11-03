@@ -74,7 +74,11 @@ export async function applyAuthenticationUpdate(
 		attempt.phase("checking-root");
 		let root: RemoteStorageScope | null;
 		try {
-			root = await deps.readCandidateRoot(update.token, path);
+			const token =
+				update.kind === "manual-confirmation"
+					? deps.getSettings().yandexTokenSecret
+					: update.token;
+			root = await deps.readCandidateRoot(token, path);
 		} catch (error) {
 			throw error instanceof AuthorizationError
 				? error
@@ -86,6 +90,10 @@ export async function applyAuthenticationUpdate(
 		}
 		if (expected && !sameRemoteStorageScope(expected, root)) {
 			throw new AuthorizationError("root-mismatch");
+		}
+		if (update.kind === "manual-confirmation") {
+			await deps.persist(update, () => attempt.assertCurrent());
+			return;
 		}
 		let accepted = false;
 		await deps.persist(update, () => {
@@ -144,6 +152,7 @@ function waitForAuthenticationIdle(
 
 const USER_SETTING_KEYS = [
 	"language",
+	"showSyncIndicator",
 	"clientId",
 	"yandexTokenSecret",
 	"remotePath",
@@ -242,6 +251,8 @@ export function prepareSettingsPatch(
 					}
 				: {}),
 			manualSyncRequired: current.manualSyncRequired || changesConnection,
+			manualAuthorizationConfirmed:
+				!changesConnection && current.manualAuthorizationConfirmed,
 			syncPatterns: [...(patch.syncPatterns ?? current.syncPatterns)],
 			excludePatterns: [
 				...(patch.excludePatterns ?? current.excludePatterns),
@@ -251,7 +262,10 @@ export function prepareSettingsPatch(
 		requiresIdle:
 			changesConnection ||
 			changed.some(
-				(key) => key !== "enableDebugLogging" && key !== "logToFile",
+				(key) =>
+					key !== "enableDebugLogging" &&
+					key !== "logToFile" &&
+					key !== "showSyncIndicator",
 			),
 		changesConnection,
 		changesFileScope,

@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { SyncCoordinator } from "../src/sync/coordinator";
 import { SyncEngine, type SyncRunOptions } from "../src/sync/engine";
-import { DEFAULT_SETTINGS, type SyncState } from "../src/types";
+import {
+	DEFAULT_SETTINGS,
+	type SyncState,
+	type SyncResult,
+} from "../src/types";
 import type { YandexDiskClient } from "../src/api/yandex-client";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import type { IndexManager } from "../src/sync/canonical/manager";
@@ -129,8 +133,8 @@ test("Force session progress ignores foreign activity and unsubscribes after set
 		runCoordinatedSession(
 			kind: "force",
 			options: SyncRunOptions,
-			task: () => Promise<void>,
-		): Promise<void>;
+			task: () => Promise<SyncResult>,
+		): Promise<SyncResult>;
 		updateState(state: Partial<SyncState>): void;
 		eventListeners: unknown[];
 	};
@@ -146,6 +150,16 @@ test("Force session progress ignores foreign activity and unsubscribes after set
 				currentOperation: "foreign progress",
 			});
 			access.updateState({ ...own, currentOperation: "owned progress" });
+			return {
+				success: true,
+				uploaded: 0,
+				downloaded: 0,
+				deleted: 0,
+				conflicts: 0,
+				errors: [],
+				startTime: 1,
+				endTime: 2,
+			};
 		},
 	);
 	assert.ok(

@@ -17,7 +17,7 @@
 | [Резервное копирование](BACKUP.md)                  | ZIP/envelope, archive choice, passwords и exact verification.                       |
 | [Авторизация](AUTHORIZATION.md)                     | Общий вход, optional manual setup, сохранение подключения и внешний provider gate.  |
 | [Ручные проверки](SMOKE_TESTS.md)                   | Два профиля Obsidian, реальный Диск, desktop/mobile и release gates.                |
-| [Changelog](../CHANGELOG.md)                        | Изменения 2.2.0 и история stable 2.1.0/2.0.0/1.1.0.                                 |
+| [Changelog](../CHANGELOG.md)                        | Изменения 2.3.0 и история stable 2.2.0/2.1.0/2.0.0/1.1.0.                           |
 
 Каталог задаёт поведение, архитектура — границы реализации, тематические документы —
 детали своих областей. При изменении алгоритма обновляйте сценарии и документ

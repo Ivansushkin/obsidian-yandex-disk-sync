@@ -6,6 +6,7 @@ import type {
 } from "../../types";
 import { findErrorCause } from "../../utils/error-utils";
 import { logger } from "../../utils/logger";
+import type { FailureSummary } from "../../errors";
 import {
 	IndexEpochMismatchError,
 	RemoteIndexTransactionError,
@@ -13,6 +14,7 @@ import {
 import { canApplyDestructiveFolderMutation } from "../canonical/mutation-rules";
 import type { CanonicalCommitProof } from "../canonical/transaction";
 import * as syncErrors from "../errors";
+import { isMobileRetryableFailure } from "../mobile-recovery";
 import type { Dependencies as ReconciliationDependencies } from "./context";
 import { cleanupRejectedUploads } from "./rejected-puts";
 export type Dependencies = Pick<
@@ -81,6 +83,7 @@ export async function saveRemoteIndexOrAbort(
 export async function saveRemoteIndexBestEffort(
 	deps: Dependencies,
 	assertLatest?: (index: Readonly<SyncIndex>) => void,
+	onRetryableFailure?: (failure: FailureSummary) => void,
 ): Promise<CanonicalCommitProof | null> {
 	try {
 		if (deps.realtimeGuardValidationToken !== undefined) {
@@ -101,6 +104,15 @@ export async function saveRemoteIndexBestEffort(
 		return proof;
 	} catch (e) {
 		if (e instanceof RemoteIndexTransactionError) {
+			if (e.outcome === "rolled-back" && e.cause) {
+				const failure = syncErrors.createSyncFailure(e.cause, {
+					stage: "realtime-canonical",
+					action: "write",
+				}).summary;
+				if (isMobileRetryableFailure(failure)) {
+					onRetryableFailure?.(failure);
+				}
+			}
 			if (
 				findErrorCause(
 					e,
@@ -128,10 +140,17 @@ export async function saveRemoteIndexBestEffort(
 /** Commit physical move completion without advancing logical revisions. */
 export async function saveMoveCompletionBestEffort(
 	deps: Dependencies,
+	onRetryableFailure?: (failure: FailureSummary) => void,
 ): Promise<boolean> {
 	deps.indexManager.beginPhysicalRewriteCommit();
 	try {
-		return Boolean(await saveRemoteIndexBestEffort(deps));
+		return Boolean(
+			await saveRemoteIndexBestEffort(
+				deps,
+				undefined,
+				onRetryableFailure,
+			),
+		);
 	} finally {
 		deps.indexManager.cancelPhysicalRewriteCommit();
 	}

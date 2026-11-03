@@ -130,6 +130,36 @@ test("logger writes correlated sanitized diagnostics to plugin data", async () =
 	}
 });
 
+test("logger sanitizes messages and fully masks secret fields", async () => {
+	const { instance, contents } = createLogger();
+	instance.info("File password=private-value https://example.test/signed", {
+		password: "private-value",
+	});
+	await instance.flush();
+	assert.doesNotMatch(
+		contents(),
+		/private-value|example\.test|priv\.\.\.alue/,
+	);
+});
+
+test("failed flush rejects reads and bounds retained entries before retry", async () => {
+	const { instance, adapter, contents } = createLogger(500);
+	instance.configure({ baseContext: {}, contextProvider: () => undefined });
+	const write = adapter.write.bind(adapter);
+	adapter.write = async () => {
+		throw new Error("write unavailable");
+	};
+	for (let i = 0; i < 20; i++) {
+		instance.info(`entry-${i}`);
+		await assert.rejects(instance.getLogContents());
+	}
+	adapter.write = write;
+	await instance.flush();
+	assert.match(contents(), /entry-19/);
+	assert.doesNotMatch(contents(), /entry-0\b/);
+	assert.match(contents(), /discarded/i);
+});
+
 test("clearing during an admitted flush discards old entries and preserves later entries", async () => {
 	const { instance, adapter, contents } = createLogger();
 	const entered = deferred();
@@ -205,11 +235,13 @@ test("failed log batches retain FIFO before queued writes and rotation", async (
 	};
 	instance.info("old-entry");
 	const older = instance.flush();
+	const rejected = assert.rejects(older);
 	await entered.promise;
 	instance.info("new-entry");
 	const newer = instance.flush();
 	release.resolve();
-	await Promise.all([older, newer]);
+	await rejected;
+	await newer;
 	await instance.flush();
 	assert.match(contents(), /new-entry/);
 	assert.doesNotMatch(contents(), /old-entry/);

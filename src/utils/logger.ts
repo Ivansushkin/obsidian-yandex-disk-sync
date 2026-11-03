@@ -204,8 +204,7 @@ function sanitizeContext(context: unknown, parentKey?: string): unknown {
 			if (
 				SENSITIVE_KEYS.some((sensitive) => lowerKey.includes(sensitive))
 			) {
-				result[key] =
-					typeof value === "string" ? maskString(value) : "***";
+				result[key] = "***";
 			} else {
 				result[key] = sanitizeContext(value, lowerKey);
 			}
@@ -236,6 +235,7 @@ export class Logger {
 
 	private buffer: string[] = [];
 	private retryEntries: string[] = [];
+	private retryEntriesDiscarded = false;
 	private clearGeneration = 0;
 	private flushTimeout: ReturnType<typeof setTimeout> | null = null;
 	private flushChain: Promise<void> = Promise.resolve();
@@ -297,7 +297,7 @@ export class Logger {
 		context?: Record<string, unknown>,
 	): string {
 		const timestamp = formatTimestamp(new Date());
-		let entry = `${timestamp} [${level.toUpperCase()}] ${LOG_PREFIX} ${message}`;
+		let entry = `${timestamp} [${level.toUpperCase()}] ${LOG_PREFIX} ${sanitizeString(message)}`;
 		let dynamicContext: Record<string, unknown> = {};
 		try {
 			dynamicContext = this.contextProvider?.() ?? {};
@@ -363,7 +363,7 @@ export class Logger {
 			return;
 		}
 		this.flushTimeout = globalThis.setTimeout(() => {
-			void this.flush();
+			void this.flush().catch(() => undefined);
 		}, FLUSH_DELAY_MS);
 	}
 
@@ -391,8 +391,14 @@ export class Logger {
 		generation: number,
 	): Promise<void> {
 		if (generation === this.clearGeneration) {
-			entries = [...this.retryEntries, ...entries];
+			const marker = this.retryEntriesDiscarded
+				? [
+						`${formatTimestamp(new Date())} [WARN] ${LOG_PREFIX} Earlier log entries discarded after write failures`,
+					]
+				: [];
+			entries = [...marker, ...this.retryEntries, ...entries];
 			this.retryEntries = [];
+			this.retryEntriesDiscarded = false;
 		}
 		if (!this.app || entries.length === 0) {
 			return;
@@ -418,7 +424,31 @@ export class Logger {
 			await adapter.write(logPath, this.trimLog(existing + content));
 		} catch (e) {
 			if (generation === this.clearGeneration) {
-				this.retryEntries = entries;
+				const encoder = new TextEncoder();
+				const markerSize = encoder.encode(
+					`${formatTimestamp(new Date())} [WARN] ${LOG_PREFIX} Earlier log entries discarded after write failures\n`,
+				).length;
+				let size = 0;
+				const retained: string[] = [];
+				for (let i = entries.length - 1; i >= 0; i--) {
+					const entry = entries[i]!;
+					if (
+						entry.includes(
+							"Earlier log entries discarded after write failures",
+						)
+					) {
+						this.retryEntriesDiscarded = true;
+						continue;
+					}
+					const entrySize = encoder.encode(entry + "\n").length;
+					if (size + entrySize + markerSize > this.maxFileSize) {
+						this.retryEntriesDiscarded = true;
+						break;
+					}
+					retained.unshift(entry);
+					size += entrySize;
+				}
+				this.retryEntries = retained;
 			}
 			console.error(
 				`${LOG_PREFIX} Failed to write log file:`,
@@ -428,7 +458,7 @@ export class Logger {
 						: "Log write failed",
 				),
 			);
-			return;
+			throw e;
 		}
 	}
 
@@ -492,6 +522,7 @@ export class Logger {
 		this.clearGeneration++;
 		this.buffer = [];
 		this.retryEntries = [];
+		this.retryEntriesDiscarded = false;
 		if (this.flushTimeout !== null) {
 			globalThis.clearTimeout(this.flushTimeout);
 			this.flushTimeout = null;

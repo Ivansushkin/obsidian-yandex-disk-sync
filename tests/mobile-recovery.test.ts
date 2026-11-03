@@ -45,11 +45,18 @@ class Clock {
 		this.now = end;
 	}
 }
-function harness(run: () => Promise<MobileRecoveryOutcome>) {
+function harness(
+	run: () => Promise<MobileRecoveryOutcome>,
+	probe: () => Promise<MobileRecoveryOutcome> = async () => "success",
+	runManual: () => Promise<null> = async () => null,
+) {
 	const clock = new Clock();
 	const context: MobileRecoveryContext = {
 		generation: 0,
 		enabled: true,
+		manualAllowed: true,
+		mobile: true,
+		cooldownUntil: 0,
 		visible: true,
 		busy: false,
 		blocked: false,
@@ -58,6 +65,8 @@ function harness(run: () => Promise<MobileRecoveryOutcome>) {
 	const recovery = new MobileSyncRecovery({
 		read: () => context,
 		run,
+		probe,
+		runManual,
 		changed: () => {},
 		clock: {
 			now: () => clock.now,
@@ -67,6 +76,167 @@ function harness(run: () => Promise<MobileRecoveryOutcome>) {
 	});
 	return { clock, context, recovery };
 }
+
+test("recovery uses one metadata probe after bounded full retries", async () => {
+	let fulls = 0;
+	let probes = 0;
+	const h = harness(
+		async () => {
+			fulls++;
+			return fulls === 5 ? "success" : "retryable";
+		},
+		async () => {
+			probes++;
+			return probes === 1 ? "retryable" : "success";
+		},
+	);
+	try {
+		h.recovery.request("online");
+		await h.clock.advance(500 + 5000 + 15000 + 60000);
+		assert.equal(fulls, 4);
+		await h.clock.advance(300000 - 1);
+		assert.equal(probes, 0);
+		await h.clock.advance(1);
+		assert.equal(probes, 1);
+		assert.equal(fulls, 4);
+		await h.clock.advance(299999);
+		assert.equal(probes, 1);
+		h.context.visible = false;
+		h.recovery.notifyActivityChanged();
+		h.context.visible = true;
+		h.recovery.notifyActivityChanged();
+		await h.clock.advance(500);
+		assert.equal(probes, 2);
+		assert.equal(fulls, 5);
+		assert.equal(h.recovery.canStartAutomatic(), true);
+	} finally {
+		h.recovery.dispose();
+	}
+});
+
+test("successful metadata probe reacquires admission before a full", async () => {
+	for (const interruption of ["connection", "native-write"] as const) {
+		const gate = deferred<MobileRecoveryOutcome>();
+		let fulls = 0;
+		const h = harness(
+			async () => {
+				fulls++;
+				return fulls === 5 ? "success" : "retryable";
+			},
+			() => gate.promise,
+		);
+		try {
+			h.recovery.request("online");
+			await h.clock.advance(500 + 5000 + 15000 + 60000 + 300000);
+			assert.equal(fulls, 4);
+			if (interruption === "connection") {
+				h.context.generation++;
+			} else {
+				h.context.native.writes = 1;
+			}
+			h.recovery.notifyActivityChanged();
+			gate.resolve("success");
+			await h.clock.advance(0);
+			assert.equal(fulls, 4, interruption);
+			if (interruption === "native-write") {
+				h.context.native.writes = 0;
+				h.recovery.notifyActivityChanged();
+				await h.clock.advance(500);
+				assert.equal(fulls, 5);
+			}
+		} finally {
+			gate.resolve("success");
+			h.recovery.dispose();
+		}
+	}
+});
+
+test("online signal during a failed metadata read schedules a prompt recheck", async () => {
+	const gate = deferred<MobileRecoveryOutcome>();
+	let probes = 0;
+	const h = harness(
+		async () => "retryable",
+		async () => {
+			probes++;
+			return probes === 1 ? gate.promise : "retryable";
+		},
+	);
+	try {
+		h.recovery.request("online");
+		await h.clock.advance(500 + 5000 + 15000 + 60000 + 300000);
+		assert.equal(probes, 1);
+		h.recovery.request("online");
+		gate.resolve("retryable");
+		await h.clock.advance(0);
+		await h.clock.advance(500);
+		assert.equal(probes, 2);
+		await h.clock.advance(300000 - 1);
+		assert.equal(probes, 2);
+		await h.clock.advance(1);
+		assert.equal(probes, 3);
+	} finally {
+		gate.resolve("retryable");
+		h.recovery.dispose();
+	}
+});
+
+test("OAuth cooldown delays recovery without consuming a retry attempt", async () => {
+	let runs = 0;
+	const h = harness(async () => {
+		runs++;
+		return "success";
+	});
+	try {
+		h.recovery.request("online");
+		h.context.cooldownUntil = h.clock.now + 30000;
+		h.recovery.request("schedule");
+		await h.clock.advance(29999);
+		assert.equal(runs, 0);
+		await h.clock.advance(1);
+		assert.equal(runs, 1);
+		assert.equal(h.recovery.canStartAutomatic(), true);
+	} finally {
+		h.recovery.dispose();
+	}
+});
+
+test("manual full waits for native write settlement even when automation is disabled", async () => {
+	let manualRuns = 0;
+	const h = harness(
+		async () => "success",
+		undefined,
+		async () => {
+			manualRuns++;
+			return null;
+		},
+	);
+	try {
+		h.context.enabled = false;
+		h.context.native.writes = 1;
+		h.recovery.notifyActivityChanged();
+		const first = h.recovery.requestManual();
+		const duplicate = h.recovery.requestManual();
+		assert.equal(first, duplicate);
+		await h.clock.advance(61000);
+		assert.equal(manualRuns, 0);
+		h.context.native.writes = 0;
+		h.recovery.notifyActivityChanged();
+		await h.clock.advance(0);
+		await first;
+		assert.equal(manualRuns, 1);
+		h.context.cooldownUntil = h.clock.now + 30000;
+		const cancelled = h.recovery.requestManual();
+		assert.equal(h.recovery.getPresentation()?.phase, "backoff");
+		h.context.generation++;
+		h.recovery.notifyActivityChanged();
+		assert.equal(await cancelled, null);
+		h.recovery.notifyActivityChanged();
+		await h.clock.advance(0);
+		assert.equal(manualRuns, 1);
+	} finally {
+		h.recovery.dispose();
+	}
+});
 
 test("mobile return waits for old host and native settlement and coalesces duplicate signals", async () => {
 	const entered = deferred<MobileRecoveryOutcome>();
@@ -131,6 +301,12 @@ test("mobile recovery backoff is bounded and noisy activity does not reset its b
 		for (const delay of [5000, 15000, 60000]) {
 			h.recovery.request("online");
 			h.recovery.notifyActivityChanged();
+			if (delay === 5000) {
+				h.context.visible = false;
+				h.recovery.notifyActivityChanged();
+				h.context.visible = true;
+				h.recovery.notifyActivityChanged();
+			}
 			await h.clock.advance(delay - 1);
 			assert.equal(
 				starts.length,
@@ -237,7 +413,12 @@ import { Platform } from "obsidian";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 
 test("mobile host waits for a real old full then uses a new invocation and saves completion", async (t) => {
-	for (const source of ["host", "scheduler", "cold-hidden"] as const) {
+	for (const source of [
+		"host",
+		"manual-active",
+		"scheduler",
+		"cold-hidden",
+	] as const) {
 		const make = managedDevices(t);
 		const a = make(new MemoryDisk(), "mobile-host", null);
 		await a.full();
@@ -291,6 +472,12 @@ test("mobile host waits for a real old full then uses a new invocation and saves
 		const entered = deferred();
 		const release = deferred();
 		let sessions = 0;
+		let nativeWrites = 0;
+		const originalNative = a.client.getNativeRequestActivity.bind(a.client);
+		a.client.getNativeRequestActivity = () => ({
+			...originalNative(),
+			writes: nativeWrites,
+		});
 		a.engine.onSyncPause(async () => {
 			if (++sessions === 1) {
 				entered.resolve();
@@ -322,7 +509,9 @@ test("mobile host waits for a real old full then uses a new invocation and saves
 			const old =
 				source === "host"
 					? plugin.runFullSync({ trigger: "automatic" }, false)
-					: a.engine.fullSync({ trigger: "automatic" });
+					: source === "manual-active"
+						? plugin.runFullSync({ trigger: "manual" })
+						: a.engine.fullSync({ trigger: "automatic" });
 			await entered.promise;
 			doc.visibilityState = "hidden";
 			doc.dispatchEvent(new Event("visibilitychange"));
@@ -335,9 +524,25 @@ test("mobile host waits for a real old full then uses a new invocation and saves
 				source === "scheduler"
 					? plugin.runFullSync(undefined, false)
 					: undefined;
+			let repeatedManual:
+				ReturnType<typeof plugin.runFullSync> | undefined;
+			if (source === "host" || source === "manual-active") {
+				nativeWrites = 1;
+				repeatedManual = plugin.runFullSync({ trigger: "manual" });
+			}
 			await new Promise((resolve) => setTimeout(resolve, 0));
 			release.resolve();
-			await old;
+			const oldResult = await old;
+			nativeWrites = 0;
+			plugin["mobileRecovery"]?.notifyActivityChanged();
+			if (repeatedManual) {
+				const repeatedResult = await repeatedManual;
+				if (source === "manual-active") {
+					assert.equal(repeatedResult, oldResult);
+				} else {
+					assert.notEqual(repeatedResult, oldResult);
+				}
+			}
 			await joined;
 			await new Promise((resolve) => setTimeout(resolve, 650));
 			assert.equal(
@@ -354,6 +559,7 @@ test("mobile host waits for a real old full then uses a new invocation and saves
 			await a.assertSettled({ "Edit.md": "edit during suspension" });
 		} finally {
 			release.resolve();
+			a.client.getNativeRequestActivity = originalNative;
 			plugin["mobileRecovery"]?.dispose();
 			for (const cleanup of cleanups.reverse()) {
 				cleanup();

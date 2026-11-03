@@ -3,6 +3,7 @@ import type { RemoteAuthorityObservation } from "./canonical/manager";
 import { VaultAdapter } from "../api/vault-adapter";
 import { YandexDiskClient } from "../api/yandex-client";
 import type { FailureSummary, RetryProgress } from "../errors";
+import { isConcurrentSyncChange } from "../errors";
 import { t } from "../i18n";
 import type {
 	SyncPhase,
@@ -14,6 +15,7 @@ import type {
 } from "../types";
 import { INITIAL_SYNC_STATE } from "../types";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
+import { getAncestorDirectories } from "../utils/path-utils";
 import {
 	IndexManager,
 	type CanonicalReadSession,
@@ -98,7 +100,30 @@ export class SyncEngine {
 	private pauseGeneration = 0;
 	private coordinator: SyncCoordinator;
 	private uiOwnerSessionId: string | null = null;
-	private expectedWatcherEvents = new Map<string, number>();
+	private sessionOutcomes = new Map<
+		string,
+		{
+			outcome: NonNullable<SyncState["lastOutcome"]>;
+			failure?: FailureSummary;
+		}
+	>();
+	private expectedWatcherEvents = new Map<
+		string,
+		Set<{ consumed: boolean }>
+	>();
+	private watcherBoundary: Record<string, string> = {};
+
+	/** Capture the observer's exact durable boundary without owning its event queue. */
+	setWatcherBoundary(boundary: Record<string, string>): void {
+		this.watcherBoundary = { ...boundary };
+	}
+
+	/** Share synchronous observation guards with the existing local mutation adapter. */
+	setLocalObservationReader(
+		read: (paths: readonly string[]) => number,
+	): void {
+		this.vaultAdapter.setLocalObservationReader(read);
+	}
 	private realtimeGuardValidationToken: string | undefined;
 	private epochReplacementPending = false;
 
@@ -195,6 +220,12 @@ export class SyncEngine {
 			},
 			get watcherCutoff() {
 				return readPorts().watcherCutoff;
+			},
+			get watcherBoundary() {
+				return readPorts().watcherBoundary;
+			},
+			get hasLocalChanges() {
+				return readPorts().hasLocalChanges;
 			},
 			get retireWatcherEvents() {
 				return readPorts().retireWatcherEvents;
@@ -396,19 +427,22 @@ export class SyncEngine {
 		action: "upload" | "delete" | "rename",
 	): boolean {
 		const key = `${action}:${path}`;
-		const count = this.expectedWatcherEvents.get(key) ?? 0;
-		if (count <= 0) {
-			return false;
+		const receipts = this.expectedWatcherEvents.get(key);
+		const receipt =
+			receipts && [...receipts].find((value) => !value.consumed);
+		if (!receipts || !receipt) {
+			return (
+				action === "delete" &&
+				[...getAncestorDirectories([path])].some((parent) =>
+					this.expectedWatcherEvents.has(`delete:${parent}`),
+				)
+			);
 		}
-		if (count === 1) {
-			this.expectedWatcherEvents.delete(key);
-		} else {
-			this.expectedWatcherEvents.set(key, count - 1);
-		}
+		receipt.consumed = true;
 		logger.debug("Suppressed internal watcher event", {
 			action,
 			path,
-			remainingExpectedEvents: Math.max(0, count - 1),
+			remainingExpectedEvents: receipts.size,
 		});
 		return true;
 	}
@@ -416,17 +450,28 @@ export class SyncEngine {
 	private expectWatcherEvent(
 		path: string,
 		action: "upload" | "delete" | "rename",
-	): void {
+	): () => void {
 		const key = `${action}:${path}`;
-		this.expectedWatcherEvents.set(
-			key,
-			(this.expectedWatcherEvents.get(key) ?? 0) + 1,
-		);
+		const receipts =
+			this.expectedWatcherEvents.get(key) ??
+			new Set<{ consumed: boolean }>();
+		const receipt = { consumed: false };
+		receipts.add(receipt);
+		this.expectedWatcherEvents.set(key, receipts);
 		logger.debug("Registered expected internal watcher event", {
 			action,
 			path,
-			expectedEvents: this.expectedWatcherEvents.get(key),
+			expectedEvents: receipts.size,
 		});
+		return () => {
+			receipts.delete(receipt);
+			if (
+				receipts.size === 0 &&
+				this.expectedWatcherEvents.get(key) === receipts
+			) {
+				this.expectedWatcherEvents.delete(key);
+			}
+		};
 	}
 
 	/**
@@ -477,6 +522,10 @@ export class SyncEngine {
 		this.uiOwnerSessionId = sessionId;
 		this.updateState({
 			status: "syncing",
+			lastOutcome:
+				sessionKind === "maintenance"
+					? this.state.lastOutcome
+					: undefined,
 			errorMessage: undefined,
 			retry: undefined,
 			failure: undefined,
@@ -558,13 +607,22 @@ export class SyncEngine {
 		success: boolean,
 		error?: unknown,
 	): void {
+		const recorded = this.sessionOutcomes.get(session.id);
+		this.sessionOutcomes.delete(session.id);
 		if (this.uiOwnerSessionId !== session.id) {
 			return;
 		}
 		this.uiOwnerSessionId = null;
 		const activeBlock = this.getHighestPriorityExternalBlock();
 		const failed =
-			!success || (this.state.status === "error" && !activeBlock);
+			!success ||
+			recorded?.outcome === "error" ||
+			(this.state.status === "error" && !activeBlock);
+		const outcome =
+			failed || activeBlock
+				? "error"
+				: (recorded?.outcome ??
+					(session.kind === "maintenance" ? "success" : "deferred"));
 		const terminalFailure =
 			error instanceof Error
 				? syncErrors.createSyncFailure(error, {
@@ -572,21 +630,34 @@ export class SyncEngine {
 						action: "unknown",
 					}).summary
 				: (activeBlock?.failure ??
+					recorded?.failure ??
 					(failed ? this.state.failure : undefined));
 		this.updateState({
 			status: this.isPaused
 				? "paused"
 				: (activeBlock?.status ?? (failed ? "error" : "idle")),
 			failure: terminalFailure,
+			lastOutcome:
+				session.kind === "maintenance" && outcome === "success"
+					? this.state.lastOutcome === "deferred"
+						? "deferred"
+						: undefined
+					: outcome,
 			lastSyncTime:
-				!failed && !activeBlock ? Date.now() : this.state.lastSyncTime,
+				outcome === "success" && session.kind !== "maintenance"
+					? Date.now()
+					: this.state.lastSyncTime,
 			errorMessage:
 				error instanceof Error
 					? syncErrors.formatOperationFailure(terminalFailure!)
 					: activeBlock
 						? activeBlock.reason
 						: failed
-							? this.state.errorMessage
+							? terminalFailure
+								? syncErrors.formatOperationFailure(
+										terminalFailure,
+									)
+								: this.state.errorMessage
 							: undefined,
 			sessionId: undefined,
 			sessionKind: undefined,
@@ -596,6 +667,40 @@ export class SyncEngine {
 			progress: undefined,
 			retry: undefined,
 		});
+	}
+
+	/** Record domain completion separately from promise fulfillment and UI ownership. */
+	private recordSessionOutcome(
+		sessionId: string,
+		pending: boolean,
+		failure?: FailureSummary,
+	): void {
+		this.sessionOutcomes.set(sessionId, {
+			outcome: failure ? "error" : pending ? "deferred" : "success",
+			failure,
+		});
+	}
+
+	/** Retained rename or folder work cannot publish a successful exchange. */
+	private recordMutationOutcome(
+		sessionId: string,
+		results: readonly (FileRenameOutcome | FolderMutationOutcome)[],
+	): void {
+		this.recordSessionOutcome(
+			sessionId,
+			results.length === 0 ||
+				results.some(
+					(result) =>
+						result.status === "retry" ||
+						("requiresFullSync" in result &&
+							Boolean(result.requiresFullSync)) ||
+						("requiresUserAction" in result &&
+							Boolean(result.requiresUserAction)) ||
+						("unresolved" in result &&
+							(result.unresolved ?? 0) > 0),
+				),
+			results.find((result) => result.retryFailure)?.retryFailure,
+		);
 	}
 
 	/** Capture cancellation across startup reads before coordinator admission, including pause/resume ABA. */
@@ -719,6 +824,7 @@ export class SyncEngine {
 							result.deleted += applied.deleted;
 							result.errors.push(...applied.errors);
 							if (!applied.completed) {
+								result.deferred = applied.errors.length === 0;
 								return;
 							}
 							result.replacementCommitted = true;
@@ -864,7 +970,9 @@ export class SyncEngine {
 							options.forceReplacement.backupMode,
 						);
 						result.replacementCommitted = applied.completed;
-						result.epochAdopted = true;
+						result.epochAdopted = applied.completed;
+						result.deferred =
+							!applied.completed && applied.errors.length === 0;
 						result.uploaded = applied.uploaded;
 						result.deleted = applied.deleted;
 						result.errors.push(...applied.errors);
@@ -906,7 +1014,9 @@ export class SyncEngine {
 							options.forceReplacement.backupMode,
 						);
 						result.replacementCommitted = applied.completed;
-						result.epochAdopted = true;
+						result.epochAdopted = applied.completed;
+						result.deferred =
+							!applied.completed && applied.errors.length === 0;
 						result.downloaded = applied.downloaded;
 						result.deleted = applied.deleted;
 						result.errors.push(...applied.errors);
@@ -1049,11 +1159,25 @@ export class SyncEngine {
 				},
 				{
 					settle: async (outcome, session) => {
-						if (outcome.status === "fulfilled" && !windowsSettled) {
-							await settle?.(outcome.value, {
-								sessionId: session.id,
-								kind: session.kind,
-							});
+						if (outcome.status === "fulfilled") {
+							if (!windowsSettled) {
+								await settle?.(outcome.value, {
+									sessionId: session.id,
+									kind: session.kind,
+								});
+							}
+							const result = outcome.value;
+							this.recordSessionOutcome(
+								session.id,
+								result.retry.length > 0 ||
+									Boolean(result.requiresFullSync) ||
+									this.epochReplacementPending ||
+									result.uploadReceipts.some(
+										(receipt) =>
+											receipt.status === "pending-put",
+									),
+								result.retryFailure,
+							);
 						}
 					},
 				},
@@ -1093,6 +1217,10 @@ export class SyncEngine {
 								sessionId: session.id,
 								kind: session.kind,
 							});
+							this.recordMutationOutcome(
+								session.id,
+								result.value.map((item) => item.outcome),
+							);
 						}
 					},
 				},
@@ -1138,6 +1266,9 @@ export class SyncEngine {
 								sessionId: session.id,
 								kind: session.kind,
 							});
+							this.recordMutationOutcome(session.id, [
+								outcome.value,
+							]);
 						}
 					},
 				},
@@ -1154,15 +1285,22 @@ export class SyncEngine {
 		path: string,
 		context: WatcherCausalContext = this.getWatcherCausalContext(),
 		onPrepared?: (outcome: FolderMutationOutcome) => void | Promise<void>,
+		settle?: (outcome: FolderMutationOutcome) => void | Promise<void>,
 	): Promise<FolderMutationOutcome> {
-		return await this.enqueueRealtime(async () => {
-			return await folderMutations.deleteFolderNow(
-				this.folderMutationsDependencies(),
-				path,
-				context,
-				onPrepared,
-			);
-		});
+		return await this.enqueueRealtime(
+			async () => {
+				return await folderMutations.deleteFolderNow(
+					this.folderMutationsDependencies(),
+					path,
+					context,
+					onPrepared,
+				);
+			},
+			async (result, sessionId) => {
+				await settle?.(result);
+				this.recordMutationOutcome(sessionId, [result]);
+			},
+		);
 	}
 
 	/**
@@ -1173,16 +1311,23 @@ export class SyncEngine {
 		newPath: string,
 		context: WatcherCausalContext = this.getWatcherCausalContext(),
 		onPrepared?: (outcome: FolderMutationOutcome) => void | Promise<void>,
+		settle?: (outcome: FolderMutationOutcome) => void | Promise<void>,
 	): Promise<FolderMutationOutcome> {
-		return await this.enqueueRealtime(async () => {
-			return await folderMutations.renameFolderNow(
-				this.folderMutationsDependencies(),
-				oldPath,
-				newPath,
-				context,
-				onPrepared,
-			);
-		});
+		return await this.enqueueRealtime(
+			async () => {
+				return await folderMutations.renameFolderNow(
+					this.folderMutationsDependencies(),
+					oldPath,
+					newPath,
+					context,
+					onPrepared,
+				);
+			},
+			async (result, sessionId) => {
+				await settle?.(result);
+				this.recordMutationOutcome(sessionId, [result]);
+			},
+		);
 	}
 
 	/**
@@ -1201,19 +1346,24 @@ export class SyncEngine {
 		};
 	}
 
-	private async enqueueRealtime<T>(task: () => Promise<T>): Promise<T> {
+	private async enqueueRealtime<T>(
+		task: () => Promise<T>,
+		classify?: (result: T, sessionId: string) => void | Promise<void>,
+	): Promise<T> {
 		return await this.coordinator.run("realtime", async () => {
 			this.setSyncPhase("applying", t("status.op.applying_realtime"));
-			return await task();
+			const result = await task();
+			await classify?.(result, this.coordinator.getActiveSession()!.id);
+			return result;
 		});
 	}
 
 	/** Dispatch a session while allowing an owned maintenance body to nest. */
-	private async runCoordinatedSession<T>(
+	private async runCoordinatedSession(
 		kind: SyncSessionKind,
 		options: SyncRunOptions | undefined,
-		run: () => Promise<T>,
-	): Promise<T> {
+		run: () => Promise<SyncResult>,
+	): Promise<SyncResult> {
 		if (
 			options?.skipMaintenanceGuard &&
 			this.coordinator.getActiveKind() === "maintenance"
@@ -1230,6 +1380,16 @@ export class SyncEngine {
 			: undefined;
 		try {
 			return await this.coordinator.run(kind, run, {
+				settle: (settlement, session) => {
+					if (settlement.status === "fulfilled") {
+						const result = settlement.value;
+						this.recordSessionOutcome(
+							session.id,
+							!result.success || Boolean(result.deferred),
+							result.failure,
+						);
+					}
+				},
 				prepare: async (session) => {
 					preparedSessionId = session.id;
 					if (kind !== "full") {
@@ -1432,7 +1592,17 @@ export class SyncEngine {
 				await body(result, startTime, guard.validationToken);
 			}
 
-			if (result.errors.length === 0) {
+			if (
+				result.errors.length > 0 &&
+				result.errors.every((error) =>
+					isConcurrentSyncChange(error.failureCause),
+				)
+			) {
+				result.errors = [];
+				result.deferred = true;
+				await this.indexSaveCallback?.();
+			}
+			if (result.errors.length === 0 && !result.deferred) {
 				assertCurrent?.();
 				if (
 					result.epochAdopted &&
@@ -1450,7 +1620,7 @@ export class SyncEngine {
 				);
 				assertCurrent?.();
 			}
-			result.success = result.errors.length === 0;
+			result.success = result.errors.length === 0 && !result.deferred;
 			if (result.success) {
 				if (!options?.authoritativeEncryption) {
 					this.indexManager.markRemoteObserved();
@@ -1464,6 +1634,7 @@ export class SyncEngine {
 			await this.notifySyncResumeCallbacks({
 				...lifecycleContext,
 				success: result.success,
+				deferred: result.deferred,
 				epochAdopted: result.success && result.epochAdopted,
 			});
 			result.endTime = Date.now();
@@ -1471,14 +1642,13 @@ export class SyncEngine {
 
 			if (!guard.blockReason) {
 				this.updateState({
-					status: result.success ? "syncing" : "error",
-					lastSyncTime: result.success
-						? result.endTime
-						: this.state.lastSyncTime,
+					status:
+						result.success || result.deferred ? "syncing" : "error",
 					failure: result.failure,
-					errorMessage: result.success
-						? undefined
-						: syncErrors.formatSyncErrorSummary(result.errors),
+					errorMessage:
+						result.success || result.deferred
+							? undefined
+							: syncErrors.formatSyncErrorSummary(result.errors),
 				});
 			}
 
@@ -1503,7 +1673,12 @@ export class SyncEngine {
 					errors: result.errors.length,
 				},
 			};
-			if (result.success) {
+			if (result.deferred) {
+				logger.info(
+					"Sync reconciliation deferred after concurrent changes",
+					diagnosticResult,
+				);
+			} else if (result.success) {
 				logger.info(logMessage(result), diagnosticResult);
 			} else {
 				logger.warn(
@@ -1514,6 +1689,34 @@ export class SyncEngine {
 
 			return result;
 		} catch (e) {
+			if (isConcurrentSyncChange(e)) {
+				result.success = false;
+				result.deferred = true;
+				result.endTime = Date.now();
+				await this.indexSaveCallback?.();
+				this.updateState({
+					status: "syncing",
+					failure: undefined,
+					errorMessage: undefined,
+				});
+				logger.info(
+					"Sync reconciliation deferred after concurrent changes",
+					{
+						...this.getDiagnosticSnapshot(),
+						durationMs: result.endTime - startTime,
+						success: false,
+						transport: this.diffRequestMetrics(
+							transportBefore,
+							this.yandexClient.getTransportMetrics?.(),
+						),
+						apiReads: this.diffRequestMetrics(
+							apiReadsBefore,
+							this.yandexClient.getApiReadMetrics?.(),
+						),
+					},
+				);
+				return result;
+			}
 			if (
 				this.coordinator.getActiveKind() === "force" &&
 				options?.forceReplacement &&
@@ -1556,10 +1759,12 @@ export class SyncEngine {
 			return result;
 		} finally {
 			this.isSyncing = false;
+			this.expectedWatcherEvents.clear();
 			if (!resumeAttempted) {
 				await this.notifySyncResumeCallbacks({
 					...lifecycleContext,
 					success: false,
+					deferred: result.deferred,
 				});
 			}
 		}
@@ -1774,6 +1979,9 @@ export class SyncEngine {
 			expectWatcherEvent: this.workflowWatcherEvent,
 			setSyncPhase: this.workflowPhase,
 			onOperationError: (error) => {
+				if (isConcurrentSyncChange(error.failureCause)) {
+					return;
+				}
 				if (!this.state.errorMessage) {
 					this.updateState({
 						failure: error.failure,
@@ -1921,6 +2129,7 @@ export class SyncEngine {
 		const getIndexSaveCallback = () => this.indexSaveCallback;
 		const getIsPaused = () => this.isPaused;
 		return {
+			watcherBoundary: this.watcherBoundary,
 			canonicalReadSession,
 			decideEpochAdoption: (epoch) =>
 				this.epochAdoptionDecision?.(epoch) ?? Promise.resolve(null),

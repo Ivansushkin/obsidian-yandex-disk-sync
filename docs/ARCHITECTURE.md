@@ -149,6 +149,11 @@ observed-state save → resume/ACK до освобождения coordinator. Lo
 перекрываются, но обе ветви завершаются до classification. Любой неполный local
 read/hash или remote listing — ошибка, никогда не пустое дерево.
 
+Только ordinary full запрашивает проекцию metadata при remote inventory. Неполная
+страница или отказ API по `fields` перечитывается без проекции и отключает её до
+конца обхода. Повторно неполный ответ блокирует reconciliation; Force, backup и
+encryption используют полный ответ API.
+
 Pristine device сначала получает live cloud paths и exact tombstones с protective
 copies; partial baselines переживают restart, но не разрешают watcher publication.
 После coherent receive обычный full загружает unknown local-only файлы. Established
@@ -307,13 +312,13 @@ POST и single-flight refresh. Refresh token и срок действия сох
 в локальном auth tuple через общую persistence queue; смена grant или
 connection запрещает публикацию старого ответа. Сборка получает общий Client
 Secret из локальной `.env` или CI и включает его в bundle. Перед сетевой
-работой истекающий OAuth-доступ обновляется, включая cold startup, mobile
+работой истекающий OAuth-доступ обновляется, включая cold startup, lifecycle
 recovery и scheduled full; 401 в этих потоках и realtime вызывает отдельный
 refresh и один повторный запуск через существующую очередь с новой startup
-invocation. Временный сбой refresh сохраняет работу и через 30 s запускает
-автоматический full после успешного обновления, если допускают lifecycle и
-конфигурация. Временная ошибка Диска в этом full оставляет recovery pending
-до следующей попытки; mobile hidden откладывает её без OAuth POST. Resume обновляет token под сохранённой pause, а automation
+invocation. Временный сбой refresh сохраняет работу и передаёт cooldown общему
+recovery-контроллеру; до его истечения новый OAuth POST не создаётся. Временная
+ошибка Диска в последующем full оставляет recovery pending. Hidden откладывает
+автоматическую попытку без OAuth POST. Resume обновляет token под сохранённой pause, а automation
 возобновляет только после успешного full. Backup и Force при ошибке остаются
 явными пользовательскими операциями.
 `main.ts` связывает transport, lifecycle, UI и существующий full; не выполняет
@@ -384,8 +389,25 @@ admission и busy bypass.
 
 `getSyncPresentation` вычисляет один приоритет и текст для плашки и settings Notice:
 Force → engine activity → foreground → connection → full → terminal/idle.
-Плашка показывает все статусы; один `SettingsStatusNotice` зеркалит её только
-в открытой вкладке настроек плагина. Idle/hide/другая вкладка/unload снимают зеркало;
+Итог engine привязан к ID сессии и публикуется после settlement: исполненная
+Promise сама по себе не доказывает успех. `SyncState.lastOutcome` — неперсистентный
+`success`/`deferred`/`error`; retained realtime work, pending-put receipts и запрос
+full дают deferred, а `retryFailure` сохраняется как terminal error. Ошибка
+settlement исключает success. Folder delete/rename ждут watcher ACK/save внутри
+той же coordinator-сессии; callback подготовки intent остаётся отдельным.
+Вложенные сессии не подменяют владельца UI.
+Время «Последний успешный обмен» обновляется только после успешного full, Force
+или realtime; deferred, partial/error и maintenance (включая вложенный full) его
+не меняют; успешное maintenance также сохраняет прежний deferred. Deferred показывает остаток работы с нейтральной иконкой и прежним
+временем успеха; только следующий успешный обмен заменяет этот итог.
+Mobile recovery заменяет основной статус только без активного внешнего workflow,
+паузы, admission/auth блока или неповторяемой ошибки; иначе остаётся подробностью.
+Информационная подробность recovery не создаёт error icon. Доступное название
+плашки использует тот же текст, прогресс и причину, включая authorization/manual Sync.
+
+При включённой локальной настройке плашка показывает все статусы. Один
+`SettingsStatusNotice` отображается внутри вкладки настроек плагина и использует ту же presentation независимо от видимости плашки. Обычный idle/hide/другая вкладка/unload снимают зеркало; глобальный Obsidian Notice для процессуального статуса не создаётся; завершившийся сбой full/realtime вне настроек показывается отдельно, повтор одинаковой причины подавляется до успешного обмена;
+idle с deferred остаётся видимым до следующей операции;
 reopen читает live state, re-render и поздние результаты не создают дубликатов.
 Ошибки preflight, settings drain и backup вне engine state хранятся в памяти как
 presentation issue: admission не меняется, ошибка очищается при следующем запуске
@@ -437,12 +459,12 @@ Capacity timeout отличается от native timeout; late reply помеч
 двухпрофильный прогон — [SMOKE_TESTS.md](SMOKE_TESTS.md). Unit results не
 подтверждают ручную приёмку.
 
-## Mobile lifecycle recovery
+## Lifecycle recovery
 
-`MobileSyncRecovery` управляет только admission и одним runtime recovery request
-на Android/iOS (`Platform.isMobileApp`). `main.ts` связывает browser events и live
+`MobileSyncRecovery` управляет admission и одним runtime recovery request
+на desktop и Android/iOS. `main.ts` связывает browser events и live
 ports с существующим full; единственный `SyncCoordinator`, persistence и canonical
-protocol не меняются. Desktop не получает новую lifecycle policy.
+protocol не меняются. Desktop focus после длинной паузы также запускает проверку.
 
 Hidden запрещает новые automatic workflows, но admitted workflow, включая full
 preparation, завершается по прежним guards. Watcher остаётся подписан и сохраняет
@@ -466,10 +488,19 @@ requests; старый full promise не используется как нов�
 Recovery использует новую invocation, manifest/canonical observations и budgets.
 После transient transport failure — до трёх outer retries через 5/15/60 s после
 settlement, только в visible состоянии. Повторные hints не обнуляют текущий budget;
-после исчерпания нужны новый return/online/schedule или manual full. Access, local,
+после исчерпания выполняется редкий metadata GET через 5 минут; полный sync
+возобновляется только после успешного probe. Новый return/online может ускорить
+проверку. Access, local,
 unknown и semantic/safety failures не получают automatic retry. Pending запрос
 отзывается при смене configuration generation (включая ABA), pause, отключении
 автоматики и unload; позднее завершение не закрывает request нового поколения.
+Ручной full допускается и при отключённой автоматике, но ожидает прежний native
+write и OAuth cooldown. Повторные нажатия объединяются; смена конфигурации,
+pause и unload отзывают ожидание. Realtime сообщает контроллеру причину только
+после сохранения неразрешённого события в durable queue; семантический retry
+не считается сетевой ошибкой. Временный startup/manifest read до начала
+transition не устанавливает постоянный block; ошибка после начала transition
+остаётся в его отдельном recovery.
 
 `YandexDiskClient` хранит только runtime count/start time native reads/writes до
 их реального settlement. Отмена caller wait не освобождает native permit и не
@@ -485,3 +516,17 @@ freeze, ни unload callback не считаются гарантированн�
 storage/remote read никогда не означает пустое дерево. Новые правила проверяются
 в `tests/mobile-recovery.test.ts`; реальная Android/iOS приёмка —
 `TC-MOBILE-RECOVERY-01`; до неё ручная приёмка остаётся невыполненной.
+
+## Локальные изменения во время sync
+
+Coordinator сериализует все session kinds. Pause сохраняет наблюдение, а временный
+observer-only не включает realtime. Raw event generations защищают native mutation
+через await; internal-event receipt снимается после settlement. Concurrent drift
+даёт deferred без success/ACK. `sync/files/move-predecessors.ts` закрывает puts
+перед move в исходном FIFO.
+
+Authoritative replacement фиксирует проверенные per-file версии; поздняя локальная
+правка не отменяет проверку remote target после commit. Foreign receive хранит
+[device-local receipt](LOCAL_REPLACEMENT_RECOVERY.md) и передаёт retained differences
+ordinary sync. Force сохраняет поздние local events и отличает подтверждённое
+исчезновение source от read/authentication failure. Remote schema не меняется.

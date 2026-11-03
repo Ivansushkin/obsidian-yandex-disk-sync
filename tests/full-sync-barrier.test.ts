@@ -120,6 +120,7 @@ function createHarness(encrypted: boolean) {
 	const engine = new SyncEngine(
 		yandexClient as unknown as YandexDiskClient,
 		{
+			setLocalObservationReader: () => {},
 			shouldSync: () => true,
 			fileExists: (path: string) => vaultFiles.has(path),
 		} as unknown as VaultAdapter,

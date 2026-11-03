@@ -8,6 +8,8 @@ import { planFolderMove, stageFolderMove } from "../files/folder-mutations";
 import { pruneRemoteFolders } from "../files/operations";
 import { executeGuardedRemoteMove } from "../files/remote-moves";
 import { stageFileMove, type Dependencies } from "../files/rename";
+import { createSyncFailure } from "../errors";
+import type { FailureSummary } from "../../errors";
 import {
 	saveMoveCompletionBestEffort,
 	saveRemoteIndexBestEffort,
@@ -279,7 +281,19 @@ export async function renameBatchNow(
 			}
 		}
 		await deps.indexSaveCallback?.();
-		if (!(await saveRemoteIndexBestEffort(deps.syncReconciliation))) {
+		let commitFailure: FailureSummary | undefined;
+		if (
+			!(await saveRemoteIndexBestEffort(
+				deps.syncReconciliation,
+				undefined,
+				(failure) => {
+					commitFailure = failure;
+				},
+			))
+		) {
+			for (const item of outcomes) {
+				item.outcome.retryFailure = commitFailure;
+			}
 			return outcomes;
 		}
 		confirmedCommits++;
@@ -340,6 +354,13 @@ export async function renameBatchNow(
 		);
 		const failed = results.find((result) => result.status === "rejected");
 		if (failed?.status === "rejected") {
+			const failure = createSyncFailure(failed.reason, {
+				stage: "realtime-rename-physical",
+				action: "write",
+			}).summary;
+			for (const item of outcomes) {
+				item.outcome.retryFailure ??= failure;
+			}
 			logger.warn("Rename batch physical work remains pending", {
 				error: failed.reason,
 			});
@@ -378,7 +399,18 @@ export async function renameBatchNow(
 		for (const item of completed) {
 			index.completeMove(item.mutation!.id);
 		}
-		if (!(await saveMoveCompletionBestEffort(deps.syncReconciliation))) {
+		commitFailure = undefined;
+		if (
+			!(await saveMoveCompletionBestEffort(
+				deps.syncReconciliation,
+				(failure) => {
+					commitFailure = failure;
+				},
+			))
+		) {
+			for (const item of outcomes) {
+				item.outcome.retryFailure ??= commitFailure;
+			}
 			return outcomes;
 		}
 		confirmedCommits++;
@@ -398,9 +430,14 @@ export async function renameBatchNow(
 		);
 		return outcomes;
 	} catch (error) {
+		const failure = createSyncFailure(error, {
+			stage: "realtime-rename",
+			action: "write",
+		}).summary;
 		for (const item of outcomes) {
 			item.outcome.status = "retry";
 			item.outcome.reason = "rename-batch-unresolved";
+			item.outcome.retryFailure = failure;
 		}
 		logger.warn("Rename batch remains durable", { error });
 		return outcomes;

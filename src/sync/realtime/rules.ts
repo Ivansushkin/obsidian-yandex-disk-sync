@@ -1,4 +1,5 @@
 import type { FileMetadata, IndexMove, PendingMutation } from "../../types";
+import type { FailureSummary } from "../../errors";
 
 export interface WatcherCausalContext {
 	epoch: string | null;
@@ -51,6 +52,8 @@ export interface RealtimeBatchResult {
 	retry: string[];
 	uploadReceipts: UploadCausalReceipt[];
 	requiresFullSync?: "epoch-replaced";
+	/** Runtime cause for retained work; never persisted with watcher events. */
+	retryFailure?: FailureSummary;
 }
 
 export type FileRenamePlan =
@@ -68,6 +71,7 @@ export interface FileRenameOutcome {
 	/** True once an API read or write may have observed or changed remote state. */
 	remoteStarted: boolean;
 	requiresFullSync?: "epoch-replaced";
+	retryFailure?: FailureSummary;
 }
 
 export interface DurableFileRenameEvent extends WatcherCausalContext {
@@ -126,6 +130,7 @@ export interface FolderMutationOutcome {
 	survivors?: number;
 	unresolved?: number;
 	requiresUserAction?: boolean;
+	retryFailure?: FailureSummary;
 }
 
 export interface FolderRenameReduction {

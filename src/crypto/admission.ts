@@ -2,6 +2,7 @@ import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import { t } from "../i18n/index";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
+import { isMobileRetryableFailure } from "../sync/mobile-recovery";
 import type { RemoteEncryptionManifest } from "../types";
 import { logger } from "../utils/logger";
 import type { EncryptionContext, EncryptionPromptMode } from "./context";
@@ -20,6 +21,8 @@ export interface EncryptionReadyOptions {
 	allowRecovery?: boolean;
 	/** Drop invocation observations before changing codec or entering recovery. */
 	invalidateReads?(): void;
+	/** Mark the point after which transition recovery owns any failure. */
+	onMutationStart?(): void;
 	/** Reject a revoked deferred request before accepting credentials. */
 	assertCurrent?(): void;
 }
@@ -209,6 +212,11 @@ export class EncryptionAdmission {
 		options: EncryptionReadyOptions,
 		knownManifest?: { manifest: RemoteEncryptionManifest | null },
 	): Promise<boolean> {
+		let mutationStarted = false;
+		const markMutation = () => {
+			mutationStarted = true;
+			options.onMutationStart?.();
+		};
 		const origin = {
 			generation: this.automaticGeneration,
 			configuration: this.context.client.getReadConfigurationVersion(),
@@ -254,6 +262,7 @@ export class EncryptionAdmission {
 							return false;
 						}
 						options.invalidateReads?.();
+						markMutation();
 						await this.context.engine.runExclusiveMaintenance(
 							async () => {
 								await this.recovery.recoverRemotePlaintextTargetTransition(
@@ -269,6 +278,7 @@ export class EncryptionAdmission {
 						"Remote encryption manifest gone; auto-disabling local encryption",
 					);
 					options.invalidateReads?.();
+					markMutation();
 					await this.workflow.clearLocalEncryptionState();
 					this.context.ui.disabledRemotely();
 					this.context.ui.stateChanged();
@@ -285,6 +295,7 @@ export class EncryptionAdmission {
 				const recoveryKind =
 					this.controller.getRemoteTargetRecoveryKind(manifest);
 				options.invalidateReads?.();
+				markMutation();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					recoveryKind === "rotate" ? "rotated" : "recover",
@@ -319,6 +330,7 @@ export class EncryptionAdmission {
 					return false;
 				}
 				options.invalidateReads?.();
+				markMutation();
 				return await this.promptForRemoteEncryptionPassword(
 					manifest,
 					hasLocalEncryption ? "rotated" : "connect",
@@ -343,6 +355,7 @@ export class EncryptionAdmission {
 						return false;
 					}
 					options.invalidateReads?.();
+					markMutation();
 					return await this.promptForRemoteEncryptionPassword(
 						manifest,
 						"rotated",
@@ -366,12 +379,14 @@ export class EncryptionAdmission {
 				);
 				return false;
 			}
-			const message = formatOperationFailure(
-				createSyncFailure(e, {
-					stage: "encryption-validation",
-					action: "read",
-				}).summary,
-			);
+			const failure = createSyncFailure(e, {
+				stage: "encryption-validation",
+				action: mutationStarted ? "write" : "read",
+			}).summary;
+			if (!mutationStarted && isMobileRetryableFailure(failure)) {
+				throw e;
+			}
+			const message = formatOperationFailure(failure);
 			logger.warn("Error checking remote encryption state:", {
 				error: e,
 			});

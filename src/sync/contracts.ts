@@ -78,6 +78,11 @@ export interface SyncRunOptions {
 	skipRemoteDeletes?: boolean;
 	/** Only a locally confirmed replacement may overwrite competing target bytes. */
 	authoritativeEncryption?: boolean;
+	/** Persist changed per-file references before an authoritative rewrite dispatches bytes. */
+	capturePhysicalRewriteReference?: (
+		path: string,
+		file?: import("../types").FileMetadata,
+	) => Promise<void>;
 	/** Run after all target files are uploaded and before the canonical commit. */
 	beforeIndexCommit?: () => void | Promise<void>;
 	/** Prove one rewritten target object before it can enter canonical state. */
@@ -118,5 +123,6 @@ export interface SyncLifecycleContext {
 
 export interface SyncLifecycleOutcome extends SyncLifecycleContext {
 	success: boolean;
+	deferred?: boolean;
 	epochAdopted?: boolean;
 }

@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Setting } from "obsidian";
+import { App, Modal, Setting } from "obsidian";
 import { t } from "../i18n";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
 import {
@@ -97,6 +97,22 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 		return password;
 	}
 
+	/** Keep password feedback in its dialog, including when settings are closed. */
+	protected showError(message: string): void {
+		if (!this.errorEl) {
+			this.errorEl = this.contentEl.createEl("p", {
+				cls: "encryption-password-error",
+				attr: { role: "alert" },
+			});
+		}
+		this.errorEl.setText(message);
+		this.errorEl.addClass("is-visible");
+	}
+
+	protected clearDisplayedError(): void {
+		this.errorEl?.removeClass("is-visible");
+	}
+
 	protected getPasswordInput(): HTMLInputElement {
 		return this.passwordInput;
 	}
@@ -134,7 +150,7 @@ abstract class PasswordModal extends ResolvableModal<string | null> {
 							}
 						} catch (error) {
 							if (!this.isSettled()) {
-								new Notice(
+								this.showError(
 									formatOperationFailure(
 										createSyncFailure(error, {
 											stage: "preflight",
@@ -252,6 +268,7 @@ export class VerifyPasswordModal extends PasswordModal {
 
 	private clearError(): void {
 		this.getPasswordInput().removeClass("is-error");
+		this.clearDisplayedError();
 	}
 
 	private setError(): void {
@@ -259,7 +276,7 @@ export class VerifyPasswordModal extends PasswordModal {
 		input.addClass("is-error");
 		input.value = "";
 		input.focus();
-		new Notice(t("notice.encryption_wrong_password"));
+		this.showError(t("notice.encryption_wrong_password"));
 	}
 
 	onOpen(): void {

@@ -39,12 +39,13 @@ export function parseScenarioEvidence(value) {
 	for (const fragment of value.split(";").map((part) => part.trim())) {
 		const firstAuto = fragment.match(/^auto:\s*(.+)$/);
 		if (firstAuto) {
-			const titles = [...firstAuto[1].matchAll(/`([^`]+)`/g)].map(
+			const names = firstAuto[1].replace(/\s+\([^()`\r\n]+\)$/, "");
+			const titles = [...names.matchAll(/`([^`]+)`/g)].map(
 				(match) => match[1],
 			);
 			if (
 				titles.length > 0 &&
-				!firstAuto[1].replace(/`[^`]+`/g, "").replace(/[\s,]/g, "")
+				!names.replace(/`[^`]+`/g, "").replace(/[\s,]/g, "")
 			) {
 				autoNames.push(...titles);
 				readingAutoNames = true;
@@ -306,7 +307,7 @@ export function collectNodeTestNames(sources) {
 /** Collect smoke cases and the scenario IDs declared by each case. */
 function collectManualCaseCoverage(markdown) {
 	const headings = [
-		...markdown.matchAll(/^## (TC-(?:[A-Z]+-)*\d+)(?=[.\s—])/gm),
+		...markdown.matchAll(/^## (TC-(?:[A-Z]+-)*\d+)(?=[.:\s—])/gm),
 	];
 	return new Map(
 		headings.map((heading, index) => {

@@ -1,4 +1,4 @@
-import { VaultAdapter } from "../../api/vault-adapter";
+import { VaultAdapter, LocalFileChangedError } from "../../api/vault-adapter";
 import { YandexDiskClient, isRemoteReadTimeout } from "../../api/yandex-client";
 import type {
 	FileMetadata,
@@ -36,6 +36,7 @@ import {
 } from "./action-rules";
 import type { SyncGuardCallback } from "../contracts";
 import { createSyncError } from "../errors";
+import { isConcurrentSyncChange } from "../../errors";
 export interface Dependencies {
 	canonicalReadSession?: CanonicalReadSession;
 	validationToken?: string;
@@ -47,7 +48,7 @@ export interface Dependencies {
 	expectWatcherEvent: (
 		path: string,
 		action: "upload" | "delete" | "rename",
-	) => void;
+	) => void | (() => void);
 	setSyncPhase: (
 		phase: SyncPhase,
 		currentOperation?: string,
@@ -207,9 +208,7 @@ export async function assertDownloadLocalUnchanged(
 	expected: string | null,
 ): Promise<void> {
 	if ((await readLocalDownloadIdentity(deps, path)) !== expected) {
-		throw new Error(
-			"Local file changed during download; reconciliation required",
-		);
+		throw new LocalFileChangedError();
 	}
 }
 
@@ -480,15 +479,21 @@ export async function deleteLocalFile(
 		return "cancelled";
 	}
 	await validateAuthority?.();
+	const assertObserved = deps.vaultAdapter.captureLocalObservation([path]);
 	if ((await readLocalDownloadIdentity(deps, path)) !== expected) {
 		return "deferred";
 	}
+	assertObserved();
 	if (expected === null) {
 		deps.indexManager.completePhysicalAction(physicalAction.id);
 		return "completed";
 	}
-	deps.expectWatcherEvent(path, "delete");
-	await deps.vaultAdapter.deleteFile(path);
+	const release = deps.expectWatcherEvent(path, "delete");
+	try {
+		await deps.vaultAdapter.deleteFile(path);
+	} finally {
+		release?.();
+	}
 	if (deps.vaultAdapter.fileExists(path)) {
 		throw new Error(`Local deletion of ${path} was not confirmed`);
 	}
@@ -499,7 +504,11 @@ export async function deleteLocalFile(
 	// so the local tree mirrors the remote tree after a delete sync. Only
 	// truly empty folders are trashed (recoverable).
 	try {
-		await deps.vaultAdapter.pruneEmptyLocalAncestors(path);
+		await deps.vaultAdapter.pruneEmptyLocalAncestors(
+			path,
+			undefined,
+			(folder) => deps.expectWatcherEvent(folder, "delete"),
+		);
 	} catch (e) {
 		logger.warn(`Failed to prune empty local ancestors for ${path}:`, {
 			error: e,
@@ -618,7 +627,7 @@ export async function executeOperationsParallel(
 				const content = await deps.vaultAdapter.readFile(op.path);
 				const sha256 = await computeSha256(content);
 				if (op.localMeta && sha256 !== op.localMeta.sha256) {
-					throw new Error("Local file changed after full scan");
+					throw new LocalFileChangedError();
 				}
 				const assertAuthority = async () => {
 					const validate = async (
@@ -724,7 +733,7 @@ export async function executeOperationsParallel(
 			stopOnError: isRemoteReadTimeout,
 			onError: (reason, index) => {
 				const operation = operations[index];
-				if (operation) {
+				if (operation && !isConcurrentSyncChange(reason)) {
 					const error =
 						reason instanceof Error
 							? reason
@@ -754,7 +763,7 @@ export async function executeOperationsParallel(
 
 		if (res.status === "rejected") {
 			errors.push(createSyncError(res.reason, op.path, op.action));
-			logger.error(
+			logger[isConcurrentSyncChange(res.reason) ? "debug" : "error"](
 				`Error executing ${op.action} operation for ${op.path}:`,
 				{ error: res.reason },
 			);

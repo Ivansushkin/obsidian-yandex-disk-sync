@@ -11,6 +11,54 @@ import {
 } from "../utils/path-utils";
 import { isJsonRecord } from "../utils/record-utils";
 
+/** Validate local-only progress before it can authorize replacement mutations. */
+export function validateLocalReplacementReceive(value: unknown): void {
+	if (
+		!isJsonRecord(value) ||
+		Object.keys(value).sort().join() !==
+			"applied,epoch,initial,operationId,scope,watcherBoundary" ||
+		typeof value.operationId !== "string" ||
+		!value.operationId ||
+		typeof value.epoch !== "string" ||
+		!value.epoch ||
+		!validScope(value.scope)
+	) {
+		throw new InvalidCurrentIndexError(
+			"local replacement",
+			"invalid receive receipt",
+		);
+	}
+	for (const key of ["initial", "applied"] as const) {
+		const hashes = value[key];
+		if (
+			!isJsonRecord(hashes) ||
+			Object.entries(hashes).some(
+				([path, hash]) =>
+					!validPaths([path]) ||
+					isProtectedPath(path) ||
+					typeof hash !== "string" ||
+					!/^[a-f0-9]{64}$/.test(hash),
+			)
+		) {
+			throw new InvalidCurrentIndexError(
+				"local replacement",
+				"invalid local hashes",
+			);
+		}
+	}
+	if (
+		!isJsonRecord(value.watcherBoundary) ||
+		Object.values(value.watcherBoundary).some(
+			(signature) => typeof signature !== "string",
+		)
+	) {
+		throw new InvalidCurrentIndexError(
+			"local replacement",
+			"invalid watcher boundary",
+		);
+	}
+}
+
 /** Apply the same frozen selection on the owner and returning devices. */
 export function isReplacementPath(
 	path: string,

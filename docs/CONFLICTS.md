@@ -179,3 +179,15 @@ frozen local reference инициатора становится fresh epoch. St
 автоматически заменяет выбранные local bytes и старые queues до ordinary merge;
 remote-only и offline edits не становятся конфликтными копиями. Protected/excluded
 paths сохраняются. Checkpoints без replacement descriptor сохраняют прежние правила.
+
+## Изменение локального дерева во время передачи
+
+Local hash/path drift откладывает устаревшую операцию без ложного успеха; следующий
+full строит новый план. Failed native write не скрывает следующее пользовательское
+событие. Move сохраняет предшествующий put в FIFO через restart.
+
+При authoritative receive late create/edit/move сохраняются. Structural blockers
+получают conflict copies вне blocking root; native deletion требует повторной
+проверки source, copy и descendants. Excluded descendants блокируют удаление.
+Remote target становится baseline, local differences и copies идут в ordinary sync.
+Force сохраняет late events через watcher boundary без protective copies.

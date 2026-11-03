@@ -1,6 +1,7 @@
 import { normalizeAuthentication } from "./auth/authentication-state";
 import {
 	validateEncryptionReplacement,
+	validateLocalReplacementReceive,
 	isReplacementPath,
 } from "./crypto/replacement";
 import { validateCurrentIndexShape } from "./sync/canonical/schema";
@@ -197,8 +198,10 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 		);
 	}
 	if (
-		settings.manualSyncRequired !== undefined &&
-		typeof settings.manualSyncRequired !== "boolean"
+		(settings.manualSyncRequired !== undefined &&
+			typeof settings.manualSyncRequired !== "boolean") ||
+		(settings.manualAuthorizationConfirmed !== undefined &&
+			typeof settings.manualAuthorizationConfirmed !== "boolean")
 	) {
 		throw new UnsupportedHistoricalDataError(
 			"Invalid manual sync admission state",
@@ -250,6 +253,9 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 			data.localState,
 			new Set([
 				"remoteScope",
+				...(data.localState.replacementReceive === undefined
+					? []
+					: ["replacementReceive"]),
 				"deviceId",
 				"observedEpoch",
 				"observedRevision",
@@ -260,6 +266,9 @@ function assertCurrentEncryptionState(data: PersistedPluginData): void {
 			]),
 			"current local state",
 		);
+		if (data.localState.replacementReceive !== undefined) {
+			validateLocalReplacementReceive(data.localState.replacementReceive);
+		}
 		if (
 			!isRecord(data.localState.files) ||
 			!isRecord(data.localState.folderTombstones)

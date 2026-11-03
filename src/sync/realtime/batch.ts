@@ -25,6 +25,7 @@ import type { IndexSaveCallback, SyncGuardResult } from "../contracts";
 import * as fileOperations from "../files/operations";
 import * as reconcileAcceptedUploads from "../reconciliation/accepted-uploads";
 import * as syncReconciliation from "../reconciliation/commits";
+import { createSyncFailure } from "../errors";
 import * as reconciliationContext from "../reconciliation/context";
 import {
 	createRealtimeBatchResult,
@@ -429,6 +430,7 @@ export async function reconcileRealtimeBatch(
 			batchResult.completed.push(...result.completed);
 			batchResult.superseded.push(...result.superseded);
 			batchResult.retry.push(...result.retry);
+			batchResult.retryFailure ??= result.retryFailure;
 			batchResult.uploadReceipts.push(...result.uploadReceipts);
 			if (result.requiresFullSync) {
 				batchResult.requiresFullSync = result.requiresFullSync;
@@ -585,6 +587,11 @@ async function applyPreparedRealtimeWindow(
 			batchResult.retry.push(
 				...prepared.slice(index).map((event) => event.id),
 			);
+			batchResult.retryFailure = createSyncFailure(e, {
+				stage: "realtime-file",
+				path: item.path,
+				action: "write",
+			}).summary;
 			break;
 		}
 	}
@@ -621,6 +628,10 @@ async function applyPreparedRealtimeWindow(
 	deps.setSyncPhase("saving-index");
 	const commitProof = await syncReconciliation.saveRemoteIndexBestEffort(
 		deps.syncReconciliation,
+		undefined,
+		(failure) => {
+			batchResult.retryFailure = failure;
+		},
 	);
 	if (!commitProof) {
 		batchResult.retry.push(

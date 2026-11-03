@@ -86,7 +86,10 @@ export async function rewriteRemoteFiles(
 	);
 	for (const [path, metadata] of liveCanonical) {
 		const local = localFiles.get(path);
-		if (!local || local.sha256 !== metadata.sha256) {
+		if (
+			(!local || local.sha256 !== metadata.sha256) &&
+			!options.authoritativeEncryption
+		) {
 			throw new Error(
 				`Encryption preflight baseline is incomplete for ${path}`,
 			);
@@ -104,12 +107,32 @@ export async function rewriteRemoteFiles(
 	);
 
 	const tasks = liveCanonical.map(([path, logicalMetadata]) => async () => {
-		const content = await deps.vaultAdapter.readFile(path);
+		let content: ArrayBuffer;
+		try {
+			content = await deps.vaultAdapter.readFile(path);
+		} catch (error) {
+			if (
+				!options.authoritativeEncryption ||
+				deps.vaultAdapter.fileExists(path)
+			) {
+				throw error;
+			}
+			delete canonical.files[path];
+			await options.capturePhysicalRewriteReference?.(path);
+			return false;
+		}
 		const sha256 = await computeSha256(content);
 		if (sha256 !== logicalMetadata.sha256) {
-			throw new Error(
-				`File changed during encryption transition: ${path}`,
-			);
+			if (!options.authoritativeEncryption) {
+				throw new Error(
+					`File changed during encryption transition: ${path}`,
+				);
+			}
+			await options.capturePhysicalRewriteReference?.(path, {
+				...logicalMetadata,
+				sha256,
+				size: content.byteLength,
+			});
 		}
 		const stamp = await uploadPhysicalRewriteTarget(
 			deps,
@@ -130,6 +153,7 @@ export async function rewriteRemoteFiles(
 		deps.indexManager.updateLocalFile(path, {
 			...rewritten,
 		});
+		return true;
 	});
 	deps.setSyncPhase("applying", t("status.op.reencoding_files"));
 	const settled = await runWithConcurrencySettled(
@@ -140,7 +164,7 @@ export async function rewriteRemoteFiles(
 	for (let index = 0; index < settled.length; index++) {
 		const outcome = settled[index];
 		if (outcome?.status === "fulfilled") {
-			result.uploaded++;
+			result.uploaded += outcome.value ? 1 : 0;
 			continue;
 		}
 		const path = liveCanonical[index]?.[0] ?? "";

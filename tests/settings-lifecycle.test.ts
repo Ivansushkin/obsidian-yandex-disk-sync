@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { getActiveLanguage, setLanguagePreference } from "../src/i18n";
 import type { UserSettingsPatch } from "../src/settings-workflow";
 import type { PluginData } from "../src/plugin-persistence";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { persistenceHarness } from "./helpers/lifecycle-fixtures";
 import { MemoryDisk, bytes, device } from "./helpers/sync-flow";
 import { deferred } from "./helpers/deferred";
@@ -11,6 +11,66 @@ import { encryptionFlow, startupFlow } from "./helpers/encryption-flow";
 import { transition } from "./helpers/encryption-scenarios";
 
 import { settingsHost } from "./helpers/settings-host";
+
+test("host disposal prevents a late full from restarting automation", async (t) => {
+	const cleanups: (() => void | Promise<void>)[] = [];
+	const host = await settingsHost({
+		after: (cleanup: () => void | Promise<void>) => cleanups.push(cleanup),
+	} as unknown as TestContext);
+	const { plugin, a, disk, scheduler, persistence } = host;
+	const entered = deferred();
+	const release = deferred();
+	const full = a.engine.fullSync.bind(a.engine);
+	let requests = 0;
+	disk.afterRequest = async () => {
+		requests++;
+	};
+	plugin["regularSyncStarted"] = false;
+	plugin["automationReady"] = false;
+	a.engine.fullSync = async (...args) => {
+		const result = await full(...args);
+		entered.resolve();
+		await release.promise;
+		return result;
+	};
+	const pending = plugin.runFullSync({ trigger: "manual" }, false);
+	afterTest(t, async () => {
+		release.resolve();
+		try {
+			await pending;
+		} finally {
+			scheduler.stop();
+			await a.stop();
+		}
+	});
+	await entered.promise;
+	const requestsBeforeDisposal = requests;
+	let restarts = 0;
+	const startWatcher = a.watcher.start.bind(a.watcher);
+	const startScheduler = scheduler.start.bind(scheduler);
+	a.watcher.start = () => {
+		restarts++;
+		startWatcher();
+	};
+	scheduler.start = () => {
+		restarts++;
+		startScheduler();
+	};
+	const closing = cleanups[0]!();
+	assert.equal(plugin["unloaded"], true);
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+	release.resolve();
+	await Promise.all([closing, pending]);
+	await persistence.idle();
+	assert.equal(a.watcher["isEnabled"], false);
+	assert.equal(scheduler["isRunning"], false);
+	assert.equal(plugin.isFullSyncInProgress(), false);
+	assert.equal(a.engine.hasPendingWork(), false);
+	assert.equal(requests, requestsBeforeDisposal);
+	assert.equal(restarts, 0);
+	assert.equal(host.dispose(), closing);
+});
 
 test("toggle command restarts watcher and scheduler after a paused full sync", async (t) => {
 	const { plugin, a, scheduler } = await settingsHost(t);
@@ -94,7 +154,7 @@ test("failed resume keeps synchronization paused for a later retry", async (t) =
 test("pause command does not interrupt an active Force replacement", async (t) => {
 	const { plugin, a, scheduler } = await settingsHost(t);
 	Object.assign(plugin, {
-		forceSyncController: { isBusy: () => true },
+		forceSyncController: { isBusy: () => true, dispose: () => {} },
 	});
 	await plugin["toggleSync"]();
 	assert.equal(a.engine.isSyncPaused(), false);
@@ -274,11 +334,13 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 		}
 		assert.equal(plugin.settings.manualSyncRequired, true);
 		await update({ excludePatterns: ["ignored/**"] });
+		await plugin.confirmManualAuthorization();
 		assert.equal(prompts, 0);
 		const saved = structuredClone(plugin["persistence"].current);
 		plugin.loadData = async () => saved;
 		await plugin.loadSettings();
 		assert.equal(plugin.settings.manualSyncRequired, true);
+		assert.equal(plugin.settings.manualAuthorizationConfirmed, true);
 		let automaticReads = 0;
 		disk.beforeRequest = async () => {
 			automaticReads++;
@@ -321,10 +383,10 @@ test("connection settings wait across restart for manual plaintext or encrypted 
 			outcome === "path" ||
 			outcome === "plaintext" ||
 			outcome === "paused";
-		assert.equal(plugin.settings.manualSyncRequired, !connected);
+		assert.equal(plugin.settings.manualSyncRequired, false);
 		assert.equal(
 			plugin["persistence"].current?.settings.manualSyncRequired,
-			!connected,
+			false,
 		);
 		assert.equal(scheduler["isRunning"], connected, outcome);
 		assert.equal(a.watcher["isEnabled"], connected, outcome);

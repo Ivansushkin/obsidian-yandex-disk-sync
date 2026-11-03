@@ -148,21 +148,29 @@ test("storage admission classifies startup failures and recovers after connectio
 				inspectRemoteCanonicalFormat: async () => "current",
 			},
 		});
-		assert.equal(
-			await plugin["refreshRemoteStartupState"](false),
-			"blocked",
-		);
+		const admission = await plugin["refreshRemoteStartupState"](false);
+		const transientFailure =
+			typeof admission === "object" ? admission.failure : undefined;
+		if (error instanceof NetworkRequestError) {
+			assert.equal(typeof admission, "object");
+			assert.equal(transientFailure?.category, "unavailable");
+		} else {
+			assert.equal(admission, "blocked");
+		}
 		assert.equal(remoteReads, 0);
 		const scopeFailure =
 			error === null || error instanceof StorageScopeError;
 		assert.equal(blocks.has("local-state"), scopeFailure);
 		assert.equal(
 			plugin["authenticationBlockReason"] !== null,
-			!scopeFailure,
+			!scopeFailure && !(error instanceof NetworkRequestError),
 		);
 		if (error) {
 			assert.equal(
-				summary?.category,
+				(error instanceof NetworkRequestError
+					? transientFailure
+					: summary
+				)?.category,
 				error instanceof YandexApiError
 					? "access"
 					: error instanceof NetworkRequestError
@@ -172,7 +180,10 @@ test("storage admission classifies startup failures and recovers after connectio
 							: "unknown",
 			);
 			assert.equal(
-				summary?.stage,
+				(error instanceof NetworkRequestError
+					? transientFailure
+					: summary
+				)?.stage,
 				scopeFailure ? "storage-admission" : "startup",
 			);
 		}
@@ -184,7 +195,11 @@ test("storage admission classifies startup failures and recovers after connectio
 });
 
 /** Run the startup oracle through its public ports, without plugin method patches. */
-function startupHarness(format: "current" | "legacy", encrypted = false) {
+function startupHarness(
+	format: "current" | "legacy",
+	encrypted = false,
+	failures: { manifest?: Error; transition?: Error } = {},
+) {
 	const settings = {
 		...DEFAULT_SETTINGS,
 		yandexTokenSecret: "configured-placeholder",
@@ -203,23 +218,55 @@ function startupHarness(format: "current" | "legacy", encrypted = false) {
 		setBlock: (kind, reason) => {
 			blocks[kind] = reason;
 		},
-		hasTransition: () => false,
+		hasTransition: () => Boolean(failures.transition),
 		isStopped: () => false,
 		ensureStorageBinding: async () => true,
 		index: {
-			downloadEncryptionManifest: async () => null,
+			downloadEncryptionManifest: async () => {
+				if (failures.manifest) {
+					throw failures.manifest;
+				}
+				return null;
+			},
 			inspectRemoteCanonicalFormat: async () => {
 				canonicalReads++;
 				return format;
 			},
 		},
 		engine: { runExclusiveMaintenance: async (task) => await task() },
-		recoverEncryptionTransition: async () => {},
+		recoverEncryptionTransition: async () => {
+			if (failures.transition) {
+				throw failures.transition;
+			}
+		},
 		tryRecoverRemoteTargetTransition: async () => false,
 		ensureEncryptionReady: async () => true,
 	});
 	return { startup, blocks, reads: () => canonicalReads };
 }
+
+test("temporary startup read failure does not create a permanent block", async () => {
+	const { startup, blocks } = startupHarness("current", false, {
+		manifest: new NetworkRequestError(new Error("synthetic offline")),
+	});
+	const result = await startup.refresh(false);
+	assert.equal(typeof result, "object");
+	assert.equal(
+		typeof result === "object" ? result.failure.category : undefined,
+		"unavailable",
+	);
+	assert.equal(blocks.authentication, null);
+	assert.equal(blocks.encryption, null);
+});
+
+test("transition recovery failure retains its domain block", async () => {
+	const { startup, blocks } = startupHarness("current", false, {
+		transition: new NetworkRequestError(new Error("synthetic offline")),
+	});
+	assert.equal(await startup.refresh(false), "blocked");
+	assert.notEqual(blocks.encryption, null);
+	assert.equal(blocks.authentication, null);
+});
 
 test("foreign device revalidates a stale legacy migration block", async () => {
 	const { startup, blocks, reads } = startupHarness("current");

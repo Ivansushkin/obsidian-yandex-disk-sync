@@ -1,7 +1,6 @@
 import { copyLogTail, openLogFile } from "./log-actions";
 import {
 	getSyncPresentation,
-	getSyncStatusText,
 	type SyncIndicatorContext,
 } from "./sync-status-presentation";
 import {
@@ -17,6 +16,7 @@ import { t } from "../i18n";
 interface SyncIndicatorActions {
 	synchronize: () => Promise<void>;
 	toggleSync: () => Promise<void>;
+	toggleFailed: () => void;
 	readLogs: () => Promise<string>;
 }
 
@@ -250,9 +250,9 @@ export class SyncIndicator extends Component {
 				fullSyncInProgress || Boolean(connection) || this.syncRequested,
 			),
 		);
-		const { state, text, detail, progress, busy, icon } =
+		const { state, text, detail, progress, busy, hasError, icon } =
 			getSyncPresentation(context);
-		this.element.className = `yandex-sync-indicator sync-${state.status}${detail && state.status === "syncing" ? " has-error" : ""}`;
+		this.element.className = `yandex-sync-indicator sync-${state.status}${hasError && state.status === "syncing" ? " has-error" : ""}`;
 		this.loaderEl.hidden = !busy;
 		if (this.iconEl.dataset.icon !== icon) {
 			setIcon(this.iconEl, icon);
@@ -267,16 +267,22 @@ export class SyncIndicator extends Component {
 		this.detailEl.hidden = !detail;
 		this.progressEl.setText(progress);
 		this.progressEl.hidden = !progress;
-		this.accessibleStatus = busy
-			? t("status.syncing")
-			: state.status === "idle"
-				? t("status.mobile.ready")
-				: getSyncStatusText(state);
-		if (busy && detail) {
-			this.accessibleStatus += ` · ${t("status.error")}`;
-		}
+		this.accessibleStatus = [text, progress, detail]
+			.filter(Boolean)
+			.join(" · ");
 		this.updateDisclosureLabel();
 		this.schedulePosition();
+	}
+
+	/** Hide the entire floating disclosure without changing sync activity. */
+	setVisible(visible: boolean): void {
+		if (!this.element) {
+			return;
+		}
+		this.element.hidden = !visible;
+		if (visible) {
+			this.update();
+		}
 	}
 
 	/** Reserve the toggle while a resume check or full sync is running. */
@@ -295,7 +301,7 @@ export class SyncIndicator extends Component {
 			await this.actions.toggleSync();
 		} catch {
 			if (!this.disposed) {
-				new Notice(t("status.actions.toggle_failed"));
+				this.actions.toggleFailed();
 			}
 		} finally {
 			this.toggleRequested = false;

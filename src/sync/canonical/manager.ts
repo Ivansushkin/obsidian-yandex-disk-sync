@@ -1,5 +1,6 @@
 import { isPreservedRawPath } from "../../crypto/replacement";
 import { ForceRecoveryPendingError } from "../workflows/force-state";
+import { ConcurrentSyncChangeError } from "../../errors";
 /**
  * Synchronization index manager
  */
@@ -695,7 +696,10 @@ export class IndexManager {
 	/** Capture local causal state so a failed adoption can be retried safely. */
 	captureLocalCausalState(): LocalCausalSnapshot {
 		return {
-			state: this.cloneValue(this.localState),
+			state: {
+				...this.cloneValue(this.localState),
+				nextMutationSeq: this.operationStore.getNextMutationSeq(),
+			},
 			mutations: this.operationStore.getMutations(),
 			physicalActions: this.operationStore.getPhysicalActions(),
 		};
@@ -902,6 +906,13 @@ export class IndexManager {
 				files: protectRecord(data.files || {}),
 				folderTombstones: protectRecord(data.folderTombstones || {}),
 				nextMutationSeq: Math.max(1, data.nextMutationSeq || 1),
+				...(data.replacementReceive
+					? {
+							replacementReceive: structuredClone(
+								data.replacementReceive,
+							),
+						}
+					: {}),
 			};
 		} else {
 			this.localState = createEmptyLocalState(this.settings.deviceId);
@@ -2297,6 +2308,7 @@ export class IndexManager {
 	 */
 	async getRemoteFiles(
 		directoryPages?: Map<string, number>,
+		options: { projectSyncInventory?: boolean } = {},
 	): Promise<Map<string, FileMetadata>> {
 		logger.info("Getting remote files list...");
 
@@ -2312,6 +2324,7 @@ export class IndexManager {
 						directoryPages.set(path, pages);
 					}
 				: undefined,
+			options.projectSyncInventory ?? false,
 		);
 
 		const result = await this.remoteResourcesToFiles(resources);
@@ -2475,10 +2488,35 @@ export class IndexManager {
 		codecLabel?: IndexCodec,
 		expectedResource?: YandexResource,
 	): Promise<IndexFileSnapshot> {
-		const snapshot = await this.yandexClient.downloadStableRawFile(
-			path,
-			expectedResource,
-		);
+		const budget = this.yandexClient.createDownloadBudget?.();
+		let snapshot;
+		try {
+			snapshot = await this.yandexClient.downloadStableRawFile(
+				path,
+				expectedResource,
+				budget,
+			);
+		} catch (error) {
+			if (
+				path !== this.getRemoteIndexPath() ||
+				!(error instanceof ConcurrentSyncChangeError) ||
+				error.observation !== "missing"
+			) {
+				throw error;
+			}
+			const fresh =
+				await this.recovery.waitForCanonicalIndexFromStableRoot();
+			if (!fresh.path) {
+				throw new ConcurrentSyncChangeError(
+					"Canonical disappeared during read; reconciliation required",
+				);
+			}
+			snapshot = await this.yandexClient.downloadStableRawFile(
+				fresh.path,
+				fresh.resource,
+				budget,
+			);
+		}
 		if (!snapshot) {
 			throw new RemoteIndexConcurrentModificationError(
 				`Index resource disappeared while reading ${path}`,

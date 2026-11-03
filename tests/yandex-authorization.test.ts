@@ -34,7 +34,6 @@ async function authorization(
 						throw new Error("context changed");
 					}
 				},
-				assertContinuation: () => {},
 			};
 		},
 		adopt: async (update, attempt) => {
@@ -44,7 +43,6 @@ async function authorization(
 				attempt.accept();
 			});
 		},
-		synchronize: () => persistence.completeManualSync(() => {}),
 	});
 	return {
 		controller,
@@ -96,7 +94,7 @@ test("PKCE authorization ignores foreign callbacks and activates one persisted g
 	assert.equal(requests, 1);
 	assert.equal(h.plugin.settings.yandexTokenSecret, "synthetic-access");
 	assert.equal(h.plugin.settings.authMethod, "oauth");
-	assert.equal(h.plugin.settings.manualSyncRequired, false);
+	assert.equal(h.plugin.settings.manualSyncRequired, true);
 });
 
 test("refresh saves rotated credentials once and preserves the grant", async (t) => {
@@ -158,7 +156,7 @@ test("refresh saves rotated credentials once and preserves the grant", async (t)
 		h.plugin.settings.oauthAuthorization?.grantId,
 		initial.grantId,
 	);
-	assert.equal(h.plugin.settings.manualSyncRequired, false);
+	assert.equal(h.plugin.settings.manualSyncRequired, true);
 });
 
 test("failed refresh and failed credential save retain the prior grant", async (t) => {
@@ -247,7 +245,7 @@ test("failed refresh and failed credential save retain the prior grant", async (
 	);
 	assert.equal(
 		await h.controller.ensureFresh(current, true, () => {}, adopt),
-		"temporary",
+		"cooldown",
 	);
 	assert.equal(refreshRequests, 4);
 	h.controller.resetRefreshState();
@@ -263,7 +261,10 @@ test("failed refresh and failed credential save retain the prior grant", async (
 	h.plugin.saveData = async () => {
 		throw new Error("private-storage-details");
 	};
-	await assert.rejects(h.controller.refresh(current, () => {}, adopt));
+	assert.deepEqual(
+		await h.controller.ensureFresh(current, true, () => {}, adopt),
+		{ kind: "failed", reason: "storage" },
+	);
 	assert.equal(h.plugin.settings.yandexTokenSecret, "initial-access");
 	assert.equal(
 		h.plugin.settings.oauthAuthorization?.refreshToken,

@@ -14,6 +14,7 @@ export type AuthenticationSettings = Pick<
 	| "authMethod"
 	| "oauthAuthorization"
 	| "manualSyncRequired"
+	| "manualAuthorizationConfirmed"
 >;
 
 export interface AuthenticationUpdate {
@@ -24,6 +25,7 @@ export interface AuthenticationUpdate {
 
 export type AuthenticationChange =
 	| AuthenticationUpdate
+	| { kind: "manual-confirmation" }
 	| {
 			kind: "logout";
 			method?: "manual" | "oauth";
@@ -35,7 +37,10 @@ export function normalizeAuthentication(
 	settings: Partial<YandexDiskSyncSettings>,
 ): Pick<
 	YandexDiskSyncSettings,
-	"authMethod" | "oauthAuthorization" | "clientId"
+	| "authMethod"
+	| "oauthAuthorization"
+	| "clientId"
+	| "manualAuthorizationConfirmed"
 > {
 	const method =
 		settings.authMethod === undefined
@@ -57,6 +62,10 @@ export function normalizeAuthentication(
 	}
 	return {
 		clientId: method === "manual" ? (settings.clientId ?? "") : "",
+		manualAuthorizationConfirmed:
+			Boolean(settings.yandexTokenSecret) &&
+			method === "manual" &&
+			settings.manualAuthorizationConfirmed !== false,
 		authMethod: method,
 		oauthAuthorization: authorization ? { ...authorization } : null,
 	};
@@ -90,6 +99,7 @@ export function captureAuthentication(
 		yandexTokenSecret: settings.yandexTokenSecret,
 		...normalizeAuthentication(settings),
 		manualSyncRequired: settings.manualSyncRequired,
+		manualAuthorizationConfirmed: settings.manualAuthorizationConfirmed,
 	};
 }
 
@@ -105,9 +115,16 @@ export function prepareAuthenticationUpdate(
 			authMethod: update.method ?? current.authMethod,
 			oauthAuthorization: null,
 			manualSyncRequired: true,
+			manualAuthorizationConfirmed: false,
 			...(update.preserveEncryptionPassword
 				? {}
 				: { encryptionPassword: null }),
+		};
+	}
+	if (update.kind === "manual-confirmation") {
+		return {
+			...captureAuthentication(current),
+			manualAuthorizationConfirmed: true,
 		};
 	}
 	if (!update.token.trim() || !isOAuthAuthorization(update.authorization)) {
@@ -130,5 +147,6 @@ export function prepareAuthenticationUpdate(
 		oauthAuthorization: { ...update.authorization },
 		manualSyncRequired:
 			update.kind === "interactive" || current.manualSyncRequired,
+		manualAuthorizationConfirmed: false,
 	};
 }

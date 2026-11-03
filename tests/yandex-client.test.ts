@@ -4,7 +4,7 @@ import { DEFAULT_SETTINGS, type YandexResource } from "../src/types";
 import { IndexManager } from "../src/sync/canonical/manager";
 import type { VaultAdapter } from "../src/api/vault-adapter";
 import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
-import { MemoryDisk, bytes } from "./helpers/sync-flow";
+import { MemoryDisk, bytes, codecFor } from "./helpers/sync-flow";
 import { deferred } from "./helpers/deferred";
 import { computeSha256 } from "../src/utils/hash-utils";
 
@@ -236,6 +236,298 @@ test("remote tree uses bounded folder concurrency and skips backup", async () =>
 	);
 	assert.equal(client.visited.includes("vault/.backup"), false);
 	assert.equal(client.maxActive, 2);
+});
+
+test("ordinary inventory projects metadata and falls back on an incomplete page", async () => {
+	const requested: Array<{ offset: number; projected: boolean }> = [];
+	let unfilteredComplete = true;
+	let projectionUnsupported = false;
+	let fallbackUnavailable = false;
+	let projectedIncompleteRoot = false;
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		const url = new URL(params.url);
+		const offset = Number(url.searchParams.get("offset"));
+		const projected = url.searchParams.has("fields");
+		requested.push({ offset, projected });
+		if (projected) {
+			const fields = url.searchParams.get("fields")?.split(",") ?? [];
+			for (const required of [
+				"path",
+				"type",
+				"resource_id",
+				"_embedded.total",
+				"_embedded.offset",
+				"_embedded.items.modified",
+				"_embedded.items.md5",
+				"_embedded.items.sha256",
+			]) {
+				assert.ok(fields.includes(required), required);
+			}
+		}
+		if (projected && projectionUnsupported) {
+			return response(400, { error: "Unsupported projection" });
+		}
+		if (!projected && fallbackUnavailable) {
+			return response(404);
+		}
+		const item = fileResource(`vault/${offset}.md`, {
+			md5: `hash-${offset}`,
+		});
+		const listing = directory("vault", [
+			(projected && (offset === 1 || projectedIncompleteRoot)) ||
+			(!unfilteredComplete && offset === 1)
+				? ({
+						...item,
+						modified: undefined,
+					} as unknown as YandexResource)
+				: item,
+		]);
+		listing.resource_id = "stable-root";
+		listing._embedded = {
+			...listing._embedded!,
+			total: 2,
+			offset,
+		};
+		return response(200, listing);
+	};
+	const client = createClient();
+	const readProjected = () =>
+		client.getResourcesRecursive(
+			"vault",
+			true,
+			2,
+			false,
+			undefined,
+			true,
+			undefined,
+			true,
+		);
+	const files = await readProjected();
+	assert.deepEqual(
+		files.map((file) => file.path),
+		["vault/0.md", "vault/1.md"],
+	);
+	assert.deepEqual(requested, [
+		{ offset: 0, projected: true },
+		{ offset: 1, projected: true },
+		{ offset: 1, projected: false },
+	]);
+	requested.length = 0;
+	await client.getResourcesRecursive("vault", true, 2);
+	assert.deepEqual(requested, [
+		{ offset: 0, projected: false },
+		{ offset: 1, projected: false },
+	]);
+	unfilteredComplete = false;
+	await assert.rejects(readProjected(), /listing is incomplete/);
+	unfilteredComplete = true;
+	projectionUnsupported = true;
+	requested.length = 0;
+	const fallback = await readProjected();
+	assert.equal(fallback.length, 2);
+	assert.deepEqual(requested, [
+		{ offset: 0, projected: true },
+		{ offset: 0, projected: false },
+		{ offset: 1, projected: false },
+	]);
+	unfilteredComplete = false;
+	await assert.rejects(readProjected(), /listing is incomplete/);
+	projectionUnsupported = false;
+	unfilteredComplete = true;
+	fallbackUnavailable = true;
+	projectedIncompleteRoot = true;
+	await assert.rejects(readProjected(), /became unavailable/);
+});
+
+test("ordinary inventory rejects missing file size after one unfiltered retry", async () => {
+	const requested: boolean[] = [];
+	let fullSize: number | undefined = 4;
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		const url = new URL(params.url);
+		const projected = url.searchParams.has("fields");
+		const offset = Number(url.searchParams.get("offset"));
+		requested.push(projected);
+		const listing = directory("vault", [
+			fileResource(`vault/${offset}.md`, {
+				md5: "stable-hash",
+				size: offset === 0 && projected ? undefined : fullSize,
+			}),
+		]);
+		listing.resource_id = "stable-root";
+		listing._embedded = { ...listing._embedded!, total: 2, offset };
+		return response(200, listing);
+	};
+	const client = createClient();
+	const read = () =>
+		client.getResourcesRecursive(
+			"vault",
+			true,
+			1,
+			false,
+			undefined,
+			true,
+			undefined,
+			true,
+		);
+	assert.deepEqual(
+		(await read()).map((file) => file.size),
+		[4, 4],
+	);
+	assert.deepEqual(requested, [true, false, false]);
+	for (const invalidSize of [undefined, -1, 1.5]) {
+		requested.length = 0;
+		fullSize = invalidSize;
+		await assert.rejects(read(), /listing is incomplete/);
+		assert.deepEqual(requested, [true, false]);
+	}
+});
+
+test("a rejected projection disables fields for later directories", async () => {
+	const requested: Array<{ path: string; projected: boolean }> = [];
+	let rejectionStatus = 400;
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		const url = new URL(params.url);
+		const path = url.searchParams.get("path") ?? "";
+		const projected = url.searchParams.has("fields");
+		requested.push({ path, projected });
+		if (projected) {
+			return response(rejectionStatus, {
+				error: "Unsupported projection",
+			});
+		}
+		const listing = directory(
+			path,
+			path === "vault"
+				? [directory("vault/sub")]
+				: [fileResource("vault/sub/note.md", { md5: "stable-hash" })],
+		);
+		listing.resource_id = `id-${path}`;
+		return response(200, listing);
+	};
+	for (const status of [400, 406]) {
+		rejectionStatus = status;
+		requested.length = 0;
+		const files = await createClient().getResourcesRecursive(
+			"vault",
+			true,
+			1,
+			false,
+			undefined,
+			true,
+			undefined,
+			true,
+		);
+		assert.deepEqual(
+			files.map((file) => file.path),
+			["vault/sub/note.md"],
+		);
+		assert.deepEqual(requested, [
+			{ path: "vault", projected: true },
+			{ path: "vault", projected: false },
+			{ path: "vault/sub", projected: false },
+		]);
+	}
+});
+
+test("a projection rejection stops new fields requests while fallback is pending", async () => {
+	const fallbackStarted = deferred();
+	const releaseFallback = deferred();
+	const requested: Array<{ path: string; projected: boolean }> = [];
+	requestGlobal.__obsidianRequestUrl = async (params) => {
+		const url = new URL(params.url);
+		const path = url.searchParams.get("path") ?? "";
+		const projected = url.searchParams.has("fields");
+		requested.push({ path, projected });
+		if (path === "vault/a" && projected) {
+			return response(400, { error: "Unsupported projection" });
+		}
+		if (path === "vault/a") {
+			fallbackStarted.resolve();
+			await releaseFallback.promise;
+		}
+		if (path === "vault/b") {
+			await fallbackStarted.promise;
+		}
+		if (path === "vault/b/child") {
+			releaseFallback.resolve();
+		}
+		const items =
+			path === "vault"
+				? [directory("vault/a"), directory("vault/b")]
+				: path === "vault/b"
+					? [directory("vault/b/child")]
+					: path === "vault/b/child"
+						? [
+								fileResource("vault/b/child/note.md", {
+									md5: "hash",
+								}),
+							]
+						: [];
+		const listing = directory(path, items);
+		listing.resource_id = `id-${path}`;
+		return response(200, listing);
+	};
+	const files = await createClient().getResourcesRecursive(
+		"vault",
+		true,
+		2,
+		false,
+		undefined,
+		true,
+		undefined,
+		true,
+	);
+	assert.deepEqual(
+		files.map((file) => file.path),
+		["vault/b/child/note.md"],
+	);
+	assert.deepEqual(
+		requested.filter(({ path }) => path === "vault/b/child"),
+		[{ path: "vault/b/child", projected: false }],
+	);
+});
+
+test("index inventory projects only by explicit full-sync request in both modes", async () => {
+	for (const encrypted of [false, true]) {
+		const client = createClient();
+		client.setRemotePath("vault");
+		client.setEncryptionService(await codecFor(encrypted));
+		const rawPath = await client.getPhysicalPath("vault/note.md");
+		const requested: boolean[] = [];
+		requestGlobal.__obsidianRequestUrl = async (params) => {
+			const projected = new URL(params.url).searchParams.has("fields");
+			requested.push(projected);
+			const item = fileResource(rawPath, {
+				md5: "stable-hash",
+				size: 42,
+				mime_type: "text/markdown",
+				revision: 9,
+			});
+			if (projected) {
+				delete item.mime_type;
+				delete item.revision;
+			}
+			const listing = directory("vault", [item]);
+			listing.resource_id = "stable-root";
+			return response(200, listing);
+		};
+		const manager = new IndexManager(
+			client,
+			{
+				shouldInspectRaw: () => true,
+				shouldSync: () => true,
+			} as unknown as VaultAdapter,
+			{ ...DEFAULT_SETTINGS, remotePath: "vault" },
+		);
+		const complete = await manager.getRemoteFiles();
+		assert.deepEqual(requested, [false]);
+		requested.length = 0;
+		const projected = await manager.getRemoteFiles(undefined, {
+			projectSyncInventory: true,
+		});
+		assert.deepEqual(requested, [true]);
+		assert.deepEqual(projected, complete);
+	}
 });
 
 test("folder observations skip mkdir until delete or connection changes invalidate them", async () => {

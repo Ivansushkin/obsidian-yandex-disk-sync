@@ -1,5 +1,49 @@
 # Changelog
 
+## 2.3.0
+
+Changes since `2.2.0`.
+
+### Changed
+
+- After OAuth or manual sign-in, synchronization waits for the first manual
+  Sync, even across restarts. Automation is enabled when that run is accepted.
+- The sync indicator can be hidden in settings without stopping synchronization;
+  its visibility choice persists across restarts.
+- Full sync requests less remote metadata. If the reduced response is incomplete
+  or unsupported, it retries with full metadata and stops safely if that too is
+  incomplete.
+- Recovery after suspension now handles desktop focus as well as mobile return.
+  It waits for outstanding requests, retries network failures and resumes after
+  connectivity returns. Repeated manual requests share one pending run.
+
+### Fixed
+
+- Sync progress notices stay inside plugin settings instead of appearing over
+  the workspace. Sync failures can still show a global notice; repeated identical
+  failures are suppressed until the next successful exchange.
+- Changes made during synchronization remain pending when earlier observations
+  become stale. Folder moves preserve mutation order across restarts, and failed
+  internal writes no longer suppress later edits.
+- Incomplete remote inventories and temporarily missing service indexes are
+  handled without treating missing data as an empty folder.
+- Force recovery verifies written data and preserves later local changes rather
+  than repeating a completed broad purge. Encryption transitions and replacement
+  recovery also preserve later edits and protected copies through interruptions.
+- Temporary startup and encryption-manifest read failures no longer leave a
+  permanent block before a transition starts. OAuth recovery avoids repeated
+  refresh requests; a rejected grant still requires signing in again.
+- The indicator and settings notice distinguish pending work and failures from
+  a successful exchange. The success time updates only after a fully settled sync,
+  and screen readers receive the same status and reason.
+- Diagnostic log write failures are reported, retained entries are bounded, and
+  sensitive values are masked in messages and context.
+
+### Diagnostics
+
+- Added read-only probes for Disk revision availability and response size.
+  Force logs its recovery phase and remaining work without file contents.
+
 ## 2.2.0
 
 Changes since `2.1.0`.

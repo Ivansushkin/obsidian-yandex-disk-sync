@@ -1,5 +1,9 @@
 import type { SyncIndex } from "../../types";
 import { protectRecord } from "../../utils/record-utils";
+import {
+	ConcurrentSyncChangeError,
+	isConcurrentSyncChange,
+} from "../../errors";
 
 /** Deep-clone canonical JSON and restore protection for persisted path records. */
 export function cloneIndex(index: Readonly<SyncIndex>): SyncIndex {
@@ -70,7 +74,19 @@ export async function collectStablePaginatedItems<T>(
 ): Promise<T[]> {
 	let previousSignature: string | null = null;
 	for (let attempt = 0; attempt < maxSnapshots; attempt++) {
-		const pageItems = await collectPaginatedItems(loadPage);
+		let pageItems;
+		try {
+			pageItems = await collectPaginatedItems(loadPage);
+		} catch (error) {
+			if (
+				!isConcurrentSyncChange(error) ||
+				attempt === maxSnapshots - 1
+			) {
+				throw error;
+			}
+			previousSignature = null;
+			continue;
+		}
 		const unique = new Map<string, T>();
 		for (const item of pageItems) {
 			unique.set(getPath(item), item);
@@ -118,7 +134,7 @@ export function didCanonicalChangeBeforeMaintenanceClaim(
 	return currentRevision !== observedRevision;
 }
 
-export class UnstablePaginationError extends Error {
+export class UnstablePaginationError extends ConcurrentSyncChangeError {
 	constructor(message: string) {
 		super(message);
 		this.name = "UnstablePaginationError";

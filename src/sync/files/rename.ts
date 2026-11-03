@@ -1,5 +1,6 @@
 import { VaultAdapter } from "../../api/vault-adapter";
 import { YandexDiskClient } from "../../api/yandex-client";
+import type { FailureSummary } from "../../errors";
 import type {
 	FileMetadata,
 	IndexMove,
@@ -35,6 +36,7 @@ import * as syncReconciliation from "../reconciliation/commits";
 import * as reconciliationContext from "../reconciliation/context";
 import * as fileOperations from "./operations";
 import * as remoteMoves from "./remote-moves";
+import { settleMovePredecessors } from "./move-predecessors";
 export interface Dependencies {
 	assertActive: () => void;
 	getWatcherCausalContext: () => WatcherCausalContext;
@@ -162,6 +164,10 @@ export async function renameFileNow(
 		};
 	}
 	deps.realtimeGuardValidationToken = validationToken;
+	let retryFailure: FailureSummary | undefined;
+	const recordRetryFailure = (failure: FailureSummary) => {
+		retryFailure ??= failure;
+	};
 
 	if (!deps.vaultAdapter.shouldSync(newPath)) {
 		return deleteExcludedRenameSource(deps, oldPath, context);
@@ -358,6 +364,7 @@ export async function renameFileNow(
 					newPath,
 					{ content, sha256 },
 					context,
+					recordRetryFailure,
 				);
 				return {
 					status: committed ? "completed" : "retry",
@@ -369,6 +376,7 @@ export async function renameFileNow(
 					reason: committed
 						? undefined
 						: "index-commit-not-confirmed",
+					retryFailure,
 					remoteStarted: true,
 				};
 			}
@@ -493,6 +501,7 @@ export async function renameFileNow(
 			const proof = await syncReconciliation.saveRemoteIndexBestEffort(
 				deps.syncReconciliation,
 				assertRecoverySource,
+				recordRetryFailure,
 			);
 			deps.assertActive();
 			if (!proof) {
@@ -501,6 +510,7 @@ export async function renameFileNow(
 					canonicalRevision: null,
 					epoch: context.epoch,
 					reason: "source-put-commit-not-confirmed",
+					retryFailure,
 					remoteStarted: true,
 				};
 			}
@@ -565,6 +575,7 @@ export async function renameFileNow(
 				newPath,
 				{ content, sha256 },
 				context,
+				recordRetryFailure,
 			);
 			if (!committed) {
 				return {
@@ -575,6 +586,7 @@ export async function renameFileNow(
 					reason: deps.epochReplacementPending
 						? "epoch-replaced"
 						: "index-commit-not-confirmed",
+					retryFailure,
 					remoteStarted: true,
 				};
 			}
@@ -661,6 +673,7 @@ async function deleteExcludedRenameSource(
 	oldPath: string,
 	context: WatcherCausalContext,
 ): Promise<FileRenameOutcome> {
+	let retryFailure: FailureSummary | undefined;
 	if (deps.vaultAdapter.shouldSync(oldPath)) {
 		const mutation = deps.indexManager.enqueueMutation(
 			"delete-file",
@@ -683,6 +696,10 @@ async function deleteExcludedRenameSource(
 		if (
 			!(await syncReconciliation.saveRemoteIndexBestEffort(
 				deps.syncReconciliation,
+				undefined,
+				(failure) => {
+					retryFailure = failure;
+				},
 			))
 		) {
 			return {
@@ -694,6 +711,7 @@ async function deleteExcludedRenameSource(
 					? "epoch-replaced"
 					: "canonical-commit-not-confirmed",
 				remoteStarted: true,
+				retryFailure,
 				requiresFullSync: deps.epochReplacementPending
 					? "epoch-replaced"
 					: undefined,
@@ -739,6 +757,7 @@ async function recoverFileRename(
 	existingMove: IndexMove,
 	{ content, sha256 }: Pick<RenameTargetSnapshot, "content" | "sha256">,
 ): Promise<FileRenameOutcome> {
+	let retryFailure: FailureSummary | undefined;
 	const canonicalSource = canonical.files[oldPath];
 	setRecordValue(deps.indexManager.getRemoteIndex().moves, existingMove.id, {
 		...existingMove,
@@ -782,11 +801,21 @@ async function recoverFileRename(
 	if (
 		!(await syncReconciliation.saveMoveCompletionBestEffort(
 			deps.syncReconciliation,
+			(failure) => {
+				retryFailure = failure;
+			},
 		))
 	) {
-		throw new Error(
-			`Could not commit recovered rename: ${oldPath} -> ${newPath}`,
-		);
+		await deps.indexSaveCallback?.();
+		return {
+			status: "retry",
+			plan: "materialize-target",
+			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+			epoch: canonical.epoch,
+			reason: "move-completion-not-confirmed",
+			remoteStarted: true,
+			retryFailure,
+		};
 	}
 	if (pendingMoveMutation) {
 		deps.indexManager.confirmMutation(pendingMoveMutation.id);
@@ -838,6 +867,14 @@ async function commitFileRename(
 		snapshot: { content, sha256 },
 	}: FileRenameCommit,
 ): Promise<FileRenameOutcome> {
+	let retryFailure: FailureSummary | undefined;
+	await settleMovePredecessors(
+		deps.fileOperations,
+		oldPath,
+		newPath,
+		false,
+		deps.indexSaveCallback,
+	);
 	const { mutation, physicalMove } = stageFileMove(
 		deps.indexManager,
 		oldPath,
@@ -854,6 +891,10 @@ async function commitFileRename(
 	if (
 		!(await syncReconciliation.saveRemoteIndexBestEffort(
 			deps.syncReconciliation,
+			undefined,
+			(failure) => {
+				retryFailure = failure;
+			},
 		))
 	) {
 		return {
@@ -865,6 +906,7 @@ async function commitFileRename(
 				? "epoch-replaced"
 				: "index-commit-not-confirmed",
 			remoteStarted: true,
+			retryFailure,
 		};
 	}
 	if (
@@ -936,11 +978,21 @@ async function commitFileRename(
 	if (
 		!(await syncReconciliation.saveMoveCompletionBestEffort(
 			deps.syncReconciliation,
+			(failure) => {
+				retryFailure = failure;
+			},
 		))
 	) {
-		throw new Error(
-			`Could not commit rename completion: ${oldPath} -> ${newPath}`,
-		);
+		await deps.indexSaveCallback?.();
+		return {
+			status: "retry",
+			plan,
+			canonicalRevision: deps.indexManager.getRemoteIndex().revision,
+			epoch: context.epoch,
+			reason: "move-completion-not-confirmed",
+			remoteStarted: true,
+			retryFailure,
+		};
 	}
 	deps.indexManager.confirmAppliedMutations();
 	const confirmedTarget = deps.indexManager.getRemoteIndex().files[newPath];
@@ -1018,6 +1070,7 @@ export async function putRenamedUnsyncedFile(
 	newPath: string,
 	snapshot: { content: ArrayBuffer; sha256: string },
 	context: WatcherCausalContext,
+	onRetryableFailure?: (failure: FailureSummary) => void,
 ): Promise<boolean> {
 	const oldPendingPut = [...deps.indexManager.getPendingMutations()]
 		.reverse()
@@ -1072,6 +1125,8 @@ export async function putRenamedUnsyncedFile(
 	stageRenameMutation(deps.indexManager, mutation, newPath);
 	const commitProof = await syncReconciliation.saveRemoteIndexBestEffort(
 		deps.syncReconciliation,
+		undefined,
+		onRetryableFailure,
 	);
 	if (!commitProof) {
 		return false;

@@ -7,7 +7,6 @@ import {
 	App,
 	type BaseComponent,
 	ButtonComponent,
-	Notice,
 	PluginSettingTab,
 	Setting,
 	TextAreaComponent,
@@ -60,7 +59,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private controlsEl: HTMLElement | null = null;
 	private controls: {
 		component: BaseComponent;
-		diagnostic: boolean;
+		availableWhileBusy: boolean;
 		disabled: boolean;
 		requiresAuthorization: boolean;
 	}[] = [];
@@ -149,12 +148,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	/** Retain each control's own admission restrictions while applying activity locks. */
 	private trackControl(
 		component: BaseComponent,
-		diagnostic = false,
+		availableWhileBusy = false,
 		requiresAuthorization = false,
 	): void {
 		this.controls.push({
 			component,
-			diagnostic,
+			availableWhileBusy,
 			disabled: component.disabled,
 			requiresAuthorization,
 		});
@@ -198,7 +197,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		const manualAuthorized =
 			this.plugin.settings.authMethod === "manual" &&
 			Boolean(this.plugin.settings.yandexTokenSecret.trim()) &&
-			!this.plugin.settings.manualSyncRequired;
+			this.plugin.settings.manualAuthorizationConfirmed;
 		this.manualAuthorizationButton?.setButtonText(
 			t(
 				manualAuthorized
@@ -221,7 +220,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		);
 		for (const {
 			component,
-			diagnostic,
+			availableWhileBusy,
 			disabled,
 			requiresAuthorization,
 		} of this.controls) {
@@ -230,7 +229,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					this.plugin.isPluginUnloaded() ||
 					(requiresAuthorization &&
 						!this.plugin.settings.yandexTokenSecret.trim()) ||
-					(!diagnostic && busy),
+					(!availableWhileBusy && busy),
 			);
 		}
 		const state = this.plugin.getForceSyncController().getState();
@@ -329,8 +328,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		try {
 			await action(isCurrent);
 		} catch (error) {
-			if (this.displayed && !this.plugin.isPluginUnloaded()) {
-				new Notice(
+			if (
+				this.displayed &&
+				generation === this.renderGeneration &&
+				!this.plugin.isPluginUnloaded()
+			) {
+				this.plugin.showSettingsNotice(
 					formatOperationFailure(
 						createSyncFailure(error, {
 							stage: "preflight",
@@ -346,13 +349,18 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	private async applyDraft(patch: UserSettingsPatch): Promise<void> {
+		const generation = this.renderGeneration;
 		try {
 			await this.plugin.applySettingsPatch(patch);
 		} catch (error) {
-			if (this.plugin.isPluginUnloaded()) {
+			if (
+				this.plugin.isPluginUnloaded() ||
+				!this.displayed ||
+				generation !== this.renderGeneration
+			) {
 				return;
 			}
-			new Notice(
+			this.plugin.showSettingsNotice(
 				formatOperationFailure(
 					createSyncFailure(error, {
 						stage: "persisting",
@@ -374,7 +382,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			if (!isCurrent()) {
 				return;
 			}
-			new Notice(
+			this.plugin.showSettingsNotice(
 				error instanceof UnsupportedHistoricalDataError
 					? t("notice.unsupported_historical_data")
 					: formatOperationFailure(
@@ -515,7 +523,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					if (count !== null && isLogActionCurrent()) {
 						tooltipGeneration++;
 						updateCopyCount(count);
-						new Notice(
+						this.plugin.showSettingsNotice(
 							count === 0
 								? t("status.actions.logs_empty")
 								: t("notice.logs_copied_count", { count }),
@@ -523,7 +531,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					}
 				} catch {
 					if (isLogActionCurrent()) {
-						new Notice(t("status.actions.copy_failed"));
+						this.plugin.showSettingsNotice(
+							t("status.actions.copy_failed"),
+						);
 					}
 				} finally {
 					this.copyingLogs = false;
@@ -583,7 +593,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				this.openingLogs = true;
 				this.updateActivity();
 				try {
-					await openLogFile(this.app, isLogActionCurrent);
+					await openLogFile(this.app, isLogActionCurrent, (message) =>
+						this.plugin.showSettingsNotice(message),
+					);
 				} finally {
 					this.openingLogs = false;
 					if (!this.plugin.isPluginUnloaded()) {
@@ -612,6 +624,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						const cleared = await clearLogsWithConfirmation(
 							this.app,
 							isLogActionCurrent,
+							(message) =>
+								this.plugin.showSettingsNotice(message),
 						);
 						if (cleared && isLogActionCurrent()) {
 							tooltipGeneration++;
@@ -649,8 +663,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 	display(): void {
 		this.displayed = true;
-		this.plugin.setSettingsStatusVisible(true);
 		this.renderSettings();
+		this.plugin.setSettingsStatusVisible(true, this.containerEl);
 	}
 
 	private renderSettings(refreshBackup = true): void {
@@ -676,6 +690,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		};
 		const { containerEl } = this;
 		containerEl.empty();
+		this.plugin.attachSettingsNotices(containerEl);
 		this.controlsEl = containerEl.createEl("div", {
 			cls: "force-settings-controls",
 		});
@@ -688,7 +703,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						!this.isActionUnavailable() ||
 						(e.target instanceof Element &&
 							e.target.closest(
-								".sync-diagnostic-controls, .sync-auth-controls",
+								".sync-diagnostic-controls, .sync-auth-controls, .sync-presentation-controls",
 							))
 					) {
 						return;
@@ -744,6 +759,21 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				});
 			});
 		const migrationPending = this.plugin.isStableMigrationPending();
+		const indicatorSetting = new Setting(containerEl)
+			.setName(t("settings.show_sync_indicator"))
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showSyncIndicator)
+					.setDisabled(migrationPending)
+					.then((control) => this.trackControl(control, true))
+					.onChange(async (value) => {
+						if (this.plugin.isPluginUnloaded()) {
+							return;
+						}
+						await this.applyDraft({ showSyncIndicator: value });
+					}),
+			);
+		indicatorSetting.settingEl.addClass("sync-presentation-controls");
 
 		// Connection section
 		new Setting(containerEl)
@@ -905,8 +935,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				) {
 					return;
 				}
-				if (this.plugin.settings.manualSyncRequired) {
-					await this.runFullSyncFromSettings();
+				if (!this.plugin.settings.manualAuthorizationConfirmed) {
+					await this.runSettingsAction(() =>
+						this.plugin.confirmManualAuthorization(),
+					);
 				} else {
 					await this.signOut();
 				}
@@ -1359,6 +1391,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 								isUnavailable: () =>
 									this.isRemoteActionUnavailable(),
 								isCurrent: () =>
+									this.displayed &&
 									!this.plugin.isPluginUnloaded(),
 								subscribe: (update) =>
 									this.plugin.onSyncActivityChange(update),
@@ -1503,7 +1536,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					await this.plugin.beginAuthorization();
 				} catch {
 					if (this.plugin.getAuthorizationState().phase === "idle") {
-						new Notice(t("settings.auth_failed"));
+						this.plugin.showSettingsNotice(
+							t("settings.auth_failed"),
+						);
 					}
 				}
 				this.renderSettings(false);
