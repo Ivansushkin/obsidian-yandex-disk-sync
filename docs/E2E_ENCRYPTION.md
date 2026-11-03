@@ -192,8 +192,12 @@ reconciliation и fresh epoch/canonical/fingerprint guards для physical actio
 
 ## Orchestration и admission
 
-Новые переходы используют **initiator-wins**: frozen local reference в текущих
-sync filters, fresh target epoch и stable replacement receipt. Чужие old-generation
+Новые переходы используют **initiator-wins**: frozen sync filters, per-file
+reference проверенных при чтении версий, fresh target epoch и stable replacement
+receipt. Изменение до чтения входит в reference; последующие правки остаются
+локальной работой для ordinary sync. Исчезнувший до чтения source не становится
+ошибкой чтения всего vault; authentication/read failure существующего source
+по-прежнему блокирует commit. Чужие old-generation
 PUT/mutation не сливаются в эталон. Верхнеуровневая папка удаляется одним DELETE,
 если весь наблюдаемый subtree removable и фильтры покрывают его целиком. Смешанная
 папка разбивается до безопасных descendants; root, service paths, `.backup`, plugin
@@ -221,7 +225,9 @@ stamps берутся из verified snapshot. Failed reads joined до recovery,
 config ABA запрещает поздние writes и успех даже после более ранней сетевой ошибки.
 Инициатор может восстановить target только из сохранённых
 reference hashes. Не более четырёх sweep/repair passes; нет сходимости — нет success.
-Local drift не меняет эталон и блокирует завершение. Foreign target-only recovery
+После commit local drift не меняет эталон и не блокирует завершение здорового
+проверенного remote target. Repair требует именно reference bytes; поздняя правка
+не разрешает подменять ими повреждённый target. Foreign target-only recovery
 использует уже durable raw cover и target codec. Если после crash обнаружился новый
 неидентифицируемый source object вне cover, recovery fail closed: нужны source-capable
 owner и его ключ; исключения нельзя расширять предположением.
@@ -236,9 +242,15 @@ owner и его ключ; исключения нельзя расширять �
 Старое устройство автоматически принимает stable target epoch до ordinary baseline
 merge и не возвращает offline edits/старые queues на сервер. Выбранные local extras
 удаляются, baseline и очереди заменяются только после проверенных bytes и coherent
-save. При failed save старые causal IDs сохраняются для повторного приёма. После
+save. При failed save старые causal IDs сохраняются для повторного приёма.
+[Local receipt](LOCAL_REPLACEMENT_RECOVERY.md) отделяет исходные selected bytes от
+правок во время приёма: late create/edit/move сохраняются, applied target не
+перезаписывается поверх поздней правки. Изменённый structural blocker сохраняется
+через обычные conflict copies вне blocking root; excluded descendants по-прежнему
+блокируют удаление. При новой replacement generation сохраняются исходные expected
+hashes и поздние события; текущий диск не объявляется новой disposable baseline. После
 foreign completion владелец снимает checkpoint только read-only: matching operation,
-reference canonical/local hashes, target read-back, отсутствие source cover и свежая
+reference canonical hashes, target read-back, отсутствие source cover и свежая
 стабильная authority. Failed save восстанавливает transition и causal snapshot.
 
 Следующие fingerprint/unchanged-epoch правила относятся к **старым guarded

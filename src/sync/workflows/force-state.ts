@@ -38,6 +38,7 @@ export interface DirectForceCheckpoint {
 
 /** Durable source identities and authority; credentials remain exclusively in local plugin data. */
 export interface ForceRecovery {
+	watcherBoundary?: Record<string, string>;
 	direct?: DirectForceCheckpoint;
 	completion: {
 		epoch: string;
@@ -102,6 +103,19 @@ export function assertForceRecovery(
 		"targetHashes",
 		"files",
 	];
+	if (state.watcherBoundary !== undefined) {
+		keys.push("watcherBoundary");
+		if (
+			!state.watcherBoundary ||
+			typeof state.watcherBoundary !== "object" ||
+			Array.isArray(state.watcherBoundary) ||
+			Object.values(state.watcherBoundary).some(
+				(value) => typeof value !== "string",
+			)
+		) {
+			throw new Error("Invalid Force watcher boundary");
+		}
+	}
 	if ("direct" in state) {
 		keys.push("direct");
 		assertDirectCheckpoint(state.direct);

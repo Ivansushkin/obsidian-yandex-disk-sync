@@ -7,7 +7,10 @@ export class SettingsStatusNotice {
 	private message = "";
 
 	update(presentation: SyncPresentation): void {
-		if (presentation.state.status === "idle") {
+		if (
+			presentation.state.status === "idle" &&
+			presentation.state.lastOutcome !== "deferred"
+		) {
 			this.hide();
 			return;
 		}

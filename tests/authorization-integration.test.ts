@@ -155,6 +155,7 @@ test("paused OAuth sync refreshes an expiring grant before resuming once", async
 	const browser = wireAuthorization(t, plugin);
 	await plugin.beginAuthorization();
 	await browser.submit("synthetic-code");
+	await plugin.runFullSync();
 	let refreshes = 0;
 	browser.setTokenResponder(async () => {
 		refreshes++;
@@ -229,6 +230,7 @@ test("temporary OAuth refresh preserves automation and a later full", async (t) 
 	const browser = wireAuthorization(t, plugin);
 	await plugin.beginAuthorization();
 	await browser.submit("synthetic-code");
+	await plugin.runFullSync();
 	let refreshes = 0;
 	browser.setTokenResponder(async () => {
 		refreshes++;
@@ -280,6 +282,7 @@ test("cold startup refreshes before Disk access and again after a 401", async (t
 	const browser = wireAuthorization(t, plugin);
 	await plugin.beginAuthorization();
 	await browser.submit("synthetic-code");
+	await plugin.runFullSync();
 	let refreshes = 0;
 	browser.setTokenResponder(async () => {
 		refreshes++;
@@ -363,6 +366,7 @@ test("scheduled full refreshes OAuth before Disk access", async (t) => {
 	const browser = wireAuthorization(t, plugin);
 	await plugin.beginAuthorization();
 	await browser.submit("synthetic-code");
+	await plugin.runFullSync();
 	let refreshes = 0;
 	browser.setTokenResponder(async () => {
 		refreshes++;
@@ -398,6 +402,7 @@ test("mobile recovery refreshes before Disk access and again after a 401", async
 	const browser = wireAuthorization(t, plugin);
 	await plugin.beginAuthorization();
 	await browser.submit("synthetic-code");
+	await plugin.runFullSync();
 	let refreshes = 0;
 	browser.setTokenResponder(async () => {
 		refreshes++;
@@ -621,7 +626,8 @@ for (const encrypted of [false, true]) {
 			}
 			assert.equal(plugin.getAuthorizationState().phase, "connected");
 			assert.equal(plugin.settings.authMethod, "oauth");
-			assert.equal(plugin.settings.manualSyncRequired, false);
+			assert.equal(plugin.settings.manualSyncRequired, true);
+			assert.equal((await plugin.runFullSync())?.success, true);
 			assert.equal(plugin.settings.deviceId, actor);
 			assert.equal(
 				persistence.current?.settings.yandexTokenSecret,
@@ -677,7 +683,7 @@ test(
 			}
 			await plugin.beginAuthorization();
 			const result = browser.submit("synthetic-code");
-			const rejected = assert.rejects(result);
+			const accepted = result;
 			await entered.promise;
 			if (timing !== "before") {
 				a.engine.pause();
@@ -686,7 +692,7 @@ test(
 				a.engine.resume();
 			}
 			release.resolve();
-			await rejected;
+			await accepted;
 			assert.equal(plugin.settings.authMethod, "oauth");
 			assert.equal(
 				persistence.current?.settings.manualSyncRequired,
@@ -732,6 +738,7 @@ test(
 		const browser = wireAuthorization(t, plugin);
 		await plugin.beginAuthorization();
 		await browser.submit("synthetic-code");
+		await plugin.runFullSync();
 		const doc = Object.assign(new EventTarget(), {
 			visibilityState: "visible",
 			defaultView: new EventTarget(),
@@ -820,6 +827,8 @@ test("logout removes credentials durably without contacting Disk or losing offli
 				yandexTokenSecret: before.settings.yandexTokenSecret,
 				oauthAuthorization: before.settings.oauthAuthorization,
 				manualSyncRequired: before.settings.manualSyncRequired,
+				manualAuthorizationConfirmed:
+					before.settings.manualAuthorizationConfirmed,
 			},
 			before.settings,
 		);
@@ -839,7 +848,8 @@ test("logout removes credentials durably without contacting Disk or losing offli
 		await plugin.beginAuthorization();
 		await browser.submit("synthetic-code");
 		assert.equal(plugin.getAuthorizationState().phase, "connected");
-		assert.equal(plugin.settings.manualSyncRequired, false);
+		assert.equal(plugin.settings.manualSyncRequired, true);
+		await plugin.runFullSync();
 		assert.equal(disk.files.has("vault/offline.md"), true);
 		assert.equal(persistence.current?.pendingWatcherEvents.length, 0);
 	}

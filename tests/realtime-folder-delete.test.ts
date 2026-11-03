@@ -73,3 +73,50 @@ for (const encrypted of [false, true]) {
 		await a.assertSettled({ "Offline.md": "offline" });
 	});
 }
+
+test("folder watcher ACK failure cannot publish a successful exchange", async (t) => {
+	for (const action of ["delete", "rename"] as const) {
+		let failAck = false;
+		let failed = false;
+		const a = managedDevices(t)(
+			new MemoryDisk(),
+			`folder-${action}`,
+			null,
+			undefined,
+			undefined,
+			{},
+			(snapshot) => {
+				if (failAck && snapshot.pendingWatcherEvents.length === 0) {
+					failAck = false;
+					failed = true;
+					throw new Error("Synthetic folder ACK save failure");
+				}
+			},
+		);
+		a.vault.put("Folder/A.md", bytes("base"));
+		await a.full();
+		const lastSuccess = a.engine.getState().lastSyncTime;
+		a.start();
+		failAck = true;
+		if (action === "delete") {
+			a.vault.remove("Folder");
+		} else {
+			a.vault.rename("Folder", "Moved");
+		}
+		try {
+			await a.drain();
+		} catch (error) {
+			assert.match(String(error), /Synthetic folder ACK save failure/);
+		}
+		failAck = false;
+		assert.equal(failed, true, action);
+		assert.equal(a.engine.getState().status, "error", action);
+		assert.equal(a.engine.getState().lastOutcome, "error", action);
+		assert.equal(a.engine.getState().lastSyncTime, lastSuccess, action);
+		await a.full();
+		await a.assertSettled(
+			action === "delete" ? {} : { "Moved/A.md": "base" },
+		);
+		await a.stop();
+	}
+});

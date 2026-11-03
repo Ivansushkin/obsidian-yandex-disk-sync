@@ -12,6 +12,7 @@ test("authorization defaults preserve existing manual connections and incomplete
 		const data = structuredClone(seed.writes.at(-1)) as PluginData;
 		Reflect.deleteProperty(data.settings, "authMethod");
 		Reflect.deleteProperty(data.settings, "oauthAuthorization");
+		Reflect.deleteProperty(data.settings, "manualAuthorizationConfirmed");
 		data.settings.yandexTokenSecret =
 			previous === "token" || previous === "oauth" ? "synthetic-old" : "";
 		data.settings.clientId =
@@ -45,6 +46,8 @@ test("authorization defaults preserve existing manual connections and incomplete
 			previous === "client" ? "synthetic-client" : "",
 		);
 		assert.equal(plugin.settings.manualSyncRequired, previous === "fresh");
+		const confirmed = plugin.settings.manualAuthorizationConfirmed;
+		assert.equal(confirmed, previous === "token");
 		assert.equal(
 			plugin.settings.yandexTokenSecret,
 			data.settings.yandexTokenSecret,

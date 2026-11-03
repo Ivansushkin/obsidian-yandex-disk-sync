@@ -15,6 +15,8 @@ import { createSafeRecord } from "./utils/record-utils";
 export interface YandexDiskSyncSettings {
 	/** Local interface override; system follows Obsidian language. */
 	language: LanguagePreference;
+	/** Show the floating sync status and actions over notes. */
+	showSyncIndicator: boolean;
 	/** OAuth token stored only in local plugin data */
 	yandexTokenSecret: string;
 	/** Credential provenance; legacy tokens remain explicitly manual. */
@@ -22,6 +24,7 @@ export interface YandexDiskSyncSettings {
 	oauthAuthorization: OAuthAuthorization | null;
 	/** Require an explicit full sync before automation can use this connection. */
 	manualSyncRequired: boolean;
+	manualAuthorizationConfirmed: boolean;
 	/** Client ID for Yandex OAuth application */
 	clientId: string;
 	/** Path to folder on Yandex Disk */
@@ -64,10 +67,12 @@ export interface YandexDiskSyncSettings {
 
 export const DEFAULT_SETTINGS: YandexDiskSyncSettings = {
 	language: "system",
+	showSyncIndicator: true,
 	yandexTokenSecret: "",
 	authMethod: "oauth",
 	oauthAuthorization: null,
 	manualSyncRequired: false,
+	manualAuthorizationConfirmed: false,
 	clientId: "",
 	remotePath: "obsidian-sync",
 	syncInterval: 5,
@@ -297,6 +302,8 @@ export interface RemoteStorageScope {
 }
 
 export interface LocalSyncState {
+	/** Device-local progress of an interrupted authoritative receive. */
+	replacementReceive?: LocalReplacementReceive;
 	/** Physical root that owns this device's causal history. */
 	remoteScope: RemoteStorageScope | null;
 	/** Installation identifier that owns pending FIFO sequences */
@@ -313,6 +320,15 @@ export interface LocalSyncState {
 	folderTombstones: Record<string, FolderTombstone>;
 	/** Next sequence reserved for a new local mutation */
 	nextMutationSeq: number;
+}
+
+export interface LocalReplacementReceive {
+	operationId: string;
+	epoch: string;
+	scope: EncryptionReplacementScope;
+	initial: Record<string, string>;
+	applied: Record<string, string>;
+	watcherBoundary: Record<string, string>;
 }
 
 export interface FileMetadata {
@@ -545,8 +561,10 @@ export interface SyncState {
 	status: SyncStatus;
 	/** Error message (if any) */
 	errorMessage?: string;
-	/** Last successful sync time */
+	/** Last fully settled successful full, Force or realtime exchange time. */
 	lastSyncTime?: number;
+	/** Non-persisted result of the last represented session. */
+	lastOutcome?: "success" | "deferred" | "error";
 	/** Coordinator session currently represented by the UI. */
 	sessionId?: string;
 	/** Kind of coordinator session represented by the UI. */
@@ -598,6 +616,10 @@ export interface SyncOperation {
 }
 
 export interface SyncResult {
+	/** Work retained after a verified concurrent change; not an error or a completed reconciliation. */
+	deferred?: boolean;
+	/** Exact event signatures covered by a completed replacement receive. */
+	settledWatcherEvents?: Record<string, string>;
 	failure?: FailureSummary;
 	/** Original failure is internal and is never passed to presentation or persistence. */
 	failureCause?: OperationFailure;

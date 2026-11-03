@@ -168,6 +168,7 @@ test("local delete retains edits made during protective backup and its durable a
 			},
 		},
 		vaultAdapter: {
+			captureLocalObservation: () => () => {},
 			fileExists: () => true,
 			readFile: async () => content,
 			backupOverwrittenFile: async (

@@ -19,6 +19,7 @@ import {
 	RemoteReadInterruptedError,
 	NetworkRequestError,
 	OperationFailure,
+	ConcurrentSyncChangeError,
 	decideRecovery,
 	withFailureContext,
 	type RetryProgress,
@@ -378,7 +379,10 @@ export class YandexDiskClient {
 		const raw = await this.downloadFile(path, true, budget);
 		const after = await this.getResource(path, 1, 0, true, budget);
 		if (!after) {
-			throw new Error("Remote service file disappeared while being read");
+			throw new ConcurrentSyncChangeError(
+				"Remote service file disappeared while being read",
+				"missing",
+			);
 		}
 		const matchingFingerprint = this.getMatchingContentFingerprint(
 			before,
@@ -386,7 +390,9 @@ export class YandexDiskClient {
 		);
 		const afterFingerprint = this.getContentFingerprint(after);
 		if (!matchingFingerprint || !afterFingerprint) {
-			throw new Error("Remote service file changed while being read");
+			throw new ConcurrentSyncChangeError(
+				"Remote service file changed while being read",
+			);
 		}
 		if (after.sha256 && (await computeSha256(raw)) !== after.sha256) {
 			if (retryContentMismatch) {
@@ -423,7 +429,9 @@ export class YandexDiskClient {
 		const raw = await this.downloadFile(rawPath, true, budget);
 		const after = await this.getLogicalResource(path, budget);
 		if (!after) {
-			throw new Error("Remote user file disappeared while being read");
+			throw new ConcurrentSyncChangeError(
+				"Remote user file disappeared while being read",
+			);
 		}
 		const matchingFingerprint = this.getMatchingContentFingerprint(
 			before,
@@ -431,7 +439,9 @@ export class YandexDiskClient {
 		);
 		const afterFingerprint = this.getContentFingerprint(after);
 		if (!matchingFingerprint || !afterFingerprint) {
-			throw new Error("Remote user file changed while being read");
+			throw new ConcurrentSyncChangeError(
+				"Remote user file changed while being read",
+			);
 		}
 		let verifiedRawSha256: string | undefined;
 		if (after.sha256) {

@@ -1,5 +1,5 @@
 import { ForceScopeConflictError } from "../force-errors";
-import { OperationFailure } from "../errors";
+import { OperationFailure, ConcurrentSyncChangeError } from "../errors";
 /**
  * Adapter for working with Obsidian Vault files
  */
@@ -31,10 +31,10 @@ import { runWithConcurrency } from "../utils/semaphore";
 export interface LocalWriteGuard {
 	expectedSha256: string | null;
 	validateBeforeWrite?: () => Promise<void>;
-	beforeWrite?: () => void;
+	beforeWrite?: () => void | (() => void);
 }
 
-export class LocalFileChangedError extends Error {
+export class LocalFileChangedError extends ConcurrentSyncChangeError {
 	constructor() {
 		super("Local file changed; reconciliation required");
 	}
@@ -43,6 +43,24 @@ export class LocalFileChangedError extends Error {
 export class VaultAdapter {
 	private app: App;
 	private settings: YandexDiskSyncSettings;
+	private localObservationReader?: (paths: readonly string[]) => number;
+
+	/** Reuse the lifecycle-owned watcher instead of registering a second observer. */
+	setLocalObservationReader(
+		read: (paths: readonly string[]) => number,
+	): void {
+		this.localObservationReader = read;
+	}
+
+	/** Reject local events admitted while asynchronous safety checks were running. */
+	captureLocalObservation(paths: readonly string[]): () => void {
+		const revision = this.localObservationReader?.(paths);
+		return () => {
+			if (revision !== this.localObservationReader?.(paths)) {
+				throw new LocalFileChangedError();
+			}
+		};
+	}
 
 	constructor(app: App, settings: YandexDiskSyncSettings) {
 		this.app = app;
@@ -180,7 +198,8 @@ export class VaultAdapter {
 	/** Permanently remove a Force destination; never move it to Obsidian trash. */
 	async deleteForcePath(
 		path: string,
-		beforeMutation?: () => Promise<void>,
+		beforeMutation?: () => Promise<void | (() => void)>,
+		observe?: () => void | (() => void),
 	): Promise<void> {
 		assertForcePath(path);
 		if (
@@ -192,13 +211,24 @@ export class VaultAdapter {
 			);
 		}
 		const entry = this.vault.getAbstractFileByPath(path);
+		const assertObserved = this.captureLocalObservation([path]);
 		if (entry) {
-			await beforeMutation?.();
-			// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- Confirmed Force explicitly requires permanent deletion without trash.
-			await this.vault.delete(entry, true);
+			const assertPrepared = await beforeMutation?.();
+			if (
+				entry.path !== path ||
+				this.vault.getAbstractFileByPath(path) !== entry
+			) {
+				throw new LocalFileChangedError();
+			}
+			(assertPrepared ?? assertObserved)();
+			await this.observeMutation(() => {
+				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- Confirmed Force requires permanent deletion without trash.
+				return this.vault.delete(entry, true);
+			}, observe);
 		} else {
 			const stat = await this.vault.adapter.stat(path);
-			await beforeMutation?.();
+			const assertPrepared = await beforeMutation?.();
+			(assertPrepared ?? assertObserved)();
 			if (stat?.type === "folder") {
 				await this.vault.adapter.rmdir(path, true);
 			} else if (stat) {
@@ -232,6 +262,7 @@ export class VaultAdapter {
 		path: string,
 		content: ArrayBuffer,
 		beforeMutation?: () => Promise<void>,
+		observe?: () => void | (() => void),
 	): Promise<void> {
 		assertForcePath(path);
 		if (
@@ -250,13 +281,30 @@ export class VaultAdapter {
 			throw new ForceScopeConflictError();
 		}
 		const file = this.getFile(path);
+		const assertObserved = this.captureLocalObservation([path]);
 		await beforeMutation?.();
-		if (file) {
-			await this.vault.modifyBinary(file, content);
-		} else if (!path.split("/").some((part) => part.startsWith("."))) {
-			await this.vault.createBinary(path, content);
-		} else {
-			await this.vault.adapter.writeBinary(path, content);
+		assertObserved();
+		await this.observeMutation(async () => {
+			if (file) {
+				await this.vault.modifyBinary(file, content);
+			} else if (!path.split("/").some((part) => part.startsWith("."))) {
+				await this.vault.createBinary(path, content);
+			} else {
+				await this.vault.adapter.writeBinary(path, content);
+			}
+		}, observe);
+	}
+
+	/** Retire the exact event expectation even when native storage rejects a mutation. */
+	private async observeMutation<T>(
+		mutate: () => Promise<T>,
+		observe?: () => void | (() => void),
+	): Promise<T> {
+		const release = observe?.();
+		try {
+			return await mutate();
+		} finally {
+			release?.();
 		}
 	}
 
@@ -306,7 +354,7 @@ export class VaultAdapter {
 	async readFile(path: string): Promise<ArrayBuffer> {
 		const file = this.getFile(path);
 		if (!file) {
-			throw new Error(`File not found: ${path}`);
+			throw new ConcurrentSyncChangeError(`File not found: ${path}`);
 		}
 		return this.vault.readBinary(file);
 	}
@@ -327,8 +375,10 @@ export class VaultAdapter {
 			await this.createFolderRecursive(dir);
 		}
 
+		let assertObserved: (() => void) | undefined;
 		if (guard) {
 			await guard.validateBeforeWrite?.();
+			assertObserved = this.captureLocalObservation([normalizedPath]);
 			await this.assertLocalIdentity(
 				normalizedPath,
 				guard.expectedSha256,
@@ -350,31 +400,32 @@ export class VaultAdapter {
 		) {
 			throw new LocalFileChangedError();
 		}
-		guard?.beforeWrite?.();
-
-		if (existingFile) {
-			if (typeof content === "string") {
-				await this.vault.modify(existingFile, content);
-			} else {
-				await this.vault.modifyBinary(existingFile, content);
-			}
-		} else {
-			try {
+		assertObserved?.();
+		await this.observeMutation(async () => {
+			if (existingFile) {
 				if (typeof content === "string") {
-					await this.vault.create(normalizedPath, content);
+					await this.vault.modify(existingFile, content);
 				} else {
-					await this.vault.createBinary(normalizedPath, content);
+					await this.vault.modifyBinary(existingFile, content);
 				}
-			} catch (error) {
-				if (
-					guard?.expectedSha256 === null &&
-					this.fileExists(normalizedPath)
-				) {
-					throw new LocalFileChangedError();
+			} else {
+				try {
+					if (typeof content === "string") {
+						await this.vault.create(normalizedPath, content);
+					} else {
+						await this.vault.createBinary(normalizedPath, content);
+					}
+				} catch (error) {
+					if (
+						guard?.expectedSha256 === null &&
+						this.fileExists(normalizedPath)
+					) {
+						throw new LocalFileChangedError();
+					}
+					throw error;
 				}
-				throw error;
 			}
-		}
+		}, guard?.beforeWrite);
 
 		logger.debug(`Written file: ${normalizedPath}`);
 	}
@@ -431,6 +482,7 @@ export class VaultAdapter {
 	async pruneEmptyLocalAncestors(
 		filePath: string,
 		canPrune?: (path: string) => boolean,
+		observe?: (path: string) => void | (() => void),
 	): Promise<void> {
 		const configDir = this.app.vault.configDir;
 		let dir = getDirectory(normalizePath(filePath));
@@ -446,7 +498,10 @@ export class VaultAdapter {
 				break;
 			}
 			try {
-				await this.app.fileManager.trashFile(folder);
+				await this.observeMutation(
+					() => this.app.fileManager.trashFile(folder),
+					() => observe?.(dir),
+				);
 				logger.debug(`Pruned empty local folder: ${dir}`);
 			} catch (e) {
 				logger.warn(`Failed to prune empty local folder ${dir}:`, {
@@ -596,9 +651,13 @@ export class VaultAdapter {
 
 		// Process files in parallel with concurrency limit
 		const tasks = files.map((file) => async () => {
+			const path = file.path;
 			try {
 				const content = await this.vault.readBinary(file);
 				const sha256 = await computeSha256(content);
+				if (file.path !== path || this.getFile(path) !== file) {
+					throw new LocalFileChangedError();
+				}
 
 				return {
 					path: file.path,
@@ -612,6 +671,9 @@ export class VaultAdapter {
 				};
 			} catch (e) {
 				if (failOnReadError) {
+					if (file.path !== path || this.getFile(path) !== file) {
+						throw new LocalFileChangedError();
+					}
 					throw e;
 				}
 				logger.warn(`Failed to get file metadata: ${file.path}`, {

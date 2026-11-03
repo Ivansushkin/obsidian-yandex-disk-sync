@@ -23,6 +23,7 @@ import * as reconciliationContext from "../reconciliation/context";
 import * as reconcilePhysicalRecovery from "../reconciliation/physical-recovery";
 import * as fileOperations from "./operations";
 import * as remoteMoves from "./remote-moves";
+import { settleMovePredecessors } from "./move-predecessors";
 export interface Dependencies {
 	indexManager: IndexManager;
 	getSyncGuardResult: (
@@ -524,6 +525,13 @@ export async function renameFolderNow(
 	context: WatcherCausalContext,
 	onPrepared?: (outcome: FolderMutationOutcome) => void | Promise<void>,
 ): Promise<FolderMutationOutcome> {
+	await settleMovePredecessors(
+		deps.fileOperations,
+		oldPath,
+		newPath,
+		true,
+		deps.indexSaveCallback,
+	);
 	const guard = await deps.getSyncGuardResult(false);
 	if (guard.blockReason) {
 		deps.setBlockedState(guard.blockReason);

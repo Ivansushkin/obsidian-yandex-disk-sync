@@ -1,5 +1,24 @@
 import { findErrorCause } from "./utils/error-utils";
 
+/** A verified observation became stale; its work must be reconciled without declaring failure. */
+export class ConcurrentSyncChangeError extends Error {
+	constructor(
+		message: string,
+		readonly observation: "changed" | "missing" = "changed",
+	) {
+		super(message);
+	}
+}
+
+export function isConcurrentSyncChange(error: unknown): boolean {
+	return (
+		findErrorCause(
+			error,
+			(cause) => cause instanceof ConcurrentSyncChangeError,
+		) !== null
+	);
+}
+
 export type FailureCategory =
 	"unavailable" | "access" | "safety" | "local" | "unknown";
 export type OperationKind =

@@ -28,7 +28,7 @@ export interface Dependencies {
 	expectWatcherEvent: (
 		path: string,
 		action: "upload" | "delete" | "rename",
-	) => void;
+	) => void | (() => void);
 	fileOperations: fileOperations.Dependencies;
 	remoteMoves: remoteMoves.Dependencies;
 }

@@ -157,6 +157,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private settingsStatusNotice: SettingsStatusNotice | null = null;
 	private settingsStatusUnsubscribe: (() => void) | null = null;
 	private activeManualFullPromise: Promise<SyncResult | null> | null = null;
+	private firstManualFullPromise: Promise<SyncResult | null> | null = null;
 	private activeResumePromise: Promise<boolean> | null = null;
 	private readonly manualActivityListeners = new Set<() => void>();
 	private forceSyncController: ForceSyncController | null = null;
@@ -341,7 +342,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		});
 
 		logger.info("Yandex Disk Sync plugin unloaded");
-		void logger.flush();
+		void logger.flush().catch(() => undefined);
 	}
 
 	/**
@@ -664,22 +665,10 @@ export default class YandexDiskSyncPlugin extends Plugin {
 							throw new AuthorizationError("revoked");
 						}
 					},
-					assertContinuation: () => {
-						lifetime();
-						if (this.unloaded || this.syncEngine.isSyncPaused()) {
-							throw new AuthorizationError("sync");
-						}
-					},
 				};
 			},
 			adopt: (update, attempt) =>
 				this.updateAuthentication(update, attempt),
-			synchronize: async () => {
-				const result = await this.runFullSync({ trigger: "manual" });
-				if (!result?.success) {
-					throw new AuthorizationError("sync");
-				}
-			},
 		});
 		this.register(
 			this.authorization.subscribe(() => {
@@ -713,6 +702,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.register(() => this.authorization?.dispose());
 		const canStartAutomatic = () =>
 			!this.settings.manualSyncRequired &&
+			!this.firstManualFullPromise &&
 			!this.configurationUpdatePending &&
 			!this.authorization?.blocksOperations &&
 			(this.mobileRecovery?.canStartAutomatic() ?? true);
@@ -726,6 +716,29 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.mobileRecovery?.request("schedule");
 			}
 		});
+	}
+
+	/** Confirm a saved manual token against the current remote root without syncing. */
+	async confirmManualAuthorization(): Promise<void> {
+		const settings = this.settings;
+		if (
+			settings.authMethod !== "manual" ||
+			!settings.yandexTokenSecret.trim()
+		) {
+			throw new AuthorizationError("unavailable");
+		}
+		await this.updateAuthentication(
+			{ kind: "manual-confirmation" },
+			{
+				assertCurrent: () => {
+					if (this.unloaded || this.settings !== settings) {
+						throw new AuthorizationError("revoked");
+					}
+				},
+				accept: () => {},
+				phase: () => {},
+			},
+		);
 	}
 
 	/** Share the existing authentication reservation and snapshot owner for sign-in and logout. */
@@ -1198,6 +1211,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			),
 		);
 		this.syncIndicator = indicator;
+		indicator.setVisible(this.settings.showSyncIndicator);
 		this.register(
 			this.syncEngine.onStateChange((state) => {
 				if (state.status === "syncing") {
@@ -1463,7 +1477,8 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (
 			this.unloaded ||
 			this.isConfigurationBusy() ||
-			this.settings.manualSyncRequired
+			this.settings.manualSyncRequired ||
+			this.firstManualFullPromise
 		) {
 			return;
 		}
@@ -1720,9 +1735,49 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		invocation?: StartupInvocation,
 		mobileRecovery = false,
 		refreshRetry = false,
+		admission = false,
 	): Promise<SyncResult | null> {
 		const requestedTrigger =
 			options?.trigger ?? (options?.startup ? "automatic" : "manual");
+		if (this.firstManualFullPromise && !admission) {
+			return requestedTrigger === "manual"
+				? this.firstManualFullPromise
+				: null;
+		}
+		if (
+			requestedTrigger === "manual" &&
+			this.settings.manualSyncRequired &&
+			!admission
+		) {
+			if (
+				this.isForceSyncUnavailable() ||
+				(!invocation && this.isConfigurationBusy()) ||
+				this.syncEngine.isSyncPaused()
+			) {
+				return null;
+			}
+			const first = this.persistence
+				.completeManualSync(this.syncEngine.createReadLifetimeGuard())
+				.then(
+					() =>
+						this.runFullSync(
+							options,
+							showProgressNotice,
+							forceFinalization,
+							invocation,
+							mobileRecovery,
+							refreshRetry,
+							true,
+						),
+					() => null,
+				)
+				.finally(() => {
+					this.firstManualFullPromise = null;
+					this.startAutomationIfReady();
+				});
+			this.firstManualFullPromise = first;
+			return first;
+		}
 		if (
 			!invocation &&
 			requestedTrigger === "manual" &&
@@ -1769,6 +1824,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					owned,
 					mobileRecovery,
 					refreshRetry,
+					admission,
 				),
 			);
 			if (
@@ -1785,6 +1841,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					undefined,
 					mobileRecovery,
 					true,
+					admission,
 				);
 			}
 			return result;
@@ -1867,27 +1924,17 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				);
 
 				// Save updated index after sync
-				if (
-					result.success &&
-					trigger === "manual" &&
-					this.settings.manualSyncRequired &&
-					!this.unloaded &&
-					!this.syncEngine.isSyncPaused()
-				) {
-					await this.persistence.completeManualSync(
-						this.syncEngine.createReadLifetimeGuard(),
-					);
-				} else {
-					await this.persistPluginData();
-				}
+				await this.persistPluginData();
 				if (result.success && recoveryGeneration !== undefined) {
 					this.persistence.completeRecovery(recoveryGeneration);
 				}
 				if (
 					!options?.epochRetry &&
-					result.errors.some(
-						(error) => error.code === "epoch-replaced-during-sync",
-					)
+					(result.deferred ||
+						result.errors.some(
+							(error) =>
+								error.code === "epoch-replaced-during-sync",
+						))
 				) {
 					this.queueEpochRecoveryFull({ ...options, trigger });
 				}
@@ -2099,8 +2146,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.fileWatcher
 					.getDeferredEvents()
 					.flatMap((event) => (event.id ? [event.id] : [])),
-			retireWatcherEvents: (cutoff) =>
-				this.fileWatcher.settleForceReplacement(cutoff),
+			watcherBoundary: () => this.fileWatcher.getEventBoundary(),
+			hasLocalChanges: (path, boundary) =>
+				this.fileWatcher.hasLocalChanges(path, boundary),
+			retireWatcherEvents: (cutoff, boundary) =>
+				this.fileWatcher.settleForceReplacement(cutoff, boundary),
 		};
 		this.syncEngine.setForceReplacementPorts(dependencies);
 		return dependencies;
@@ -2458,6 +2508,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 		if (
 			this.settings.manualSyncRequired ||
+			this.firstManualFullPromise ||
 			this.isConfigurationBusy() ||
 			this.unloaded ||
 			this.persistence.failed ||
@@ -2711,9 +2762,12 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.isAuthorizationPending() &&
 			Object.keys(patch).some(
 				(key) =>
-					!["language", "enableDebugLogging", "logToFile"].includes(
-						key,
-					),
+					![
+						"language",
+						"showSyncIndicator",
+						"enableDebugLogging",
+						"logToFile",
+					].includes(key),
 			)
 		) {
 			throw new Error(t("notice.configuration_busy"));
@@ -2910,6 +2964,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	private publishSettingsToComponents(): void {
+		this.syncIndicator?.setVisible(this.settings.showSyncIndicator);
 		const authorizationScope = JSON.stringify([
 			this.settings.syncPatterns,
 			this.settings.excludePatterns,
@@ -3293,7 +3348,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 
 	/** Start listeners only after durable reconciliation and all owning flows have settled. */
 	private startAutomationIfReady(refresh = false): void {
-		if (this.settings.manualSyncRequired) {
+		if (this.settings.manualSyncRequired || this.firstManualFullPromise) {
 			return;
 		}
 		if (this.forceRecovery?.direct) {

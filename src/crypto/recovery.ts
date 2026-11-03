@@ -571,13 +571,11 @@ export class EncryptionRecovery {
 						"Completed replacement has no stable reference authority",
 					);
 				}
-				const local = await this.context.index.buildLocalIndex();
 				for (const [path, file] of Object.entries(current.files)) {
 					if (
 						file.deleted ||
 						file.sha256 !==
-							transition.referenceFiles?.[path]?.sha256 ||
-						local.get(path)?.sha256 !== file.sha256
+							transition.referenceFiles?.[path]?.sha256
 					) {
 						throw new Error(
 							"Completed replacement reference changed",

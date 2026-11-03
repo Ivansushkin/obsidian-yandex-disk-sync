@@ -22,7 +22,11 @@ import {
 
 import { createEmptyIndex } from "../../types";
 import { isJsonRecord } from "../../utils/record-utils";
-import { decideRecovery, OperationFailure } from "../../errors";
+import {
+	decideRecovery,
+	OperationFailure,
+	ConcurrentSyncChangeError,
+} from "../../errors";
 import { isStableLockStale } from "./mutation-rules";
 import {
 	collectStablePaginatedItems,
@@ -328,7 +332,7 @@ export class CanonicalRecovery {
 					offset + embedded.items.length > total ||
 					(offset < total && embedded.items.length === 0)
 				) {
-					throw new UnstablePaginationError(
+					throw new ConcurrentSyncChangeError(
 						"Remote root pagination is incomplete",
 					);
 				}

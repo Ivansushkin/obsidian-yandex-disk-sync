@@ -104,6 +104,7 @@ for (const encrypted of [false, true]) {
 		const codec = await codecFor(encrypted);
 		let a = device(disk, "device-a", codec);
 		await a.full();
+		const lastSuccess = a.engine.getState().lastSyncTime;
 		const b = device(disk, "device-b", await codecFor(encrypted));
 		await b.full();
 		b.vault.put("Offline.md", bytes("offline"));
@@ -144,6 +145,10 @@ for (const encrypted of [false, true]) {
 			return read(path);
 		};
 		await a.drain();
+		assert.equal(a.engine.getState().status, "error");
+		assert.equal(a.engine.getState().lastOutcome, "error");
+		assert.equal(a.engine.getState().failure?.category, "unavailable");
+		assert.equal(a.engine.getState().lastSyncTime, lastSuccess);
 		await a.stop();
 		disk.afterRequest = undefined;
 		assert.equal(lostResponse, true);
@@ -234,4 +239,47 @@ test("realtime byte windows isolate oversized files and rehash changed-size read
 	assert.equal(firstCommittedBeforeReread, true);
 	assert.equal(oversizedCommittedBeforeLastRead, true);
 	await a.assertSettled(expected);
+});
+
+test("realtime settlement failure preserves the last success until a completed retry", async (t) => {
+	const a = managedDevices(t)(new MemoryDisk(), "settlement", null);
+	await a.full();
+	const lastSuccess = a.engine.getState().lastSyncTime;
+	a.vault.put("A.md", bytes("local"));
+	const event = {
+		id: "upload-a",
+		path: "A.md",
+		action: "upload" as const,
+		createdAt: Date.now(),
+		...a.engine.getWatcherCausalContext(),
+	};
+	await assert.rejects(
+		a.engine.syncFileBatch([event], () => {
+			throw new Error("Synthetic receipt persistence failure");
+		}),
+		/Synthetic receipt persistence failure/,
+	);
+	assert.equal(a.engine.getState().status, "error");
+	assert.equal(a.engine.getState().lastOutcome, "error");
+	assert.equal(a.engine.getState().lastSyncTime, lastSuccess);
+	assert.ok((await a.canonical()).files["A.md"]);
+	await a.engine.syncFileBatch([event]);
+	assert.equal(a.engine.getState().lastOutcome, "success");
+	assert.ok(a.engine.getState().lastSyncTime! >= lastSuccess!);
+	await a.assertSettled({ "A.md": "local" });
+});
+
+test("nested full in maintenance does not advance the last exchange time", async (t) => {
+	const a = managedDevices(t)(new MemoryDisk(), "maintenance", null);
+	await a.full();
+	const lastSuccess = a.engine.getState().lastSyncTime;
+	await new Promise((resolve) => setTimeout(resolve, 2));
+	await a.engine.runExclusiveMaintenance(async () => {
+		assert.equal(
+			(await a.engine.fullSync({ skipMaintenanceGuard: true })).success,
+			true,
+		);
+	});
+	assert.equal(a.engine.getState().status, "idle");
+	assert.equal(a.engine.getState().lastSyncTime, lastSuccess);
 });

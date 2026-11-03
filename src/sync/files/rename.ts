@@ -36,6 +36,7 @@ import * as syncReconciliation from "../reconciliation/commits";
 import * as reconciliationContext from "../reconciliation/context";
 import * as fileOperations from "./operations";
 import * as remoteMoves from "./remote-moves";
+import { settleMovePredecessors } from "./move-predecessors";
 export interface Dependencies {
 	assertActive: () => void;
 	getWatcherCausalContext: () => WatcherCausalContext;
@@ -867,6 +868,13 @@ async function commitFileRename(
 	}: FileRenameCommit,
 ): Promise<FileRenameOutcome> {
 	let retryFailure: FailureSummary | undefined;
+	await settleMovePredecessors(
+		deps.fileOperations,
+		oldPath,
+		newPath,
+		false,
+		deps.indexSaveCallback,
+	);
 	const { mutation, physicalMove } = stageFileMove(
 		deps.indexManager,
 		oldPath,

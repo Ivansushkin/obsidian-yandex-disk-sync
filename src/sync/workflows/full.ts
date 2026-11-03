@@ -35,6 +35,7 @@ import * as reconciliationContext from "../reconciliation/context";
 import * as reconcilePhysicalRecovery from "../reconciliation/physical-recovery";
 import { receiveInitialRemoteState } from "./initial-receive";
 export interface Dependencies {
+	watcherBoundary?: Record<string, string>;
 	canonicalReadSession?: CanonicalReadSession;
 	decideEpochAdoption?: (
 		epoch: string,
@@ -955,7 +956,11 @@ export function restoreAdoptionSnapshot(
 	indexManager: IndexManager,
 	snapshot: NonNullable<FullSyncContext["adoptionSnapshot"]>,
 ): void {
+	const receive = indexManager.getLocalIndex().replacementReceive;
 	indexManager.restoreLocalCausalState(snapshot);
+	if (receive) {
+		indexManager.getLocalIndex().replacementReceive = receive;
+	}
 }
 
 /** Report adoption only after lifecycle finalization has determined success. */

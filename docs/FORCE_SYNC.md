@@ -70,8 +70,9 @@ verification; missing source bytes or failed requests are never reported as succ
 
 A local checkpoint retains existing Force fields plus direct:
 format direct-v1, config directory, stage (purging, copying, publishing),
-source directories and remaining deletions/transfers. The persisted schema is
-unchanged: frozen selection is ephemeral until confirmation; applying checkpoints
+source directories and remaining deletions/transfers. Optional local
+`watcherBoundary` stores ID/signature pairs; older checkpoints retain cutoff IDs.
+Remote markers and physical-action schemas are unchanged: frozen selection is ephemeral until confirmation; applying checkpoints
 already contain explicit selected sources/deletes, so recovery never recomputes or
 widens them under new settings. Filter changes before applying invalidate the plan.
 Older unfiltered direct-v1 remainders retain their admitted explicit actions; a new
@@ -90,16 +91,22 @@ confirmed source is read again before initial deletion. The checkpoint is saved
 before destructive work. After deletion starts, each independent failure is
 recorded while other actions continue. Completed actions are retired durably.
 A failed subtree deletion requeues affected copies before retrying that deletion.
-A continuation never repeats the completed broad purge. Copy/mkdir never implicitly
+A continuation never repeats the completed broad purge. Late local edits narrow a
+pending purge to unaffected descendants; each narrowing strictly descends and cannot
+requeue its own parent. New files and edited paths are retained for ordinary sync.
+Verified source metadata remains the baseline when a late local edit prevents copying. Copy/mkdir never implicitly
 delete new file/folder blockers; only explicit pending deletes authorize removal.
 New blockers retain the remainder and require resolving the collision or confirming
 a newly prepared Force. Even raw-pruned encrypted exclusions block codec removal.
 
 Ordinary manual, startup and scheduled full sessions resume a direct checkpoint
 before normal admission/merge. If the remainder cannot finish, the session reports
-the concrete failure; it never treats incomplete copies as source deletions.
+the concrete failure or a deferred concurrent change, with no success or epoch ACK.
+A source confirmed absent by a fresh readable-root observation and repeated absence
+checks, including replacement by a directory, is retired from the remainder; its later deletion is ordinary work. If a previous transfer left destination bytes, recovery verifies their source hash and includes them in canonical before retiring the pending transfer. Read,
+authentication and decryption errors never prove absence.
 Realtime does not operate on a pending replacement. Successful cutover clears old
-causal work and only covered watcher IDs, preserves later work, installs the new
+causal work and only unchanged covered watcher signatures, preserves later work, installs the new
 baseline and clears the checkpoint. A post-Force ordinary full is not a success
 prerequisite. Ordinary filters apply again without turning out-of-scope canonical
 entries into deletions.

@@ -389,8 +389,26 @@ admission и busy bypass.
 
 `getSyncPresentation` вычисляет один приоритет и текст для плашки и settings Notice:
 Force → engine activity → foreground → connection → full → terminal/idle.
-Плашка показывает все статусы; один `SettingsStatusNotice` зеркалит её только
-в открытой вкладке настроек плагина. Idle/hide/другая вкладка/unload снимают зеркало;
+Итог engine привязан к ID сессии и публикуется после settlement: исполненная
+Promise сама по себе не доказывает успех. `SyncState.lastOutcome` — неперсистентный
+`success`/`deferred`/`error`; retained realtime work, pending-put receipts и запрос
+full дают deferred, а `retryFailure` сохраняется как terminal error. Ошибка
+settlement исключает success. Folder delete/rename ждут watcher ACK/save внутри
+той же coordinator-сессии; callback подготовки intent остаётся отдельным.
+Вложенные сессии не подменяют владельца UI.
+Время «Последний успешный обмен» обновляется только после успешного full, Force
+или realtime; deferred, partial/error и maintenance (включая вложенный full) его
+не меняют; успешное maintenance также сохраняет прежний deferred. Deferred показывает остаток работы с нейтральной иконкой и прежним
+временем успеха; только следующий успешный обмен заменяет этот итог.
+Mobile recovery заменяет основной статус только без активного внешнего workflow,
+паузы, admission/auth блока или неповторяемой ошибки; иначе остаётся подробностью.
+Информационная подробность recovery не создаёт error icon. Доступное название
+плашки использует тот же текст, прогресс и причину, включая authorization/manual Sync.
+
+При включённой локальной настройке плашка показывает все статусы. Один
+`SettingsStatusNotice` использует ту же presentation в открытой вкладке
+настроек плагина независимо от видимости плашки. Обычный idle/hide/другая вкладка/unload снимают зеркало;
+idle с deferred остаётся видимым до следующей операции;
 reopen читает live state, re-render и поздние результаты не создают дубликатов.
 Ошибки preflight, settings drain и backup вне engine state хранятся в памяти как
 presentation issue: admission не меняется, ошибка очищается при следующем запуске
@@ -499,3 +517,17 @@ freeze, ни unload callback не считаются гарантированн�
 storage/remote read никогда не означает пустое дерево. Новые правила проверяются
 в `tests/mobile-recovery.test.ts`; реальная Android/iOS приёмка —
 `TC-MOBILE-RECOVERY-01`; до неё ручная приёмка остаётся невыполненной.
+
+## Локальные изменения во время sync
+
+Coordinator сериализует все session kinds. Pause сохраняет наблюдение, а временный
+observer-only не включает realtime. Raw event generations защищают native mutation
+через await; internal-event receipt снимается после settlement. Concurrent drift
+даёт deferred без success/ACK. `sync/files/move-predecessors.ts` закрывает puts
+перед move в исходном FIFO.
+
+Authoritative replacement фиксирует проверенные per-file версии; поздняя локальная
+правка не отменяет проверку remote target после commit. Foreign receive хранит
+[device-local receipt](LOCAL_REPLACEMENT_RECOVERY.md) и передаёт retained differences
+ordinary sync. Force сохраняет поздние local events и отличает подтверждённое
+исчезновение source от read/authentication failure. Remote schema не меняется.

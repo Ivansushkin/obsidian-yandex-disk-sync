@@ -318,22 +318,14 @@ export async function cleanupEncryptionReplacement(
 						transition?.id === initial.id &&
 						transition.referenceFiles
 					) {
-						const actual = await index.buildLocalIndex();
 						if (
 							!sameIndexValue(
 								index.getEncryptionReplacementScope(),
 								replacement.scope,
-							) ||
-							actual.size !==
-								Object.keys(transition.referenceFiles).length ||
-							[...actual].some(
-								([path, file]) =>
-									transition.referenceFiles?.[path]
-										?.sha256 !== file.sha256,
 							)
 						) {
 							throw new Error(
-								"The initiating local reference changed during cleanup",
+								"The encryption replacement scope changed during cleanup",
 							);
 						}
 					}

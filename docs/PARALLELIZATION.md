@@ -41,9 +41,9 @@ delete сохраняется; запоздалый delete прежнего эк
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Normal full              | Prepare сохраняет cutoff и завершает допустимый destructive/rename pre-drain; pause фиксирует signatures. Finalize сохраняет rename settlement до `markRemoteObserved`. Resume дожидается upload ACK/save и только затем допускает late replay. |
 | Initial receive          | Prepare не отправляет destructive cutoff. До полного receive события только durable. Finalize снимает лишь unchanged cutoff signatures; новые/изменившиеся IDs остаются.                                                                        |
-| Failed full              | Нет queue ACK, observed advancement или late replay. Незавершённая работа остаётся для restart.                                                                                                                                                 |
+| Failed full              | Нет queue ACK или observed advancement. Обычная ошибка оставляет durable work для retry; typed concurrent drift допускает до двух coalesced follow-up full через существующий watcher callback.                                                 |
 | Stopped/unloaded watcher | Settlement и обязательные saves уже принятой сессии не зависят от enabled-state; новый replay запрещён.                                                                                                                                         |
-| Confirmed Force          | Checkpoint хранит cutoff; после verified replacement снимаются только covered IDs с awaited save. Поздние events сохраняются; recovery сохраняет operation ID/epoch.                                                                            |
+| Confirmed Force          | Checkpoint хранит cutoff и optional ID/signature boundary; после verified replacement снимаются только unchanged covered IDs с awaited save. Поздние events сохраняются; recovery сохраняет operation ID/epoch.                                 |
 | Foreign epoch            | Replay заблокирован до full adoption. Late events получают принятые epoch/base revision через awaited resume-save; failure восстанавливает прежний causal snapshot.                                                                             |
 
 Dirty/saved revisions объединяют watcher saves поверх прежнего `PluginPersistence`.
@@ -202,7 +202,7 @@ purge. Failed subtree delete возвращает затрагиваемые cop
 не удалил уже записанные bytes. Cutover снимает старые queues и covered watcher IDs,
 сохраняя late events. Foreign offline delta требует accept/preserve/later.
 
-Новые [encryption transitions](E2E_ENCRYPTION.md) выбирают frozen local reference,
+Новые [encryption transitions](E2E_ENCRYPTION.md) фиксируют per-file verified reference внутри frozen filters,
 fresh epoch и durable deletion cover. `planRecursiveDeletes` схлопывает только
 полностью removable subtree без protected/excluded/live descendants. Filter coverage
 проверяется до collapse. Workers повторяют fresh authority/cover/lifetime checks
@@ -226,3 +226,15 @@ watcher/engine/IndexManager/client/adapter/codecs с synthetic filesystem/HTTP,
 `--encryption-transitions`, `--verify-oracle`. Они не подтверждают native events,
 сетевую latency, throttling или mobile memory. Реальная приёмка —
 [SMOKE_TESTS.md](SMOKE_TESTS.md).
+
+## Изменения во время сессии
+
+Pause останавливает replay, сохраняя observation. Observer-only до settlement не
+включает realtime. Internal receipt снимается после native mutation, включая
+failure. Recursive internal delete подавляет свои descendant events. Поздние
+signatures не снимаются старым cutoff.
+
+`ConcurrentSyncChangeError` даёт deferred без success, error UI, ACK или observed
+advancement. Read/access failure остаётся ошибкой. Canonical rediscovery сохраняет
+read budget; unstable pagination имеет bounded restart. Put перед move получает
+FIFO ACK после verified physical source и canonical commit без смены ID/sequence.

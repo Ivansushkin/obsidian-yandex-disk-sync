@@ -19,7 +19,7 @@ import {
 	joinPath,
 	normalizePath,
 } from "../utils/path-utils";
-import { protectRecord } from "../utils/record-utils";
+import { protectRecord, setRecordValue } from "../utils/record-utils";
 import { runWithConcurrencySettled } from "../utils/semaphore";
 import {
 	getPhysicalResourceFingerprint,
@@ -243,6 +243,23 @@ export class EncryptionTransitionController {
 					skipEncryptionGuard: true,
 					skipMaintenanceGuard: true,
 					authoritativeEncryption: Boolean(transition.replacement),
+					capturePhysicalRewriteReference: transition.replacement
+						? async (path, file) => {
+								if (file) {
+									setRecordValue(
+										transition.referenceFiles!,
+										path,
+										{ ...file },
+									);
+								} else {
+									delete transition.referenceFiles![path];
+									delete transition.targetRawByLogicalPath[
+										path
+									];
+								}
+								await this.lifecycle.setPhase(transition.phase);
+							}
+						: undefined,
 					verifyPhysicalRewriteUpload: async (logicalPath, sha256) =>
 						await this.lifecycle.verifyTargetUpload(
 							transition,
@@ -250,7 +267,31 @@ export class EncryptionTransitionController {
 							sha256,
 						),
 					beforeIndexCommit: async () => {
-						await this.lifecycle.assertSourceUnchanged(transition);
+						if (transition.replacement) {
+							const files =
+								this.indexManager.getRemoteIndex().files;
+							if (
+								Object.entries(files).some(
+									([path, file]) =>
+										transition.referenceFiles?.[path]
+											?.sha256 !== file.sha256 ||
+										!transition.targetFingerprints[
+											transition.targetRawByLogicalPath[
+												path
+											]!
+										],
+								)
+							) {
+								throw new Error(
+									"Encryption reference has no verified target proof",
+								);
+							}
+							transition.referenceFiles = structuredClone(files);
+						} else {
+							await this.lifecycle.assertSourceUnchanged(
+								transition,
+							);
+						}
 						await this.lifecycle.setPhase("files-copied");
 						const cleanup = transition.replacement
 							? []

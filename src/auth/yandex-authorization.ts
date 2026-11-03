@@ -36,7 +36,6 @@ export type AuthorizationPhase =
 	| "waiting-idle"
 	| "checking-root"
 	| "committing"
-	| "synchronizing"
 	| "connected"
 	| "error";
 export interface AuthorizationState {
@@ -68,13 +67,11 @@ interface Options {
 	request(body: URLSearchParams): Promise<OAuthResponse>;
 	captureContext(): {
 		assertCurrent: () => void;
-		assertContinuation: () => void;
 	};
 	adopt(
 		update: AuthenticationUpdate,
 		attempt: AuthorizationAttempt,
 	): Promise<void>;
-	synchronize(): Promise<void>;
 	now?: () => number;
 	requestTimeoutMs?: number;
 }
@@ -84,7 +81,6 @@ interface PendingAttempt {
 	deviceId: string;
 	deadline: number;
 	assertContext(): void;
-	assertContinuation(): void;
 	accepted: boolean;
 	waiters: Set<(error: AuthorizationError) => void>;
 	timer?: ReturnType<typeof setTimeout>;
@@ -301,7 +297,7 @@ export class YandexAuthorization {
 		await adopt(update, assertCurrent);
 	}
 	get blocksOperations(): boolean {
-		return this.pending !== null && this.state.phase !== "synchronizing";
+		return this.pending !== null;
 	}
 	get canCancel(): boolean {
 		return this.pending !== null && !this.pending.accepted;
@@ -327,7 +323,6 @@ export class YandexAuthorization {
 			deviceId: "",
 			deadline: this.now() + 600_000,
 			assertContext: context.assertCurrent,
-			assertContinuation: context.assertContinuation,
 			accepted: false,
 			waiters: new Set(),
 		};
@@ -433,13 +428,6 @@ export class YandexAuthorization {
 				},
 			});
 			this.assertAttempt(attempt);
-			this.update({ phase: "synchronizing" });
-			try {
-				attempt.assertContinuation();
-				await this.options.synchronize();
-			} catch {
-				throw new AuthorizationError("sync");
-			}
 			this.finish(attempt);
 			this.update({ phase: "connected" });
 		} catch (error) {

@@ -44,6 +44,27 @@ test("user settings publish only after persistence and retain queues saved ahead
 	);
 });
 
+test("indicator visibility saves while busy without changing sync admission", async () => {
+	const { plugin, writes } = harness();
+	await plugin.loadSettings();
+	assert.equal(plugin.settings.showSyncIndicator, true);
+	const previousManualSyncRequired = plugin.settings.manualSyncRequired;
+	plugin.isConfigurationBusy = () => true;
+
+	await plugin.applySettingsPatch({ showSyncIndicator: false });
+
+	assert.equal(plugin.settings.showSyncIndicator, false);
+	assert.equal(
+		plugin.settings.manualSyncRequired,
+		previousManualSyncRequired,
+	);
+	assert.equal(
+		(writes.at(-1) as { settings: typeof DEFAULT_SETTINGS }).settings
+			.showSyncIndicator,
+		false,
+	);
+});
+
 test("logging persistence does not replace an internal encryption update queued during the save", async () => {
 	const { plugin, persistence, writes } = harness();
 	await plugin.loadSettings();

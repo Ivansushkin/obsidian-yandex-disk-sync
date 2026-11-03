@@ -66,6 +66,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.language_desc":
 			"Follow Obsidian’s language or choose a language for this plugin. Changes apply immediately.",
 		"settings.language_system": "System default",
+		"settings.show_sync_indicator":
+			"Show synchronization status and quick actions over notes",
 		"units.byte": "B",
 		"units.kilobyte": "KB",
 		"units.megabyte": "MB",
@@ -272,7 +274,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Saving synchronization state…",
 		"notice.force_phase_reconciling": "Final synchronization check",
 		"notice.force_migration_completed":
-			"Upgrade to 2.2.1 completed. Synchronization finished.",
+			"Upgrade to 2.3.0 completed. Synchronization finished.",
 		"notice.force_backup_failed":
 			"Backup could not be verified. Force synchronization was not started.",
 		"notice.force_finalization_pending":
@@ -294,10 +296,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.checking_connection": "Checking connection...",
 		"status.encryption_required": "YD: Encryption password required",
 		"status.migration_required": "YD: Migration required",
-		"status.last_sync": "YD: {time}",
+		"status.last_sync": "YD: Last successful exchange {time}",
 		"status.ready_full": "YD: Ready",
+		"status.pending_changes": "Changes remain to be synchronized",
 		"status.mobile.ready": "YD: Ready to synchronize",
-		"status.mobile.last_sync": "YD: Last synchronization",
+		"status.mobile.last_sync": "YD: Last successful exchange",
 		"status.mobile.paused": "Synchronization paused",
 		"status.mobile.error": "Synchronization error",
 		"status.mobile.encryption": "Encryption operation...",
@@ -319,7 +322,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Status: Synchronization is blocked until encryption password is entered",
 		"status.tooltip.migration_required":
 			"Status: Stable 1.1 data requires a verified Force migration",
-		"status.tooltip.last_sync": "Last synchronization: {datetime}",
+		"status.tooltip.last_sync": "Last successful exchange: {datetime}",
 		"status.session.full": "Full sync",
 		"status.session.force": "Force sync",
 		"status.session.realtime": "Realtime sync",
@@ -681,6 +684,8 @@ export const translations: Record<Language, Record<string, string>> = {
 		"settings.language_desc":
 			"Следовать языку Obsidian или выбрать язык плагина. Изменение применяется сразу.",
 		"settings.language_system": "Системный",
+		"settings.show_sync_indicator":
+			"Показывать плашку со статусом синхронизации и быстрыми действиями поверх заметок",
 		"units.byte": "Б",
 		"units.kilobyte": "КБ",
 		"units.megabyte": "МБ",
@@ -889,7 +894,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"notice.force_phase_persisting": "Сохранение состояния синхронизации…",
 		"notice.force_phase_reconciling": "Завершающая проверка синхронизации",
 		"notice.force_migration_completed":
-			"Переход на 2.2.1 завершён. Синхронизация выполнена.",
+			"Переход на 2.3.0 завершён. Синхронизация выполнена.",
 		"notice.force_backup_failed":
 			"Резервная копия не подтверждена. Принудительная синхронизация не запущена.",
 		"notice.force_finalization_pending":
@@ -911,10 +916,11 @@ export const translations: Record<Language, Record<string, string>> = {
 		"status.checking_connection": "Проверка подключения...",
 		"status.encryption_required": "YD: Требуется пароль шифрования",
 		"status.migration_required": "YD: Требуется миграция",
-		"status.last_sync": "YD: {time}",
+		"status.last_sync": "YD: Последний успешный обмен {time}",
 		"status.ready_full": "YD: Готов",
+		"status.pending_changes": "Остались изменения для синхронизации",
 		"status.mobile.ready": "YD: Готов к синхронизации",
-		"status.mobile.last_sync": "YD: Последняя синхронизация",
+		"status.mobile.last_sync": "YD: Последний успешный обмен",
 		"status.mobile.paused": "Синхронизация приостановлена",
 		"status.mobile.error": "Ошибка синхронизации",
 		"status.mobile.encryption": "Операция шифрования...",
@@ -936,7 +942,7 @@ export const translations: Record<Language, Record<string, string>> = {
 			"Статус: Синхронизация заблокирована до ввода пароля шифрования",
 		"status.tooltip.migration_required":
 			"Статус: Данные stable 1.1 требуют подтверждённой Force-миграции",
-		"status.tooltip.last_sync": "Последняя синхронизация: {datetime}",
+		"status.tooltip.last_sync": "Последний успешный обмен: {datetime}",
 		"status.session.full": "Полная синхронизация",
 		"status.session.force": "Принудительная синхронизация",
 		"status.session.realtime": "Синхронизация изменений",

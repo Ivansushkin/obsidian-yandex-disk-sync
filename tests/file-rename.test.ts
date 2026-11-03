@@ -24,6 +24,7 @@ import {
 } from "./helpers/realtime-fixtures";
 
 class RenameVaultFake {
+	setLocalObservationReader(): void {}
 	readonly files = new Map<string, ArrayBuffer>();
 
 	shouldSync() {

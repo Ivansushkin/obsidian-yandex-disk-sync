@@ -60,7 +60,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private controlsEl: HTMLElement | null = null;
 	private controls: {
 		component: BaseComponent;
-		diagnostic: boolean;
+		availableWhileBusy: boolean;
 		disabled: boolean;
 		requiresAuthorization: boolean;
 	}[] = [];
@@ -149,12 +149,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	/** Retain each control's own admission restrictions while applying activity locks. */
 	private trackControl(
 		component: BaseComponent,
-		diagnostic = false,
+		availableWhileBusy = false,
 		requiresAuthorization = false,
 	): void {
 		this.controls.push({
 			component,
-			diagnostic,
+			availableWhileBusy,
 			disabled: component.disabled,
 			requiresAuthorization,
 		});
@@ -198,7 +198,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		const manualAuthorized =
 			this.plugin.settings.authMethod === "manual" &&
 			Boolean(this.plugin.settings.yandexTokenSecret.trim()) &&
-			!this.plugin.settings.manualSyncRequired;
+			this.plugin.settings.manualAuthorizationConfirmed;
 		this.manualAuthorizationButton?.setButtonText(
 			t(
 				manualAuthorized
@@ -221,7 +221,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		);
 		for (const {
 			component,
-			diagnostic,
+			availableWhileBusy,
 			disabled,
 			requiresAuthorization,
 		} of this.controls) {
@@ -230,7 +230,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					this.plugin.isPluginUnloaded() ||
 					(requiresAuthorization &&
 						!this.plugin.settings.yandexTokenSecret.trim()) ||
-					(!diagnostic && busy),
+					(!availableWhileBusy && busy),
 			);
 		}
 		const state = this.plugin.getForceSyncController().getState();
@@ -688,7 +688,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						!this.isActionUnavailable() ||
 						(e.target instanceof Element &&
 							e.target.closest(
-								".sync-diagnostic-controls, .sync-auth-controls",
+								".sync-diagnostic-controls, .sync-auth-controls, .sync-presentation-controls",
 							))
 					) {
 						return;
@@ -744,6 +744,21 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				});
 			});
 		const migrationPending = this.plugin.isStableMigrationPending();
+		const indicatorSetting = new Setting(containerEl)
+			.setName(t("settings.show_sync_indicator"))
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showSyncIndicator)
+					.setDisabled(migrationPending)
+					.then((control) => this.trackControl(control, true))
+					.onChange(async (value) => {
+						if (this.plugin.isPluginUnloaded()) {
+							return;
+						}
+						await this.applyDraft({ showSyncIndicator: value });
+					}),
+			);
+		indicatorSetting.settingEl.addClass("sync-presentation-controls");
 
 		// Connection section
 		new Setting(containerEl)
@@ -905,8 +920,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				) {
 					return;
 				}
-				if (this.plugin.settings.manualSyncRequired) {
-					await this.runFullSyncFromSettings();
+				if (!this.plugin.settings.manualAuthorizationConfirmed) {
+					await this.runSettingsAction(() =>
+						this.plugin.confirmManualAuthorization(),
+					);
 				} else {
 					await this.signOut();
 				}

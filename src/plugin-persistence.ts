@@ -163,7 +163,7 @@ export class PluginPersistence {
 		}
 		await this.enqueue(undefined, false, undefined, {
 			update:
-				update.kind === "logout"
+				update.kind !== "interactive" && update.kind !== "refresh"
 					? { ...update }
 					: { ...update, authorization: { ...update.authorization } },
 			assertCurrent,

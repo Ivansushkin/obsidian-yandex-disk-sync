@@ -93,6 +93,10 @@
 	);
 }
 
+.yandex-sync-indicator[hidden] {
+	display: none;
+}
+
 .yandex-sync-indicator[data-placement="bottom"] .yandex-sync-indicator-summary {
 	align-self: flex-end;
 	width: max-content;

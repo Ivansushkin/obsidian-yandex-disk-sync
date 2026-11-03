@@ -38,6 +38,9 @@ export function getSyncStatusIcon(status: SyncStatus): string {
 export function getSyncStatusText(state: SyncState): string {
 	switch (state.status) {
 		case "idle":
+			if (state.lastOutcome === "deferred") {
+				return t("status.pending_changes");
+			}
 			if (state.lastSyncTime) {
 				return t("status.last_sync", {
 					time: formatTime(state.lastSyncTime),
@@ -120,6 +123,7 @@ export interface SyncPresentation {
 	detail: string;
 	progress: string;
 	busy: boolean;
+	hasError: boolean;
 	icon: string;
 }
 
@@ -143,6 +147,12 @@ export function getSyncPresentation(
 	if (force?.active) {
 		state = { ...sync, status: "syncing" };
 		text = t(`notice.force_phase_${force.phase}`);
+		detail = force.failure ? formatOperationFailure(force.failure) : "";
+		if (force.phase === "preflight" && force.failure) {
+			text = t("force.preparation_failed");
+		} else if (force.phase === "preflight" && force.sourceProgress) {
+			text = t("force.source_progress", force.sourceProgress);
+		}
 		if (force.activity?.status === "syncing") {
 			text += `: ${force.activity.currentOperation ?? t("status.syncing")}`;
 			progress =
@@ -172,14 +182,19 @@ export function getSyncPresentation(
 		state = { ...sync, status: "syncing" };
 		text = t("status.syncing");
 	} else if (!context.hasAuthorization) {
-		state = { ...sync, status: "idle" };
+		state = { ...sync, status: "idle", lastOutcome: undefined };
 		text = t("status.authorization_required");
 	} else if (
 		manualSyncRequired &&
 		(sync.status === "idle" || sync.status === "initializing")
 	) {
-		state = { ...sync, status: "idle" };
+		state = { ...sync, status: "idle", lastOutcome: undefined };
 		text = t("status.manual_sync_required");
+	} else if (sync.status === "idle" && sync.lastOutcome === "deferred") {
+		text = t("status.pending_changes");
+		detail = sync.lastSyncTime
+			? t("status.last_sync", { time: formatTime(sync.lastSyncTime) })
+			: "";
 	} else if (sync.status === "idle") {
 		text = t("status.mobile.ready");
 		if (sync.lastSyncTime) {
@@ -216,6 +231,7 @@ export function getSyncPresentation(
 		}
 		detail = context.operationError;
 	}
+	let hasError = Boolean(detail) && state.status !== "idle";
 	if (context.mobileRecovery) {
 		const recoveryDetail = t(
 			context.mobileRecovery.phase === "waiting-native"
@@ -224,7 +240,16 @@ export function getSyncPresentation(
 		);
 		if (
 			!context.operationError &&
-			sync.status !== "syncing" &&
+			!context.paused &&
+			!force?.active &&
+			!foreground &&
+			!fullSyncInProgress &&
+			!connection &&
+			context.hasAuthorization &&
+			!manualSyncRequired &&
+			(state.status === "idle" ||
+				state.status === "offline" ||
+				state.status === "error") &&
 			(isMobileRetryableFailure(sync.failure) || sync.status === "idle")
 		) {
 			state = {
@@ -235,22 +260,26 @@ export function getSyncPresentation(
 			};
 			text = recoveryDetail;
 			detail = "";
+			hasError = false;
 		} else {
 			detail = [detail, recoveryDetail].filter(Boolean).join("\n");
 		}
 	}
 	const busy = state.status === "syncing" || state.status === "initializing";
-	let icon = busy ? "cloud" : getSyncStatusIcon(state.status);
+	let icon =
+		busy || (state.status === "idle" && state.lastOutcome === "deferred")
+			? "cloud"
+			: getSyncStatusIcon(state.status);
 	if (busy && force?.active) {
 		icon = "replace";
 	}
 	if (busy && foreground) {
 		icon = foreground === "encryption" ? "lock-keyhole" : "archive";
 	}
-	if (busy && detail) {
+	if (busy && hasError) {
 		icon = "triangle-alert";
 	}
-	return { state, text, detail, progress, busy, icon };
+	return { state, text, detail, progress, busy, hasError, icon };
 }
 
 /** Format known progress without inventing totals for preparation phases. */

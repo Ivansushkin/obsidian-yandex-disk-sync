@@ -386,6 +386,10 @@ export class ForceSyncController {
 						result.uploaded + result.downloaded + result.deleted,
 					failed: result.errors.length,
 				});
+				if (result.deferred) {
+					update({ outcome: "recovery-pending" });
+					return;
+				}
 				if (!result.success || !committed) {
 					fail(
 						result.errors[0]?.failureCause ??

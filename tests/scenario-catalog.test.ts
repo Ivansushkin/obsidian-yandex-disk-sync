@@ -44,23 +44,60 @@ test("scenario catalogue recognizes compound IDs, named manual ranges, and two-m
 		"OAuth encrypted full",
 		"OAuth plaintext full",
 	]);
-	assert.deepEqual(
-		validateScenarioCatalog(catalog, [source], smoke, scripts),
-		[],
-	);
+	for (const [separator, annotation] of [
+		[".", ""],
+		[":", " (durable event)"],
+		["—", ""],
+	]) {
+		assert.deepEqual(
+			validateScenarioCatalog(
+				catalog.replace(
+					"`OAuth encrypted full`",
+					"`OAuth encrypted full`" + annotation,
+				),
+				[source],
+				smoke.replace("TC-AUTH-01.", `TC-AUTH-01${separator}`),
+				scripts,
+			),
+			[],
+		);
+	}
 });
 
 test("scenario catalogue rejects unknown evidence and diagnostic-only positive claims", async () => {
 	const { validateScenarioCatalog } = await catalogPromise;
 	assert.match(
 		validateScenarioCatalog(
-			catalog.replace("OAuth plaintext full", "missing executable title"),
+			catalog
+				.replace("OAuth plaintext full", "missing executable title")
+				.replace(
+					"`OAuth encrypted full`",
+					"`OAuth encrypted full` (durable event)",
+				),
 			[source],
 			smoke,
 			scripts,
 		).join("; "),
 		/missing executable test missing executable title/,
 	);
+	for (const suffix of [
+		" (nested (note))",
+		" (note) trailing",
+		" (first) (second)",
+	]) {
+		assert.match(
+			validateScenarioCatalog(
+				catalog.replace(
+					"`OAuth encrypted full`",
+					"`OAuth encrypted full`" + suffix,
+				),
+				[source],
+				smoke,
+				scripts,
+			).join("; "),
+			/invalid evidence fragment/,
+		);
+	}
 	assert.match(
 		validateScenarioCatalog(
 			catalog.replace("known-limitation; ", ""),

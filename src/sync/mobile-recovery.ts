@@ -57,6 +57,9 @@ export function mobileRecoveryOutcome(
 	if (result?.success) {
 		return "success";
 	}
+	if (result?.deferred) {
+		return "retryable";
+	}
 	const failures = result?.errors.length
 		? result.errors.map((error) => error.failure)
 		: [failure];

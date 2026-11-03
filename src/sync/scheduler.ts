@@ -125,7 +125,11 @@ export class SyncScheduler {
 		try {
 			const result = await this.runFullSync();
 
-			if (result?.success) {
+			if (result?.deferred) {
+				logger.debug(
+					"Scheduled reconciliation deferred after concurrent changes",
+				);
+			} else if (result?.success) {
 				logger.info("Scheduled synchronization completed successfully");
 			} else if (result) {
 				logger.warn(

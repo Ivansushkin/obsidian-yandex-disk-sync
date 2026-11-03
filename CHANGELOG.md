@@ -1,39 +1,45 @@
 # Changelog
 
-## 2.2.1
+## 2.3.0
 
 Changes since `2.2.0`.
 
 ### Changed
 
-- Ordinary full sync requests only the remote metadata needed for inventory and
-  physical fingerprints. An incomplete page or an HTTP 400/406 response is read
-  again without `fields`, and projection is disabled for the rest of that scan.
-  If the full response is also incomplete, sync stops before reconciliation;
-  Force, backup and encryption operations keep their full metadata responses.
-- Recovery after suspension now covers desktop focus as well as mobile return.
-  It waits for earlier native requests to settle before a fresh full sync.
-  Repeated network failures use bounded retries followed by a metadata probe
-  every five minutes; a successful probe resumes normal reconciliation.
-- Repeated manual sync requests join one pending run while an earlier native
-  write or OAuth refresh cooldown is outstanding. Pause, connection changes and
-  unload revoke that wait.
+- After OAuth or manual sign-in, synchronization waits for the first manual
+  Sync, even across restarts. Automation is enabled when that run is accepted.
+- The sync indicator can be hidden in settings without stopping synchronization;
+  its visibility choice persists across restarts.
+- Full sync requests less remote metadata. If the reduced response is incomplete
+  or unsupported, it retries with full metadata and stops safely if that too is
+  incomplete.
+- Recovery after suspension now handles desktop focus as well as mobile return.
+  It waits for outstanding requests, retries network failures and resumes after
+  connectivity returns. Repeated manual requests share one pending run.
 
 ### Fixed
 
-- Temporary startup or encryption-manifest read failures before a transition
-  starts no longer leave a permanent connection block. Once a transition has
-  started, its own recovery rules still apply.
-- OAuth refresh cooldown prevents repeated token requests during recovery.
-  A rejected grant still requires signing in again.
-- Unresolved realtime uploads, renames, folder operations and canonical commits
-  retain their work before reporting a transient failure to recovery. The sync
-  indicator shows the pending offline recovery without claiming success.
+- Changes made during synchronization remain pending when earlier observations
+  become stale. Folder moves preserve mutation order across restarts, and failed
+  internal writes no longer suppress later edits.
+- Incomplete remote inventories and temporarily missing service indexes are
+  handled without treating missing data as an empty folder.
+- Force recovery verifies written data and preserves later local changes rather
+  than repeating a completed broad purge. Encryption transitions and replacement
+  recovery also preserve later edits and protected copies through interruptions.
+- Temporary startup and encryption-manifest read failures no longer leave a
+  permanent block before a transition starts. OAuth recovery avoids repeated
+  refresh requests; a rejected grant still requires signing in again.
+- The indicator and settings notice distinguish pending work and failures from
+  a successful exchange. The success time updates only after a fully settled sync,
+  and screen readers receive the same status and reason.
+- Diagnostic log write failures are reported, retained entries are bounded, and
+  sensitive values are masked in messages and context.
 
 ### Diagnostics
 
-- Added read-only probes for Disk revision availability and projected resource
-  response size. Revision-based skipping of full sync is not enabled.
+- Added read-only probes for Disk revision availability and response size.
+  Force logs its recovery phase and remaining work without file contents.
 
 ## 2.2.0
 
