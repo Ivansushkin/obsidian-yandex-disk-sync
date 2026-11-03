@@ -19,6 +19,9 @@ Changes since `2.2.0`.
 
 ### Fixed
 
+- Sync progress notices stay inside plugin settings instead of appearing over
+  the workspace. Sync failures can still show a global notice; repeated identical
+  failures are suppressed until the next successful exchange.
 - Changes made during synchronization remain pending when earlier observations
   become stale. Folder moves preserve mutation order across restarts, and failed
   internal writes no longer suppress later edits.
