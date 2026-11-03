@@ -150,6 +150,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private syncScheduler!: SyncScheduler;
 	private mobileRecovery: MobileSyncRecovery | null = null;
 	private lastFullFailure?: FailureSummary;
+	private lastNotifiedSyncFailure: string | null = null;
 	private backupManager!: BackupManager;
 	private syncIndicator: SyncIndicator | null = null;
 	private sidebarButton: HTMLElement | null = null;
@@ -693,7 +694,13 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					this.getAuthorizationState().phase === "idle" &&
 					params.state
 				) {
-					new Notice(t("settings.auth_expired"));
+					if (this.settingsStatusNotice?.element.isConnected) {
+						this.settingsStatusNotice.show(
+							t("settings.auth_expired"),
+						);
+					} else {
+						new Notice(t("settings.auth_expired"));
+					}
 					return;
 				}
 				void this.authorization?.acceptCallback(params).catch(() => {});
@@ -1203,6 +1210,11 @@ export default class YandexDiskSyncPlugin extends Plugin {
 						}
 					},
 					toggleSync: async () => await this.toggleSync(),
+					toggleFailed: () =>
+						this.presentOperationIssue(
+							"sync",
+							t("status.actions.toggle_failed"),
+						),
 					readLogs: async () =>
 						sanitizeDiagnosticMessage(
 							await logger.getLogContents(),
@@ -1214,6 +1226,16 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		indicator.setVisible(this.settings.showSyncIndicator);
 		this.register(
 			this.syncEngine.onStateChange((state) => {
+				if (!state.sessionId && state.lastOutcome === "success") {
+					this.lastNotifiedSyncFailure = null;
+				} else if (!state.sessionId && state.lastOutcome === "error") {
+					const message = state.failure
+						? formatOperationFailure(state.failure)
+						: state.errorMessage;
+					if (message) {
+						this.notifySyncFailure(message);
+					}
+				}
 				if (state.status === "syncing") {
 					this.operationIssue = undefined;
 				}
@@ -1250,19 +1272,34 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	}
 
 	/** Scope mirrored status to the open plugin settings, including modal operations. */
-	setSettingsStatusVisible(visible: boolean): void {
+	setSettingsStatusVisible(visible: boolean, container?: HTMLElement): void {
 		this.settingsStatusUnsubscribe?.();
 		this.settingsStatusUnsubscribe = null;
 		this.settingsStatusNotice?.hide();
 		this.settingsStatusNotice = null;
-		if (!visible || this.unloaded) {
+		if (!visible || this.unloaded || !container) {
 			return;
 		}
-		this.settingsStatusNotice = new SettingsStatusNotice();
+		this.settingsStatusNotice = new SettingsStatusNotice(
+			container.ownerDocument,
+		);
+		container.prepend(this.settingsStatusNotice.element);
 		this.settingsStatusUnsubscribe = this.onSyncActivityChange(() =>
 			this.updateSettingsStatusNotice(),
 		);
 		this.updateSettingsStatusNotice();
+	}
+
+	/** Reattach the settings notices after a tab re-render. */
+	attachSettingsNotices(container: HTMLElement): void {
+		if (this.settingsStatusNotice) {
+			container.prepend(this.settingsStatusNotice.element);
+		}
+	}
+
+	/** Show a transient action result only while its settings context exists. */
+	showSettingsNotice(message: string): void {
+		this.settingsStatusNotice?.show(message);
 	}
 
 	private updateSettingsStatusNotice(): void {
@@ -2031,12 +2068,31 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 	}
 
+	/** Report a settled failure once until synchronization succeeds. */
+	private notifySyncFailure(message: string): void {
+		const safeMessage = sanitizeDiagnosticMessage(message);
+		if (this.unloaded || this.lastNotifiedSyncFailure === safeMessage) {
+			return;
+		}
+		this.lastNotifiedSyncFailure = safeMessage;
+		const settingsNotice = this.settingsStatusNotice?.element;
+		if (
+			!settingsNotice?.isConnected ||
+			settingsNotice.getClientRects().length === 0
+		) {
+			new Notice(safeMessage);
+		}
+	}
+
 	/** Keep failures visible on the indicator and the optional settings mirror. */
 	private presentOperationIssue(code: string, message: string): void {
 		if (this.unloaded) {
 			return;
 		}
 		this.operationIssue = { code, message };
+		if (code === "sync") {
+			this.notifySyncFailure(message);
+		}
 		if (this.getConnectionActivity()) {
 			this.connectionIssue = { kind: code, message };
 		}

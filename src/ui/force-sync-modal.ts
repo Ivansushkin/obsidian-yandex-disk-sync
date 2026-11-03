@@ -5,7 +5,7 @@ import type { FailureSummary } from "../errors";
 import { App, Modal, Setting, type ButtonComponent } from "obsidian";
 import { t } from "../i18n";
 import { createSyncFailure, formatOperationFailure } from "../sync/errors";
-import { formatForceResult } from "./force-sync-progress";
+import { formatForceActivity, formatForceResult } from "./force-sync-progress";
 import {
 	getNewEncryptionPasswordError,
 	NEW_ENCRYPTION_PASSWORD_LIMITS,
@@ -19,6 +19,7 @@ export class ForceSyncModal extends Modal {
 	private confirmed = false;
 	private state?: ForceFlowState;
 	private bodyEl!: HTMLElement;
+	private progressEl!: HTMLElement;
 	private controlsEl!: HTMLElement;
 	private actionsEl!: HTMLElement;
 	private passwordResult?: (value: string | null) => void;
@@ -51,6 +52,10 @@ export class ForceSyncModal extends Modal {
 						: this.app.vault.getName(),
 			}),
 		});
+		this.progressEl = this.contentEl.createDiv({
+			cls: "force-sync-stage",
+			attr: { role: "status", "aria-live": "polite" },
+		});
 		this.bodyEl = this.contentEl.createDiv({ cls: "force-sync-body" });
 		const footer = this.contentEl.createDiv({ cls: "force-sync-footer" });
 		this.controlsEl = footer.createDiv({ cls: "force-sync-options" });
@@ -58,12 +63,13 @@ export class ForceSyncModal extends Modal {
 		this.showChecking();
 	}
 
-	/** Keep active progress in the Notice and show the final result in this dialog. */
+	/** Keep progress and the final result visible in the Force dialog. */
 	render(state: ForceFlowState): void {
 		if (this.closed) {
 			return;
 		}
 		this.state = state;
+		this.progressEl.setText(state.active ? formatForceActivity(state) : "");
 		if (!state.active) {
 			if (state.outcome === "cancelled") {
 				this.close();

@@ -16,6 +16,7 @@ import { t } from "../i18n";
 interface SyncIndicatorActions {
 	synchronize: () => Promise<void>;
 	toggleSync: () => Promise<void>;
+	toggleFailed: () => void;
 	readLogs: () => Promise<string>;
 }
 
@@ -300,7 +301,7 @@ export class SyncIndicator extends Component {
 			await this.actions.toggleSync();
 		} catch {
 			if (!this.disposed) {
-				new Notice(t("status.actions.toggle_failed"));
+				this.actions.toggleFailed();
 			}
 		} finally {
 			this.toggleRequested = false;

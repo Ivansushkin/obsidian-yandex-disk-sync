@@ -10,6 +10,9 @@ export const LOG_COPY_LIMIT = 4000;
 export async function openLogFile(
 	app: App,
 	isCurrent: () => boolean = () => true,
+	notify: (message: string) => void = (message) => {
+		new Notice(message);
+	},
 ): Promise<void> {
 	if (!isCurrent()) {
 		return;
@@ -25,7 +28,7 @@ export async function openLogFile(
 			return;
 		}
 		if (!exists) {
-			new Notice(t("settings.log_file_missing"));
+			notify(t("settings.log_file_missing"));
 			return;
 		}
 		const opener = (
@@ -34,13 +37,13 @@ export async function openLogFile(
 			}
 		).openWithDefaultApp;
 		if (typeof opener !== "function") {
-			new Notice(t("settings.open_logs_failed"));
+			notify(t("settings.open_logs_failed"));
 			return;
 		}
 		await opener.call(app, path);
 	} catch {
 		if (isCurrent()) {
-			new Notice(t("settings.open_logs_failed"));
+			notify(t("settings.open_logs_failed"));
 		}
 	}
 }
@@ -126,6 +129,9 @@ let clearingLogs = false;
 export async function clearLogsWithConfirmation(
 	app: App,
 	isCurrent: () => boolean,
+	notify: (message: string) => void = (message) => {
+		new Notice(message);
+	},
 ): Promise<boolean> {
 	if (clearingLogs || !isCurrent()) {
 		return false;
@@ -154,12 +160,12 @@ export async function clearLogsWithConfirmation(
 		}
 		await logger.clearLogs();
 		if (isCurrent()) {
-			new Notice(t("notice.logs_cleared"));
+			notify(t("notice.logs_cleared"));
 		}
 		return true;
 	} catch (error) {
 		if (isCurrent()) {
-			new Notice(
+			notify(
 				formatOperationFailure(
 					createSyncFailure(error, {
 						stage: "persisting",

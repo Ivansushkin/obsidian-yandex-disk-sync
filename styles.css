@@ -785,3 +785,24 @@
 		animation: none;
 	}
 }
+
+/* Notices belong to the settings view rather than the workspace. */
+.yd-settings-notices {
+	position: sticky;
+	top: 0;
+	z-index: 2;
+	pointer-events: none;
+}
+.yd-settings-notice {
+	background: var(--background-secondary);
+	color: var(--text-normal);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	padding: 8px 12px;
+	margin-bottom: 8px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.yd-settings-notice[hidden] {
+	display: none;
+}

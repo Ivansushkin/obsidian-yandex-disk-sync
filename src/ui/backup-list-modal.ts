@@ -2,7 +2,7 @@
  * Modal for displaying and managing available backups
  */
 
-import { App, Modal, Notice } from "obsidian";
+import { App, Modal } from "obsidian";
 import type { BackupInfo } from "../types";
 import {
 	BackupManager,
@@ -186,7 +186,7 @@ export class BackupListModal extends Modal {
 			button.addClass("sync-button-active");
 			button.setText(t("settings.backup_in_progress"));
 
-			new Notice(t("notice.backup_download_started"));
+			this.showNotice(t("notice.backup_download_started"));
 
 			let content: ArrayBuffer;
 			try {
@@ -231,7 +231,7 @@ export class BackupListModal extends Modal {
 
 			URL.revokeObjectURL(url);
 
-			new Notice(
+			this.showNotice(
 				t("notice.backup_download_completed", { name: downloadName }),
 			);
 		} catch (error) {
@@ -243,7 +243,7 @@ export class BackupListModal extends Modal {
 				error instanceof UnsupportedHistoricalDataError
 					? t("notice.unsupported_historical_data")
 					: t("notice.backup_download_failed");
-			new Notice(message);
+			this.showNotice(message);
 		} finally {
 			if (!this.closed && generation === this.renderGeneration) {
 				this.downloading = false;
@@ -253,6 +253,22 @@ export class BackupListModal extends Modal {
 				button.setText(t("backup_list.download"));
 			}
 		}
+	}
+
+	/** Keep backup feedback in the dialog that owns the action. */
+	private showNotice(message: string): void {
+		if (this.closed || this.activity?.isCurrent() === false) {
+			return;
+		}
+		const notice = this.contentEl.createDiv({
+			cls: "yd-settings-notice",
+			text: message,
+			attr: { role: "status" },
+		});
+		this.contentEl.ownerDocument.defaultView?.setTimeout(
+			() => notice.remove(),
+			5000,
+		);
 	}
 
 	private async promptBackupPassword(): Promise<string | null> {
