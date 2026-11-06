@@ -237,7 +237,7 @@ export class Logger {
 	private retryEntries: string[] = [];
 	private retryEntriesDiscarded = false;
 	private clearGeneration = 0;
-	private flushTimeout: ReturnType<typeof setTimeout> | null = null;
+	private flushTimeout: number | null = null;
 	private flushChain: Promise<void> = Promise.resolve();
 
 	/**
@@ -362,7 +362,7 @@ export class Logger {
 		if (this.flushTimeout !== null) {
 			return;
 		}
-		this.flushTimeout = globalThis.setTimeout(() => {
+		this.flushTimeout = window.setTimeout(() => {
 			void this.flush().catch(() => undefined);
 		}, FLUSH_DELAY_MS);
 	}
@@ -372,7 +372,7 @@ export class Logger {
 	 */
 	async flush(): Promise<void> {
 		if (this.flushTimeout !== null) {
-			globalThis.clearTimeout(this.flushTimeout);
+			window.clearTimeout(this.flushTimeout);
 			this.flushTimeout = null;
 		}
 		const entries = this.buffer.splice(0);
@@ -524,7 +524,7 @@ export class Logger {
 		this.retryEntries = [];
 		this.retryEntriesDiscarded = false;
 		if (this.flushTimeout !== null) {
-			globalThis.clearTimeout(this.flushTimeout);
+			window.clearTimeout(this.flushTimeout);
 			this.flushTimeout = null;
 		}
 		const clear = async () => {

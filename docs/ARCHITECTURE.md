@@ -253,6 +253,10 @@ Force и authoritative encryption replacement не дают server fencing: уж
 
 ## Startup, settings и остановка
 
+Начиная с 2.4.0, минимальная версия Obsidian — 1.13.1. Поиск Obsidian
+индексирует разделы настроек и связанные названия полей. Отрисовка использует
+существующие обработчики, draft и busy guards для сохранения настроек.
+
 Локальная настройка `language` принимает `system`, `en`, `ru`, `kk`, `be`, `uz`.
 `system` сохраняет существующий источник Obsidian `localStorage["language"]`;
 неизвестный системный язык даёт English. Отсутствующее/неизвестное сохранённое

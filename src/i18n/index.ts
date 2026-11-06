@@ -25,7 +25,7 @@ export function normalizeLanguagePreference(
 /** Retain the existing Obsidian localStorage source for automatic selection. */
 function detectLanguage(): Language {
 	try {
-		const value = globalThis.localStorage
+		const value = window.localStorage
 			?.getItem("language")
 			?.toLowerCase()
 			.split(/[-_]/)[0];

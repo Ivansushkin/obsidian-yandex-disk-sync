@@ -37,7 +37,14 @@ try {
 		const grouped = process.platform !== "win32";
 		const child = spawn(
 			process.execPath,
-			["--test", "--test-timeout=60000", ...outputFiles],
+			[
+				"--import",
+				"data:text/javascript," +
+					encodeURIComponent("globalThis.window ??= globalThis"),
+				"--test",
+				"--test-timeout=60000",
+				...outputFiles,
+			],
 			{ stdio: "inherit", detached: grouped },
 		);
 		let stopping = false;

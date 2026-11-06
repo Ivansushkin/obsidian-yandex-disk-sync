@@ -11,7 +11,7 @@ export class SyncScheduler {
 	private syncEngine: SyncEngine;
 	private settings: YandexDiskSyncSettings;
 
-	private intervalId: ReturnType<typeof setInterval> | null = null;
+	private intervalId: number | null = null;
 	private isRunning = false;
 	private generation = 0;
 	private canStartAutomatic: () => boolean = () => true;
@@ -67,7 +67,7 @@ export class SyncScheduler {
 		const intervalMs = intervalMinutes * 60 * 1000;
 
 		const generation = ++this.generation;
-		this.intervalId = setInterval(() => {
+		this.intervalId = window.setInterval(() => {
 			if (this.isRunning && generation === this.generation) {
 				void this.runScheduledSync();
 			}
@@ -89,7 +89,7 @@ export class SyncScheduler {
 		}
 
 		if (this.intervalId) {
-			clearInterval(this.intervalId);
+			window.clearInterval(this.intervalId);
 			this.intervalId = null;
 		}
 

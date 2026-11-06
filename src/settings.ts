@@ -8,7 +8,10 @@ import {
 	type BaseComponent,
 	ButtonComponent,
 	PluginSettingTab,
-	Setting,
+	type Setting,
+	type SettingDefinitionGroup,
+	type SettingDefinitionItem,
+	type SettingDefinitionRender,
 	TextAreaComponent,
 	TextComponent,
 	ToggleComponent,
@@ -77,6 +80,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private connectionMethod: "manual" | "oauth" | null = null;
 	private renderGeneration = 0;
 	private displayed = false;
+	private refreshBackupOnRender = true;
 
 	constructor(app: App, plugin: YandexDiskSyncPlugin) {
 		super(app, plugin);
@@ -133,6 +137,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		this.displayed = false;
 		this.plugin.setSettingsStatusVisible(false);
 		this.detachActivity();
+		this.controlsEl = null;
 		this.renderGeneration++;
 		this.plugin.encryptionStateChangeCallback = null;
 		super.hide();
@@ -476,14 +481,12 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	/** Render local log actions and read their copy count only on hover or focus. */
-	private renderLogActions(loggingEl: HTMLElement, generation: number): void {
+	private renderLogActions(logActions: Setting, generation: number): void {
 		const isLogActionCurrent = () =>
 			this.displayed &&
 			generation === this.renderGeneration &&
 			!this.plugin.isPluginUnloaded();
-		const logActions = new Setting(loggingEl);
-		logActions.settingEl.addClass("sync-log-actions");
-		logActions.infoEl.remove();
+		logActions.setClass("sync-log-actions");
 		const updateCopyTooltip = (details: string) => {
 			if (this.copyLogsButton && isLogActionCurrent()) {
 				setTooltip(
@@ -514,7 +517,9 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 				this.copyingLogs = true;
 				this.updateActivity();
 				try {
-					const win = loggingEl.ownerDocument.defaultView ?? window;
+					const win =
+						logActions.settingEl.ownerDocument.defaultView ??
+						window;
 					const count = await copyLogTail(
 						win,
 						() => logger.getLogContents(),
@@ -608,8 +613,8 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		logActions.addButton((button) =>
 			button
 				.setButtonText(t("settings.clear_logs_button"))
-				// eslint-disable-next-line @typescript-eslint/no-deprecated
-				.setWarning()
+				.setDestructive()
+				.setCta()
 				.then((control) => {
 					this.clearLogsButton = control;
 					this.trackControl(control, true);
@@ -661,16 +666,98 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 	}
 
-	display(): void {
-		this.displayed = true;
-		this.renderSettings();
-		this.plugin.setSettingsStatusVisible(true, this.containerEl);
+	/** Describe native groups and rows without creating controls or starting I/O. */
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const group = (
+			heading: string | undefined,
+			items: SettingDefinitionRender[],
+			cls = "",
+		): SettingDefinitionGroup => ({
+			type: "group",
+			heading: heading ? t(heading) : undefined,
+			cls: ["yds-settings-group", cls].filter(Boolean).join(" "),
+			items,
+		});
+
+		return [
+			group(undefined, this.getPresentationSettings()),
+			group(
+				"settings.connection_section",
+				this.getConnectionSettings(),
+				"sync-connection-group",
+			),
+			group(
+				"settings.automatic_sync_section",
+				this.getAutomaticSyncSettings(),
+			),
+			group("settings.force_sync_section", [
+				this.defineSetting(
+					"settings.force_sync_section",
+					(setting) => this.renderForceSettings(setting),
+					[
+						"settings.force_sync_from_local_button",
+						"settings.force_sync_from_remote_button",
+					],
+				),
+			]),
+			group("settings.encryption_section", this.getEncryptionSettings()),
+			group("settings.file_filters_section", this.getFilterSettings()),
+			group(
+				"settings.logging_section",
+				this.getLoggingSettings(),
+				"sync-diagnostic-controls",
+			),
+			group("settings.backup_section", [
+				this.defineSetting(
+					"settings.backup_section",
+					(setting) => {
+						void this.renderBackupSettings(
+							setting,
+							this.renderGeneration,
+							this.refreshBackupOnRender,
+						);
+					},
+					["settings.backup_button", "settings.backup_show_all"],
+				),
+			]),
+			group("settings.information_section", [
+				this.defineSetting(
+					"settings.device_id",
+					(setting) => this.renderInformationSettings(setting),
+					["settings.information_section"],
+				),
+			]),
+		];
+	}
+
+	private defineSetting(
+		name: string,
+		render: (setting: Setting) => void,
+		aliases: string[] = [],
+	): SettingDefinitionRender {
+		return {
+			name: t(name),
+			aliases: aliases.map((alias) => t(alias)),
+			render,
+		};
 	}
 
 	private renderSettings(refreshBackup = true): void {
 		if (!this.displayed) {
 			return;
 		}
+		this.refreshBackupOnRender = refreshBackup;
+		try {
+			this.update();
+		} finally {
+			this.refreshBackupOnRender = true;
+		}
+	}
+
+	/** Reset live control references before Obsidian renders the settings sections. */
+	private prepareSettingsRender(): void {
+		const wasDisplayed = this.displayed;
+		this.displayed = true;
 		this.detachActivity();
 		this.renderGeneration++;
 		this.syncButton = null;
@@ -689,144 +776,179 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			this.renderSettings();
 		};
 		const { containerEl } = this;
-		containerEl.empty();
-		this.plugin.attachSettingsNotices(containerEl);
-		this.controlsEl = containerEl.createEl("div", {
-			cls: "force-settings-controls",
+		this.controlsEl = containerEl;
+		if (!wasDisplayed) {
+			this.plugin.setSettingsStatusVisible(true, containerEl);
+		}
+		const generation = this.renderGeneration;
+		// Obsidian reconciles the tab's direct children after the row callbacks.
+		queueMicrotask(() => {
+			if (this.displayed && generation === this.renderGeneration) {
+				this.plugin.attachSettingsNotices(containerEl);
+			}
 		});
 		// Guard stale native/custom events as well as disabling each Obsidian component.
-		for (const event of ["click", "keydown", "input", "change"]) {
-			this.controlsEl.addEventListener(
-				event,
-				(e) => {
-					if (
-						!this.isActionUnavailable() ||
-						(e.target instanceof Element &&
-							e.target.closest(
-								".sync-diagnostic-controls, .sync-auth-controls, .sync-presentation-controls",
-							))
-					) {
-						return;
-					}
-					if (e instanceof KeyboardEvent && e.key === "Tab") {
-						return;
-					}
-					e.preventDefault();
-					e.stopImmediatePropagation();
-				},
-				true,
-			);
+		const events = ["click", "keydown", "input", "change"];
+		const guard = (event: Event) => {
+			const target = event.target as Node | null;
+			if (
+				!this.isActionUnavailable() ||
+				!target?.instanceOf(Element) ||
+				!target.closest(".yds-settings-group") ||
+				target.closest(
+					".sync-diagnostic-controls, .sync-auth-controls, .sync-presentation-controls",
+				)
+			) {
+				return;
+			}
+			if (
+				event.type === "keydown" &&
+				(event as KeyboardEvent).key === "Tab"
+			) {
+				return;
+			}
+			event.preventDefault();
+			event.stopImmediatePropagation();
+		};
+		for (const event of events) {
+			containerEl.addEventListener(event, guard, true);
 		}
 		this.activityUnsubscribers = [
+			() => {
+				for (const event of events) {
+					containerEl.removeEventListener(event, guard, true);
+				}
+			},
 			this.plugin.onSyncActivityChange(() => this.updateActivity()),
 			this.plugin.onAuthorizationStateChange(() =>
 				this.renderSettings(false),
 			),
 		];
 		this.updateActivity();
-		void this.renderDisplay(
-			this.controlsEl,
-			this.renderGeneration,
-			refreshBackup,
-		);
 	}
 
-	private async renderDisplay(
-		containerEl: HTMLElement,
-		generation: number,
-		refreshBackup: boolean,
-	): Promise<void> {
-		new Setting(containerEl)
-			.setName(t("settings.language"))
-			.setDesc(t("settings.language_desc"))
-			.addDropdown((dropdown) => {
-				dropdown.addOption("system", t("settings.language_system"));
-				for (const [code, label] of Object.entries(LANGUAGE_NAMES)) {
-					dropdown.addOption(code, label);
-				}
-				dropdown.setValue(this.plugin.settings.language);
-				this.trackControl(dropdown);
-				dropdown.onChange(async (value) => {
-					if (this.isActionUnavailable()) {
-						return;
-					}
-					await this.applyDraft({
-						language: normalizeLanguagePreference(value),
+	private getPresentationSettings(): SettingDefinitionRender[] {
+		return [
+			this.defineSetting("settings.language", (setting) => {
+				this.prepareSettingsRender();
+				setting
+					.setDesc(t("settings.language_desc"))
+					.addDropdown((dropdown) => {
+						dropdown.addOption(
+							"system",
+							t("settings.language_system"),
+						);
+						for (const [code, label] of Object.entries(
+							LANGUAGE_NAMES,
+						)) {
+							dropdown.addOption(code, label);
+						}
+						dropdown.setValue(this.plugin.settings.language);
+						this.trackControl(dropdown);
+						dropdown.onChange(async (value) => {
+							if (this.isActionUnavailable()) {
+								return;
+							}
+							await this.applyDraft({
+								language: normalizeLanguagePreference(value),
+							});
+							if (!this.plugin.isPluginUnloaded()) {
+								this.renderSettings(false);
+							}
+						});
 					});
-					if (!this.plugin.isPluginUnloaded()) {
-						this.renderSettings(false);
-					}
-				});
-			});
-		const migrationPending = this.plugin.isStableMigrationPending();
-		const indicatorSetting = new Setting(containerEl)
-			.setName(t("settings.show_sync_indicator"))
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.showSyncIndicator)
-					.setDisabled(migrationPending)
-					.then((control) => this.trackControl(control, true))
-					.onChange(async (value) => {
-						if (this.plugin.isPluginUnloaded()) {
+			}),
+			this.defineSetting("settings.show_sync_indicator", (setting) => {
+				const migrationPending = this.plugin.isStableMigrationPending();
+				setting.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.showSyncIndicator)
+						.setDisabled(migrationPending)
+						.then((control) => this.trackControl(control, true))
+						.onChange(async (value) => {
+							if (this.plugin.isPluginUnloaded()) {
+								return;
+							}
+							await this.applyDraft({ showSyncIndicator: value });
+						}),
+				);
+				setting.settingEl.addClass("sync-presentation-controls");
+			}),
+		];
+	}
+
+	private getConnectionSettings(): SettingDefinitionRender[] {
+		return [
+			this.defineSetting(
+				"settings.remote_path",
+				(setting) => {
+					setting.addText((control) => {
+						control
+							.setPlaceholder(
+								t("settings.remote_path_placeholder"),
+							)
+							.setValue(this.plugin.settings.remotePath);
+						control.inputEl.setAttribute(
+							"aria-label",
+							t("settings.remote_path"),
+						);
+						this.trackControl(control);
+						control.onChange(async (value) => {
+							if (this.isActionUnavailable()) {
+								return;
+							}
+							await this.applyDraft({ remotePath: value });
+						});
+					});
+				},
+				["settings.connection_section"],
+			),
+			this.defineSetting("settings.auth_method", (setting) => {
+				const connectionMethod =
+					this.connectionMethod ?? this.plugin.settings.authMethod;
+				setting.addDropdown((control) => {
+					control.addOption("oauth", t("settings.auth_oauth"));
+					control.addOption("manual", t("settings.auth_manual"));
+					control.setValue(connectionMethod);
+					this.trackControl(control);
+					control.onChange((value) => {
+						if (this.isActionUnavailable()) {
 							return;
 						}
-						await this.applyDraft({ showSyncIndicator: value });
-					}),
-			);
-		indicatorSetting.settingEl.addClass("sync-presentation-controls");
-
-		// Connection section
-		new Setting(containerEl)
-			.setName(t("settings.connection_section"))
-			.setHeading();
-
-		const connectionBlock = containerEl.createDiv({
-			cls: "connection-block",
-		});
-		const pathSetting = new Setting(connectionBlock)
-			.setName(t("settings.remote_path"))
-			.addText((control) => {
-				control
-					.setPlaceholder(t("settings.remote_path_placeholder"))
-					.setValue(this.plugin.settings.remotePath);
-				control.inputEl.setAttribute(
-					"aria-label",
-					t("settings.remote_path"),
-				);
-				this.trackControl(control);
-				control.onChange(async (value) => {
-					if (this.isActionUnavailable()) {
-						return;
-					}
-					await this.applyDraft({ remotePath: value });
+						this.connectionMethod =
+							value === "manual" ? "manual" : "oauth";
+						this.renderSettings(false);
+					});
 				});
-			});
-		pathSetting.settingEl.addClass("connection-subblock");
+			}),
+			this.defineSetting(
+				"settings.auth_sign_in",
+				(setting) => {
+					setting.setName("");
+					this.renderConnectionAuthorization(setting);
+				},
+				[
+					"settings.auth_logout",
+					"settings.client_id",
+					"settings.oauth_token",
+				],
+			),
+			this.defineSetting("settings.sync_button", (setting) => {
+				setting.setName("");
+				this.renderSyncButton(setting);
+			}),
+		];
+	}
 
-		const authorizationBlock = connectionBlock.createDiv({
-			cls: "connection-subblock connection-authorization",
-		});
+	/** Render the selected authorization form without changing the surrounding row layout. */
+	private renderConnectionAuthorization(oauthSetting: Setting): void {
 		const connectionMethod =
 			this.connectionMethod ?? this.plugin.settings.authMethod;
-		new Setting(authorizationBlock)
-			.setName(t("settings.auth_method"))
-			.addDropdown((control) => {
-				control.addOption("oauth", t("settings.auth_oauth"));
-				control.addOption("manual", t("settings.auth_manual"));
-				control.setValue(connectionMethod);
-				this.trackControl(control);
-				control.onChange((value) => {
-					if (this.isActionUnavailable()) {
-						return;
-					}
-					this.connectionMethod =
-						value === "manual" ? "manual" : "oauth";
-					this.renderSettings(false);
-				});
-			});
-
-		const oauthSetting = new Setting(authorizationBlock);
-
+		oauthSetting.setClass("sync-connection-actions");
+		oauthSetting.settingEl.toggleClass(
+			"sync-manual-auth-row",
+			connectionMethod === "manual",
+		);
 		const descEl = oauthSetting.descEl;
 		descEl.empty();
 		if (connectionMethod === "manual") {
@@ -872,7 +994,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					if (this.isActionUnavailable()) {
 						return;
 					}
-					window.open("https://oauth.yandex.ru/", "_blank");
+					controlEl.win.open("https://oauth.yandex.ru/", "_blank");
 				});
 
 			controlEl.createEl("label", { text: t("settings.client_id") });
@@ -899,7 +1021,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					const clientId = this.plugin.settings.clientId?.trim();
 					if (clientId) {
 						const authUrl = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${encodeURIComponent(clientId)}`;
-						window.open(authUrl, "_blank");
+						controlEl.win.open(authUrl, "_blank");
 					}
 				});
 
@@ -945,14 +1067,14 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			});
 			this.updateActivity();
 		}
+	}
 
-		const syncSetting = new Setting(connectionBlock);
-		syncSetting.settingEl.addClass("connection-subblock");
+	private renderSyncButton(syncSetting: Setting): void {
+		syncSetting.setClass("sync-connection-actions");
 		syncSetting.settingEl.toggleClass(
 			"authorization-pending-hidden",
 			this.isAuthorizationFlowActive(),
 		);
-		syncSetting.infoEl.remove();
 		this.syncButton = new ButtonComponent(syncSetting.controlEl).setCta();
 		this.syncButton.buttonEl.addClass("connection-sync-button");
 		this.syncButton.buttonEl.setAttribute(
@@ -968,91 +1090,90 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			void this.runFullSyncFromSettings();
 		});
 		this.updateActivity();
+	}
 
-		// Automatic sync section
-		new Setting(containerEl)
-			.setName(t("settings.automatic_sync_section"))
-			.setHeading();
+	private getAutomaticSyncSettings(): SettingDefinitionRender[] {
+		return [
+			this.defineSetting(
+				"settings.realtime_sync",
+				(setting) => {
+					setting
+						.setDesc(t("settings.realtime_sync_desc"))
+						.addToggle((toggle) =>
+							toggle
+								.setValue(
+									this.plugin.settings.enableRealtimeSync,
+								)
+								.then((control) => this.trackControl(control))
+								.onChange(async (value) => {
+									if (this.isActionUnavailable()) {
+										return;
+									}
+									await this.applyDraft({
+										enableRealtimeSync: value,
+									});
+								}),
+						);
+				},
+				["settings.automatic_sync_section"],
+			),
+			this.defineSetting("settings.full_sync_interval", (setting) => {
+				setting
+					.setDesc(t("settings.full_sync_interval_desc"))
+					.addSlider((slider) =>
+						slider
+							.setLimits(0, 60, 1)
+							.setValue(this.plugin.settings.syncInterval)
+							.then((control) => this.trackControl(control))
+							.onChange(async (value) => {
+								if (this.isActionUnavailable()) {
+									return;
+								}
+								await this.applyDraft({ syncInterval: value });
+							}),
+					);
+			}),
+			this.defineSetting("settings.sync_delay", (setting) => {
+				setting
+					.setDesc(t("settings.sync_delay_desc"))
+					.addSlider((slider) =>
+						slider
+							.setLimits(500, 10000, 500)
+							.setValue(this.plugin.settings.debounceDelay)
+							.then((control) => this.trackControl(control))
+							.onChange(async (value) => {
+								if (this.isActionUnavailable()) {
+									return;
+								}
+								await this.applyDraft({ debounceDelay: value });
+							}),
+					);
+			}),
+			this.defineSetting("settings.max_concurrency", (setting) => {
+				setting
+					.setDesc(t("settings.max_concurrency_desc"))
+					.addSlider((slider) =>
+						slider
+							.setLimits(1, 40, 1)
+							.setValue(this.plugin.settings.maxConcurrency)
+							.then((control) => this.trackControl(control))
+							.onChange(async (value) => {
+								if (this.isActionUnavailable()) {
+									return;
+								}
+								await this.applyDraft({
+									maxConcurrency: value,
+								});
+							}),
+					);
+			}),
+		];
+	}
 
-		// Enable real-time sync
-		new Setting(containerEl)
-			.setName(t("settings.realtime_sync"))
-			.setDesc(t("settings.realtime_sync_desc"))
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.enableRealtimeSync)
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({ enableRealtimeSync: value });
-					}),
-			);
-
-		// Sync interval
-		new Setting(containerEl)
-			.setName(t("settings.full_sync_interval"))
-			.setDesc(t("settings.full_sync_interval_desc"))
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 60, 1)
-					.setValue(this.plugin.settings.syncInterval)
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					.setDynamicTooltip()
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({ syncInterval: value });
-					}),
-			);
-
-		// Debounce delay
-		new Setting(containerEl)
-			.setName(t("settings.sync_delay"))
-			.setDesc(t("settings.sync_delay_desc"))
-			.addSlider((slider) =>
-				slider
-					.setLimits(500, 10000, 500)
-					.setValue(this.plugin.settings.debounceDelay)
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					.setDynamicTooltip()
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({ debounceDelay: value });
-					}),
-			);
-
-		// Max concurrency
-		new Setting(containerEl)
-			.setName(t("settings.max_concurrency"))
-			.setDesc(t("settings.max_concurrency_desc"))
-			.addSlider((slider) =>
-				slider
-					.setLimits(1, 40, 1)
-					.setValue(this.plugin.settings.maxConcurrency)
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					.setDynamicTooltip()
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({ maxConcurrency: value });
-					}),
-			);
-
-		// Force Sync section
-		new Setting(containerEl)
-			.setName(t("settings.force_sync_section"))
-			.setHeading();
-
-		new Setting(containerEl)
+	private renderForceSettings(setting: Setting): void {
+		setting
+			.setName("")
+			.setClass("sync-stacked-actions")
 			.setDesc(t("settings.force_sync_desc"))
 			.addButton((button) => {
 				this.forceButtons.push({ button, direction: "from_local" });
@@ -1081,232 +1202,290 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 					});
 			});
 		this.updateActivity();
+	}
 
-		// Encryption section
-		new Setting(containerEl)
-			.setName(t("settings.encryption_section"))
-			.setHeading();
+	private getEncryptionSettings(): SettingDefinitionRender[] {
+		return [
+			this.defineSetting(
+				"settings.encryption_info_title",
+				(setting) => {
+					setting.setDesc(t("settings.encryption_info_how"));
 
-		const infoSetting = new Setting(containerEl)
-			.setName(t("settings.encryption_info_title"))
-			.setDesc(t("settings.encryption_info_how"));
-
-		infoSetting.descEl.createEl("p", {
-			text: t("settings.encryption_info_warning"),
-			cls: "encryption-info-warning",
-		});
-
-		infoSetting.descEl.createEl("p", {
-			text: t("settings.encryption_info_password"),
-		});
-		if (migrationPending) {
-			infoSetting.descEl.createEl("p", {
-				text: t("settings.migration_features_locked"),
-				cls: "encryption-info-warning",
-			});
-		}
-
-		new Setting(containerEl)
-			.setName(t("settings.encryption_desc"))
-			.addToggle((toggle) => {
-				this.encryptionToggle = toggle;
-				this.encryptionSpinner =
-					toggle.toggleEl.parentElement!.createSpan({
-						cls: "encryption-toggle-spinner",
+					setting.descEl.createEl("p", {
+						text: t("settings.encryption_info_warning"),
+						cls: "encryption-info-warning",
 					});
-				this.encryptionSpinner.hidden = true;
-				return toggle
-					.setValue(this.plugin.settings.enableEncryption)
-					.setDisabled(migrationPending)
-					.then((control) => this.trackControl(control, false, true))
-					.onChange(async (value) => {
-						toggle.setValue(this.plugin.settings.enableEncryption);
-						if (this.isRemoteActionUnavailable()) {
-							return;
-						}
-						await this.runSettingsAction(async (isCurrent) => {
-							try {
-								if (
-									value &&
-									!this.plugin.settings.enableEncryption
-								) {
-									await this.enableEncryptionFlow(isCurrent);
-								} else if (
-									!value &&
-									this.plugin.settings.enableEncryption
-								) {
-									await this.disableEncryptionFlow(isCurrent);
-								}
-							} finally {
-								toggle.setValue(
-									this.plugin.settings.enableEncryption,
-								);
-							}
+
+					setting.descEl.createEl("p", {
+						text: t("settings.encryption_info_password"),
+					});
+					if (this.plugin.isStableMigrationPending()) {
+						setting.descEl.createEl("p", {
+							text: t("settings.migration_features_locked"),
+							cls: "encryption-info-warning",
 						});
-					});
-			});
-
-		if (this.plugin.settings.enableEncryption) {
-			new Setting(containerEl)
-				.setDesc(t("settings.encryption_status_active"))
-				.addButton((button) =>
-					button
-						.setButtonText(t("settings.encryption_change_password"))
-						.then((control) => {
-							this.encryptionButton = control;
-							this.trackControl(control, false, true);
-						})
-						.onClick(async () => {
+					}
+				},
+				["settings.encryption_section"],
+			),
+			this.defineSetting("settings.encryption_desc", (setting) => {
+				const migrationPending = this.plugin.isStableMigrationPending();
+				setting.addToggle((toggle) => {
+					this.encryptionToggle = toggle;
+					this.encryptionSpinner =
+						toggle.toggleEl.parentElement!.createSpan({
+							cls: "encryption-toggle-spinner",
+						});
+					this.encryptionSpinner.hidden = true;
+					return toggle
+						.setValue(this.plugin.settings.enableEncryption)
+						.setDisabled(migrationPending)
+						.then((control) =>
+							this.trackControl(control, false, true),
+						)
+						.onChange(async (value) => {
+							toggle.setValue(
+								this.plugin.settings.enableEncryption,
+							);
 							if (this.isRemoteActionUnavailable()) {
 								return;
 							}
 							await this.runSettingsAction(async (isCurrent) => {
-								const currentPassword =
-									await this.promptCurrentEncryptionPassword();
-								if (!currentPassword || !isCurrent()) {
-									return;
-								}
-								const password = await new Promise<
-									string | null
-								>((resolve) =>
-									new ChangePasswordModal(
-										this.app,
-										resolve,
-									).open(),
-								);
-								if (!password || !isCurrent()) {
-									return;
-								}
 								try {
-									await this.plugin.rotateEncryptionPassword(
-										password,
+									if (
+										value &&
+										!this.plugin.settings.enableEncryption
+									) {
+										await this.enableEncryptionFlow(
+											isCurrent,
+										);
+									} else if (
+										!value &&
+										this.plugin.settings.enableEncryption
+									) {
+										await this.disableEncryptionFlow(
+											isCurrent,
+										);
+									}
+								} finally {
+									toggle.setValue(
+										this.plugin.settings.enableEncryption,
 									);
-								} catch {
-									// The shared status owns operation progress and errors.
 								}
 							});
-						}),
-				);
-		}
-
-		// File filters section
-		new Setting(containerEl)
-			.setName(t("settings.file_filters_section"))
-			.setHeading();
-
-		// Sync config folder
-		new Setting(containerEl)
-			.setName(t("settings.sync_config_folder"))
-			.setDesc(t("settings.sync_config_folder_desc"))
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.syncDotObsidian)
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({ syncDotObsidian: value });
-					}),
-			);
-
-		// Include patterns
-		new Setting(containerEl)
-			.setName(t("settings.include_patterns"))
-			.setDesc(t("settings.include_patterns_desc"))
-			.addTextArea((textArea: TextAreaComponent) => {
-				textArea
-					.setPlaceholder(t("settings.include_patterns_placeholder"))
-					.setValue(this.plugin.settings.syncPatterns.join("\n"))
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({
-							syncPatterns: value
-								.split("\n")
-								.map((s) => s.trim())
-								.filter((s) => s.length > 0),
 						});
+				});
+			}),
+			{
+				...this.defineSetting(
+					"settings.encryption_change_password",
+					(setting) => {
+						setting
+							.setName("")
+							.setClass("sync-settings-button-row")
+							.setDesc(t("settings.encryption_status_active"))
+							.addButton((button) =>
+								button
+									.setButtonText(
+										t(
+											"settings.encryption_change_password",
+										),
+									)
+									.then((control) => {
+										this.encryptionButton = control;
+										this.trackControl(control, false, true);
+									})
+									.onClick(async () => {
+										if (this.isRemoteActionUnavailable()) {
+											return;
+										}
+										await this.runSettingsAction(
+											async (isCurrent) => {
+												const currentPassword =
+													await this.promptCurrentEncryptionPassword();
+												if (
+													!currentPassword ||
+													!isCurrent()
+												) {
+													return;
+												}
+												const password =
+													await new Promise<
+														string | null
+													>((resolve) =>
+														new ChangePasswordModal(
+															this.app,
+															resolve,
+														).open(),
+													);
+												if (!password || !isCurrent()) {
+													return;
+												}
+												try {
+													await this.plugin.rotateEncryptionPassword(
+														password,
+													);
+												} catch {
+													// The shared status owns operation progress and errors.
+												}
+											},
+										);
+									}),
+							);
+					},
+				),
+				visible: () => this.plugin.settings.enableEncryption,
+			},
+		];
+	}
+
+	private getFilterSettings(): SettingDefinitionRender[] {
+		return [
+			this.defineSetting(
+				"settings.sync_config_folder",
+				(setting) => {
+					setting
+						.setDesc(t("settings.sync_config_folder_desc"))
+						.addToggle((toggle) =>
+							toggle
+								.setValue(this.plugin.settings.syncDotObsidian)
+								.then((control) => this.trackControl(control))
+								.onChange(async (value) => {
+									if (this.isActionUnavailable()) {
+										return;
+									}
+									await this.applyDraft({
+										syncDotObsidian: value,
+									});
+								}),
+						);
+				},
+				["settings.file_filters_section"],
+			),
+			this.defineSetting("settings.include_patterns", (setting) => {
+				setting
+					.setDesc(t("settings.include_patterns_desc"))
+					.addTextArea((textArea: TextAreaComponent) => {
+						textArea
+							.setPlaceholder(
+								t("settings.include_patterns_placeholder"),
+							)
+							.setValue(
+								this.plugin.settings.syncPatterns.join("\n"),
+							)
+							.then((control) => this.trackControl(control))
+							.onChange(async (value) => {
+								if (this.isActionUnavailable()) {
+									return;
+								}
+								await this.applyDraft({
+									syncPatterns: value
+										.split("\n")
+										.map((s) => s.trim())
+										.filter((s) => s.length > 0),
+								});
+							});
+						textArea.inputEl.rows = 4;
+						textArea.inputEl.cols = 30;
 					});
-				textArea.inputEl.rows = 4;
-				textArea.inputEl.cols = 30;
-			});
-
-		// Exclude patterns
-		new Setting(containerEl)
-			.setName(t("settings.exclude_patterns"))
-			.setDesc(t("settings.exclude_patterns_desc"))
-			.addTextArea((textArea: TextAreaComponent) => {
-				textArea
-					.setPlaceholder(t("settings.exclude_patterns_placeholder"))
-					.setValue(this.plugin.settings.excludePatterns.join("\n"))
-					.then((control) => this.trackControl(control))
-					.onChange(async (value) => {
-						if (this.isActionUnavailable()) {
-							return;
-						}
-						await this.applyDraft({
-							excludePatterns: value
-								.split("\n")
-								.map((s) => s.trim())
-								.filter((s) => s.length > 0),
-						});
+			}),
+			this.defineSetting("settings.exclude_patterns", (setting) => {
+				setting
+					.setDesc(t("settings.exclude_patterns_desc"))
+					.addTextArea((textArea: TextAreaComponent) => {
+						textArea
+							.setPlaceholder(
+								t("settings.exclude_patterns_placeholder"),
+							)
+							.setValue(
+								this.plugin.settings.excludePatterns.join("\n"),
+							)
+							.then((control) => this.trackControl(control))
+							.onChange(async (value) => {
+								if (this.isActionUnavailable()) {
+									return;
+								}
+								await this.applyDraft({
+									excludePatterns: value
+										.split("\n")
+										.map((s) => s.trim())
+										.filter((s) => s.length > 0),
+								});
+							});
+						textArea.inputEl.rows = 4;
+						textArea.inputEl.cols = 30;
 					});
-				textArea.inputEl.rows = 4;
-				textArea.inputEl.cols = 30;
-			});
+			}),
+		];
+	}
 
-		// Logging remains available during every synchronization operation.
-		const loggingEl = containerEl.createDiv({
-			cls: "sync-diagnostic-controls",
-		});
-		new Setting(loggingEl)
-			.setName(t("settings.logging_section"))
-			.setHeading();
+	private getLoggingSettings(): SettingDefinitionRender[] {
+		return [
+			this.defineSetting(
+				"settings.enable_debug_logging",
+				(setting) => {
+					const migrationPending =
+						this.plugin.isStableMigrationPending();
+					setting
+						.setDesc(t("settings.enable_debug_logging_desc"))
+						.addToggle((toggle) =>
+							toggle
+								.setValue(
+									this.plugin.settings.enableDebugLogging,
+								)
+								.setDisabled(migrationPending)
+								.then((control) =>
+									this.trackControl(control, true),
+								)
+								.onChange(async (value) => {
+									if (this.plugin.isPluginUnloaded()) {
+										return;
+									}
+									await this.applyDraft({
+										enableDebugLogging: value,
+									});
+								}),
+						);
+				},
+				["settings.logging_section"],
+			),
+			this.defineSetting("settings.log_to_file", (setting) => {
+				const migrationPending = this.plugin.isStableMigrationPending();
+				setting
+					.setDesc(t("settings.log_to_file_desc"))
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.plugin.settings.logToFile)
+							.setDisabled(migrationPending)
+							.then((control) => this.trackControl(control, true))
+							.onChange(async (value) => {
+								if (this.plugin.isPluginUnloaded()) {
+									return;
+								}
+								await this.applyDraft({ logToFile: value });
+							}),
+					);
+			}),
+			this.defineSetting(
+				"settings.copy_logs_button",
+				(setting) => {
+					setting.setName("");
+					this.renderLogActions(setting, this.renderGeneration);
+				},
+				["settings.open_logs_button", "settings.clear_logs_button"],
+			),
+		];
+	}
 
-		// Enable debug logging
-		new Setting(loggingEl)
-			.setName(t("settings.enable_debug_logging"))
-			.setDesc(t("settings.enable_debug_logging_desc"))
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.enableDebugLogging)
-					.setDisabled(migrationPending)
-					.then((control) => this.trackControl(control, true))
-					.onChange(async (value) => {
-						if (this.plugin.isPluginUnloaded()) {
-							return;
-						}
-						await this.applyDraft({ enableDebugLogging: value });
-					}),
-			);
-
-		// Write logs to file
-		new Setting(loggingEl)
-			.setName(t("settings.log_to_file"))
-			.setDesc(t("settings.log_to_file_desc"))
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.logToFile)
-					.setDisabled(migrationPending)
-					.then((control) => this.trackControl(control, true))
-					.onChange(async (value) => {
-						if (this.plugin.isPluginUnloaded()) {
-							return;
-						}
-						await this.applyDraft({ logToFile: value });
-					}),
-			);
-
-		this.renderLogActions(loggingEl, generation);
-
-		// Backup section
-		new Setting(containerEl)
-			.setName(t("settings.backup_section"))
-			.setDesc(t("settings.backup_desc"))
-			.setHeading();
+	private async renderBackupSettings(
+		setting: Setting,
+		generation: number,
+		refreshBackup: boolean,
+	): Promise<void> {
+		setting
+			.setClass("sync-stacked-actions")
+			.setName("")
+			.setDesc(t("settings.backup_desc"));
 
 		// Combined backup status and button
 		const lastBackupText = await this.getLastBackupText(refreshBackup);
@@ -1314,7 +1493,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 			return;
 		}
 
-		new Setting(containerEl)
+		setting
 			.setName(lastBackupText)
 			.addButton((button) =>
 				button
@@ -1399,15 +1578,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 						).open();
 					}),
 			);
+	}
 
-		// Information section
-		new Setting(containerEl)
-			.setName(t("settings.information_section"))
-			.setHeading();
-
-		// Device ID
-		new Setting(containerEl)
-			.setName(t("settings.device_id"))
+	private renderInformationSettings(setting: Setting): void {
+		setting
 			.setDesc(t("settings.device_id_desc"))
 			.addText((text) =>
 				text.setValue(this.plugin.settings.deviceId).setDisabled(true),

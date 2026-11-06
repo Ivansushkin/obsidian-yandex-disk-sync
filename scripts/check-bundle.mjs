@@ -28,9 +28,16 @@ const increase = withNoble - baseline;
 if (increase > 12 * 1024) {
 	throw new Error(`@noble/ciphers adds ${increase} bytes; limit is 12288`);
 }
-if (readFileSync("build/main.js", "utf8").includes("dotenv")) {
+const bundle = readFileSync("build/main.js", "utf8");
+if (bundle.includes("dotenv")) {
 	throw new Error(
 		"Runtime bundle must not contain the dev-only dotenv package",
 	);
+}
+if (/\bcreateElement\s*\(\s*["'`]script["'`]/i.test(bundle)) {
+	throw new Error("Runtime bundle must not create script elements");
+}
+if (/\bnew\s+Function\s*\(/.test(bundle)) {
+	throw new Error("Runtime bundle must not use the Function constructor");
 }
 console.log(`@noble/ciphers minified contribution: ${increase} bytes`);

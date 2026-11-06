@@ -26,12 +26,10 @@ export class DecisionModal<T extends string | null> extends Modal {
 		for (const choice of this.choices) {
 			row.addButton((button) => {
 				button.setButtonText(choice.label);
-				if (choice.cta) {
-					button.setCta();
-				}
 				if (choice.warning) {
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					button.setWarning();
+					button.setDestructive().setCta();
+				} else if (choice.cta) {
+					button.setCta();
 				}
 				button.onClick(() => {
 					this.finish(choice.value);

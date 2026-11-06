@@ -203,14 +203,14 @@ export class RemoteReadTransport {
 		operation: string,
 		requestState: "not-started" | "unresolved",
 	): Promise<T> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timer: number | undefined;
 		let abort: (() => void) | undefined;
 		return new Promise<T>((resolve, reject) => {
 			const timeout = Math.max(
 				0,
 				Math.min(timeoutMs, budget.deadline - Date.now()),
 			);
-			timer = setTimeout(() => {
+			timer = window.setTimeout(() => {
 				reject(
 					new RemoteReadTimeoutError(
 						timeout,
@@ -228,7 +228,7 @@ export class RemoteReadTransport {
 				abort();
 			}
 		}).finally(() => {
-			clearTimeout(timer);
+			window.clearTimeout(timer);
 			if (abort) {
 				budget.signal?.removeEventListener("abort", abort);
 			}

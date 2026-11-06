@@ -5,11 +5,11 @@ import type { EncryptionBackupProof } from "../crypto/encryption-transition";
  * Backup manager for creating and managing vault backups
  */
 
-import JSZip from "jszip";
+import { Zip, ZipDeflate, ZipPassThrough } from "fflate";
 import type { YandexDiskSyncSettings, BackupInfo } from "../types";
 import { YandexDiskClient, YandexApiError } from "../api/yandex-client";
 import { VaultAdapter } from "../api/vault-adapter";
-import { joinPath } from "../utils/path-utils";
+import { getAncestorDirectories, joinPath } from "../utils/path-utils";
 import { logger } from "../utils/logger";
 import { computeSha256 } from "../utils/hash-utils";
 import {
@@ -23,7 +23,13 @@ import {
 	captureLogicalVaultDigest,
 	captureLogicalVaultSnapshot,
 	captureRemoteRawSnapshot,
+	type BackupSnapshotFile,
 } from "./backup-snapshot";
+
+const ZIP32_SIZE_LIMIT = 0xffffffff;
+const ZIP32_ENTRY_LIMIT = 0xffff;
+const ZIP_INPUT_CHUNK_SIZE = 256 * 1024;
+const ZIP_WORK_SLICE_MS = 8;
 
 export interface BackupResult {
 	success: boolean;
@@ -149,17 +155,7 @@ export class BackupManager {
 			);
 			logger.info(`Found ${snapshot.files.length} files to backup`);
 
-			const zip = new JSZip();
-			for (const file of snapshot.files) {
-				zip.file(file.path, file.content);
-			}
-
-			// Generate ZIP content
-			const zipContent = await zip.generateAsync({
-				type: "arraybuffer",
-				compression: "DEFLATE",
-				compressionOptions: { level: 6 },
-			});
+			const zipContent = await createSnapshotZip(snapshot.files);
 
 			const createdAt = Date.now();
 			const uploadContent = password
@@ -253,15 +249,10 @@ export class BackupManager {
 				remotePath,
 				fullForce ? this.vaultAdapter.vault.configDir : undefined,
 			);
-			const zip = new JSZip();
-			for (const file of snapshot.files) {
-				zip.file(`remote-raw/${file.path}`, file.content);
-			}
-			const zipContent = await zip.generateAsync({
-				type: "arraybuffer",
-				compression: "DEFLATE",
-				compressionOptions: { level: 6 },
-			});
+			const zipContent = await createSnapshotZip(
+				snapshot.files,
+				"remote-raw/",
+			);
 			const createdAt = Date.now();
 			const uploadContent = password
 				? await sealBackupEnvelope(zipContent, password, {
@@ -591,6 +582,75 @@ export class BackupManager {
 	getSuggestedDownloadName(name: string): string {
 		return name.replace(/\.enc\.zip$/, ".zip");
 	}
+}
+
+/** Write a ZIP32 snapshot in short compression slices without dynamic workers. */
+async function createSnapshotZip(
+	files: readonly BackupSnapshotFile[],
+	prefix = "",
+): Promise<ArrayBuffer> {
+	const directories = getAncestorDirectories(
+		files.map(({ path }) => `${prefix}${path}`),
+	);
+	if (files.length + directories.size >= ZIP32_ENTRY_LIMIT) {
+		throw new Error("Backup exceeds the ZIP32 entry limit");
+	}
+
+	const chunks: Uint8Array<ArrayBuffer>[] = [];
+	let archiveSize = 0;
+	const zip = new Zip((error, chunk) => {
+		if (error) {
+			throw error;
+		}
+		archiveSize += chunk.byteLength;
+		if (archiveSize >= ZIP32_SIZE_LIMIT) {
+			throw new Error("Backup exceeds the ZIP32 archive size limit");
+		}
+		chunks.push(chunk);
+	});
+	const empty = new Uint8Array(0);
+	for (const directory of directories) {
+		const entry = new ZipPassThrough(`${directory}/`);
+		entry.attrs = 0x10; // DOS directory attribute.
+		zip.add(entry);
+		entry.push(empty, true);
+	}
+
+	let yieldAt = performance.now() + ZIP_WORK_SLICE_MS;
+	for (const { path, content } of files) {
+		const bytes = new Uint8Array(content);
+		if (bytes.byteLength >= ZIP32_SIZE_LIMIT) {
+			throw new Error(
+				"Backup contains a file that exceeds the ZIP32 size limit",
+			);
+		}
+		const name = `${prefix}${path}`;
+		const entry = bytes.length
+			? new ZipDeflate(name, { level: 6 })
+			: new ZipPassThrough(name);
+		zip.add(entry);
+		let offset = 0;
+		do {
+			if (performance.now() >= yieldAt) {
+				await new Promise<void>((resolve) =>
+					window.setTimeout(resolve, 0),
+				);
+				yieldAt = performance.now() + ZIP_WORK_SLICE_MS;
+			}
+			const end = Math.min(offset + ZIP_INPUT_CHUNK_SIZE, bytes.length);
+			entry.push(bytes.subarray(offset, end), end === bytes.length);
+			offset = end;
+		} while (offset < bytes.length);
+	}
+	zip.end();
+
+	const archive = new Uint8Array(archiveSize);
+	let offset = 0;
+	for (const chunk of chunks) {
+		archive.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return archive.buffer;
 }
 
 function assertZipContent(content: ArrayBuffer): void {

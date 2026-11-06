@@ -1280,10 +1280,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (!visible || this.unloaded || !container) {
 			return;
 		}
-		this.settingsStatusNotice = new SettingsStatusNotice(
-			container.ownerDocument,
-		);
-		container.prepend(this.settingsStatusNotice.element);
+		this.settingsStatusNotice = new SettingsStatusNotice(container);
 		this.settingsStatusUnsubscribe = this.onSyncActivityChange(() =>
 			this.updateSettingsStatusNotice(),
 		);
@@ -2709,7 +2706,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			}
 		});
 		try {
-			globalThis.localStorage?.setItem(
+			window.localStorage?.setItem(
 				`yandex-disk-sync:device-id:${this.getVaultStorageScope()}`,
 				this.settings.deviceId,
 			);
@@ -2726,7 +2723,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private getInstallationDeviceId(persistedDeviceId?: string): string {
 		const key = `yandex-disk-sync:device-id:${this.getVaultStorageScope()}`;
 		try {
-			const existing = globalThis.localStorage?.getItem(key);
+			const existing = window.localStorage?.getItem(key);
 			if (existing && persistedDeviceId) {
 				return existing;
 			}
@@ -2750,7 +2747,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private readLegacyExposureRemediationFlag(): boolean {
 		try {
 			return (
-				globalThis.localStorage?.getItem(
+				window.localStorage?.getItem(
 					this.getLegacyExposureStorageKey(),
 				) === "required"
 			);
@@ -2763,7 +2760,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.legacyExposureRemediationPending = true;
 		this.legacyExposedTokenInSession = this.settings.yandexTokenSecret;
 		try {
-			globalThis.localStorage?.setItem(
+			window.localStorage?.setItem(
 				this.getLegacyExposureStorageKey(),
 				"required",
 			);
@@ -2775,9 +2772,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private clearLegacyExposureRemediation(): void {
 		this.legacyExposureRemediationPending = false;
 		try {
-			globalThis.localStorage?.removeItem(
-				this.getLegacyExposureStorageKey(),
-			);
+			window.localStorage?.removeItem(this.getLegacyExposureStorageKey());
 		} catch {
 			// The remote safety check still runs before every migration Force.
 		}

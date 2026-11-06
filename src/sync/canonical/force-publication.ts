@@ -437,7 +437,7 @@ export class ForcePublication {
 			fingerprint = observed.fingerprint;
 		};
 		await renew();
-		const timer = setInterval(() => {
+		const timer = window.setInterval(() => {
 			if (!active || running) {
 				return;
 			}
@@ -445,7 +445,7 @@ export class ForcePublication {
 				.catch((error) => {
 					failure = error;
 					active = false;
-					clearInterval(timer);
+					window.clearInterval(timer);
 				})
 				.finally(() => {
 					running = null;
@@ -453,7 +453,7 @@ export class ForcePublication {
 		}, 30_000);
 		const stop = async () => {
 			active = false;
-			clearInterval(timer);
+			window.clearInterval(timer);
 			await running;
 			if (failure) {
 				throw failure instanceof Error
@@ -465,7 +465,7 @@ export class ForcePublication {
 			stop,
 			cleanup: async () => {
 				active = false;
-				clearInterval(timer);
+				window.clearInterval(timer);
 				await running;
 				await this.deps.client.deleteResource(
 					path,

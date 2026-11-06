@@ -7,16 +7,17 @@ export class SettingsStatusNotice {
 	private messages: HTMLElement;
 	private timers = new Set<number>();
 
-	constructor(doc: Document) {
-		this.element = doc.createElement("div");
-		this.element.className = "yd-settings-notices";
-		this.status = doc.createElement("div");
-		this.status.className = "yd-settings-notice";
-		this.status.setAttribute("role", "status");
-		this.status.setAttribute("aria-live", "polite");
+	constructor(container: HTMLElement) {
+		this.element = container.createDiv({
+			cls: "yd-settings-notices",
+			prepend: true,
+		});
+		this.status = this.element.createDiv({
+			cls: "yd-settings-notice",
+			attr: { role: "status", "aria-live": "polite" },
+		});
 		this.status.hidden = true;
-		this.messages = doc.createElement("div");
-		this.element.append(this.status, this.messages);
+		this.messages = this.element.createDiv();
 	}
 
 	update(presentation: SyncPresentation): void {
@@ -37,11 +38,11 @@ export class SettingsStatusNotice {
 	}
 
 	show(message: string): void {
-		const notice = this.element.ownerDocument.createElement("div");
-		notice.className = "yd-settings-notice";
-		notice.setAttribute("role", "status");
-		notice.textContent = message;
-		this.messages.appendChild(notice);
+		const notice = this.messages.createDiv({
+			cls: "yd-settings-notice",
+			attr: { role: "status" },
+			text: message,
+		});
 		const win = this.element.ownerDocument.defaultView;
 		if (win) {
 			const timer = win.setTimeout(() => {

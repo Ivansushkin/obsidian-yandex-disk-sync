@@ -458,7 +458,7 @@ export function encodePathForUrl(path: string): string {
  * Generate unique device ID
  */
 export function generateDeviceId(): string {
-	const uuid = globalThis.crypto?.randomUUID?.();
+	const uuid = window.crypto?.randomUUID?.();
 	if (uuid) {
 		return `device_${uuid}`;
 	}
