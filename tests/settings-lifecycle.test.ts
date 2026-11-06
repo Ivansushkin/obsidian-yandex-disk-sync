@@ -826,21 +826,19 @@ test("manual connection activation remains pending after failed save or pause", 
 
 test("connection changes revoke queued manual epoch retries across token ABA", async (t) => {
 	const { plugin, disk, scheduler, update } = await settingsHost(t);
-	const oldWindow = globalThis.window;
+	const originalSetTimeout = window.setTimeout;
 	let retry = () => {};
-	Object.assign(globalThis, {
-		window: {
+	try {
+		Object.assign(window, {
 			setTimeout: (callback: () => void) => {
 				retry = callback;
-				return 1;
+				return -1;
 			},
-			clearTimeout: () => {},
-		},
-	});
-	afterTest(t, () => {
-		Object.assign(globalThis, { window: oldWindow });
-	});
-	plugin["queueEpochRecoveryFull"]({ trigger: "manual" });
+		});
+		plugin["queueEpochRecoveryFull"]({ trigger: "manual" });
+	} finally {
+		Object.assign(window, { setTimeout: originalSetTimeout });
+	}
 	await update({ yandexTokenSecret: "replacement" });
 	await update({ yandexTokenSecret: "synthetic" });
 	let reads = 0;

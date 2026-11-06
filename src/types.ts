@@ -479,7 +479,7 @@ export interface PendingPhysicalAction {
 }
 
 export function createSyncEpoch(): string {
-	const uuid = globalThis.crypto?.randomUUID?.();
+	const uuid = window.crypto?.randomUUID?.();
 	if (uuid) {
 		return uuid;
 	}

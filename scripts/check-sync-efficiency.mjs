@@ -17,6 +17,7 @@ try {
 		logLevel: "silent",
 		plugins: [obsidianStubPlugin],
 	});
+	globalThis.window ??= globalThis;
 	const probe = await import(pathToFileURL(outfile).href);
 	try {
 		await probe.run();

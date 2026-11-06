@@ -1157,5 +1157,5 @@ export class CanonicalRecovery {
 
 /** Preserve the canonical lock retry delay in discovery and commit. */
 export function waitForIndexRetry(ms: number): Promise<void> {
-	return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+	return new Promise((resolve) => window.setTimeout(resolve, ms));
 }

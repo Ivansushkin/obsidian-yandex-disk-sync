@@ -214,22 +214,21 @@ export class BackupListModal extends Modal {
 			}
 
 			this.assertCurrentSelection(generation);
-			// Create blob and download
-			const blob = new Blob([content], { type: "application/zip" });
-			const url = URL.createObjectURL(blob);
-
-			// Create download link
-			const a = document.createElement("a");
-			a.href = url;
 			const downloadName = this.backupManager.getSuggestedDownloadName(
 				backup.name,
 			);
-			a.download = downloadName;
-			document.body.appendChild(a);
-			a.click();
-			document.body.removeChild(a);
-
-			URL.revokeObjectURL(url);
+			const win = this.contentEl.ownerDocument.defaultView ?? window;
+			const blob = new win.Blob([content], { type: "application/zip" });
+			const url = win.URL.createObjectURL(blob);
+			const link = this.contentEl.createEl("a", {
+				attr: { href: url, download: downloadName },
+			});
+			try {
+				link.click();
+			} finally {
+				link.remove();
+				win.URL.revokeObjectURL(url);
+			}
 
 			this.showNotice(
 				t("notice.backup_download_completed", { name: downloadName }),

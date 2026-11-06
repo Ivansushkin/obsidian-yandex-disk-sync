@@ -47,22 +47,19 @@ function wireAuthorization(
 		params.url === "https://oauth.yandex.ru/token"
 			? tokenResponder(params)
 			: previousRequest(params);
-	const oldWindow = globalThis.window;
+	const oldOpen = window.open;
 	let browserUrl = "";
-	globalThis.window = {
-		...oldWindow,
-		open: (url?: string | URL) => {
-			browserUrl = String(url ?? "");
-			return null;
-		},
-	} as unknown as Window & typeof globalThis;
+	window.open = (url?: string | URL) => {
+		browserUrl = String(url ?? "");
+		return null;
+	};
 	afterTest(t, () => {
 		for (const cleanup of cleanups.reverse()) {
 			cleanup();
 		}
 		SHARED_YANDEX_OAUTH.clientId = oldClient;
 		transport.__obsidianRequestUrl = previousRequest;
-		globalThis.window = oldWindow;
+		window.open = oldOpen;
 	});
 	plugin["initializeAuthorization"]();
 	return {

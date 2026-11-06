@@ -10,10 +10,13 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -32,7 +35,7 @@ jobs:
       - run: npm run validate:release
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-      - name: Download and compare published assets
+      - name: Verify published assets and provenance
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -40,3 +43,11 @@ jobs:
           mkdir published-assets
           gh release download "$RELEASE_TAG" --dir published-assets
           node scripts/verify-published-assets.mjs published-assets build
+          release_commit="$(git rev-parse HEAD)"
+          for asset in main.js styles.css; do
+            gh attestation verify "published-assets/$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "$release_commit"
+          done

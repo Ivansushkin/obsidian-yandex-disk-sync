@@ -47,15 +47,15 @@ export class FileWatcher {
 	private debounceTimers = new Map<
 		string,
 		{
-			timer: ReturnType<typeof setTimeout>;
+			timer: number;
 			event: RealtimeFileEvent;
 		}
 	>();
 	private readyFileEvents = new Map<string, RealtimeFileEvent>();
 	private submittedFileEvents = new Map<string, RealtimeFileEvent>();
 	private submittedWatcherEventIds = new Set<string>();
-	private batchFlushTimer: ReturnType<typeof setTimeout> | null = null;
-	private deferredReplayTimer: ReturnType<typeof setTimeout> | null = null;
+	private batchFlushTimer: number | null = null;
+	private deferredReplayTimer: number | null = null;
 	private deferredDrainPromise: Promise<void> | null = null;
 	private deferredReplayRequested = false;
 	private reconciliationRetries = 0;
@@ -940,16 +940,16 @@ export class FileWatcher {
 	/** Retire scheduling references; their events were already queued for persistence before debounce. */
 	private drainPendingFileEvents(): void {
 		for (const pending of this.debounceTimers.values()) {
-			clearTimeout(pending.timer);
+			window.clearTimeout(pending.timer);
 		}
 		this.debounceTimers.clear();
 		this.readyFileEvents.clear();
 		if (this.batchFlushTimer) {
-			clearTimeout(this.batchFlushTimer);
+			window.clearTimeout(this.batchFlushTimer);
 			this.batchFlushTimer = null;
 		}
 		if (this.deferredReplayTimer) {
-			clearTimeout(this.deferredReplayTimer);
+			window.clearTimeout(this.deferredReplayTimer);
 			this.deferredReplayTimer = null;
 		}
 	}
@@ -1285,7 +1285,7 @@ export class FileWatcher {
 			) {
 				break;
 			}
-			adjacent.push(candidate as DurableRenameEvent);
+			adjacent.push(candidate);
 		}
 		const candidates = independentRenamePrefix(adjacent);
 		if (candidates.length < 2) {
@@ -1715,7 +1715,7 @@ export class FileWatcher {
 			return;
 		}
 
-		const timer = setTimeout(() => {
+		const timer = window.setTimeout(() => {
 			this.debounceTimers.delete(path);
 			this.readyFileEvents.set(path, event);
 			this.scheduleBatchFlush();
@@ -1736,7 +1736,7 @@ export class FileWatcher {
 	private cancelPendingSync(path: string): void {
 		const pending = this.debounceTimers.get(path);
 		if (pending) {
-			clearTimeout(pending.timer);
+			window.clearTimeout(pending.timer);
 			this.debounceTimers.delete(path);
 			pending.event.superseded = true;
 			this.acknowledgeEvents([pending.event.id]);
@@ -1762,7 +1762,7 @@ export class FileWatcher {
 			if (!path.startsWith(prefix)) {
 				continue;
 			}
-			clearTimeout(pending.timer);
+			window.clearTimeout(pending.timer);
 			this.debounceTimers.delete(path);
 			pending.event.superseded = true;
 			this.acknowledgeEvents([pending.event.id]);
@@ -1788,7 +1788,7 @@ export class FileWatcher {
 		if (this.batchFlushTimer) {
 			return;
 		}
-		this.batchFlushTimer = setTimeout(() => {
+		this.batchFlushTimer = window.setTimeout(() => {
 			this.batchFlushTimer = null;
 			if (!this.canStartAutomatic()) {
 				this.drainPendingFileEvents();
@@ -1810,7 +1810,7 @@ export class FileWatcher {
 		) {
 			return;
 		}
-		this.deferredReplayTimer = setTimeout(() => {
+		this.deferredReplayTimer = window.setTimeout(() => {
 			this.deferredReplayTimer = null;
 			if (!this.isEnabled || !this.canStartAutomatic()) {
 				return;
@@ -2002,7 +2002,7 @@ export class FileWatcher {
 
 	private createEventId(): string {
 		return (
-			globalThis.crypto?.randomUUID?.() ??
+			window.crypto?.randomUUID?.() ??
 			`${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 		);
 	}

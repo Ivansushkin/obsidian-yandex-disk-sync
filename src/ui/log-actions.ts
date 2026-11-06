@@ -77,8 +77,7 @@ export async function copyLogTail(
 	void content.catch(() => undefined);
 	try {
 		const clipboard = win.navigator.clipboard;
-		const ClipboardItemConstructor = (win as Window & typeof globalThis)
-			.ClipboardItem;
+		const ClipboardItemConstructor = (win as typeof window).ClipboardItem;
 		if (ClipboardItemConstructor && clipboard?.write) {
 			const data = content.then(
 				(text) => new Blob([text], { type: "text/plain" }),

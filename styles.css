@@ -287,9 +287,25 @@
 	pointer-events: none;
 }
 
+/* Let native settings rows host the existing full-width sections. */
+.sync-settings-section.setting-item {
+	display: block;
+	padding: 0;
+	border: 0;
+}
+
+.sync-settings-section > .setting-item-info {
+	display: none;
+}
+
+.sync-settings-section > .setting-item-control {
+	display: block;
+	text-align: start;
+}
+
 /* Keep button controls within this plugin's settings layout. */
 :where(.force-settings-controls)
-	.setting-item:has(button)
+	.sync-settings-button-row
 	.setting-item-control {
 	display: flex;
 	flex-direction: column;
@@ -298,7 +314,7 @@
 }
 
 :where(.force-settings-controls)
-	.setting-item:has(button)
+	.sync-settings-button-row
 	.setting-item-control
 	button {
 	width: 100%;
@@ -377,26 +393,34 @@
 	}
 }
 
-.sync-log-actions.setting-item {
+:is(.sync-force-actions, .sync-log-actions).setting-item {
 	display: block;
 	border-bottom: 0;
 	padding: var(--size-4-4, 16px);
 }
 
-.sync-log-actions.setting-item .setting-item-control {
+.sync-force-actions > .setting-item-info {
+	margin: 0 0 var(--size-4-2);
+}
+
+:is(.sync-force-actions, .sync-log-actions) > .setting-item-control {
 	display: flex;
 	flex-direction: row;
 	flex-wrap: wrap;
 	justify-content: flex-start;
-	gap: 8px;
+	gap: var(--size-4-2);
 	width: 100%;
 	margin: 0;
 }
 
-.sync-log-actions.setting-item .setting-item-control button {
+:is(.sync-force-actions, .sync-log-actions) > .setting-item-control button {
 	flex: 1 1 180px;
 	gap: var(--size-4-2);
 	min-width: 0;
+	max-width: 100%;
+	min-height: var(--input-height);
+	height: auto;
+	white-space: normal;
 }
 
 .sync-log-button-icon {

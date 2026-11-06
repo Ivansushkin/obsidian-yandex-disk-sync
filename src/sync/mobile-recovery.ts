@@ -108,9 +108,8 @@ export class MobileSyncRecovery {
 	constructor(private readonly ports: RecoveryPorts) {
 		this.clock = ports.clock ?? {
 			now: () => Date.now(),
-			setTimeout: (run, delay) => setTimeout(run, delay),
-			clearTimeout: (handle) =>
-				clearTimeout(handle as ReturnType<typeof setTimeout>),
+			setTimeout: (run, delay) => window.setTimeout(run, delay),
+			clearTimeout: (handle) => window.clearTimeout(handle as number),
 		};
 		const state = ports.read();
 		this.generation = state.generation;

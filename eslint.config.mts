@@ -29,7 +29,7 @@ export default tseslint.config(
 				"error",
 				{
 					presets: ["native", "microutilities", "preferred"],
-					allowed: ["dotenv", "lint-staged"],
+					allowed: ["lint-staged"],
 				},
 			],
 		},

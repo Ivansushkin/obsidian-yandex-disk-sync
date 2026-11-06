@@ -83,7 +83,7 @@ interface PendingAttempt {
 	assertContext(): void;
 	accepted: boolean;
 	waiters: Set<(error: AuthorizationError) => void>;
-	timer?: ReturnType<typeof setTimeout>;
+	timer?: number;
 }
 
 /** Own one memory-only PKCE attempt while the host retains storage and synchronization ownership. */
@@ -239,19 +239,19 @@ export class YandexAuthorization {
 		}
 		assertCurrent();
 		if (this.native) {
-			let waitTimer: ReturnType<typeof setTimeout> | undefined;
+			let waitTimer: number | undefined;
 			try {
 				await Promise.race([
 					this.native,
 					new Promise<never>((_, reject) => {
-						waitTimer = setTimeout(
+						waitTimer = window.setTimeout(
 							() => reject(new AuthorizationError("timeout")),
 							this.options.requestTimeoutMs ?? 30_000,
 						);
 					}),
 				]);
 			} finally {
-				clearTimeout(waitTimer);
+				window.clearTimeout(waitTimer);
 			}
 		}
 		assertCurrent();
@@ -272,13 +272,13 @@ export class YandexAuthorization {
 			return this.options.request(body);
 		});
 		this.trackNative(request);
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timer: number | undefined;
 		let response: OAuthResponse;
 		try {
 			response = await Promise.race([
 				request,
 				new Promise<never>((_, reject) => {
-					timer = setTimeout(
+					timer = window.setTimeout(
 						() => reject(new AuthorizationError("timeout")),
 						this.options.requestTimeoutMs ?? 30_000,
 					);
@@ -290,7 +290,7 @@ export class YandexAuthorization {
 			}
 			throw new AuthorizationError("network");
 		} finally {
-			clearTimeout(timer);
+			window.clearTimeout(timer);
 		}
 		assertCurrent();
 		const update = this.parseResponse(response, current.authorization);
@@ -328,7 +328,7 @@ export class YandexAuthorization {
 		};
 		this.pending = attempt;
 		this.update({ phase: "preparing" });
-		attempt.timer = setTimeout(
+		attempt.timer = window.setTimeout(
 			() => this.retire(attempt, "expired"),
 			600_000,
 		);
@@ -418,7 +418,7 @@ export class YandexAuthorization {
 				accept: () => {
 					this.assertAttempt(attempt);
 					attempt.accepted = true;
-					clearTimeout(attempt.timer);
+					window.clearTimeout(attempt.timer);
 					attempt.verifier = "";
 					this.update({ phase: "committing" });
 				},
@@ -571,7 +571,7 @@ export class YandexAuthorization {
 					return;
 				}
 				settled = true;
-				clearTimeout(timer);
+				window.clearTimeout(timer);
 				attempt.waiters.delete(cancel);
 				if (error) {
 					reject(error);
@@ -580,7 +580,7 @@ export class YandexAuthorization {
 				}
 			};
 			const cancel = (error: AuthorizationError) => done(error);
-			const timer = setTimeout(
+			const timer = window.setTimeout(
 				() => done(new AuthorizationError("timeout")),
 				this.options.requestTimeoutMs ?? 30_000,
 			);
@@ -616,7 +616,7 @@ export class YandexAuthorization {
 	}
 
 	private finish(attempt: PendingAttempt): void {
-		clearTimeout(attempt.timer);
+		window.clearTimeout(attempt.timer);
 		attempt.verifier = "";
 		if (this.pending === attempt) {
 			this.pending = null;

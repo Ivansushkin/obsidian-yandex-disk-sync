@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.4.0
+
+Changes since `2.3.0`. Requires Obsidian `1.13.1` or later.
+
+### Added
+
+- Find plugin settings through Obsidian's settings search. Results open the
+  relevant section and match localized setting names.
+
+### Fixed
+
+- Backup downloads use the window that owns the backup dialog. Background
+  timers use the plugin's window, and settings buttons fit narrow layouts.
+- Settings sliders use Obsidian's inline values, and destructive actions use
+  the current button API.
+
+### Changed
+
+- The Community Directory compatibility table now requires Obsidian
+  `1.0.0` for the `1.1.0` fallback release.
+- Backup, Force sync and encryption archives use a browser-compatible ZIP
+  writer without dynamic code. Existing backups remain readable.
+- Release validation checks that the tag, source manifest and packaged
+  manifest agree. GitHub Actions attest `main.js` and `styles.css` and verify
+  their provenance after publication.
+
 ## 2.3.0
 
 Changes since `2.2.0`.
