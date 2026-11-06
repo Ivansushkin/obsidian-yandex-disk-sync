@@ -321,37 +321,35 @@
 	flex-shrink: 0;
 }
 
-/* Connection setup block */
-.connection-block {
-	margin-bottom: 24px;
-	container-type: inline-size;
+/* Use one action column for sign-in and synchronization. */
+.sync-connection-group {
+	container: yds-connection / inline-size;
 }
 
-.connection-block .setting-item {
-	border-top: none;
-}
-
-.connection-block .setting-item-info {
+.sync-connection-actions > .setting-item-info {
 	min-width: 0;
 }
 
-.connection-block .setting-item-control {
+.sync-connection-actions > .setting-item-control {
 	flex: 0 0 22ch;
 	min-width: 0;
 	margin-inline-start: auto;
 }
 
-.connection-block .sync-auth-controls {
+.sync-connection-actions > .setting-item-control,
+.sync-auth-controls {
+	display: flex;
 	flex-direction: column;
 	align-items: stretch;
-	gap: 8px;
+	gap: var(--size-4-2);
 }
 
-.connection-block .authorization-pending-hidden {
+.sync-connection-actions.authorization-pending-hidden {
 	display: none;
 }
 
-.sync-auth-controls button {
+.sync-connection-actions button {
+	width: 100%;
 	height: auto;
 	min-height: var(--input-height);
 	white-space: normal;
@@ -361,49 +359,48 @@
 	overflow-wrap: anywhere;
 }
 
-.is-phone .connection-block .setting-item-control {
+.is-phone .sync-connection-actions > .setting-item-control {
 	flex-basis: auto;
 }
 
-.connection-block .setting-item-control input {
+.sync-manual-auth-row input {
 	width: 100%;
 }
 
-.connection-block .setting-item-control label {
-	display: block;
-	text-align: left;
-	font-size: 12px;
-	font-weight: 600;
+.sync-manual-auth-row label {
+	text-align: start;
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-semibold);
 	color: var(--text-muted);
 }
 
-@container (max-width: 34em) {
-	.connection-block .setting-item {
+@container yds-connection (max-width: 34em) {
+	.sync-connection-actions {
 		flex-direction: column;
 		align-items: stretch;
 	}
 
-	.connection-block .setting-item-info {
+	.sync-connection-actions > .setting-item-info {
 		margin-inline-end: 0;
 	}
 
-	.connection-block .setting-item-control {
+	.sync-connection-actions > .setting-item-control {
 		flex-basis: auto;
 		width: 100%;
 	}
 }
 
-:is(.sync-force-actions, .sync-log-actions).setting-item {
+:is(.sync-stacked-actions, .sync-log-actions).setting-item {
 	display: block;
 	border-bottom: 0;
 	padding: var(--size-4-4, 16px);
 }
 
-.sync-force-actions > .setting-item-info {
+.sync-stacked-actions > .setting-item-info {
 	margin: 0 0 var(--size-4-2);
 }
 
-:is(.sync-force-actions, .sync-log-actions) > .setting-item-control {
+:is(.sync-stacked-actions, .sync-log-actions) > .setting-item-control {
 	display: flex;
 	flex-direction: row;
 	flex-wrap: wrap;
@@ -413,7 +410,7 @@
 	margin: 0;
 }
 
-:is(.sync-force-actions, .sync-log-actions) > .setting-item-control button {
+:is(.sync-stacked-actions, .sync-log-actions) > .setting-item-control button {
 	flex: 1 1 180px;
 	gap: var(--size-4-2);
 	min-width: 0;

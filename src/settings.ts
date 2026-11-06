@@ -681,7 +681,11 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 
 		return [
 			group(undefined, this.getPresentationSettings()),
-			group("settings.connection_section", this.getConnectionSettings()),
+			group(
+				"settings.connection_section",
+				this.getConnectionSettings(),
+				"sync-connection-group",
+			),
 			group(
 				"settings.automatic_sync_section",
 				this.getAutomaticSyncSettings(),
@@ -940,6 +944,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private renderConnectionAuthorization(oauthSetting: Setting): void {
 		const connectionMethod =
 			this.connectionMethod ?? this.plugin.settings.authMethod;
+		oauthSetting.setClass("sync-connection-actions");
 		oauthSetting.settingEl.toggleClass(
 			"sync-manual-auth-row",
 			connectionMethod === "manual",
@@ -1065,7 +1070,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	}
 
 	private renderSyncButton(syncSetting: Setting): void {
-		syncSetting.setClass("sync-settings-button-row");
+		syncSetting.setClass("sync-connection-actions");
 		syncSetting.settingEl.toggleClass(
 			"authorization-pending-hidden",
 			this.isAuthorizationFlowActive(),
@@ -1168,7 +1173,7 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 	private renderForceSettings(setting: Setting): void {
 		setting
 			.setName("")
-			.setClass("sync-force-actions")
+			.setClass("sync-stacked-actions")
 			.setDesc(t("settings.force_sync_desc"))
 			.addButton((button) => {
 				this.forceButtons.push({ button, direction: "from_local" });
@@ -1477,7 +1482,10 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		generation: number,
 		refreshBackup: boolean,
 	): Promise<void> {
-		setting.setName("").setDesc(t("settings.backup_desc"));
+		setting
+			.setClass("sync-stacked-actions")
+			.setName("")
+			.setDesc(t("settings.backup_desc"));
 
 		// Combined backup status and button
 		const lastBackupText = await this.getLastBackupText(refreshBackup);
@@ -1486,7 +1494,6 @@ export class YandexDiskSyncSettingTab extends PluginSettingTab {
 		}
 
 		setting
-			.setClass("sync-settings-button-row")
 			.setName(lastBackupText)
 			.addButton((button) =>
 				button
