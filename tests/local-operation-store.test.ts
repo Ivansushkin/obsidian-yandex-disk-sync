@@ -2,18 +2,34 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { LocalOperationStore } from "../src/sync/local/operation-store";
 
-test("mutation replay advances only a contiguous FIFO prefix from its durable allocation floor", () => {
+test("mutation replay advances a contiguous FIFO prefix, including retired trash work", () => {
 	for (const firstSeq of [1, 8]) {
 		const label = `allocation floor ${firstSeq}`;
 		const store = new LocalOperationStore("device-a");
 		store.loadMutations(undefined, firstSeq);
-		const first = store.enqueueMutation("put", "a.md", "epoch-a", 7);
+		const first = store.enqueueMutation("move", "a.md", "epoch-a", 7, {
+			targetPath: ".TRASH/a.md",
+			resourceKind: "file",
+		});
 		const second = store.enqueueMutation(
 			"delete-file",
 			"b.md",
 			"epoch-a",
 			7,
 		);
+		const action = store.enqueuePhysicalAction(
+			"move-remote",
+			".trash/old.md",
+			7,
+			{
+				epoch: "epoch-a",
+				targetPath: "old.md",
+			},
+		);
+		store.loadMutations(store.getMutations(), store.getNextMutationSeq());
+		store.loadPhysicalActions([action]);
+		assert.equal(store.getMutations()[0]?.type, "noop");
+		assert.deepEqual(store.getPhysicalActions(), []);
 		const applied = { "device-a": firstSeq - 1 };
 		assert.equal(first.id, `device-a:${firstSeq}`, label);
 		assert.equal(second.seq, firstSeq + 1, label);

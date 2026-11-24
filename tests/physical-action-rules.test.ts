@@ -8,7 +8,6 @@ import {
 	type YandexResource,
 } from "../src/types";
 import {
-	classifyPhysicalDeleteFingerprint,
 	classifyPhysicalDeleteResource,
 	isPhysicalDeleteAuthorized,
 } from "../src/sync/files/action-rules";
@@ -82,21 +81,6 @@ test("physical cleanup requires current epoch and canonical deletion or accepted
 			isPhysicalDeleteAuthorized(cleanup, canonical),
 			expected,
 			label,
-		);
-	}
-});
-
-test("remote deletion requires an exact expected fingerprint", () => {
-	for (const [expected, current, decision] of [
-		["expected", "expected", "match"],
-		[undefined, "current", "missing-expected"],
-		["expected", undefined, "missing-current"],
-		["expected", "changed", "mismatch"],
-	] as const) {
-		assert.equal(
-			classifyPhysicalDeleteFingerprint(expected, current),
-			decision,
-			decision,
 		);
 	}
 });

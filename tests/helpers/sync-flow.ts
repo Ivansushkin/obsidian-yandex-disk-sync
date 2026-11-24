@@ -4,6 +4,18 @@ import { App, TFile, TFolder, type RequestUrlParam } from "obsidian";
 import { YandexDiskClient } from "../../src/api/yandex-client";
 import { VaultAdapter } from "../../src/api/vault-adapter";
 import { IndexManager } from "../../src/sync/canonical/manager";
+import { BackupManager } from "../../src/backup/backup-manager";
+import { EncryptionManager } from "../../src/crypto/encryption-manager";
+import {
+	confirmForceReplacementPlan,
+	ensureForceRoot,
+	prepareForceReplacement,
+} from "../../src/sync/workflows/force-replacement";
+import type {
+	ForceDirection,
+	ForceRecovery,
+} from "../../src/sync/workflows/force-state";
+import type { RemoteObservation } from "../../src/sync/contracts";
 import { SyncEngine } from "../../src/sync/engine";
 import {
 	FileWatcher,
@@ -320,7 +332,16 @@ export class MemoryVault {
 			return this.files.get(path)!.slice(0);
 		},
 		remove: async (path: string) => this.remove(path),
-		rmdir: async (path: string) => this.remove(path),
+		rmdir: async (path: string, recursive: boolean) => {
+			const contents = await this.adapter.list(path);
+			if (
+				!recursive &&
+				(contents.files.length || contents.folders.length)
+			) {
+				throw new Error("Directory is not empty");
+			}
+			this.remove(path);
+		},
 		mkdir: async (path: string) => {
 			this.folder(path);
 		},
@@ -342,16 +363,21 @@ export class MemoryVault {
 	async delete(entry: TFile | TFolder) {
 		this.remove(entry.path);
 	}
+	async trashFile(entry: TFile | TFolder) {
+		this.remove(entry.path);
+	}
 	getName() {
 		return "synthetic";
 	}
 	getFiles() {
-		return [...this.entries.values()].filter(
+		return this.getAllLoadedFiles().filter(
 			(entry) => entry instanceof TFile,
 		);
 	}
 	getAllLoadedFiles() {
-		return [...this.entries.values()];
+		return [...this.entries.values()].filter(
+			(entry) => this.getAbstractFileByPath(entry.path) === entry,
+		);
 	}
 	getAbstractFileByPath(path: string) {
 		return this.entries.get(path) ?? null;
@@ -500,7 +526,7 @@ export function device(
 		downloadTimeoutMs?: number;
 		maxRetries?: number;
 	} = {},
-	onPersist?: (snapshot: SavedDevice) => void,
+	onPersist?: (snapshot: SavedDevice) => void | Promise<void>,
 	isStopped: () => boolean = () => false,
 ) {
 	disk.install();
@@ -517,7 +543,7 @@ export function device(
 		vault,
 		workspace: { layoutReady: true },
 		fileManager: {
-			trashFile: async (file: TFile | TFolder) => vault.remove(file.path),
+			trashFile: async (file: TFile | TFolder) => vault.trashFile(file),
 		},
 	} as unknown as App;
 	const adapter = new VaultAdapter(app, settings);
@@ -536,22 +562,45 @@ export function device(
 		index.loadPendingMutations(saved.pendingMutations);
 		index.loadPendingPhysicalActions(saved.pendingPhysicalActions);
 	}
-	const engine = new SyncEngine(client, adapter, index, settings, isStopped);
+	let crashed = false;
+	const engine = new SyncEngine(
+		client,
+		adapter,
+		index,
+		settings,
+		() => crashed || isStopped(),
+	);
 	const watcher = new FileWatcher(app, engine, settings);
 	if (saved) {
 		watcher.loadDeferredEvents(saved.pendingWatcherEvents);
 	}
-	let persisted: SavedDevice;
-	const persist = async () => {
-		persisted = JSON.parse(
+	let persisted = saved ? structuredClone(saved) : undefined;
+	const lastSaved = () => {
+		assert.ok(persisted, "Device has no durable snapshot yet");
+		return structuredClone(persisted);
+	};
+	const persist = async (observation?: RemoteObservation) => {
+		if (crashed) {
+			return;
+		}
+		const snapshot = JSON.parse(
 			JSON.stringify({
-				localState: index.getLocalIndexData(),
+				localState: {
+					...index.getLocalIndexData(),
+					...observation?.state,
+				},
 				pendingMutations: index.getPendingMutations(),
 				pendingPhysicalActions: index.getPendingPhysicalActions(),
 				pendingWatcherEvents: watcher.getDeferredEvents(),
 			}),
 		) as SavedDevice;
-		onPersist?.(structuredClone(persisted));
+		if (onPersist) {
+			await onPersist(structuredClone(snapshot));
+		}
+		if (!crashed) {
+			persisted = snapshot;
+			observation?.publish();
+		}
 	};
 	engine.setIndexSaveCallback(persist);
 	watcher.setPersistCallback(persist);
@@ -573,12 +622,19 @@ export function device(
 			await watcher.waitForPendingPersistence();
 			await persist();
 		},
-		async saved() {
+		async saved(observation?: RemoteObservation) {
 			await watcher.waitForPendingPersistence();
-			await persist();
-			return structuredClone(persisted);
+			await persist(observation);
+			return lastSaved();
 		},
-		lastSaved: () => structuredClone(persisted),
+		lastSaved,
+		/** Recover only writes completed before the process stopped. */
+		crash() {
+			const durable = lastSaved();
+			crashed = true;
+			watcher.stop();
+			return durable;
+		},
 		assertLocal(path: string, text?: string) {
 			assert.deepEqual(
 				vault.files.get(path),
@@ -673,4 +729,94 @@ export function device(
 			);
 		},
 	};
+}
+
+/** Attach the manifest that matches the shared encrypted MemoryDisk fixture. */
+export async function seedForceEncryption(
+	disk: MemoryDisk,
+	current: ReturnType<typeof device>,
+	codec: EncryptionCodec | null,
+): Promise<void> {
+	if (!codec) {
+		return;
+	}
+	current.settings.enableEncryption = true;
+	current.settings.encryptionPassword = "synthetic-flow-password";
+	const manifest = await new EncryptionManager().createManifest({
+		service: codec,
+		salt: EncryptionService.bytesToBase64(
+			new Uint8Array(SALT_LENGTH).fill(12),
+		),
+		state: "enabled",
+		revision: 1,
+		deviceId: current.settings.deviceId,
+	});
+	disk.files.set(
+		"vault/.obsidian-encrypt.json",
+		bytes(JSON.stringify(manifest)),
+	);
+}
+
+/** Confirm a real Force plan and invoke the same engine entry point as the plugin. */
+export async function runConfirmedForce(
+	current: ReturnType<typeof device>,
+	direction: ForceDirection,
+	withBackup = false,
+) {
+	let checkpoint: ForceRecovery | null = null;
+	const deps = {
+		...current,
+		getRecovery: () => checkpoint,
+		persist: async (state: ForceRecovery | null) => {
+			checkpoint = structuredClone(state);
+			await current.saved();
+		},
+		password: async () => null,
+	};
+	current.engine.setForceReplacementPorts(deps);
+	const plan = await prepareForceReplacement(deps, direction, true);
+	assert.ok(plan);
+	if (withBackup) {
+		await ensureForceRoot(deps, plan);
+		const backup = new BackupManager(
+			current.client,
+			current.adapter,
+			current.settings,
+			"2.0.0",
+		);
+		const archive = await current.index.withForceScope(plan.recovery, () =>
+			direction === "from_local"
+				? backup.createRemoteSnapshotBackup(
+						plan.password ?? undefined,
+						undefined,
+						true,
+					)
+				: backup.createBackup(
+						plan.password ?? undefined,
+						undefined,
+						true,
+					),
+		);
+		assert.ok(archive.success, archive.error);
+		assert.ok(
+			archive.backupName && archive.sha256 && archive.snapshotDigest,
+		);
+		plan.recovery.backupProof = {
+			name: archive.backupName,
+			sha256: archive.sha256,
+			snapshotDigest: archive.snapshotDigest,
+		};
+	}
+	confirmForceReplacementPlan(plan);
+	const options = {
+		forceReplacement: {
+			plan,
+			backupMode: withBackup
+				? ("with-backup" as const)
+				: ("without-backup" as const),
+		},
+	};
+	return direction === "from_local"
+		? await current.engine.forceSyncFromLocal(options)
+		: await current.engine.forceSyncFromRemote(options);
 }

@@ -10,6 +10,9 @@ import { planRecursiveDeletes } from "../sync/files/deletion-cover";
 import {
 	getAncestorDirectories,
 	isProtectedPath,
+	isVaultTrashPath,
+	mayBeEncodedVaultTrashRoot,
+	VAULT_TRASH_DIRECTORY,
 	joinPath,
 	shouldInspectRawSyncPath,
 	toLocalPath,
@@ -36,6 +39,9 @@ export async function cleanupEncryptionReplacement(
 	const replacement = initial?.replacement;
 	if (!initial || !replacement || initial.phase !== "cleanup") {
 		throw new Error("Authoritative cleanup has no committed authority");
+	}
+	if (sourceCodec === undefined && !initial.source.enabled) {
+		sourceCodec = null;
 	}
 	const epoch = index.getRemoteIndex().epoch;
 	const root = context.getSettings().remotePath;
@@ -84,23 +90,21 @@ export async function cleanupEncryptionReplacement(
 			for (let pass = 0; pass < 4; pass++) {
 				const canonical = await readAuthority();
 				const targets = new Map<string, string>();
+				const preserved = new Set(replacement.preservedRawPaths);
 				for (const [path, file] of Object.entries(canonical.files)) {
 					if (!file.deleted) {
-						targets.set(
-							toLocalPath(
-								await context.client.getPhysicalPath(
-									joinPath(root, path),
-								),
-								root,
+						const raw = toLocalPath(
+							await context.client.getPhysicalPath(
+								joinPath(root, path),
 							),
-							path,
+							root,
 						);
+						preserved.add(raw);
+						if (!isVaultTrashPath(path)) {
+							targets.set(raw, path);
+						}
 					}
 				}
-				const preserved = new Set([
-					...replacement.preservedRawPaths,
-					...targets.keys(),
-				]);
 				const directoryPages = new Map<string, number>();
 				const resources = await context.client.getResourcesRecursive(
 					root,
@@ -109,6 +113,10 @@ export async function cleanupEncryptionReplacement(
 					true,
 					(path) => {
 						const raw = toLocalPath(path, root);
+						if (isVaultTrashPath(raw)) {
+							preserved.add(raw);
+							return false;
+						}
 						if (isProtectedPath(raw)) {
 							if (raw.includes("/")) {
 								preserved.add(raw);
@@ -172,20 +180,21 @@ export async function cleanupEncryptionReplacement(
 						}
 						continue;
 					}
-					if (
-						sourceCodec === undefined &&
-						context.getTransition()?.source.enabled === false
-					) {
-						sourceCodec = null;
-					}
+					const needsLegacyTrashCheck =
+						initial.source.enabled &&
+						!replacement.preservedRawPaths.includes(
+							VAULT_TRASH_DIRECTORY,
+						) &&
+						mayBeEncodedVaultTrashRoot(raw);
 					if (
 						sourceCodec === undefined &&
 						resource.type === "file" &&
-						!replacement.deletions.some(
-							(action) =>
-								raw === action.path ||
-								raw.startsWith(`${action.path}/`),
-						)
+						(needsLegacyTrashCheck ||
+							!replacement.deletions.some(
+								(action) =>
+									raw === action.path ||
+									raw.startsWith(`${action.path}/`),
+							))
 					) {
 						const source = context.getTransition()?.source;
 						if (source?.enabled && source.salt && source.password) {
@@ -209,6 +218,11 @@ export async function cleanupEncryptionReplacement(
 						}
 					}
 					if (sourceCodec === undefined) {
+						if (needsLegacyTrashCheck && resource.type === "file") {
+							throw new Error(
+								"Protected-path verification requires source-capable recovery",
+							);
+						}
 						if (
 							replacement.deletions.some(
 								(action) =>
@@ -241,7 +255,9 @@ export async function cleanupEncryptionReplacement(
 						raw,
 						sourceCodec,
 					);
-					if (resource.type === "dir") {
+					if (isVaultTrashPath(logical)) {
+						preserved.add(raw.split("/", 1)[0]!);
+					} else if (resource.type === "dir") {
 						if (isReplacementSubtree(logical, replacement.scope)) {
 							collapsible.add(raw);
 						}

@@ -40,22 +40,6 @@ export function isPhysicalDeleteAuthorized(
 }
 
 /**
- * Require an exact server fingerprint match before destructive remote work.
- */
-export function classifyPhysicalDeleteFingerprint(
-	expectedFingerprint: string | undefined,
-	currentFingerprint: string | undefined,
-): PhysicalDeleteFingerprintDecision {
-	if (!expectedFingerprint) {
-		return "missing-expected";
-	}
-	if (!currentFingerprint) {
-		return "missing-current";
-	}
-	return expectedFingerprint === currentFingerprint ? "match" : "mismatch";
-}
-
-/**
  * Classify a destructive guard against current Yandex resource metadata.
  * Persisted legacy fingerprints may refer to any server identity field.
  */

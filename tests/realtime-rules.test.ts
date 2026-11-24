@@ -204,10 +204,10 @@ test("queue absorption follows rename targets without swallowing unrelated sourc
 test("file and folder chains retain running identities across JSON restart", () => {
 	for (const kind of ["file", "folder"] as const) {
 		const first = {
-			...renameEvent("first", "A", "B", {
-				mutationId: "device-a:11",
-				mutationSeq: 11,
-			}),
+			...renameEvent("first", "A", "B"),
+			...(kind === "file"
+				? { mutationId: "device-a:11", mutationSeq: 11 }
+				: {}),
 			kind,
 		};
 		const second = { ...renameEvent("second", "B", "deep/C"), kind };
@@ -229,8 +229,11 @@ test("file and folder chains retain running identities across JSON restart", () 
 			JSON.stringify(queued.events),
 		) as WatcherQueueEvent[];
 		assert.equal(restored[0]?.id, "first");
-		assert.equal(restored[0]?.mutationId, "device-a:11");
-		assert.equal(restored[0]?.mutationSeq, 11);
+		const prepared = {
+			...restored[0],
+			mutationId: "device-a:11",
+			mutationSeq: 11,
+		};
 		const successor = {
 			...renameEvent("third", "deep/C", "D", {
 				epoch: "foreign-epoch",
@@ -239,15 +242,16 @@ test("file and folder chains retain running identities across JSON restart", () 
 			}),
 			kind,
 		};
-		const running = reduceWatcherQueue(restored, successor, {
+		const running = reduceWatcherQueue([prepared], successor, {
 			...queueContext,
-			submittedWatcherIds: new Set(["first"]),
+			submittedWatcherIds:
+				kind === "folder" ? new Set() : new Set(["first"]),
 		});
 		assert.equal(running.chain?.disposition, "running");
 		const restarted = JSON.parse(
 			JSON.stringify(running.events),
 		) as WatcherQueueEvent[];
-		assert.deepEqual(restarted[0], restored[0]);
+		assert.deepEqual(restarted[0], prepared);
 		assert.deepEqual(
 			restarted.map((event) => [
 				event.id,

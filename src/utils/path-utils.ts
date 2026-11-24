@@ -29,6 +29,21 @@ export function assertForcePath(path: string): void {
 	}
 }
 
+export const VAULT_TRASH_DIRECTORY = ".trash";
+
+/** Reserve Obsidian's vault-root trash without reserving nested names or codec metadata. */
+export function isVaultTrashPath(path: string): boolean {
+	return (
+		normalizePath(path).split("/", 1)[0]?.toLowerCase() ===
+		VAULT_TRASH_DIRECTORY
+	);
+}
+
+/** A six-byte trash name plus the 16-byte authentication tag encodes to 30 characters. */
+export function mayBeEncodedVaultTrashRoot(path: string): boolean {
+	return /^[A-Za-z0-9_-]{29}[AQgw](?:\/|$)/.test(path);
+}
+
 /** Reserve only the root service namespace; nested names remain literal user paths. */
 export function isForceServicePath(path: string): boolean {
 	const root = path.split("/")[0]!;
@@ -54,6 +69,7 @@ export function isForcePluginPath(path: string, configDir: string): boolean {
 /** Protect the Force/archive namespace before applying caller-specific user filters. */
 export function isForceSourcePath(path: string, configDir: string): boolean {
 	return (
+		!isVaultTrashPath(path) &&
 		path !== ".backup" &&
 		!path.startsWith(".backup/") &&
 		!isForceServicePath(path) &&
@@ -68,6 +84,7 @@ export function preservesForceLocalPath(
 	configDir: string,
 ): boolean {
 	return (
+		isVaultTrashPath(path) ||
 		path === ".backup" ||
 		path.startsWith(".backup/") ||
 		isForcePluginPath(path, configDir)
@@ -227,20 +244,26 @@ export function isRootIndexLockPath(path: string): boolean {
 	);
 }
 
-/** Reject ambiguous portable trees without renaming logical paths. */
+/** Compare logical vault paths across case-insensitive and Unicode-normalizing filesystems. */
+export function getPortablePathKey(path: string): string {
+	return path.normalize("NFC").toLocaleLowerCase("en-US");
+}
+
+/** Check a portable tree and its intersections with independently retained paths. */
 export function hasPortablePathCollision(
 	paths: Iterable<string>,
 	folders: Iterable<string> = [],
+	retained?: { files: Iterable<string>; directories: Iterable<string> },
 ): boolean {
 	const observed = new Map<string, { spelling: string; file: boolean }>();
-	const add = (path: string, file: boolean): boolean => {
+	const inspect = (path: string, file: boolean, record: boolean): boolean => {
 		const segments = normalizePath(path).split("/");
 		for (let i = 1; i <= segments.length; i++) {
 			const spelling = segments.slice(0, i).join("/");
 			if (!spelling) {
 				continue;
 			}
-			const key = spelling.normalize("NFC").toLocaleLowerCase("en-US");
+			const key = getPortablePathKey(spelling);
 			const isFile = file && i === segments.length;
 			const previous = observed.get(key);
 			if (
@@ -249,18 +272,32 @@ export function hasPortablePathCollision(
 			) {
 				return true;
 			}
-			observed.set(key, { spelling, file: isFile });
+			if (record) {
+				observed.set(key, { spelling, file: isFile });
+			}
 		}
 		return false;
 	};
 	for (const path of folders) {
-		if (add(path, false)) {
+		if (inspect(path, false, true)) {
 			return true;
 		}
 	}
 	for (const path of paths) {
-		if (add(path, true)) {
+		if (inspect(path, true, true)) {
 			return true;
+		}
+	}
+	if (retained) {
+		for (const path of retained.directories) {
+			if (inspect(path, false, false)) {
+				return true;
+			}
+		}
+		for (const path of retained.files) {
+			if (inspect(path, true, false)) {
+				return true;
+			}
 		}
 	}
 	return false;
@@ -304,7 +341,7 @@ export function shouldSyncFile(
 	const normalized = normalizePath(path);
 
 	// Check if path is protected (never sync)
-	if (isProtectedPath(normalized)) {
+	if (isVaultTrashPath(normalized) || isProtectedPath(normalized)) {
 		return false;
 	}
 

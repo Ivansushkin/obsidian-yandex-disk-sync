@@ -34,6 +34,8 @@ export interface DirectForceCheckpoint {
 	pendingFiles: string[];
 	pendingDirectories: string[];
 	canonicalReset: boolean;
+	/** This deletion cover was prepared with the vault-trash policy. */
+	trashExcluded?: true;
 }
 
 /** Durable source identities and authority; credentials remain exclusively in local plugin data. */
@@ -271,6 +273,9 @@ function assertDirectCheckpoint(
 		"pendingDirectories",
 		"canonicalReset",
 	];
+	if (state?.trashExcluded === true) {
+		keys.push("trashExcluded");
+	}
 	if (
 		!state ||
 		Object.keys(state).length !== keys.length ||

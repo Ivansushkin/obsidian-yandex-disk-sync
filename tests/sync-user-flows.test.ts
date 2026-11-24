@@ -2,22 +2,24 @@ import JSZip from "jszip";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import type { App } from "obsidian";
+import { persistenceHarness } from "./helpers/lifecycle-fixtures";
+import type { PluginData } from "../src/plugin-persistence";
 import { BackupManager } from "../src/backup/backup-manager";
 import { EncryptionManager } from "../src/crypto/encryption-manager";
 import { EncryptionService } from "../src/crypto/encryption";
-import {
-	captureLogicalVaultSnapshot,
-	captureRemoteRawSnapshot,
-} from "../src/backup/backup-snapshot";
+import { RemoteReadTimeoutError } from "../src/errors";
 import { UnreadableRemoteIndexError } from "../src/sync/canonical/manager";
 import { SyncEngine } from "../src/sync/engine";
-import type { ForcePreflightProof } from "../src/sync/contracts";
 import { computeSha256 } from "../src/utils/hash-utils";
+import { logger } from "../src/utils/logger";
 import {
 	MemoryDisk,
 	bytes,
 	codecFor,
 	managedDevices,
+	runConfirmedForce,
+	seedForceEncryption,
 	type device,
 } from "./helpers/sync-flow";
 
@@ -41,6 +43,231 @@ function bindInitialReadGuards(phone: ReturnType<typeof device>): void {
 		return { blockReason: null, validationToken: manifest.validationToken };
 	});
 }
+
+test("ordinary full packs mixed downloads, preserves a late edit and stops new windows after timeout", async (t) => {
+	const disk = new MemoryDisk();
+	const make = managedDevices(t);
+	const source = make(disk, "window-source", null);
+	const target = make(disk, "window-target", null);
+	source.vault.put("anchor.md", bytes("established"));
+	await source.full();
+	await target.full();
+	target.settings.maxConcurrency = 20;
+	const mib = 1024 * 1024;
+	const fixture = new Map([
+		["small.md", bytes("published")],
+		["a-large.bin", new ArrayBuffer(5 * mib)],
+		["b-medium.bin", new ArrayBuffer(3 * mib)],
+		["c-oversized.bin", new ArrayBuffer(9 * mib)],
+	]);
+	for (const [path, content] of fixture) {
+		source.vault.put(path, content);
+	}
+	await source.full();
+	const read = target.client.downloadFile.bind(target.client);
+	const started: string[] = [];
+	const active = new Set<string>();
+	let overlappingBytes = 0;
+	target.client.downloadFile = async (remote, ...options) => {
+		const path = remote.slice("vault/".length);
+		if (!fixture.has(path)) {
+			return read(remote, ...options);
+		}
+		started.push(path);
+		active.add(path);
+		try {
+			if (active.size > 1) {
+				overlappingBytes = Math.max(
+					overlappingBytes,
+					[...active].reduce(
+						(sum, key) => sum + fixture.get(key)!.byteLength,
+						0,
+					),
+				);
+			}
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			if (path === "a-large.bin") {
+				throw new RemoteReadTimeoutError(10, "synthetic payload");
+			}
+			if (path === "small.md") {
+				target.vault.put(path, bytes("late local edit"));
+			}
+			return await read(remote, ...options);
+		} finally {
+			active.delete(path);
+		}
+	};
+	const result = await target.engine.fullSync();
+	assert.equal(result.success, false);
+	assert.deepEqual(started, ["small.md", "a-large.bin", "b-medium.bin"]);
+	assert.equal(overlappingBytes, 8 * mib);
+	target.assertLocal("small.md", "late local edit");
+	assert.deepEqual(
+		target.vault.files.get("b-medium.bin"),
+		fixture.get("b-medium.bin"),
+	);
+	assert.equal(target.vault.files.has("c-oversized.bin"), false);
+	assert.deepEqual(disk.files.get("vault/small.md"), fixture.get("small.md"));
+});
+
+test("ordinary full rejects stale published bytes and verifies edits made directly on Disk", async (t) => {
+	const make = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const a = make(disk, "a", await codecFor(encrypted));
+		const b = make(disk, "b", await codecFor(encrypted));
+		const path = "note.md";
+		const remote = `vault/${path}`;
+		const rawPath = await a.client.getPhysicalPath(remote);
+		a.vault.put(path, bytes("v1"));
+		await a.full();
+		await b.full();
+		const previous = disk.files.get(rawPath)!;
+		a.vault.put(path, bytes("v2"));
+		await a.full();
+
+		const before = await a.canonical();
+		const baseline = structuredClone(b.index.getLocalIndex().files[path]);
+		const latest = disk.files.get(rawPath)!;
+		const request = disk.request.bind(disk);
+		let sentStale = false;
+		disk.request = async (params, accepted) => {
+			const response = await request(params, accepted);
+			const url = new URL(params.url);
+			if (
+				!sentStale &&
+				url.pathname === "/download" &&
+				url.searchParams.get("path") === rawPath
+			) {
+				sentStale = true;
+				return { ...response, arrayBuffer: previous };
+			}
+			return response;
+		};
+		assert.equal((await b.engine.fullSync()).success, false);
+		assert.equal(sentStale, true);
+		b.assertLocal(path, "v1");
+		assert.deepEqual(await b.canonical(), before);
+		assert.deepEqual(b.index.getLocalIndex().files[path], baseline);
+		assert.deepEqual(b.index.getPendingMutations(), []);
+		assert.deepEqual(disk.files.get(rawPath), latest);
+
+		await b.full();
+		await b.assertSettled({ [path]: "v2" });
+		const settled = await b.full();
+		assert.deepEqual(
+			[settled.uploaded, settled.downloaded, settled.deleted],
+			[0, 0, 0],
+		);
+		assert.deepEqual(await b.canonical(), before);
+		await a.client.uploadFile(remote, bytes("external"));
+		const write = b.vault.adapter.writeBinary.bind(b.vault.adapter);
+		b.vault.adapter.writeBinary = async (target, content) => {
+			if (target.includes("/overwritten/")) {
+				throw new Error("Synthetic local backup refusal");
+			}
+			await write(target, content);
+		};
+		assert.equal((await b.engine.fullSync()).success, false);
+		b.assertLocal(path, "v2");
+		assert.deepEqual(await b.canonical(), before);
+		b.vault.adapter.writeBinary = write;
+		await b.full();
+		const backups = [...b.vault.files]
+			.filter(([name]) => name.includes("/overwritten/"))
+			.map(([, content]) => content);
+		assert.deepEqual(backups, [bytes("v2")]);
+		await a.full();
+		for (const profile of [a, b]) {
+			await profile.assertSettled({ [path]: "external" });
+			const repeat = await profile.full();
+			assert.deepEqual(
+				[repeat.uploaded, repeat.downloaded, repeat.deleted],
+				[0, 0, 0],
+			);
+		}
+
+		// The observer can publish the external bytes before their author returns.
+		a.vault.put(path, bytes("last author version"));
+		await a.full();
+		await b.client.uploadFile(remote, bytes("another external edit"));
+		await b.full();
+		await a.full();
+		await a.assertSettled({ [path]: "another external edit" });
+		assert.ok(
+			[...a.vault.files].some(
+				([name, content]) =>
+					name.includes("/overwritten/") &&
+					new TextDecoder().decode(content) === "last author version",
+			),
+		);
+	}
+});
+
+test("ordinary full rejects stale conflict bytes that match a later local edit", async (t) => {
+	const make = managedDevices(t);
+	for (const encrypted of [false, true]) {
+		const disk = new MemoryDisk();
+		const a = make(disk, "publisher", await codecFor(encrypted));
+		const b = make(disk, "editor", await codecFor(encrypted));
+		const path = "note.md";
+		const rawPath = await a.client.getPhysicalPath(`vault/${path}`);
+		a.vault.put(path, bytes("v0"));
+		await a.full();
+		const oldBytes = disk.files.get(rawPath)!;
+		a.vault.put(path, bytes("v1"));
+		await a.full();
+		await b.full();
+		a.vault.put(path, bytes("v2"));
+		await a.full();
+		b.vault.put(path, bytes("v0"));
+		const canonical = await a.canonical();
+		const published = disk.files.get(rawPath)!;
+
+		const request = disk.request.bind(disk);
+		let returned = false;
+		disk.request = async (params, accepted) => {
+			const response = await request(params, accepted);
+			const url = new URL(params.url);
+			if (
+				url.searchParams.get("path")?.replace(/^disk:\//, "") ===
+				rawPath
+			) {
+				if (url.pathname.endsWith("/resources")) {
+					return {
+						...response,
+						json: {
+							...response.json,
+							sha256: undefined,
+							md5: undefined,
+						},
+					};
+				}
+				if (!returned && url.pathname === "/download") {
+					returned = true;
+					return { ...response, arrayBuffer: oldBytes };
+				}
+			}
+			return response;
+		};
+		assert.equal((await b.engine.fullSync()).success, false);
+		assert.equal(returned, true);
+		assert.deepEqual(await b.canonical(), canonical);
+		assert.deepEqual(disk.files.get(rawPath), published);
+		assert.deepEqual(b.index.getPendingMutations(), []);
+		b.assertLocal(path, "v0");
+		disk.request = request;
+		assert.equal((await b.full()).conflicts, 1);
+		await a.full();
+		const copy = Object.keys((await a.canonical()).files).find((name) =>
+			name.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		for (const profile of [a, b]) {
+			await profile.assertSettled({ [path]: "v2", [copy]: "v0" });
+		}
+	}
+});
 
 test("ordinary full reuses verified service bytes and avoids healthy repair reads across two devices", async (t) => {
 	const device = managedDevices(t);
@@ -396,14 +623,37 @@ test("stable logical verification rejects bytes that do not match the physical c
 test("published local tombstones retain protection and durable recovery after save or backup failure", async (t) => {
 	const makeDevice = managedDevices(t);
 	for (const encrypted of [false, true]) {
-		for (const failure of ["save", "backup"] as const) {
+		for (const failure of ["before-write", "lost-ack", "backup"] as const) {
 			const disk = new MemoryDisk();
 			const desktop = makeDevice(
 				disk,
 				"desktop",
 				await codecFor(encrypted),
 			);
-			let phone = makeDevice(disk, "phone", await codecFor(encrypted));
+			let armed = false;
+			let rejected = false;
+			let phone = makeDevice(
+				disk,
+				"phone",
+				await codecFor(encrypted),
+				undefined,
+				undefined,
+				{},
+				(snapshot) => {
+					if (
+						armed &&
+						failure === "before-write" &&
+						snapshot.pendingPhysicalActions.some(
+							(action) =>
+								action.type === "delete-local" &&
+								action.path === "Old.md",
+						)
+					) {
+						rejected = true;
+						throw new Error("Synthetic write rejected");
+					}
+				},
+			);
 			desktop.vault.put("Old.md", bytes("original"));
 			await desktop.full();
 			await phone.full();
@@ -412,19 +662,21 @@ test("published local tombstones retain protection and durable recovery after sa
 			desktop.vault.put("New.md", bytes("published"));
 			await desktop.engine.renameFile("Old.md", "New.md");
 			const remote = structuredClone([...disk.files]);
-			if (failure === "save") {
-				phone.engine.setIndexSaveCallback(async () => {
-					await phone.saved();
+			armed = true;
+			if (failure === "lost-ack") {
+				phone.engine.setIndexSaveCallback(async (observation) => {
+					await phone.saved(observation);
 					if (
 						phone.index.hasPendingPhysicalAction(
 							"delete-local",
 							"Old.md",
 						)
 					) {
-						throw new Error("Synthetic durable save failure");
+						rejected = true;
+						throw new Error("Synthetic lost save acknowledgement");
 					}
 				});
-			} else {
+			} else if (failure === "backup") {
 				phone.vault.put("Old.md", bytes("offline edit"));
 				phone.adapter.backupOverwrittenFile = async () => {
 					throw new Error("Synthetic mandatory backup failure");
@@ -437,19 +689,21 @@ test("published local tombstones retain protection and durable recovery after sa
 			);
 			phone.assertLocal(
 				"Old.md",
-				failure === "save" ? "original" : "offline edit",
+				failure === "backup" ? "offline edit" : "original",
 			);
 			assert.equal(phone.index.getObservedRevision(), observed);
-			const saved = await phone.saved();
-			assert.ok(
+			const saved = phone.crash();
+			armed = false;
+			assert.equal(rejected, failure !== "backup");
+			assert.equal(
 				saved.pendingPhysicalActions.some(
 					(action) =>
 						action.type === "delete-local" &&
 						action.path === "Old.md",
 				),
+				failure !== "before-write",
 			);
 			assert.deepEqual([...disk.files], remote);
-			await phone.stop();
 			phone = makeDevice(
 				disk,
 				"phone",
@@ -655,7 +909,25 @@ test("ordinary reception preserves partial baselines on final drift and rejects 
 			const disk = new MemoryDisk();
 			const codec = await codecFor(encrypted);
 			const desktop = device(disk, "desktop", codec);
-			let phone = device(disk, "phone", await codecFor(encrypted));
+			let injected = false;
+			let rejectSave = false;
+			let phone: ReturnType<typeof device> = device(
+				disk,
+				"phone",
+				await codecFor(encrypted),
+				undefined,
+				undefined,
+				{},
+				() => {
+					if (
+						rejectSave &&
+						phone.engine.getState().phase === "saving-index"
+					) {
+						injected = true;
+						throw new Error("synthetic baseline save failure");
+					}
+				},
+			);
 			desktop.vault.put("note.md", bytes("original"));
 			await desktop.full();
 			await phone.full();
@@ -679,9 +951,9 @@ test("ordinary reception preserves partial baselines on final drift and rejects 
 				"vault/.obsidian-encrypt.json",
 			);
 			const before = phone.lastSaved();
+			rejectSave = failure === "save";
 			desktop.vault.put("note.md", bytes("published successor"));
 			await desktop.full();
-			let injected = false;
 			let moves = 0;
 			disk.beforeRequest = async (method, endpoint) => {
 				moves += Number(
@@ -707,14 +979,6 @@ test("ordinary reception preserves partial baselines on final drift and rejects 
 					}
 				}
 			};
-			if (failure === "save") {
-				phone.engine.setIndexSaveCallback(async () => {
-					if (phone.engine.getState().phase === "saving-index") {
-						injected = true;
-						throw new Error("synthetic baseline save failure");
-					}
-				});
-			}
 			const failed = await phone.engine.fullSync();
 			assert.equal(injected, true);
 			assert.equal(failed.success, false);
@@ -728,7 +992,7 @@ test("ordinary reception preserves partial baselines on final drift and rejects 
 				phone.index.getLocalIndex().lastSyncTime,
 				before.localState.lastSyncTime,
 			);
-			const saved = phone.lastSaved();
+			const saved = phone.crash();
 			assert.equal(
 				saved.localState.observedRevision,
 				before.localState.observedRevision,
@@ -785,6 +1049,219 @@ test("ordinary reception preserves partial baselines on final drift and rejects 
 			await desktop.full();
 			await desktop.assertSettled(expected);
 		}
+	}
+});
+
+test("ordinary full preserves verified downloads and late watcher events after a failed final save", async (t) => {
+	const make = managedDevices(t);
+	for (const write of [
+		"rejected",
+		"acknowledgement-lost",
+		"revoked-while-queued",
+		"revoked-during-save",
+		"revoked-initial-save",
+	] as const) {
+		const revoked = write.startsWith("revoked-");
+		const disk = new MemoryDisk();
+		const codec = await codecFor(write === "acknowledgement-lost");
+		const source = make(disk, "source", codec);
+		const target = make(disk, "target", codec);
+		if (codec) {
+			await seedForceEncryption(disk, target, codec);
+			const manifest = await target.index.downloadEncryptionManifest();
+			assert.ok(manifest);
+			Object.assign(target.settings, {
+				authMethod: "manual",
+				manualAuthorizationConfirmed: true,
+				yandexTokenSecret: "synthetic",
+				encryptionSalt: manifest.salt,
+				encryptionRevision: manifest.revision,
+				encryptionProfileId: manifest.profileId,
+			});
+		}
+		source.vault.put("first.md", bytes("established"));
+		await source.full();
+		if (write === "revoked-initial-save") {
+			await target.saved();
+		} else {
+			await target.full();
+		}
+		const before = target.crash();
+		before.localState.remoteScope = {
+			remotePath: "vault",
+			rootResourceId: `${disk.identity}:vault`,
+		};
+		const { plugin, persistence } = persistenceHarness({
+			format: "plugin-data",
+			settings: target.settings,
+			...before,
+			encryptionTransition: null,
+			forceRecovery: null,
+		});
+		plugin.app = {
+			vault: target.vault,
+			workspace: { layoutReady: true },
+		} as unknown as App;
+		Object.assign(plugin, {
+			register() {},
+			registerObsidianProtocolHandler() {},
+		});
+		await plugin.loadSettings();
+		plugin["initializeComponents"]();
+		await plugin["encryptionWorkflow"].initEncryption();
+		plugin["restoreLocalStateOnce"]();
+		plugin["registerSyncLifecycleOnce"]();
+		const engine = plugin["syncEngine"];
+		const watcher = plugin["fileWatcher"];
+		const index = plugin["indexManager"];
+		watcher.start();
+		source.vault.put("received.md", bytes("peer edit"));
+		await source.full();
+		const canonical = await source.canonical();
+		const verified = canonical.files["received.md"]!.sha256;
+		let lateBase: number | null | undefined;
+		let inFlightTime: number | undefined;
+		let durable = structuredClone(persistence.current!);
+		let atFailure: PluginData | undefined;
+		let precedingSave = false;
+		let candidateWrites = 0;
+		if (write === "revoked-while-queued") {
+			engine.setIndexSaveCallback(async (observation) => {
+				if (observation) {
+					precedingSave = true;
+					const prior = persistence.persist();
+					const final = persistence.persist(undefined, observation);
+					await Promise.all([prior, final]);
+				} else {
+					await persistence.persist();
+				}
+			});
+		}
+		plugin.saveData = async (snapshot: PluginData) => {
+			const candidate =
+				snapshot.localState?.observedRevision === canonical.revision;
+			if (candidate) {
+				candidateWrites++;
+			}
+			if (!atFailure && (candidate || precedingSave)) {
+				if (write === "acknowledgement-lost") {
+					durable = structuredClone(snapshot);
+				}
+				atFailure = structuredClone(durable);
+				target.vault.put("late.md", bytes("during final save"));
+				lateBase = watcher.getDeferredEvents()[0]?.baseRevision;
+				inFlightTime = index.getLocalIndex().lastSyncTime;
+				// Let the watcher enqueue its save behind the outstanding final write.
+				await Promise.resolve();
+				if (revoked) {
+					engine.pause();
+					engine.resume();
+				} else {
+					throw new Error("synthetic final save failure");
+				}
+			}
+			durable = structuredClone(snapshot);
+		};
+		let loggedSuccess = false;
+		const info = logger.info.bind(logger);
+		logger.info = (message) => {
+			loggedSuccess ||=
+				message.startsWith("Full reconciliation completed:") ||
+				message === "Initial remote receive completed";
+		};
+		const failed = await engine.fullSync().finally(() => {
+			logger.info = info;
+		});
+		assert.equal(loggedSuccess, false);
+		await watcher.waitForPendingPersistence();
+		assert.equal(failed.success, false);
+		assert.equal(
+			failed.downloaded,
+			write === "revoked-initial-save" ? 2 : 1,
+		);
+		assert.equal(persistence.failed, !revoked);
+		assert.equal(
+			candidateWrites,
+			write === "revoked-while-queued" ? 0 : 1,
+			write,
+		);
+		target.assertLocal("received.md", "peer edit");
+		assert.equal(lateBase, before.localState.observedRevision);
+		assert.equal(inFlightTime, before.localState.lastSyncTime);
+		assert.ok(atFailure?.localState);
+		assert.equal(
+			atFailure.localState.files?.["received.md"]?.sha256,
+			verified,
+		);
+		assert.equal(
+			atFailure.localState.observedRevision,
+			write === "acknowledgement-lost"
+				? canonical.revision
+				: before.localState.observedRevision,
+		);
+		const late = watcher.getDeferredEvents();
+		assert.deepEqual(
+			late.map((event) => event.path),
+			["late.md"],
+		);
+		assert.equal(
+			index.getObservedRevision(),
+			before.localState.observedRevision,
+		);
+		assert.equal(
+			index.getLocalIndex().lastSyncTime,
+			before.localState.lastSyncTime,
+		);
+		assert.equal(
+			index.getLocalIndex().files["received.md"]?.sha256,
+			verified,
+		);
+		assert.equal(
+			durable.localState?.observedRevision,
+			before.localState.observedRevision,
+		);
+		assert.equal(
+			durable.localState?.lastSyncTime,
+			before.localState.lastSyncTime,
+		);
+		assert.equal(
+			durable.localState?.files?.["received.md"]?.sha256,
+			verified,
+		);
+		assert.deepEqual(
+			durable.pendingWatcherEvents,
+			JSON.parse(JSON.stringify(late)),
+		);
+		assert.deepEqual(durable.pendingMutations, []);
+		assert.deepEqual(durable.pendingPhysicalActions, []);
+		const afterWatcherSave = structuredClone(durable.localState);
+		await persistence.persist();
+		plugin.onunload();
+		await persistence.idle();
+		assert.deepEqual(durable.localState, afterWatcherSave);
+		assert.deepEqual(
+			durable.pendingWatcherEvents,
+			JSON.parse(JSON.stringify(late)),
+		);
+		assert.deepEqual(await source.canonical(), canonical);
+
+		const restartSnapshot =
+			write === "acknowledgement-lost" ? atFailure : durable;
+		const resumed = make(disk, "target", codec, target.vault, {
+			...restartSnapshot,
+			localState: restartSnapshot.localState as typeof before.localState,
+		});
+		const retry = await resumed.full();
+		assert.equal(retry.conflicts, 0);
+		await resumed.assertSettled({
+			"first.md": "established",
+			"received.md": "peer edit",
+			"late.md": "during final save",
+		});
+		const settled = await resumed.canonical();
+		assert.equal(settled.appliedMutationSeq.target, 1);
+		await resumed.full();
+		assert.deepEqual(await resumed.canonical(), settled);
 	}
 });
 
@@ -990,9 +1467,24 @@ test("initial matching batch rejects drift and failed observations without ackno
 		] as const) {
 			const disk = new MemoryDisk();
 			const desktop = device(disk, "desktop", codec);
-			const phone = device(disk, "phone", codec, undefined, undefined, {
-				readTimeoutMs: 1000,
-			});
+			const phone = device(
+				disk,
+				"phone",
+				codec,
+				undefined,
+				undefined,
+				{
+					readTimeoutMs: 1000,
+				},
+				(snapshot) => {
+					if (
+						failure === "save" &&
+						Object.keys(snapshot.localState.files).length > 0
+					) {
+						throw new Error("synthetic batch save failed");
+					}
+				},
+			);
 			for (const path of ["a.md", "b.md", "c.md"]) {
 				desktop.vault.put(path, bytes("kept"));
 				phone.vault.put(path, bytes("kept"));
@@ -1022,6 +1514,7 @@ test("initial matching batch rejects drift and failed observations without ackno
 				remotePath: "vault",
 				rootResourceId: `${disk.identity}:vault`,
 			};
+			await phone.saved();
 			bindInitialReadGuards(phone);
 			let observingInitialMetadata = false;
 			const buildLocal = phone.index.buildLocalIndex.bind(phone.index);
@@ -1053,16 +1546,6 @@ test("initial matching batch rejects drift and failed observations without ackno
 					? { ...meta, resource_id: "replaced-root" }
 					: meta;
 			};
-			if (failure === "save") {
-				phone.engine.setIndexSaveCallback(async () => {
-					if (
-						Object.keys(phone.index.getLocalIndex().files).length >
-						0
-					) {
-						throw new Error("synthetic batch save failed");
-					}
-				});
-			}
 			disk.beforeRequest = async (method, endpoint, path) => {
 				if (
 					observingInitialMetadata &&
@@ -1174,7 +1657,7 @@ test("initial matching batch rejects drift and failed observations without ackno
 				);
 			}
 			assert.equal(result.success, false, `${encrypted}/${failure}`);
-			const saved = await phone.saved();
+			const saved = phone.crash();
 			assert.equal(saved.localState.observedRevision, 0, failure);
 			assert.equal(saved.localState.lastSyncTime, 0, failure);
 			assert.deepEqual(saved.pendingMutations, []);
@@ -1194,7 +1677,6 @@ test("initial matching batch rejects drift and failed observations without ackno
 			disk.afterRequest = undefined;
 			disk.resource = resource;
 			disk.files = new Map(original);
-			await phone.stop();
 			const restarted = device(
 				disk,
 				"phone",
@@ -1543,6 +2025,7 @@ test("initial canonical timeout stops queued authority reads and recovers after 
 		const phone = device(disk, "phone", codec, undefined, undefined, {
 			readTimeoutMs: 1000,
 		});
+		await phone.saved();
 		for (const path of paths) {
 			desktop.vault.put(path, bytes("kept"));
 			phone.vault.put(path, bytes("kept"));
@@ -1588,7 +2071,7 @@ test("initial canonical timeout stops queued authority reads and recovers after 
 			"Queued guards cannot retry an unresolved canonical read",
 		);
 		await new Promise((resolve) => setTimeout(resolve, 5));
-		const saved = await phone.saved();
+		const saved = phone.crash();
 		assert.equal(saved.localState.observedRevision, 0);
 		assert.equal(saved.localState.lastSyncTime, 0);
 		assert.deepEqual(saved.localState.files, {});
@@ -1596,7 +2079,6 @@ test("initial canonical timeout stops queued authority reads and recovers after 
 		for (const path of paths) {
 			phone.assertLocal(path, "kept");
 		}
-		await phone.stop();
 		disk.beforeRequest = undefined;
 		const restarted = device(
 			disk,
@@ -1637,8 +2119,7 @@ test("initial canonical timeout stops queued authority reads and recovers after 
 		assert.deepEqual(restarted.index.getPendingMutations(), []);
 		assert.deepEqual(restarted.index.getPendingPhysicalActions(), []);
 		disk.resource = resource;
-		await restarted.stop();
-		const connected = await restarted.saved();
+		const connected = restarted.crash();
 		restarted.vault.put(paths[1]!, bytes("phone offline edit"));
 		desktop.vault.put("desktop-new.md", bytes("desktop edit"));
 		await desktop.full();
@@ -1821,8 +2302,8 @@ test("ordinary full rejects a late canonical load after pause or host stop witho
 				phone.settings,
 				() => stopped,
 			);
-			engine.setIndexSaveCallback(async () => {
-				await phone.saved();
+			engine.setIndexSaveCallback(async (observation) => {
+				await phone.saved(observation);
 			});
 			bindInitialReadGuards({ ...phone, engine });
 			let armed = false;
@@ -1863,7 +2344,7 @@ test("ordinary full rejects a late canonical load after pause or host stop witho
 			assert.equal(writesAfterStop, 0);
 			assert.deepEqual([...disk.files], remote);
 			phone.assertLocal("note.md", "after");
-			const saved = await phone.saved();
+			const saved = phone.crash();
 			assert.equal(
 				saved.localState.observedRevision,
 				before.localState.observedRevision,
@@ -1898,8 +2379,8 @@ test("ordinary full rejects a late canonical load after pause or host stop witho
 				restarted.settings,
 				() => stopped,
 			);
-			finalEngine.setIndexSaveCallback(async () => {
-				await restarted.saved();
+			finalEngine.setIndexSaveCallback(async (observation) => {
+				await restarted.saved(observation);
 			});
 			bindInitialReadGuards({ ...restarted, engine: finalEngine });
 			finalEngine.onSyncFinalize(async () => {
@@ -1913,7 +2394,7 @@ test("ordinary full rejects a late canonical load after pause or host stop witho
 			const finalResult = await finalEngine.fullSync();
 			assert.equal(finalResult.success, false);
 			restarted.assertLocal("note.md", "successor");
-			const afterFinalize = await restarted.saved();
+			const afterFinalize = restarted.lastSaved();
 			assert.equal(
 				afterFinalize.localState.observedRevision,
 				beforeFinalize.localState.observedRevision,
@@ -2014,6 +2495,61 @@ test("canonical reads reuse stable root metadata without weakening snapshot chec
 
 for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
+	test(`${mode} independent rename and delete from one revision converge in either delivery order`, async (t) => {
+		const make = managedDevices(t);
+		for (const renameFirst of [true, false]) {
+			const disk = new MemoryDisk();
+			const a = make(disk, "rename", await codecFor(encrypted));
+			const b = make(disk, "delete", await codecFor(encrypted));
+			a.vault.put("Old.md", bytes("shared base"));
+			await a.full();
+			await b.full();
+			for (const profile of [a, b]) {
+				profile.watcher.setAutomaticAdmission(() => false);
+				profile.start();
+			}
+			a.vault.rename("Old.md", "New.md");
+			b.vault.remove("Old.md");
+			const base = (await a.canonical()).revision;
+			for (const [profile, action] of [
+				[a, "rename"],
+				[b, "delete"],
+			] as const) {
+				const [event] = profile.watcher.getDeferredEvents();
+				assert.equal(event?.action, action);
+				assert.equal(event.baseRevision, base);
+			}
+			const [first, second] = renameFirst ? [a, b] : [b, a];
+			await first.drain();
+			const delivered = await first.canonical();
+			assert.equal(delivered.files["Old.md"]?.deleted, true);
+			assert.equal(
+				Boolean(delivered.files["New.md"]?.sha256),
+				renameFirst,
+			);
+			await second.drain();
+			const settled = await b.canonical();
+			assert.equal(settled.files["Old.md"]?.deleted, true);
+			assert.equal(
+				settled.files["New.md"]?.sha256,
+				await computeSha256(bytes("shared base")),
+			);
+			assert.equal(
+				await a.client.getLogicalResource("vault/Old.md"),
+				null,
+			);
+			assert.deepEqual(
+				await a.client.downloadFile("vault/New.md"),
+				bytes("shared base"),
+			);
+			for (const profile of [a, b]) {
+				await profile.full();
+				await profile.assertSettled({ "New.md": "shared base" });
+				assert.deepEqual(await profile.canonical(), settled);
+			}
+		}
+	});
+
 	test(`${mode} absent foreign tombstones stay read-only across restart`, async (t) => {
 		const device = managedDevices(t);
 		const disk = new MemoryDisk();
@@ -2054,8 +2590,7 @@ for (const encrypted of [false, true]) {
 			assert.equal(b.index.getLocalIndex().files[known]?.deleted, true);
 			assert.equal(b.index.getLocalIndex().files[unknown], undefined);
 			await b.assertSettled(expected);
-			const saved = await b.saved();
-			await b.stop();
+			const saved = b.crash();
 			b = device(disk, "device-b", codec, b.vault, saved);
 		}
 
@@ -2085,8 +2620,7 @@ for (const encrypted of [false, true]) {
 		});
 		assert.equal((await b.engine.fullSync()).success, false);
 		assert.equal(writes, 0);
-		const saved = await b.saved();
-		await b.stop();
+		const saved = b.crash();
 		b = device(disk, "device-b", codec, b.vault, saved);
 
 		// The local scan is already finished when the physical tree is requested.
@@ -2289,16 +2823,14 @@ for (const encrypted of [false, true]) {
 			await b.full();
 			await a.full();
 			await b.full();
-			const expected: Record<string, string> = {};
-			for (const file of b.adapter.getAllSyncableFiles()) {
-				expected[file.path] = new TextDecoder().decode(
-					await b.adapter.readFile(file.path),
-				);
-			}
-			assert.deepEqual(
-				new Set(Object.values(expected)),
-				new Set(["offline B edit", "online A edit"]),
-			);
+			const copies = b.adapter
+				.getAllSyncableFiles()
+				.filter(({ path }) => path.startsWith("Итог/Копия_conflict_"));
+			assert.equal(copies.length, 1);
+			const expected: Record<string, string> = {
+				"Итог/Копия.md": "online A edit",
+				[copies[0]!.path]: "offline B edit",
+			};
 			await a.assertSettled(expected);
 			await b.assertSettled(expected);
 			a.vault.put("Restored.md", bytes("before deletion"));
@@ -2437,8 +2969,8 @@ for (const encrypted of [false, true]) {
 					});
 				}
 				a.vault.put("Folder/Deep/Copy.md", bytes("copy"));
-				await a.stop();
-				const saved = await a.saved();
+				await a.watcher.waitForPendingPersistence();
+				const saved = a.crash();
 				if (saved.pendingMutations.length !== 3) {
 					throw new Error(
 						"Failure must retain the original predecessor and both old retry puts",
@@ -2520,7 +3052,7 @@ for (const encrypted of [false, true]) {
 							.some((event) => event.action === "rename"),
 					);
 					disk.beforeRequest = undefined;
-					const blocked = await a.saved();
+					const blocked = a.crash();
 					a = device(disk, "device-a", codec, a.vault, blocked);
 					bindInitialReadGuards(a);
 					a.start();
@@ -2581,13 +3113,13 @@ for (const encrypted of [false, true]) {
 							.getDeferredEvents()
 							.some((event) => event.action === "rename"),
 					);
-					await a.stop();
+					const retainedSnapshot = a.crash();
 					a = device(
 						disk,
 						"device-a",
 						await codecFor(encrypted),
 						a.vault,
-						await a.saved(),
+						retainedSnapshot,
 					);
 					bindInitialReadGuards(a);
 					await a.full();
@@ -2663,8 +3195,7 @@ for (const encrypted of [false, true]) {
 								action.path === "Rejected.md",
 						),
 				);
-				await a.stop();
-				a = device(disk, "device-a", codec, a.vault, await a.saved());
+				a = device(disk, "device-a", codec, a.vault, a.crash());
 				await a.full();
 				assert.ok(
 					[...a.vault.files.values()].some(
@@ -2692,7 +3223,8 @@ for (const encrypted of [false, true]) {
 			const device = managedDevices(t);
 			for (const withBackup of [false, true]) {
 				const disk = new MemoryDisk();
-				const a = device(disk, "device-a", await codecFor(encrypted));
+				const codec = await codecFor(encrypted);
+				const a = device(disk, "device-a", codec);
 				let b = device(disk, "device-b", await codecFor(encrypted));
 
 				a.vault.put("Keep.md", bytes("initial"));
@@ -2701,56 +3233,16 @@ for (const encrypted of [false, true]) {
 				b.vault.put("Keep.md", bytes("offline edit"));
 				a.vault.remove("Keep.md");
 				a.vault.put("Authoritative.md", bytes("force local"));
-				const backup = new BackupManager(
-					a.client,
-					a.adapter,
-					{
-						...a.settings,
-						encryptionPassword: encrypted
-							? "synthetic-flow-password"
-							: null,
-					},
-					"2.0.0",
-				);
+				await seedForceEncryption(disk, a, codec);
 				for (const direction of [
 					"from_local",
 					"from_remote",
 				] as const) {
-					const canonical =
-						await a.index.captureForceCanonicalProof();
-					const snapshot =
-						direction === "from_local"
-							? await captureRemoteRawSnapshot(a.client, "vault")
-							: await captureLogicalVaultSnapshot(a.adapter);
-					const proof: ForcePreflightProof = {
+					const result = await runConfirmedForce(
+						a,
 						direction,
-						canonical,
-						snapshotDigest: snapshot.digest,
-						backup: null,
-					};
-					if (withBackup) {
-						const archive =
-							direction === "from_local"
-								? await backup.createRemoteSnapshotBackup()
-								: await backup.createBackup();
-						assert.equal(archive.success, true, archive.error);
-						assert.equal(
-							archive.snapshotDigest,
-							proof.snapshotDigest,
-						);
-						proof.backup = {
-							backupName: archive.backupName!,
-							backupSha256: archive.sha256!,
-						};
-					}
-					const result =
-						direction === "from_local"
-							? await a.engine.forceSyncFromLocal({
-									forcePreflightProof: proof,
-								})
-							: await a.engine.forceSyncFromRemote({
-									forcePreflightProof: proof,
-								});
+						withBackup,
+					);
 					assert.equal(
 						result.success,
 						true,
@@ -2881,4 +3373,56 @@ for (const encrypted of [false, true]) {
 			}
 		},
 	);
+}
+
+for (const folder of [false, true]) {
+	test(`programmatic ${folder ? "folder" : "file"} rename across trash syncs the visible side only`, async (t) => {
+		const disk = new MemoryDisk();
+		const a = managedDevices(t)(disk, "trash-boundary", null);
+		const source = folder ? "Folder" : "Note.md";
+		const child = folder ? "/nested/Note.md" : "";
+		const restored = folder ? "Restored" : "Restored.md";
+		const trashed = `.trash/${source}`;
+		a.vault.put(source + child, bytes("original"));
+		await a.full();
+		a.start();
+		a.vault.rename(source, trashed);
+		await a.drain();
+		const deleted = await a.canonical();
+		assert.equal(deleted.files[source + child]?.deleted, true);
+		if (folder) {
+			assert.equal(
+				deleted.files[source + child]?.deletedByFolder,
+				source,
+			);
+		}
+		assert.equal(disk.files.has(`vault/${source}${child}`), false);
+		a.assertLocal(trashed + child, "original");
+
+		const renamedInTrash = `.trash/other/${source}`;
+		a.vault.rename(trashed, renamedInTrash);
+		await a.drain();
+		assert.deepEqual(await a.canonical(), deleted);
+
+		a.vault.rename(renamedInTrash, restored);
+		await a.drain();
+		const canonical = await a.canonical();
+		assert.equal(canonical.files[restored + child]?.deleted, undefined);
+		assert.ok(canonical.files[restored + child]);
+		assert.deepEqual(
+			disk.files.get(`vault/${restored}${child}`),
+			bytes("original"),
+		);
+		assert.ok(
+			Object.keys(canonical.files).every(
+				(path) => !path.startsWith(".trash/"),
+			),
+		);
+		assert.ok(
+			[...disk.files.keys()].every(
+				(path) => !path.startsWith("vault/.trash/"),
+			),
+		);
+		assert.deepEqual(a.watcher.getDeferredEvents(), []);
+	});
 }

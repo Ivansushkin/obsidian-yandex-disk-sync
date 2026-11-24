@@ -4,6 +4,8 @@ import type { NativeRequestActivity } from "./read-transport";
  */
 
 import { requestUrl, RequestUrlParam, RequestUrlResponse } from "obsidian";
+import { md5 } from "@noble/hashes/legacy.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type {
 	YandexResource,
 	YandexUploadLink,
@@ -91,6 +93,7 @@ export interface StableLogicalFileSnapshot {
 	resource: YandexResource;
 	fingerprint: string;
 	verifiedRawSha256?: string;
+	verifiedRawHashAlgorithm?: "sha256" | "md5";
 }
 
 type ApiReadCategory = "manifest" | "index" | "root" | "tree" | "other";
@@ -444,6 +447,7 @@ export class YandexDiskClient {
 			);
 		}
 		let verifiedRawSha256: string | undefined;
+		let verifiedRawHashAlgorithm: StableLogicalFileSnapshot["verifiedRawHashAlgorithm"];
 		if (after.sha256) {
 			verifiedRawSha256 = await computeSha256(raw);
 			if (verifiedRawSha256 !== after.sha256) {
@@ -451,6 +455,14 @@ export class YandexDiskClient {
 					"Remote user file content hash does not match downloaded bytes",
 				);
 			}
+			verifiedRawHashAlgorithm = "sha256";
+		} else if (after.md5) {
+			if (bytesToHex(md5(new Uint8Array(raw))) !== after.md5) {
+				throw new Error(
+					"Remote user file content hash does not match downloaded bytes",
+				);
+			}
+			verifiedRawHashAlgorithm = "md5";
 		}
 		if (configurationVersion !== this.getReadConfigurationVersion()) {
 			throw new Error("Logical read configuration changed");
@@ -464,6 +476,7 @@ export class YandexDiskClient {
 			resource: after,
 			fingerprint: afterFingerprint,
 			verifiedRawSha256,
+			verifiedRawHashAlgorithm,
 		};
 	}
 
@@ -1421,6 +1434,26 @@ export class YandexDiskClient {
 		}
 	}
 
+	/** Dispatch one raw overwrite in an existing root; publication recovery owns any later attempt. */
+	async uploadRawFileOnce(
+		path: string,
+		raw: ArrayBuffer,
+		beforePut: () => Promise<void>,
+	): Promise<void> {
+		await this.putFile(
+			path,
+			raw,
+			true,
+			true,
+			async () => {
+				await this.writeGuard?.();
+				await beforePut();
+			},
+			undefined,
+			0,
+		);
+	}
+
 	/**
 	 * Upload a file only when the target path does not already exist.
 	 *
@@ -1498,6 +1531,7 @@ export class YandexDiskClient {
 		overwrite: boolean,
 		beforeAttempt: () => Promise<void>,
 		confirmAmbiguousResult?: () => Promise<boolean>,
+		retries = this.maxRetries,
 	): Promise<void> {
 		const bytes =
 			typeof content === "string"
@@ -1512,7 +1546,7 @@ export class YandexDiskClient {
 		const uploadLink = await this.getUploadLink(remotePath, overwrite, raw);
 
 		let lastError: Error | null = null;
-		for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+		for (let attempt = 0; attempt <= retries; attempt++) {
 			await beforeAttempt();
 			this.assertWriteInvocation();
 			const startedAt = Date.now();
@@ -1536,11 +1570,7 @@ export class YandexDiskClient {
 				throw error;
 			} catch (e) {
 				lastError = e as Error;
-				const decision = this.recovery(
-					e,
-					"put",
-					this.maxRetries - attempt,
-				);
+				const decision = this.recovery(e, "put", retries - attempt);
 				if (decision.confirm) {
 					const context = {
 						stage: "upload",

@@ -331,14 +331,7 @@ export async function receiveInitialRemoteState(
 		);
 	}
 	await assertAuthority();
-	const previous = index.captureLocalCausalState();
-	try {
-		index.markRemoteObserved();
-		await deps.indexSaveCallback?.();
-	} catch (error) {
-		index.restoreLocalCausalState(previous);
-		throw error;
-	}
+	await index.markRemoteObserved(deps.indexSaveCallback, assertSession);
 	logger.info("Initial remote receive completed", {
 		files: live.length,
 		matchedFiles: confirmed.size,

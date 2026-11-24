@@ -29,41 +29,57 @@ test("folder tombstones delete only unchanged known descendants", () => {
 			lastModifiedBy: "device-a",
 		},
 	};
-	for (const { label, local, remote, known, expected } of [
+	for (const { label, local, remote, known, canonical, expected } of [
 		{
 			label: "first-sync local child",
 			local: file("new"),
-			expected: "upload",
+			expected: ["upload"],
 		},
 		{
 			label: "unchanged known child",
 			local: baseline,
 			known: baseline,
-			expected: "delete_local",
+			expected: ["delete_local"],
+		},
+		{
+			label: "same-revision exact tombstone still wins over local edit",
+			local: file("edited"),
+			known: baseline,
+			canonical: { ...deleted, changedRevision: 4 },
+			expected: ["delete_local"],
+		},
+		{
+			label: "same-revision published live child survives",
+			local: baseline,
+			remote: baseline,
+			known: baseline,
+			canonical: { ...baseline, changedRevision: 4 },
+			expected: [],
 		},
 		{
 			label: "new remote child",
 			remote: file("remote", { remoteMtime: 10 }),
-			expected: "download",
+			expected: ["download"],
 		},
 		{
 			label: "external remote edit",
 			remote: { ...baseline, remoteFingerprint: "new" },
 			known: baseline,
-			expected: "download",
+			expected: ["download"],
 		},
 	]) {
+		const published = canonical ?? known;
 		const operations = new ConflictResolver().determineOperations(
 			new Map(local ? [[path, local]] : []),
 			new Map(remote ? [[path, remote]] : []),
 			local && known ? { [path]: known } : {},
-			known ? { [path]: known } : {},
+			published ? { [path]: published } : {},
 			1,
 			folder,
 		);
 		assert.deepEqual(
 			operations.map(({ action }) => action),
-			[expected],
+			expected,
 			label,
 		);
 	}

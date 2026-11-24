@@ -74,6 +74,49 @@ for (const encrypted of [false, true]) {
 	});
 }
 
+test("ordinary sync prunes only physically empty local folders after receiving deletions", async (t) => {
+	const make = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = make(disk, "source", null);
+	const b = make(disk, "receiver", null);
+	const folders = ["hidden", "late", "empty", "refused"];
+	for (const folder of folders) {
+		a.vault.put(`${folder}/note.md`, bytes("synced"));
+	}
+	await a.full();
+	await b.full();
+
+	b.vault.files.set("hidden/.keep", bytes("original"));
+	const rmdir = b.vault.adapter.rmdir;
+	b.vault.adapter.rmdir = async (path, recursive) => {
+		if (path === "refused" && !recursive) {
+			throw Object.assign(new Error("Is a directory"), {
+				code: "ERR_FS_EISDIR",
+			});
+		}
+		if (path === "late") {
+			b.vault.files.set("late/.keep", bytes("arrived during sync"));
+		}
+		await rmdir(path, recursive);
+	};
+	for (const folder of folders) {
+		a.vault.remove(`${folder}/note.md`);
+	}
+	await a.full();
+	await b.full();
+
+	for (const folder of folders) {
+		b.assertLocal(`${folder}/note.md`);
+	}
+	b.assertLocal("hidden/.keep", "original");
+	b.assertLocal("late/.keep", "arrived during sync");
+	assert.ok(b.vault.getAbstractFileByPath("hidden"));
+	assert.ok(b.vault.getAbstractFileByPath("late"));
+	assert.ok(b.vault.getAbstractFileByPath("refused"));
+	assert.equal(b.vault.getAbstractFileByPath("empty"), null);
+	await b.assertSettled({});
+});
+
 test("folder watcher ACK failure cannot publish a successful exchange", async (t) => {
 	for (const action of ["delete", "rename"] as const) {
 		let failAck = false;

@@ -10,7 +10,10 @@ import {
 } from "../../utils/path-utils";
 import { logger } from "../../utils/logger";
 import { getRecordValue } from "../../utils/record-utils";
-import { findFolderTombstone } from "../canonical/mutation-rules";
+import {
+	findFolderTombstone,
+	getPublishedFolderDeletion,
+} from "../canonical/mutation-rules";
 import {
 	getRemotePhysicalDrift,
 	hasCanonicalMetadataChanged,
@@ -530,6 +533,8 @@ export class ConflictResolver {
 		syncStartTime?: number,
 		folderTombstones: Record<string, FolderTombstone> = {},
 		pendingLocalDeletes: ReadonlySet<string> = new Set(),
+		replayedFolderChildren: ReadonlySet<string> = new Set(),
+		verifiedRemotePaths: ReadonlySet<string> = new Set(),
 	): SyncOperation[] {
 		const allPaths = this.collectAllPaths(
 			localFiles,
@@ -545,20 +550,61 @@ export class ConflictResolver {
 			const remoteMeta = remoteFiles.get(path) || null;
 			const localIndexMeta = getRecordValue(localIndex, path) ?? null;
 			const remoteIndexMeta = getRecordValue(remoteIndex, path) ?? null;
-			const folderTombstone = findFolderTombstone(path, folderTombstones);
+			const replayedFolderChild = replayedFolderChildren.has(path);
+			const liveFolderSurvivor =
+				replayedFolderChild &&
+				remoteIndexMeta !== null &&
+				!remoteIndexMeta.deleted;
+			const unverifiedFolderChild =
+				replayedFolderChild &&
+				remoteMeta !== null &&
+				remoteIndexMeta?.deletedByFolder !== undefined &&
+				(!verifiedRemotePaths.has(path) ||
+					remoteMeta.sha256 !== remoteIndexMeta.sha256) &&
+				getRemotePhysicalDrift(remoteMeta, remoteIndexMeta) !== false;
+			if (
+				!localMeta &&
+				remoteMeta &&
+				(liveFolderSurvivor || unverifiedFolderChild)
+			) {
+				operations.push({
+					action: "download",
+					path,
+					reason: "Live child survives the replayed folder deletion",
+					remoteMeta,
+					requireStableDownload: true,
+				});
+				continue;
+			}
+			const publishedFolder = getPublishedFolderDeletion(
+				path,
+				remoteIndexMeta,
+				folderTombstones,
+			);
+			const folderTombstone =
+				publishedFolder ?? findFolderTombstone(path, folderTombstones);
 			const tombstoneApplies =
+				!liveFolderSurvivor &&
 				folderTombstone !== null &&
-				(remoteIndexMeta?.changedRevision ?? 0) <
-					folderTombstone.changedRevision;
+				(publishedFolder !== null ||
+					(remoteIndexMeta?.changedRevision ?? 0) <
+						folderTombstone.changedRevision);
 
 			if (tombstoneApplies) {
 				const localChanged =
 					localMeta !== null &&
-					hasLocalContentChanged(localMeta, localIndexMeta);
+					(hasLocalContentChanged(localMeta, localIndexMeta) ||
+						(publishedFolder !== null &&
+							localIndexMeta?.deleted === true &&
+							!pendingLocalDeletes.has(path)));
 				const remoteChanged =
 					remoteMeta !== null &&
-					(getRemotePhysicalDrift(remoteMeta, remoteIndexMeta) ??
-						false);
+					(publishedFolder && verifiedRemotePaths.has(path)
+						? remoteMeta.sha256 !== remoteIndexMeta?.sha256
+						: (getRemotePhysicalDrift(
+								remoteMeta,
+								remoteIndexMeta,
+							) ?? false));
 				if (localChanged && remoteChanged) {
 					operations.push({
 						action:
@@ -566,6 +612,7 @@ export class ConflictResolver {
 								? "upload"
 								: "conflict",
 						path,
+						folderTombstonePath: publishedFolder?.path,
 						reason: "Both descendants changed during folder deletion",
 						localMeta,
 						remoteMeta,
@@ -587,7 +634,10 @@ export class ConflictResolver {
 						action: "download",
 						path,
 						reason: "New or modified remote file survives concurrent folder deletion",
+						localMeta: localMeta ?? undefined,
+						folderTombstonePath: publishedFolder?.path,
 						remoteMeta,
+						requireStableDownload: replayedFolderChild,
 					});
 					continue;
 				}
@@ -597,6 +647,9 @@ export class ConflictResolver {
 						path,
 						reason: "Parent folder was deleted",
 						localMeta,
+						remoteMeta: publishedFolder
+							? (remoteMeta ?? undefined)
+							: undefined,
 						folderTombstonePath: folderTombstone?.path,
 					});
 					continue;
@@ -624,6 +677,9 @@ export class ConflictResolver {
 			);
 
 			if (operation.action !== "none") {
+				if (operation.action === "download" && liveFolderSurvivor) {
+					operation.requireStableDownload = true;
+				}
 				operations.push(operation);
 			}
 		}

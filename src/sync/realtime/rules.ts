@@ -285,7 +285,10 @@ function reduceRenameChain<T extends DurableRenameEvent>(
 		return { events: [...existing, incoming], disposition: "queued" };
 	}
 	const predecessor = existing[predecessorIndex]!;
-	if (runningIds.has(predecessor.id)) {
+	if (
+		runningIds.has(predecessor.id) ||
+		(predecessor.kind === "folder" && predecessor.mutationId)
+	) {
 		return {
 			events: [...existing, incoming],
 			disposition: "running",

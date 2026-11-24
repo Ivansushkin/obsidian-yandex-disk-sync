@@ -12,6 +12,7 @@ import {
 	RemoteIndexTransactionError,
 } from "../canonical/errors";
 import { canApplyDestructiveFolderMutation } from "../canonical/mutation-rules";
+import type { LockedCanonicalCheck } from "../canonical/manager";
 import type { CanonicalCommitProof } from "../canonical/transaction";
 import * as syncErrors from "../errors";
 import { isMobileRetryableFailure } from "../mobile-recovery";
@@ -38,12 +39,13 @@ export async function saveRemoteIndexOrAbort(
 	deps: Dependencies,
 	result: SyncResult,
 	includePendingMutations = true,
+	assertLatest?: LockedCanonicalCheck,
 ): Promise<CanonicalCommitProof | null> {
 	try {
 		if (includePendingMutations) {
 			deps.indexManager.stagePendingMutations();
 		}
-		const proof = await deps.indexManager.saveRemoteIndex();
+		const proof = await deps.indexManager.saveRemoteIndex(assertLatest);
 		await cleanupRejectedUploads(deps);
 		if (includePendingMutations) {
 			deps.indexManager.confirmAppliedMutations();

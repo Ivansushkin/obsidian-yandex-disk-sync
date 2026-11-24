@@ -71,17 +71,19 @@ ordering; token/path инвалидируют admission. Failed save устан�
 
 ## Внутри сессии
 
-| Работа                                          | Параллелизм и порядок                                                                                                             |
-| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Обычные независимые transfers и directory reads | `maxConcurrency`, целое 1–40, default 20; сохранённая настройка не заменяется.                                                    |
-| Страницы одного каталога                        | Последовательно, полная pagination и identity checks. Dynamic traversal запускает потомка при свободном слоте без барьера уровня. |
-| Canonical transactions и plugin persistence     | Последовательно у своих владельцев.                                                                                               |
-| Local и remote full scans                       | Перекрываются после admission/adoption/recovery; обе ветви joined до classification даже при failure.                             |
-| Realtime upload/delete                          | Последовательные окна; внутри uploads последовательны.                                                                            |
-| Независимые rename roots                        | До 32 events; physical tasks всех папок/файлов используют общий лимит `min(maxConcurrency, 4)`.                                   |
-| Post-commit encryption cleanup                  | До `max(1, min(maxConcurrency, 4))` workers; у каждого отдельная canonical read-session.                                          |
-| Encryption rewrite mkdir                        | До четырёх siblings одной глубины, затем depth barrier; остальные callers default 1.                                              |
-| Pre-commit encryption rollback                  | Последовательно, с source authority и fingerprint guards.                                                                         |
+| Работа                                          | Параллелизм и порядок                                                                                                                            |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Обычные независимые transfers и directory reads | `maxConcurrency`, целое 1–40, default 20; сохранённая настройка не заменяется.                                                                   |
+| Страницы одного каталога                        | Последовательно, полная pagination и identity checks. Dynamic traversal запускает потомка при свободном слоте без барьера уровня.                |
+| Canonical transactions и plugin persistence     | Последовательно у своих владельцев.                                                                                                              |
+| Local и remote full scans                       | Перекрываются после admission/adoption/recovery; обе ветви joined до classification даже при failure.                                            |
+| Direct Force с Диска в Obsidian                 | До 20 мелких чтений или четырёх в смешанном окне с учётом `maxConcurrency` и оценки 8 МиБ. Записи Vault и сохранения checkpoint последовательны. |
+| Скачивания обычного full                        | Только мелкие файлы идут скользящим пулом. Смешанные размеры группируются в окна по оценке 8 МиБ.                                                |
+| Realtime upload/delete                          | Последовательные окна; внутри uploads последовательны.                                                                                           |
+| Независимые rename roots                        | До 32 events; physical tasks всех папок/файлов используют общий лимит `min(maxConcurrency, 4)`.                                                  |
+| Post-commit encryption cleanup                  | До `max(1, min(maxConcurrency, 4))` workers; у каждого отдельная canonical read-session.                                                         |
+| Encryption rewrite mkdir                        | До четырёх siblings одной глубины, затем depth barrier; остальные callers default 1.                                                             |
+| Pre-commit encryption rollback                  | Последовательно, с source authority и fingerprint guards.                                                                                        |
 
 `runWithConcurrencySettled` возвращает отдельные outcomes. Первая ошибка traversal
 останавливает новые directory tasks, уже начатые завершаются без partial success.
@@ -201,6 +203,21 @@ inventory. Исключённые/protected descendants запрещают recur
 purge. Failed subtree delete возвращает затрагиваемые copies в pending, чтобы retry
 не удалил уже записанные bytes. Cutover снимает старые queues и covered watcher IDs,
 сохраняя late events. Foreign offline delta требует accept/preserve/later.
+
+Оба прохода проверки источника и перенос с Диска используют ограниченные окна
+чтения. Мелкие файлы собираются вместе. В остальных окнах самый крупный
+из оставшихся файлов дополняется теми, что помещаются в бюджет. Файл больше
+8 МиБ или неизвестного размера занимает своё окно. Перед копированием Force
+уточняет размеры ближайшего окна и передаёт то же наблюдение и бюджет
+в стабильное скачивание. При ошибке
+проверки следующее окно не начинается, текущие чтения завершаются до возврата
+ошибки. В переносе ошибки отдельных файлов сохраняют остаток для восстановления.
+Перед локальной записью проверяются актуальные watcher events и поколение
+подключения. Файл снимается с очереди только после сохранения checkpoint.
+
+Обычный full использует размеры из плана сверки. Для набора из одних мелких
+файлов сохраняется скользящий пул. В смешанном наборе таймаут останавливает
+следующие окна, а уже начатые операции завершаются по текущим правилам.
 
 Новые [encryption transitions](E2E_ENCRYPTION.md) фиксируют per-file verified reference внутри frozen filters,
 fresh epoch и durable deletion cover. `planRecursiveDeletes` схлопывает только

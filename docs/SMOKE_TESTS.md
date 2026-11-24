@@ -884,10 +884,13 @@ vault не использовать. Повторить plaintext/encrypted и �
    local vault в remote `.backup`. Только destructive click разрешает replacement.
    При encrypted source добавить обычную .agents и настроить исключение .agents/**;
    конфигурацию отключить через её switch. Эти raw paths не читаются/не декодируются,
-   исключённые local files сохраняются. In-scope undecodable имя или content дают
-   force-source-format до изменений; плашка показывает остановку вместо 0/N.
+   исключённые local files сохраняются. Нечитаемое имя или содержимое выбранного
+   файла дают force-source-format до изменений; плашка показывает остановку вместо 0/N.
+   После смены ключа проверить старое пустое дерево на Диске: Force оставляет его
+   на Диске и переносит читаемые данные. Файл, добавленный в старое дерево после
+   подготовки, останавливает замену до локального удаления даже под исключённым путём.
    .backup никогда не попадает в расшифровку. Проверить nested includes и custom configDir.
-   После selected source pre-read permanent delete заменяет только выбранные файлы,
+   После selected source pre-read локальное удаление по настройке Obsidian заменяет только выбранные файлы,
    исключённые не удаляются. File/folder blocker с excluded descendants блокирует
    оба направления до записи; изменение filters после подготовки требует нового запуска. Собственный sync-плагин и .backup сохранены;
    source manifest/bytes не изменены, canonical перестроен. Перезапустить Obsidian.
@@ -901,8 +904,13 @@ vault не использовать. Повторить plaintext/encrypted и �
    Отмена доступна во время архива; reservation держится до settlement, purge не
    начинается. Проверить, что локальные данные действительно находятся в ZIP.
    После начала replacement закрытие окна только скрывает его; плашка сохраняет прогресс.
-   Без архива нет protective/conflict copies, локального .trash и snapshot старого
-   destination. Не журналировать tokens/passwords/content/ciphertext.
+   Без архива нет protective/conflict copies и snapshot старого destination.
+   Повторить локальную замену с системной корзиной, локальной .trash и удалением
+   без корзины. Проверить файл, папку, немедленную запись по тому же пути и
+   full/realtime на втором профиле. Корневая .trash сохраняется локально и на
+   Диске, её содержимое не переносится. Скрытый объект вне дерева Vault и его
+   родитель сохраняются, видимые выбранные соседи удаляются. Структурная коллизия
+   с таким объектом останавливает подготовку. Не журналировать tokens/passwords/content/ciphertext.
 6. Прервать DELETE/upload/canonical/persistence. Независимые действия продолжаются,
    partial result честный. Обычный manual/startup/scheduled full повторяет остаток,
    не очищает заново успешно заменённое дерево и не удаляет источник из-за недокопии.
@@ -915,11 +923,28 @@ vault не использовать. Повторить plaintext/encrypted и �
    После Force full с прежними ограниченными фильтрами не удаляет out-of-scope files.
 9. Чужие поздние запросы не блокируют Force. Зафиксировать наблюдавшийся результат,
    не заявляя server fencing или гарантированное исправление любой concurrent порчи.
+10. Повторить Force с Диска на одинаковом зашифрованном наборе из мелких файлов
+    и вложений при лимитах 8 и 20. Сравнить со сборкой до группировки по размерам.
+    Начинать запуски с одинакового состояния Vault. Измерить подготовку и
+    применение отдельно, сверить локальные байты, canonical и пустой checkpoint.
+    Подтвердить перекрытие независимых чтений и проверить большой файл в отдельном
+    окне. Во время отмены или смены подключения поздний ответ не должен вызвать
+    новую локальную запись.
+
+11. На тестовой сборке прервать Force между публикацией финального индекса и
+    записью локального подтверждения. На B изменить тот же файл и завершить full.
+    До запуска A записать revision и хеши. После восстановления A убедиться,
+    что revision, индекс и байты B сохранились. Очередной ordinary full должен
+    доставить правку B на A. Повторить в plaintext и encrypted.
+12. Остановить попытку удаления выбранного файла на Диске. До восстановления
+    заменить его папкой с тем же именем и добавить исключённое вложение.
+    Запустить ordinary full. Вложение сохранило байты, задание удаления осталось
+    в checkpoint, независимый файл скопирован, успешного завершения Force нет.
 
 Записать revision, safe counts/hashes, local/canonical/physical результат и остаток
 checkpoint. Автоматическая suite не доказывает выполнение этого manual smoke.
 
-Покрывает: `FORCE-DIRECT-001`–`FORCE-DIRECT-028`, `INIT-012`, `INIT-019`,
+Покрывает: `FORCE-DIRECT-001`–`FORCE-DIRECT-032`, `INIT-012`, `INIT-019`,
 `INIT-023`, `INIT-029`, `TRANS-040`, `PATH-006`, `SAFE-002`, `SAFE-004`,
 `SAFE-009`, `SAFE-013`, `UI-006`.
 
@@ -970,14 +995,17 @@ different branch and cannot establish this tracked-source result.
 
 Два независимых профиля и disposable реальный remote. Для enable, rotate и disable
 использовать отдельные исходные snapshots; повторить с выбранным архивом и без него.
-До конца перехода не редактировать устройства, кроме явно контролируемой fault fixture.
+Вносить правки в моменты, указанные в шагах.
 
 1. На A подготовить local reference; на Диск добавить remote-only файл, а на
    отключённом B — stale edit, new child и queued rename. В filters оставить
    selected и excluded subtree; сохранить безопасные path/count/hash ожидания.
 2. На A запустить переход. Проверить предупреждение о локальном эталоне и прогресс
    до verification/persistence. Target canonical получает fresh epoch и
-   replacement receipt; selected bytes совпадают с A. Remote-only selected extras
+   replacement receipt. Изменить один файл до его чтения, второй — после чтения.
+   В target проверить новую версию первого и прочитанную версию второго.
+   При исправном target переход завершается. Поздняя правка остаётся на A
+   и попадает на Диск при следующем ordinary full. Remote-only selected extras
    удалены, `.backup`, plugin state и excluded raw descendants сохранены.
 3. Прервать post-commit cleanup и перезапустить A. На отдельной fixture завершить
    его через B с target password, включая disable без source key/manifest.
@@ -985,8 +1013,9 @@ different branch and cannot establish this tracked-source result.
    Unknown late old-codec object вне cover без source-capable owner оставляет recovery.
 4. Через контролируемую задержку отправить stale full/realtime PUT и изменить target.
    Следующая попытка старой сессии блокируется maintenance/epoch guard. Cleanup удаляет
-   selected extras, target repair использует pinned A reference и read-back. Local
-   drift, отсутствие сходимости либо guard revocation не показывают success.
+   selected extras, target repair использует pinned A reference и read-back.
+   Если эталонные байты для ремонта недоступны или guard отозван, проверить
+   сохранённое задание cleanup и отсутствие успешного завершения.
 5. Вернуть offline B: после authentication он автоматически получает selected target
    до ordinary merge, старые queues не отправляются. Failed local save/restart не
    превращает старые offline edits в новый push. Retained excluded descendants,

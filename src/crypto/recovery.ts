@@ -5,7 +5,8 @@ import type { IndexMaintenance, RemoteEncryptionManifest } from "../types";
 import { logger } from "../utils/logger";
 import { computeSha256 } from "../utils/hash-utils";
 import { sameIndexValue } from "../sync/canonical/transaction-rules";
-import { joinPath } from "../utils/path-utils";
+import { joinPath, toLocalPath } from "../utils/path-utils";
+import { isPreservedRawPath } from "./replacement";
 import { UnreadableRemoteIndexError } from "../sync/canonical/errors";
 import type { EncryptionContext } from "./context";
 import { type EncryptionCodec } from "./encryption";
@@ -602,22 +603,52 @@ export class EncryptionRecovery {
 						);
 					}
 				}
+				const root = this.context.getSettings().remotePath;
+				const preserved = current.epochAdoption.preservedRawPaths;
 				for (const action of transition.replacement.deletions) {
+					if (isPreservedRawPath(action.path, preserved)) {
+						continue;
+					}
+					const raw = joinPath(root, action.path);
+					const resource = await this.context.client.getResource(
+						raw,
+						1,
+						0,
+						true,
+					);
+					if (!resource) {
+						continue;
+					}
 					if (
-						await this.context.client.getResource(
-							joinPath(
-								this.context.getSettings().remotePath,
-								action.path,
-							),
-							1,
-							0,
-							true,
+						action.kind === "dir" &&
+						resource.type === "dir" &&
+						preserved.some((path) =>
+							path.startsWith(`${action.path}/`),
 						)
 					) {
-						throw new Error(
-							"Completed replacement retains a source subtree",
-						);
+						const files =
+							await this.context.client.getResourcesRecursive(
+								raw,
+								true,
+								4,
+								false,
+								() => true,
+								false,
+							);
+						if (
+							files.every((file) =>
+								isPreservedRawPath(
+									toLocalPath(file.path, root),
+									preserved,
+								),
+							)
+						) {
+							continue;
+						}
 					}
+					throw new Error(
+						"Completed replacement retains a source subtree",
+					);
 				}
 				if (
 					!sameIndexValue(current, await reader()) ||
@@ -671,6 +702,14 @@ export class EncryptionRecovery {
 					);
 				}
 				if (
+					isPreservedRawPath(
+						action.path,
+						current.epochAdoption?.preservedRawPaths ?? [],
+					)
+				) {
+					continue;
+				}
+				if (
 					await this.context.client.getResource(
 						joinPath(
 							this.context.getSettings().remotePath,
@@ -688,9 +727,7 @@ export class EncryptionRecovery {
 			}
 			const latest = await reader();
 			if (
-				latest.epoch !== current.epoch ||
-				latest.revision !== current.revision ||
-				latest.maintenance ||
+				!sameIndexValue(latest, current) ||
 				this.context.getTransition() !== transition
 			) {
 				throw new Error("Completed target cleanup authority changed");

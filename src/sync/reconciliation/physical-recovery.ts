@@ -1,5 +1,6 @@
 import type { FileMetadata, IndexMove, SyncResult } from "../../types";
 import { logger } from "../../utils/logger";
+import { isVaultTrashPath } from "../../utils/path-utils";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import * as syncErrors from "../errors";
 import * as fileOperations from "../files/operations";
@@ -22,6 +23,11 @@ export type Dependencies = Pick<
 	| "vaultAdapter"
 	| "yandexClient"
 >;
+
+/** Historical trash moves may be retired without executing their physical phase. */
+export function isVaultTrashMove(move: IndexMove): boolean {
+	return isVaultTrashPath(move.fromPath) || isVaultTrashPath(move.toPath);
+}
 
 /** Return whether a full session still has guarded physical work to resume. */
 export function hasPendingPhysicalWork(
@@ -59,6 +65,11 @@ export async function resumePendingMoves(
 	const completedLocalMutationIds: string[] = [];
 	for (const move of pendingMoves) {
 		try {
+			if (isVaultTrashMove(move)) {
+				deps.indexManager.completeMove(move.id);
+				changed = true;
+				continue;
+			}
 			if (move.kind === "folder") {
 				const folderResult = await resumePendingFolderMove(deps, move);
 				if (folderResult.unresolved > 0) {

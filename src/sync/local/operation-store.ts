@@ -8,6 +8,7 @@ import type {
 import { findLatestPutBaselineSha } from "./baseline-rules";
 import { advanceMutationSequence } from "../canonical/mutation-rules";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
+import { isVaultTrashPath } from "../../utils/path-utils";
 
 interface MutationOptions {
 	targetPath?: string;
@@ -55,6 +56,17 @@ export class LocalOperationStore {
 					const sequence = mutation.seq || index + 1;
 					return {
 						...mutation,
+						...(isVaultTrashPath(mutation.path) ||
+						(mutation.targetPath !== undefined &&
+							isVaultTrashPath(mutation.targetPath))
+							? {
+									type: "noop" as const,
+									targetPath: undefined,
+									resourceKind: undefined,
+									sha256: undefined,
+									baselineSha256: undefined,
+								}
+							: {}),
 						seq: sequence,
 						epoch: mutation.epoch ?? null,
 						id:
@@ -358,11 +370,18 @@ export class LocalOperationStore {
 
 	loadPhysicalActions(actions: PendingPhysicalAction[] | undefined): void {
 		this.pendingPhysicalActions = Array.isArray(actions)
-			? actions.map((action) => ({
-					...action,
-					epoch: action.epoch ?? null,
-					origin: action.origin ?? "exact-delete",
-				}))
+			? actions
+					.filter(
+						(action) =>
+							!isVaultTrashPath(action.path) &&
+							(action.targetPath === undefined ||
+								!isVaultTrashPath(action.targetPath)),
+					)
+					.map((action) => ({
+						...action,
+						epoch: action.epoch ?? null,
+						origin: action.origin ?? "exact-delete",
+					}))
 			: [];
 		logger.debug("Loaded durable physical action queue", {
 			pendingPhysicalActions: this.pendingPhysicalActions.length,

@@ -7,6 +7,8 @@ import {
 	type ForceDirection,
 } from "../src/sync/workflows/force-controller";
 import type { SyncResult, SyncState } from "../src/types";
+import { prepareForceReplacement } from "../src/sync/workflows/force-replacement";
+import { managedDevices, MemoryDisk } from "./helpers/sync-flow";
 
 function deferred() {
 	let resolve = () => {};
@@ -31,14 +33,30 @@ function result(overrides: Partial<SyncResult> = {}): SyncResult {
 	};
 }
 
-function harness(overrides: Partial<ForceSyncDependencies> = {}) {
+function harness(
+	context: Parameters<typeof managedDevices>[0],
+	overrides: Partial<ForceSyncDependencies> = {},
+) {
+	const owner = managedDevices(context)(
+		new MemoryDisk(),
+		"controller-fixture",
+		null,
+	);
 	const calls: string[] = [];
 	const states: ForceFlowState[] = [];
 	const deps: ForceSyncDependencies = {
 		isSyncBusy: () => false,
-		preflight: async () => {
+		preflight: (direction) => {
 			calls.push("preflight");
-			return { migration: true, canonical: { state: "absent" } };
+			return prepareForceReplacement(
+				{
+					...owner,
+					persist: async () => {},
+					password: async () => null,
+				},
+				direction,
+				true,
+			);
 		},
 		confirm: async () => {
 			calls.push("confirm");
@@ -59,12 +77,8 @@ function harness(overrides: Partial<ForceSyncDependencies> = {}) {
 				totalSize: 20,
 			};
 		},
-		beforeMutation: async () => {
-			calls.push("cutover");
-		},
-		run: async (_, options) => {
+		run: async () => {
 			calls.push("force");
-			await options.beforeForceMutation?.();
 			return result();
 		},
 		persist: async () => {
@@ -73,11 +87,7 @@ function harness(overrides: Partial<ForceSyncDependencies> = {}) {
 		replacementCommitted: () => {
 			calls.push("committed");
 		},
-		reconcile: async () => {
-			calls.push("reconcile");
-			return result();
-		},
-		hasPendingCleanup: () => false,
+
 		hasPendingRecovery: () => false,
 		reportError: () => {},
 		...overrides,
@@ -87,7 +97,7 @@ function harness(overrides: Partial<ForceSyncDependencies> = {}) {
 	return { controller, deps, calls, states };
 }
 
-test("Force owns busy state from first click through backup persistence and final full", async () => {
+test("Force owns busy state from first click through archive and durable completion", async (context) => {
 	for (const direction of ["from_local", "from_remote"] as ForceDirection[]) {
 		for (const boundary of [
 			"preflight",
@@ -95,11 +105,10 @@ test("Force owns busy state from first click through backup persistence and fina
 			"backup",
 			"run",
 			"persist",
-			"reconcile",
 		] as const) {
 			const entered = deferred();
 			const release = deferred();
-			const h = harness();
+			const h = harness(context);
 			const original = h.deps[boundary] as (
 				...args: unknown[]
 			) => Promise<unknown>;
@@ -140,185 +149,71 @@ test("Force owns busy state from first click through backup persistence and fina
 	}
 });
 
-test("Force admission and completion reject unverified work and honor the archive choice", async () => {
-	const cleanupError = {
-		message: "interrupted cleanup",
-		path: "old.md",
-		operation: "delete_remote" as const,
-	};
-	const cases: Array<{
-		name: string;
-		overrides: Partial<ForceSyncDependencies>;
-		outcome?: ForceFlowState["outcome"];
-		noForce?: boolean;
-		noReconcile?: boolean;
-		errorCode?: string;
-		noBackup?: boolean;
-	}> = [
-		{
-			name: "cancel",
-			overrides: { confirm: async () => "cancel" },
-			noForce: true,
-			noBackup: true,
-		},
-		{
-			name: "blocked",
-			overrides: { preflight: async () => null },
-			noForce: true,
-			noBackup: true,
-		},
-		{
-			name: "busy",
-			overrides: { isSyncBusy: () => true },
-			noForce: true,
-			noBackup: true,
-		},
-		{
-			name: "backup rejected",
-			overrides: {
-				backup: async () => ({
-					success: false,
-					fileCount: 0,
-					totalSize: 0,
-				}),
-			},
-			outcome: "backup-failed",
-			noForce: true,
-		},
-		{
-			name: "backup exception",
-			overrides: {
-				backup: async () => {
-					throw new Error("offline");
-				},
-			},
-			outcome: "backup-failed",
-			noForce: true,
-		},
-		...["force-backup-stale", "force-source-changed"].map((code) => ({
-			name: code,
-			overrides: {
-				run: async () =>
-					result({
-						success: false,
-						replacementCommitted: false,
-						errors: [
-							{
-								code,
-								message: code,
-								path: "",
-								operation: "upload" as const,
-							},
-						],
-					}),
-			},
-			outcome: "failed" as const,
-			errorCode: code,
-			noReconcile: true,
-		})),
-		{
-			name: "uncommitted",
-			overrides: {
-				run: async () => result({ replacementCommitted: false }),
-			},
-		},
-		{
-			name: "no reconciliation",
-			overrides: { reconcile: async () => null },
-		},
-		{
-			name: "failed reconciliation",
-			overrides: { reconcile: async () => result({ success: false }) },
-		},
-		{
-			name: "pending cleanup",
-			overrides: { hasPendingCleanup: () => true },
-		},
-		{
-			name: "recovered cleanup",
-			overrides: {
-				run: async () =>
-					result({ success: false, errors: [cleanupError] }),
-			},
-			outcome: "success",
-		},
-		{
-			name: "without archive",
-			overrides: {
-				confirm: async () => "without-backup",
-				run: async (_, options) => {
-					assert.equal(
-						options.forcePreflightProof?.snapshotDigest,
-						"snapshot",
-					);
-					assert.equal(options.forcePreflightProof?.backup, null);
-					return result();
-				},
-			},
-			outcome: "success",
-			noBackup: true,
-		},
-	];
+test("Force admission and completion honor cancellation, archive and durable success", async (context) => {
 	for (const direction of ["from_local", "from_remote"] as const) {
-		for (const row of cases) {
-			const h = harness(row.overrides);
+		for (const [name, overrides, outcome] of [
+			["cancel", { confirm: async () => "cancel" }, "cancelled"],
+			["blocked", { preflight: async () => null }, "blocked"],
+			["busy", { isSyncBusy: () => true }, undefined],
+			[
+				"backup rejected",
+				{
+					backup: async () => ({
+						success: false,
+						fileCount: 0,
+						totalSize: 0,
+					}),
+				},
+				"failed",
+			],
+			[
+				"uncommitted",
+				{ run: async () => result({ replacementCommitted: false }) },
+				"failed",
+			],
+			[
+				"partial",
+				{ run: async () => result({ success: false, deferred: true }) },
+				"recovery-pending",
+			],
+			[
+				"without archive",
+				{ confirm: async () => "without-backup" },
+				"success",
+			],
+		] satisfies [
+			string,
+			Partial<ForceSyncDependencies>,
+			ForceFlowState["outcome"],
+		][]) {
+			const h = harness(context, overrides);
 			await h.controller.run(direction);
-			assert.equal(h.controller.isBusy(), false, row.name);
-			if (row.outcome) {
-				assert.equal(
-					h.controller.getState()?.outcome,
-					row.outcome,
-					row.name,
-				);
-			} else {
-				assert.notEqual(
-					h.controller.getState()?.outcome,
-					"success",
-					row.name,
-				);
+			assert.equal(h.controller.isBusy(), false, name);
+			assert.equal(h.controller.getState()?.outcome, outcome, name);
+			if (outcome !== "success") {
+				assert.ok(!h.calls.includes("committed"), name);
 			}
-			if (row.errorCode) {
-				assert.equal(
-					h.controller.getState()?.errorCode,
-					row.errorCode,
-					row.name,
-				);
-			}
-			if (row.noForce) {
-				assert.ok(!h.calls.includes("force"), row.name);
-			}
-			if (row.noReconcile) {
-				assert.ok(!h.calls.includes("reconcile"), row.name);
-			}
-			if (row.noBackup) {
-				assert.ok(!h.calls.includes("backup"), row.name);
-			}
-			if (row.name === "busy") {
+			if (name === "busy") {
 				assert.deepEqual(h.calls, []);
 			}
-			if (row.outcome === "success") {
-				assert.equal(
-					h.calls.filter((call) => call === "reconcile").length,
-					1,
-					row.name,
-				);
+			if (name === "without archive") {
+				assert.ok(!h.calls.includes("backup"));
 				assert.ok(
-					h.calls.indexOf("committed") < h.calls.indexOf("persist"),
-					row.name,
+					h.calls.indexOf("persist") < h.calls.indexOf("committed"),
 				);
 			}
-			if (row.name === "without archive") {
-				assert.ok(
-					!h.states.some((state) => state.phase.includes("backup")),
-				);
+			if (
+				["cancel", "blocked", "busy", "backup rejected"].includes(name)
+			) {
+				assert.ok(!h.calls.includes("force"), name);
 			}
 		}
 	}
 });
 
-test("Force late activity from a completed operation cannot overwrite its successor", async () => {
+test("Force late activity from a completed operation cannot overwrite its successor", async (context) => {
 	let previousActivity: ((state: SyncState) => void) | undefined;
-	const h = harness({
+	const h = harness(context, {
 		run: async (_, options) => {
 			previousActivity = options.onActivity;
 			return result();
@@ -341,18 +236,17 @@ test("Force late activity from a completed operation cannot overwrite its succes
 	await second;
 });
 
-test("Force retains the failing boundary and committed outcome without starting preflight mutations", async () => {
+test("Force retains the failing boundary and committed outcome without starting preflight mutations", async (context) => {
 	for (const [boundary, stage] of [
 		["preflight", "preflight"],
 		["confirm", "confirming"],
 		["readyForBackup", "confirming"],
-		["captureProtectedSnapshot", "protected-snapshot"],
+		["captureProtectedSnapshot", "confirming"],
 		["run", "syncing"],
 		["persist", "persisting"],
-		["reconcile", "reconciling"],
 	] as const) {
 		const cause = new Error("connection failed");
-		const h = harness({
+		const h = harness(context, {
 			[boundary]: async () => {
 				throw cause;
 			},
@@ -362,12 +256,15 @@ test("Force retains the failing boundary and committed outcome without starting 
 		assert.equal(h.controller.isBusy(), false);
 		assert.equal(
 			state.outcome,
-			boundary === "persist" || boundary === "reconcile"
-				? "cleanup-pending"
-				: "failed",
+			boundary === "persist" ? "cleanup-pending" : "failed",
 		);
 		assert.equal(state.failure?.message, cause.message);
 		assert.equal(state.failure?.stage, stage);
+		if (boundary === "captureProtectedSnapshot") {
+			assert.ok(
+				h.states.some((state) => state.phase === "protected-snapshot"),
+			);
+		}
 		if (
 			boundary === "preflight" ||
 			boundary === "captureProtectedSnapshot"
@@ -377,8 +274,8 @@ test("Force retains the failing boundary and committed outcome without starting 
 	}
 });
 
-test("Force presentation errors cannot interrupt commit or keep buttons busy", async () => {
-	const h = harness();
+test("Force presentation errors cannot interrupt commit or keep buttons busy", async (context) => {
+	const h = harness(context);
 	h.controller.subscribe(() => {
 		throw new Error("detached UI");
 	});
@@ -387,12 +284,12 @@ test("Force presentation errors cannot interrupt commit or keep buttons busy", a
 	assert.equal(h.controller.isBusy(), false);
 });
 
-test("Force opens before source reads and cancellation joins preparation before releasing its reservation", async () => {
+test("Force opens before source reads and cancellation joins preparation before releasing its reservation", async (context) => {
 	const entered = deferred();
 	const release = deferred();
 	let attempts = 0;
 	let published = false;
-	const h = harness({
+	const h = harness(context, {
 		open: () => {
 			h.calls.push("open");
 		},
@@ -410,7 +307,7 @@ test("Force opens before source reads and cancellation joins preparation before 
 			assert.deepEqual(h.calls, ["open"]);
 			await release.promise;
 			assert.equal(preparation.isCancelled(), true);
-			return { migration: false, canonical: { state: "absent" } };
+			return null;
 		},
 	});
 	const pending = h.controller.run("from_remote");

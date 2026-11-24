@@ -16,6 +16,7 @@ import {
 	type UserSettingsPatch,
 } from "./settings-workflow";
 import type { DeferredWatcherEvent } from "./sync/realtime/watcher";
+import type { RemoteObservation } from "./sync/contracts";
 import type { ForceRecovery } from "./sync/workflows/force-state";
 import type {
 	LocalSyncState,
@@ -97,7 +98,7 @@ export class PluginPersistence {
 
 	/** Unload never retries a failed save, including a failure still in flight. */
 	async saveOnUnload(): Promise<void> {
-		await this.enqueue(undefined, true);
+		await this.enqueue({ unloading: true });
 	}
 
 	/** Load and initialize identity before the first coherent migration save. */
@@ -147,9 +148,12 @@ export class PluginPersistence {
 	}
 
 	/** Build the snapshot at execution time; publish a user draft only after save. */
-	async persist(patch?: UserSettingsPatch): Promise<void> {
+	async persist(
+		patch?: UserSettingsPatch,
+		observation?: RemoteObservation,
+	): Promise<void> {
 		this.requireLoaded();
-		await this.enqueue(patch, false);
+		await this.enqueue({ patch, observation });
 	}
 
 	/** Save a validated credential bundle before publishing it to running components. */
@@ -161,30 +165,42 @@ export class PluginPersistence {
 		if (!this.ports.publishAuthentication) {
 			throw new Error("Authorization publication is unavailable");
 		}
-		await this.enqueue(undefined, false, undefined, {
-			update:
-				update.kind !== "interactive" && update.kind !== "refresh"
-					? { ...update }
-					: { ...update, authorization: { ...update.authorization } },
-			assertCurrent,
+		await this.enqueue({
+			authentication: {
+				update:
+					update.kind !== "interactive" && update.kind !== "refresh"
+						? { ...update }
+						: {
+								...update,
+								authorization: { ...update.authorization },
+							},
+				assertCurrent,
+			},
 		});
 	}
 
 	/** Activate this connection only after the successful full snapshot is durable. */
 	async completeManualSync(assertCurrent: () => void): Promise<void> {
 		this.requireLoaded();
-		await this.enqueue(undefined, false, assertCurrent);
+		await this.enqueue({ activateConnection: assertCurrent });
 	}
 
-	private async enqueue(
-		patch: UserSettingsPatch | undefined,
-		unloading: boolean,
-		activateConnection?: () => void,
+	private async enqueue({
+		patch,
+		unloading,
+		activateConnection,
+		authentication,
+		observation,
+	}: {
+		patch?: UserSettingsPatch;
+		unloading?: boolean;
+		activateConnection?: () => void;
 		authentication?: {
 			update: AuthenticationChange;
 			assertCurrent(): void;
-		},
-	): Promise<void> {
+		};
+		observation?: RemoteObservation;
+	}): Promise<void> {
 		const generation = this.generation;
 		const persistence = this.tail.then(async () => {
 			if (unloading && !this.canSaveOnUnload) {
@@ -195,19 +211,11 @@ export class PluginPersistence {
 			if ((patch || authentication) && this.ports.isUnloaded()) {
 				throw new Error("Plugin was unloaded before settings save");
 			}
-			activateConnection?.();
+			const assertPublication =
+				activateConnection ?? observation?.assertCurrent;
+			assertPublication?.();
 			authentication?.assertCurrent();
-			const current = this.ports.snapshot();
-			if (this.authenticationCommitted && this.data) {
-				current.settings = {
-					...current.settings,
-					...captureAuthentication(this.data.settings),
-					...(this.sensitiveLogoutCommitted &&
-					!this.data.settings.yandexTokenSecret
-						? { encryptionPassword: null }
-						: {}),
-				};
-			}
+			const current = this.currentData(observation);
 			if (patch) {
 				current.settings = prepareSettingsPatch(
 					current.settings,
@@ -220,7 +228,6 @@ export class PluginPersistence {
 					manualSyncRequired: false,
 				};
 			}
-			// Storage owns immutable bytes even if live encryption advances during the await.
 			if (authentication) {
 				current.settings = {
 					...current.settings,
@@ -230,29 +237,33 @@ export class PluginPersistence {
 					),
 				};
 			}
-			const snapshot = JSON.parse(JSON.stringify(current)) as PluginData;
-			await this.saveSnapshot(snapshot, generation);
-			if (activateConnection) {
+			const snapshot = await this.saveSnapshot(current, generation);
+			if (assertPublication) {
 				try {
 					this.assertGeneration(generation);
-					activateConnection();
+					assertPublication();
 				} catch (error) {
-					const pending = {
-						...snapshot,
-						settings: {
-							...snapshot.settings,
+					// Rebuild from live state so late events and the active scope survive revocation.
+					const pending = this.currentData();
+					if (activateConnection) {
+						pending.settings = {
+							...pending.settings,
 							manualSyncRequired: true,
-						},
-					};
-					await this.saveSnapshot(pending, generation);
+						};
+					}
+					const restored = await this.saveSnapshot(
+						pending,
+						generation,
+					);
 					if (generation === this.generation) {
-						this.data = pending;
+						this.data = restored;
 					}
 					throw error;
 				}
 			}
 			this.assertGeneration(generation);
 			this.data = snapshot;
+			observation?.publish();
 			if (
 				authentication ||
 				(patch && ("yandexTokenSecret" in patch || "clientId" in patch))
@@ -297,13 +308,37 @@ export class PluginPersistence {
 		await persistence;
 	}
 
-	/** Classify storage failures identically for ordinary and revoked activation snapshots. */
+	/** Capture only published device state, optionally proposing one reconciled observation. */
+	private currentData(observation?: RemoteObservation): PluginData {
+		const current = this.ports.snapshot();
+		if (observation) {
+			current.localState = {
+				...current.localState,
+				...observation.state,
+			};
+		}
+		if (this.authenticationCommitted && this.data) {
+			current.settings = {
+				...current.settings,
+				...captureAuthentication(this.data.settings),
+				...(this.sensitiveLogoutCommitted &&
+				!this.data.settings.yandexTokenSecret
+					? { encryptionPassword: null }
+					: {}),
+			};
+		}
+		return current;
+	}
+
+	/** Freeze the complete device snapshot before crossing the storage boundary. */
 	private async saveSnapshot(
-		snapshot: PluginData,
+		current: PluginData,
 		generation: number,
-	): Promise<void> {
+	): Promise<PluginData> {
+		const snapshot = JSON.parse(JSON.stringify(current)) as PluginData;
 		try {
 			await this.ports.save(snapshot);
+			return snapshot;
 		} catch (error) {
 			if (generation === this.generation) {
 				this.saveFailed = true;

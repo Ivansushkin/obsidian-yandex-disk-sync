@@ -609,7 +609,19 @@ export interface SyncOperation {
 	localMeta?: FileMetadata;
 	/** Remote metadata (if available) */
 	remoteMeta?: FileMetadata;
-	/** Folder tombstone responsible for a derived deletion */
+	/** Plaintext SHA-256 of the published version selected by full sync. */
+	expectedDownloadSha256?: string;
+	/** Recheck the listed physical identity before restoring a folder survivor. */
+	requireStableDownload?: boolean;
+	/** Published deletion observed when selecting a physical descendant for recovery. */
+	folderSurvivor?: {
+		epoch: string;
+		parent: string;
+		folderRevision: number;
+		fileRevision?: number;
+		sha256: string;
+	};
+	/** Folder tombstone responsible for the selected operation. */
 	folderTombstonePath?: string;
 	/** Causal source used to decide whether canonical metadata may be changed. */
 	causalOrigin?: SyncCausalOrigin;

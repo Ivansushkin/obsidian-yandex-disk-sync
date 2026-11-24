@@ -1,5 +1,8 @@
 import { isPreservedRawPath } from "../../crypto/replacement";
-import { ForceRecoveryPendingError } from "../workflows/force-state";
+import {
+	ForceRecoveryPendingError,
+	type ForceRecovery,
+} from "../workflows/force-state";
 import { ConcurrentSyncChangeError } from "../../errors";
 /**
  * Synchronization index manager
@@ -34,6 +37,7 @@ import { VaultAdapter } from "../../api/vault-adapter";
 import {
 	PathAncestryIndex,
 	isProtectedPath,
+	isVaultTrashPath,
 	isLegacyPluginDataPath,
 	isLegacyServicePathCollision,
 	isRootIndexLockPath,
@@ -63,6 +67,7 @@ import {
 	classifyIndexFormat,
 } from "./mutation-rules";
 import { LocalOperationStore } from "../local/operation-store";
+import type { IndexSaveCallback, RemoteObservation } from "../contracts";
 import {
 	readRemoteStorageScope,
 	sameRemoteStorageScope,
@@ -122,6 +127,12 @@ export interface CanonicalReadSession {
 	assertCurrent(): void;
 	close(): void;
 }
+
+/** Validate the locked canonical and any guarded physical work before reduction. */
+export type LockedCanonicalCheck = (
+	index: Readonly<SyncIndex>,
+	assertOwnership: () => Promise<void>,
+) => void | Promise<void>;
 
 /** Startup service observations expire with their owning lifecycle invocation. */
 export interface StartupReadSession extends CanonicalReadSession {
@@ -348,10 +359,16 @@ export class IndexManager {
 		index: SyncIndex,
 		codec: EncryptionCodec | null,
 		reset = false,
+		beforeFinalPut?: () => Promise<void>,
 	): Promise<{ epoch: string; revision: number; canonicalSha256: string }> {
 		if (!this.forceScope?.direct) {
 			throw new Error(
 				"Direct Force publication requires its explicit scope",
+			);
+		}
+		if (!index.maintenance && !beforeFinalPut) {
+			throw new ForceRecoveryPendingError(
+				"Final Force publication requires its saved publishing checkpoint",
 			);
 		}
 		await this.assertRemoteScope();
@@ -365,9 +382,30 @@ export class IndexManager {
 			await this.yandexClient.deleteResource(path, true, true);
 		}
 		let uploadError: unknown;
+		let admitted = !beforeFinalPut;
 		try {
-			await this.yandexClient.uploadFile(path, raw, false, true, true);
+			if (beforeFinalPut) {
+				await this.yandexClient.uploadRawFileOnce(
+					path,
+					raw,
+					async () => {
+						await beforeFinalPut();
+						admitted = true;
+					},
+				);
+			} else {
+				await this.yandexClient.uploadFile(
+					path,
+					raw,
+					false,
+					true,
+					true,
+				);
+			}
 		} catch (error) {
+			if (!admitted) {
+				throw error;
+			}
 			uploadError = error;
 		}
 		const snapshot = await this.yandexClient.downloadStableRawFile(path);
@@ -388,6 +426,86 @@ export class IndexManager {
 			revision: index.revision,
 			canonicalSha256,
 		};
+	}
+
+	/** Identify a pending final publication without acquiring locks or repairing the destination. */
+	async readDirectForcePublication(
+		state: ForceRecovery,
+		expected: SyncIndex,
+		codec: EncryptionCodec | null,
+		assertActive: () => void,
+	): Promise<SyncIndex> {
+		const pending = () =>
+			new ForceRecoveryPendingError(
+				"The saved Force publication cannot be confirmed in the selected storage",
+			);
+		const snapshot = await this.yandexClient.downloadStableRawFile(
+			this.getRemoteIndexPath(),
+		);
+		if (!snapshot) {
+			throw pending();
+		}
+		const { index } = await this.decodeIndexSnapshot(
+			snapshot.raw,
+			false,
+			codec,
+		);
+		const { manifest, validationToken } =
+			await this.downloadEncryptionManifestForGuard();
+		const listing = await this.recovery.getStableRootListing(assertActive);
+		const canonical = listing.resources.find(
+			(item) => item.name === REMOTE_INDEX_FILENAME,
+		);
+		const manifestResource = listing.resources.find(
+			(item) => item.name === ENCRYPTION_MANIFEST_FILENAME,
+		);
+		if (
+			!state.rootResourceId ||
+			listing.root?.resource_id !== state.rootResourceId ||
+			this.recovery.selectIndexLocks(listing.resources).length ||
+			!matchesStableContentFingerprint(
+				snapshot.fingerprint,
+				canonical ?? null,
+			) ||
+			validationToken !==
+				(manifestResource
+					? `present:${this.yandexClient.getContentFingerprint(manifestResource)}`
+					: "absent") ||
+			Boolean(manifest) !== state.target.enabled ||
+			(manifest &&
+				(manifest.state !== "enabled" ||
+					manifest.salt !== state.target.salt ||
+					manifest.revision !== state.target.revision ||
+					!(await codec?.verifyVerifier(manifest.verifier)))) ||
+			index.epoch !== state.epoch
+		) {
+			throw pending();
+		}
+		assertActive();
+		if (index.maintenance) {
+			const maintenance = index.maintenance;
+			if (
+				state.completion ||
+				maintenance.kind !== "force" ||
+				maintenance.id !== state.id ||
+				maintenance.initiatedBy !== expected.deviceId ||
+				maintenance.direction !== state.direction ||
+				!sameIndexValue(maintenance.target, state.target) ||
+				index.revision >= expected.revision
+			) {
+				throw pending();
+			}
+		} else if (
+			index.revision < expected.revision ||
+			(index.revision === expected.revision &&
+				(!sameIndexValue(index, expected) ||
+					(state.completion &&
+						state.completion.canonicalSha256 !==
+							(await computeSha256(snapshot.raw)))))
+		) {
+			throw pending();
+		}
+		return index;
 	}
 
 	/** Require matching operation authority before every Force write and retry. */
@@ -816,32 +934,35 @@ export class IndexManager {
 	}
 
 	/**
-	 * Mark the currently loaded canonical state as fully reconciled locally.
+	 * Build the reconciled baseline without exposing it to earlier or failed device saves.
 	 */
-	markRemoteObserved(): void {
-		if (this.epochAdoptionTarget === this.remoteIndex.epoch) {
-			const adoptedFiles = createSafeRecord<FileMetadata>();
-			for (const [path, canonical] of Object.entries(
-				this.remoteIndex.files,
-			)) {
-				const local = this.localState.files[path];
-				setRecordValue(adoptedFiles, path, {
-					...canonical,
-					mtime:
-						local && local.sha256 === canonical.sha256
-							? local.mtime
-							: canonical.mtime,
-				});
-			}
-			this.localState.files = adoptedFiles;
-		}
-		for (const [path, baseline] of Object.entries(this.localState.files)) {
+	markRemoteObserved(): void;
+	markRemoteObserved(
+		save: IndexSaveCallback | null | undefined,
+		assertCurrent?: () => void,
+	): void | Promise<void>;
+	markRemoteObserved(
+		save?: IndexSaveCallback | null,
+		assertCurrent?: () => void,
+	): void | Promise<void> {
+		assertCurrent?.();
+		const local = this.localState;
+		const files = createSafeRecord<FileMetadata>();
+		const adopting = this.epochAdoptionTarget === this.remoteIndex.epoch;
+		const baselines = adopting ? this.remoteIndex.files : local.files;
+		for (const [path, baseline] of Object.entries(baselines)) {
 			const canonical = this.remoteIndex.files[path];
 			if (!canonical) {
+				setRecordValue(files, path, { ...baseline });
 				continue;
 			}
-			setRecordValue(this.localState.files, path, {
+			const previous = local.files[path];
+			setRecordValue(files, path, {
 				...baseline,
+				mtime:
+					adopting && previous?.sha256 === canonical.sha256
+						? previous.mtime
+						: baseline.mtime,
 				sha256: canonical.sha256,
 				size: canonical.size,
 				syncedAt: canonical.syncedAt,
@@ -856,14 +977,23 @@ export class IndexManager {
 				baseRevision: canonical.baseRevision,
 			});
 		}
-		this.localState.observedEpoch = this.remoteIndex.epoch;
-		this.localState.observedRevision = this.remoteIndex.revision;
-		this.localState.folderTombstones = protectRecord(
-			this.cloneValue(this.remoteIndex.folderTombstones),
-		);
-		this.localState.nextMutationSeq =
-			this.operationStore.getNextMutationSeq();
-		this.localState.lastSyncTime = Date.now();
+		const state: RemoteObservation["state"] = {
+			files,
+			observedEpoch: this.remoteIndex.epoch,
+			observedRevision: this.remoteIndex.revision,
+			folderTombstones: protectRecord(
+				this.cloneValue(this.remoteIndex.folderTombstones),
+			),
+			lastSyncTime: Date.now(),
+		};
+		const publish = () => {
+			Object.assign(local, state);
+			local.nextMutationSeq = this.operationStore.getNextMutationSeq();
+		};
+		if (save) {
+			return save({ state, publish, assertCurrent });
+		}
+		publish();
 	}
 
 	getObservedRevision(): number {
@@ -944,9 +1074,10 @@ export class IndexManager {
 	 * Get local index data for saving
 	 */
 	getLocalIndexData(): LocalSyncState {
-		this.localState.nextMutationSeq =
-			this.operationStore.getNextMutationSeq();
-		return this.localState;
+		return {
+			...this.localState,
+			nextMutationSeq: this.operationStore.getNextMutationSeq(),
+		};
 	}
 
 	loadPendingMutations(mutations: PendingMutation[] | undefined): void {
@@ -1096,9 +1227,13 @@ export class IndexManager {
 	/**
 	 * Reapply durable local intentions after loading the canonical index.
 	 */
-	replayPendingMutations(): boolean {
+	replayPendingMutations(): {
+		confirmedMutations: boolean;
+		replayedFolderChildren: Set<string>;
+	} {
 		const before = this.getPendingMutations().length;
 		this.confirmAppliedMutations();
+		const replayedFolderChildren = new Set<string>();
 		let ancestry: PathAncestryIndex | undefined;
 		for (const mutation of this.getPendingMutations()) {
 			if (mutation.type === "delete-file") {
@@ -1113,6 +1248,7 @@ export class IndexManager {
 					undefined,
 					mutation.baseRevision ?? 0,
 					mutation.seq,
+					{ replaceFolderTombstone: true },
 				);
 				continue;
 			}
@@ -1131,10 +1267,11 @@ export class IndexManager {
 				for (const path of ancestry.get(
 					mutation.path.replace(/\/+$/, ""),
 				) ?? []) {
-					if (!path.startsWith(prefix)) {
+					const current = this.remoteIndex.files[path];
+					if (!path.startsWith(prefix) || current?.deleted) {
 						continue;
 					}
-					const current = this.remoteIndex.files[path];
+					replayedFolderChildren.add(path);
 					if (
 						current &&
 						!canApplyDestructiveFolderMutation(
@@ -1161,7 +1298,18 @@ export class IndexManager {
 				continue;
 			}
 		}
-		return before !== this.getPendingMutations().length;
+		return {
+			confirmedMutations: before !== this.getPendingMutations().length,
+			replayedFolderChildren,
+		};
+	}
+
+	/** Distinguish a published tombstone from a deletion only replayed in memory. */
+	hasPublishedFileDeletion(path: string): boolean {
+		return (
+			this.loadedRemoteIndex.epoch === this.remoteIndex.epoch &&
+			this.loadedRemoteIndex.files[path]?.deleted === true
+		);
 	}
 
 	enqueueMutation(
@@ -1908,7 +2056,7 @@ export class IndexManager {
 	 * Save remote index; optional authority validation runs on the acquired lock before reduction.
 	 */
 	async saveRemoteIndex(
-		assertLatest?: (index: Readonly<SyncIndex>) => void,
+		assertLatest?: LockedCanonicalCheck,
 	): Promise<CanonicalCommitProof> {
 		const save = this.saveChain.then(() =>
 			this.saveRemoteIndexWithRetry(assertLatest),
@@ -1921,7 +2069,7 @@ export class IndexManager {
 	}
 
 	private async saveRemoteIndexWithRetry(
-		assertLatest?: (index: Readonly<SyncIndex>) => void,
+		assertLatest?: LockedCanonicalCheck,
 	): Promise<CanonicalCommitProof> {
 		return await commitCanonicalIndex({
 			client: this.yandexClient,
@@ -1954,8 +2102,39 @@ export class IndexManager {
 			readUnparsedSnapshot: (path) =>
 				this.downloadUnparsedIndexSnapshot(path),
 			serialize: (index) => this.serializeCurrentIndex(index),
-			reduceLockedIndex: (...args) => {
-				assertLatest?.(cloneIndex(args[0].index));
+			reduceLockedIndex: async (...args) => {
+				if (assertLatest) {
+					const [original, , lockPath] = args;
+					const assertOwnership = async () => {
+						await this.assertRemoteScope();
+						const listing =
+							await this.recovery.getStableRootListing();
+						const locks = this.recovery.selectIndexLocks(
+							listing.resources,
+						);
+						const owned = locks[0];
+						if (
+							locks.length !== 1 ||
+							owned?.name !==
+								lockPath.slice(lockPath.lastIndexOf("/") + 1) ||
+							listing.resources.some(
+								(entry) => entry.name === REMOTE_INDEX_FILENAME,
+							) ||
+							!matchesStableContentFingerprint(
+								original.fingerprint,
+								owned ?? null,
+							)
+						) {
+							throw new RemoteIndexConcurrentModificationError(
+								"Canonical lock ownership changed",
+							);
+						}
+					};
+					await assertLatest(
+						cloneIndex(original.index),
+						assertOwnership,
+					);
+				}
 				return this.reduceLockedIndex(...args);
 			},
 			acceptCommit: (index, proof) =>
@@ -2181,14 +2360,13 @@ export class IndexManager {
 		return stamped > 0;
 	}
 
-	/**
-	 * Mark file as deleted in remote index
-	 */
+	/** Record a file deletion, optionally replacing a folder-derived tombstone with an exact intent. */
 	markRemoteFileDeleted(
 		path: string,
 		deletedByFolder?: string,
 		baseRevision = this.loadedRemoteIndex.revision,
 		mutationSeq?: number,
+		options?: { replaceFolderTombstone: boolean },
 	): void {
 		const meta = this.remoteIndex.files[path] ||
 			this.localState.files[path] || {
@@ -2199,7 +2377,10 @@ export class IndexManager {
 				syncedAt: 0,
 			};
 		setRecordValue(this.remoteIndex.files, path, meta);
-		if (meta.deleted) {
+		if (
+			meta.deleted &&
+			!(options?.replaceFolderTombstone && meta.deletedByFolder)
+		) {
 			return;
 		}
 		if (mutationSeq === undefined) {
@@ -2317,7 +2498,11 @@ export class IndexManager {
 			true,
 			this.settings.maxConcurrency,
 			false,
-			undefined,
+			(path, type) =>
+				!isVaultTrashPath(
+					toLocalPath(path, this.settings.remotePath),
+				) &&
+				(type === "file" || !isProtectedPath(path)),
 			true,
 			directoryPages
 				? (path, pages) => {

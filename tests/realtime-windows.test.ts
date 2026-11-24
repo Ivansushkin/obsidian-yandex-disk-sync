@@ -149,12 +149,11 @@ for (const encrypted of [false, true]) {
 		assert.equal(a.engine.getState().lastOutcome, "error");
 		assert.equal(a.engine.getState().failure?.category, "unavailable");
 		assert.equal(a.engine.getState().lastSyncTime, lastSuccess);
-		await a.stop();
+		const saved = a.crash();
 		disk.afterRequest = undefined;
 		assert.equal(lostResponse, true);
 		assert.deepEqual(retryableFailures, ["unavailable"]);
 		assert.equal(reads.includes("Note64.md"), false);
-		const saved = await a.saved();
 		assert.deepEqual(
 			saved.pendingWatcherEvents.map((event) => event.id),
 			ids.slice(40),

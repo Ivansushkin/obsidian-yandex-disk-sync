@@ -1,6 +1,8 @@
 import { planRecursiveDeletes } from "../files/deletion-cover";
+import { isPathInsideFolder } from "../canonical/mutation-rules";
 import {
 	assertForceRecovery,
+	ForceRecoveryPendingError,
 	ForceSourceFormatError,
 	ForceScopeConflictError,
 	type ForceDirection,
@@ -9,7 +11,10 @@ import {
 } from "./force-state";
 import type { VaultAdapter } from "../../api/vault-adapter";
 import type { YandexDiskClient } from "../../api/yandex-client";
-import type { EncryptionCodec } from "../../crypto/encryption";
+import {
+	EncryptionService,
+	type EncryptionCodec,
+} from "../../crypto/encryption";
 import { EncryptionManager } from "../../crypto/encryption-manager";
 import { getNewEncryptionPasswordError } from "../../crypto/password-policy";
 import { parseEncryptionManifest } from "../../crypto/manifest-schema";
@@ -23,10 +28,12 @@ import {
 	createSyncEpoch,
 	type EncryptionManifest,
 	type EncryptionReplacementScope,
+	type FileMetadata,
 	type RecursiveDeleteAction,
 	type SyncIndex,
 	type SyncPhase,
 	type SyncResult,
+	type YandexResource,
 	type YandexDiskSyncSettings,
 } from "../../types";
 import { computeSha256, computeSha256FromString } from "../../utils/hash-utils";
@@ -34,17 +41,26 @@ import {
 	assertForcePath,
 	containsForceLocalPreservedPath,
 	getDirectory,
+	getPortablePathKey,
 	hasPortablePathCollision,
 	isForceSourcePath,
+	isVaultTrashPath,
 	joinPath,
 	mayBeEncryptedPath,
+	mayBeEncodedVaultTrashRoot,
+	normalizePath,
 	preservesForceLocalPath,
 	shouldInspectRawSyncDirectory,
 	shouldInspectRawSyncPath,
 	shouldTraverseSyncDirectory,
 	toLocalPath,
 } from "../../utils/path-utils";
-import { createSafeRecord, setRecordValue } from "../../utils/record-utils";
+import {
+	createSafeRecord,
+	getRecordValue,
+	protectRecord,
+	setRecordValue,
+} from "../../utils/record-utils";
 import { getPhysicalResourceFingerprint } from "../../utils/resource-fingerprint";
 import {
 	ConcurrentSyncChangeError,
@@ -53,8 +69,14 @@ import {
 } from "../../errors";
 import { findErrorCause } from "../../utils/error-utils";
 import type { IndexManager } from "../canonical/manager";
+import {
+	LegacyIndexFormatError,
+	UnreadableRemoteIndexError,
+} from "../canonical/errors";
 import { createSyncError } from "../errors";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
+import { runWithConcurrencySettled } from "../../utils/semaphore";
+import { planTransferWindows } from "../files/transfer-windows";
 
 export interface ForceReplacementDependencies {
 	client: YandexDiskClient;
@@ -63,7 +85,7 @@ export interface ForceReplacementDependencies {
 	settings: YandexDiskSyncSettings;
 	persist(state: ForceRecovery | null): Promise<void>;
 	password(create: boolean, invalid?: boolean): Promise<string | null>;
-	sourceProgress?(completed: number, total: number): void;
+	sourceProgress?(this: void, completed: number, total: number): void;
 	isCancelled?(): boolean;
 	watcherCutoff?(): string[];
 	watcherBoundary?(): Record<string, string>;
@@ -98,7 +120,7 @@ export interface PreparedForceReplacement {
 	scope?: EncryptionReplacementScope;
 	destinationCodec?: EncryptionCodec | null;
 	destinationManifest?: EncryptionManifest | null;
-	assertConfiguration(): Promise<void>;
+	assertConfiguration(this: void): void;
 }
 export interface ForceApplyResult {
 	uploaded: number;
@@ -111,6 +133,12 @@ const encryption = new EncryptionManager();
 const manifestName = ".obsidian-encrypt.json";
 const indexName = ".obsidian-sync-index.json";
 const emptyWatcherBoundary: Record<string, string> = Object.freeze({});
+
+class ForceConfigurationChangedError extends Error {
+	constructor() {
+		super("Force connection changed or plugin unloaded");
+	}
+}
 
 class ForceSourceMissingError extends ConcurrentSyncChangeError {
 	constructor() {
@@ -147,12 +175,22 @@ function inspectRaw(
 	);
 }
 
-/** Allocate a replacement generation only after its destructive confirmation. */
+const confirmedForcePlans = new WeakSet<PreparedForceReplacement>();
+
+/** Record confirmation on the in-memory plan, separate from recovery identity. */
 export function confirmForceReplacementPlan(
 	plan: PreparedForceReplacement,
 ): void {
 	plan.recovery.id ||= createSyncEpoch();
 	plan.recovery.epoch ||= createSyncEpoch();
+	confirmedForcePlans.add(plan);
+}
+
+/** Check confirmation without inferring it from the persisted recovery fields. */
+export function isForceReplacementPlanConfirmed(
+	plan: PreparedForceReplacement,
+): boolean {
+	return confirmedForcePlans.has(plan);
 }
 
 /** Hash identities rather than retaining the whole vault in memory. */
@@ -184,6 +222,210 @@ async function physicalPath(
 		: path;
 }
 
+type ForceSourcePosition = {
+	resourceNumber: number;
+	totalResources: number;
+	resourceType: "file" | "dir";
+};
+
+function forceReadConcurrency(settings: YandexDiskSyncSettings): number {
+	return Math.max(1, Math.min(Math.trunc(settings.maxConcurrency) || 1, 20));
+}
+
+interface ForceReadObservation {
+	resource: YandexResource;
+	budget: ReturnType<YandexDiskClient["createDownloadBudget"]>;
+}
+
+/** Validate the response before treating a missing resource or a directory as absence. */
+function assertForceResourceIdentity(
+	resource: YandexResource | null,
+	path: string,
+): void {
+	if (
+		resource &&
+		((resource.type !== "file" && resource.type !== "dir") ||
+			typeof resource.path !== "string" ||
+			resource.path.includes("\\") ||
+			normalizePath(resource.path.replace(/^disk:\//, "")) !==
+				normalizePath(path.replace(/^disk:\//, "")) ||
+			typeof resource.modified !== "string" ||
+			!Number.isSafeInteger(Date.parse(resource.modified)) ||
+			Date.parse(resource.modified) < 0 ||
+			(resource.size !== undefined &&
+				(!Number.isSafeInteger(resource.size) || resource.size < 0)))
+	) {
+		throw new Error("Force resource metadata is invalid");
+	}
+}
+
+/** Read a stable physical file and authenticate its bytes within the active Force plan. */
+async function readRemoteForceSource(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+	rawPath: string,
+	assertActive: () => void,
+	position?: ForceSourcePosition,
+	observation?: ForceReadObservation,
+) {
+	assertActive();
+	const path = joinPath(plan.recovery.remotePath, rawPath);
+	const snapshot = await deps.client
+		.downloadStableRawFile(path, observation?.resource, observation?.budget)
+		.catch((error: unknown) => {
+			if (
+				(error instanceof ConcurrentSyncChangeError &&
+					error.observation === "missing") ||
+				findErrorCause(
+					error,
+					(cause) =>
+						cause instanceof RemoteHttpError &&
+						cause.status === 404,
+				)
+			) {
+				throw new ForceSourceMissingError();
+			}
+			throw error;
+		});
+	assertActive();
+	if (!snapshot) {
+		throw new ForceSourceMissingError();
+	}
+	assertForceResourceIdentity(snapshot.resource, path);
+	if (snapshot.resource.type !== "file") {
+		throw new ForceSourceMissingError();
+	}
+	const content = await decodeSourceContent(
+		snapshot.raw,
+		plan.codec,
+		position,
+	);
+	const sha256 = await computeSha256(content);
+	assertActive();
+	return {
+		content,
+		sha256,
+		resource: snapshot.resource,
+		fingerprint: snapshot.fingerprint,
+	};
+}
+
+/** Recheck the next window before admitting payloads, keeping each observation's deadline. */
+async function* readRemoteForceWindows(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+	pending: readonly ForceSourceFile[],
+	assertActive: () => void,
+) {
+	const concurrency = forceReadConcurrency(deps.settings);
+	for (const window of planTransferWindows(
+		pending.map((file) => ({ file, size: file.size })),
+		concurrency,
+	)) {
+		type Candidate = {
+			file: ForceSourceFile;
+			size?: number;
+			renewed?: boolean;
+		};
+		const remaining: Candidate[][] = [window];
+		while (remaining.length > 0) {
+			const candidates = remaining.pop()!;
+			assertActive();
+			const metadata = await Promise.allSettled(
+				candidates.map(async (candidate) => {
+					const budget = deps.client.createDownloadBudget();
+					const path = joinPath(
+						plan.recovery.remotePath,
+						candidate.file.rawPath,
+					);
+					const resource = await deps.client.getResource(
+						path,
+						1,
+						0,
+						true,
+						budget,
+					);
+					assertForceResourceIdentity(resource, path);
+					if (resource?.type !== "file") {
+						throw new ForceSourceMissingError();
+					}
+					return {
+						...candidate,
+						size: resource.size,
+						observation: { resource, budget },
+					};
+				}),
+			);
+			assertActive();
+			const expired: Candidate[][] = [];
+			const now = Date.now();
+			const observed = metadata.flatMap((entry) => {
+				if (entry.status === "rejected") {
+					return [];
+				}
+				const { file, size, observation, renewed } = entry.value;
+				if (!renewed && observation.budget.deadline <= now) {
+					// A slow sibling must not consume a fast file's only read budget.
+					expired.push([{ file, size, renewed: true }]);
+					return [];
+				}
+				return [entry.value];
+			});
+			const [first = [], ...later] = planTransferWindows(
+				observed,
+				concurrency,
+			);
+			// Discard observations for postponed files. Their next window rechecks them.
+			const postponed = later.map((batch) =>
+				batch.map(({ file, size, renewed }) => ({
+					file,
+					size,
+					renewed,
+				})),
+			);
+			remaining.push(...postponed.reverse(), ...expired.reverse());
+			const reads = await Promise.allSettled(
+				first.map(({ file, observation }) =>
+					readRemoteForceSource(
+						deps,
+						plan,
+						file.rawPath,
+						assertActive,
+						undefined,
+						observation,
+					),
+				),
+			);
+			assertActive();
+			yield [
+				...metadata.flatMap((read, index) =>
+					read.status === "rejected"
+						? [{ file: candidates[index]!.file, read }]
+						: [],
+				),
+				...reads.map((read, index) => ({
+					file: first[index]!.file,
+					read,
+				})),
+			];
+		}
+	}
+}
+
+/** Fence transfers against an intervening client connection or codec change. */
+function forceConnectionGuard(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+): () => void {
+	const version = deps.client.getReadConfigurationVersion();
+	return () => {
+		plan.assertConfiguration();
+		if (deps.client.getReadConfigurationVersion() !== version) {
+			throw new ForceConfigurationChangedError();
+		}
+	};
+}
+
 async function logicalPath(
 	path: string,
 	codec: EncryptionCodec | null,
@@ -208,6 +450,7 @@ async function logicalPath(
 async function decodeSourceContent(
 	raw: ArrayBuffer,
 	codec: EncryptionCodec | null,
+	sourcePosition?: ForceSourcePosition,
 ): Promise<ArrayBuffer> {
 	if (!codec) {
 		return raw;
@@ -215,20 +458,151 @@ async function decodeSourceContent(
 	try {
 		return await codec.decrypt(raw);
 	} catch {
+		if (sourcePosition) {
+			logger.warn("Force encrypted source verification failed", {
+				...sourcePosition,
+				decodeStage: "content",
+			});
+		}
 		throw new ForceSourceFormatError();
 	}
+}
+
+/** Retired encrypted trash cannot be classified by a plaintext Force snapshot. */
+async function assertNoRetiredTrash(
+	deps: ForceReplacementDependencies,
+	paths: string[],
+): Promise<void> {
+	const roots = new Set(
+		paths
+			.filter(mayBeEncodedVaultTrashRoot)
+			.map((path) => path.split("/", 1)[0]),
+	);
+	if (!roots.size) {
+		return;
+	}
+	const canonical = await deps.index
+		.readCanonicalIndexWithCodecIfPresent(null)
+		.catch((error: unknown) => {
+			if (
+				error instanceof LegacyIndexFormatError ||
+				error instanceof UnreadableRemoteIndexError
+			) {
+				return null;
+			}
+			throw error;
+		});
+	if (
+		canonical?.epochAdoption?.preservedRawPaths.some((path) =>
+			roots.has(path.split("/", 1)[0]),
+		) ||
+		paths.some(
+			(path) =>
+				path.includes("/") &&
+				mayBeEncodedVaultTrashRoot(path) &&
+				mayBeEncryptedPath(path) &&
+				(!canonical?.files[path] || canonical.files[path].deleted),
+		)
+	) {
+		throw new ForceScopeConflictError();
+	}
+}
+
+/** A Force epoch cannot carry the previous encryption adoption receipt. */
+async function assertForceCanReplaceReceipt(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+): Promise<void> {
+	const root = plan.recovery.remotePath;
+	const destinationCodec = plan.destinationCodec ?? null;
+	const children = await deps.client.getRawChildren(root);
+	const opaqueRoots = new Set<string>();
+	for (const child of children) {
+		const path = toLocalPath(child.path, root);
+		if (!mayBeEncryptedPath(path)) {
+			continue;
+		}
+		try {
+			EncryptionService.base64UrlDecode(path);
+		} catch {
+			continue;
+		}
+		if (
+			!destinationCodec ||
+			(await logicalPath(path, destinationCodec).catch(
+				(error: unknown) => {
+					if (error instanceof ForceSourceFormatError) {
+						return null;
+					}
+					throw error;
+				},
+			)) === null
+		) {
+			opaqueRoots.add(path);
+		}
+	}
+	if (!opaqueRoots.size) {
+		return;
+	}
+	const canonical = await deps.index
+		.readCanonicalIndexWithCodecIfPresent(destinationCodec)
+		.catch((error: unknown) => {
+			if (
+				error instanceof LegacyIndexFormatError ||
+				(!destinationCodec &&
+					error instanceof UnreadableRemoteIndexError)
+			) {
+				return null;
+			}
+			throw error;
+		});
+	for (const path of canonical?.epochAdoption?.preservedRawPaths ?? []) {
+		if (
+			!opaqueRoots.has(path.split("/", 1)[0]!) ||
+			!mayBeEncryptedPath(path)
+		) {
+			continue;
+		}
+		const raw = joinPath(root, path);
+		const resource = await deps.client.getResource(raw, 1, 0, true);
+		assertForceResourceIdentity(resource, raw);
+		if (
+			resource?.type === "file" ||
+			(resource?.type === "dir" &&
+				(
+					await deps.client.getResourcesRecursive(
+						raw,
+						true,
+						4,
+						false,
+						() => true,
+						false,
+					)
+				).length > 0)
+		) {
+			throw new ForceScopeConflictError(
+				"Force would lose the exclusion for retained ciphertext from an earlier encryption mode",
+			);
+		}
+	}
+	plan.assertConfiguration();
 }
 
 /** Prove every selected source is readable before any destination deletion. */
 async function scanSource(
 	deps: ForceReplacementDependencies,
 	plan: PreparedForceReplacement,
+	progress = deps.sourceProgress,
 ): Promise<void> {
 	const state = plan.recovery;
 	const direct = state.direct!;
 	const source: ForceSourceFile[] = [];
 	const directories: { path: string; rawPath: string }[] = [];
-	await plan.assertConfiguration();
+	const assertActive =
+		state.direction === "from_remote"
+			? forceConnectionGuard(deps, plan)
+			: plan.assertConfiguration;
+	assertActive();
 	let completed = 0;
 	if (state.direction === "from_local") {
 		const tree = await deps.adapter.getForceTree(
@@ -240,23 +614,23 @@ async function scanSource(
 					: isReplacementPath(path, plan.scope)),
 		);
 		const total = tree.directories.length + tree.files.length;
-		deps.sourceProgress?.(0, total);
+		progress?.(0, total);
 		for (const path of tree.directories) {
-			await plan.assertConfiguration();
+			plan.assertConfiguration();
 			if (plan.scope && !isReplacementPath(path, plan.scope)) {
-				deps.sourceProgress?.(++completed, total);
+				progress?.(++completed, total);
 				continue;
 			}
 			directories.push({
 				path,
 				rawPath: await physicalPath(path, plan.codec),
 			});
-			deps.sourceProgress?.(++completed, total);
+			progress?.(++completed, total);
 		}
 		for (const path of tree.files) {
-			await plan.assertConfiguration();
+			plan.assertConfiguration();
 			const content = await deps.adapter.readForceFile(path);
-			await plan.assertConfiguration();
+			plan.assertConfiguration();
 			const stat = await deps.adapter.vault.adapter.stat(path);
 			if (!stat || stat.type !== "file") {
 				throw new Error("Force local source became unavailable");
@@ -269,8 +643,9 @@ async function scanSource(
 				mtime: stat.mtime,
 				fingerprint: null,
 			});
-			deps.sourceProgress?.(++completed, total);
+			progress?.(++completed, total);
 		}
+		assertForceSourcePaths(source, directories);
 	} else {
 		const resources = await deps.client.getResourcesRecursive(
 			state.remotePath,
@@ -292,10 +667,26 @@ async function scanSource(
 			},
 			false,
 		);
-		deps.sourceProgress?.(0, resources.length);
+		assertActive();
+		if (!plan.codec) {
+			await assertNoRetiredTrash(
+				deps,
+				resources.map(({ path }) =>
+					toLocalPath(path, state.remotePath),
+				),
+			);
+		}
+		assertActive();
+		progress?.(0, resources.length);
 		const excluded = new Set<string>();
-		for (const resource of resources) {
-			await plan.assertConfiguration();
+		const selected: {
+			path: string;
+			rawPath: string;
+			size?: number;
+			position: ForceSourcePosition;
+		}[] = [];
+		for (const [index, resource] of resources.entries()) {
+			assertActive();
 			const rawPath = toLocalPath(resource.path, state.remotePath);
 			assertForcePath(rawPath);
 			if (
@@ -308,11 +699,45 @@ async function scanSource(
 						resource.type === "dir",
 					))
 			) {
-				deps.sourceProgress?.(++completed, resources.length);
+				progress?.(++completed, resources.length);
 				continue;
 			}
-			const path = await logicalPath(rawPath, plan.codec);
+			const sourcePosition: ForceSourcePosition = {
+				resourceNumber: index + 1,
+				totalResources: resources.length,
+				resourceType: resource.type,
+			};
+			const path = await logicalPath(rawPath, plan.codec).catch(
+				async (error: unknown) => {
+					assertActive();
+					if (!(error instanceof ForceSourceFormatError)) {
+						throw error;
+					}
+					if (resource.type === "dir") {
+						// A retired codec can leave empty trees. Check every raw descendant, including protected paths.
+						const files = await deps.client.getResourcesRecursive(
+							joinPath(state.remotePath, rawPath),
+							true,
+							4,
+							false,
+							() => true,
+							false,
+						);
+						assertActive();
+						if (files.length === 0) {
+							return null;
+						}
+					}
+					logger.warn("Force encrypted source verification failed", {
+						...sourcePosition,
+						decodeStage: "name",
+					});
+					throw error;
+				},
+			);
+			assertActive();
 			if (
+				path === null ||
 				!isForceSourcePath(path, direct.configDir) ||
 				(plan.scope &&
 					(resource.type === "dir"
@@ -322,7 +747,7 @@ async function scanSource(
 				if (resource.type === "dir") {
 					excluded.add(rawPath);
 				}
-				deps.sourceProgress?.(++completed, resources.length);
+				progress?.(++completed, resources.length);
 				continue;
 			}
 			if (
@@ -338,46 +763,93 @@ async function scanSource(
 				if (!plan.scope || isReplacementPath(path, plan.scope)) {
 					directories.push({ path, rawPath });
 				}
-				deps.sourceProgress?.(++completed, resources.length);
+				progress?.(++completed, resources.length);
 				continue;
 			}
-			await plan.assertConfiguration();
-			const snapshot = await deps.client.downloadStableRawFile(
-				joinPath(state.remotePath, rawPath),
-			);
-			await plan.assertConfiguration();
-			if (!snapshot) {
-				throw new Error("Force remote source became unavailable");
-			}
-			const content = await decodeSourceContent(snapshot.raw, plan.codec);
-			source.push({
+			selected.push({
 				path,
 				rawPath,
-				sha256: await computeSha256(content),
-				size: content.byteLength,
-				mtime: Date.parse(snapshot.resource.modified),
-				fingerprint: snapshot.fingerprint,
+				size: resource.size,
+				position: sourcePosition,
 			});
-			deps.sourceProgress?.(++completed, resources.length);
+		}
+		assertForceSourcePaths(selected, directories);
+		for (const window of planTransferWindows(
+			selected,
+			forceReadConcurrency(deps.settings),
+		)) {
+			assertActive();
+			let firstFailure: { reason: unknown } | undefined;
+			const outcomes = await runWithConcurrencySettled(
+				window.map(
+					({ path, rawPath, position }) =>
+						async (): Promise<ForceSourceFile> => {
+							const snapshot = await readRemoteForceSource(
+								deps,
+								plan,
+								rawPath,
+								assertActive,
+								position,
+							);
+							if (!firstFailure) {
+								progress?.(++completed, resources.length);
+							}
+							return {
+								path,
+								rawPath,
+								sha256: snapshot.sha256,
+								size: snapshot.content.byteLength,
+								mtime: Date.parse(snapshot.resource.modified),
+								fingerprint: snapshot.fingerprint,
+							};
+						},
+				),
+				window.length,
+				undefined,
+				{
+					onError: (reason) => {
+						firstFailure ??= { reason };
+					},
+				},
+			);
+			if (firstFailure) {
+				if (firstFailure.reason instanceof ForceSourceMissingError) {
+					throw new Error("Force remote source became unavailable");
+				}
+				throw firstFailure.reason;
+			}
+			for (const outcome of outcomes) {
+				if (outcome.status === "fulfilled") {
+					source.push(outcome.value);
+				}
+			}
 		}
 	}
 	source.sort((a, b) => a.path.localeCompare(b.path));
-	if (
-		hasPortablePathCollision(
-			source.map((file) => file.path),
-			directories.map((folder) => folder.path),
-		)
-	) {
-		throw new Error("Force source has ambiguous portable paths");
-	}
-	await plan.assertConfiguration();
+	const sourceDigest = await digestSource(source);
+	assertActive();
 	state.source = source;
-	state.sourceDigest = await digestSource(source);
+	state.sourceDigest = sourceDigest;
 	direct.directories = directories.sort((a, b) =>
 		a.path.localeCompare(b.path),
 	);
 	direct.pendingFiles = source.map((file) => file.path);
 	direct.pendingDirectories = directories.map((folder) => folder.path);
+}
+
+/** Reject ambiguous source paths before admitting destination work. */
+function assertForceSourcePaths(
+	files: readonly { path: string }[],
+	directories: readonly { path: string }[],
+): void {
+	if (
+		hasPortablePathCollision(
+			files.map((file) => file.path),
+			directories.map((folder) => folder.path),
+		)
+	) {
+		throw new Error("Force source has ambiguous portable paths");
+	}
 }
 
 /** Choose a source codec without decoding the old destination index. */
@@ -530,6 +1002,7 @@ export async function prepareForceReplacement(
 			pendingFiles: [],
 			pendingDirectories: [],
 			canonicalReset: false,
+			trashExcluded: true,
 		},
 	};
 	const plan: PreparedForceReplacement = {
@@ -539,7 +1012,7 @@ export async function prepareForceReplacement(
 		scope,
 		destinationCodec,
 		destinationManifest,
-		assertConfiguration: async () => {
+		assertConfiguration: () => {
 			if (
 				deps.isCancelled?.() ||
 				deps.settings.remotePath !== remotePath ||
@@ -551,24 +1024,32 @@ export async function prepareForceReplacement(
 					JSON.stringify(scope.excludePatterns) ||
 				deps.settings.syncDotObsidian !== scope.syncDotObsidian
 			) {
-				throw new Error("Force connection changed or plugin unloaded");
+				throw new ForceConfigurationChangedError();
 			}
 		},
 	};
+	await assertForceCanReplaceReceipt(deps, plan);
 	await scanSource(deps, plan);
 	await prepareDeletion(deps, plan);
 	return plan;
 }
 
-/** Resume direct progress only; old scoped checkpoints require a new explicit replacement. */
+/** Resume only direct progress whose explicit actions were saved at apply time. */
 export async function resumeForceReplacement(
 	deps: ForceReplacementDependencies,
 	recovery: ForceRecovery,
 ): Promise<PreparedForceReplacement> {
+	const token = deps.settings.yandexTokenSecret;
+	const configuration = deps.client.getReadConfigurationVersion();
 	assertForceRecovery(recovery);
 	if (!recovery.direct) {
 		throw new Error(
 			"Legacy Force recovery requires a new full replacement confirmation",
+		);
+	}
+	if (recovery.phase === "prepared") {
+		throw new ForceRecoveryPendingError(
+			"The saved Force has no confirmed replacement scope; prepare and confirm a new replacement",
 		);
 	}
 	if (
@@ -593,7 +1074,16 @@ export async function resumeForceReplacement(
 	) {
 		throw new Error("Force recovery encryption parameters are invalid");
 	}
-	const token = deps.settings.yandexTokenSecret;
+	await assertForceRemainderScope(deps, recovery, codec);
+	if (
+		deps.isCancelled?.() ||
+		deps.settings.yandexTokenSecret !== token ||
+		deps.settings.remotePath !== recovery.remotePath ||
+		deps.adapter.vault.configDir !== recovery.direct.configDir ||
+		deps.client.getReadConfigurationVersion() !== configuration
+	) {
+		throw new Error("Force recovery connection changed during preparation");
+	}
 	logger.info("Direct Force recovery prepared", {
 		operationId: shortenDiagnosticValue(recovery.id),
 		direction: recovery.direction,
@@ -607,19 +1097,94 @@ export async function resumeForceReplacement(
 		recovery,
 		codec,
 		password: recovery.password,
-		assertConfiguration: async () => {
+		assertConfiguration: () => {
 			if (
 				deps.isCancelled?.() ||
 				deps.settings.remotePath !== recovery.remotePath ||
 				deps.settings.yandexTokenSecret !== token ||
 				deps.adapter.vault.configDir !== recovery.direct!.configDir
 			) {
-				throw new Error(
-					"Force recovery connection changed or plugin unloaded",
-				);
+				throw new ForceConfigurationChangedError();
 			}
 		},
 	};
+}
+
+/** Reject old checkpoints that would act outside today's protected replacement scope. */
+async function assertForceRemainderScope(
+	deps: ForceReplacementDependencies,
+	state: ForceRecovery,
+	codec: EncryptionCodec | null,
+): Promise<void> {
+	const direct = state.direct!;
+	const incompatible = () =>
+		new ForceRecoveryPendingError(
+			"The saved Force includes protected or unavailable paths; prepare and confirm a new replacement",
+		);
+	if (
+		[
+			...state.source.map(({ path }) => path),
+			...direct.directories.map(({ path }) => path),
+			...direct.pendingDeletes.map(({ path }) => path),
+		].some(isVaultTrashPath)
+	) {
+		throw incompatible();
+	}
+	const remoteDeletes = direct.pendingDeletes.filter(
+		({ location, path }) =>
+			location === "remote" && mayBeEncodedVaultTrashRoot(path),
+	);
+	if (
+		!direct.trashExcluded &&
+		remoteDeletes.length > 0 &&
+		!codec &&
+		state.direction === "from_local" &&
+		(direct.canonicalReset ||
+			(await deps.index.downloadEncryptionManifest()))
+	) {
+		throw incompatible();
+	}
+	if (codec) {
+		for (const root of new Set(
+			remoteDeletes.map(({ path }) => path.split("/", 1)[0]!),
+		)) {
+			const decoded = await codec.decryptFilename(root).catch(() => null);
+			if (decoded !== null && isVaultTrashPath(decoded)) {
+				throw incompatible();
+			}
+		}
+	}
+	if (
+		state.direction === "from_remote" &&
+		(direct.pendingDeletes.some(({ location }) => location === "local") ||
+			direct.pendingFiles.length ||
+			direct.pendingDirectories.length)
+	) {
+		const { files, directories } = await deps.adapter.getForceTree(false);
+		const unindexed = (path: string) =>
+			!deps.adapter.vault.getAbstractFileByPath(path);
+		const unavailableFiles = files.filter(unindexed);
+		const unavailableDirs = directories.filter(unindexed);
+		const deleted = direct.pendingDeletes.filter(
+			({ location }) => location === "local",
+		);
+		if (
+			[...unavailableFiles, ...unavailableDirs].some((path) =>
+				deleted.some(
+					(action) =>
+						action.path === path ||
+						path.startsWith(`${action.path}/`),
+				),
+			) ||
+			hasPortablePathCollision(
+				direct.pendingFiles,
+				direct.pendingDirectories,
+				{ files: unavailableFiles, directories: unavailableDirs },
+			)
+		) {
+			throw incompatible();
+		}
+	}
 }
 
 /** Create a missing root without using old baseline identity as admission authority. */
@@ -627,7 +1192,7 @@ export async function ensureForceRoot(
 	deps: ForceReplacementDependencies,
 	plan: PreparedForceReplacement,
 ): Promise<void> {
-	await plan.assertConfiguration();
+	plan.assertConfiguration();
 	await deps.index.withForceScope(plan.recovery, async () => {
 		await deps.client.createFolderRecursive(plan.recovery.remotePath);
 		const root = await deps.client.getResource(
@@ -650,7 +1215,7 @@ function forceIndex(
 	final = false,
 ): SyncIndex {
 	const index = createEmptyIndex(deps.settings.deviceId, state.epoch);
-	index.revision = final ? 3 : 1;
+	index.revision = final ? (state.completion?.revision ?? 3) : 1;
 	index.files = structuredClone(state.files);
 	if (!final) {
 		index.maintenance = {
@@ -668,6 +1233,17 @@ function forceIndex(
 		};
 	}
 	return index;
+}
+
+/** A raw-only file can be acknowledged only when no write is needed. */
+async function assertRetainedForceFileMatches(
+	adapter: VaultAdapter,
+	path: string,
+	sha256: string,
+): Promise<void> {
+	if ((await computeSha256(await adapter.readForceFile(path))) !== sha256) {
+		throw new ForceScopeConflictError();
+	}
 }
 
 /** Freeze selected deletes while retaining every excluded or protected descendant. */
@@ -710,19 +1286,31 @@ async function prepareScopedDeletion(
 			path: toLocalPath(entry.path, state.remotePath),
 			kind: entry.type,
 		}));
+		if (!codec) {
+			await assertNoRetiredTrash(
+				deps,
+				entries.map(({ path }) => path),
+			);
+		}
 	}
 	const removable = new Set<string>();
 	const collapsible = new Set<string>();
+	const unindexedLocal = new Set<string>();
 	const logicalEntries = new Map<string, RecursiveDeleteAction>();
 	for (const entry of [...entries].sort((a, b) =>
 		a.path.localeCompare(b.path),
 	)) {
-		await plan.assertConfiguration();
-		if (isPreservedRawPath(entry.path, [...preserved])) {
+		plan.assertConfiguration();
+		if (!local && isPreservedRawPath(entry.path, [...preserved])) {
 			continue;
 		}
 		const path = await logicalPath(entry.path, codec);
 		logicalEntries.set(path, entry);
+		if (local && !deps.adapter.vault.getAbstractFileByPath(path)) {
+			preserved.add(path);
+			unindexedLocal.add(path);
+			continue;
+		}
 		const selected =
 			isForceSourcePath(path, scope.configDir) &&
 			isReplacementPath(path, scope);
@@ -752,24 +1340,55 @@ async function prepareScopedDeletion(
 	}
 	// A selected file must not recursively replace a directory holding excluded data.
 	for (const file of [
-		...state.source.map((file) => ({ ...file, kind: "file" })),
+		...state.source.map((file) => ({ ...file, kind: "file" as const })),
 		...state.direct!.directories.map((folder) => ({
 			...folder,
-			kind: "dir",
+			kind: "dir" as const,
 		})),
 	]) {
 		const targetPath = local ? file.path : file.rawPath;
 		if (
-			[...preserved].some(
-				(path) =>
+			[...preserved].some((path) => {
+				const retained = local ? logicalEntries.get(path) : undefined;
+				if (unindexedLocal.has(path)) {
+					if (
+						retained?.kind === "dir" &&
+						targetPath.startsWith(`${path}/`)
+					) {
+						return false;
+					}
+					if (targetPath === path && retained?.kind === file.kind) {
+						return false;
+					}
+				}
+				return (
 					targetPath === path ||
 					targetPath.startsWith(`${path}/`) ||
-					(file.kind === "file" && path.startsWith(`${targetPath}/`)),
-			)
+					(file.kind === "file" &&
+						path.startsWith(`${targetPath}/`)) ||
+					(retained !== undefined &&
+						hasPortablePathCollision(
+							[file, retained]
+								.filter(({ kind }) => kind === "file")
+								.map(({ path }) => path),
+							[file, retained]
+								.filter(({ kind }) => kind === "dir")
+								.map(({ path }) => path),
+						))
+				);
+			})
 		) {
 			throw new ForceScopeConflictError();
 		}
 		const target = logicalEntries.get(file.path);
+		if (file.kind === "file" && unindexedLocal.has(targetPath)) {
+			await assertRetainedForceFileMatches(
+				deps.adapter,
+				file.path,
+				file.sha256,
+			);
+			plan.assertConfiguration();
+		}
 		if (
 			file.kind === "file" &&
 			target?.kind === "dir" &&
@@ -835,33 +1454,38 @@ async function prepareDeletion(
 		direct.pendingDeletes = planRecursiveDeletes(
 			entries,
 			new Set(entries.map((entry) => entry.path)),
-			new Set([".backup", indexName, manifestName]),
+			new Set([
+				".backup",
+				indexName,
+				manifestName,
+				...entries
+					.filter(({ path }) => isVaultTrashPath(path))
+					.map(({ path }) => path),
+			]),
 		).map((entry) => ({ ...entry, location: "remote" }));
 	} else {
 		const tree = await deps.adapter.getForceTree(false);
-		const directories = tree.directories.filter(
-			(path) => !containsForceLocalPreservedPath(path, direct.configDir),
-		);
-		const top = directories.filter(
-			(path) =>
-				!directories.some((parent) => path.startsWith(parent + "/")),
-		);
-		direct.pendingDeletes = [
-			...top.map((path) => ({
-				path,
-				location: "local" as const,
-				kind: "dir" as const,
-			})),
-			...tree.files
+		const entries = [
+			...tree.directories.map((path) => ({ path, kind: "dir" as const })),
+			...tree.files.map((path) => ({ path, kind: "file" as const })),
+		];
+		const preserved = new Set(
+			entries
 				.filter(
-					(path) =>
-						!top.some((parent) => path.startsWith(parent + "/")),
+					({ path }) =>
+						!deps.adapter.vault.getAbstractFileByPath(path),
 				)
-				.map((path) => ({
-					path,
-					location: "local" as const,
-					kind: "file" as const,
-				})),
+				.map(({ path }) => path),
+		);
+		const removable = new Set(entries.map(({ path }) => path));
+		direct.pendingDeletes = [
+			...planRecursiveDeletes(
+				entries,
+				removable,
+				preserved,
+				(path) =>
+					!containsForceLocalPreservedPath(path, direct.configDir),
+			).map((entry) => ({ ...entry, location: "local" as const })),
 			...(await deps.client.getRawChildren(state.remotePath))
 				.filter((entry) =>
 					toLocalPath(entry.path, state.remotePath).startsWith(
@@ -960,7 +1584,7 @@ async function verifyUpload(
 	deps: ForceReplacementDependencies,
 	path: string,
 	content: ArrayBuffer,
-): Promise<Awaited<ReturnType<YandexDiskClient["getResource"]>>> {
+): Promise<YandexResource> {
 	const hash = await computeSha256(content);
 	const resource = await deps.client.getResource(path, 1, 0, true);
 	if (resource?.type !== "file") {
@@ -981,160 +1605,86 @@ async function verifyUpload(
 	return resource;
 }
 
-/** Transfer one file directly and record only the bytes that actually reached its destination. */
-async function transferFile(
+interface VerifiedForceCopy {
+	sha256: string;
+	size: number;
+	resource: YandexResource;
+	rawSha256?: string;
+}
+
+/** Transfer one file directly and return the identity of the verified destination bytes. */
+async function uploadForceFile(
 	deps: ForceReplacementDependencies,
 	plan: PreparedForceReplacement,
 	file: ForceSourceFile,
-): Promise<boolean> {
+): Promise<VerifiedForceCopy> {
 	const state = plan.recovery;
-	let copied = true;
 	let content: ArrayBuffer;
-	let resource: Awaited<ReturnType<YandexDiskClient["getResource"]>>;
-	if (state.direction === "from_local") {
-		const path = joinPath(state.remotePath, file.rawPath);
-		if (
-			(await deps.adapter.vault.adapter.stat(file.path))?.type !== "file"
-		) {
-			const recovered = await deps.client.downloadStableRawFile(path);
-			if (!recovered) {
-				throw new ForceSourceMissingError();
-			}
-			content = await decodeSourceContent(recovered.raw, plan.codec);
-			if ((await computeSha256(content)) !== file.sha256) {
-				throw new ConcurrentSyncChangeError(
-					"Force destination does not match the missing source",
-				);
-			}
-			resource = recovered.resource;
-			setRecordValue(
-				state.targetHashes,
-				file.rawPath,
-				await computeSha256(recovered.raw),
-			);
-		} else {
-			content = await deps.adapter.readForceFile(file.path);
-			const raw = plan.codec
-				? await plan.codec.encrypt(content)
-				: content;
-			const parent = getDirectory(file.rawPath);
-			if (parent) {
-				await ensureRemoteDirectory(
-					deps,
-					state.remotePath,
-					parent,
-					() => plan.assertConfiguration(),
-				);
-			}
-			if (
-				(await deps.client.getResource(path, 1, 0, true))?.type ===
-				"dir"
-			) {
-				throw new ForceScopeConflictError();
-			}
-			let uploadError: unknown;
-			try {
-				await deps.client.uploadFile(path, raw, true, true, true, () =>
-					plan.assertConfiguration(),
-				);
-			} catch (error) {
-				uploadError = error;
-			}
-			try {
-				resource = await verifyUpload(deps, path, raw);
-			} catch (error) {
-				throw uploadError instanceof Error ? uploadError : error;
-			}
-			setRecordValue(
-				state.targetHashes,
-				file.rawPath,
-				await computeSha256(raw),
-			);
-		}
-	} else {
-		let source;
-		try {
-			source = await deps.client.downloadStableRawFile(
-				joinPath(state.remotePath, file.rawPath),
-			);
-		} catch (error) {
-			if (
-				error instanceof ConcurrentSyncChangeError &&
-				error.observation === "missing"
-			) {
-				throw new ForceSourceMissingError();
-			}
-			if (
-				findErrorCause(
-					error,
-					(cause) =>
-						cause instanceof RemoteHttpError &&
-						cause.status === 404,
-				)
-			) {
-				throw new ForceSourceMissingError();
-			}
-			throw error;
-		}
-		if (!source) {
+	let raw: ArrayBuffer;
+	let resource: YandexResource;
+	const path = joinPath(state.remotePath, file.rawPath);
+	if ((await deps.adapter.vault.adapter.stat(file.path))?.type !== "file") {
+		const recovered = await deps.client.downloadStableRawFile(path);
+		if (!recovered) {
 			throw new ForceSourceMissingError();
 		}
-		content = await decodeSourceContent(source.raw, plan.codec);
-		resource = source.resource;
-		if (
-			(await deps.adapter.vault.adapter.stat(file.path))?.type ===
-			"folder"
-		) {
-			throw new ForceScopeConflictError();
-		}
-		const awaitingPurge = state.direct!.pendingDeletes.some(
-			(action) =>
-				action.location === "local" &&
-				(file.path === action.path ||
-					file.path.startsWith(`${action.path}/`)),
-		);
-		copied = !(
-			deps.hasLocalChanges?.(
-				file.path,
-				state.watcherBoundary ?? emptyWatcherBoundary,
-			) ||
-			(!awaitingPurge &&
-				!state.files[file.path] &&
-				(await deps.adapter.vault.adapter.exists(file.path)))
-		);
-		if (copied) {
-			await deps.adapter.writeForceFile(
-				file.path,
-				content,
-				async () => {
-					await plan.assertConfiguration();
-					if (
-						deps.hasLocalChanges?.(
-							file.path,
-							state.watcherBoundary ?? emptyWatcherBoundary,
-						)
-					) {
-						throw new ConcurrentSyncChangeError(
-							"Force destination changed before copying",
-						);
-					}
-				},
-				() => deps.expectWatcherEvent?.(file.path, "upload"),
+		content = await decodeSourceContent(recovered.raw, plan.codec);
+		if ((await computeSha256(content)) !== file.sha256) {
+			throw new ConcurrentSyncChangeError(
+				"Force destination does not match the missing source",
 			);
 		}
-		if (
-			copied &&
-			(await computeSha256(
-				await deps.adapter.readForceFile(file.path),
-			)) !== (await computeSha256(content))
-		) {
-			throw new Error("Force local write was not confirmed");
+		resource = recovered.resource;
+		raw = recovered.raw;
+	} else {
+		content = await deps.adapter.readForceFile(file.path);
+		raw = plan.codec ? await plan.codec.encrypt(content) : content;
+		const parent = getDirectory(file.rawPath);
+		if (parent) {
+			await ensureRemoteDirectory(
+				deps,
+				state.remotePath,
+				parent,
+				async () => plan.assertConfiguration(),
+			);
+		}
+		if ((await deps.client.getResource(path, 1, 0, true))?.type === "dir") {
+			throw new ForceScopeConflictError();
+		}
+		let uploadError: unknown;
+		try {
+			await deps.client.uploadFile(
+				path,
+				raw,
+				true,
+				true,
+				true,
+				async () => plan.assertConfiguration(),
+			);
+		} catch (error) {
+			uploadError = error;
+		}
+		try {
+			resource = await verifyUpload(deps, path, raw);
+		} catch (error) {
+			throw uploadError instanceof Error ? uploadError : error;
 		}
 	}
-	file.sha256 = await computeSha256(content);
-	file.size = content.byteLength;
-	state.sourceDigest = await digestSource(state.source);
-	setRecordValue(state.files, file.path, {
+	return {
+		sha256: await computeSha256(content),
+		size: content.byteLength,
+		resource,
+		rawSha256: await computeSha256(raw),
+	};
+}
+
+/** Build the same canonical metadata for a verified copy or preserved late edit. */
+function forceFileMetadata(
+	deps: ForceReplacementDependencies,
+	file: ForceSourceFile,
+	resource: YandexResource | null,
+): FileMetadata {
+	return {
 		path: file.path,
 		sha256: file.sha256,
 		size: file.size,
@@ -1147,19 +1697,194 @@ async function transferFile(
 		mutationSeq: 0,
 		baseRevision: 0,
 		changedRevision: 1,
+	};
+}
+
+/** Apply a prefetched copy only against current Vault state and verify its output. */
+async function writeRemoteForceFile(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+	file: ForceSourceFile,
+	source: Awaited<ReturnType<typeof readRemoteForceSource>>,
+	assertActive: () => void,
+): Promise<"copied" | "already-copied" | "preserved"> {
+	const state = plan.recovery;
+	const stat = await deps.adapter.vault.adapter.stat(file.path);
+	assertActive();
+	if (stat && stat.type !== "file") {
+		throw new ForceScopeConflictError();
+	}
+	if (stat && !deps.adapter.vault.getAbstractFileByPath(file.path)) {
+		await assertRetainedForceFileMatches(
+			deps.adapter,
+			file.path,
+			source.sha256,
+		);
+		assertActive();
+		return "already-copied";
+	}
+	const hasLocalChanges = () =>
+		deps.hasLocalChanges?.(
+			file.path,
+			state.watcherBoundary ?? emptyWatcherBoundary,
+		);
+	if (hasLocalChanges()) {
+		return "preserved";
+	}
+	if (
+		!getRecordValue(state.files, file.path) &&
+		(await deps.adapter.vault.adapter.exists(file.path))
+	) {
+		if (stat?.type === "file") {
+			const local = await deps.adapter.readForceFile(file.path);
+			if ((await computeSha256(local)) === source.sha256) {
+				return "already-copied";
+			}
+		}
+		return "preserved";
+	}
+	await deps.adapter.writeForceFile(
+		file.path,
+		source.content,
+		() => {
+			assertActive();
+			if (hasLocalChanges()) {
+				throw new ConcurrentSyncChangeError(
+					"Force destination changed before copying",
+				);
+			}
+		},
+		() => deps.expectWatcherEvent?.(file.path, "upload"),
+	);
+	if (
+		(await computeSha256(await deps.adapter.readForceFile(file.path))) !==
+		source.sha256
+	) {
+		throw new Error("Force local write was not confirmed");
+	}
+	return "copied";
+}
+
+/** Retire a missing source only after a readable root and repeated absence observations. */
+async function confirmForceSourceAbsent(
+	deps: ForceReplacementDependencies,
+	plan: PreparedForceReplacement,
+	file: ForceSourceFile,
+	assertActive = plan.assertConfiguration,
+): Promise<boolean> {
+	const state = plan.recovery;
+	assertActive();
+	let absent = false;
+	if (state.direction === "from_local") {
+		const stat = () => deps.adapter.vault.adapter.stat(file.path);
+		if ((await stat())?.type !== "file") {
+			await deps.adapter.vault.adapter.list("");
+			absent = (await stat())?.type !== "file";
+		}
+	} else {
+		const root = await deps.client.getResource(
+			state.remotePath,
+			1,
+			0,
+			true,
+		);
+		assertForceResourceIdentity(root, state.remotePath);
+		if (root?.type === "dir" && root.resource_id === state.rootResourceId) {
+			const sourcePath = joinPath(state.remotePath, file.rawPath);
+			const stat = async () => {
+				assertActive();
+				const resource = await deps.client.getResource(
+					sourcePath,
+					1,
+					0,
+					true,
+				);
+				assertForceResourceIdentity(resource, sourcePath);
+				return resource;
+			};
+			absent =
+				(await stat())?.type !== "file" &&
+				(await stat())?.type !== "file";
+		}
+	}
+	assertActive();
+	return absent;
+}
+
+/** Save a verified copy or confirmed absence before retiring the path in memory. */
+async function persistForceFileOutcome(
+	deps: ForceReplacementDependencies,
+	state: ForceRecovery,
+	file: ForceSourceFile,
+	copy: VerifiedForceCopy | null,
+	assertActive: () => void,
+): Promise<void> {
+	const direct = state.direct!;
+	const verified = copy && {
+		...file,
+		sha256: copy.sha256,
+		size: copy.size,
+	};
+	const source = !verified
+		? state.source.filter((entry) => entry.path !== file.path)
+		: verified.sha256 !== file.sha256 || verified.size !== file.size
+			? state.source.map((entry) =>
+					entry.path === file.path ? verified : entry,
+				)
+			: state.source;
+	const sourceDigest =
+		source === state.source
+			? state.sourceDigest
+			: await digestSource(source);
+	const files = protectRecord({ ...state.files });
+	const targetHashes = protectRecord({ ...state.targetHashes });
+	if (verified && copy) {
+		setRecordValue(
+			files,
+			file.path,
+			forceFileMetadata(deps, verified, copy.resource),
+		);
+		if (copy.rawSha256 !== undefined) {
+			setRecordValue(targetHashes, file.rawPath, copy.rawSha256);
+		}
+	} else {
+		delete files[file.path];
+		delete targetHashes[file.rawPath];
+	}
+	const pendingFiles = direct.pendingFiles.filter(
+		(path) => path !== file.path,
+	);
+	assertActive();
+	await deps.persist({
+		...state,
+		source,
+		sourceDigest,
+		files,
+		targetHashes,
+		direct: { ...direct, pendingFiles },
 	});
-	return copied;
+	state.source = source;
+	state.sourceDigest = sourceDigest;
+	state.files = files;
+	state.targetHashes = targetHashes;
+	direct.pendingFiles = pendingFiles;
 }
 
 /** Preserve covered watcher boundaries and clear old history only after a confirmed final publication. */
 async function finishForceReplacement(
 	deps: ForceReplacementDependencies,
 	plan: PreparedForceReplacement,
+	assertActive: () => void,
+	observed?: SyncIndex,
 ): Promise<void> {
 	const state = plan.recovery;
-	const canonical = forceIndex(deps, state, true);
-	canonical.revision = state.completion!.revision;
-	deps.index.finishForceReplacement(canonical, state.rootResourceId!);
+	const baseline = forceIndex(deps, state, true);
+	assertActive();
+	deps.index.finishForceReplacement(
+		observed ?? baseline,
+		state.rootResourceId!,
+		baseline,
+	);
 	deps.settings.enableEncryption = state.target.enabled;
 	deps.settings.encryptionPassword = plan.password;
 	deps.settings.encryptionSalt = state.target.salt;
@@ -1171,6 +1896,7 @@ async function finishForceReplacement(
 		state.watcherCutoff,
 		state.watcherBoundary,
 	);
+	assertActive();
 	await deps.persist(null);
 }
 
@@ -1182,7 +1908,7 @@ async function assertSourceEncryptionCurrent(
 	if (plan.recovery.direction !== "from_remote") {
 		if (plan.scope) {
 			const current = await deps.index.downloadEncryptionManifest();
-			await plan.assertConfiguration();
+			plan.assertConfiguration();
 			if (
 				JSON.stringify(current) !==
 				JSON.stringify(plan.destinationManifest)
@@ -1195,7 +1921,7 @@ async function assertSourceEncryptionCurrent(
 		return;
 	}
 	const manifest = await deps.index.downloadEncryptionManifest();
-	await plan.assertConfiguration();
+	plan.assertConfiguration();
 	const target = plan.recovery.target;
 	if (
 		Boolean(manifest) !== target.enabled ||
@@ -1245,15 +1971,22 @@ export async function applyForceReplacement(
 	logger.info("Direct Force applying", diagnostic());
 	let failed = false;
 	try {
+		plan.assertConfiguration();
+		deps.client.setEncryptionService(plan.codec);
+		// Installing the output codec starts this invocation's connection lifetime.
+		const assertActive = forceConnectionGuard(deps, plan);
 		const attempt = async (
 			path: string,
 			operation: () => Promise<void>,
 		): Promise<boolean> => {
 			try {
-				await plan.assertConfiguration();
+				assertActive();
 				await operation();
 				return true;
 			} catch (error) {
+				if (error instanceof ForceConfigurationChangedError) {
+					throw error;
+				}
 				if (isConcurrentSyncChange(error)) {
 					return false;
 				}
@@ -1263,17 +1996,88 @@ export async function applyForceReplacement(
 				return false;
 			}
 		};
-		await plan.assertConfiguration();
-		deps.client.setEncryptionService(plan.codec);
-		if (state.completion) {
-			await finishForceReplacement(deps, plan);
-			result.completed = true;
+		const pendingActions = () =>
+			direct.pendingDeletes.length +
+			direct.pendingFiles.length +
+			direct.pendingDirectories.length;
+		let observedFinal: SyncIndex | undefined;
+		const publishFinal = async () => {
+			const expected = forceIndex(deps, state, true);
+			const inspect = () =>
+				deps.index.readDirectForcePublication(
+					state,
+					expected,
+					plan.codec,
+					assertActive,
+				);
+			let completion: NonNullable<ForceRecovery["completion"]>;
+			try {
+				completion = await deps.index.publishDirectForceCanonical(
+					expected,
+					plan.codec,
+					false,
+					async () => {
+						if (!(await inspect()).maintenance) {
+							throw new ForceRecoveryPendingError(
+								"The final Force publication has already advanced",
+							);
+						}
+					},
+				);
+			} catch (error) {
+				assertActive();
+				const current = await inspect();
+				if (current.maintenance) {
+					throw error;
+				}
+				observedFinal = current;
+				return;
+			}
+			assertActive();
+			await deps.persist({ ...state, completion });
+			state.completion = completion;
+		};
+		if (
+			state.completion ||
+			(direct.stage === "publishing" && !pendingActions())
+		) {
+			const baseline = forceIndex(deps, state, true);
+			result.completed = await attempt(indexName, async () => {
+				const observed = await deps.index.readDirectForcePublication(
+					state,
+					baseline,
+					plan.codec,
+					assertActive,
+				);
+				assertActive();
+				if (observed.maintenance) {
+					await deps.index.withForceScope(state, () =>
+						deps.client.withWriteGuard(assertActive, publishFinal),
+					);
+				} else {
+					observedFinal = observed;
+				}
+				await finishForceReplacement(
+					deps,
+					plan,
+					assertActive,
+					observedFinal,
+				);
+			});
 			return result;
 		}
 		if (state.phase === "prepared") {
 			await assertSourceEncryptionCurrent(deps, plan);
-			await scanSource(deps, plan);
+			await scanSource(
+				deps,
+				plan,
+				state.direction === "from_remote" && deps.progress
+					? (completed, total) =>
+							deps.progress?.("validating", completed, total)
+					: deps.sourceProgress,
+			);
 			await assertSourceEncryptionCurrent(deps, plan);
+			await assertForceCanReplaceReceipt(deps, plan);
 			if (choice === "with-backup") {
 				const proof = state.backupProof;
 				if (!proof) {
@@ -1294,16 +2098,18 @@ export async function applyForceReplacement(
 				}
 			}
 			state.backupMode = choice;
-			await ensureForceRoot(deps, plan);
+			await deps.client.withWriteGuard(assertActive, () =>
+				ensureForceRoot(deps, plan),
+			);
 			await prepareDeletion(deps, plan);
+			assertActive();
 			state.phase = "applying";
 			await deps.persist(state);
 			logger.info("Direct Force phase saved", diagnostic());
 		}
 		assertForceRecovery(state);
 		deps.client.clearFolderCache();
-		await deps.index.withForceScope(state, async () => {
-			deps.client.setEncryptionService(plan.codec);
+		const apply = async (): Promise<boolean> => {
 			if (!direct.canonicalReset) {
 				await attempt(indexName, async () => {
 					await deps.index.publishDirectForceCanonical(
@@ -1316,6 +2122,14 @@ export async function applyForceReplacement(
 				});
 			}
 			await attempt(manifestName, () => publishManifest(deps, plan));
+			const destination =
+				state.direction === "from_local" ? "remote" : "local";
+			const destinationKey = (path: string) =>
+				destination === "remote" ? path : getPortablePathKey(path);
+			const copyKey = (entry: { path: string; rawPath: string }) =>
+				destinationKey(
+					destination === "remote" ? entry.rawPath : entry.path,
+				);
 			const deletions = [...direct.pendingDeletes];
 			for (const [position, action] of deletions.entries()) {
 				deps.progress?.("cleanup", position, deletions.length);
@@ -1387,30 +2201,23 @@ export async function applyForceReplacement(
 						await deps.persist(state);
 						return;
 					}
-					const affected = state.source.filter(
-						(file) =>
-							(action.location === "local"
-								? file.path
-								: file.rawPath) === action.path ||
-							(action.location === "local"
-								? file.path
-								: file.rawPath
-							).startsWith(action.path + "/"),
-					);
-					for (const file of affected) {
+					const deletion = destinationKey(action.path);
+					const affected = (entry: {
+						path: string;
+						rawPath: string;
+					}) =>
+						action.location === destination &&
+						isPathInsideFolder(copyKey(entry), deletion);
+					for (const file of state.source.filter(affected)) {
 						if (!direct.pendingFiles.includes(file.path)) {
 							direct.pendingFiles.push(file.path);
 						}
 						delete state.files[file.path];
 					}
-					for (const directory of direct.directories) {
-						const path =
-							action.location === "local"
-								? directory.path
-								: directory.rawPath;
+					for (const directory of direct.directories.filter(
+						affected,
+					)) {
 						if (
-							(path === action.path ||
-								path.startsWith(action.path + "/")) &&
 							!direct.pendingDirectories.includes(directory.path)
 						) {
 							direct.pendingDirectories.push(directory.path);
@@ -1419,17 +2226,56 @@ export async function applyForceReplacement(
 					await deps.persist(state);
 					if (action.location === "remote") {
 						const path = joinPath(state.remotePath, action.path);
-						await deps.client.deleteResource(path, true, true, () =>
-							plan.assertConfiguration(),
+						const absent = new Error(
+							"Force deletion target is already absent",
 						);
-						if (await deps.client.getResource(path, 1, 0, true)) {
-							throw new Error("Force deletion was not confirmed");
+						try {
+							await deps.client.deleteResource(
+								path,
+								true,
+								true,
+								async () => {
+									assertActive();
+									const target =
+										await deps.client.getResource(
+											path,
+											1,
+											0,
+											true,
+										);
+									assertActive();
+									if (target === null) {
+										throw absent;
+									}
+									assertForceResourceIdentity(target, path);
+									if (target.type !== action.kind) {
+										throw new ForceScopeConflictError();
+									}
+								},
+							);
+							if (
+								(await deps.client.getResource(
+									path,
+									1,
+									0,
+									true,
+								)) !== null
+							) {
+								throw new Error(
+									"Force deletion was not confirmed",
+								);
+							}
+						} catch (error) {
+							if (error !== absent) {
+								throw error;
+							}
 						}
+						assertActive();
 					} else {
 						await deps.adapter.deleteForcePath(
 							action.path,
-							async () => {
-								await plan.assertConfiguration();
+							async () => () => {
+								assertActive();
 								if (
 									deps.hasLocalChanges?.(
 										action.path,
@@ -1448,13 +2294,6 @@ export async function applyForceReplacement(
 									"delete",
 								),
 						);
-						if (
-							await deps.adapter.vault.adapter.exists(action.path)
-						) {
-							throw new Error(
-								"Force local deletion was not confirmed",
-							);
-						}
 					}
 					direct.pendingDeletes = direct.pendingDeletes.filter(
 						(entry) => entry !== action,
@@ -1467,21 +2306,36 @@ export async function applyForceReplacement(
 			if (await attempt("", () => deps.persist(state))) {
 				logger.info("Direct Force phase saved", diagnostic());
 			}
+			const pendingPurge = direct.pendingDeletes
+				.filter(({ location }) => location === destination)
+				.map(({ path }) => destinationKey(path));
+			const canCopy = (entry: { path: string; rawPath: string }) => {
+				const path = copyKey(entry);
+				return !pendingPurge.some(
+					(deletion) =>
+						isPathInsideFolder(path, deletion) ||
+						isPathInsideFolder(deletion, path),
+				);
+			};
 			for (const path of [...direct.pendingDirectories]) {
+				const directory = direct.directories.find(
+					(entry) => entry.path === path,
+				)!;
+				if (!canCopy(directory)) {
+					continue;
+				}
 				await attempt(path, async () => {
-					const directory = direct.directories.find(
-						(entry) => entry.path === path,
-					)!;
 					if (state.direction === "from_local") {
 						await ensureRemoteDirectory(
 							deps,
 							state.remotePath,
 							directory.rawPath,
-							() => plan.assertConfiguration(),
+							async () => plan.assertConfiguration(),
 						);
 					} else {
-						await deps.adapter.createForceDirectory(path, () =>
-							plan.assertConfiguration(),
+						await deps.adapter.createForceDirectory(
+							path,
+							assertActive,
 						);
 					}
 					direct.pendingDirectories =
@@ -1491,137 +2345,172 @@ export async function applyForceReplacement(
 					await deps.persist(state);
 				});
 			}
-			const pending = [...direct.pendingFiles];
-			for (const [position, path] of pending.entries()) {
-				deps.progress?.("applying", position, pending.length);
-				await attempt(path, async () => {
-					const file = state.source.find(
-						(entry) => entry.path === path,
-					)!;
-					let copied;
-					try {
-						copied = await transferFile(deps, plan, file);
-					} catch (error) {
-						if (!(error instanceof ForceSourceMissingError)) {
-							throw error;
-						}
-						await plan.assertConfiguration();
-						let absent = false;
-						if (state.direction === "from_local") {
-							if (
-								(await deps.adapter.vault.adapter.stat(path))
-									?.type !== "file"
-							) {
-								await deps.adapter.vault.adapter.list("");
-								absent =
-									(
-										await deps.adapter.vault.adapter.stat(
-											path,
-										)
-									)?.type !== "file";
-							}
-						} else {
-							const root = await deps.client.getResource(
-								state.remotePath,
-								1,
-								0,
-								true,
-							);
-							if (
-								root?.type === "dir" &&
-								root.resource_id === state.rootResourceId
-							) {
-								const sourcePath = joinPath(
-									state.remotePath,
-									file.rawPath,
+			const source = new Map(
+				state.source.map((file) => [file.path, file]),
+			);
+			const pending = direct.pendingFiles
+				.map((path) => source.get(path)!)
+				.filter(canCopy);
+			if (state.direction === "from_remote") {
+				let completed = 0;
+				deps.progress?.("applying", completed, pending.length);
+				for await (const reads of readRemoteForceWindows(
+					deps,
+					plan,
+					pending,
+					assertActive,
+				)) {
+					for (const { file, read } of reads) {
+						await attempt(file.path, async () => {
+							if (read.status === "rejected") {
+								if (
+									!(
+										read.reason instanceof
+										ForceSourceMissingError
+									) ||
+									!(await confirmForceSourceAbsent(
+										deps,
+										plan,
+										file,
+										assertActive,
+									))
+								) {
+									throw read.reason;
+								}
+								await persistForceFileOutcome(
+									deps,
+									state,
+									file,
+									null,
+									assertActive,
 								);
-								absent =
-									(
-										await deps.client.getResource(
-											sourcePath,
-											1,
-											0,
-											true,
-										)
-									)?.type !== "file" &&
-									(
-										await deps.client.getResource(
-											sourcePath,
-											1,
-											0,
-											true,
-										)
-									)?.type !== "file";
+								return;
+							}
+							const disposition = await writeRemoteForceFile(
+								deps,
+								plan,
+								file,
+								read.value,
+								assertActive,
+							);
+							await persistForceFileOutcome(
+								deps,
+								state,
+								file,
+								{
+									sha256: read.value.sha256,
+									size: read.value.content.byteLength,
+									resource: read.value.resource,
+								},
+								assertActive,
+							);
+							if (disposition === "copied") {
+								result.downloaded++;
+							}
+						});
+						deps.progress?.(
+							"applying",
+							++completed,
+							pending.length,
+						);
+					}
+				}
+			} else {
+				for (const [position, file] of pending.entries()) {
+					deps.progress?.("applying", position, pending.length);
+					await attempt(file.path, async () => {
+						let copy: VerifiedForceCopy | null = null;
+						try {
+							copy = await uploadForceFile(deps, plan, file);
+						} catch (error) {
+							if (
+								!(error instanceof ForceSourceMissingError) ||
+								!(await confirmForceSourceAbsent(
+									deps,
+									plan,
+									file,
+									assertActive,
+								))
+							) {
+								throw error;
 							}
 						}
-						await plan.assertConfiguration();
-						if (!absent) {
-							throw error;
+						await persistForceFileOutcome(
+							deps,
+							state,
+							file,
+							copy,
+							assertActive,
+						);
+						if (copy) {
+							result.uploaded++;
 						}
-						state.source = state.source.filter(
-							(entry) => entry.path !== path,
-						);
-						state.sourceDigest = await digestSource(state.source);
-						direct.pendingFiles = direct.pendingFiles.filter(
-							(entry) => entry !== path,
-						);
-						await deps.persist(state);
-						return;
-					}
-					direct.pendingFiles = direct.pendingFiles.filter(
-						(pendingPath) => pendingPath !== path,
-					);
-					if (copied && state.direction === "from_local") {
-						result.uploaded++;
-					} else if (copied) {
-						result.downloaded++;
-					}
-					await deps.persist(state);
-				});
+					});
+				}
 			}
-			direct.stage = "publishing";
-			state.phase = "cleanup";
-			if (await attempt("", () => deps.persist(state))) {
-				logger.info("Direct Force phase saved", diagnostic());
-			}
-			const pendingWork =
-				direct.pendingDeletes.length +
-				direct.pendingFiles.length +
-				direct.pendingDirectories.length;
+			assertActive();
 			deps.progress?.("saving-index", 0, 1);
-			if (pendingWork || result.errors.length) {
+			if (
+				pendingActions() ||
+				result.errors.length ||
+				!direct.canonicalReset
+			) {
 				await attempt(indexName, async () => {
 					await deps.index.publishDirectForceCanonical(
 						forceIndex(deps, state),
 						plan.codec,
 					);
 				});
-				return;
+				return false;
 			}
-			const manifestReady = await attempt(manifestName, () =>
-				publishManifest(deps, plan),
-			);
-			if (!manifestReady) {
-				return;
+			if (
+				!(await attempt(manifestName, () =>
+					publishManifest(deps, plan),
+				))
+			) {
+				return false;
 			}
-			const committed = await attempt(indexName, async () => {
-				state.completion = await deps.index.publishDirectForceCanonical(
-					forceIndex(deps, state, true),
-					plan.codec,
-				);
-				await deps.persist(state);
+			return attempt(indexName, async () => {
+				const publishing = {
+					...state,
+					phase: "cleanup" as const,
+					direct: { ...direct, stage: "publishing" as const },
+				};
+				await deps.persist(publishing);
+				state.phase = publishing.phase;
+				direct.stage = publishing.direct.stage;
+				logger.info("Direct Force phase saved", diagnostic());
+				assertActive();
+				await publishFinal();
 			});
-			if (!committed) {
-				return;
-			}
-			const finished = await attempt("", () =>
-				finishForceReplacement(deps, plan),
+		};
+		await deps.index.withForceScope(state, async () => {
+			const committed = await deps.client.withWriteGuard(
+				assertActive,
+				apply,
 			);
-			result.completed = finished;
+			if (committed) {
+				result.completed = await attempt("", () =>
+					finishForceReplacement(
+						deps,
+						plan,
+						assertActive,
+						observedFinal,
+					),
+				);
+			}
 		});
 		return result;
 	} catch (error) {
 		failed = true;
+		if (
+			state.phase !== "prepared" &&
+			error instanceof ForceConfigurationChangedError
+		) {
+			result.completed = false;
+			result.errors.push(createSyncError(error, "", "none", "applying"));
+			return result;
+		}
 		throw error;
 	} finally {
 		const outcome =

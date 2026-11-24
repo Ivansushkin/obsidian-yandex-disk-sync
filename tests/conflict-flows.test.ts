@@ -16,8 +16,77 @@ import {
 	MemoryDisk,
 	bytes,
 	codecFor,
+	type device as createDevice,
 	managedDevices,
 } from "./helpers/sync-flow";
+
+/** Interrupt one canonical write after its lock body is uploaded. */
+function failNextCanonicalReadback(disk: MemoryDisk): () => void {
+	const resource = disk.resource.bind(disk);
+	let writtenLock: string | undefined;
+	let failed = false;
+	disk.afterRequest = async (method, endpoint, path) => {
+		if (
+			method === "PUT" &&
+			endpoint === "/upload" &&
+			path.includes(".lock.")
+		) {
+			writtenLock = path;
+		}
+	};
+	disk.resource = async (path) => {
+		const value = await resource(path);
+		if (value && path === writtenLock && !failed) {
+			failed = true;
+			return { ...value, sha256: "0".repeat(64) };
+		}
+		return value;
+	};
+	return () => {
+		disk.resource = resource;
+		disk.afterRequest = undefined;
+		assert.equal(failed, true);
+	};
+}
+
+/** Leave the exact delete durable while the ordinary canonical transaction rolls back. */
+async function interruptDeletion(
+	disk: MemoryDisk,
+	device: ReturnType<typeof createDevice>,
+	path: string,
+) {
+	device.vault.remove(path);
+	const restore = failNextCanonicalReadback(disk);
+	try {
+		assert.equal((await device.engine.fullSync()).success, false);
+	} finally {
+		restore();
+	}
+}
+
+/** Return a stale file body once while leaving resource metadata current. */
+function returnStaleDownloadOnce(
+	disk: MemoryDisk,
+	path: string,
+	raw: ArrayBuffer,
+): () => boolean {
+	const request = disk.request.bind(disk);
+	let returned = false;
+	disk.request = async (params, accepted) => {
+		const response = await request(params, accepted);
+		const url = new URL(params.url);
+		if (
+			!returned &&
+			url.pathname === "/download" &&
+			url.searchParams.get("path") === path
+		) {
+			returned = true;
+			return { ...response, arrayBuffer: raw };
+		}
+		return response;
+	};
+	return () => returned;
+}
 
 test("storage confirmation preserves queued work and rolls back a failed save", async (t) => {
 	const device = managedDevices(t);
@@ -136,11 +205,10 @@ test("initial exact deletion resumes its durable action after restart", async (t
 	};
 	const before = structuredClone([...disk.files]);
 	assert.equal((await phone.engine.fullSync()).success, false);
-	const saved = await phone.saved();
+	const saved = phone.crash();
 	assert.equal(saved.localState.lastSyncTime, 0);
 	assert.equal(saved.pendingPhysicalActions.length, 1);
 	phone.assertLocal("deleted.md", "old");
-	await phone.stop();
 	restarted = device(disk, "phone", null, phone.vault, saved);
 	await restarted.full();
 	assert.equal(restarted.vault.files.has("deleted.md"), false);
@@ -153,6 +221,49 @@ test("initial exact deletion resumes its durable action after restart", async (t
 				new TextDecoder().decode(content) === "old",
 		),
 	);
+});
+
+test("restart preserves a late edit behind a legacy queued folder deletion", async (t) => {
+	const device = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = device(disk, "a", null);
+	const b = device(disk, "b", null);
+	const path = "folder/note.md";
+	a.vault.put(path, bytes("base"));
+	await a.full();
+	await b.full();
+	a.vault.remove("folder");
+	a.index.enqueueMutation("delete-folder", "folder");
+	await a.full();
+	b.adapter.deleteFile = async () => {
+		throw new Error("interrupted trash");
+	};
+	assert.equal((await b.engine.fullSync()).success, false);
+	const saved = b.crash();
+	assert.equal(saved.pendingPhysicalActions.length, 1);
+	const action = saved.pendingPhysicalActions[0]!;
+	assert.equal(action.type, "delete-local");
+	assert.equal(action.path, path);
+	// Older clients persisted this folder-derived action as an exact delete.
+	action.origin = "exact-delete";
+	b.vault.put(path, bytes("edited after enqueue"));
+	const restarted = device(disk, "b", null, b.vault, saved);
+	const read = restarted.adapter.readFile.bind(restarted.adapter);
+	restarted.adapter.readFile = async () => {
+		throw new Error("interrupted read");
+	};
+	assert.equal((await restarted.engine.fullSync()).success, false);
+	assert.deepEqual(
+		restarted.index.getPendingPhysicalActions().map((item) => item.id),
+		[action.id],
+	);
+	restarted.assertLocal(path, "edited after enqueue");
+	restarted.adapter.readFile = read;
+	await restarted.full();
+	await a.full();
+	for (const peer of [a, restarted]) {
+		await peer.assertSettled({ [path]: "edited after enqueue" });
+	}
 });
 
 for (const encrypted of [false, true]) {
@@ -337,11 +448,10 @@ for (const encrypted of [false, true]) {
 		assert.deepEqual([...disk.files], before);
 		phone.assertLocal("a.md", "cloud a");
 		phone.assertLocal("b.md", "old b");
-		const saved = await phone.saved();
+		const saved = phone.crash();
 		assert.equal(saved.localState.lastSyncTime, 0);
 		assert.equal(saved.localState.observedRevision, 0);
 		assert.deepEqual(saved.pendingMutations, []);
-		await phone.stop();
 		disk.beforeRequest = undefined;
 		restarted = device(disk, "phone", codec, phone.vault, saved);
 		restarted.start();
@@ -402,15 +512,12 @@ for (const encrypted of [false, true]) {
 				}
 				return path;
 			};
-			const persist = async () => {
-				if (
-					failure === "save" &&
-					phone.index.getLocalIndex().lastSyncTime > 0
-				) {
+			phone.engine.setIndexSaveCallback(async (observation) => {
+				if (failure === "save" && observation) {
 					throw new Error("synthetic save failure");
 				}
-			};
-			phone.engine.setIndexSaveCallback(persist);
+				await phone.saved(observation);
+			});
 			const physical =
 				await phone.client.getPhysicalPath("vault/note.md");
 			const canonical = await desktop.canonical();
@@ -826,6 +933,1196 @@ for (const encrypted of [false, true]) {
 		await restarted.assertSettled({ "note.md": "after restart" });
 	});
 
+	test(`${mode} aborted full sync does not turn a local edit into a conflict`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		a.vault.put("note.md", bytes("base"));
+		await a.full();
+		const initial = await a.canonical();
+		assert.equal(initial.files["note.md"]?.deleted, undefined);
+
+		a.vault.put("earlier.md", bytes("uploaded before rollback"));
+		const restore = failNextCanonicalReadback(disk);
+		try {
+			const aborted = await a.engine.fullSync();
+			assert.equal(aborted.deferred, true);
+			assert.equal(aborted.uploaded, 1);
+		} finally {
+			restore();
+		}
+		assert.deepEqual(await a.canonical(), initial);
+		const saved = a.lastSaved();
+		assert.equal(saved.localState.files["note.md"]?.deleted, false);
+		assert.deepEqual(
+			saved.pendingMutations.map(({ path }) => path),
+			["earlier.md"],
+		);
+		await a.stop();
+
+		a.vault.put("note.md", bytes("journal edit"), false);
+		const restarted = device(disk, "a", codec, a.vault, saved);
+		const result = await restarted.full();
+		assert.equal(result.conflicts, 0);
+		const expected = {
+			"note.md": "journal edit",
+			"earlier.md": "uploaded before rollback",
+		};
+		await restarted.assertSettled(expected);
+		const settled = await restarted.canonical();
+		assert.equal((await restarted.full()).conflicts, 0);
+		assert.deepEqual(await restarted.canonical(), settled);
+	});
+
+	test(`${mode} full settles absent deletion predecessors before a conflict`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("note.md", bytes("base"));
+		a.vault.put("gone.md", bytes("exact deletion"));
+		a.vault.put("folder/child.md", bytes("folder deletion"));
+		a.vault.put("folder/exact.md", bytes("both deletion intents"));
+		await a.full();
+		await b.full();
+		a.vault.put("note.md", bytes("remote edit"));
+		await a.full();
+
+		b.vault.remove("gone.md");
+		b.vault.remove("folder");
+		const exact = b.index.enqueueMutation("delete-file", "gone.md");
+		const firstFolder = b.index.enqueueMutation("delete-folder", "folder");
+		const folder = b.index.enqueueMutation("delete-folder", "folder");
+		const exactChild = b.index.enqueueMutation(
+			"delete-file",
+			"folder/exact.md",
+		);
+		for (const path of ["gone.md", "folder/child.md", "folder/exact.md"]) {
+			disk.files.delete(await b.client.getPhysicalPath(`vault/${path}`));
+		}
+		b.vault.put("note.md", bytes("offline edit"));
+		await b.stop();
+		const restarted = device(disk, "b", codec, b.vault, b.lastSaved());
+		assert.equal((await restarted.full()).conflicts, 1);
+		const canonical = await restarted.canonical();
+		const copy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		assert.equal(canonical.files["gone.md"]?.deleted, true);
+		assert.equal(canonical.files["gone.md"]?.mutationSeq, exact.seq);
+		assert.equal(
+			canonical.folderTombstones.folder?.mutationSeq,
+			folder.seq,
+		);
+		assert.equal(
+			canonical.files["folder/child.md"]?.deletedByFolder,
+			"folder",
+		);
+		assert.equal(
+			canonical.files["folder/child.md"]?.mutationSeq,
+			firstFolder.seq,
+		);
+		assert.equal(canonical.files["folder/exact.md"]?.deleted, true);
+		assert.equal(
+			canonical.files["folder/exact.md"]?.deletedByFolder,
+			undefined,
+		);
+		assert.equal(
+			canonical.files["folder/exact.md"]?.mutationSeq,
+			exactChild.seq,
+		);
+		assert.equal(canonical.appliedMutationSeq.b, exactChild.seq + 1);
+		assert.equal(canonical.files[copy]?.mutationSeq, exactChild.seq + 1);
+		await restarted.assertSettled({
+			"note.md": "remote edit",
+			[copy]: "offline edit",
+		});
+		assert.equal((await restarted.full()).conflicts, 0);
+		assert.deepEqual(await restarted.canonical(), canonical);
+	});
+
+	test(`${mode} offline edit survives a published folder deletion`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		const changed = "folder/changed.md";
+		const unchanged = "folder/unchanged.md";
+		const created = "folder/new.md";
+		a.vault.put(changed, bytes("base"));
+		a.vault.put(unchanged, bytes("remove"));
+		await a.full();
+		await b.full();
+		const offline = await b.saved();
+		await b.stop();
+		b.vault.put(changed, bytes("offline edit"));
+		b.vault.put(created, bytes("offline creation"));
+		a.vault.remove("folder");
+		a.index.enqueueMutation("delete-folder", "folder");
+		await a.full();
+		const published = await a.canonical();
+		assert.equal(published.files[changed]?.deletedByFolder, "folder");
+		assert.ok(published.folderTombstones.folder);
+		assert.equal(
+			published.files[changed]?.changedRevision,
+			published.folderTombstones.folder.changedRevision,
+		);
+		assert.equal(
+			await a.client.getLogicalResource(`vault/${changed}`),
+			null,
+		);
+
+		const returned = device(disk, "b", codec, b.vault, offline);
+		await returned.full();
+		returned.assertLocal(changed, "offline edit");
+		await a.full();
+		const expected = {
+			[changed]: "offline edit",
+			[created]: "offline creation",
+		};
+		const settled = await a.canonical();
+		for (const peer of [a, returned]) {
+			await peer.assertSettled(expected);
+			const restarted = device(
+				disk,
+				peer.settings.deviceId,
+				codec,
+				peer.vault,
+				peer.crash(),
+			);
+			const repeat = await restarted.full();
+			assert.deepEqual(
+				[repeat.uploaded, repeat.downloaded, repeat.conflicts],
+				[0, 0, 0],
+			);
+			await restarted.assertSettled(expected);
+			assert.deepEqual(await restarted.canonical(), settled);
+		}
+	});
+
+	test(`${mode} physical edits after folder deletion converge with a returning device`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		const both = "folder/both.md";
+		const external = "folder/external.md";
+		const restored = "folder/restored.md";
+		const absent = "folder/absent.md";
+		const unchanged = "folder/unchanged.md";
+		for (const path of [both, external, restored, absent, unchanged]) {
+			a.vault.put(path, bytes("base"));
+		}
+		await a.full();
+		await b.full();
+		b.vault.put(both, bytes("offline"));
+		b.vault.put(restored, bytes("offline"));
+		b.vault.remove(absent);
+		a.vault.remove("folder");
+		a.index.enqueueMutation("delete-folder", "folder");
+		await a.full();
+		for (const path of [both, external]) {
+			await a.client.uploadFile(`vault/${path}`, bytes("external"));
+		}
+
+		for (const path of [restored, absent, unchanged]) {
+			await a.client.uploadFile(`vault/${path}`, bytes("base"));
+		}
+		assert.equal((await b.full()).conflicts, 1);
+		const live = await b.canonical();
+		const copy = Object.keys(live.files).find((path) =>
+			path.startsWith("folder/both_conflict_"),
+		);
+		assert.ok(copy);
+		const expected = {
+			[both]: "external",
+			[external]: "external",
+			[restored]: "offline",
+			[copy]: "offline",
+		};
+		await a.full();
+		await b.assertSettled(expected);
+		await a.assertSettled(expected);
+		assert.equal((await b.full()).conflicts, 0);
+	});
+
+	test(`${mode} full preserves concurrent children during offline folder deletion`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("note.md", bytes("base"));
+		a.vault.put("folder/changed.md", bytes("before"));
+		a.vault.put("folder/recreated.md", bytes("before recreation"));
+		a.vault.put("folder/unchanged.md", bytes("remove this child"));
+		await a.full();
+		await b.full();
+		b.vault.remove("folder");
+		const deletion = b.index.enqueueMutation("delete-folder", "folder");
+		b.vault.put("note.md", bytes("offline edit"));
+		b.vault.put("folder/recreated.md", bytes("offline recreation"));
+		await b.stop();
+		a.vault.put("folder/changed.md", bytes("remote child edit"));
+		a.vault.put("folder/recreated.md", bytes("remote child version"));
+		a.vault.put("folder/new.md", bytes("new child"));
+		a.vault.put("note.md", bytes("remote edit"));
+		await a.full();
+		a.vault.put("extra.md", bytes("later unrelated revision"));
+		await a.full();
+
+		const restarted = device(disk, "b", codec, b.vault, b.lastSaved());
+		assert.equal((await restarted.full()).conflicts, 2);
+		const canonical = await restarted.canonical();
+		const copy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		const recreatedCopy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("folder/recreated_conflict_"),
+		);
+		assert.ok(recreatedCopy);
+		assert.equal(canonical.files["folder/changed.md"]?.lastModifiedBy, "a");
+		assert.equal(
+			canonical.files["folder/unchanged.md"]?.deletedByFolder,
+			"folder",
+		);
+		assert.equal(
+			canonical.folderTombstones.folder?.mutationSeq,
+			deletion.seq,
+		);
+		assert.equal(canonical.appliedMutationSeq.b, deletion.seq + 2);
+		assert.equal(
+			await restarted.client.getLogicalResource(
+				"vault/folder/unchanged.md",
+			),
+			null,
+		);
+		await restarted.assertSettled({
+			"extra.md": "later unrelated revision",
+			"folder/changed.md": "remote child edit",
+			"folder/new.md": "new child",
+			"folder/recreated.md": "remote child version",
+			[recreatedCopy]: "offline recreation",
+			"note.md": "remote edit",
+			[copy]: "offline edit",
+		});
+		assert.equal((await restarted.full()).conflicts, 0);
+		assert.deepEqual(await restarted.canonical(), canonical);
+	});
+
+	test(`${mode} full preserves unpublished remote bytes during offline folder deletion`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("folder/child.md", bytes("canonical child"));
+		await a.full();
+		await b.full();
+		const before = await b.canonical();
+		const path = await a.client.getPhysicalPath("vault/folder/child.md");
+		const oldRaw = disk.files.get(path)!;
+		b.vault.remove("folder");
+		const deletion = b.index.enqueueMutation("delete-folder", "folder");
+		await b.stop();
+		await a.client.uploadFile(
+			"vault/folder/child.md",
+			bytes("remote bytes before commit"),
+		);
+
+		const sentStale = returnStaleDownloadOnce(disk, path, oldRaw);
+		const interrupted = device(disk, "b", codec, b.vault, b.lastSaved());
+		assert.equal((await interrupted.engine.fullSync()).success, false);
+		assert.equal(sentStale(), true);
+		assert.deepEqual(await interrupted.canonical(), before);
+		interrupted.assertLocal("folder/child.md");
+		assert.deepEqual(
+			interrupted.lastSaved().pendingMutations.map(({ id }) => id),
+			[deletion.id],
+		);
+		const saved = interrupted.crash();
+		await a.client.uploadFile(
+			"vault/folder/new.md",
+			bytes("new physical child"),
+		);
+		const restarted = device(disk, "b", codec, b.vault, saved);
+		await restarted.full();
+		await restarted.assertSettled({
+			"folder/child.md": "remote bytes before commit",
+			"folder/new.md": "new physical child",
+		});
+		const canonical = await restarted.canonical();
+		assert.equal(
+			canonical.folderTombstones.folder?.mutationSeq,
+			deletion.seq,
+		);
+		assert.equal(canonical.appliedMutationSeq.b, deletion.seq + 2);
+		await restarted.full();
+		assert.deepEqual(await restarted.canonical(), canonical);
+	});
+
+	for (const md5Only of [false, true]) {
+		test(`${mode} full verifies a published folder survivor with ${md5Only ? "MD5" : "SHA-256"} metadata`, async (t) => {
+			const device = managedDevices(t);
+			const disk = new MemoryDisk();
+			const codec = await codecFor(encrypted);
+			const a = device(disk, "a", codec);
+			const b = device(disk, "b", codec);
+			const child = "folder/child.md";
+			const rawPath = await a.client.getPhysicalPath(`vault/${child}`);
+			if (md5Only) {
+				const resource = disk.resource.bind(disk);
+				disk.resource = async (path) => {
+					const observed = await resource(path);
+					return path === rawPath && observed?.type === "file"
+						? {
+								...observed,
+								sha256: undefined,
+								md5: createHash("md5")
+									.update(Buffer.from(disk.files.get(path)!))
+									.digest("hex"),
+							}
+						: observed;
+				};
+			}
+			a.vault.put(child, bytes("old child"));
+			await a.full();
+			await b.full();
+			const oldRaw = disk.files.get(rawPath)!;
+			const oldResource = await disk.resource(rawPath);
+			assert.ok(oldResource);
+			b.vault.remove("folder");
+			const deletion = b.index.enqueueMutation("delete-folder", "folder");
+			await b.stop();
+			a.vault.put(child, bytes("published edit"));
+			await a.full();
+			const before = await a.canonical();
+			const publishedRaw = disk.files.get(rawPath)!;
+			const pending = b.lastSaved().pendingMutations;
+			assert.equal(pending[0]?.id, deletion.id);
+			const interrupted = device(
+				disk,
+				"b",
+				codec,
+				b.vault,
+				b.lastSaved(),
+			);
+			const request = disk.request.bind(disk);
+			for (const staleMetadata of [false, true]) {
+				let staleMetadataReads = 0;
+				disk.request = async (params, accepted) => {
+					const response = await request(params, accepted);
+					const url = new URL(params.url);
+					if (
+						staleMetadata &&
+						url.pathname.endsWith("/resources") &&
+						url.searchParams
+							.get("path")
+							?.replace(/^disk:\//, "") === rawPath
+					) {
+						staleMetadataReads++;
+						return { ...response, json: oldResource };
+					}
+					return response;
+				};
+				const sentStale = returnStaleDownloadOnce(
+					disk,
+					rawPath,
+					oldRaw,
+				);
+				try {
+					const result = await interrupted.engine.fullSync();
+					assert.equal(sentStale(), true);
+					assert.equal(staleMetadataReads, staleMetadata ? 2 : 0);
+					assert.equal(result.success, false);
+					assert.deepEqual(await interrupted.canonical(), before);
+					assert.deepEqual(disk.files.get(rawPath), publishedRaw);
+					interrupted.assertLocal(child);
+					assert.deepEqual(
+						interrupted.lastSaved().pendingMutations,
+						pending,
+					);
+				} finally {
+					disk.request = request;
+				}
+			}
+			const saved = interrupted.crash();
+
+			const restarted = device(disk, "b", codec, b.vault, saved);
+			if (md5Only) {
+				await a.client.uploadFile(
+					`vault/${child}`,
+					bytes("unpublished remote edit"),
+				);
+				const latestRaw = disk.files.get(rawPath)!;
+				const sentCanonicalBytes = returnStaleDownloadOnce(
+					disk,
+					rawPath,
+					publishedRaw,
+				);
+				assert.equal(
+					(await restarted.engine.fullSync()).success,
+					false,
+				);
+				assert.equal(sentCanonicalBytes(), true);
+				restarted.assertLocal(child);
+				assert.deepEqual(await restarted.canonical(), before);
+				assert.deepEqual(
+					restarted.lastSaved().pendingMutations,
+					pending,
+				);
+				assert.deepEqual(disk.files.get(rawPath), latestRaw);
+				disk.files.set(rawPath, publishedRaw);
+			}
+
+			await restarted.full();
+			await restarted.assertSettled({ [child]: "published edit" });
+			assert.equal(
+				(await restarted.canonical()).files[child]?.sha256,
+				before.files[child]?.sha256,
+			);
+			assert.deepEqual(disk.files.get(rawPath), publishedRaw);
+		});
+	}
+
+	test(`${mode} full settles a recreation after a published folder deletion`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("folder/recreated.md", bytes("old child"));
+		a.vault.put("note.md", bytes("note base"));
+		await a.full();
+		await b.full();
+		b.vault.remove("folder/recreated.md");
+		const restore = failNextCanonicalReadback(disk);
+		try {
+			assert.equal((await b.engine.fullSync()).success, false);
+		} finally {
+			restore();
+		}
+		const deletion = b.index.getPendingMutations()[0];
+		assert.equal(deletion?.type, "delete-file");
+		b.vault.put("note.md", bytes("offline edit"));
+		const saved = b.crash();
+		a.vault.remove("folder");
+		a.index.enqueueMutation("delete-folder", "folder");
+		a.vault.put("note.md", bytes("remote edit"));
+		await a.full();
+		assert.equal(
+			(await a.canonical()).files["folder/recreated.md"]?.deletedByFolder,
+			"folder",
+		);
+		b.vault.put("folder/recreated.md", bytes("recreated offline"));
+
+		const restarted = device(disk, "b", codec, b.vault, saved);
+		assert.equal((await restarted.full()).conflicts, 1);
+		const canonical = await restarted.canonical();
+		const copy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		assert.equal(
+			canonical.files["folder/recreated.md"]?.mutationSeq,
+			deletion.seq + 1,
+		);
+		assert.equal(canonical.appliedMutationSeq.b, deletion.seq + 2);
+		await restarted.assertSettled({
+			"folder/recreated.md": "recreated offline",
+			"note.md": "remote edit",
+			[copy]: "offline edit",
+		});
+		assert.equal((await restarted.full()).conflicts, 0);
+		assert.deepEqual(await restarted.canonical(), canonical);
+	});
+
+	for (const foreignEdit of [false, true]) {
+		test(`${mode} unpublished recreation recovers after ${foreignEdit ? "a foreign edit" : "a remote ABA"}`, async (t) => {
+			const device = managedDevices(t);
+			const disk = new MemoryDisk();
+			const codec = await codecFor(encrypted);
+			const a = device(disk, "a", codec);
+			const b = device(disk, "b", codec);
+			const path = "recreated.md";
+			a.vault.put(path, bytes("base"));
+			a.vault.put("note.md", bytes("base note"));
+			await a.full();
+			await b.full();
+
+			await interruptDeletion(disk, b, path);
+			const savedDelete = b.crash();
+			const deletion = savedDelete.pendingMutations[0]!;
+			assert.equal(deletion.type, "delete-file");
+			b.vault.put(path, bytes("local recreation"));
+			b.vault.put("note.md", bytes("local note"));
+			a.vault.put("note.md", bytes("remote note"));
+			await a.full();
+
+			const returning = device(disk, "b", codec, b.vault, savedDelete);
+			const physical = await b.client.getPhysicalPath(`vault/${path}`);
+			let admittedOriginal = false;
+			let published = false;
+			disk.beforeRequest = async (method, endpoint, target) => {
+				if (
+					method === "PUT" &&
+					endpoint === "/upload" &&
+					target === physical
+				) {
+					admittedOriginal = true;
+				}
+				if (
+					endpoint.endsWith("/resources/move") &&
+					target.includes(".lock.")
+				) {
+					disk.beforeRequest = undefined;
+					a.vault.put(path, bytes("remote edit"));
+					await a.full();
+					if (!foreignEdit) {
+						a.vault.put(path, bytes("base"));
+						await a.full();
+					}
+					published = true;
+				}
+			};
+			const interrupted = await returning.engine.fullSync();
+			assert.equal(published, true);
+			assert.equal(
+				admittedOriginal,
+				false,
+				"recreation wrote before canonical arbitration",
+			);
+			assert.equal(interrupted.success, false);
+			const saved = returning.crash();
+			assert.deepEqual(
+				saved.pendingMutations.map(({ seq, type }) => [seq, type]),
+				[
+					[deletion.seq, "delete-file"],
+					[deletion.seq + 1, "put"],
+				],
+			);
+			const restarted = device(disk, "b", codec, b.vault, saved);
+			const result = await restarted.full();
+			assert.equal(result.conflicts, foreignEdit ? 2 : 1);
+			const canonical = await restarted.canonical();
+			const noteCopy = Object.keys(canonical.files).find((key) =>
+				key.startsWith("note_conflict_"),
+			);
+			assert.ok(noteCopy);
+			const expected = {
+				[path]: foreignEdit ? "remote edit" : "local recreation",
+				"note.md": "remote note",
+				[noteCopy]: "local note",
+			};
+			if (foreignEdit) {
+				const copy = Object.keys(canonical.files).find((key) =>
+					key.startsWith("recreated_conflict_"),
+				);
+				assert.ok(copy);
+				expected[copy] = "local recreation";
+			}
+			await restarted.assertSettled(expected);
+			assert.equal((await restarted.full()).conflicts, 0);
+			assert.deepEqual(await restarted.canonical(), canonical);
+			await a.full();
+			await a.assertSettled(expected);
+		});
+	}
+
+	test(`${mode} a late foreign edit waits for the locked recreation transfer`, async (t) => {
+		const make = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = make(disk, "a", codec),
+			b = make(disk, "b", codec);
+		const path = "recreated.md";
+		a.vault.put(path, bytes("base"));
+		await a.full();
+		await b.full();
+		await interruptDeletion(disk, b, path);
+		b.vault.put(path, bytes("local recreation"));
+		const physical = await b.client.getPhysicalPath(`vault/${path}`);
+		const admitted = deferred();
+		const release = deferred();
+		const waiting = deferred();
+		let blocked = false;
+		disk.beforeRequest = async (method, endpoint, target) => {
+			if (
+				method === "PUT" &&
+				endpoint === "/upload" &&
+				target === physical &&
+				!blocked
+			) {
+				blocked = true;
+				admitted.resolve();
+				await release.promise;
+			} else if (blocked && method === "GET") {
+				waiting.resolve();
+			}
+		};
+		const recreating = b.engine.fullSync();
+		await admitted.promise;
+		a.vault.put(path, bytes("late foreign"));
+		const competing = a.engine.fullSync();
+		try {
+			await waiting.promise;
+			assert.equal(
+				disk.files.has("vault/.obsidian-sync-index.json"),
+				false,
+			);
+		} finally {
+			release.resolve();
+		}
+		assert.equal((await recreating).success, true);
+		await competing;
+		disk.beforeRequest = undefined;
+		await a.full();
+		const canonical = await a.canonical();
+		const copy = Object.keys(canonical.files).find((key) =>
+			key.startsWith("recreated_conflict_"),
+		);
+		assert.ok(copy);
+		await b.full();
+		const expected = { [path]: "local recreation", [copy]: "late foreign" };
+		await a.assertSettled(expected);
+		await b.assertSettled(expected);
+	});
+
+	test(`${mode} legacy recreation waits for the actual published winner bytes`, async (t) => {
+		const make = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = make(disk, "a", codec),
+			b = make(disk, "b", codec);
+		const path = "recreated.md";
+		a.vault.put(path, bytes("base"));
+		await a.full();
+		await b.full();
+		await interruptDeletion(disk, b, path);
+		b.vault.put(path, bytes("recreation"));
+		a.vault.put(path, bytes("foreign winner"));
+		await a.full();
+		const winner = await a.canonical();
+		// A pre-upgrade transfer left the physically present bytes different from canonical.
+		await b.client.uploadFile(`vault/${path}`, bytes("recreation"));
+		assert.equal((await b.engine.fullSync()).success, false);
+		const saved = b.crash();
+		const restarted = make(disk, "b", codec, b.vault, saved);
+		assert.equal((await restarted.engine.fullSync()).success, false);
+		assert.deepEqual(
+			restarted.lastSaved().pendingMutations,
+			saved.pendingMutations,
+		);
+		assert.deepEqual(
+			saved.pendingMutations.map(({ type }) => type),
+			["delete-file", "put"],
+		);
+		assert.deepEqual(await a.canonical(), winner);
+		restarted.assertLocal(path, "recreation");
+		const original = await a.adapter.readFile(path);
+		await a.full();
+		a.vault.put(path, original);
+		await a.full();
+		assert.equal((await restarted.full()).conflicts, 1);
+		const canonical = await a.canonical();
+		const copy = Object.keys(canonical.files).find((key) =>
+			key.startsWith("recreated_conflict_"),
+		);
+		assert.ok(copy);
+		await a.full();
+		await a.assertSettled({
+			[path]: "foreign winner",
+			[copy]: "recreation",
+		});
+	});
+
+	test(`${mode} partial recreation preserves a later local edit after a lost PUT response`, async (t) => {
+		const make = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const b = make(disk, "b", codec);
+		const path = "recreate.md";
+		b.vault.put(path, bytes("base"));
+		await b.full();
+		await interruptDeletion(disk, b, path);
+		b.vault.put(path, bytes("first recreation"));
+		const physical = await b.client.getPhysicalPath(`vault/${path}`);
+		disk.afterRequest = async (method, endpoint, target) => {
+			if (
+				method === "PUT" &&
+				endpoint === "/upload" &&
+				target === physical
+			) {
+				disk.afterRequest = undefined;
+				b.vault.put(path, bytes("later recreation"));
+				throw new Error("lost upload response");
+			}
+		};
+		assert.equal((await b.engine.fullSync()).success, false);
+		const saved = b.crash();
+		assert.deepEqual(
+			saved.pendingMutations.map(({ type }) => type),
+			["delete-file", "put"],
+		);
+		b.assertLocal(path, "later recreation");
+		const restarted = make(disk, "b", codec, b.vault, saved);
+		await restarted.full();
+		await restarted.assertSettled({ [path]: "later recreation" });
+	});
+
+	test(`${mode} a lost canonical lock cannot confirm an already admitted recreation PUT`, async (t) => {
+		const make = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = make(disk, "a", codec),
+			b = make(disk, "b", codec);
+		const path = "recreate.md";
+		a.vault.put(path, bytes("base"));
+		await a.full();
+		await b.full();
+		await interruptDeletion(disk, b, path);
+		b.vault.put(path, bytes("recreation"));
+		const physical = await b.client.getPhysicalPath(`vault/${path}`);
+		const canonicalPath = "vault/.obsidian-sync-index.json";
+		disk.beforeRequest = async (method, endpoint, target) => {
+			if (
+				method === "PUT" &&
+				endpoint === "/upload" &&
+				target === physical
+			) {
+				disk.beforeRequest = undefined;
+				const lock = [...disk.files.keys()].find((key) =>
+					key.includes(".lock."),
+				);
+				assert.ok(lock);
+				// Another owner has recovered the lock while the native request was in flight.
+				await a.client.moveResourceExclusive(lock, canonicalPath);
+				a.vault.put(path, bytes("foreign winner"));
+				await a.full();
+			}
+		};
+		assert.equal((await b.engine.fullSync()).success, false);
+		const saved = b.crash();
+		assert.deepEqual(
+			saved.pendingMutations.map(({ type }) => type),
+			["delete-file", "put"],
+		);
+		const restarted = make(disk, "b", codec, b.vault, saved);
+		assert.equal((await restarted.engine.fullSync()).success, false);
+		a.assertLocal(path, "foreign winner");
+		restarted.assertLocal(path, "recreation");
+		const original = await a.adapter.readFile(path);
+		await a.full();
+		assert.ok(
+			[...a.vault.files].some(
+				([key, content]) =>
+					key.includes("/yandex-disk-sync/overwritten/") &&
+					Buffer.from(content).equals(Buffer.from(original)),
+			),
+		);
+		a.vault.put(path, original);
+		await a.full();
+		assert.equal((await restarted.full()).conflicts, 1);
+		const published = await a.canonical();
+		const copy = Object.keys(published.files).find((key) =>
+			key.startsWith("recreate_conflict_"),
+		);
+		assert.ok(copy);
+		await a.full();
+		await a.assertSettled({
+			[path]: "foreign winner",
+			[copy]: "recreation",
+		});
+	});
+
+	test(`${mode} full supersedes only a verified own interrupted upload`, async (t) => {
+		const device = managedDevices(t);
+		for (const scenario of [
+			"own-sha",
+			"own-md5",
+			"foreign-md5",
+			"stale-download",
+			"missing-hash",
+		]) {
+			const disk = new MemoryDisk();
+			const codec = await codecFor(encrypted);
+			const a = device(disk, "a", codec);
+			a.vault.put("note.md", bytes("base"));
+			await a.full();
+			const initial = await a.canonical();
+			a.vault.put("note.md", bytes("interrupted edit"));
+			const restore = failNextCanonicalReadback(disk);
+			try {
+				const aborted = await a.engine.fullSync();
+				assert.equal(aborted.success, false);
+				assert.equal(aborted.uploaded, 1);
+			} finally {
+				restore();
+			}
+			assert.deepEqual(await a.canonical(), initial);
+			const saved = a.lastSaved();
+			const predecessor = saved.pendingMutations[0]!;
+			assert.equal(
+				saved.localState.files["note.md"]?.mutationSeq,
+				predecessor.seq,
+			);
+			assert.deepEqual(
+				await a.client.downloadFile("vault/note.md"),
+				bytes("interrupted edit"),
+			);
+			await a.stop();
+			const foreignEdit =
+				scenario === "foreign-md5" || scenario === "stale-download";
+			const path = await a.client.getPhysicalPath("vault/note.md");
+			const interruptedRaw = disk.files.get(path)!;
+			if (foreignEdit) {
+				const b = device(disk, "b", codec);
+				await b.client.uploadFile(
+					"vault/note.md",
+					bytes("foreign edit"),
+				);
+			}
+			let sentStale = () => false;
+			const resource = disk.resource.bind(disk);
+			if (scenario !== "own-sha") {
+				disk.resource = async (candidate) => {
+					const metadata = await resource(candidate);
+					return metadata && candidate === path
+						? {
+								...metadata,
+								sha256: undefined,
+								md5:
+									scenario === "missing-hash"
+										? undefined
+										: createHash("md5")
+												.update(
+													Buffer.from(
+														disk.files.get(path)!,
+													),
+												)
+												.digest("hex"),
+							}
+						: metadata;
+				};
+			}
+			if (scenario === "stale-download") {
+				sentStale = returnStaleDownloadOnce(disk, path, interruptedRaw);
+			}
+			a.vault.put("note.md", bytes("latest edit"), false);
+			const restarted = device(disk, "a", codec, a.vault, saved);
+			if (scenario === "stale-download" || scenario === "missing-hash") {
+				const physical = disk.files.get(path)!;
+				assert.equal(
+					(await restarted.engine.fullSync()).success,
+					false,
+				);
+				restarted.assertLocal("note.md", "latest edit");
+				assert.deepEqual(await restarted.canonical(), initial);
+				assert.deepEqual(disk.files.get(path), physical);
+				assert.deepEqual(
+					restarted.index.getPendingMutations(),
+					saved.pendingMutations,
+				);
+				if (scenario === "missing-hash") {
+					disk.resource = resource;
+				}
+			}
+			assert.equal(
+				(await restarted.full()).conflicts,
+				Number(foreignEdit),
+			);
+			assert.equal(sentStale(), scenario === "stale-download");
+			const canonical = await restarted.canonical();
+			if (foreignEdit) {
+				const copy = Object.keys(canonical.files).find((path) =>
+					path.startsWith("note_conflict_"),
+				);
+				assert.ok(copy);
+				assert.equal(
+					canonical.files[copy]?.mutationSeq,
+					predecessor.seq + 1,
+				);
+				assert.equal(
+					canonical.appliedMutationSeq.a,
+					predecessor.seq + 2,
+				);
+				await restarted.assertSettled({
+					"note.md": "foreign edit",
+					[copy]: "latest edit",
+				});
+			} else {
+				assert.equal(
+					canonical.appliedMutationSeq.a,
+					predecessor.seq + 1,
+				);
+				await restarted.assertSettled({ "note.md": "latest edit" });
+			}
+			assert.equal((await restarted.full()).conflicts, 0);
+			assert.deepEqual(await restarted.canonical(), canonical);
+		}
+	});
+
+	test(`${mode} watcher replays rename with a queued put before full conflict`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("before.md", bytes("rename base"));
+		a.vault.put("note.md", bytes("note base"));
+		await a.full();
+		await b.full();
+		a.vault.put("note.md", bytes("remote edit"));
+		await a.full();
+		const before = await b.canonical();
+
+		b.vault.put("note.md", bytes("offline edit"), false);
+		const edited = bytes("renamed edit");
+		b.vault.put("before.md", edited, false);
+		const put = b.index.enqueueMutation("put", "before.md", {
+			sha256: await computeSha256(edited),
+		});
+		b.start();
+		disk.beforeRequest = async (method, endpoint, path) => {
+			if (
+				method === "PUT" &&
+				endpoint === "/upload" &&
+				path.includes(".lock.")
+			) {
+				throw new Error("synthetic interrupted rename commit");
+			}
+		};
+		try {
+			b.vault.rename("before.md", "after.md");
+			await b.drain();
+		} finally {
+			disk.beforeRequest = undefined;
+		}
+		const saved = b.crash();
+		assert.equal(saved.pendingMutations[0]?.id, put.id);
+		assert.ok(
+			saved.pendingWatcherEvents.some(
+				({ action }) => action === "rename",
+			),
+		);
+		assert.deepEqual(await b.canonical(), before);
+
+		const restarted = device(disk, "b", codec, b.vault, saved);
+		restarted.start();
+		await restarted.drain();
+		assert.equal((await restarted.full()).conflicts, 1);
+		const canonical = await restarted.canonical();
+		const copy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		assert.equal(canonical.files["before.md"]?.deleted, true);
+		assert.ok(canonical.files["after.md"]!.mutationSeq! > put.seq);
+		assert.equal(
+			canonical.appliedMutationSeq.b,
+			canonical.files[copy]?.mutationSeq,
+		);
+		await restarted.assertSettled({
+			"after.md": "renamed edit",
+			"note.md": "remote edit",
+			[copy]: "offline edit",
+		});
+		assert.equal((await restarted.full()).conflicts, 0);
+		assert.deepEqual(await restarted.canonical(), canonical);
+	});
+
+	test(`${mode} first failed conflict stops later publication until restart`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		for (const path of ["first.md", "second.md"]) {
+			a.vault.put(path, bytes("base"));
+		}
+		await a.full();
+		await b.full();
+		for (const path of ["first.md", "second.md"]) {
+			a.vault.put(path, bytes(`remote ${path}`));
+			b.vault.put(path, bytes(`offline ${path}`));
+		}
+		await a.full();
+		const before = await a.canonical();
+		const restore = failNextCanonicalReadback(disk);
+		try {
+			const aborted = await b.engine.fullSync();
+			assert.equal(aborted.success, false);
+			assert.equal(aborted.conflicts, 0);
+		} finally {
+			restore();
+		}
+		assert.deepEqual(await b.canonical(), before);
+		b.assertLocal("first.md", "offline first.md");
+		b.assertLocal("second.md", "offline second.md");
+		const copies = [...b.vault.files.keys()].filter((path) =>
+			path.includes("_conflict_"),
+		);
+		assert.equal(copies.length, 1);
+		const interruptedCopy = copies[0]!;
+		assert.deepEqual(
+			b.lastSaved().pendingMutations.map(({ path }) => path),
+			[interruptedCopy],
+		);
+		assert.ok(
+			await b.client.getLogicalResource(`vault/${interruptedCopy}`),
+		);
+		const restarted = device(disk, "b", codec, b.vault, b.crash());
+		assert.equal((await restarted.full()).conflicts, 2);
+		const canonical = await restarted.canonical();
+		const firstCopy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("first_conflict_"),
+		);
+		const secondCopy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("second_conflict_"),
+		);
+		assert.ok(firstCopy && secondCopy);
+		assert.ok([firstCopy, secondCopy].includes(interruptedCopy));
+		await restarted.assertSettled({
+			"first.md": "remote first.md",
+			"second.md": "remote second.md",
+			[firstCopy]: "offline first.md",
+			[secondCopy]: "offline second.md",
+		});
+		assert.equal((await restarted.full()).conflicts, 0);
+		assert.deepEqual(await restarted.canonical(), canonical);
+	});
+
+	test(`${mode} full conflict settles verified predecessors before preserving a copy`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("note.md", bytes("base"));
+		await a.full();
+		await b.full();
+		a.vault.put("note.md", bytes("remote edit"));
+		await a.full();
+		b.vault.put("note.md", bytes("offline edit"));
+		b.vault.put("extra.md", bytes("ordinary upload"));
+
+		const result = await b.full();
+		assert.equal(result.uploaded, 1);
+		assert.equal(result.conflicts, 1);
+		const canonical = await b.canonical();
+		const copy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		assert.equal(
+			canonical.appliedMutationSeq.b,
+			canonical.files[copy]?.mutationSeq,
+		);
+		const expected = {
+			"note.md": "remote edit",
+			"extra.md": "ordinary upload",
+			[copy]: "offline edit",
+		};
+		await b.assertSettled(expected);
+		assert.equal((await b.full()).conflicts, 0);
+		await a.full();
+		await a.assertSettled(expected);
+	});
+
+	test(`${mode} full conflict waits for an unresolved move across restart`, async (t) => {
+		const device = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const a = device(disk, "a", codec);
+		const b = device(disk, "b", codec);
+		a.vault.put("note.md", bytes("base"));
+		a.vault.put("before.md", bytes("renamed file"));
+		a.vault.put("delete.md", bytes("deleted file"));
+		await a.full();
+		await b.full();
+		a.vault.put("note.md", bytes("remote edit"));
+		await a.full();
+		const before = await b.canonical();
+		const beforePhysical = [...disk.files.keys()];
+		const move = b.index.enqueueMutation("move", "before.md", {
+			targetPath: "after.md",
+			resourceKind: "file",
+		});
+		b.vault.put("note.md", bytes("offline edit"));
+		b.vault.put("extra.md", bytes("ordinary upload"));
+		b.vault.remove("delete.md");
+
+		const result = await b.engine.fullSync();
+		assert.equal(result.deferred, true);
+		assert.equal(result.success, false);
+		assert.equal(result.conflicts, 0);
+		assert.deepEqual(await b.canonical(), before);
+		assert.deepEqual(
+			[...disk.files.keys()].sort(),
+			[
+				...beforePhysical,
+				await b.client.getPhysicalPath("vault/extra.md"),
+			].sort(),
+		);
+		b.assertLocal("note.md", "offline edit");
+		assert.equal(
+			[...b.vault.files.keys()].some((path) =>
+				path.includes("_conflict_"),
+			),
+			false,
+		);
+		const saved = b.lastSaved();
+		assert.deepEqual(
+			saved.pendingMutations.map(({ id, type, path }) => ({
+				id,
+				type,
+				path,
+			})),
+			[
+				{ id: move.id, type: "move", path: "before.md" },
+				{ id: `b:${move.seq + 1}`, type: "put", path: "extra.md" },
+			],
+		);
+		await b.stop();
+		const restarted = device(disk, "b", codec, b.vault, saved);
+		restarted.vault.rename("before.md", "after.md");
+		await restarted.engine.renameFile("before.md", "after.md", {
+			epoch: move.epoch,
+			baseRevision: move.baseRevision,
+		});
+		assert.equal(
+			(await restarted.canonical()).appliedMutationSeq.b,
+			move.seq,
+		);
+		assert.deepEqual(
+			restarted.index.getPendingMutations(),
+			saved.pendingMutations.slice(1),
+		);
+		restarted.index.enqueueMutation("delete-file", "delete.md");
+		assert.equal((await restarted.full()).conflicts, 1);
+		const canonical = await restarted.canonical();
+		const copy = Object.keys(canonical.files).find((path) =>
+			path.startsWith("note_conflict_"),
+		);
+		assert.ok(copy);
+		await restarted.assertSettled({
+			"note.md": "remote edit",
+			"after.md": "renamed file",
+			"extra.md": "ordinary upload",
+			[copy]: "offline edit",
+		});
+		assert.equal(
+			await restarted.client.getLogicalResource("vault/delete.md"),
+			null,
+		);
+	});
+
 	test(`${mode} full compares content before preserving a conflict`, async (t) => {
 		const device = managedDevices(t);
 		const disk = new MemoryDisk();
@@ -983,12 +2280,11 @@ for (const encrypted of [false, true]) {
 				"Queued downloads must not start after timeout",
 			);
 			assert.deepEqual(b.index.getLocalIndex().files, before);
-			const saved = await b.saved();
+			const saved = b.crash();
 			release();
 			await new Promise((resolve) => setTimeout(resolve, 5));
 			b.assertLocal("a.md", "base");
 			assert.deepEqual(b.index.getLocalIndex().files, before);
-			await b.stop();
 			disk.beforeRequest = undefined;
 			restarted = device(disk, "b", codec, b.vault, saved);
 			assert.equal((await restarted.full()).conflicts, 0);
@@ -1037,8 +2333,7 @@ for (const encrypted of [false, true]) {
 		assert.equal(failed.downloaded, 0);
 		b.assertLocal("note.md", "base");
 		assert.deepEqual(b.index.getLocalIndex().files["note.md"], before);
-		const saved = await b.saved();
-		await b.stop();
+		const saved = b.crash();
 		disk.beforeRequest = undefined;
 		restarted = device(disk, "b", codec, b.vault, saved);
 		assert.equal((await restarted.full()).conflicts, 0);
@@ -1059,6 +2354,7 @@ for (const encrypted of [false, true]) {
 		a.vault.put("note.md", bytes("remote edit"));
 		await a.full();
 		b.vault.put("note.md", bytes("local edit"));
+		b.vault.put("extra.md", bytes("ordinary upload"));
 		const original = await b.client.getPhysicalPath("vault/note.md");
 		let progressDuringTransfer: number | undefined;
 		disk.beforeRequest = async (_method, endpoint, path) => {
@@ -1077,20 +2373,21 @@ for (const encrypted of [false, true]) {
 		assert.equal((await b.engine.fullSync()).success, false);
 		assert.equal(
 			progressDuringTransfer,
-			0,
+			1,
 			"Conflict is not complete while winner transfer is pending",
 		);
+		b.assertLocal("note.md", "local edit");
 		const copies = [...b.vault.files.keys()].filter((path) =>
 			path.includes("_conflict_"),
 		);
 		assert.equal(copies.length, 1);
-		const saved = await b.saved();
-		await b.stop();
+		const saved = b.crash();
 		disk.beforeRequest = undefined;
 		restarted = device(disk, "b", codec, b.vault, saved);
 		await restarted.full();
 		await restarted.assertSettled({
 			"note.md": "remote edit",
+			"extra.md": "ordinary upload",
 			[copies[0]!]: "local edit",
 		});
 	});
@@ -1183,7 +2480,7 @@ for (const encrypted of [false, true]) {
 			}
 		};
 		assert.equal((await b.engine.fullSync()).success, false);
-		const saved = await b.saved();
+		const saved = b.crash();
 		const copy = saved.pendingMutations.find((mutation) =>
 			mutation.path.includes("_conflict_"),
 		)!.path;
@@ -1192,7 +2489,6 @@ for (const encrypted of [false, true]) {
 				.length,
 			1,
 		);
-		await b.stop();
 		disk.beforeRequest = undefined;
 		restarted = device(disk, "b", codec, b.vault, saved);
 		assert.deepEqual(
