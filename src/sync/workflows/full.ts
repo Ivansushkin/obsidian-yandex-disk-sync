@@ -1,7 +1,16 @@
+import {
+	collectReplayedDeletions,
+	planFullRecreations,
+	prepareRecreationVersions,
+	commitRecreatedFiles,
+	type ReplayedExactDeletion,
+	type FullRecreation,
+} from "../reconciliation/recreations";
 import { receiveEncryptionReplacement } from "./encryption-adoption";
 import { YandexDiskClient } from "../../api/yandex-client";
 import { t } from "../../i18n";
 import type {
+	FileMetadata,
 	PendingMutation,
 	SyncError,
 	SyncOperation,
@@ -11,7 +20,10 @@ import type {
 	YandexDiskSyncSettings,
 } from "../../types";
 import { logger, shortenDiagnosticValue } from "../../utils/logger";
-import { PendingPutLookup } from "../local/baseline-rules";
+import {
+	isPublishedRemoteVersion,
+	PendingPutLookup,
+} from "../local/baseline-rules";
 import {
 	IndexManager,
 	type CanonicalReadSession,
@@ -68,9 +80,107 @@ export interface FullSyncContext {
 	adoptedEpoch: string | null;
 }
 
+/** Match a queued put against the live file version selected by full sync. */
+function matchesReconciledPut(
+	mutation: PendingMutation,
+	file: FileMetadata | undefined,
+): boolean {
+	return (
+		file !== undefined &&
+		!file.deleted &&
+		mutation.sha256 !== undefined &&
+		file.sha256 === mutation.sha256
+	);
+}
+
+/** Validate the FIFO before either commit in a full sync that has conflicts. */
+async function prepareFullConflictPredecessors(
+	deps: Pick<Dependencies, "indexManager" | "indexSaveCallback" | "settings">,
+	result: SyncResult,
+	phase: "deletion" | "conflict" | "recreation",
+	recreatedPaths?: ReadonlyMap<string, FullRecreation>,
+): Promise<boolean> {
+	const index = deps.indexManager;
+	const desired = index.getRemoteIndex();
+	const applied = desired.appliedMutationSeq[deps.settings.deviceId] ?? 0;
+	const pending = index
+		.getPendingMutations()
+		.filter(({ seq }) => seq > applied)
+		.sort((left, right) => left.seq - right.seq);
+	const latestFolderDelete = new Map<string, number>();
+	const pendingBySeq = new Map<number, PendingMutation>();
+	for (const mutation of pending) {
+		pendingBySeq.set(mutation.seq, mutation);
+		if (mutation.type === "delete-folder") {
+			latestFolderDelete.set(
+				mutation.path.replace(/\/+$/, ""),
+				mutation.seq,
+			);
+		}
+	}
+	let expected = applied + 1;
+	for (const mutation of pending) {
+		const file = desired.files[mutation.path];
+		const recreationPlan = recreatedPaths?.get(mutation.path);
+		const retainedForeign =
+			recreationPlan?.foreign && recreationPlan.copyPath;
+		const readyPut =
+			mutation.type === "put" &&
+			(matchesReconciledPut(mutation, file) ||
+				(retainedForeign && recreationPlan.put.id === mutation.id));
+		const folderPath = mutation.path.replace(/\/+$/, "");
+		const folder = desired.folderTombstones[folderPath];
+		const recreation = pendingBySeq.get(file?.mutationSeq ?? 0);
+		const restoredAfterDeletion =
+			mutation.type === "delete-file" &&
+			file?.lastModifiedBy === deps.settings.deviceId &&
+			recreation?.type === "put" &&
+			recreation.path === mutation.path &&
+			recreation.epoch === mutation.epoch &&
+			recreation.seq > mutation.seq &&
+			matchesReconciledPut(recreation, file) &&
+			(index.hasPublishedFileDeletion(mutation.path) ||
+				recreationPlan?.deletions.has(mutation.seq));
+		const preparedDelete =
+			(mutation.type === "delete-file" &&
+				file?.deleted === true &&
+				!file.deletedByFolder) ||
+			restoredAfterDeletion ||
+			(retainedForeign &&
+				mutation.type === "delete-file" &&
+				recreationPlan.deletions.has(mutation.seq)) ||
+			(mutation.type === "delete-folder" &&
+				folder?.lastModifiedBy === deps.settings.deviceId &&
+				folder.mutationSeq === latestFolderDelete.get(folderPath));
+		if (
+			mutation.seq !== expected ||
+			mutation.epoch !== desired.epoch ||
+			!(mutation.type === "noop" || readyPut || preparedDelete)
+		) {
+			logger.info("Full conflict waits for a pending mutation", {
+				phase,
+				mutationType: mutation.type,
+				mutationSeq: mutation.seq,
+				expectedSequence: expected,
+			});
+			await deps.indexSaveCallback?.();
+			result.deferred = true;
+			return false;
+		}
+		expected++;
+	}
+	if (phase === "conflict") {
+		for (const mutation of pending) {
+			index.stageMutation(mutation);
+		}
+	}
+	return true;
+}
+
 /** Settle durable puts against the logical state selected by full sync.  Matching puts only need their device watermark. Puts superseded by the reconciled state become local no-ops so staging cannot alter canonical file metadata. */
 export function settleFullSyncPendingPuts(
 	deps: Pick<Dependencies, "indexManager">,
+	retainedPuts: ReadonlySet<string> = new Set(),
 ): {
 	pendingWatermarks: number;
 	matchingPuts: number;
@@ -84,16 +194,10 @@ export function settleFullSyncPendingPuts(
 		if (mutation.type === "noop") {
 			continue;
 		}
-		if (mutation.type !== "put") {
+		if (mutation.type !== "put" || retainedPuts.has(mutation.id)) {
 			continue;
 		}
-		const canonical = canonicalFiles[mutation.path];
-		if (
-			canonical &&
-			!canonical.deleted &&
-			mutation.sha256 !== undefined &&
-			canonical.sha256 === mutation.sha256
-		) {
+		if (matchesReconciledPut(mutation, canonicalFiles[mutation.path])) {
 			matchingPuts++;
 			continue;
 		}
@@ -125,6 +229,8 @@ export function settleFullSyncPendingPuts(
 export function prepareFullUploadMutations(
 	deps: Pick<Dependencies, "indexManager">,
 	uploads: SyncOperation[],
+	verifiedPredecessors: ReadonlyMap<string, PendingMutation> = new Map(),
+	replayedDeletes?: ReadonlyMap<string, ReplayedExactDeletion>,
 ): PendingMutation[] {
 	const pending = new PendingPutLookup(
 		deps.indexManager.getPendingMutations(),
@@ -134,8 +240,17 @@ export function prepareFullUploadMutations(
 		if (!sha256) {
 			return [];
 		}
+		const deletion = replayedDeletes?.get(operation.path);
+		const predecessor =
+			deletion ?? verifiedPredecessors.get(operation.path);
 		const existing = pending.get(operation.path, sha256);
-		if (existing) {
+		if (
+			existing &&
+			(!deletion || existing.seq > deletion.lastDeletion) &&
+			(!predecessor ||
+				(existing.baseRevision === predecessor.baseRevision &&
+					existing.baselineSha256 === predecessor.baselineSha256))
+		) {
 			return [existing];
 		}
 		const mutation = deps.indexManager.enqueueMutation(
@@ -143,9 +258,11 @@ export function prepareFullUploadMutations(
 			operation.path,
 			{
 				sha256,
-				baselineSha256:
-					deps.indexManager.getLocalIndex().files[operation.path]
-						?.sha256,
+				baseRevision: predecessor?.baseRevision,
+				baselineSha256: predecessor
+					? predecessor.baselineSha256
+					: deps.indexManager.getLocalIndex().files[operation.path]
+							?.sha256,
 			},
 		);
 		pending.add(mutation);
@@ -249,6 +366,7 @@ export async function reconcileFullSync(
 		result,
 		plan,
 		admission.hadPendingCausalWork,
+		admission.replayedExactDeletions,
 		validationToken,
 	);
 	deps.canonicalReadSession?.assertCurrent();
@@ -257,6 +375,8 @@ export async function reconcileFullSync(
 interface FullAdmission {
 	adoptionDecision: "accept" | "preserve" | null;
 	hadPendingCausalWork: boolean;
+	replayedFolderChildren: ReadonlySet<string> | undefined;
+	replayedExactDeletions: ReadonlyMap<string, ReplayedExactDeletion>;
 }
 
 interface FullPlan {
@@ -265,6 +385,7 @@ interface FullPlan {
 	verifiedMetadataChanged: boolean;
 	baselinesChanged: boolean;
 	allowPublishedLocalDeletes: boolean;
+	verifiedUploadPredecessors: ReadonlyMap<string, PendingMutation>;
 }
 
 /** Discover canonical state and finish first-connection reception before adoption. */
@@ -302,7 +423,11 @@ async function loadFullCanonical(
 		!(initialCanonical.appliedMutationSeq[deps.settings.deviceId] ?? 0)
 	) {
 		if (
-			Object.values(initialCanonical.moves).some((move) => move.pending)
+			Object.values(initialCanonical.moves).some(
+				(move) =>
+					move.pending &&
+					!reconcilePhysicalRecovery.isVaultTrashMove(move),
+			)
 		) {
 			throw new Error(
 				"Initial remote receive waits for pending canonical moves to finish",
@@ -395,13 +520,14 @@ async function prepareFullReconciliation(
 		deps.indexManager.getPendingMutations().length > 0 ||
 		deps.indexManager.getPendingPhysicalActions().length > 0 ||
 		Object.keys(deps.indexManager.getRemoteIndex().moves).length > 0;
-	if (
-		!adoption.adoptionSnapshot &&
-		deps.indexManager.replayPendingMutations()
-	) {
-		if (deps.indexSaveCallback) {
-			await deps.indexSaveCallback();
-		}
+	const replayedExactDeletions = adoption.adoptionSnapshot
+		? new Map<string, ReplayedExactDeletion>()
+		: collectReplayedDeletions(deps);
+	const replay = adoption.adoptionSnapshot
+		? undefined
+		: deps.indexManager.replayPendingMutations();
+	if (replay?.confirmedMutations) {
+		await deps.indexSaveCallback?.();
 	}
 	fileOperations.assertPortableLocalTree(
 		deps.fileOperations,
@@ -429,14 +555,23 @@ async function prepareFullReconciliation(
 		return null;
 	}
 
-	return { adoptionDecision, hadPendingCausalWork };
+	return {
+		adoptionDecision,
+		hadPendingCausalWork,
+		replayedFolderChildren: replay?.replayedFolderChildren,
+		replayedExactDeletions,
+	};
 }
 
 /** Classify fresh local/remote observations without claiming lifecycle completion. */
 async function scanFullReconciliation(
 	deps: Dependencies,
 	adoption: FullSyncContext,
-	{ adoptionDecision, hadPendingCausalWork }: FullAdmission,
+	{
+		adoptionDecision,
+		hadPendingCausalWork,
+		replayedFolderChildren,
+	}: FullAdmission,
 	startTime: number,
 ): Promise<FullPlan> {
 	// 3. Build local index
@@ -457,12 +592,13 @@ async function scanFullReconciliation(
 	}
 	const localFiles = scans[0].value;
 	const remoteFiles = scans[1].value;
+	const listedFiles = new Map(remoteFiles);
 	logger.info("Full scan observations completed", {
 		durationMs: Date.now() - scanStartedAt,
 		localFiles: localFiles.size,
 		remoteFiles: remoteFiles.size,
 	});
-	const verifiedMetadataChanged =
+	const { metadataChanged: verifiedMetadataChanged, hashVerifiedPaths } =
 		await reconcileBaselines.verifyRemoteContentCandidates(
 			deps.syncReconciliation,
 			localFiles,
@@ -505,10 +641,42 @@ async function scanFullReconciliation(
 				startTime,
 				remoteIndex.folderTombstones,
 				deps.indexManager.getPendingLocalDeletePaths(),
+				replayedFolderChildren,
+				hashVerifiedPaths,
 			);
 	operations = operations.filter((operation) =>
 		deps.syncReconciliation.vaultAdapter.shouldSync(operation.path),
 	);
+	// Absence from the Vault snapshot does not prove a Force-written raw file was deleted.
+	const retainedLocalPaths = new Set<string>();
+	for (const { action, path } of operations) {
+		if (
+			action === "delete_remote" &&
+			!localFiles.has(path) &&
+			(await deps.fileOperations.vaultAdapter.vault.adapter.stat(path))
+		) {
+			retainedLocalPaths.add(path);
+		}
+	}
+	operations = operations.filter(({ path }) => !retainedLocalPaths.has(path));
+	const verifiedUploadPredecessors = adoption.adoptionSnapshot
+		? new Map<string, PendingMutation>()
+		: reconcileBaselines.findVerifiedUploadPredecessors(
+				deps,
+				operations,
+				hashVerifiedPaths,
+			);
+	if (verifiedUploadPredecessors.size > 0) {
+		operations = operations.map((operation) =>
+			verifiedUploadPredecessors.has(operation.path)
+				? {
+						...operation,
+						action: "upload",
+						reason: "Later local edit supersedes a verified unfinished upload",
+					}
+				: operation,
+		);
+	}
 	if (
 		!adoption.adoptionSnapshot &&
 		!hadPendingCausalWork &&
@@ -562,11 +730,43 @@ async function scanFullReconciliation(
 	}
 	const pendingMutationsBeforeBaselines =
 		deps.indexManager.getPendingMutations().length;
-	operations = operations.map((operation) =>
-		operation.action === "upload"
-			? { ...operation, remoteMeta: remoteFiles.get(operation.path) }
-			: operation,
-	);
+	operations = operations.map((operation) => {
+		if (
+			operation.action === "download" ||
+			operation.action === "conflict"
+		) {
+			const listed = listedFiles.get(operation.path);
+			const canonical = remoteIndex.files[operation.path];
+			const published =
+				listed && isPublishedRemoteVersion(listed, canonical);
+			const parent = operation.folderTombstonePath;
+			const folder = parent && remoteIndex.folderTombstones[parent];
+			return {
+				...operation,
+				folderSurvivor:
+					folder && canonical?.deletedByFolder === parent
+						? {
+								parent: folder.path,
+								epoch: remoteIndex.epoch,
+								folderRevision: folder.changedRevision,
+								fileRevision: canonical.changedRevision,
+								sha256: canonical.sha256,
+							}
+						: undefined,
+				remoteMeta: listed,
+				expectedDownloadSha256: published
+					? canonical?.sha256
+					: undefined,
+			};
+		}
+		if (operation.action === "upload") {
+			return {
+				...operation,
+				remoteMeta: remoteFiles.get(operation.path),
+			};
+		}
+		return operation;
+	});
 	const baselinesChanged = reconcileBaselines.recordConfirmedBaselines(
 		deps.syncReconciliation,
 		localFiles,
@@ -588,6 +788,7 @@ async function scanFullReconciliation(
 		verifiedMetadataChanged,
 		baselinesChanged,
 		directoryPages,
+		verifiedUploadPredecessors,
 		allowPublishedLocalDeletes:
 			!adoption.adoptionSnapshot &&
 			!hadPendingCausalWork &&
@@ -606,8 +807,10 @@ async function applyFullReconciliation(
 		baselinesChanged,
 		directoryPages,
 		allowPublishedLocalDeletes,
+		verifiedUploadPredecessors,
 	}: FullPlan,
 	hadPendingCausalWork: boolean,
+	replayedExactDeletions: ReadonlyMap<string, ReplayedExactDeletion>,
 	validationToken?: string,
 ): Promise<void> {
 	// 6. Preflight: Create all necessary folders
@@ -638,15 +841,37 @@ async function applyFullReconciliation(
 		(op) => op.action === "delete_remote" || op.action === "delete_local",
 	);
 	const conflicts = operations.filter((op) => op.action === "conflict");
-	const fullUploadMutations = prepareFullUploadMutations(deps, uploads);
-	if (fullUploadMutations.length > 0 && deps.indexSaveCallback) {
-		await deps.indexSaveCallback();
+	const canonical = deps.indexManager.getRemoteIndex();
+	const expectedEpoch = canonical.epoch;
+	for (const { path } of uploads) {
+		const deletion = replayedExactDeletions.get(path);
+		if (
+			deletion &&
+			(!deletion.baselineSha256 || deletion.baseRevision === null)
+		) {
+			throw new Error("Cannot verify the original recreation baseline");
+		}
 	}
-	let indexCommittedBeforeDeletes = false;
+	const fullUploadMutations = prepareFullUploadMutations(
+		deps,
+		uploads,
+		verifiedUploadPredecessors,
+		replayedExactDeletions,
+	);
+	if (fullUploadMutations.length > 0) {
+		await deps.indexSaveCallback?.();
+	}
+	const recreations = planFullRecreations(
+		deps,
+		uploads,
+		fullUploadMutations,
+		replayedExactDeletions,
+	);
+	let indexCommittedBeforeConflicts = false;
 
 	const mtimeStamped = await executeBulkUploads(
 		deps,
-		uploads,
+		uploads.filter((operation) => !recreations.has(operation.path)),
 		result,
 		(completed) => {
 			processedOps = completed;
@@ -675,6 +900,7 @@ async function applyFullReconciliation(
 				processedOps = uploads.length + completed;
 				deps.reportProgress(processedOps, totalOps);
 			},
+			"by-size",
 		);
 		result.downloaded = downloadResults.succeeded;
 		result.errors.push(...downloadResults.errors);
@@ -684,12 +910,50 @@ async function applyFullReconciliation(
 		}
 	}
 
-	const mutationSettlement = settleFullSyncPendingPuts(deps);
+	const retainedPuts = new Set(
+		[...recreations.values()].map(({ put }) => put.id),
+	);
+	const mutationSettlement = settleFullSyncPendingPuts(deps, retainedPuts);
 	if (mutationSettlement.noopPuts > 0 && deps.indexSaveCallback) {
 		await deps.indexSaveCallback();
 	}
 
+	if (recreations.size > 0) {
+		await prepareRecreationVersions(deps, recreations);
+		if (
+			!(await prepareFullConflictPredecessors(
+				deps,
+				result,
+				"recreation",
+				recreations,
+			))
+		) {
+			return;
+		}
+		if (
+			!(await commitRecreatedFiles(
+				deps,
+				recreations,
+				uploads,
+				result,
+				options,
+				expectedEpoch,
+				validationToken,
+			))
+		) {
+			return;
+		}
+		indexCommittedBeforeConflicts = true;
+	}
+
 	if (deletes.length > 0) {
+		// Publishing deletion intents also confirms the pending queue.
+		if (
+			conflicts.length > 0 &&
+			!(await prepareFullConflictPredecessors(deps, result, "deletion"))
+		) {
+			return;
+		}
 		deps.setSyncPhase("applying", t("status.op.deleting_files"));
 		const deletionCommitProof =
 			await syncReconciliation.commitDeletionIntents(
@@ -711,7 +975,7 @@ async function applyFullReconciliation(
 				deletionCommitProof.proof,
 				validationToken,
 			);
-			indexCommittedBeforeDeletes = true;
+			indexCommittedBeforeConflicts = true;
 		}
 		deletes = syncReconciliation.filterCommittedDeletions(
 			deps.syncReconciliation,
@@ -754,13 +1018,23 @@ async function applyFullReconciliation(
 	}
 
 	if (conflicts.length > 0) {
-		await resolveFullConflicts(
-			deps,
-			conflicts,
-			result,
-			processedOps,
-			totalOps,
-		);
+		if (
+			!(await prepareFullConflictPredecessors(deps, result, "conflict"))
+		) {
+			return;
+		}
+		if (
+			!(await resolveFullConflicts(
+				deps,
+				conflicts,
+				result,
+				processedOps,
+				totalOps,
+			))
+		) {
+			await deps.indexSaveCallback?.();
+			return;
+		}
 	}
 
 	await commitFullReconciliation(
@@ -774,7 +1048,7 @@ async function applyFullReconciliation(
 			hadPendingCausalWork,
 			mtimeStamped,
 			pendingWatermarks: mutationSettlement.pendingWatermarks,
-			indexCommittedBeforeDeletes,
+			indexCommittedBeforeConflicts,
 			hasConflicts: conflicts.length > 0,
 		},
 		validationToken,
@@ -788,7 +1062,7 @@ interface FullCommitState {
 	hadPendingCausalWork: boolean;
 	mtimeStamped: boolean;
 	pendingWatermarks: number;
-	indexCommittedBeforeDeletes: boolean;
+	indexCommittedBeforeConflicts: boolean;
 	hasConflicts: boolean;
 }
 
@@ -804,7 +1078,7 @@ async function commitFullReconciliation(
 		hadPendingCausalWork,
 		mtimeStamped,
 		pendingWatermarks,
-		indexCommittedBeforeDeletes,
+		indexCommittedBeforeConflicts,
 		hasConflicts,
 	}: FullCommitState,
 	validationToken?: string,
@@ -835,7 +1109,7 @@ async function commitFullReconciliation(
 			pendingWatermarks > 0;
 	if (
 		!indexDirty &&
-		!indexCommittedBeforeDeletes &&
+		!indexCommittedBeforeConflicts &&
 		deps.canonicalReadSession
 	) {
 		// Preserve applied bytes across failed validation/restart without observing success.
@@ -872,7 +1146,7 @@ async function commitFullReconciliation(
 	}
 
 	const strictNoOp =
-		!indexDirty && !hadPendingCausalWork && !indexCommittedBeforeDeletes;
+		!indexDirty && !hadPendingCausalWork && !indexCommittedBeforeConflicts;
 	if (!strictNoOp) {
 		const guard = await deps.getSyncGuardResult(
 			options?.skipEncryptionGuard,
@@ -896,7 +1170,7 @@ async function commitFullReconciliation(
 			validation: "strict-noop",
 		});
 	}
-	if (!indexDirty && !indexCommittedBeforeDeletes) {
+	if (!indexDirty && !indexCommittedBeforeConflicts) {
 		logger.debug(
 			"[SyncEngine] No changes detected, skipping remote index save",
 		);
@@ -906,7 +1180,7 @@ async function commitFullReconciliation(
 		await settleFullPhysicalWork(deps, result);
 		return;
 	}
-	if (indexCommittedBeforeDeletes && !hasConflicts) {
+	if (indexCommittedBeforeConflicts && !hasConflicts) {
 		await settleFullPhysicalWork(deps, result);
 		return;
 	}
@@ -991,7 +1265,7 @@ async function resolveFullConflicts(
 	result: SyncResult,
 	processedOps: number,
 	totalOps: number,
-): Promise<void> {
+): Promise<boolean> {
 	deps.setSyncPhase("applying", t("status.op.resolving_conflicts"));
 	for (const op of conflicts) {
 		if (deps.isPaused) {
@@ -1001,7 +1275,7 @@ async function resolveFullConflicts(
 				operation: "none",
 				message: "Synchronization interrupted",
 			});
-			break;
+			return false;
 		}
 
 		deps.setSyncPhase(
@@ -1022,9 +1296,11 @@ async function resolveFullConflicts(
 			logger.error(`Error resolving conflict for ${op.path}:`, {
 				error: e,
 			});
+			return false;
 		} finally {
 			processedOps++;
 			deps.reportProgress(processedOps, totalOps);
 		}
 	}
+	return true;
 }

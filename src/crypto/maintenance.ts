@@ -13,8 +13,10 @@ import { computeSha256 } from "../utils/hash-utils";
 import { logger, shortenDiagnosticValue } from "../utils/logger";
 import {
 	joinPath,
+	isVaultTrashPath,
 	toLocalPath,
 	shouldInspectRawSyncPath,
+	VAULT_TRASH_DIRECTORY,
 } from "../utils/path-utils";
 import type { EncryptionContext } from "./context";
 import { type EncryptionCodec } from "./encryption";
@@ -125,9 +127,29 @@ export class EncryptionMaintenance {
 					),
 				)
 			: undefined;
-		const preserved = new Set(
-			canonical.epochAdoption?.preservedRawPaths ?? [],
-		);
+		const preserved = new Set([
+			VAULT_TRASH_DIRECTORY,
+			...(canonical.epochAdoption?.preservedRawPaths ?? []),
+		]);
+		if (scope && source.enabled) {
+			const codec = this.cleanupSourceCodec;
+			if (!codec) {
+				throw new Error(
+					"Encryption replacement requires the source codec",
+				);
+			}
+			// Reserve each root even when an old upload is still in flight.
+			let names = [""];
+			for (const letter of VAULT_TRASH_DIRECTORY) {
+				const variants = new Set([letter, letter.toUpperCase()]);
+				names = names.flatMap((prefix) =>
+					[...variants].map((variant) => prefix + variant),
+				);
+			}
+			for (const name of names) {
+				preserved.add(await codec.encryptFilename(name));
+			}
+		}
 		for (const path of scope ? sourceRawPaths : []) {
 			if (isPreservedRawPath(path, [...preserved])) {
 				continue;
@@ -397,6 +419,11 @@ export class EncryptionMaintenance {
 		transition: LocalEncryptionTransition,
 	): Promise<void> {
 		if (transition.referenceFiles) {
+			for (const path of Object.keys(transition.referenceFiles).filter(
+				isVaultTrashPath,
+			)) {
+				delete transition.referenceFiles[path];
+			}
 			this.context.index.getRemoteIndex().files = structuredClone(
 				transition.referenceFiles,
 			);
@@ -404,7 +431,10 @@ export class EncryptionMaintenance {
 		const logicalPaths = Object.entries(
 			this.context.index.getRemoteIndex().files,
 		)
-			.filter(([, metadata]) => !metadata.deleted)
+			.filter(
+				([path, metadata]) =>
+					!metadata.deleted && !isVaultTrashPath(path),
+			)
 			.map(([logicalPath]) => logicalPath)
 			.sort();
 		const targetEntries: Array<readonly [string, string]> = [];

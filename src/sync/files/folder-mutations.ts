@@ -456,63 +456,47 @@ export function stageFolderMove(
 	plannedPairs: ReturnType<typeof planFolderMove>["plannedPairs"],
 ): void {
 	const localIndex = index.getLocalIndex();
-	const oldPrefix = `${oldPath.replace(/\/+$/, "")}/`;
-	const newPrefix = `${newPath.replace(/\/+$/, "")}/`;
+	const baseRevision = mutation.baseRevision ?? 0;
 	index.recordMove(
 		mutation.id,
 		oldPath,
 		newPath,
 		"folder",
-		mutation.baseRevision ?? index.getRemoteIndex().revision,
+		baseRevision,
 		mutation.seq,
 	);
+	const move = index.getRemoteIndex().moves[mutation.id]!;
 	index.markFolderDeleted(
 		oldPath,
 		mutation.createdAt,
-		mutation.baseRevision,
+		baseRevision,
 		mutation.seq,
 	);
-	for (const { fromPath: filePath, toPath: target } of plannedPairs) {
-		const meta = canonical.files[filePath]!;
-		index.markRemoteFileDeleted(
-			filePath,
-			oldPath,
-			mutation.baseRevision ?? 0,
-			mutation.seq,
-		);
-		index.updateRemoteFile(target, {
-			...meta,
-			path: target,
+	for (const { fromPath, toPath } of plannedPairs) {
+		const targetState = {
+			path: toPath,
 			deleted: false,
 			deletedAt: undefined,
 			deletedByFolder: undefined,
+			lastModifiedBy: move.lastModifiedBy,
+			baseRevision,
 			mutationSeq: mutation.seq,
-		});
-	}
-	const plannedSourcePaths = new Set(
-		plannedPairs.map((pair) => pair.fromPath),
-	);
-	for (const [filePath, meta] of Object.entries({
-		...localIndex.files,
-	})) {
-		if (!filePath.startsWith(oldPrefix) || meta.deleted) {
-			continue;
-		}
-		if (!plannedSourcePaths.has(filePath)) {
-			continue;
-		}
-		index.markLocalFileDeleted(filePath, oldPath, mutation.seq);
-		index.updateLocalFile(
-			`${newPrefix}${filePath.slice(oldPrefix.length)}`,
-			{
-				...meta,
-				path: `${newPrefix}${filePath.slice(oldPrefix.length)}`,
-				deleted: false,
-				deletedAt: undefined,
-				deletedByFolder: undefined,
-				mutationSeq: mutation.seq,
-			},
+		};
+		index.markRemoteFileDeleted(
+			fromPath,
+			oldPath,
+			baseRevision,
+			mutation.seq,
 		);
+		index.updateRemoteFile(toPath, {
+			...canonical.files[fromPath]!,
+			...targetState,
+		});
+		const local = localIndex.files[fromPath];
+		if (local && !local.deleted) {
+			index.markLocalFileDeleted(fromPath, oldPath, mutation.seq);
+			index.updateLocalFile(toPath, { ...local, ...targetState });
+		}
 	}
 	index.stageMutation(mutation);
 }
@@ -525,13 +509,21 @@ export async function renameFolderNow(
 	context: WatcherCausalContext,
 	onPrepared?: (outcome: FolderMutationOutcome) => void | Promise<void>,
 ): Promise<FolderMutationOutcome> {
-	await settleMovePredecessors(
-		deps.fileOperations,
-		oldPath,
-		newPath,
-		true,
-		deps.indexSaveCallback,
-	);
+	const { mutationId, mutationSeq } = context;
+	const pendingMutation = mutationId
+		? deps.indexManager
+				.getPendingMutations()
+				.find((item) => item.id === mutationId && item.type === "move")
+		: undefined;
+	if (!mutationId || pendingMutation) {
+		await settleMovePredecessors(
+			deps.fileOperations,
+			oldPath,
+			newPath,
+			true,
+			deps.indexSaveCallback,
+		);
+	}
 	const guard = await deps.getSyncGuardResult(false);
 	if (guard.blockReason) {
 		deps.setBlockedState(guard.blockReason);
@@ -544,9 +536,71 @@ export async function renameFolderNow(
 	}
 	deps.realtimeGuardValidationToken = guard.validationToken;
 	const canonical = await deps.indexManager.refreshCanonicalForMutation();
-	const pendingMove = context.mutationId
-		? canonical.moves[context.mutationId]
-		: undefined;
+	const pendingMove = mutationId ? canonical.moves[mutationId] : undefined;
+	if (mutationId && mutationSeq !== undefined) {
+		const deviceId = deps.settings.deviceId;
+		const receipt = {
+			mutationId,
+			mutationSeq,
+			canonicalRevision: canonical.revision,
+			epoch: canonical.epoch,
+		};
+		if (
+			context.epoch !== canonical.epoch ||
+			mutationId !== `${deviceId}:${mutationSeq}` ||
+			(pendingMove &&
+				(pendingMove.kind !== "folder" ||
+					pendingMove.fromPath !== oldPath ||
+					pendingMove.toPath !== newPath ||
+					pendingMove.lastModifiedBy !== deviceId ||
+					pendingMove.mutationSeq !== mutationSeq))
+		) {
+			return {
+				...receipt,
+				status: "retry",
+				reason: "folder-move-receipt-mismatch",
+			};
+		}
+		if (
+			!pendingMove &&
+			(canonical.appliedMutationSeq[deviceId] ?? 0) >= mutationSeq
+		) {
+			// A later folder deletion can supersede the remote tombstone before watcher ACK.
+			const tombstone = [
+				canonical.folderTombstones[oldPath],
+				deps.indexManager.getLocalIndex().folderTombstones[oldPath],
+			].find(
+				(entry) =>
+					entry?.lastModifiedBy === deviceId &&
+					entry.mutationSeq === mutationSeq &&
+					entry.baseRevision === (context.baseRevision ?? 0),
+			);
+			if (!tombstone) {
+				return {
+					...receipt,
+					status: "retry",
+					reason: "folder-move-receipt-mismatch",
+				};
+			}
+			// A completed marker may disappear before the watcher ACK is durable.
+			deps.indexManager.confirmMutation(mutationId);
+			for (const action of deps.indexManager.getPendingPhysicalActions()) {
+				if (
+					action.type === "move-remote" &&
+					action.epoch === canonical.epoch &&
+					action.parentMutationId === mutationId
+				) {
+					deps.indexManager.completePhysicalAction(action.id);
+				}
+			}
+			await deps.indexSaveCallback?.();
+			return {
+				...receipt,
+				status: "completed",
+				canonicalRevision: tombstone.changedRevision,
+			};
+		}
+	}
 	if (pendingMove?.pending && pendingMove.kind === "folder") {
 		return recoverFolderRename(
 			deps,

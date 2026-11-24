@@ -2,13 +2,25 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { RemoteIndexTransactionError } from "../src/sync/canonical/manager";
 import type { DurableRenameEvent } from "../src/sync/realtime/rules";
-import { bytes, codecFor, device, MemoryDisk } from "./helpers/sync-flow";
+import {
+	bytes,
+	codecFor,
+	device,
+	managedDevices,
+	MemoryDisk,
+	type SavedDevice,
+} from "./helpers/sync-flow";
 
 for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
 	test(`${mode} independent file and folder renames share two canonical commits`, async () => {
-		const { disk, a, b, drain } = await queuedRenames(encrypted);
+		const { disk, a, b, drain } = await queuedRenames(encrypted, true);
 		try {
+			const before = await a.canonical();
+			assert.equal(
+				before.files["Folder/D.md"]?.lastModifiedBy,
+				"device-b",
+			);
 			let transactions = 0;
 			disk.beforeRequest = async (method, endpoint, path) => {
 				if (
@@ -50,6 +62,26 @@ for (const encrypted of [false, true]) {
 			assert.equal(transactions, 2);
 			assert.equal(publications, 2);
 			assert.equal(lostMoveReply, true);
+			const after = await a.canonical();
+			const sequence = after.appliedMutationSeq["device-a"]!;
+			assert.ok(sequence > before.appliedMutationSeq["device-b"]!);
+			assert.equal(
+				after.appliedMutationSeq["device-b"],
+				before.appliedMutationSeq["device-b"],
+			);
+			for (const path of [
+				"Destination/Folder/Deep/C.md",
+				"Destination/Folder/D.md",
+			]) {
+				for (const entry of [
+					after.files[path],
+					a.index.getLocalIndex().files[path],
+				]) {
+					assert.equal(entry?.lastModifiedBy, "device-a");
+					assert.equal(entry.mutationSeq, sequence);
+					assert.equal(entry.baseRevision, before.revision);
+				}
+			}
 			disk.afterRequest = undefined;
 			disk.beforeRequest = undefined;
 			await a.full();
@@ -79,15 +111,19 @@ const finalFiles = {
 };
 
 /** Collect a mixed rename burst without replacing any sync algorithms. */
-async function queuedRenames(encrypted: boolean) {
+async function queuedRenames(encrypted: boolean, foreignFolder = false) {
 	const disk = new MemoryDisk();
 	const codec = await codecFor(encrypted);
 	const a = device(disk, "device-a", codec);
 	const b = device(disk, "device-b", codec);
 	a.vault.put("A.md", bytes("alpha"));
 	a.vault.put("B.md", bytes("beta"));
-	a.vault.put("Folder/Deep/C.md", bytes("charlie"));
-	a.vault.put("Folder/D.md", bytes("delta"));
+	const folderOwner = foreignFolder ? b : a;
+	folderOwner.vault.put("Folder/Deep/C.md", bytes("charlie"));
+	folderOwner.vault.put("Folder/D.md", bytes("delta"));
+	if (foreignFolder) {
+		await b.full();
+	}
 	await a.full();
 	await b.full();
 	a.vault.folder("Destination");
@@ -317,7 +353,8 @@ for (const encrypted of [false, true]) {
 for (const encrypted of [false, true]) {
 	const mode = encrypted ? "encrypted" : "plaintext";
 	test(`${mode} full waits for the rename batch and retains edits made while it runs`, async () => {
-		const { disk, a, b, drain } = await queuedRenames(encrypted);
+		const { disk, codec, a, b, drain } = await queuedRenames(encrypted);
+		let restarted: ReturnType<typeof device> | undefined;
 		let entered!: () => void;
 		let release!: () => void;
 		const started = new Promise<void>((resolve) => {
@@ -341,47 +378,88 @@ for (const encrypted of [false, true]) {
 					await blocked;
 				}
 			};
+			const renames = a.watcher.getDeferredEvents().map(({ id }) => id);
+			assert.equal(renames.length, 3);
+			let lateId: string | undefined;
+			const scan = a.index.buildLocalIndex.bind(a.index);
+			a.index.buildLocalIndex = async (...args) => {
+				const local = await scan(...args);
+				assert.equal(
+					a
+						.lastSaved()
+						.pendingWatcherEvents.some(({ id }) =>
+							renames.includes(id),
+						),
+					false,
+				);
+				const canonical = await a.canonical();
+				assert.deepEqual(canonical.moves, {});
+				assert.equal(canonical.files["A.md"]?.deleted, true);
+				assert.ok(canonical.files["Destination/A.md"]?.sha256);
+				a.vault.put("Late.md", bytes("after the full scan"));
+				lateId = a.watcher
+					.getDeferredEvents()
+					.find(({ path }) => path === "Late.md")?.id;
+				assert.ok(lateId);
+				return local;
+			};
 			const running = drain();
 			await started;
 			a.vault.put("Destination/B.md", bytes("edit during batch"));
+			a.watcher.setAutomaticAdmission(() => false);
 			const full = a.full();
 			release();
 			await running;
 			await full;
-			await a.drain();
-			await a.full();
+			const saved = a.crash();
+			assert.ok(lateId);
+			assert.deepEqual(
+				saved.pendingWatcherEvents.map(({ id }) => id),
+				[lateId],
+			);
+			assert.equal((await a.canonical()).files["Late.md"], undefined);
+			assert.equal(
+				await a.client.getLogicalResource("vault/Late.md"),
+				null,
+			);
+			restarted = device(disk, "device-a", codec, a.vault, saved);
+			assert.deepEqual(
+				restarted.watcher.getDeferredEvents().map(({ id }) => id),
+				[lateId],
+			);
+			await restarted.index.loadRemoteIndex();
+			restarted.start();
+			await restarted.drain();
 			await b.full();
-			await a.assertSettled({
+			const expected = {
 				...finalFiles,
 				"Destination/B.md": "edit during batch",
-			});
-			await b.assertSettled({
-				...finalFiles,
-				"Destination/B.md": "edit during batch",
-			});
+				"Late.md": "after the full scan",
+			};
+			await restarted.assertSettled(expected);
+			await b.assertSettled(expected);
 		} finally {
 			release();
 			disk.beforeRequest = undefined;
 			await a.stop();
 			await b.stop();
+			await restarted?.stop();
 		}
 	});
 	test(`${mode} failed post-commit persistence cannot acknowledge rename events`, async () => {
 		const { disk, a, b, drain } = await queuedRenames(encrypted);
-		const originalPersist = (
-			a.engine as unknown as { indexSaveCallback: () => Promise<void> }
-		).indexSaveCallback;
+		const originalPersist = a.engine["indexSaveCallback"]!;
 		let reject = false;
 		let publications = 0;
 		try {
 			const ids = a.watcher.getDeferredEvents().map((event) => event.id);
-			a.engine.setIndexSaveCallback(async () => {
+			a.engine.setIndexSaveCallback(async (observation) => {
 				if (reject) {
 					throw new Error(
 						"Synthetic post-commit persistence failure",
 					);
 				}
-				await originalPersist();
+				await originalPersist(observation);
 			});
 			disk.afterRequest = async (_method, endpoint, path) => {
 				if (
@@ -623,5 +701,198 @@ for (const encrypted of [false, true]) {
 			await a.stop();
 			await b.stop();
 		}
+	});
+}
+
+for (const encrypted of [false, true]) {
+	const mode = encrypted ? "encrypted" : "plaintext";
+	test(`${mode} a foreign folder child coalesces with an equal target and resumes its original move`, async (t) => {
+		const open = managedDevices(t);
+		const disk = new MemoryDisk();
+		const codec = await codecFor(encrypted);
+		const writer = open(disk, "writer", codec);
+		const mover = open(disk, "mover", codec);
+		const source = "Old/note.md";
+		const target = "New/note.md";
+		writer.vault.put(source, bytes("shared"));
+		await writer.full();
+		await mover.full();
+		const base = await mover.canonical();
+		mover.start();
+		const pause = {
+			sessionId: "offline-move",
+			kind: "maintenance",
+		} as const;
+		mover.watcher.pauseForSync(pause);
+		mover.vault.rename("Old", "New");
+		const [event] = mover.watcher.getDeferredEvents();
+		assert.ok(event);
+		writer.vault.put(target, bytes("shared"));
+		writer.vault.put("Old/later.md", bytes("later"));
+		await writer.full();
+		const before = await writer.canonical();
+		if (encrypted) {
+			assert.notEqual(
+				before.files[source]?.remoteFingerprint,
+				before.files[target]?.remoteFingerprint,
+			);
+		}
+
+		const physicalSource = await mover.client.getPhysicalPath(
+			`vault/${source}`,
+		);
+		disk.beforeRequest = async (method, _endpoint, path) => {
+			if (method === "DELETE" && path === physicalSource) {
+				throw new Error("Synthetic interruption during source cleanup");
+			}
+		};
+		await mover.watcher.resumeAfterSync({ ...pause, success: true });
+		await mover.drain();
+		const saved = mover.crash();
+		const intent = await writer.canonical();
+		const [move] = Object.values(intent.moves);
+		assert.ok(move?.pending);
+		assert.ok(
+			move.mutationSeq &&
+				move.mutationSeq < before.appliedMutationSeq.writer!,
+		);
+		assert.equal(
+			intent.appliedMutationSeq.writer,
+			before.appliedMutationSeq.writer,
+		);
+		assert.equal(intent.appliedMutationSeq.mover, move.mutationSeq);
+		assert.equal(move.baseRevision, base.revision);
+		assert.equal(move.lastModifiedBy, "mover");
+		for (const entry of [
+			intent.files[source],
+			intent.files[target],
+			saved.localState.files[target],
+		]) {
+			assert.equal(entry?.lastModifiedBy, "mover");
+			assert.equal(entry.mutationSeq, move.mutationSeq);
+			assert.equal(entry.baseRevision, base.revision);
+		}
+		assert.equal(intent.files[source]?.deleted, true);
+		assert.equal(
+			intent.files[target]?.sha256,
+			before.files[source]?.sha256,
+		);
+		assert.equal(intent.files["Old/later.md"]?.lastModifiedBy, "writer");
+		assert.equal(
+			intent.files["Old/later.md"]?.mutationSeq,
+			before.files["Old/later.md"]?.mutationSeq,
+		);
+		assert.deepEqual(
+			saved.pendingWatcherEvents.map(
+				({ id, mutationId, mutationSeq }) => [
+					id,
+					mutationId,
+					mutationSeq,
+				],
+			),
+			[[event.id, move.id, move.mutationSeq]],
+		);
+		const [action] = saved.pendingPhysicalActions;
+		assert.equal(action?.parentMutationId, move.id);
+		assert.equal(action.path, source);
+		assert.equal(action.targetPath, target);
+		assert.equal(
+			action.expectedFingerprint,
+			before.files[source]?.remoteFingerprint,
+		);
+		assert.ok(await mover.client.getLogicalResource(`vault/${source}`));
+
+		disk.beforeRequest = undefined;
+		let awaitingAck: SavedDevice | undefined;
+		const restarted = open(
+			disk,
+			"mover",
+			codec,
+			mover.vault,
+			saved,
+			{},
+			(snapshot) => {
+				if (
+					!snapshot.pendingMutations.length &&
+					snapshot.pendingWatcherEvents.some(
+						({ id }) => id === event.id,
+					)
+				) {
+					awaitingAck = snapshot;
+				}
+			},
+		);
+		await restarted.index.loadRemoteIndex();
+		restarted.start();
+		await restarted.drain();
+		const completed = await restarted.canonical();
+		assert.deepEqual(completed.moves, {});
+		assert.equal(
+			completed.files[target]?.remoteFingerprint,
+			before.files[target]?.remoteFingerprint,
+		);
+		assert.equal(completed.files[target]?.lastModifiedBy, "mover");
+		assert.equal(completed.files[target]?.mutationSeq, move.mutationSeq);
+		assert.deepEqual(
+			await restarted.client.downloadFile("vault/Old/later.md"),
+			bytes("later"),
+		);
+		assert.equal(
+			await restarted.client.getLogicalResource(`vault/${source}`),
+			null,
+		);
+		assert.equal(
+			restarted.index.getLocalIndexData().nextMutationSeq,
+			saved.localState.nextMutationSeq,
+		);
+		assert.ok(awaitingAck);
+		const unrelated = await writer.engine.renameFolder("Old", "New", {
+			epoch: intent.epoch,
+			baseRevision: base.revision,
+			mutationId: move.id,
+			mutationSeq: move.mutationSeq,
+		});
+		assert.equal(unrelated.status, "retry");
+		assert.equal((await writer.canonical()).revision, completed.revision);
+		restarted.crash();
+		await writer.full();
+		writer.start();
+		writer.vault.remove("Old");
+		await writer.drain();
+		writer.vault.put(source, bytes("recreated"));
+		await writer.drain();
+		const replacement = await writer.canonical();
+		assert.equal(
+			replacement.folderTombstones.Old?.lastModifiedBy,
+			"writer",
+		);
+		assert.equal(replacement.files[source]?.deleted ?? false, false);
+		const replay = open(disk, "mover", codec, mover.vault, awaitingAck);
+		await replay.index.loadRemoteIndex();
+		replay.vault.put("Queued.md", bytes("next"), false);
+		const laterPut = replay.index.enqueueMutation("put", "Queued.md", {
+			epoch: replacement.epoch,
+			baseRevision: base.revision,
+		});
+		const nextSeq = replay.index.getLocalIndexData().nextMutationSeq;
+		replay.start();
+		await replay.drain();
+		assert.equal((await replay.canonical()).revision, replacement.revision);
+		assert.equal(replay.index.getLocalIndexData().nextMutationSeq, nextSeq);
+		assert.deepEqual(replay.lastSaved().pendingWatcherEvents, []);
+		assert.deepEqual(replay.index.getPendingMutations(), [laterPut]);
+		assert.equal(
+			await replay.client.getLogicalResource("vault/Queued.md"),
+			null,
+		);
+		await replay.full();
+		await writer.full();
+		const expected = {
+			[target]: "shared",
+			[source]: "recreated",
+			"Queued.md": "next",
+		};
+		await replay.assertSettled(expected);
+		await writer.assertSettled(expected);
 	});
 }

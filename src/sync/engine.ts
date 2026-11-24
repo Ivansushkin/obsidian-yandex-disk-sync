@@ -25,6 +25,7 @@ import {
 import type {
 	ExternalSyncBlock,
 	ExternalSyncBlockKind,
+	ForceRunOptions,
 	IndexSaveCallback,
 	SyncEventCallback,
 	SyncGuardCallback,
@@ -58,19 +59,21 @@ import {
 import { ConflictResolver } from "./reconciliation/conflicts";
 import * as reconciliationContext from "./reconciliation/context";
 import * as encryptionRewrite from "./workflows/encryption-rewrite";
-import * as forceSync from "./workflows/force";
 import {
 	applyForceReplacement,
+	isForceReplacementPlanConfirmed,
 	resumeForceReplacement,
 	type ForceReplacementDependencies,
 	type ForceReplacementPorts,
 } from "./workflows/force-replacement";
+import {
+	assertForceRecovery,
+	type ForceDirection,
+} from "./workflows/force-state";
 import * as fullSync from "./workflows/full";
 export type {
 	ExternalSyncBlock,
 	ExternalSyncBlockKind,
-	ForceBackupProof,
-	ForcePreflightProof,
 	IndexSaveCallback,
 	PhysicalRewriteUploadProof,
 	SyncEventCallback,
@@ -777,19 +780,15 @@ export class SyncEngine {
 		startupReads?: StartupReadSession,
 	): Promise<SyncResult> {
 		const pendingForce = this.forceReplacementPorts?.getRecovery?.();
-		if (pendingForce?.direct) {
-			options = {
-				...options,
-				forceReplacement: {
+		const forceReplacement = pendingForce?.direct
+			? {
 					plan: await resumeForceReplacement(
 						this.forceReplacementDependencies(),
 						pendingForce,
 					),
 					backupMode: pendingForce.backupMode,
-					continuing: true,
-				},
-			};
-		}
+				}
+			: undefined;
 		const adoption: fullSync.FullSyncContext = {
 			adoptionSnapshot: null,
 			adoptedEpoch: null,
@@ -811,13 +810,13 @@ export class SyncEngine {
 			});
 			try {
 				const result = await this.runSyncSession(
-					options,
+					{ ...options, forceReplacement },
 					async (result, startTime, validationToken) => {
-						if (options?.forceReplacement?.plan.recovery.direct) {
+						if (forceReplacement) {
 							const applied = await applyForceReplacement(
 								this.forceReplacementDependencies(),
-								options.forceReplacement.plan,
-								options.forceReplacement.backupMode,
+								forceReplacement.plan,
+								forceReplacement.backupMode,
 							);
 							result.uploaded += applied.uploaded;
 							result.downloaded += applied.downloaded;
@@ -831,7 +830,7 @@ export class SyncEngine {
 						}
 						const deps = this.fullSyncDependencies(
 							validationToken,
-							!options?.forceReplacement &&
+							!forceReplacement &&
 								!options?.skipMaintenanceGuard &&
 								!options?.skipEncryptionGuard,
 							startupReads,
@@ -952,91 +951,79 @@ export class SyncEngine {
 		return await this.runCoordinatedSession("maintenance", options, run);
 	}
 
-	/**
-	 * Force synchronization from local to remote.
-	 * Overwrites ALL remote files with local versions.
-	 * Files not present locally are deleted from remote.
-	 */
-	async forceSyncFromLocal(options?: SyncRunOptions): Promise<SyncResult> {
-		const force: forceSync.ForceRunContext = { bootstrapStarted: false };
-		const run = async () =>
-			await this.runSyncSession(
-				options,
-				async (result, _startTime, validationToken) => {
-					if (options?.forceReplacement) {
-						const applied = await applyForceReplacement(
-							this.forceReplacementDependencies(),
-							options.forceReplacement.plan,
-							options.forceReplacement.backupMode,
-						);
-						result.replacementCommitted = applied.completed;
-						result.epochAdopted = applied.completed;
-						result.deferred =
-							!applied.completed && applied.errors.length === 0;
-						result.uploaded = applied.uploaded;
-						result.deleted = applied.deleted;
-						result.errors.push(...applied.errors);
-						return;
-					}
-					return await forceSync.reconcileForceLocal(
-						this.forceSyncDependencies(),
-						options,
-						force,
-						result,
-						validationToken,
-					);
-				},
-				(result) =>
-					`Force sync from local completed: uploaded ${result.uploaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
-			);
-		const result = await this.runCoordinatedSession("force", options, run);
-		if (force.bootstrapStarted && !result.replacementCommitted) {
-			this.indexManager.cancelForceBootstrap();
-		}
-		return result;
+	/** Replace the selected remote destination from a confirmed local plan. */
+	async forceSyncFromLocal(options?: ForceRunOptions): Promise<SyncResult> {
+		return await this.runForceReplacement("from_local", options);
 	}
 
-	/**
-	 * Force synchronization from remote to local.
-	 * Overwrites ALL local files with remote versions.
-	 * Files not present on remote are deleted locally.
-	 */
-	async forceSyncFromRemote(options?: SyncRunOptions): Promise<SyncResult> {
-		const force: forceSync.ForceRunContext = { bootstrapStarted: false };
-		const run = async () =>
-			await this.runSyncSession(
-				options,
+	/** Replace the selected local destination from a confirmed remote plan. */
+	async forceSyncFromRemote(options?: ForceRunOptions): Promise<SyncResult> {
+		return await this.runForceReplacement("from_remote", options);
+	}
+
+	/** Admit a new Force before any guard, lifecycle callback or storage access. */
+	private async runForceReplacement(
+		direction: ForceDirection,
+		options?: ForceRunOptions,
+	): Promise<SyncResult> {
+		const replacement = options?.forceReplacement;
+		const plan = replacement?.plan;
+		if (
+			!replacement ||
+			!plan?.scope ||
+			!isForceReplacementPlanConfirmed(plan) ||
+			plan.recovery?.direct?.format !== "direct-v1" ||
+			plan.recovery.direction !== direction ||
+			plan.recovery.phase !== "prepared" ||
+			typeof plan.assertConfiguration !== "function" ||
+			!["with-backup", "without-backup"].includes(replacement.backupMode)
+		) {
+			return this.createErrorResult(
+				"Force requires a confirmed Direct plan for the requested direction",
+			);
+		}
+		try {
+			assertForceRecovery({
+				...plan.recovery,
+				backupMode: replacement.backupMode,
+			});
+		} catch {
+			return this.createErrorResult(
+				"Force requires a valid, confirmed Direct plan",
+			);
+		}
+		const runOptions = {
+			forceReplacement: replacement,
+			onActivity: options?.onActivity,
+		};
+		const run = async () => {
+			if (plan.recovery.phase !== "prepared") {
+				return this.createErrorResult(
+					"Force plan has already been applied",
+				);
+			}
+			return await this.runSyncSession(
+				runOptions,
 				async (result) => {
-					if (options?.forceReplacement) {
-						const applied = await applyForceReplacement(
-							this.forceReplacementDependencies(),
-							options.forceReplacement.plan,
-							options.forceReplacement.backupMode,
-						);
-						result.replacementCommitted = applied.completed;
-						result.epochAdopted = applied.completed;
-						result.deferred =
-							!applied.completed && applied.errors.length === 0;
-						result.downloaded = applied.downloaded;
-						result.deleted = applied.deleted;
-						result.errors.push(...applied.errors);
-						return;
-					}
-					return await forceSync.reconcileForceRemote(
-						this.forceSyncDependencies(),
-						options,
-						force,
-						result,
+					const applied = await applyForceReplacement(
+						this.forceReplacementDependencies(),
+						plan,
+						replacement.backupMode,
 					);
+					result.replacementCommitted = applied.completed;
+					result.epochAdopted = applied.completed;
+					result.deferred =
+						!applied.completed && applied.errors.length === 0;
+					result.uploaded = applied.uploaded;
+					result.downloaded = applied.downloaded;
+					result.deleted = applied.deleted;
+					result.errors.push(...applied.errors);
 				},
 				(result) =>
-					`Force sync from remote completed: downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
+					`Force sync ${direction} completed: uploaded ${result.uploaded}, downloaded ${result.downloaded}, deleted ${result.deleted}, errors ${result.errors.length}`,
 			);
-		const result = await this.runCoordinatedSession("force", options, run);
-		if (force.bootstrapStarted && !result.replacementCommitted) {
-			this.indexManager.cancelForceBootstrap();
-		}
-		return result;
+		};
+		return await this.runCoordinatedSession("force", runOptions, run);
 	}
 
 	/**
@@ -1511,7 +1498,7 @@ export class SyncEngine {
 	 * Run a sync session with common guard, lifecycle, and error handling.
 	 */
 	private async runSyncSession(
-		options: SyncRunOptions | undefined,
+		options: (SyncRunOptions & ForceRunOptions) | undefined,
 		body: (
 			result: SyncResult,
 			startTime: number,
@@ -1555,26 +1542,23 @@ export class SyncEngine {
 				this.getDiagnosticSnapshot(),
 			);
 			this.setSyncPhase("validating");
-			const guard =
-				options?.forceReplacement?.plan.recovery.direct ||
-				(this.coordinator.getActiveKind() === "force" &&
-					options?.forceReplacement)
-					? {
-							blockReason: null,
-							validationToken: undefined,
-							blockCode: undefined,
-							failure: undefined,
-							blockStatus: undefined,
-						}
-					: await this.getSyncGuardResult(
-							options?.skipEncryptionGuard,
-							undefined,
-							options?.validateThroughExternalEncryptionBlock,
-							undefined,
-							startupReads
-								? await startupReads.manifest()
-								: undefined,
-						);
+			const guard = options?.forceReplacement?.plan.recovery.direct
+				? {
+						blockReason: null,
+						validationToken: undefined,
+						blockCode: undefined,
+						failure: undefined,
+						blockStatus: undefined,
+					}
+				: await this.getSyncGuardResult(
+						options?.skipEncryptionGuard,
+						undefined,
+						options?.validateThroughExternalEncryptionBlock,
+						undefined,
+						startupReads
+							? await startupReads.manifest()
+							: undefined,
+					);
 			if (guard.blockReason) {
 				result.errors.push({
 					path: "",
@@ -1622,11 +1606,18 @@ export class SyncEngine {
 			}
 			result.success = result.errors.length === 0 && !result.deferred;
 			if (result.success) {
-				if (!options?.authoritativeEncryption) {
-					this.indexManager.markRemoteObserved();
-				}
-				if (this.indexSaveCallback) {
-					await this.indexSaveCallback();
+				// Direct Force already saved the copied baseline, even if a successor revision exists.
+				if (
+					lifecycleContext.kind === "force" ||
+					options?.authoritativeEncryption
+				) {
+					await this.indexSaveCallback?.();
+					assertCurrent?.();
+				} else {
+					await this.indexManager.markRemoteObserved(
+						this.indexSaveCallback,
+						assertCurrent,
+					);
 				}
 			}
 			this.isSyncing = false;
@@ -1844,12 +1835,6 @@ export class SyncEngine {
 	): Promise<SyncGuardResult> {
 		const external = this.getHighestPriorityExternalBlock((block) => {
 			if (
-				block.kind === "migration" &&
-				this.coordinator.getActiveKind() === "force"
-			) {
-				return false;
-			}
-			if (
 				block.kind === "encryption" &&
 				(skipGuard || validateThroughExternalBlock)
 			) {
@@ -2066,26 +2051,6 @@ export class SyncEngine {
 
 	private epochAdoptionDecision:
 		((epoch: string) => Promise<"accept" | "preserve" | null>) | undefined;
-
-	private forceSyncDependencies(): forceSync.Dependencies {
-		const getSettings = () => this.settings;
-		const getIndexSaveCallback = () => this.indexSaveCallback;
-		return {
-			yandexClient: this.yandexClient,
-			get settings() {
-				return getSettings();
-			},
-			indexManager: this.indexManager,
-			vaultAdapter: this.vaultAdapter,
-			setSyncPhase: this.workflowPhase,
-			reportProgress: this.workflowProgress,
-			get indexSaveCallback() {
-				return getIndexSaveCallback();
-			},
-			fileOperations: this.fileOperationsDependencies(),
-			syncReconciliation: this.syncReconciliationDependencies(),
-		};
-	}
 
 	private encryptionRewriteDependencies(): encryptionRewrite.Dependencies {
 		const getSettings = () => this.settings;

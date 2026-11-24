@@ -19,8 +19,33 @@ export function hasCanonicalMetadataChanged(
 ): boolean {
 	return (
 		canonical === null ||
-		canonical.deleted !== baseline.deleted ||
+		Boolean(canonical.deleted) !== Boolean(baseline.deleted) ||
 		canonical.sha256 !== baseline.sha256
+	);
+}
+
+/** Select a live published version from its physical fingerprint or recorded server mtime. */
+export function isPublishedRemoteVersion(
+	listed: FileMetadata,
+	canonical: FileMetadata | undefined,
+): boolean {
+	if (!canonical?.sha256 || canonical.deleted) {
+		return false;
+	}
+	if (canonical.remoteFingerprint && listed.remoteFingerprint) {
+		if (canonical.remoteFingerprint !== listed.remoteFingerprint) {
+			return false;
+		}
+		if (
+			listed.sha256 === listed.remoteFingerprint &&
+			/^[a-f0-9]{64}$/i.test(listed.sha256)
+		) {
+			return true;
+		}
+	}
+	return (
+		canonical.remoteMtime !== undefined &&
+		canonical.remoteMtime === listed.remoteMtime
 	);
 }
 

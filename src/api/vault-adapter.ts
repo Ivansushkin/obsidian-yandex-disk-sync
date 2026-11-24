@@ -22,6 +22,7 @@ import {
 	getAncestorDirectories,
 	assertForcePath,
 	isForceSourcePath,
+	isVaultTrashPath,
 	preservesForceLocalPath,
 	containsForceLocalPreservedPath,
 } from "../utils/path-utils";
@@ -117,7 +118,11 @@ export class VaultAdapter {
 		const files: string[] = [];
 		const folders: string[] = [];
 		for (const entry of this.vault.getAllLoadedFiles()) {
-			if (!entry.path || entry.path === "/") {
+			if (
+				!entry.path ||
+				entry.path === "/" ||
+				isVaultTrashPath(entry.path)
+			) {
 				continue;
 			}
 			(entry instanceof TFolder ? folders : files).push(entry.path);
@@ -155,6 +160,7 @@ export class VaultAdapter {
 	async getForceTree(
 		source: boolean,
 		inspect: (path: string, directory: boolean) => boolean = () => true,
+		root = "",
 	): Promise<{ files: string[]; directories: string[] }> {
 		const files: string[] = [];
 		const directories: string[] = [];
@@ -183,7 +189,7 @@ export class VaultAdapter {
 				}
 			}
 		};
-		await visit("");
+		await visit(root);
 		return { files: files.sort(), directories: directories.sort() };
 	}
 
@@ -195,7 +201,7 @@ export class VaultAdapter {
 			: this.vault.adapter.readBinary(path);
 	}
 
-	/** Permanently remove a Force destination; never move it to Obsidian trash. */
+	/** Delete a visible replacement target using Obsidian's deletion preference. */
 	async deleteForcePath(
 		path: string,
 		beforeMutation?: () => Promise<void | (() => void)>,
@@ -206,52 +212,68 @@ export class VaultAdapter {
 			preservesForceLocalPath(path, this.vault.configDir) ||
 			containsForceLocalPreservedPath(path, this.vault.configDir)
 		) {
-			throw new Error(
-				"Force cannot delete its preserved local installation",
-			);
+			throw new ForceScopeConflictError();
 		}
 		const entry = this.vault.getAbstractFileByPath(path);
 		const assertObserved = this.captureLocalObservation([path]);
-		if (entry) {
-			const assertPrepared = await beforeMutation?.();
+		const assertPrepared = await beforeMutation?.();
+		const stat = await this.vault.adapter.stat(path);
+		if (
+			entry &&
+			(!stat || (stat.type === "folder") !== entry instanceof TFolder)
+		) {
+			throw new LocalFileChangedError();
+		}
+		if (entry instanceof TFolder) {
+			const tree = await this.getForceTree(false, undefined, path);
 			if (
-				entry.path !== path ||
-				this.vault.getAbstractFileByPath(path) !== entry
+				[...tree.files, ...tree.directories].some(
+					(child) => !this.vault.getAbstractFileByPath(child),
+				)
 			) {
-				throw new LocalFileChangedError();
+				throw new ForceScopeConflictError();
 			}
-			(assertPrepared ?? assertObserved)();
-			await this.observeMutation(() => {
-				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- Confirmed Force requires permanent deletion without trash.
-				return this.vault.delete(entry, true);
-			}, observe);
-		} else {
-			const stat = await this.vault.adapter.stat(path);
-			const assertPrepared = await beforeMutation?.();
-			(assertPrepared ?? assertObserved)();
-			if (stat?.type === "folder") {
-				await this.vault.adapter.rmdir(path, true);
-			} else if (stat) {
-				await this.vault.adapter.remove(path);
+		}
+		if (
+			this.vault.getAbstractFileByPath(path) !== entry ||
+			(entry && entry.path !== path)
+		) {
+			throw new LocalFileChangedError();
+		}
+		(assertPrepared ?? assertObserved)();
+		if (!entry) {
+			if (stat) {
+				throw new ForceScopeConflictError();
 			}
+			return;
+		}
+		await this.observeMutation(
+			() => this.app.fileManager.trashFile(entry),
+			observe,
+		);
+		if (await this.vault.adapter.exists(path)) {
+			throw new Error("Local replacement deletion was not confirmed");
 		}
 	}
 
 	/** Make a Force directory only after explicit deletion has removed its blockers. */
 	async createForceDirectory(
 		path: string,
-		beforeMutation?: () => Promise<void>,
+		beforeMutation?: () => void,
 	): Promise<void> {
+		if (preservesForceLocalPath(path, this.vault.configDir)) {
+			throw new ForceScopeConflictError();
+		}
 		for (const directory of [...getAncestorDirectories([path])]
 			.reverse()
 			.concat(path)) {
 			assertForcePath(directory);
 			const stat = await this.vault.adapter.stat(directory);
-			if (stat?.type === "file") {
+			if (stat && stat.type !== "folder") {
 				throw new ForceScopeConflictError();
 			}
 			if (!stat) {
-				await beforeMutation?.();
+				beforeMutation?.();
 				await this.vault.adapter.mkdir(directory);
 			}
 		}
@@ -261,7 +283,7 @@ export class VaultAdapter {
 	async writeForceFile(
 		path: string,
 		content: ArrayBuffer,
-		beforeMutation?: () => Promise<void>,
+		beforeMutation?: () => void,
 		observe?: () => void | (() => void),
 	): Promise<void> {
 		assertForcePath(path);
@@ -277,13 +299,14 @@ export class VaultAdapter {
 		if (parent) {
 			await this.createForceDirectory(parent, beforeMutation);
 		}
-		if ((await this.vault.adapter.stat(path))?.type === "folder") {
-			throw new ForceScopeConflictError();
-		}
 		const file = this.getFile(path);
 		const assertObserved = this.captureLocalObservation([path]);
-		await beforeMutation?.();
+		const stat = await this.vault.adapter.stat(path);
 		assertObserved();
+		if (stat?.type === "folder" || (stat && !file)) {
+			throw new ForceScopeConflictError();
+		}
+		beforeMutation?.();
 		await this.observeMutation(async () => {
 			if (file) {
 				await this.vault.modifyBinary(file, content);
@@ -469,16 +492,7 @@ export class VaultAdapter {
 		}
 	}
 
-	/**
-	 * Walk up from a deleted file's directory and trash each ancestor folder
-	 * that has become completely empty (no files and no subfolders). Stops at
-	 * the first non-empty ancestor, at the vault root, or at the Obsidian
-	 * config directory. Only folders that contain nothing are removed, so a
-	 * folder holding local-only or excluded files is never touched. Trashed
-	 * folders are recoverable from the system trash. Mirrors the remote
-	 * remote folder pruning behavior so the local and remote
-	 * folder trees stay consistent after deletions.
-	 */
+	/** Prune empty ancestors non-recursively so a hidden or newly created child survives. */
 	async pruneEmptyLocalAncestors(
 		filePath: string,
 		canPrune?: (path: string) => boolean,
@@ -491,15 +505,16 @@ export class VaultAdapter {
 				break;
 			}
 			const folder = this.getFolder(dir);
-			if (!folder) {
-				break;
-			}
-			if (folder.children.length > 0) {
+			if (!folder || folder.children.length > 0) {
 				break;
 			}
 			try {
+				const { files, folders } = await this.vault.adapter.list(dir);
+				if (files.length > 0 || folders.length > 0) {
+					break;
+				}
 				await this.observeMutation(
-					() => this.app.fileManager.trashFile(folder),
+					() => this.vault.adapter.rmdir(dir, false),
 					() => observe?.(dir),
 				);
 				logger.debug(`Pruned empty local folder: ${dir}`);
@@ -513,15 +528,7 @@ export class VaultAdapter {
 		}
 	}
 
-	/**
-	 * Save a recoverable backup copy of the given content under the plugin's
-	 * data folder inside the Obsidian config directory (`.obsidian/plugins`),
-	 * which is excluded from synchronization by default. Used before a download
-	 * overwrites a local file whose content diverged from the last synced state
-	 * (including unknown first-sync content and Force remote), so unsaved local edits are never silently lost. The backup is
-	 * flattened into a single file with a timestamp to avoid nested folder
-	 * creation and to keep it out of the sync scope.
-	 */
+	/** Preserve ordinary sync's displaced local bytes in the plugin's excluded backup directory. */
 	async backupOverwrittenFile(
 		originalPath: string,
 		content: ArrayBuffer,

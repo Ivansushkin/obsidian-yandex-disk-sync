@@ -184,8 +184,8 @@ export class ForceSyncModal extends Modal {
 
 	/** Archive verification completes before resolving the explicit destructive choice. */
 	confirm(
-		replacement?: PreparedForceReplacement,
-		prepareArchive?: () => Promise<void>,
+		replacement: PreparedForceReplacement,
+		prepareArchive: () => Promise<void>,
 	): Promise<OperationBackupChoice> {
 		if (this.closed) {
 			return Promise.resolve("cancel");
@@ -193,24 +193,22 @@ export class ForceSyncModal extends Modal {
 		this.bodyEl.empty();
 		this.controlsEl.empty();
 		const summary = this.bodyEl.createDiv({ cls: "force-sync-summary" });
-		if (replacement) {
-			const state = replacement.recovery;
-			summary.createEl("p", {
-				text: t(
-					this.direction === "from_local"
-						? "force.local_source_details"
-						: "force.remote_source_details",
-					{
-						count: state.source.length,
-						mode: t(
-							state.target.enabled
-								? "force.encrypted"
-								: "force.plaintext",
-						),
-					},
-				),
-			});
-		}
+		const state = replacement.recovery;
+		summary.createEl("p", {
+			text: t(
+				this.direction === "from_local"
+					? "force.local_source_details"
+					: "force.remote_source_details",
+				{
+					count: state.source.length,
+					mode: t(
+						state.target.enabled
+							? "force.encrypted"
+							: "force.plaintext",
+					),
+				},
+			),
+		});
 		summary.createEl("p", {
 			cls: "force-sync-note",
 			text: `${t("force.filters_applied")} ${t(
@@ -230,7 +228,7 @@ export class ForceSyncModal extends Modal {
 		warning.createEl("strong", {
 			text: ` ${t("modal.force_sync_warning")}`,
 		});
-		if (replacement?.recovery.source.length === 0) {
+		if (replacement.recovery.source.length === 0) {
 			this.bodyEl.createEl("p", {
 				text: t("force.empty_source"),
 				cls: "force-sync-warning",
@@ -273,7 +271,7 @@ export class ForceSyncModal extends Modal {
 					archive.setDisabled(true);
 					errorEl.empty();
 					try {
-						if (withArchive && prepareArchive) {
+						if (withArchive) {
 							await prepareArchive();
 						}
 						if (!this.closed) {
@@ -337,11 +335,11 @@ export class ForceSyncModal extends Modal {
 			cls: "force-sync-checking",
 			attr: { role: "status", "aria-live": "polite" },
 		});
-		checking.createEl("span", {
+		checking.createSpan({
 			cls: "force-sync-checking-spinner",
 			attr: { "aria-hidden": "true" },
 		});
-		checking.createEl("span", { text: t("force.source_checking") });
+		checking.createSpan({ text: t("force.source_checking") });
 		this.renderActions();
 	}
 

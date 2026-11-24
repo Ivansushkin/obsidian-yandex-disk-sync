@@ -54,6 +54,8 @@ checkpoints, `LocalSyncState`, pending mutations, physical actions и watcher ev
 непрерывный watermark внутри epoch. Retry сохраняет исходные ID/seq. FIFO gap,
 чужой actor или один sequence с разным logical state блокируют commit. Own successor
 с непрерывным watermark не становится конфликтом из-за старого `baseRevision`.
+При переименовании папки целевые файлы получают автора, номер и базовую ревизию
+операции переименования. SHA-256 и размер берутся у переносимого файла.
 Client clocks не выбирают победителя.
 
 Local drift определяется plaintext SHA-256 относительно baseline. Remote drift —
@@ -116,6 +118,12 @@ Stable raw/logical read проверяет metadata до и после download 
 с server SHA-256, когда он доступен. Raw read при несовпадении хеша один раз заново
 получает download link и проверяет metadata в прежнем budget, сохраняя исходную
 content identity; повторное несовпадение или смена версии — ошибка.
+Для пользовательского файла stable logical read сверяет переданные байты с MD5
+Диска, если сервер не вернул SHA-256. При шифровании это проверка до расшифровки.
+Обычный full принимает опубликованную версию по SHA-256 открытого содержимого
+из canonical. Для импорта изменённой версии с Диска нужны совпадение с наблюдением
+листинга и проверенная серверная сумма. Для признания прерванной загрузки своей
+также нужны локальная квитанция, ожидающая мутация и совпадение SHA-256 содержимого.
 Invocation-owned
 `CanonicalReadSession` хранит только собственный verified snapshot; caller не может
 seed-ить её desired index. Fresh scope/root/lock/hash checks обязательны на каждом
@@ -166,6 +174,9 @@ partial baselines/queues без observed advancement/ACK, затем fresh final
 сверяет scope/manifest/canonical/lifetime. Stamp, watermark и conflict settlement
 по-прежнему требуют commit. Published local tombstone может создать durable local
 action без нового commit; backup, local identity и final authority checks сохраняются.
+Обычный full публикует в памяти финальные observed epoch/revision и время успеха
+после сохранения общего локального снимка. До подтверждения этой записи новые
+события watcher получают прежнюю подтверждённую базовую ревизию.
 
 Обычный upload и публикация metadata раздельны. Перед каждым PUT/retry проверяются
 canonical/codec/scope и expected physical state. Accepted repair сначала проверяет
@@ -176,12 +187,20 @@ canonical entries. Lifetime/config ABA отменяет всю группу по
 Repair и conflict copies остаются последовательными; stamps берутся из verified snapshot.
 Ambiguous PUT подтверждается stable plaintext read-back, а не повторным overwrite.
 Upload-group failure сохраняет FIFO и останавливает full до дальнейшего settlement.
+Для неопубликованной пары delete-file и повторного put того же пути
+`sync/reconciliation/recreations.ts` сопоставляет сохранённые операции и исходный SHA,
+проверяет победителя под блокировкой существующей транзакции canonical и подтверждает
+физические байты. Пара пропускает массовую выгрузку. Правила конфликта описаны в
+[CONFLICTS.md](CONFLICTS.md).
 
 Local write фиксирует absence/SHA до remote I/O и повторяет проверку после mandatory
 protective copy и parent preparation. Scope и полный portable-collision scan проходят
 до watcher suppression и записи. Late create/edit/delete запрещает stale apply.
 Обычное локальное удаление использует FileManager trash. Ошибка обязательной копии
 блокирует overwrite/delete.
+После удаления последней заметки full проверяет содержимое родителя через
+DataAdapter и удаляет пустой каталог нерекурсивно. Если внутри остался или
+появился файл, очистка предков на этом заканчивается.
 
 Обычное remote delete требует durable intent, fresh canonical authority и expected
 physical fingerprint на каждой попытке; move cleanup дополнительно доказывает target.
@@ -214,8 +233,10 @@ ancestry membership и Set live ancestors не кешируют authority. По�
 Direct Force применяет общие include/exclude/protected правила к чтению и удалению.
 Для encrypted destination нужны проверенные параметры: сохранение codec защищает
 исключённые ciphertext; его удаление при таких остатках блокируется. Scope до
-apply заморожен в плане; persistent schema не меняется, explicit pending lists
-определяют recovery независимо от новых filters.
+apply заморожен в плане. Explicit pending lists определяют recovery независимо
+от новых filters. Корневая `.trash` исключена на обеих сторонах. Локальная
+замена и приём после смены шифрования используют настройку удаления Obsidian
+и сохраняют существующие объекты вне дерева Vault.
 
 Direct Force сохраняет direct-v1 remainder до destructive work. Independent failures
 не останавливают остальные действия; ordinary manual/startup/scheduled full продолжает
@@ -284,6 +305,11 @@ Load/format/initial-save failure закрывает persistence и automation; u
 save до automation. Encrypted legacy/unknown formats fail closed; mixed builds не
 поддерживаются. Confirmed Force независимо проверяет source/destination admission,
 но не обходит failed local load/persistence.
+
+Обновление с 2.4.0 до 2.5.0 сохраняет форматы канонического индекса и шифрования.
+Сохранённые мутации с путями в `.trash` продолжают FIFO как `noop`.
+Небезопасный остаток старого Force сохраняется до подготовки и подтверждения
+новой замены.
 
 Только успешный full после read-only classification допускает watcher/scheduler.
 Resume сначала перепроверяет blocks и выполняет full; явная pause сохраняется.

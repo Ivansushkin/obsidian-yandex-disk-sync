@@ -6,6 +6,7 @@ import type {
 import { InvalidCurrentIndexError } from "../sync/canonical/errors";
 import {
 	isProtectedPath,
+	isVaultTrashPath,
 	normalizePath,
 	shouldSyncFile,
 } from "../utils/path-utils";
@@ -210,6 +211,7 @@ export function isReplacementSubtree(
 			return !prefix.includes("*") && inside(path, prefix);
 		});
 	if (
+		isVaultTrashPath(path) ||
 		!included ||
 		(!scope.syncDotObsidian &&
 			(inside(path, scope.configDir) || inside(scope.configDir, path)))

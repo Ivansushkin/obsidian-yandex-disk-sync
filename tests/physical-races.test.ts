@@ -321,7 +321,14 @@ test("download protects differing local bytes without a baseline", async () => {
 });
 
 test("move source retry requires current move authority and an intact target", async () => {
-	for (const change of ["move", "target", "fingerprint"] as const) {
+	const expectedTarget = bytes("canonical target");
+	const expectedSha = await computeSha256(expectedTarget);
+	for (const change of [
+		"move",
+		"target",
+		"fingerprint",
+		"stale-target-download",
+	] as const) {
 		const canonical = createEmptyIndex("device", "E");
 		const move = {
 			id: "move",
@@ -345,7 +352,8 @@ test("move source retry requires current move authority and an intact target", a
 			...metadata,
 			path: "new.md",
 			deleted: false,
-			remoteFingerprint: "target-fingerprint",
+			sha256: expectedSha,
+			remoteFingerprint: expectedSha,
 		};
 		const source = {
 			type: "file" as const,
@@ -360,16 +368,26 @@ test("move source retry requires current move authority and an intact target", a
 			...source,
 			path: "vault/new.md",
 			name: "new.md",
-			sha256: "target-fingerprint",
+			sha256: expectedSha,
 		};
+		let sourceExists = true;
 		let targetExists = true;
 		let attempts = 0;
 		const client = createClient({ maxRetries: 1 });
-		client.getLogicalResource = async (path) =>
-			path.endsWith("old.md") ? source : targetExists ? target : null;
+		client.getLogicalResource = async (path) => {
+			if (path.endsWith("old.md")) {
+				return sourceExists ? source : null;
+			}
+			return targetExists ? target : null;
+		};
+		client.downloadFile = async () => expectedTarget;
 		requestGlobal.__obsidianRequestUrl = async ({ method }) => {
 			assert.equal(method, "DELETE");
 			attempts++;
+			if (attempts === 2) {
+				sourceExists = false;
+				return response(204);
+			}
 			if (change === "move") {
 				move.pending = false;
 			}
@@ -378,6 +396,9 @@ test("move source retry requires current move authority and an intact target", a
 			}
 			if (change === "fingerprint") {
 				source.sha256 = "changed-source";
+			}
+			if (change === "stale-target-download") {
+				target.sha256 = await computeSha256(bytes("foreign overwrite"));
 			}
 			return response(503);
 		};

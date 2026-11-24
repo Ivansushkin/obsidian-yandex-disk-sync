@@ -12,7 +12,7 @@ import type {
 } from "../../types";
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger } from "../../utils/logger";
-import { joinPath } from "../../utils/path-utils";
+import { isVaultTrashPath, joinPath } from "../../utils/path-utils";
 import { setRecordValue } from "../../utils/record-utils";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
 import { IndexManager } from "../canonical/manager";
@@ -82,7 +82,7 @@ export async function rewriteRemoteFiles(
 	const localFiles = await deps.indexManager.buildLocalIndex();
 	const canonical = deps.indexManager.getRemoteIndex();
 	const liveCanonical = Object.entries(canonical.files).filter(
-		([, metadata]) => !metadata.deleted,
+		([path, metadata]) => !metadata.deleted && !isVaultTrashPath(path),
 	);
 	for (const [path, metadata] of liveCanonical) {
 		const local = localFiles.get(path);

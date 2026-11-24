@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
 import { loadPluginData, PLUGIN_DATA_FORMAT } from "../src/plugin-data-loader";
+import {
+	applyForceReplacement,
+	prepareForceReplacement,
+} from "../src/sync/workflows/force-replacement";
 import { computeSha256 } from "../src/utils/hash-utils";
 import test from "node:test";
 import { bytes, MemoryDisk, managedDevices } from "./helpers/sync-flow";
-import { encryptionFlow, startupFlow } from "./helpers/encryption-flow";
+import {
+	encryptionFlow,
+	legacyEncryptionFlow,
+	startupFlow,
+} from "./helpers/encryption-flow";
 import {
 	transition,
 	recoverTransition,
@@ -367,6 +375,106 @@ test("late full uploads are discarded by collapsed cleanup and cannot return fro
 		await b.assertSettled(expected);
 		assert.equal(b.vault.files.has("Folder/New.md"), false);
 		assert.equal(b.vault.files.has("NewFolder/New.md"), false);
+	}
+});
+
+test("Force refuses a file uploaded with the old key after rotation", async (t) => {
+	const disk = new MemoryDisk();
+	const createDevice = managedDevices(t);
+	const a = createDevice(disk, "a", null);
+	const b = createDevice(disk, "b", null);
+	const ea = encryptionFlow(a);
+	const eb = encryptionFlow(b);
+	startupFlow(a, ea);
+	startupFlow(b, eb);
+	const reference = { "Note.md": "reference" };
+	const source = await transitionSource(a, ea, "rotate", reference);
+	await eb.workflow.connectForSync("source-password");
+	await b.full();
+	const oldCodec = eb.context.getService();
+	assert.ok(oldCodec);
+	const latePath = "Unused/Nested/Late.md";
+	const rawDirectory = await b.client.getPhysicalPath("vault/Unused/Nested");
+	const rawFile = await b.client.getPhysicalPath(`vault/${latePath}`);
+	b.vault.put(latePath, bytes("late source bytes"));
+
+	const entered = deferred();
+	const release = deferred();
+	disk.beforeRequest = async (method, endpoint, path) => {
+		if (method === "PUT" && endpoint === "/upload" && path === rawFile) {
+			entered.resolve();
+			await release.promise;
+		}
+	};
+	const staleFull = b.engine.fullSync();
+	try {
+		await Promise.race([
+			entered.promise,
+			staleFull.then(() => {
+				throw new Error("Full finished before its PUT barrier");
+			}),
+		]);
+		await transition(a, ea, "rotate");
+		await a.assertSettled(reference);
+		const rotated = await a.canonical();
+		assert.notEqual(rotated.epoch, source.epoch);
+		assert.equal(disk.folders.has(rawDirectory), true);
+		assert.equal(disk.files.has(rawFile), false);
+
+		a.vault.put("Local.md", bytes("keep local"));
+		const deps = {
+			client: a.client,
+			adapter: a.adapter,
+			index: a.index,
+			settings: a.settings,
+			persist: async () => {},
+			password: async () => null,
+		};
+		const force = await prepareForceReplacement(deps, "from_remote");
+		assert.ok(force);
+		assert.deepEqual(
+			force.recovery.source.map(({ path }) => path),
+			["Note.md"],
+		);
+		assert.deepEqual(force.recovery.direct?.directories, []);
+
+		release.resolve();
+		assert.equal((await staleFull).success, false);
+		assert.deepEqual(
+			b.index.getPendingMutations().map(({ path }) => path),
+			[latePath],
+		);
+		assert.deepEqual(await a.canonical(), rotated);
+		const ciphertext = disk.files.get(rawFile);
+		assert.ok(ciphertext);
+		assert.deepEqual(
+			await oldCodec.decrypt(ciphertext),
+			bytes("late source bytes"),
+		);
+		const rawPath = rawFile.slice("vault/".length);
+		assert.equal(
+			await b.client.decodePhysicalUserPath(rawPath, oldCodec),
+			latePath,
+		);
+		await assert.rejects(
+			a.client.decodePhysicalUserPath(rawPath, ea.context.getService()),
+		);
+
+		const before = structuredClone(disk.files);
+		const baseline = structuredClone(a.index.getLocalIndex());
+		await assert.rejects(
+			applyForceReplacement(deps, force, "without-backup"),
+			{
+				name: "ForceSourceFormatError",
+			},
+		);
+		a.assertLocal("Local.md", "keep local");
+		a.assertLocal("Note.md", reference["Note.md"]);
+		assert.deepEqual(a.index.getLocalIndex(), baseline);
+		assert.deepEqual(disk.files, before);
+	} finally {
+		release.resolve();
+		await staleFull;
 	}
 });
 
@@ -1159,4 +1267,300 @@ test("disable cleanup ignores empty old-mode directories without treating undeco
 			assert.equal(disk.folders.has("vault/Unused/Nested"), true);
 		}
 	}
+});
+
+test("foreign recovery honors a legacy plaintext cover and the owner retires preserved trash", async (t) => {
+	const create = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = create(disk, "owner", null);
+	const flow = encryptionFlow(a);
+	a.vault.put("Note.md", bytes("reference"));
+	await a.full();
+	const folder = "abcdefghijklmnopqrstuvwxyzabcA";
+	disk.folders.add(`vault/${folder}`);
+	disk.files.set(`vault/${folder}/Other.md`, bytes("obsolete"));
+	disk.folders.add("vault/.trash");
+	disk.files.set("vault/.trash/Keep.md", bytes("retained"));
+	const resolve = flow.workflow.maintenance.resolveTransitionTargetPaths.bind(
+		flow.workflow.maintenance,
+	);
+	flow.workflow.maintenance.resolveTransitionTargetPaths = async (state) => {
+		await resolve(state);
+		// Older writers recorded the trash as a recursive source deletion.
+		state.replacement!.preservedRawPaths = [];
+		state.replacement!.deletions.push({ path: ".trash", kind: "dir" });
+	};
+	flow.workflow.maintenance.deleteRemoteRawPaths = async () => {
+		throw new Error("synthetic interruption before cleanup");
+	};
+	await assert.rejects(transition(a, flow, "enable"));
+	const saved = await flow.saved();
+	assert.equal(saved.transition?.phase, "cleanup");
+	assert.deepEqual(saved.transition?.replacement?.preservedRawPaths, []);
+	await a.stop();
+
+	const b = create(disk, "foreign", null);
+	await encryptionFlow(b).workflow.connectForSync("target-password");
+	const stable = await b.canonical();
+	assert.equal(stable.maintenance, undefined);
+	assert.ok(stable.epochAdoption?.preservedRawPaths.includes(".trash"));
+	assert.equal(disk.files.has(`vault/${folder}/Other.md`), false);
+	assert.deepEqual(disk.files.get("vault/.trash/Keep.md"), bytes("retained"));
+
+	const restarted = create(disk, "owner", null, a.vault, saved.device);
+	Object.assign(restarted.settings, saved.settings);
+	const recovery = encryptionFlow(restarted);
+	recovery.context.setTransition(saved.transition);
+	await recovery.workflow.initEncryption();
+	await recoverTransition(restarted, recovery);
+	assert.equal(recovery.context.getTransition(), null);
+	assert.equal(restarted.index.getObservedEpoch(), stable.epoch);
+	assert.deepEqual(await restarted.canonical(), stable);
+});
+
+test("target-only recovery confirms an absent legacy cleanup source after rotation", async (t) => {
+	const create = managedDevices(t);
+	const disk = new MemoryDisk();
+	const owner = create(disk, "guarded-owner", null);
+	const flow = legacyEncryptionFlow(owner);
+	await transitionSource(owner, flow, "rotate", { "One.md": "reference" });
+	const old = await owner.client.getPhysicalPath("vault/One.md");
+	const original = disk.files.get(old)!;
+	flow.workflow.maintenance.finishCanonicalMaintenanceIfCleanupComplete =
+		async () => {
+			throw new Error("synthetic interruption after deletion");
+		};
+	await assert.rejects(transition(owner, flow, "rotate"));
+	assert.equal(disk.files.has(old), false);
+	assert.equal((await owner.canonical()).maintenance?.phase, "cleanup");
+	await owner.stop();
+
+	const foreign = create(disk, "target-only", null);
+	const recovery = encryptionFlow(foreign);
+	disk.files.set(old, original);
+	await assert.rejects(
+		recovery.workflow.connectForSync("target-password"),
+		/source-capable recovery/,
+	);
+	assert.deepEqual(disk.files.get(old), original);
+	disk.files.delete(old);
+	const read = foreign.client.getResource.bind(foreign.client);
+	foreign.client.getResource = async (path, ...args) => {
+		if (path === old) {
+			throw new Error("synthetic unavailable source metadata");
+		}
+		return read(path, ...args);
+	};
+	await assert.rejects(
+		recovery.workflow.connectForSync("target-password"),
+		/unavailable source metadata/,
+	);
+	foreign.client.getResource = read;
+	assert.equal((await owner.canonical()).maintenance?.phase, "cleanup");
+	const physicalPath = foreign.client.getPhysicalPath.bind(foreign.client);
+	foreign.client.getPhysicalPath = async (path) =>
+		path === "vault/One.md" ? old : physicalPath(path);
+	await assert.rejects(
+		recovery.workflow.connectForSync("target-password"),
+		/live canonical target/,
+	);
+	foreign.client.getPhysicalPath = physicalPath;
+	await recovery.workflow.connectForSync("target-password");
+	assert.equal((await foreign.canonical()).maintenance, undefined);
+	await foreign.full();
+	foreign.assertLocal("One.md", "reference");
+});
+
+test("replacement excludes late children of previously absent encrypted trash roots", async (t) => {
+	const create = managedDevices(t);
+	for (const kind of ["disable", "rotate"] as const) {
+		const disk = new MemoryDisk();
+		const owner = create(disk, kind, null);
+		const flow = encryptionFlow(owner);
+		await transitionSource(owner, flow, kind, { "Note.md": "reference" });
+		const source = flow.context.getService()!;
+		const directory = await owner.client.getPhysicalPath("vault/.TrAsH");
+		const late = await owner.client.getPhysicalPath("vault/.TrAsH/Late.md");
+		const ciphertext = await source.encrypt(bytes("late trash"));
+		assert.equal(disk.folders.has(directory), false);
+		await transition(owner, flow, kind);
+		const canonical = await owner.canonical();
+		const deps = {
+			...owner,
+			password: async () => "target-password",
+			persist: async () =>
+				assert.fail("preparation persisted replacement"),
+		};
+		assert.ok(await prepareForceReplacement(deps, "from_remote"));
+
+		disk.folders.add(directory);
+		disk.files.set(late, ciphertext);
+		await owner.full();
+		assert.deepEqual(await owner.canonical(), canonical);
+		assert.equal(owner.vault.files.has(late.slice("vault/".length)), false);
+		assert.deepEqual(disk.files.get(late), ciphertext);
+		owner.vault.put("Note.md", bytes("edited"));
+		await owner.full();
+		assert.deepEqual(
+			await owner.client.downloadFile("vault/Note.md"),
+			bytes("edited"),
+		);
+		assert.deepEqual(Object.keys((await owner.canonical()).files), [
+			"Note.md",
+		]);
+		await assert.rejects(prepareForceReplacement(deps, "from_remote"), {
+			name: "ForceScopeConflictError",
+		});
+	}
+});
+
+test("legacy rotation keeps cleanup pending when encrypted trash has no durable exclusion", async (t) => {
+	const create = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = create(disk, "guarded", null);
+	const flow = legacyEncryptionFlow(a);
+	a.vault.put("Note.md", bytes("reference"));
+	await a.full();
+	await transition(a, flow, "enable", "source-password");
+	await a.client.uploadFile("vault/.trash/Keep.md", bytes("retained"));
+	const trash = await a.client.getPhysicalPath("vault/.trash/Keep.md");
+	const retained = disk.files.get(trash)!.slice(0);
+	await assert.rejects(
+		transition(a, flow, "rotate"),
+		/retained encrypted trash/i,
+	);
+	const saved = await flow.saved();
+	assert.equal(saved.transition?.phase, "cleanup");
+	assert.equal(saved.transition?.replacement, undefined);
+	await a.stop();
+	const restarted = create(disk, "guarded", null, a.vault, saved.device);
+	Object.assign(restarted.settings, saved.settings);
+	const recovery = encryptionFlow(restarted);
+	recovery.context.setTransition(saved.transition);
+	await recovery.workflow.initEncryption();
+	await assert.rejects(
+		recoverTransition(restarted, recovery),
+		/retained encrypted trash/i,
+	);
+	assert.equal(recovery.context.getTransition()?.phase, "cleanup");
+	assert.equal((await restarted.canonical()).maintenance?.phase, "cleanup");
+	assert.deepEqual(disk.files.get(trash), retained);
+	assert.deepEqual(Object.keys((await restarted.canonical()).files), [
+		"Note.md",
+	]);
+});
+
+test("Force preserves the receipt needed to exclude old ciphertext after rotation", async (t) => {
+	const disk = new MemoryDisk();
+	const a = managedDevices(t)(disk, "retained-trash", null);
+	const flow = encryptionFlow(a);
+	a.vault.put("Note.md", bytes("reference"));
+	await a.full();
+	await transition(a, flow, "enable", "source-password");
+	await a.client.uploadFile("vault/.trash/Keep.md", bytes("retained"));
+	const trash = await a.client.getPhysicalPath("vault/.trash/Keep.md");
+	const retained = disk.files.get(trash)!.slice(0);
+	await transition(a, flow, "rotate");
+	const before = await a.canonical();
+	assert.ok(
+		before.epochAdoption?.preservedRawPaths.includes(
+			trash.slice("vault/".length).split("/")[0]!,
+		),
+	);
+	const deps = {
+		client: a.client,
+		adapter: a.adapter,
+		index: a.index,
+		settings: a.settings,
+		persist: async () => assert.fail("preparation persisted replacement"),
+		password: async () => "target-password",
+	};
+	for (const direction of ["from_remote", "from_local"] as const) {
+		await assert.rejects(prepareForceReplacement(deps, direction), {
+			name: "ForceScopeConflictError",
+			message: /retained ciphertext/i,
+		});
+		assert.deepEqual(await a.canonical(), before);
+		assert.deepEqual(disk.files.get(trash), retained);
+	}
+	const readCanonical = a.index.readCanonicalIndexWithCodecIfPresent.bind(
+		a.index,
+	);
+	a.index.readCanonicalIndexWithCodecIfPresent = async () => {
+		throw new Error("synthetic exclusion read interrupted");
+	};
+	try {
+		await assert.rejects(
+			prepareForceReplacement(deps, "from_local"),
+			/synthetic exclusion read interrupted/,
+		);
+	} finally {
+		a.index.readCanonicalIndexWithCodecIfPresent = readCanonical;
+	}
+
+	await a.full();
+	a.assertLocal("Note.md", "reference");
+	assert.deepEqual(await a.canonical(), before);
+	assert.deepEqual(disk.files.get(trash), retained);
+});
+
+test("a legacy guarded owner retires a protected action after foreign cleanup", async (t) => {
+	const create = managedDevices(t);
+	const disk = new MemoryDisk();
+	const a = create(disk, "guarded-owner", null);
+	const initial = encryptionFlow(a);
+	a.vault.put("Note.md", bytes("reference"));
+	await a.full();
+	await transition(a, initial, "enable", "source-password");
+	await a.client.uploadFile("vault/.trash/Keep.md", bytes("retained"));
+	const trash = await a.client.getPhysicalPath("vault/.trash/Keep.md");
+	const retained = disk.files.get(trash)!.slice(0);
+	await transition(a, initial, "rotate");
+	const rawPath = trash.slice("vault/".length);
+	assert.ok(
+		(await a.canonical()).epochAdoption?.preservedRawPaths.includes(
+			rawPath.split("/")[0]!,
+		),
+	);
+
+	const flow = legacyEncryptionFlow(a);
+	await flow.workflow.initEncryption();
+	flow.workflow.maintenance.deleteRemoteRawPaths = async () => {
+		throw new Error(
+			"synthetic offline owner after queuing guarded cleanup",
+		);
+	};
+	await assert.rejects(transition(a, flow, "rotate", "final-password"));
+	const saved = await flow.saved();
+	assert.equal(saved.transition?.phase, "cleanup");
+	assert.equal(saved.transition?.replacement, undefined);
+	assert.ok(
+		saved.device.pendingPhysicalActions.some(
+			({ path }) => path === rawPath,
+		),
+	);
+	await a.stop();
+
+	const b = create(disk, "guarded-foreign", null);
+	await encryptionFlow(b).workflow.connectForSync("final-password");
+	const stable = await b.canonical();
+	assert.equal(stable.maintenance, undefined);
+	assert.deepEqual(disk.files.get(trash), retained);
+
+	const restarted = create(
+		disk,
+		"guarded-owner",
+		null,
+		a.vault,
+		saved.device,
+	);
+	Object.assign(restarted.settings, saved.settings);
+	const recovery = encryptionFlow(restarted);
+	recovery.context.setTransition(saved.transition);
+	await recovery.workflow.initEncryption();
+	await recoverTransition(restarted, recovery);
+	assert.equal(recovery.context.getTransition(), null);
+	assert.deepEqual(restarted.index.getPendingPhysicalActions(), []);
+	assert.deepEqual(await restarted.canonical(), stable);
+	assert.deepEqual(disk.files.get(trash), retained);
 });

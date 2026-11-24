@@ -9,16 +9,21 @@ empty directories participate only within that selection. A successfully read
 empty selection clears only selected destination files after explicit confirmation.
 A missing remote root is unavailable, not empty.
 
-Protected paths, excluded files, .backup and this plugin's credentials/state/logs
-are preserved and never treated as payload. Existing excluded remote copies are
+Protected paths, excluded files, root .trash, .backup and this plugin's
+credentials/state/logs are preserved and never treated as payload. Existing excluded remote copies are
 not silently cleaned up. Canonical, manifest and old root locks are managed as
 service metadata through their existing owners. Nested protected service names
 also follow shared path-utils policy.
 
-Force creates no payload staging, locks, leases, MOVE operations, protective
-copies or trash. Local deletion is permanent. An optional archive is a final
-backup artifact, not a staging file. Ordinary synchronization keeps its existing
-transaction, filtering and protective-copy rules.
+Force creates no payload staging, locks, leases, MOVE operations or protective
+copies. Local deletion follows the Obsidian preference, including permanent
+deletion when configured. Remote deletion is permanent. The optional archive is
+written before replacement. The root .trash is outside the sync selection in
+both directions, including older remote copies and case variants. Plaintext
+Force stops before writes if a retired subtree could be encrypted trash and
+its paths cannot be classified safely. In either direction, a surviving raw
+object that still requires the previous encryption receipt blocks preparation
+before the index is replaced.
 
 ## Direction and encryption
 
@@ -46,9 +51,17 @@ Raw excluded/protected directories are pruned before decryption. Candidate encry
 names are decoded first, then logical filters select which contents may be read.
 A .agents directory is excluded only by actual user settings; the configured
 Obsidian directory follows its switch. Neither name is hardcoded as extra protection.
-Included undecodable names/content stop with force-source-format without a plaintext
-fallback. The indicator shows preparation failed instead of retaining 0/N.
-File/folder collisions that would erase excluded descendants block preparation.
+An undecodable directory is left on Disk and omitted from the replacement only
+if a complete, unfiltered raw listing proves it has no file descendants. This
+covers empty trees retained by encryption cleanup. Force repeats this check
+before local purge. A file anywhere in the subtree, an undecodable selected file,
+or a failed listing stops replacement. There is no plaintext fallback. The
+indicator shows preparation failed instead of retaining 0/N.
+Existing local paths unavailable through the Vault tree are preserved. A parent
+folder with such a descendant is cleaned only through eligible children. An
+existing raw-only directory can contain new files at the same path. An exact
+raw-only file is accepted only when its SHA-256 matches the verified source.
+Incompatible types, portable name collisions, and different bytes block preparation.
 An unreadable source, impossible portable name or file occupying a preserved plugin
 ancestor stops preparation without clearing the destination.
 Remote user bytes are not replaced; the index is rebuilt from the actual source
@@ -59,6 +72,16 @@ Both directions preserve the remote root itself and its backup subtree. The loca
 root is also retained. Source is pre-read without retaining vault-sized buffers;
 this is not an immutable snapshot. Transfers record the bytes actually read.
 Later changes are handled by ordinary sync, not by a rollback or conflict dialog.
+
+For Disk to local, Force classifies paths and checks collisions before reading
+file contents. Preparation, confirmed validation and copy prefetch group small
+files into windows of up to 20 reads within the configured concurrency. Other
+files share windows of up to four reads and an estimated 8 MiB. An oversized
+file or a file of unknown size is read alone. Before copying, Force refreshes
+sizes for the next window and regroups it when needed. The same metadata and
+read budget carry into stable download. A file can grow after the observation,
+so the estimate is not a bound on actual memory. Validation stops at a failed
+window and waits for its admitted reads to settle before returning the error.
 
 ## Publication and recovery
 
@@ -83,6 +106,9 @@ Passwords remain exclusively in local plugin data.
 
 Existing checkpoints without direct retain their old interpretation. They are
 not automatically widened to a full purge. A newly confirmed Force replaces them.
+A direct remainder that would delete root .trash or unavailable local objects
+requires a newly confirmed plan. Older remainders can also require confirmation when the
+former codec is gone and a pending name could be encrypted trash.
 Missing old completion still normalizes to null through the existing loader.
 Downgrading with a direct checkpoint is unsupported.
 
@@ -90,21 +116,45 @@ One coordinator and persistence flow remain. Preparation is read-only; the
 confirmed source is read again before initial deletion. The checkpoint is saved
 before destructive work. After deletion starts, each independent failure is
 recorded while other actions continue. Completed actions are retired durably.
-A failed subtree deletion requeues affected copies before retrying that deletion.
+A pending deletion defers file copies and directory creation at intersecting
+destination paths. Other transfers continue. Retrying an older checkpoint
+requeues completed copies under the subtree before that deletion runs again.
+Before each remote DELETE attempt, Force reads the type at that path. A
+confirmed 404 retires the action. A file/directory type change or failed read
+keeps it pending, preserves the replacement object and allows independent
+transfers to continue.
+A remote copy window settles its reads before applying the files in order.
+Local writes, verification and copy checkpoints run one at a time. A failed copy
+checkpoint leaves that path pending, even when the local write already succeeded.
 A continuation never repeats the completed broad purge. Late local edits narrow a
 pending purge to unaffected descendants; each narrowing strictly descends and cannot
 requeue its own parent. New files and edited paths are retained for ordinary sync.
 Verified source metadata remains the baseline when a late local edit prevents copying. Copy/mkdir never implicitly
 delete new file/folder blockers; only explicit pending deletes authorize removal.
+On restart, portable name and type checks compare the remaining targets and their
+ancestors with local objects outside the Vault tree. Two retained names can
+differ only by case when no target intersects them.
 New blockers retain the remainder and require resolving the collision or confirming
 a newly prepared Force. Even raw-pruned encrypted exclusions block codec removal.
 
 Ordinary manual, startup and scheduled full sessions resume a direct checkpoint
 before normal admission/merge. If the remainder cannot finish, the session reports
 the concrete failure or a deferred concurrent change, with no success or epoch ACK.
-A source confirmed absent by a fresh readable-root observation and repeated absence
-checks, including replacement by a directory, is retired from the remainder; its later deletion is ordinary work. If a previous transfer left destination bytes, recovery verifies their source hash and includes them in canonical before retiring the pending transfer. Read,
+Force retires a missing source only after verifying the same readable root and
+repeatedly observing a 404 or a directory at the exact path. Invalid metadata
+keeps the file pending. Later deletion is ordinary work. If a previous transfer left destination bytes, recovery verifies their source hash and includes them in canonical before retiring the pending transfer. Read,
 authentication and decryption errors never prove absence.
+Force saves the publishing checkpoint with an empty remainder before uploading
+the final index. After a lost upload response, Force can confirm the write by
+reading back the exact bytes. An unconfirmed write leaves the checkpoint pending.
+Before sending the final index again, recovery checks the root, manifest and
+canonical. Its own active maintenance can finish the publication. An already
+published final index or a later ordinary revision in the same epoch needs
+only local completion. The local baseline describes the
+files copied by Force. The public Force session persists that baseline. A full
+session that resumes Force may then receive and acknowledge a later revision. A foreign epoch,
+active successor maintenance or ambiguous read leaves recovery pending.
+
 Realtime does not operate on a pending replacement. Successful cutover clears old
 causal work and only unchanged covered watcher signatures, preserves later work, installs the new
 baseline and clears the checkpoint. A post-Force ordinary full is not a success

@@ -5,6 +5,7 @@ import type {
 	PendingMutation,
 	PendingPhysicalAction,
 	SyncError,
+	SyncIndex,
 	SyncOperation,
 	SyncPhase,
 	SyncProgress,
@@ -15,19 +16,23 @@ import { logger, shortenDiagnosticValue } from "../../utils/logger";
 import {
 	getDirectory,
 	hasPortablePathCollision,
+	isVaultTrashPath,
 	joinPath,
 } from "../../utils/path-utils";
 import {
 	getPhysicalResourceFingerprint,
+	matchesListedFile,
 	matchesPhysicalResourceFingerprint,
 } from "../../utils/resource-fingerprint";
 import { runWithConcurrencySettled } from "../../utils/semaphore";
+import { isSmallTransfer, planTransferWindows } from "./transfer-windows";
 import { createConfirmedBaseline } from "../local/baseline-rules";
 import {
 	IndexManager,
 	type CanonicalReadSession,
 	type RemoteAuthorityObservation,
 } from "../canonical/manager";
+import { getPublishedFolderDeletion } from "../canonical/mutation-rules";
 import { PortablePathCollisionError } from "../canonical/errors";
 import {
 	classifyPhysicalDeleteResource,
@@ -167,27 +172,97 @@ export function applyUploadedFileMetadata(
 	});
 }
 
-/** Capture the local precondition before retrieving remote bytes. */
+/** Recheck the selected folder deletion before restoring independently verified bytes. */
+export function folderSurvivorGuard(
+	index: IndexManager,
+	path: string,
+	selection: SyncOperation["folderSurvivor"],
+): ((canonical?: SyncIndex) => Promise<void>) | undefined {
+	if (!selection) {
+		return undefined;
+	}
+	return async (observed) => {
+		const canonical = observed ?? (await index.readCanonicalIndex());
+		const file = canonical.files[path];
+		const folder = getPublishedFolderDeletion(
+			path,
+			file,
+			canonical.folderTombstones,
+		);
+		if (
+			canonical.epoch !== selection.epoch ||
+			folder?.path !== selection.parent ||
+			folder.changedRevision !== selection.folderRevision ||
+			file?.changedRevision !== selection.fileRevision ||
+			file?.sha256 !== selection.sha256
+		) {
+			throw new Error(
+				"Folder deletion changed before restoring its descendant",
+			);
+		}
+	};
+}
+
+/** Apply the selected published version or independently verified physical edit. */
 export async function downloadFile(
 	deps: Dependencies,
 	path: string,
 	serverMtime?: number,
 	expectedLocalSha?: string | null,
+	selection?: Pick<
+		SyncOperation,
+		| "remoteMeta"
+		| "expectedDownloadSha256"
+		| "requireStableDownload"
+		| "folderSurvivor"
+	>,
 ): Promise<void> {
 	logger.debug(`Downloading file: ${path}`);
-
 	const remotePath = joinPath(deps.settings.remotePath, path);
 	const localSha =
 		expectedLocalSha === undefined
 			? await readLocalDownloadIdentity(deps, path)
 			: expectedLocalSha;
-	const content = await deps.yandexClient.downloadFile(remotePath);
+	const listed = selection?.remoteMeta;
+	const publishedSha = selection?.expectedDownloadSha256;
+	if (selection && !listed) {
+		throw new Error("Remote file was absent from the full sync listing");
+	}
+	let stamp: { serverMtime?: number; remoteFingerprint?: string | null } = {
+		serverMtime,
+		remoteFingerprint: listed
+			? (listed.remoteFingerprint ?? null)
+			: undefined,
+	};
+	let content: ArrayBuffer;
+	if (listed && (!publishedSha || selection?.requireStableDownload)) {
+		const snapshot =
+			await deps.yandexClient.downloadStableLogicalFile(remotePath);
+		if (!snapshot || !matchesListedFile(listed, snapshot.resource)) {
+			throw new Error("Remote file changed after full sync selected it");
+		}
+		if (!snapshot.verifiedRawHashAlgorithm) {
+			throw new Error(
+				"Remote file bytes could not be verified before recovery",
+			);
+		}
+		content = snapshot.content;
+		stamp = {
+			serverMtime: Date.parse(snapshot.resource.modified),
+			remoteFingerprint: getPhysicalResourceFingerprint(
+				snapshot.resource,
+			),
+		};
+	} else {
+		content = await deps.yandexClient.downloadFile(remotePath);
+	}
 	await applyDownloadedContent(
 		deps,
 		path,
 		content,
-		{ serverMtime },
+		{ ...stamp, expectedSha256: publishedSha },
 		localSha,
+		folderSurvivorGuard(deps.indexManager, path, selection?.folderSurvivor),
 	);
 }
 
@@ -220,7 +295,10 @@ export function assertPortableLocalTree(
 	const local = deps.vaultAdapter.getLocalPathEntries?.();
 	if (
 		hasPortablePathCollision(
-			[...paths, ...(local?.files ?? [])],
+			[
+				...paths.filter((path) => !isVaultTrashPath(path)),
+				...(local?.files ?? []),
+			],
 			local?.folders,
 		)
 	) {
@@ -234,12 +312,22 @@ export async function applyDownloadedContent(
 	path: string,
 	content: ArrayBuffer,
 	verified?: {
+		expectedSha256?: string;
 		serverMtime?: number;
-		remoteFingerprint?: string;
+		remoteFingerprint?: string | null;
 	},
 	expectedLocalSha?: string | null,
 	validateAuthority?: () => Promise<void>,
 ): Promise<void> {
+	const sha256 = await computeSha256(content);
+	if (
+		verified?.expectedSha256 !== undefined &&
+		sha256 !== verified.expectedSha256
+	) {
+		throw new Error(
+			"Downloaded file does not match the selected canonical content",
+		);
+	}
 	await deps.indexManager.assertRemoteScope();
 	await validateAuthority?.();
 	const expected =
@@ -252,9 +340,15 @@ export async function applyDownloadedContent(
 	if (deps.vaultAdapter.fileExists(path)) {
 		const existing = await deps.vaultAdapter.readFile(path);
 		const existingSha = await computeSha256(existing);
+		const published = deps.indexManager.getRemoteIndex().files[path];
+		// An external write can replace the last published copy before its author returns.
 		if (
-			existingSha !== (await computeSha256(content)) &&
-			existingSha !== localIndexMeta?.sha256
+			existingSha !== sha256 &&
+			(existingSha !== localIndexMeta?.sha256 ||
+				localIndexMeta?.lastModifiedBy === deps.settings.deviceId ||
+				(published &&
+					!published.deleted &&
+					published.sha256 === existingSha))
 		) {
 			await deps.vaultAdapter.backupOverwrittenFile(path, existing);
 		}
@@ -272,14 +366,14 @@ export async function applyDownloadedContent(
 	});
 
 	// Update indexes
-	const sha256 = await computeSha256(content);
 	const mtime = deps.vaultAdapter.getFileMtime(path) || Date.now();
-	const remoteStamp = verified?.remoteFingerprint
-		? {
-				remoteMtime: verified.serverMtime,
-				remoteFingerprint: verified.remoteFingerprint,
-			}
-		: await fetchRemoteStamp(deps, path);
+	const remoteStamp =
+		verified && verified.remoteFingerprint !== undefined
+			? {
+					remoteMtime: verified.serverMtime,
+					remoteFingerprint: verified.remoteFingerprint ?? undefined,
+				}
+			: await fetchRemoteStamp(deps, path);
 	const remoteMtime = verified?.serverMtime ?? remoteStamp.remoteMtime;
 
 	const metadata: FileMetadata = {
@@ -451,15 +545,27 @@ export async function deleteLocalFile(
 
 	const expected = await readLocalDownloadIdentity(deps, path);
 	const baseline = deps.indexManager.getLocalIndex().files[path];
+	const baselineSha256 =
+		physicalAction.baselineSha256 ??
+		(physicalAction.origin === "rejected-upload"
+			? undefined
+			: baseline?.sha256);
+	const folderEditSurvives = (index: SyncIndex) =>
+		expected !== null &&
+		expected !== baselineSha256 &&
+		getPublishedFolderDeletion(
+			path,
+			index.files[path],
+			index.folderTombstones,
+		) !== null;
+	if (folderEditSurvives(canonical)) {
+		deps.indexManager.completePhysicalAction(physicalAction.id);
+		return "cancelled";
+	}
 	if (deps.vaultAdapter.fileExists(path)) {
 		try {
 			const content = await deps.vaultAdapter.readFile(path);
 			const sha256 = await computeSha256(content);
-			const baselineSha256 =
-				physicalAction.baselineSha256 ??
-				(physicalAction.origin === "rejected-upload"
-					? undefined
-					: baseline?.sha256);
 			if (shouldBackupLocalDelete(sha256, baselineSha256)) {
 				logger.info("Backing up changed local file before deletion", {
 					...actionContext,
@@ -474,7 +580,10 @@ export async function deleteLocalFile(
 		}
 	}
 	const latest = await deps.indexManager.readCanonicalIndex();
-	if (!isPhysicalDeleteAuthorized(physicalAction, latest)) {
+	if (
+		!isPhysicalDeleteAuthorized(physicalAction, latest) ||
+		folderEditSurvives(latest)
+	) {
 		deps.indexManager.completePhysicalAction(physicalAction.id);
 		return "cancelled";
 	}
@@ -500,9 +609,7 @@ export async function deleteLocalFile(
 	deps.indexManager.completePhysicalAction(physicalAction.id);
 	logger.info("Local physical deletion confirmed", actionContext);
 
-	// Prune local ancestor folders that became empty after this deletion,
-	// so the local tree mirrors the remote tree after a delete sync. Only
-	// truly empty folders are trashed (recoverable).
+	// The note deletion is complete even if the adapter refuses to prune its parent.
 	try {
 		await deps.vaultAdapter.pruneEmptyLocalAncestors(
 			path,
@@ -602,6 +709,7 @@ export async function executeOperationsParallel(
 	deps: Dependencies,
 	operations: SyncOperation[],
 	onProgress?: (completed: number) => void,
+	downloadWindows?: "by-size",
 ): Promise<{ succeeded: number; errors: SyncError[] }> {
 	const tasks = operations.map((op) => async () => {
 		if (deps.isPaused) {
@@ -703,6 +811,7 @@ export async function executeOperationsParallel(
 					op.path,
 					op.remoteMeta?.remoteMtime ?? op.remoteMeta?.mtime,
 					op.localMeta?.sha256 ?? null,
+					op,
 				);
 				break;
 			case "delete_remote":
@@ -725,30 +834,62 @@ export async function executeOperationsParallel(
 		typeof deps.settings.maxConcurrency === "number"
 			? deps.settings.maxConcurrency
 			: 5;
-	const results = await runWithConcurrencySettled(
-		tasks,
-		concurrency,
-		onProgress,
-		{
-			stopOnError: isRemoteReadTimeout,
-			onError: (reason, index) => {
-				const operation = operations[index];
-				if (operation && !isConcurrentSyncChange(reason)) {
-					const error =
-						reason instanceof Error
-							? reason
-							: new Error(String(reason));
-					deps.onOperationError?.(
-						createSyncError(
-							error,
-							operation.path,
-							operation.action,
-						),
-					);
-				}
+	const onError = (reason: unknown, index: number) => {
+		const operation = operations[index];
+		if (operation && !isConcurrentSyncChange(reason)) {
+			const error =
+				reason instanceof Error ? reason : new Error(String(reason));
+			deps.onOperationError?.(
+				createSyncError(error, operation.path, operation.action),
+			);
+		}
+	};
+	const sized = downloadWindows
+		? operations.map((op, index) => ({ index, size: op.remoteMeta?.size }))
+		: undefined;
+	let results: Awaited<ReturnType<typeof runWithConcurrencySettled<boolean>>>;
+	if (sized?.some((entry) => !isSmallTransfer(entry, concurrency))) {
+		results = [];
+		let completed = 0;
+		let stopReason: unknown;
+		for (const window of planTransferWindows(sized, concurrency)) {
+			const outcomes = await runWithConcurrencySettled(
+				window.map(({ index }) => tasks[index]!),
+				window.length,
+				() => onProgress?.(++completed),
+				{
+					stopOnError: isRemoteReadTimeout,
+					onError: (reason, index) => {
+						if (isRemoteReadTimeout(reason)) {
+							stopReason ??= reason;
+						}
+						onError(reason, window[index]!.index);
+					},
+				},
+			);
+			for (const [position, { index }] of window.entries()) {
+				results[index] = outcomes[position]!;
+			}
+			if (stopReason) {
+				break;
+			}
+		}
+		if (stopReason) {
+			for (const { index } of sized) {
+				results[index] ??= { status: "rejected", reason: stopReason };
+			}
+		}
+	} else {
+		results = await runWithConcurrencySettled(
+			tasks,
+			concurrency,
+			onProgress,
+			{
+				stopOnError: isRemoteReadTimeout,
+				onError,
 			},
-		},
-	);
+		);
+	}
 
 	const errors: SyncError[] = [];
 	let succeeded = 0;

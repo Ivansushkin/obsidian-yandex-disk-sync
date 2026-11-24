@@ -366,6 +366,17 @@ async function prepareReceptionStructure(
 		}
 		const assertRemovable = (current: typeof tree) => {
 			if (
+				[...current.files, ...current.directories].some(
+					(path) =>
+						inside(path, entry.path) &&
+						!adapter.vault.getAbstractFileByPath(path),
+				)
+			) {
+				throw new Error(
+					"A local object unavailable through Vault blocks authoritative reception",
+				);
+			}
+			if (
 				entry.directory
 					? current.files.some(
 							(path) =>

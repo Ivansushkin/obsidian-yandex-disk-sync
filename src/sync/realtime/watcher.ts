@@ -9,7 +9,11 @@ import type { SyncResult, YandexDiskSyncSettings } from "../../types";
 import { logger } from "../../utils/logger";
 import type { FailureSummary } from "../../errors";
 import { createSyncFailure } from "../errors";
-import { getAncestorDirectories } from "../../utils/path-utils";
+import {
+	getAncestorDirectories,
+	isVaultTrashPath,
+	shouldSyncFile,
+} from "../../utils/path-utils";
 import { isMobileRetryableFailure } from "../mobile-recovery";
 import {
 	independentRenamePrefix,
@@ -184,7 +188,14 @@ export class FileWatcher {
 
 	loadDeferredEvents(events: DeferredWatcherEvent[] | undefined): void {
 		this.deferredEvents = Array.isArray(events)
-			? events.map((event) => this.normalizeEvent(event))
+			? events
+					.filter(
+						(event) =>
+							!isVaultTrashPath(event.path) &&
+							(event.action !== "rename" ||
+								!isVaultTrashPath(event.targetPath)),
+					)
+					.map((event) => this.normalizeEvent(event))
 			: [];
 		logger.info("Loaded durable watcher event queue", {
 			pendingWatcherEvents: this.deferredEvents.length,
@@ -884,7 +895,7 @@ export class FileWatcher {
 			if (file instanceof TFile) {
 				this.handleFileDelete(file);
 			} else if (file instanceof TFolder) {
-				this.handleFolderDelete(file);
+				this.handleFolderDelete(file.path);
 			}
 		});
 		this.eventRefs.push(deleteRef);
@@ -924,6 +935,9 @@ export class FileWatcher {
 		file: TFile,
 		reason: "created" | "modified",
 	): void {
+		if (isVaultTrashPath(file.path)) {
+			return;
+		}
 		this.observeLiveDescendant(file);
 		if (this.syncEngine.consumeInternalWatcherEvent(file.path, "upload")) {
 			return;
@@ -957,38 +971,46 @@ export class FileWatcher {
 	/**
 	 * Handle file deletion
 	 */
-	private handleFileDelete(file: TFile): void {
+	private handleFileDelete(file: TFile, path = file.path): void {
+		if (isVaultTrashPath(path)) {
+			return;
+		}
 		const now = Date.now();
 		for (const [prefix, deletion] of this.recentFolderDeletes) {
 			if (deletion.expiresAt < now) {
 				this.recentFolderDeletes.delete(prefix);
 				continue;
 			}
-			if (
-				file.path.startsWith(prefix) &&
-				!deletion.successors.has(file)
-			) {
+			if (path.startsWith(prefix) && !deletion.successors.has(file)) {
 				return;
 			}
 		}
-		if (this.syncEngine.consumeInternalWatcherEvent(file.path, "delete")) {
+		if (this.syncEngine.consumeInternalWatcherEvent(path, "delete")) {
 			return;
 		}
 		if (this.isWatcherFrozen()) {
-			const event = this.createFileEvent(file.path, "delete");
+			const event = this.createFileEvent(path, "delete");
 			this.deferEvent(event);
-			this.cancelPendingSync(file.path);
+			this.cancelPendingSync(path);
 			return;
 		}
 
-		logger.info(`[FileWatcher] File deleted: ${file.path}`);
-		this.scheduleSync(file.path, "delete");
+		logger.info(`[FileWatcher] File deleted: ${path}`);
+		this.scheduleSync(path, "delete");
 	}
 
 	/**
 	 * Handle file rename
 	 */
 	private handleFileRename(file: TFile, oldPath: string): void {
+		if (isVaultTrashPath(oldPath)) {
+			this.queueTrashRestore(file);
+			return;
+		}
+		if (isVaultTrashPath(file.path)) {
+			this.handleFileDelete(file, oldPath);
+			return;
+		}
 		this.observeLiveDescendant(file);
 		if (this.isMechanicalFolderChild(oldPath, file.path)) {
 			return;
@@ -1023,26 +1045,50 @@ export class FileWatcher {
 		this.scheduleDeferredReplay();
 	}
 
-	private handleFolderDelete(folder: TFolder): void {
-		this.recentFolderDeletes.set(`${folder.path.replace(/\/+$/, "")}/`, {
+	private handleFolderDelete(path: string): void {
+		if (isVaultTrashPath(path)) {
+			return;
+		}
+		this.recentFolderDeletes.set(`${path.replace(/\/+$/, "")}/`, {
 			expiresAt:
 				Date.now() + Math.max(2_000, this.settings.debounceDelay * 2),
 			successors: new WeakSet(),
 		});
-		if (
-			this.syncEngine.consumeInternalWatcherEvent(folder.path, "delete")
-		) {
+		if (this.syncEngine.consumeInternalWatcherEvent(path, "delete")) {
 			return;
 		}
-		const absorbedDescendantEvents = this.cancelPendingDescendants(
-			folder.path,
-		);
-		logger.info(`[FileWatcher] Folder deleted: ${folder.path}`, {
+		const absorbedDescendantEvents = this.cancelPendingDescendants(path);
+		logger.info(`[FileWatcher] Folder deleted: ${path}`, {
 			absorbedDescendantEvents,
 		});
-		this.deferEvent({ action: "delete-folder", path: folder.path });
+		this.deferEvent({ action: "delete-folder", path });
 		if (!this.isWatcherFrozen()) {
 			this.scheduleDeferredReplay();
+		}
+	}
+
+	/** A restore publishes only the visible files under the new path. */
+	private queueTrashRestore(entry: TFile | TFolder): void {
+		if (isVaultTrashPath(entry.path)) {
+			return;
+		}
+		if (entry instanceof TFolder) {
+			for (const child of entry.children) {
+				if (child instanceof TFile || child instanceof TFolder) {
+					this.queueTrashRestore(child);
+				}
+			}
+		} else if (
+			this.app.vault.getAbstractFileByPath(entry.path) === entry &&
+			shouldSyncFile(
+				entry.path,
+				this.settings.syncPatterns,
+				this.settings.excludePatterns,
+				this.settings.syncDotObsidian,
+				this.app.vault.configDir,
+			)
+		) {
+			this.handleFileCreate(entry);
 		}
 	}
 
@@ -1094,6 +1140,27 @@ export class FileWatcher {
 	}
 
 	private handleFolderRename(folder: TFolder, oldPath: string): void {
+		if (isVaultTrashPath(oldPath)) {
+			this.queueTrashRestore(folder);
+			return;
+		}
+		if (isVaultTrashPath(folder.path)) {
+			if (this.isMechanicalFolderChild(oldPath, folder.path)) {
+				return;
+			}
+			this.handleFolderDelete(oldPath);
+			const parent = this.deferredEvents.find(
+				(event) =>
+					event.action === "delete-folder" && event.path === oldPath,
+			);
+			if (parent?.id) {
+				this.mechanicalFolderRenames.set(oldPath, {
+					targetPath: folder.path,
+					eventId: parent.id,
+				});
+			}
+			return;
+		}
 		this.observeLiveDescendant(folder);
 		if (this.isMechanicalFolderChild(oldPath, folder.path)) {
 			return;

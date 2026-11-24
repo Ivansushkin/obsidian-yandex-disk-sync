@@ -147,5 +147,7 @@ async function preserveRejectedConcurrentPut(
 		deps.fileOperations,
 		path,
 		new Date(physical.modified).getTime(),
+		localSha256,
+		{ remoteMeta: winner, expectedDownloadSha256: winner.sha256 },
 	);
 }

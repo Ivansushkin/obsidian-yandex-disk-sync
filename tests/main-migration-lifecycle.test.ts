@@ -2,14 +2,11 @@ import { PluginStartup, type StartupBlocks } from "../src/plugin-startup";
 import { EncryptionWorkflow } from "../src/crypto/workflow";
 import type { EncryptionContext } from "../src/crypto/context";
 import { NetworkRequestError, type FailureSummary } from "../src/errors";
-import type { App } from "obsidian";
 import { SyncCoordinator } from "../src/sync/coordinator";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { lifecyclePlugin } from "./helpers/lifecycle-fixtures";
 import { DEFAULT_SETTINGS } from "../src/types";
-import type { SyncResult } from "../src/types";
-import type { SyncRunOptions } from "../src/sync/engine";
 import { YandexApiError } from "../src/api/yandex-client";
 import { StorageScopeError } from "../src/sync/local/storage-scope";
 
@@ -284,100 +281,6 @@ test("encrypted current local state cannot Force a plaintext stable migration", 
 	assert.notEqual(blocks.historical, null);
 });
 
-test("post-commit Force failure resumes cleanup without repeating migration", async () => {
-	const plugin = lifecyclePlugin();
-	plugin.settings = {
-		...DEFAULT_SETTINGS,
-		yandexTokenSecret: "configured",
-	};
-	let cleanupStarts = 0;
-	let migrationReason: string | null = "migration required";
-	plugin["remoteStateValidated"] = true;
-	plugin["prepareForceSync"] = async () => ({
-		canonical: { state: "absent" },
-		migration: true,
-	});
-	Object.assign(plugin, {
-		indexManager: {
-			getPendingPhysicalActions: () => [],
-			getMaintenance: () => undefined,
-			assertForceCleanupComplete: async () => {},
-		},
-	});
-	Object.assign(plugin, {
-		openForceSyncModal: () => ({
-			confirm: async () => "with-backup",
-			render: () => {},
-			close: () => {},
-		}),
-	});
-	Object.assign(plugin, {
-		backupManager: {
-			createRemoteSnapshotBackup: async () => ({
-				success: true,
-				backupName: "verified.zip",
-				sha256: "backup-sha",
-				snapshotDigest: "snapshot-sha",
-				fileCount: 1,
-				totalSize: 10,
-			}),
-		},
-	});
-	plugin["recheckLegacyMigrationSafety"] = async () => true;
-	plugin["ensureEncryptionReady"] = async () => true;
-	plugin["captureForceSnapshot"] = async () => "snapshot-sha";
-	plugin["renderForceProgress"] = () => {};
-	plugin["persistPluginData"] = async () => {};
-	plugin["setMigrationBlock"] = (reason) => {
-		migrationReason = reason;
-	};
-	const result: SyncResult = {
-		success: false,
-		replacementCommitted: true,
-		uploaded: 1,
-		downloaded: 0,
-		deleted: 0,
-		conflicts: 0,
-		startTime: 1,
-		endTime: 2,
-		errors: [
-			{
-				path: "old.md",
-				operation: "delete_remote",
-				message: "cleanup interrupted",
-			},
-		],
-	};
-	Object.assign(plugin, {
-		syncEngine: {
-			isSyncInProgress: () => false,
-			hasPendingWork: () => false,
-			isSyncPaused: () => false,
-			forceSyncFromLocal: async (options: SyncRunOptions) => {
-				await options.beforeForceMutation?.();
-				return result;
-			},
-		},
-	});
-	plugin.runFullSync = async (options, notice, owned) => {
-		assert.equal(notice, false);
-		assert.equal(owned, true);
-		assert.equal(typeof options?.onActivity, "function");
-		cleanupStarts++;
-		return { ...result, success: true, errors: [] };
-	};
-	Object.assign(plugin, { fileWatcher: { start() {} } });
-	Object.assign(plugin, { syncScheduler: { start() {} } });
-	await plugin["getForceSyncController"]().run("from_local");
-	assert.equal(migrationReason, null);
-	assert.equal(plugin["remoteStateValidated"], false);
-	assert.equal(cleanupStarts, 1);
-	assert.equal(
-		plugin["getForceSyncController"]().getState()?.outcome,
-		"success",
-	);
-});
-
 test("Force remains available while ordinary full preflight is pending", async () => {
 	for (const visible of [true, false]) {
 		let release = () => {};
@@ -457,35 +360,6 @@ test("encrypted Force permits owned authentication but blocks independent encryp
 	await plugin["connectToRemoteEncryptionForSync"]("test-password");
 	assert.equal(authenticated, 1);
 	assert.equal(maintenance, 1);
-});
-
-test("legacy plugin exposure requires a different OAuth token before Force", () => {
-	const plugin = lifecyclePlugin();
-	plugin.app = {
-		vault: {
-			adapter: { getBasePath: () => "/test/vault" },
-			getName: () => "vault",
-		},
-	} as unknown as App;
-	plugin.settings = {
-		...DEFAULT_SETTINGS,
-		yandexTokenSecret: "exposed-token-placeholder",
-	};
-	plugin["legacyExposureRemediationPending"] = false;
-	plugin["legacyExposedTokenInSession"] = null;
-
-	plugin["markLegacyExposureRemediationRequired"]();
-	assert.equal(plugin["legacyExposureRemediationPending"], true);
-
-	plugin["updateLegacyExposureAfterTokenChange"](false);
-	assert.equal(plugin["legacyExposureRemediationPending"], true);
-	plugin.settings.yandexTokenSecret = "replacement-token-placeholder";
-	plugin["updateLegacyExposureAfterTokenChange"](true);
-	assert.equal(plugin["legacyExposureRemediationPending"], false);
-
-	plugin.settings.yandexTokenSecret = "exposed-token-placeholder";
-	plugin["updateLegacyExposureAfterTokenChange"](true);
-	assert.equal(plugin["legacyExposureRemediationPending"], true);
 });
 
 test("scope settings stay unchanged while coordinator work is preparing or queued", async () => {

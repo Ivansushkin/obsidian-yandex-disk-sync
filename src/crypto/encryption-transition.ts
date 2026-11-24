@@ -1,5 +1,8 @@
 import { findErrorCause } from "../utils/error-utils";
-import { EncryptionReplacementRevokedError } from "./replacement";
+import {
+	EncryptionReplacementRevokedError,
+	isPreservedRawPath,
+} from "./replacement";
 import { ForceRecoveryPendingError } from "../sync/workflows/force-state";
 import type { PhysicalRewriteUploadProof, SyncEngine } from "../sync/engine";
 import { createSyncFailure } from "../sync/errors";
@@ -16,6 +19,8 @@ import { logger } from "../utils/logger";
 import {
 	getAncestorDirectories,
 	isProtectedPath,
+	isVaultTrashPath,
+	mayBeEncodedVaultTrashRoot,
 	joinPath,
 	normalizePath,
 } from "../utils/path-utils";
@@ -200,6 +205,9 @@ interface EncryptionCleanupIO {
 	client: EncryptionClient;
 	getRemotePath(): string;
 	getConcurrency(): number;
+	getSourceCodec?(
+		mode: EncryptionModeDescriptor,
+	): Promise<EncryptionCodec | undefined>;
 	completeAction(path: string): void;
 	persist(): Promise<void>;
 }
@@ -402,11 +410,13 @@ export class EncryptionTransitionController {
 		const mapping = { ...transition.targetRawByLogicalPath };
 		const targets = protectRecord(
 			Object.fromEntries(
-				Object.values(mapping)
-					.filter((path) =>
-						Boolean(transition.targetFingerprints[path]),
+				Object.entries(mapping)
+					.filter(
+						([logical, raw]) =>
+							!isVaultTrashPath(logical) &&
+							Boolean(transition.targetFingerprints[raw]),
 					)
-					.map((path) => [
+					.map(([, path]) => [
 						path,
 						transition.targetFingerprints[path]!,
 					]),
@@ -507,6 +517,11 @@ export class EncryptionTransitionController {
 		const concurrency = rollback
 			? 1
 			: Math.max(1, Math.min(io.getConcurrency() || 1, 4));
+		let sourceCodec: Promise<EncryptionCodec | undefined> | undefined;
+		const getSourceCodec = () =>
+			(sourceCodec ??=
+				io.getSourceCodec?.(authority.source) ??
+				Promise.resolve(undefined));
 		let cursor = 0;
 		let failed = false;
 		let firstFailure: unknown;
@@ -542,6 +557,7 @@ export class EncryptionTransitionController {
 										),
 									() => reader.assertCurrent(),
 									rollback,
+									getSourceCodec,
 								);
 							}
 						} catch (error) {
@@ -574,11 +590,12 @@ export class EncryptionTransitionController {
 		expected: string | undefined,
 		readAuthority: () => Promise<SyncIndex>,
 		assertCurrent: () => void,
-		rollback?: SourceRollbackAuthority,
+		rollback: SourceRollbackAuthority | undefined,
+		getSourceCodec: () => Promise<EncryptionCodec | undefined>,
 	): Promise<void> {
 		const io = this.cleanupIO!;
 		const remotePath = joinPath(io.getRemotePath(), path);
-		const validate = async (): Promise<void> => {
+		const readActionAuthority = async (): Promise<SyncIndex> => {
 			const current = await readAuthority();
 			if (
 				!expected ||
@@ -595,6 +612,55 @@ export class EncryptionTransitionController {
 				);
 			}
 			await this.assertNotLiveRawTarget(remotePath, current.files);
+			assertCurrent();
+			return current;
+		};
+		const complete = async (): Promise<void> => {
+			assertCurrent();
+			io.completeAction(path);
+			await io.persist();
+		};
+		if (isVaultTrashPath(path)) {
+			await readActionAuthority();
+			await complete();
+			return;
+		}
+		if (!rollback && mayBeEncodedVaultTrashRoot(path)) {
+			const current = await readActionAuthority();
+			if (
+				isPreservedRawPath(
+					path,
+					current.epochAdoption?.preservedRawPaths ?? [],
+				)
+			) {
+				await complete();
+				return;
+			}
+			if (current.maintenance?.source.enabled) {
+				if (!(await io.client.getResource(remotePath, 1, 0, true))) {
+					await readActionAuthority();
+					await complete();
+					return;
+				}
+				const codec = await getSourceCodec();
+				if (!codec) {
+					throw new Error(
+						"Protected-path verification requires source-capable recovery",
+					);
+				}
+				if (
+					isVaultTrashPath(
+						await codec.decryptFilename(path.split("/", 1)[0]!),
+					)
+				) {
+					throw new Error(
+						"Retained encrypted trash has no durable exclusion for the target mode",
+					);
+				}
+			}
+		}
+		const validate = async (): Promise<void> => {
+			await readActionAuthority();
 			const resource = await io.client.getResource(
 				remotePath,
 				1,
@@ -643,9 +709,7 @@ export class EncryptionTransitionController {
 				? deletionError
 				: new Error("Encryption cleanup deletion is incomplete");
 		}
-		assertCurrent();
-		io.completeAction(path);
-		await io.persist();
+		await complete();
 	}
 
 	/** Optional recursive folder pruning is disabled until the server can fence late descendants. */

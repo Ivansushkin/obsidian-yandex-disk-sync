@@ -20,7 +20,7 @@ export function formatForceActivity(state: ForceFlowState): string {
 /** A committed replacement can require recovery but can never be reported as rolled back. */
 export function formatForceResult(state: ForceFlowState): string {
 	if (state.outcome === "success") {
-		if (state.direct && state.direction === "from_remote") {
+		if (state.direction === "from_remote") {
 			return (
 				t("notice.force_sync_completed", {
 					successful: state.successful ?? 0,
@@ -29,14 +29,12 @@ export function formatForceResult(state: ForceFlowState): string {
 				t("force.restart_required")
 			);
 		}
-		return state.migration
-			? t("notice.force_migration_completed")
-			: t("notice.force_sync_completed", {
-					successful: state.successful ?? 0,
-				});
+		return t("notice.force_sync_completed", {
+			successful: state.successful ?? 0,
+		});
 	}
 	if (state.failure) {
-		if (state.direct) {
+		if (state.phase !== "preflight") {
 			return formatOperationFailure(
 				state.failure,
 				t(
@@ -61,9 +59,6 @@ export function formatForceResult(state: ForceFlowState): string {
 				? `${t("notice.force_finalization_pending")} `
 				: "";
 		return prefix + formatOperationFailure(state.failure);
-	}
-	if (state.outcome === "backup-failed") {
-		return t("notice.force_backup_failed");
 	}
 	if (state.outcome === "cleanup-pending") {
 		return t("notice.force_finalization_pending");

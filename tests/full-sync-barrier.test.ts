@@ -284,7 +284,7 @@ test("owned encryption preflight revalidates remote state through its local bloc
 	);
 });
 
-test("stable 1.1 startup exposes Force without enabling normal sync", async () => {
+test("a stable 1.1 migration block keeps ordinary sync disabled", async () => {
 	const { engine, index } = createHarness(false);
 	engine.setExternalBlock("migration", "migration required");
 
@@ -296,25 +296,6 @@ test("stable 1.1 startup exposes Force without enabling normal sync", async () =
 	engine.pause();
 	engine.resume();
 	assert.equal(engine.getState().status, "migration-required");
-
-	const force = await engine.forceSyncFromLocal();
-	assert.equal(force.success, false);
-	assert.equal(force.errors[0]?.code, "force-backup-stale");
-	assert.notEqual(force.errors[0]?.code, "migration-required");
-});
-
-test("historical and authentication blocks reject Force before backup work", async () => {
-	for (const [kind, code] of [
-		["historical", "unsupported-historical"],
-		["authentication", "authentication"],
-	] as const) {
-		const { engine, index } = createHarness(false);
-		engine.setExternalBlock(kind, `${kind} blocked`);
-		const result = await engine.forceSyncFromLocal();
-		assert.equal(result.success, false);
-		assert.equal(result.errors[0]?.code, code);
-		assert.equal(index.remoteSaveCount, 0);
-	}
 });
 
 test("an explicit epoch choice accepts replacement without Force ping-pong", async () => {

@@ -145,6 +145,25 @@ export class EncryptionWorkflow {
 				client: context.client,
 				getRemotePath: () => context.getSettings().remotePath,
 				getConcurrency: () => context.getSettings().maxConcurrency,
+				getSourceCodec: async (mode) => {
+					const source = context.getTransition()?.source;
+					if (
+						!source?.password ||
+						!mode.salt ||
+						!mode.verifier ||
+						source.salt !== mode.salt
+					) {
+						return undefined;
+					}
+					const codec = await context.manager.createCodec(
+						"hardened",
+						mode.salt,
+						source.password,
+					);
+					return (await codec.verifyVerifier(mode.verifier))
+						? codec
+						: undefined;
+				},
 				completeAction: (path) =>
 					this.maintenance.completeGuardedCleanup(path),
 				persist: () => context.persist(),

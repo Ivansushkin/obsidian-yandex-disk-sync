@@ -246,6 +246,7 @@ function downloadEngine(
 		{
 			assertRemoteScope: async () => {},
 			getLocalIndex: () => ({ files }),
+			getRemoteIndex: () => ({ files: {} }),
 		} as unknown as IndexManager,
 		{ ...DEFAULT_SETTINGS, remotePath: "vault" },
 	);

@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { unzipSync } from "fflate";
 import {
 	BackupManager,
 	BackupPasswordRequiredError,
 } from "../src/backup/backup-manager";
 import { captureRemoteRawDigest } from "../src/backup/backup-snapshot";
-import { isBackupEnvelope } from "../src/backup/backup-envelope";
+import {
+	isBackupEnvelope,
+	openBackupEnvelope,
+} from "../src/backup/backup-envelope";
 import {
 	YandexApiError,
 	type YandexDiskClient,
@@ -15,11 +19,18 @@ import type { YandexResource } from "../src/types";
 import { fileResource } from "./helpers/client-fixtures";
 import { DEFAULT_SETTINGS } from "../src/types";
 import { UnsupportedHistoricalDataError } from "../src/compatibility-errors";
+import {
+	applyForceReplacement,
+	confirmForceReplacementPlan,
+	prepareForceReplacement,
+} from "../src/sync/workflows/force-replacement";
 import { deferred } from "./helpers/deferred";
+import { bytes, managedDevices, MemoryDisk } from "./helpers/sync-flow";
 
 class FakeBackupClient {
 	files = new Map<string, ArrayBuffer>();
 	uploadedPaths: string[] = [];
+	firstUpload?: ArrayBuffer;
 	storeThenTimeout = false;
 	corruptFirstUpload = false;
 	conflictFirstUpload = false;
@@ -37,14 +48,16 @@ class FakeBackupClient {
 		content: ArrayBuffer,
 	): Promise<void> {
 		this.uploadedPaths.push(path);
+		this.firstUpload ??= content.slice(0);
 		if (this.conflictFirstUpload && this.uploadedPaths.length === 1) {
 			this.files.set(path, new Uint8Array([9, 9, 9]).buffer);
 			throw new YandexApiError("name collision", 409);
 		}
-		const stored =
-			this.corruptFirstUpload && this.uploadedPaths.length === 1
-				? new Uint8Array([1, 2, 3]).buffer
-				: content.slice(0);
+		const stored = content.slice(0);
+		if (this.corruptFirstUpload && this.uploadedPaths.length === 1) {
+			const bytes = new Uint8Array(stored);
+			bytes[bytes.length - 1] = bytes[bytes.length - 1]! ^ 1;
+		}
 		this.files.set(path, stored);
 		if (this.storeThenTimeout) {
 			this.storeThenTimeout = false;
@@ -199,6 +212,83 @@ test("Force backup proof binds the exact logical and remote snapshots", async ()
 	assert.notEqual(firstRemote.snapshotDigest, secondRemote.snapshotDigest);
 });
 
+test("Force local archives raw remote bytes and blocks purge after archive substitution", async (context) => {
+	const disk = new MemoryDisk();
+	const owner = managedDevices(context)(disk, "force-raw-archive", null);
+	owner.vault.configDir = "custom-config";
+	owner.vault.put("source.md", bytes("local source"));
+	await owner.full();
+	disk.folders.add("vault/old");
+	const raw = new Uint8Array([0, 255, 128]);
+	disk.files.set("vault/old/destination.md", raw.buffer);
+	disk.folders.add("vault/.backup");
+	disk.files.set("vault/.backup/older.zip", bytes("protected archive"));
+	const config = "vault/custom-config";
+	disk.folders.add(config);
+	disk.folders.add(`${config}/plugins`);
+	disk.folders.add(`${config}/plugins/yandex-disk-sync`);
+	disk.files.set(
+		`${config}/plugins/yandex-disk-sync/manifest.json`,
+		bytes("protected plugin"),
+	);
+	const deps = {
+		...owner,
+		persist: async () => {},
+		password: async () => null,
+	};
+	const plan = await prepareForceReplacement(deps, "from_local");
+	assert.ok(plan);
+	const backup = new BackupManager(
+		owner.client,
+		owner.adapter,
+		owner.settings,
+	);
+	const password = "synthetic-force-archive-password";
+	const result = await owner.index.withForceScope(plan.recovery, () =>
+		backup.createRemoteSnapshotBackup(password, undefined, true),
+	);
+	assert.ok(
+		result.success &&
+			result.backupName &&
+			result.sha256 &&
+			result.snapshotDigest,
+	);
+	const path = `vault/.backup/${result.backupName}`;
+	const archive = disk.files.get(path);
+	assert.ok(archive);
+	const { header, content } = await openBackupEnvelope(archive, password);
+	assert.equal(header.kind, "remote-raw");
+	const files = unzipSync(new Uint8Array(content));
+	assert.deepEqual(files["remote-raw/old/destination.md"], raw);
+	assert.deepEqual(
+		Object.keys(files)
+			.filter((entry) => !entry.endsWith("/"))
+			.sort(),
+		[
+			"remote-raw/.obsidian-sync-index.json",
+			"remote-raw/old/destination.md",
+			"remote-raw/source.md",
+		],
+	);
+	plan.recovery.backupProof = {
+		name: result.backupName,
+		sha256: result.sha256,
+		snapshotDigest: result.snapshotDigest,
+	};
+	confirmForceReplacementPlan(plan);
+	disk.files.set(path, bytes("substituted archive"));
+	const remoteBefore = structuredClone(disk.files);
+	const localBefore = await owner.saved();
+	await assert.rejects(
+		applyForceReplacement(deps, plan, "with-backup"),
+		/The selected Force archive is missing or unreadable/,
+	);
+	assert.equal(plan.recovery.phase, "prepared");
+	assert.deepEqual(disk.files, remoteBefore);
+	assert.deepEqual(await owner.saved(), localBefore);
+	owner.assertLocal("source.md", "local source");
+});
+
 test("remote snapshot backup rejects legacy plugin data before download", async () => {
 	const { client, manager } = createManager();
 	const exposedPath =
@@ -220,29 +310,40 @@ test("remote snapshot backup rejects legacy plugin data before download", async 
 });
 
 test("backup verification accepts committed timeouts and retries collisions without overwriting", async () => {
-	for (const [label, flag, damaged] of [
-		["byte mismatch", "corruptFirstUpload", [1, 2, 3]],
-		["exclusive collision", "conflictFirstUpload", [9, 9, 9]],
-		["lost response", "storeThenTimeout", null],
+	for (const [flag, attempts] of [
+		["corruptFirstUpload", 2],
+		["conflictFirstUpload", 2],
+		["storeThenTimeout", 1],
 	] as const) {
 		const { client, manager } = createManager({ [flag]: true });
-		assert.equal((await manager.createBackup()).success, true, label);
-		assert.equal(client.uploadedPaths.length, damaged ? 2 : 1, label);
-		const verifiedPath =
-			client.uploadedPaths[client.uploadedPaths.length - 1]!;
-		assert.ok(verifiedPath.endsWith(".enc.zip"), label);
-		assert.equal(
-			isBackupEnvelope(client.files.get(verifiedPath)!),
-			true,
-			label,
+		const result = await manager.createBackup();
+		assert.equal(result.success, true, flag);
+		assert.equal(client.uploadedPaths.length, attempts, flag);
+		const verifiedPath = client.uploadedPaths[attempts - 1]!;
+		assert.equal(verifiedPath, `vault/.backup/${result.backupName}`);
+		assert.ok(verifiedPath.endsWith(".enc.zip"));
+		assert.ok(client.firstUpload && isBackupEnvelope(client.firstUpload));
+		assert.deepEqual(
+			client.files.get(verifiedPath),
+			client.firstUpload,
+			flag,
 		);
-		if (damaged) {
-			assert.notEqual(client.uploadedPaths[0], verifiedPath, label);
-			assert.deepEqual(
-				new Uint8Array(client.files.get(client.uploadedPaths[0]!)!),
-				new Uint8Array(damaged),
-				label,
-			);
+		if (attempts === 2) {
+			const firstPath = client.uploadedPaths[0]!;
+			assert.notEqual(firstPath, verifiedPath);
+			const retained = client.files.get(firstPath)!;
+			if (flag === "corruptFirstUpload") {
+				assert.equal(
+					retained.byteLength,
+					client.firstUpload.byteLength,
+				);
+				assert.notDeepEqual(retained, client.firstUpload);
+			} else {
+				assert.deepEqual(
+					new Uint8Array(retained),
+					new Uint8Array([9, 9, 9]),
+				);
+			}
 		}
 	}
 });
@@ -326,8 +427,6 @@ test("optional transition archive retains exact bytes and fails closed on source
 		await computeSha256(client.files.get(proof.path)!),
 		proof.sha256,
 	);
-	const { openBackupEnvelope } =
-		await import("../src/backup/backup-envelope");
 	await assert.doesNotReject(
 		openBackupEnvelope(client.files.get(proof.path)!, "target-password"),
 	);

@@ -70,6 +70,22 @@ export function collectFolderDeleteTargets(
 	};
 }
 
+/** Identify the published parent deletion that accounts for this file tombstone. */
+export function getPublishedFolderDeletion(
+	path: string,
+	file: FileMetadata | null | undefined,
+	tombstones: Record<string, FolderTombstone>,
+): FolderTombstone | null {
+	const parent = file?.deletedByFolder;
+	if (!file?.deleted || !parent || !path.startsWith(parent + "/")) {
+		return null;
+	}
+	const folder = getRecordValue(tombstones, parent);
+	return folder && folder.changedRevision >= (file.changedRevision ?? 0)
+		? folder
+		: null;
+}
+
 /**
  * Select the newest folder tombstone that contains a path.
  */

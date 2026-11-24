@@ -99,7 +99,7 @@
 - For physical user resources, use the shared physical fingerprint helpers.
   The matcher must accept persisted SHA-256, MD5, resource ID, and modified
   values without queue migration.
-- Service paths, `.backup`, and this plugin's own directory are protected by
+- Service paths, `.backup`, root `.trash`, and this plugin's own directory are protected by
   `path-utils`. Do not add local variants of path filtering.
 - Use the shared `path-utils` helper for ancestor directories and deepest-first
   cleanup.
@@ -151,7 +151,9 @@
   encryption manifest only to match authenticated source/output parameters.
 - Force offers one confirmation with an archive toggle off by default. A selected
   archive must succeed before purge; errors stay in that dialog. Force never
-  creates staging, locks, trash or protective/conflict copies.
+  creates staging, locks or protective/conflict copies. Local Force deletion
+  follows Obsidian's deletion preference and preserves objects absent from the
+  Vault tree, including their containing directories.
 - Force continues independent actions after individual errors and persists a
   direct-v1 remainder. Ordinary manual/startup/scheduled full resumes it before
   normal merge, without repeating a completed broad purge. Legacy checkpoints

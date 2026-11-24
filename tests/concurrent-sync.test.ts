@@ -10,6 +10,7 @@ import { encryptionFlow } from "./helpers/encryption-flow";
 import { recoverTransition, transition } from "./helpers/encryption-scenarios";
 import {
 	applyForceReplacement,
+	confirmForceReplacementPlan,
 	prepareForceReplacement,
 	resumeForceReplacement,
 } from "../src/sync/workflows/force-replacement";
@@ -526,6 +527,7 @@ test("Force engine observes late edits and suppresses its own recursive purge", 
 			}
 			return await stat(path);
 		};
+		confirmForceReplacementPlan(plan);
 		const result = await a.engine.forceSyncFromRemote({
 			forceReplacement: { plan, backupMode: "without-backup" },
 		});
@@ -574,6 +576,7 @@ test("Force source races retain recovery without reporting success", async (t) =
 			};
 		}
 	};
+	confirmForceReplacementPlan(plan);
 	const result = await a.engine.forceSyncFromLocal({
 		forceReplacement: { plan, backupMode: "without-backup" },
 	});

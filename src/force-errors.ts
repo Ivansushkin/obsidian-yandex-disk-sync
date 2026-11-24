@@ -8,10 +8,10 @@ export class ForceSourceFormatError extends Error {
 
 /** A replacement cannot use a selected path to erase excluded data or its codec. */
 export class ForceScopeConflictError extends Error {
-	constructor() {
-		super(
-			"Force replacement conflicts with excluded or protected destination data",
-		);
+	constructor(
+		message = "Force replacement conflicts with excluded or protected destination data",
+	) {
+		super(message);
 		this.name = "ForceScopeConflictError";
 	}
 }

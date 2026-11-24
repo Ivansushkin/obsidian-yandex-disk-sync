@@ -9,7 +9,10 @@ import type {
 import { computeSha256 } from "../../utils/hash-utils";
 import { logger } from "../../utils/logger";
 import { getExtension, joinPath } from "../../utils/path-utils";
-import { getPhysicalResourceFingerprint } from "../../utils/resource-fingerprint";
+import {
+	getPhysicalResourceFingerprint,
+	matchesListedFile,
+} from "../../utils/resource-fingerprint";
 import * as fileOperations from "../files/operations";
 import { saveRemoteIndexBestEffort } from "./commits";
 import type { Dependencies as ReconciliationDependencies } from "./context";
@@ -33,6 +36,7 @@ export type Dependencies = Pick<
 export async function readVerifiedRemoteVersion(
 	deps: Dependencies,
 	path: string,
+	selection?: Pick<SyncOperation, "remoteMeta" | "expectedDownloadSha256">,
 ): Promise<{
 	canonical: SyncIndex;
 	snapshot: StableLogicalFileSnapshot;
@@ -60,6 +64,34 @@ export async function readVerifiedRemoteVersion(
 	) {
 		throw new Error("Canonical changed during content verification");
 	}
+	const sha256 = await computeSha256(snapshot.content);
+	if (
+		selection &&
+		(!selection.remoteMeta ||
+			!matchesListedFile(selection.remoteMeta, snapshot.resource))
+	) {
+		throw new Error(
+			"Remote conflict file changed after full sync selected it",
+		);
+	}
+	const publishedSha = selection?.expectedDownloadSha256;
+	if (publishedSha !== undefined) {
+		if (
+			!current ||
+			current.deleted ||
+			current.sha256 !== publishedSha ||
+			sha256 !== publishedSha
+		) {
+			throw new Error(
+				"Conflict winner does not match the selected canonical content",
+			);
+		}
+	} else if (
+		!snapshot.verifiedRawHashAlgorithm &&
+		(selection || !current || current.deleted || current.sha256 !== sha256)
+	) {
+		throw new Error("Remote conflict version has no verified content hash");
+	}
 	const unchanged = await deps.getSyncGuardResult(
 		false,
 		guard.validationToken,
@@ -70,7 +102,7 @@ export async function readVerifiedRemoteVersion(
 	return {
 		canonical,
 		snapshot,
-		sha256: await computeSha256(snapshot.content),
+		sha256,
 	};
 }
 
@@ -104,7 +136,7 @@ export async function handleConflict(
 	logger.warn(`Handling conflict: ${op.path}`);
 
 	if (!op.localMeta || !op.remoteMeta) {
-		return;
+		throw new Error("Full sync could not identify both conflict versions");
 	}
 	const localContent = await deps.vaultAdapter.readFile(op.path);
 	const localSha256 = await computeSha256(localContent);
@@ -112,8 +144,14 @@ export async function handleConflict(
 		throw new Error("Local file changed after conflict classification");
 	}
 	logger.debug("Conflict stage", { stage: "read-remote-version" });
-	const remote = await readVerifiedRemoteVersion(deps, op.path);
-	if (remote.canonical.files[op.path]?.deleted) {
+	const remote = await readVerifiedRemoteVersion(deps, op.path, op);
+	const checkFolder = fileOperations.folderSurvivorGuard(
+		deps.indexManager,
+		op.path,
+		op.folderSurvivor,
+	);
+	await checkFolder?.(remote.canonical);
+	if (!checkFolder && remote.canonical.files[op.path]?.deleted) {
 		throw new Error("Canonical deletion superseded the conflict");
 	}
 	if (remote.sha256 === localSha256) {
@@ -131,6 +169,7 @@ export async function handleConflict(
 				).getTime(),
 			},
 			localSha256,
+			checkFolder,
 		);
 		return;
 	}
@@ -154,10 +193,11 @@ export async function handleConflict(
 		remote.canonical.epoch,
 	);
 	logger.debug("Conflict stage", { stage: "reread-winner" });
-	const winner = await readVerifiedRemoteVersion(deps, op.path);
+	const winner = await readVerifiedRemoteVersion(deps, op.path, op);
+	await checkFolder?.(winner.canonical);
 	if (
 		winner.canonical.epoch !== remote.canonical.epoch ||
-		winner.canonical.files[op.path]?.deleted ||
+		(!checkFolder && winner.canonical.files[op.path]?.deleted) ||
 		winner.sha256 !== remote.sha256
 	) {
 		throw new Error("Winner changed after preserving conflict copy");
@@ -174,6 +214,7 @@ export async function handleConflict(
 			serverMtime: new Date(winner.snapshot.resource.modified).getTime(),
 		},
 		localSha256,
+		checkFolder,
 	);
 	logger.info(`Conflict resolved, copy retained: ${conflictPath}`);
 }

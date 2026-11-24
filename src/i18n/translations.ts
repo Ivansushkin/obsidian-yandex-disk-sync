@@ -179,7 +179,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.recovery_choice":
 			"Continue the saved direction, encryption mode and backup choice, or confirm a new replacement separately. Cancel keeps recovery unchanged.",
 		"force.recovery_pending":
-			"Force recovery is unfinished. Resume it before normal synchronization.",
+			"Force recovery is unfinished. Continue the saved operation or confirm a new replacement before normal synchronization.",
 		"force.empty_source":
 			"The source is empty. All synchronized files in the destination will be deleted.",
 		"force.epoch_title": "The remote storage was replaced",
@@ -619,7 +619,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_from_local_text":
 			"Selected files on Disk will be replaced with local versions. Selected Disk-only files will be permanently deleted.",
 		"modal.force_sync_from_remote_text":
-			"Selected local files will be replaced with versions from Disk. Selected local-only files will be permanently deleted.",
+			"Selected local files will be replaced with versions from Disk. Local deletion follows the Obsidian setting.",
 		"modal.force_sync_warning": "This cannot be undone.",
 		"modal.force_sync_recommend_backup":
 			"Choose a full archive or continue without one. Snapshot and file protection checks remain active.",
@@ -797,7 +797,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"force.recovery_choice":
 			"Продолжить сохранённое направление, режим шифрования и выбор архива либо отдельно подтвердить новую замену. Отмена сохраняет recovery.",
 		"force.recovery_pending":
-			"Восстановление Force не завершено. Продолжите его перед обычной синхронизацией.",
+			"Восстановление Force не завершено. Продолжите сохранённую операцию или подтвердите новую замену перед обычной синхронизацией.",
 		"force.empty_source":
 			"Источник пуст. Назначение будет очищено, кроме явно сохраняемых путей.",
 		"force.epoch_title": "Хранилище на Диске заменено",
@@ -1244,7 +1244,7 @@ export const translations: Record<Language, Record<string, string>> = {
 		"modal.force_sync_from_local_text":
 			"Выбранные фильтрами файлы на Диске будут заменены локальными, а выбранные файлы, отсутствующие локально, — удалены навсегда.",
 		"modal.force_sync_from_remote_text":
-			"Выбранные фильтрами локальные файлы будут заменены версиями с Диска, а выбранные файлы, отсутствующие на Диске, — удалены навсегда.",
+			"Выбранные фильтрами локальные файлы будут заменены версиями с Диска. Удаление учитывает настройку Obsidian.",
 		"modal.force_sync_warning": "Отменить замену нельзя.",
 		"modal.force_sync_recommend_backup":
 			"Архив необязателен. Без него защитные и конфликтные копии не создаются.",

@@ -1050,6 +1050,15 @@ async function prepareRealtimeEvents(
 			});
 			continue;
 		}
+		const baselineSha256 =
+			baselineSource &&
+			!baselineSource.deleted &&
+			baselineSource.changedRevision !== undefined &&
+			event.baseRevision !== null &&
+			baselineSource.changedRevision <= event.baseRevision &&
+			deps.indexManager.getLocalIndex().observedEpoch === event.epoch
+				? baselineSource.sha256
+				: undefined;
 		deps.indexManager.markLocalFileDeleted(event.path);
 		prepared.push({
 			...event,
@@ -1061,6 +1070,7 @@ async function prepareRealtimeEvents(
 					: undefined) ??
 				reusePendingFileMutation(deps, event, "delete-file") ??
 				deps.indexManager.enqueueMutation("delete-file", event.path, {
+					baselineSha256,
 					epoch: event.epoch,
 					baseRevision: event.baseRevision,
 				}),

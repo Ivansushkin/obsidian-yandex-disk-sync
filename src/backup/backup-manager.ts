@@ -17,6 +17,7 @@ import {
 	isBackupEnvelope,
 	openBackupEnvelope,
 	sealBackupEnvelope,
+	type BackupKind,
 } from "./backup-envelope";
 import { UnsupportedHistoricalDataError } from "../compatibility-errors";
 import {
@@ -126,96 +127,17 @@ export class BackupManager {
 	/**
 	 * Create backup of all synchronized files
 	 */
-	async createBackup(
+	createBackup(
 		passwordOverride?: string,
 		onProgress?: (phase: BackupProgress) => void,
 		fullForce = false,
 	): Promise<BackupResult> {
-		const remotePath = this.settings.remotePath;
-		const password =
-			passwordOverride ??
-			(this.yandexClient.hasEncryptionService()
-				? (this.settings.encryptionPassword ?? undefined)
-				: undefined);
-		const activity: { stage: BackupProgress } = {
-			stage: "creating-backup",
-		};
-		const startedAt = Date.now();
-		const progress = (phase: BackupProgress) => {
-			activity.stage = phase;
-			onProgress?.(phase);
-		};
-		try {
-			progress("creating-backup");
-			logger.info("Starting backup creation...");
-
-			const snapshot = await captureLogicalVaultSnapshot(
-				this.vaultAdapter,
-				fullForce,
-			);
-			logger.info(`Found ${snapshot.files.length} files to backup`);
-
-			const zipContent = await createSnapshotZip(snapshot.files);
-
-			const createdAt = Date.now();
-			const uploadContent = password
-				? await sealBackupEnvelope(zipContent, password, {
-						kind: "logical-vault",
-						createdAt,
-						pluginVersion: this.pluginVersion,
-						fileCount: snapshot.files.length,
-					})
-				: zipContent;
-			const uploaded = await this.uploadVerifiedBackup(
-				remotePath,
-				uploadContent,
-				Boolean(password),
-				createdAt,
-				progress,
-			);
-
-			logger.info("Backup upload verified", {
-				backupName: uploaded.backupName,
-				fileCount: snapshot.files.length,
-				totalSize: snapshot.totalSize,
-				remoteFingerprint: uploaded.remoteFingerprint,
-				sha256: uploaded.sha256,
-			});
-
-			return {
-				success: true,
-				backupName: uploaded.backupName,
-				fileCount: snapshot.files.length,
-				totalSize: snapshot.totalSize,
-				remoteFingerprint: uploaded.remoteFingerprint,
-				sha256: uploaded.sha256,
-				snapshotDigest: snapshot.digest,
-			};
-		} catch (error) {
-			const failure = new OperationFailure(error, {
-				stage: activity.stage,
-				action:
-					activity.stage === "creating-backup"
-						? "local"
-						: activity.stage === "uploading-backup"
-							? "put"
-							: "read",
-				outcome:
-					activity.stage === "uploading-backup"
-						? "write-unconfirmed"
-						: "unknown",
-				durationMs: Date.now() - startedAt,
-			});
-			logger.error("Backup failed", { error: failure });
-			return {
-				success: false,
-				fileCount: 0,
-				totalSize: 0,
-				error: failure.summary.message,
-				failure: failure.summary,
-				failureCause: failure,
-			};
-		}
+		return this.createSnapshotBackup(
+			"logical-vault",
+			passwordOverride,
+			onProgress,
+			fullForce,
+		);
 	}
 
 	/**
@@ -223,10 +145,25 @@ export class BackupManager {
 	 * Raw ciphertext and service metadata make this independent from a
 	 * potentially ambiguous canonical index.
 	 */
-	async createRemoteSnapshotBackup(
+	createRemoteSnapshotBackup(
 		passwordOverride?: string,
 		onProgress?: (phase: BackupProgress) => void,
 		fullForce = false,
+	): Promise<BackupResult> {
+		return this.createSnapshotBackup(
+			"remote-raw",
+			passwordOverride,
+			onProgress,
+			fullForce,
+		);
+	}
+
+	/** Capture one snapshot and store its archive after verifying the exact bytes. */
+	private async createSnapshotBackup(
+		kind: BackupKind,
+		passwordOverride: string | undefined,
+		onProgress: ((phase: BackupProgress) => void) | undefined,
+		fullForce: boolean,
 	): Promise<BackupResult> {
 		const remotePath = this.settings.remotePath;
 		const password =
@@ -244,22 +181,37 @@ export class BackupManager {
 		};
 		try {
 			progress("creating-backup");
-			const snapshot = await captureRemoteRawSnapshot(
-				this.yandexClient,
-				remotePath,
-				fullForce ? this.vaultAdapter.vault.configDir : undefined,
-			);
+			const isRemote = kind === "remote-raw";
+			if (!isRemote) {
+				logger.info("Starting backup creation...");
+			}
+			const snapshot = isRemote
+				? await captureRemoteRawSnapshot(
+						this.yandexClient,
+						remotePath,
+						fullForce
+							? this.vaultAdapter.vault.configDir
+							: undefined,
+					)
+				: await captureLogicalVaultSnapshot(
+						this.vaultAdapter,
+						fullForce,
+					);
+			const fileCount = snapshot.files.length;
+			if (!isRemote) {
+				logger.info(`Found ${fileCount} files to backup`);
+			}
 			const zipContent = await createSnapshotZip(
 				snapshot.files,
-				"remote-raw/",
+				isRemote ? "remote-raw/" : "",
 			);
 			const createdAt = Date.now();
 			const uploadContent = password
 				? await sealBackupEnvelope(zipContent, password, {
-						kind: "remote-raw",
+						kind,
 						createdAt,
 						pluginVersion: this.pluginVersion,
-						fileCount: snapshot.files.length,
+						fileCount,
 					})
 				: zipContent;
 			const uploaded = await this.uploadVerifiedBackup(
@@ -269,17 +221,22 @@ export class BackupManager {
 				createdAt,
 				progress,
 			);
-			logger.info("Remote snapshot backup upload verified", {
-				backupName: uploaded.backupName,
-				rawObjectCount: snapshot.files.length,
-				totalSize: snapshot.totalSize,
-				remoteFingerprint: uploaded.remoteFingerprint,
-				sha256: uploaded.sha256,
-			});
+			logger.info(
+				isRemote
+					? "Remote snapshot backup upload verified"
+					: "Backup upload verified",
+				{
+					backupName: uploaded.backupName,
+					[isRemote ? "rawObjectCount" : "fileCount"]: fileCount,
+					totalSize: snapshot.totalSize,
+					remoteFingerprint: uploaded.remoteFingerprint,
+					sha256: uploaded.sha256,
+				},
+			);
 			return {
 				success: true,
 				backupName: uploaded.backupName,
-				fileCount: snapshot.files.length,
+				fileCount,
 				totalSize: snapshot.totalSize,
 				remoteFingerprint: uploaded.remoteFingerprint,
 				sha256: uploaded.sha256,

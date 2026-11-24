@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
 import {
 	bytes,
 	codecFor,
 	managedDevices,
+	runConfirmedForce,
+	seedForceEncryption,
 	MemoryDisk,
 } from "./helpers/sync-flow";
 
@@ -117,16 +118,8 @@ for (const encrypted of [false, true]) {
 		});
 		await a.full();
 		a.vault.put("note.md", bytes("replacement"));
-		const canonical = await a.index.captureForceCanonicalProof();
-		const snapshot = await captureRemoteRawSnapshot(a.client, "vault");
-		const force = await a.engine.forceSyncFromLocal({
-			forcePreflightProof: {
-				direction: "from_local",
-				canonical,
-				snapshotDigest: snapshot.digest,
-				backup: null,
-			},
-		});
+		await seedForceEncryption(disk, a, codec);
+		const force = await runConfirmedForce(a, "from_local");
 		assert.equal(force.success, true, JSON.stringify(force.errors));
 		const epoch = (await a.canonical()).epoch;
 		const before = await b.saved();

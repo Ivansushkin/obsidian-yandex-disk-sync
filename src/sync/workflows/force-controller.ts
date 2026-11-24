@@ -1,26 +1,28 @@
-import { confirmForceReplacementPlan } from "./force-replacement";
+import {
+	confirmForceReplacementPlan,
+	type PreparedForceReplacement,
+} from "./force-replacement";
+import type { ForceDirection } from "./force-state";
 import type { OperationBackupChoice } from "../../backup/operation-backup-choice";
 import type { BackupProgress, BackupResult } from "../../backup/backup-manager";
 import type { SyncResult, SyncState } from "../../types";
-import type { ForcePreflightProof, SyncRunOptions } from "../contracts";
+import type { ForceRunOptions } from "../contracts";
 import { createSyncFailure } from "../errors";
 import type { FailureSummary } from "../../errors";
 import { logger } from "../../utils/logger";
 
-export type ForceDirection = "from_local" | "from_remote";
+export type { ForceDirection } from "./force-state";
 export type ForcePhase =
 	| "preflight"
 	| "confirming"
 	| "protected-snapshot"
 	| BackupProgress
 	| "syncing"
-	| "persisting"
-	| "reconciling";
+	| "persisting";
 export type ForceOutcome =
 	| "success"
 	| "cancelled"
 	| "blocked"
-	| "backup-failed"
 	| "failed"
 	| "recovery-pending"
 	| "cleanup-pending";
@@ -28,7 +30,6 @@ export type ForceOutcome =
 export interface ForceFlowState {
 	id: number;
 	direction: ForceDirection;
-	migration: boolean;
 	active: boolean;
 	phase: ForcePhase;
 	activity?: SyncState;
@@ -38,7 +39,6 @@ export interface ForceFlowState {
 	failure?: FailureSummary;
 	successful?: number;
 	failed?: number;
-	direct?: boolean;
 }
 
 /** Read-only preparation capabilities scoped to one reserved Force invocation. */
@@ -57,41 +57,24 @@ export interface ForceSyncDependencies {
 	preflight(
 		direction: ForceDirection,
 		preparation: ForcePreparationContext,
-	): Promise<{
-		replacement?: NonNullable<SyncRunOptions["forceReplacement"]>;
-		canonical: ForcePreflightProof["canonical"];
-		migration: boolean;
-	} | null>;
+	): Promise<PreparedForceReplacement | null>;
 	confirm(
-		direction: ForceDirection,
-		migration: boolean,
-		replacement?: SyncRunOptions["forceReplacement"],
-		prepareArchive?: () => Promise<void>,
+		plan: PreparedForceReplacement,
+		prepareArchive: () => Promise<void>,
 	): Promise<OperationBackupChoice>;
 	captureProtectedSnapshot(direction: ForceDirection): Promise<string>;
-	readyForBackup(
-		migration: boolean,
-		replacement?: SyncRunOptions["forceReplacement"],
-	): Promise<boolean>;
-	backupFailure?(
-		replacement?: SyncRunOptions["forceReplacement"],
-	): Promise<"retry" | "without-backup" | "cancel">;
+	readyForBackup(plan: PreparedForceReplacement): Promise<boolean>;
 	backup(
 		direction: ForceDirection,
 		progress: (phase: BackupProgress) => void,
-		replacement?: SyncRunOptions["forceReplacement"],
+		plan: PreparedForceReplacement,
 	): Promise<BackupResult>;
-	beforeMutation(migration: boolean): Promise<void>;
 	run(
 		direction: ForceDirection,
-		options: SyncRunOptions,
+		options: ForceRunOptions,
 	): Promise<SyncResult>;
 	persist(result: SyncResult): Promise<void>;
 	replacementCommitted(): void;
-	reconcile(
-		onActivity: (state: SyncState) => void,
-	): Promise<SyncResult | null>;
-	hasPendingCleanup(): boolean;
 	hasPendingRecovery(): boolean;
 	reportError(error: unknown): void;
 }
@@ -123,7 +106,7 @@ export class ForceSyncController {
 	cancel(): boolean {
 		if (
 			!this.isBusy() ||
-			["syncing", "persisting", "reconciling"].includes(this.state!.phase)
+			["syncing", "persisting"].includes(this.state!.phase)
 		) {
 			return false;
 		}
@@ -158,7 +141,6 @@ export class ForceSyncController {
 		this.state = {
 			id,
 			direction,
-			migration: false,
 			active: true,
 			phase: "preflight",
 		};
@@ -217,9 +199,7 @@ export class ForceSyncController {
 		try {
 			this.deps.open?.(direction);
 			update({});
-			let prepared: Awaited<
-				ReturnType<ForceSyncDependencies["preflight"]>
-			> = null;
+			let prepared: PreparedForceReplacement | null = null;
 			while (!isCancelled()) {
 				try {
 					prepared = await this.deps.preflight(direction, {
@@ -269,324 +249,124 @@ export class ForceSyncController {
 				update({ outcome: "blocked" });
 				return;
 			}
-			update({ migration: prepared.migration });
-			if (prepared.replacement?.plan.recovery.direct) {
-				const replacement = prepared.replacement;
-				update({ direct: true });
-				phase("confirming");
-				const archiveWork: { pending: Promise<void> | null } = {
-					pending: null,
-				};
-				const assertArchiveActive = () => {
-					if (isCancelled()) {
-						throw new Error(
-							"Force archive was cancelled before replacement",
-						);
-					}
-				};
-				const createArchive = async () => {
-					try {
-						assertArchiveActive();
-						if (
-							!(await this.deps.readyForBackup(
-								false,
-								replacement,
-							))
-						) {
-							throw new Error(
-								"Force archive destination is unavailable",
-							);
-						}
-						assertArchiveActive();
-						phase("protected-snapshot");
-						const snapshotDigest =
-							await this.deps.captureProtectedSnapshot(direction);
-						assertArchiveActive();
-						phase("creating-backup");
-						const backup = await this.deps.backup(
-							direction,
-							phase,
-							replacement,
-						);
-						if (
-							!backup.success ||
-							!backup.backupName ||
-							!backup.sha256 ||
-							backup.snapshotDigest !== snapshotDigest
-						) {
-							throw (
-								backup.failureCause ??
-								new Error(
-									backup.error ??
-										"The selected archive was not verified",
-								)
-							);
-						}
-						assertArchiveActive();
-						replacement.plan.recovery.backupProof = {
-							name: backup.backupName,
-							sha256: backup.sha256,
-							snapshotDigest,
-						};
-					} finally {
-						phase("confirming");
-					}
-				};
-				const prepareArchive = () => {
-					if (!archiveWork.pending) {
-						archiveWork.pending = createArchive();
-						void archiveWork.pending.then(
-							() => {
-								archiveWork.pending = null;
-							},
-							() => {
-								archiveWork.pending = null;
-							},
-						);
-					}
-					return archiveWork.pending;
-				};
-				let choice: OperationBackupChoice;
-				try {
-					choice = await this.deps.confirm(
-						direction,
-						false,
-						replacement,
-						prepareArchive,
-					);
-				} finally {
-					// Closing confirmation cancels replacement, but cannot release an active archive scope.
-					await archiveWork.pending?.catch(() => {});
-				}
-				if (choice === "cancel" || isCancelled()) {
-					update({ outcome: "cancelled" });
-					return;
-				}
-				if (
-					choice === "with-backup" &&
-					!replacement.plan.recovery.backupProof
-				) {
-					await prepareArchive();
-				}
-				if (isCancelled()) {
-					update({ outcome: "cancelled" });
-					return;
-				}
-				confirmForceReplacementPlan(replacement.plan);
-				phase("syncing");
-				const result = await this.deps.run(direction, {
-					forceReplacement: { ...replacement, backupMode: choice },
-					onActivity: (activity) => update({ activity }),
-				});
-				committed = result.replacementCommitted === true;
-				phase("persisting");
-				await this.deps.persist(result);
-				update({
-					successful:
-						result.uploaded + result.downloaded + result.deleted,
-					failed: result.errors.length,
-				});
-				if (result.deferred) {
-					update({ outcome: "recovery-pending" });
-					return;
-				}
-				if (!result.success || !committed) {
-					fail(
-						result.errors[0]?.failureCause ??
-							new Error(
-								result.errors[0]?.message ??
-									"Force replacement remains incomplete",
-							),
-						"failed",
-					);
-					return;
-				}
-				this.deps.replacementCommitted();
-				update({ outcome: "success" });
-				return;
-			}
+			const plan = prepared;
 			phase("confirming");
-			let choice = prepared.replacement?.continuing
-				? prepared.replacement.backupMode
-				: await this.deps.confirm(
-						direction,
-						prepared.migration,
-						prepared.replacement,
+			const archiveWork: { pending: Promise<void> | null } = {
+				pending: null,
+			};
+			const assertArchiveActive = () => {
+				if (isCancelled()) {
+					throw new Error(
+						"Force archive was cancelled before replacement",
 					);
+				}
+			};
+			const createArchive = async () => {
+				try {
+					assertArchiveActive();
+					if (!(await this.deps.readyForBackup(plan))) {
+						throw new Error(
+							"Force archive destination is unavailable",
+						);
+					}
+					assertArchiveActive();
+					phase("protected-snapshot");
+					const snapshotDigest =
+						await this.deps.captureProtectedSnapshot(direction);
+					assertArchiveActive();
+					phase("creating-backup");
+					const backup = await this.deps.backup(
+						direction,
+						phase,
+						plan,
+					);
+					if (
+						!backup.success ||
+						!backup.backupName ||
+						!backup.sha256 ||
+						backup.snapshotDigest !== snapshotDigest
+					) {
+						throw (
+							backup.failureCause ??
+							new Error(
+								backup.error ??
+									"The selected archive was not verified",
+							)
+						);
+					}
+					assertArchiveActive();
+					plan.recovery.backupProof = {
+						name: backup.backupName,
+						sha256: backup.sha256,
+						snapshotDigest,
+					};
+				} finally {
+					phase("confirming");
+				}
+			};
+			const prepareArchive = () => {
+				if (!archiveWork.pending) {
+					archiveWork.pending = createArchive();
+					void archiveWork.pending.then(
+						() => {
+							archiveWork.pending = null;
+						},
+						() => {
+							archiveWork.pending = null;
+						},
+					);
+				}
+				return archiveWork.pending;
+			};
+			let choice: OperationBackupChoice;
+			try {
+				choice = await this.deps.confirm(plan, prepareArchive);
+			} finally {
+				// Closing confirmation cancels replacement, but cannot release an active archive scope.
+				await archiveWork.pending?.catch(() => {});
+			}
 			if (choice === "cancel" || isCancelled()) {
 				update({ outcome: "cancelled" });
 				return;
 			}
-			if (prepared.replacement && !prepared.replacement.continuing) {
-				confirmForceReplacementPlan(prepared.replacement.plan);
+			if (choice === "with-backup" && !plan.recovery.backupProof) {
+				await prepareArchive();
 			}
-			if (
-				!prepared.replacement?.continuing &&
-				!(await this.deps.readyForBackup(
-					prepared.migration,
-					prepared.replacement,
-				))
-			) {
-				update({ outcome: "blocked" });
+			if (isCancelled()) {
+				update({ outcome: "cancelled" });
 				return;
 			}
-			let snapshotDigest = "";
-			if (!prepared.replacement) {
-				phase("protected-snapshot");
-				snapshotDigest =
-					await this.deps.captureProtectedSnapshot(direction);
-			}
-			let backupProof: ForcePreflightProof["backup"] = null;
-			while (
-				choice === "with-backup" &&
-				!prepared.replacement?.continuing
-			) {
-				let backup: BackupResult;
-				try {
-					if (prepared.replacement) {
-						phase("protected-snapshot");
-						snapshotDigest =
-							await this.deps.captureProtectedSnapshot(direction);
-					}
-					phase("creating-backup");
-					backup = await this.deps.backup(
-						direction,
-						phase,
-						prepared.replacement,
-					);
-				} catch (error) {
-					const decision = await this.deps.backupFailure?.(
-						prepared.replacement,
-					);
-					if (decision === "retry") {
-						continue;
-					}
-					if (decision === "without-backup") {
-						choice = "without-backup";
-						break;
-					}
-					fail(error, "backup-failed");
-					return;
-				}
-				if (
-					!backup.success ||
-					!backup.backupName ||
-					!backup.sha256 ||
-					backup.snapshotDigest !== snapshotDigest
-				) {
-					const decision = await this.deps.backupFailure?.(
-						prepared.replacement,
-					);
-					if (decision === "retry") {
-						continue;
-					}
-					if (decision === "without-backup") {
-						choice = "without-backup";
-						break;
-					}
-					fail(
-						backup.failureCause ??
-							new Error(
-								backup.error ??
-									"Backup proof did not match the protected snapshot",
-							),
-						"backup-failed",
-					);
-					return;
-				}
-				backupProof = {
-					backupName: backup.backupName,
-					backupSha256: backup.sha256,
-				};
-				break;
-			}
-			if (prepared.replacement && !prepared.replacement.continuing) {
-				prepared.replacement.plan.recovery.backupProof = backupProof
-					? {
-							name: backupProof.backupName,
-							sha256: backupProof.backupSha256,
-							snapshotDigest,
-						}
-					: null;
-			}
+			confirmForceReplacementPlan(plan);
 			phase("syncing");
-			if (
-				prepared.replacement &&
-				!prepared.replacement.continuing &&
-				choice === "with-backup" &&
-				snapshotDigest !==
-					(await this.deps.captureProtectedSnapshot(direction))
-			) {
-				throw new Error(
-					"Force destination changed after archive verification",
-				);
-			}
 			const result = await this.deps.run(direction, {
-				forceReplacement: prepared.replacement
-					? { ...prepared.replacement, backupMode: choice }
-					: undefined,
-				forcePreflightProof: {
-					direction,
-					canonical: prepared.canonical,
-					snapshotDigest,
-					backup: backupProof,
-				},
-				beforeForceMutation: () =>
-					this.deps.beforeMutation(prepared.migration),
+				forceReplacement: { plan, backupMode: choice },
 				onActivity: (activity) => update({ activity }),
 			});
 			committed = result.replacementCommitted === true;
-			if (committed) {
-				this.deps.replacementCommitted();
-			}
 			phase("persisting");
 			await this.deps.persist(result);
-			if (!committed) {
-				const first = result.errors[0];
-				fail(
-					first?.failureCause ??
-						new Error(
-							first?.message ??
-								"Force did not commit a replacement",
-						),
-					"failed",
-				);
-				if (first?.code) {
-					update({ errorCode: first.code });
-				}
+			update({
+				successful:
+					result.uploaded + result.downloaded + result.deleted,
+				failed: result.errors.length,
+			});
+			if (result.deferred) {
+				update({ outcome: "recovery-pending" });
 				return;
 			}
-			if (prepared.replacement && !result.success) {
+			if (!result.success || !committed) {
 				fail(
 					result.errors[0]?.failureCause ??
 						new Error(
 							result.errors[0]?.message ??
-								"Force recovery is unfinished",
+								"Force replacement remains incomplete",
 						),
-					"cleanup-pending",
+					"failed",
 				);
 				return;
 			}
-			phase("reconciling");
-			const reconciled = await this.deps.reconcile((activity) =>
-				update({ activity }),
-			);
-			if (!reconciled?.success || this.deps.hasPendingCleanup()) {
-				fail(
-					reconciled?.errors[0]?.failureCause ??
-						new Error(
-							reconciled?.errors[0]?.message ??
-								"Committed replacement needs finalization",
-						),
-					"cleanup-pending",
-				);
-				return;
-			}
-			update({
-				outcome: "success",
-				successful:
-					result.uploaded + result.downloaded + result.deleted,
-			});
+			this.deps.replacementCommitted();
+			update({ outcome: "success" });
 		} catch (error) {
 			if (isCancelled()) {
 				update({ outcome: "cancelled" });

@@ -1,15 +1,23 @@
-import { confirmForceReplacementPlan } from "../src/sync/workflows/force-replacement";
+import {
+	confirmForceReplacementPlan,
+	type PreparedForceReplacement,
+} from "../src/sync/workflows/force-replacement";
+import { loadPluginData } from "../src/plugin-data-loader";
+import type { ForceRecovery } from "../src/sync/workflows/force-state";
+import { computeSha256 } from "../src/utils/hash-utils";
 import { encryptionFlow } from "./helpers/encryption-flow";
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-	captureLogicalVaultSnapshot,
-	captureRemoteRawSnapshot,
-} from "../src/backup/backup-snapshot";
-import { BackupManager } from "../src/backup/backup-manager";
+import { captureRemoteRawSnapshot } from "../src/backup/backup-snapshot";
 import { createEmptyIndex } from "../src/types";
-import type { ForcePreflightProof } from "../src/sync/contracts";
-import { MemoryDisk, bytes, codecFor, device } from "./helpers/sync-flow";
+import {
+	MemoryDisk,
+	bytes,
+	codecFor,
+	device,
+	runConfirmedForce,
+	seedForceEncryption,
+} from "./helpers/sync-flow";
 import YandexDiskSyncPlugin from "../src/main";
 import type { ForceSyncController } from "../src/sync/workflows/force-controller";
 import type { CanonicalRecovery } from "../src/sync/canonical/recovery";
@@ -54,52 +62,25 @@ function forceUi(a: ReturnType<typeof device>) {
 		prepareForceSync(
 			direction: "from_local" | "from_remote",
 			preparation: import("../src/sync/workflows/force-controller").ForcePreparationContext,
-		): Promise<{
-			canonical: ForcePreflightProof["canonical"];
-			replacement: NonNullable<
-				import("../src/sync/contracts").SyncRunOptions["forceReplacement"]
-			>;
-		} | null>;
+		): Promise<PreparedForceReplacement | null>;
+		runForceSyncFromLocal(): Promise<void>;
+		runForceSyncFromRemote(): Promise<void>;
+		refreshRemoteStartupState(prompt: boolean): Promise<unknown>;
+		forceRecovery: ForceRecovery | null;
+		runFullSync: YandexDiskSyncPlugin["runFullSync"];
 		getForceSyncController(): ForceSyncController;
 	};
 }
 
-/** Exercise the same preflight and optional archive as the UI without mocking sync. */
-async function forceProof(
-	a: ReturnType<typeof device>,
-	direction: "from_local" | "from_remote",
-	withBackup = false,
-): Promise<ForcePreflightProof> {
-	const canonical = await a.index.captureForceCanonicalProof();
-	await a.index.assertLegacyMigrationPathsSafe();
-	const snapshot =
-		direction === "from_local"
-			? await captureRemoteRawSnapshot(a.client, "vault")
-			: await captureLogicalVaultSnapshot(a.adapter);
-	const proof: ForcePreflightProof = {
-		direction,
-		canonical,
-		snapshotDigest: snapshot.digest,
-		backup: null,
-	};
-	if (withBackup) {
-		const backup = new BackupManager(
-			a.client,
-			a.adapter,
-			a.settings,
-			"2.0.0",
-		);
-		const result =
-			direction === "from_local"
-				? await backup.createRemoteSnapshotBackup()
-				: await backup.createBackup();
-		assert.equal(result.success, true, result.error);
-		proof.backup = {
-			backupName: result.backupName!,
-			backupSha256: result.sha256!,
-		};
+/** Initialize the retained legacy canonical transaction at its owning boundary. */
+async function prepareLegacyPublication(a: ReturnType<typeof device>) {
+	const proof = await a.index.captureForceCanonicalProof();
+	const files = a.index.getRemoteIndex().files;
+	a.index.beginForceBootstrap(true);
+	await a.index.assertForceCanonicalProof(proof);
+	for (const [path, metadata] of Object.entries(files)) {
+		a.index.updateRemoteFile(path, metadata);
 	}
-	return proof;
 }
 
 test("stale lock codec fallback reuses stable bytes and stops unresolved reads", async () => {
@@ -519,17 +500,24 @@ test("Force local rebuilds a cleared disk and another device adopts it", async (
 			const previousEpoch = (await a.canonical()).epoch;
 			b.vault.put("Note.md", bytes("offline edit"));
 			disk.files.clear();
-			const canonical = await a.index.captureForceCanonicalProof();
-			await a.index.assertLegacyMigrationPathsSafe();
-			const snapshot = await captureRemoteRawSnapshot(a.client, "vault");
-			const result = await a.engine.forceSyncFromLocal({
-				forcePreflightProof: {
-					direction: "from_local",
-					canonical,
-					snapshotDigest: snapshot.digest,
-					backup: null,
-				},
-			});
+			if (codec) {
+				a.settings.enableEncryption = true;
+				a.settings.encryptionPassword = "synthetic-flow-password";
+			}
+			const result = await runConfirmedForce(a, "from_local");
+			if (codec) {
+				const manifest = await a.index.downloadEncryptionManifest();
+				assert.ok(manifest);
+				const { EncryptionManager } =
+					await import("../src/crypto/encryption-manager");
+				b.client.setEncryptionService(
+					await new EncryptionManager().createCodec(
+						"hardened",
+						manifest.salt,
+						"synthetic-flow-password",
+					),
+				);
+			}
 			assert.equal(result.success, true, JSON.stringify(result.errors));
 			assert.notEqual((await a.canonical()).epoch, previousEpoch);
 			assert.equal((await a.canonical()).deviceId, "device-a");
@@ -576,10 +564,8 @@ test("confirmed Force replaces abandoned bootstrap locks without weakening curre
 					raw.slice(0),
 				);
 			}
-			const proof = await forceProof(a, "from_local", true);
-			const result = await a.engine.forceSyncFromLocal({
-				forcePreflightProof: proof,
-			});
+			await seedForceEncryption(disk, a, codec);
+			const result = await runConfirmedForce(a, "from_local", true);
 			assert.equal(result.success, true, JSON.stringify(result.errors));
 			await a.assertSettled({ "Note.md": "kept" });
 			await a.index.assertLegacyMigrationPathsSafe();
@@ -594,7 +580,7 @@ test("confirmed Force replaces abandoned bootstrap locks without weakening curre
 	}
 });
 
-test("Force proof rejects canonical or lock drift before transfers and replacement commit", async () => {
+test("legacy canonical publication rejects lock drift and a competing canonical", async () => {
 	for (const timing of [
 		"before-apply",
 		"before-commit",
@@ -602,37 +588,46 @@ test("Force proof rejects canonical or lock drift before transfers and replaceme
 	] as const) {
 		const disk = new MemoryDisk();
 		const a = device(disk, "device-a", null);
+		const canonicalPath = "vault/.obsidian-sync-index.json";
 		const path =
 			timing === "canonical-before-commit"
-				? "vault/.obsidian-sync-index.json"
+				? canonicalPath
 				: "vault/.obsidian-sync-index.lock.device-b.attempt";
 		try {
-			a.vault.put("Note.md", bytes("kept"));
-			const proof = await forceProof(a, "from_local");
+			await prepareLegacyPublication(a);
 			const foreign = bytes(JSON.stringify(createEmptyIndex("device-b")));
+			let seed: ArrayBuffer | undefined;
+			disk.afterRequest = async (method, endpoint, target) => {
+				if (
+					method === "PUT" &&
+					endpoint === "/upload" &&
+					target === canonicalPath
+				) {
+					seed = disk.files.get(canonicalPath)?.slice(0);
+				}
+			};
 			if (timing === "before-apply") {
 				disk.files.set(path, foreign);
 			}
-			const result = await a.engine.forceSyncFromLocal({
-				forcePreflightProof: proof,
-				beforeIndexCommit:
+			await assert.rejects(
+				a.index.saveRemoteIndex(
 					timing !== "before-apply"
 						? () => {
 								disk.files.set(path, foreign);
 							}
 						: undefined,
-			});
-			assert.equal(result.success, false);
-			assert.deepEqual(disk.files.get(path), foreign);
-			assert.equal(
-				disk.files.has("vault/.obsidian-sync-index.json"),
-				timing === "canonical-before-commit",
+				),
 			);
-			assert.equal(a.index.getObservedEpoch(), null);
-			if (timing === "before-apply") {
-				assert.equal(disk.files.has("vault/Note.md"), false);
+			assert.deepEqual(disk.files.get(path), foreign);
+			if (timing === "before-commit") {
+				assert.ok(seed);
+				assert.deepEqual(disk.files.get(canonicalPath), seed);
+			} else if (timing === "before-apply") {
+				assert.equal(disk.files.has(canonicalPath), false);
 			}
+			assert.equal(a.index.getObservedEpoch(), null);
 		} finally {
+			disk.afterRequest = undefined;
 			await a.stop();
 		}
 	}
@@ -642,14 +637,11 @@ test("empty Force sources create a readable canonical in both directions", async
 	for (const encrypted of [false, true]) {
 		for (const direction of ["from_local", "from_remote"] as const) {
 			const disk = new MemoryDisk();
-			const a = device(disk, "device-a", await codecFor(encrypted));
+			const codec = await codecFor(encrypted);
+			const a = device(disk, "device-a", codec);
 			try {
-				const proof = await forceProof(a, direction);
-				const options = { forcePreflightProof: proof };
-				const result =
-					direction === "from_local"
-						? await a.engine.forceSyncFromLocal(options)
-						: await a.engine.forceSyncFromRemote(options);
+				await seedForceEncryption(disk, a, codec);
+				const result = await runConfirmedForce(a, direction);
 				assert.equal(
 					result.success,
 					true,
@@ -758,7 +750,7 @@ test("orphan recovery preserves malformed and state-bearing old bootstrap locks"
 	}
 });
 
-test("committed Force cleanup resumes after restart without another Force or archive", async () => {
+test("committed legacy Force cleanup resumes after restart without another Force or archive", async () => {
 	for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
 		const codec = await codecFor(encrypted);
@@ -766,6 +758,8 @@ test("committed Force cleanup resumes after restart without another Force or arc
 		const now = Date.now;
 		try {
 			a.vault.put("Note.md", bytes("kept"));
+			await a.full();
+			disk.files.delete("vault/.obsidian-sync-index.json");
 			const seed = bytes(JSON.stringify(createEmptyIndex("")));
 			const raw = codec ? await codec.encrypt(seed) : seed;
 			for (const id of ["old-a", "old-b"]) {
@@ -774,7 +768,7 @@ test("committed Force cleanup resumes after restart without another Force or arc
 					raw.slice(0),
 				);
 			}
-			const proof = await forceProof(a, "from_local");
+			await prepareLegacyPublication(a);
 			disk.beforeRequest = async (method, _endpoint, path) => {
 				if (
 					method === "DELETE" &&
@@ -783,11 +777,7 @@ test("committed Force cleanup resumes after restart without another Force or arc
 					throw new TypeError("synthetic cleanup failure");
 				}
 			};
-			const result = await a.engine.forceSyncFromLocal({
-				forcePreflightProof: proof,
-			});
-			assert.equal(result.success, false);
-			assert.equal(result.replacementCommitted, true);
+			await assert.rejects(a.index.saveRemoteIndex());
 			const committed = disk.files
 				.get("vault/.obsidian-sync-index.json")!
 				.slice(0);
@@ -819,14 +809,14 @@ test("committed Force cleanup resumes after restart without another Force or arc
 	}
 });
 
-test("a lock changed after replacement commit is preserved and reported", async () => {
+test("legacy publication preserves and reports a lock changed after commit", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	const path = "vault/.obsidian-sync-index.lock.old.attempt";
 	try {
 		a.vault.put("Note.md", bytes("kept"));
 		disk.files.set(path, bytes(JSON.stringify(createEmptyIndex(""))));
-		const proof = await forceProof(a, "from_local");
+		await prepareLegacyPublication(a);
 		const changed = bytes(
 			JSON.stringify(createEmptyIndex("device-b", "new-foreign-epoch")),
 		);
@@ -839,11 +829,7 @@ test("a lock changed after replacement commit is preserved and reported", async 
 				disk.files.set(path, changed);
 			}
 		};
-		const result = await a.engine.forceSyncFromLocal({
-			forcePreflightProof: proof,
-		});
-		assert.equal(result.success, false);
-		assert.equal(result.replacementCommitted, true);
+		await assert.rejects(a.index.saveRemoteIndex());
 		assert.deepEqual(disk.files.get(path), changed);
 		assert.equal(
 			a.index.getObservedEpoch(),
@@ -856,7 +842,7 @@ test("a lock changed after replacement commit is preserved and reported", async 
 	}
 });
 
-test("Force cannot replace a competing canonical created after its absent preflight", async () => {
+test("legacy bootstrap preserves a competing canonical created after absent preflight", async () => {
 	const disk = new MemoryDisk();
 	const a = device(disk, "device-a", null);
 	const path = "vault/.obsidian-sync-index.json";
@@ -866,7 +852,7 @@ test("Force cannot replace a competing canonical created after its absent prefli
 	let replaced = false;
 	try {
 		a.vault.put("Note.md", bytes("kept"));
-		const proof = await forceProof(a, "from_local");
+		await prepareLegacyPublication(a);
 		disk.afterRequest = async (method, endpoint, target) => {
 			if (
 				!replaced &&
@@ -878,10 +864,7 @@ test("Force cannot replace a competing canonical created after its absent prefli
 				disk.files.set(path, foreign);
 			}
 		};
-		const result = await a.engine.forceSyncFromLocal({
-			forcePreflightProof: proof,
-		});
-		assert.equal(result.success, false);
+		await assert.rejects(a.index.saveRemoteIndex());
 		assert.deepEqual(disk.files.get(path), foreign);
 		assert.equal(a.index.getObservedEpoch(), null);
 		assert.equal(
@@ -912,14 +895,14 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 			password: async () => null,
 			progress: () => {},
 		});
-		assert.equal(prepared?.canonical.state, "absent");
+		assert.ok(prepared);
 		assert.equal(
 			(await captureRemoteRawSnapshot(a.client, "vault")).digest,
 			before.digest,
 		);
-		confirmForceReplacementPlan(prepared.replacement.plan);
+		confirmForceReplacementPlan(prepared);
 		const result = await a.engine.forceSyncFromLocal({
-			forceReplacement: prepared.replacement,
+			forceReplacement: { plan: prepared, backupMode: "without-backup" },
 		});
 		assert.equal(result.success, true, JSON.stringify(result.errors));
 		await a.assertSettled({});
@@ -928,49 +911,125 @@ test("Force UI preflight after restart does not attempt normal orphan recovery",
 	}
 });
 
-test("Force UI deletes changed orphan garbage and completes without a normal post-Force merge", async () => {
-	const disk = new MemoryDisk();
-	const a = device(disk, "device-a", null);
-	const path = "vault/.obsidian-sync-index.lock.old.attempt";
-	try {
-		a.vault.put("Note.md", bytes("kept"));
-		disk.files.set(path, bytes(JSON.stringify(createEmptyIndex(""))));
-		const changed = bytes(
-			JSON.stringify(createEmptyIndex("device-b", "foreign-epoch")),
-		);
-		disk.beforeRequest = async (method, _endpoint, target) => {
-			if (method === "DELETE" && target === path) {
-				disk.files.set(path, changed);
-			}
-		};
-		const plugin = forceUi(a);
-		let schedulerStarts = 0;
-		Object.assign(plugin, {
-			automationReady: false,
-			persistence: { failed: false },
-			app: { workspace: { layoutReady: true } },
-			syncScheduler: {
-				start: () => {
-					schedulerStarts++;
+test("both Force actions replace stable 1.1 canonical and complete without a normal post-Force merge", async () => {
+	for (const direction of ["from_local", "from_remote"] as const) {
+		const disk = new MemoryDisk();
+		const a = device(disk, "device-a", null);
+		const path = "vault/.obsidian-sync-index.lock.old.attempt";
+		try {
+			const canonicalPath = "vault/.obsidian-sync-index.json";
+			const stable = bytes(
+				JSON.stringify({
+					version: 2,
+					lastSyncTime: 1,
+					deviceId: "legacy-device",
+					files: {},
+				}),
+			);
+			disk.files.set(canonicalPath, stable);
+			a.vault.put("Note.md", bytes("local"));
+			disk.files.set("vault/Note.md", bytes("remote"));
+			disk.files.set(path, bytes(JSON.stringify(createEmptyIndex(""))));
+			const changed = bytes(
+				JSON.stringify(createEmptyIndex("device-b", "foreign-epoch")),
+			);
+			disk.beforeRequest = async (method, _endpoint, target) => {
+				if (method === "DELETE" && target === path) {
+					disk.files.set(path, changed);
+				}
+			};
+			const plugin = forceUi(a);
+			let schedulerStarts = 0;
+			Object.assign(plugin, {
+				automationReady: false,
+				persistence: { failed: false },
+				app: { workspace: { layoutReady: true } },
+				syncScheduler: {
+					start: () => {
+						schedulerStarts++;
+					},
+					stop: () => {},
 				},
-				stop: () => {},
-			},
-			runFullSync: async () => {
-				throw new Error("Force must not require a post-Force merge");
-			},
-		});
-		const controller = plugin.getForceSyncController();
-		await controller.run("from_local");
-		assert.equal(controller.getState()?.outcome, "success");
-		assert.equal((await a.canonical()).maintenance, undefined);
-		a.assertLocal("Note.md", "kept");
-		assert.deepEqual(disk.files.get("vault/Note.md"), bytes("kept"));
-		assert.equal(disk.files.has(path), false);
-		assert.ok(a.index.getObservedEpoch());
-		assert.equal(schedulerStarts, 1);
-	} finally {
-		disk.beforeRequest = undefined;
-		await a.stop();
+				runFullSync: async () => {
+					throw new Error(
+						"Force must not require a post-Force merge",
+					);
+				},
+			});
+			if (direction === "from_local") {
+				// Staged Force from 1fad609 persisted this shape without a direct remainder.
+				const legacy: ForceRecovery = {
+					completion: null,
+					password: null,
+					id: "legacy-force-id",
+					direction,
+					phase: "applying",
+					backupMode: "without-backup",
+					backupProof: null,
+					epoch: "legacy-force-epoch",
+					remotePath: "vault",
+					rootResourceId: null,
+					originalCanonicalFingerprint: null,
+					serviceCleanup: [
+						{
+							path: path.slice("vault/".length),
+							expectedFingerprint: "legacy-fingerprint",
+						},
+					],
+					sourceDigest: await computeSha256(bytes("[]")),
+					source: [],
+					target: {
+						enabled: false,
+						salt: null,
+						verifier: null,
+						revision: null,
+					},
+					manifest: null,
+					watcherCutoff: [],
+					cleanup: [],
+					targetHashes: {},
+					files: {},
+				};
+				plugin.forceRecovery = loadPluginData({
+					format: "plugin-data",
+					settings: a.settings,
+					...(await a.saved()),
+					encryptionTransition: null,
+					forceRecovery: legacy,
+				})!.forceRecovery;
+				const diskBefore = structuredClone(disk.files);
+				assert.equal(
+					await plugin.refreshRemoteStartupState(false),
+					"blocked",
+				);
+				const blocked = await a.engine.fullSync();
+				assert.equal(blocked.errors[0]?.code, "force-recovery-pending");
+				assert.deepEqual(plugin.forceRecovery, legacy);
+				assert.deepEqual(disk.files, diskBefore);
+				a.assertLocal("Note.md", "local");
+			}
+			const controller = plugin.getForceSyncController();
+			if (direction === "from_local") {
+				await plugin.runForceSyncFromLocal();
+			} else {
+				await plugin.runForceSyncFromRemote();
+			}
+			assert.equal(controller.getState()?.outcome, "success");
+			assert.equal((await a.canonical()).maintenance, undefined);
+			assert.equal(plugin.forceRecovery, null);
+			const expected = direction === "from_local" ? "local" : "remote";
+			a.assertLocal("Note.md", expected);
+			assert.deepEqual(disk.files.get("vault/Note.md"), bytes(expected));
+			assert.deepEqual(Object.keys((await a.canonical()).files), [
+				"Note.md",
+			]);
+			assert.equal(disk.files.has(path), false);
+			assert.ok(a.index.getObservedEpoch());
+			assert.equal(schedulerStarts, 1);
+		} finally {
+			disk.beforeRequest = undefined;
+			await a.stop();
+		}
 	}
 });
 
@@ -1026,7 +1085,7 @@ test("directional Force admission ignores destination maintenance without implic
 	}
 });
 
-test("failed first Force lock write restores a valid seed and a fresh Force converges", async () => {
+test("failed first legacy Force lock write restores a valid seed and a fresh publication converges", async () => {
 	for (const encrypted of [false, true]) {
 		const disk = new MemoryDisk();
 		const a = device(disk, "device-a", await codecFor(encrypted));
@@ -1034,8 +1093,8 @@ test("failed first Force lock write restores a valid seed and a fresh Force conv
 			a.vault.put("Note.md", bytes("kept"));
 			await a.full();
 			const oldEpoch = a.index.getObservedEpoch();
-			disk.files.clear();
-			const proof = await forceProof(a, "from_local");
+			disk.files.delete("vault/.obsidian-sync-index.json");
+			await prepareLegacyPublication(a);
 			let corrupted = false;
 			disk.afterRequest = async (method, endpoint, path) => {
 				if (
@@ -1052,20 +1111,16 @@ test("failed first Force lock write restores a valid seed and a fresh Force conv
 					disk.files.set(path, content.buffer);
 				}
 			};
-			const failed = await a.engine.forceSyncFromLocal({
-				forcePreflightProof: proof,
-			});
-			assert.equal(failed.success, false);
+			await assert.rejects(a.index.saveRemoteIndex());
+			a.index.cancelForceBootstrap();
 			assert.equal(a.index.getObservedEpoch(), oldEpoch);
 			disk.afterRequest = undefined;
 			assert.equal(
 				(await a.index.readCanonicalIndex()).deviceId,
 				"device-a",
 			);
-			const retry = await a.engine.forceSyncFromLocal({
-				forcePreflightProof: await forceProof(a, "from_local"),
-			});
-			assert.equal(retry.success, true, JSON.stringify(retry.errors));
+			await prepareLegacyPublication(a);
+			await a.index.saveRemoteIndex();
 			await a.assertSettled({ "Note.md": "kept" });
 		} finally {
 			disk.afterRequest = undefined;

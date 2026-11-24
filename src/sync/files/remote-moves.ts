@@ -543,9 +543,12 @@ export async function deleteMoveSourceIfUnchanged(
 		) {
 			throw new MoveCleanupAuthorityError();
 		}
-		const physicalTarget = await deps.yandexClient.getLogicalResource(
-			joinPath(deps.settings.remotePath, toPath),
-		);
+		const targetPath = joinPath(deps.settings.remotePath, toPath);
+		const physicalTarget =
+			await deps.yandexClient.getLogicalResource(targetPath);
+		if (physicalTarget?.type !== "file") {
+			throw new MoveCleanupAuthorityError();
+		}
 		const proofFingerprint = verifiedTarget
 			? getStableContentFingerprint(verifiedTarget.resource)
 			: null;
@@ -562,17 +565,20 @@ export async function deleteMoveSourceIfUnchanged(
 				target.changedRevision &&
 			verifiedTarget.metadata.lastModifiedBy === target.lastModifiedBy &&
 			verifiedTarget.metadata.mutationSeq === target.mutationSeq;
-		if (
-			!physicalTarget ||
-			(!proofMatches &&
-				!(await remoteResourceMatchesCanonical(
-					deps,
-					toPath,
-					physicalTarget,
-					target,
-				)))
-		) {
-			throw new MoveCleanupAuthorityError();
+		const matchesCanonicalHash =
+			target.remoteFingerprint &&
+			(target.remoteFingerprint === physicalTarget.sha256 ||
+				target.remoteFingerprint === physicalTarget.md5);
+		if (!proofMatches && !matchesCanonicalHash) {
+			const snapshot = await deps.yandexClient
+				.downloadStableLogicalFile(targetPath, physicalTarget)
+				.catch(() => null);
+			if (
+				!snapshot?.verifiedRawHashAlgorithm ||
+				(await computeSha256(snapshot.content)) !== target.sha256
+			) {
+				throw new MoveCleanupAuthorityError();
+			}
 		}
 		const physicalSource =
 			await deps.yandexClient.getLogicalResource(remotePath);

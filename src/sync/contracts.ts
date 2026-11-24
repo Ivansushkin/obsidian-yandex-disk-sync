@@ -3,12 +3,27 @@ import type {
 	RemoteAuthorityObservation,
 } from "./canonical/manager";
 import type { FailureSummary } from "../errors";
-import type { SyncSessionKind, SyncState } from "../types";
-import { type ForceCanonicalProof } from "./canonical/manager";
+import type { LocalSyncState, SyncSessionKind, SyncState } from "../types";
 
 export type SyncEventCallback = (state: SyncState) => void;
 
-export type IndexSaveCallback = () => void | Promise<void>;
+/** Publish only these reconciliation fields after their coherent device snapshot is saved. */
+export interface RemoteObservation {
+	state: Pick<
+		LocalSyncState,
+		| "observedEpoch"
+		| "observedRevision"
+		| "lastSyncTime"
+		| "files"
+		| "folderTombstones"
+	>;
+	assertCurrent?: () => void;
+	publish(): void;
+}
+
+export type IndexSaveCallback = (
+	observation?: RemoteObservation,
+) => void | Promise<void>;
 
 export interface SyncGuardResult {
 	failure?: FailureSummary;
@@ -51,13 +66,6 @@ export interface SyncRunOptions {
 	trigger?: "manual" | "automatic" | "maintenance";
 	/** One explicit, epoch-bound choice; never retained across replacement generations. */
 	epochAdoption?: { epoch: string; decision: "accept" | "preserve" };
-	/** Direction-verified replacement, created before the destructive confirmation. */
-	forceReplacement?: {
-		continuing?: boolean;
-		plan: import("./workflows/force-replacement").PreparedForceReplacement;
-		backupMode: "with-backup" | "without-backup";
-	};
-
 	/** Report only activity owned by this invocation, including queue preparation. */
 	onActivity?: (state: SyncState) => void;
 	/** Use the startup discovery path inside the regular full-sync session. */
@@ -70,12 +78,6 @@ export interface SyncRunOptions {
 	requireStableCanonical?: boolean;
 	/** Re-run the remote encryption guard through this transition's local block. */
 	validateThroughExternalEncryptionBlock?: boolean;
-	/**
-	 * Skip generation of delete_remote operations. Used by encryption transition
-	 * flows where remote cleanup of stale paths is handled separately as a bulk
-	 * operation, avoiding race conditions from concurrent folder deletions.
-	 */
-	skipRemoteDeletes?: boolean;
 	/** Only a locally confirmed replacement may overwrite competing target bytes. */
 	authoritativeEncryption?: boolean;
 	/** Persist changed per-file references before an authoritative rewrite dispatches bytes. */
@@ -92,27 +94,15 @@ export interface SyncRunOptions {
 	) => Promise<PhysicalRewriteUploadProof>;
 	/** Prevent an epoch race from scheduling more than one immediate follow-up. */
 	epochRetry?: boolean;
-	/** Exact verified backup and pre-backup canonical identity for Force only. */
-	forceBackupProof?: ForceBackupProof;
-	/** Verified source boundaries, with an optional user-selected archive. */
-	forcePreflightProof?: ForcePreflightProof;
-	/** Run a compatible caller pre-mutation hook after Force proof revalidation. */
-	beforeForceMutation?: () => void | Promise<void>;
 }
 
-export interface ForcePreflightProof {
-	direction: "from_local" | "from_remote";
-	canonical: ForceCanonicalProof;
-	snapshotDigest: string;
-	backup: { backupName: string; backupSha256: string } | null;
-}
-
-export interface ForceBackupProof {
-	direction: "from_local" | "from_remote";
-	canonical: ForceCanonicalProof;
-	snapshotDigest: string;
-	backupName: string;
-	backupSha256: string;
+export interface ForceRunOptions {
+	/** Direction-verified replacement, created before the destructive confirmation. */
+	forceReplacement?: {
+		plan: import("./workflows/force-replacement").PreparedForceReplacement;
+		backupMode: "with-backup" | "without-backup";
+	};
+	onActivity?: SyncRunOptions["onActivity"];
 }
 
 export interface SyncLifecycleContext {

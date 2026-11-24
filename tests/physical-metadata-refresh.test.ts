@@ -53,8 +53,7 @@ for (const encrypted of [false, true]) {
 			assert.deepEqual((await a.canonical()).files, source.files);
 			assert.deepEqual(disk.files.get(physicalPath), physicalBytes);
 			disk.beforeRequest = undefined;
-			await a.stop();
-			const saved = await a.saved();
+			const saved = a.crash();
 			assert.equal(
 				saved.pendingWatcherEvents.some(
 					(event) => event.path === "late.md",

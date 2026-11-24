@@ -1,4 +1,4 @@
-import type { YandexResource } from "../types";
+import type { FileMetadata, YandexResource } from "../types";
 
 /**
  * Return a content identity suitable for stable service-file reads.
@@ -105,4 +105,26 @@ export function matchesPhysicalResourceFingerprint(
 		resource.resource_id,
 		resource.modified,
 	].some((candidate) => candidate === expected);
+}
+
+/** Bind an exact read to the listed object; stable IDs alone do not identify content. */
+export function matchesListedFile(
+	listed: FileMetadata,
+	resource: YandexResource,
+): boolean {
+	if (resource.type !== "file") {
+		return false;
+	}
+	const expected = listed.remoteFingerprint;
+	if (
+		expected &&
+		(expected === resource.sha256 || expected === resource.md5)
+	) {
+		return true;
+	}
+	return (
+		(!expected || matchesPhysicalResourceFingerprint(expected, resource)) &&
+		listed.remoteMtime === Date.parse(resource.modified) &&
+		listed.size === resource.size
+	);
 }

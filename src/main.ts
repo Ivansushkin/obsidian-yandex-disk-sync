@@ -34,6 +34,7 @@ import {
 	prepareForceEpochConnection,
 	prepareForceReplacement,
 	type ForceReplacementDependencies,
+	type PreparedForceReplacement,
 } from "./sync/workflows/force-replacement";
 import type { ForceRecovery } from "./sync/workflows/force-state";
 import { DecisionModal } from "./ui/decision-modal";
@@ -82,17 +83,9 @@ import {
 	type StartupState,
 } from "./plugin-startup";
 import { YandexDiskSyncSettingTab } from "./settings";
-import {
-	LegacyIndexFormatError,
-	LegacyPluginDataExposureError,
-	LegacyServicePathCollisionError,
-} from "./sync/canonical/errors";
+import { LegacyIndexFormatError } from "./sync/canonical/errors";
 import { IndexManager } from "./sync/canonical/manager";
-import {
-	SyncEngine,
-	type ForceBackupProof,
-	type SyncRunOptions,
-} from "./sync/engine";
+import { SyncEngine, type SyncRunOptions } from "./sync/engine";
 import { createSyncFailure, formatOperationFailure } from "./sync/errors";
 import { FileWatcher } from "./sync/realtime/watcher";
 import { SyncScheduler } from "./sync/scheduler";
@@ -129,15 +122,6 @@ import {
 	shortenDiagnosticValue,
 } from "./utils/logger";
 import { generateDeviceId } from "./utils/path-utils";
-
-class LegacyTokenRotationRequiredError extends Error {
-	constructor() {
-		super(
-			"OAuth token rotation is required after legacy plugin-data exposure",
-		);
-		this.name = "LegacyTokenRotationRequiredError";
-	}
-}
 
 export default class YandexDiskSyncPlugin extends Plugin {
 	settings: YandexDiskSyncSettings = DEFAULT_SETTINGS;
@@ -198,7 +182,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				this.encryptionService = null;
 				this.yandexClient?.setEncryptionService(null);
 				this.indexManager?.clearIndexTransitionServices();
-				this.legacyExposedTokenInSession = null;
 			}
 			this.publishSettingsToComponents();
 		},
@@ -220,8 +203,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private historicalBlockReason: string | null = null;
 	private authenticationBlockReason: string | null = null;
 	private forceBlockReason: string | null = null;
-	private legacyExposureRemediationPending = false;
-	private legacyExposedTokenInSession: string | null = null;
 
 	private regularSyncStarted = false;
 	private automationReady = false;
@@ -254,8 +235,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (this.unloaded) {
 			return;
 		}
-		this.legacyExposureRemediationPending =
-			this.readLegacyExposureRemediationFlag();
 
 		// Configure logger from settings
 		logger.configure({
@@ -506,9 +485,9 @@ export default class YandexDiskSyncPlugin extends Plugin {
 					).open(),
 				),
 		);
-		this.syncEngine.setIndexSaveCallback(async () => {
-			await this.persistPluginData();
-		});
+		this.syncEngine.setIndexSaveCallback((observation) =>
+			this.persistence.persist(undefined, observation),
+		);
 		this.syncEngine.setSyncGuardCallback(
 			async (validationToken, observation, knownManifest) => {
 				const hostBlock = () => {
@@ -2213,11 +2192,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	private async prepareForceSync(
 		direction: ForceDirection,
 		preparation: ForcePreparationContext,
-	): Promise<{
-		canonical: ForceBackupProof["canonical"];
-		migration: boolean;
-		replacement?: NonNullable<SyncRunOptions["forceReplacement"]>;
-	} | null> {
+	): Promise<PreparedForceReplacement | null> {
 		if (!(await this.ensureFreshAuthorization())) {
 			return null;
 		}
@@ -2227,7 +2202,7 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		this.restoreLocalStateOnce();
 		this.registerSyncLifecycleOnce();
 		const dependencies = this.forceReplacementDependencies();
-		const plan = await prepareForceReplacement(
+		return await prepareForceReplacement(
 			{
 				...dependencies,
 				password: (create, invalid) =>
@@ -2239,16 +2214,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			direction,
 			true,
 		);
-		return plan
-			? {
-					canonical: { state: "absent" },
-					migration: false,
-					replacement: {
-						plan,
-						backupMode: "without-backup",
-					},
-				}
-			: null;
 	}
 
 	private async captureForceSnapshot(
@@ -2280,7 +2245,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 	/** Compose the shared Force workflow; the controller owns its lifetime. */
 	getForceSyncController(): ForceSyncController {
 		if (!this.forceSyncController) {
-			let replacementResult: SyncResult | null = null;
 			let modal: ForceSyncModal | null = null;
 			this.forceSyncController = new ForceSyncController({
 				open: (direction) => {
@@ -2296,139 +2260,48 @@ export default class YandexDiskSyncPlugin extends Plugin {
 				isSyncBusy: () => this.isForceSyncUnavailable(),
 				preflight: (direction, preparation) =>
 					this.prepareForceSync(direction, preparation),
-				confirm: (
-					_direction,
-					_migration,
-					replacement,
-					prepareArchive,
-				) =>
-					modal?.confirm(replacement?.plan, prepareArchive) ??
+				confirm: (plan, prepareArchive) =>
+					modal?.confirm(plan, prepareArchive) ??
 					Promise.resolve("cancel"),
 				captureProtectedSnapshot: (direction) =>
 					this.captureForceSnapshot(direction),
-				readyForBackup: async (_migration, replacement) => {
-					if (replacement) {
-						await ensureForceRoot(
-							this.forceReplacementDependencies(),
-							replacement.plan,
-						);
-					}
+				readyForBackup: async (plan) => {
+					await ensureForceRoot(
+						this.forceReplacementDependencies(),
+						plan,
+					);
 					return true;
 				},
-				backupFailure: (replacement) =>
-					!replacement
-						? Promise.resolve("cancel" as const)
-						: new Promise((resolve) =>
-								new DecisionModal<
-									"retry" | "without-backup" | "cancel"
-								>(
-									this.app,
-									t("force.backup_failed_title"),
-									t("force.backup_failed_description"),
-									[
-										{
-											label: t("force.retry"),
-											value: "retry" as const,
-										},
-										{
-											label: t(
-												"modal.continue_without_backup",
-											),
-											value: "without-backup" as const,
-										},
-										{
-											label: t("modal.cancel_button"),
-											value: "cancel" as const,
-										},
-									],
-									"cancel",
-									resolve,
-								).open(),
-							),
-				backup: async (direction, progress, replacement) => {
-					const create = () =>
+				backup: async (direction, progress, plan) =>
+					await this.indexManager.withForceScope(plan.recovery, () =>
 						direction === "from_local"
 							? this.backupManager.createRemoteSnapshotBackup(
-									replacement?.plan.password ?? undefined,
+									plan.password ?? undefined,
 									progress,
 									true,
 								)
 							: this.backupManager.createBackup(
-									replacement?.plan.password ?? undefined,
+									plan.password ?? undefined,
 									progress,
 									true,
-								);
-					return replacement
-						? await this.indexManager.withForceScope(
-								replacement.plan.recovery,
-								create,
-							)
-						: await create();
-				},
-				beforeMutation: async (migration) => {
-					if (
-						migration &&
-						!(await this.recheckLegacyMigrationSafety())
-					) {
-						throw new Error(
-							"Legacy migration safety changed before Force cutover",
-						);
-					}
-				},
-				run: async (direction, options) => {
-					replacementResult = null;
-					const result =
-						direction === "from_local"
-							? await this.syncEngine.forceSyncFromLocal(options)
-							: await this.syncEngine.forceSyncFromRemote(
-									options,
-								);
-					if (options.forceReplacement && result.success) {
-						replacementResult = result;
-					}
-					return result;
-				},
+								),
+					),
+				run: (direction, options) =>
+					direction === "from_local"
+						? this.syncEngine.forceSyncFromLocal(options)
+						: this.syncEngine.forceSyncFromRemote(options),
 				persist: async () => {
 					await this.persistPluginData();
 				},
 				replacementCommitted: () => {
 					this.setMigrationBlock(null);
-					if (replacementResult) {
-						this.setEncryptionBlock(null);
-						this.setHistoricalBlock(null);
-						this.setAuthenticationBlock(null);
-						this.automationReady = true;
-					}
-
+					this.setEncryptionBlock(null);
+					this.setHistoricalBlock(null);
+					this.setAuthenticationBlock(null);
+					this.automationReady = true;
 					this.remoteStateValidated = false;
 				},
-				reconcile: async (onActivity) => {
-					if (replacementResult && this.syncEngine.isSyncPaused()) {
-						this.automationReady = true;
-						return replacementResult;
-					}
-					const result = await this.runFullSync(
-						{ onActivity, trigger: "maintenance" },
-						false,
-						true,
-					);
-					if (result?.success) {
-						await this.indexManager.assertForceCleanupComplete();
-					}
-					if (
-						result?.success &&
-						!this.unloaded &&
-						!this.syncEngine.isSyncPaused()
-					) {
-						this.automationReady = true;
-						this.startAutomationIfReady();
-					}
-					return result;
-				},
 				hasPendingRecovery: () => this.forceRecovery !== null,
-				hasPendingCleanup: () =>
-					this.indexManager.getPendingPhysicalActions().length > 0 ||
-					this.indexManager.getMaintenance() !== undefined,
 				reportError: (error) =>
 					logger.error("Force workflow failed", { error }),
 			});
@@ -2495,41 +2368,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		}
 		this.syncIndicator?.update();
 		this.updateSettingsStatusNotice();
-	}
-
-	private async recheckLegacyMigrationSafety(): Promise<boolean> {
-		try {
-			await this.indexManager.assertLegacyMigrationPathsSafe();
-			if (this.legacyExposureRemediationPending) {
-				throw new LegacyTokenRotationRequiredError();
-			}
-			return true;
-		} catch (error) {
-			if (error instanceof LegacyPluginDataExposureError) {
-				this.markLegacyExposureRemediationRequired();
-				this.setMigrationBlock(t("notice.legacy_plugin_data_exposure"));
-				return false;
-			}
-			if (error instanceof LegacyServicePathCollisionError) {
-				this.setMigrationBlock(t("notice.legacy_service_collision"));
-				return false;
-			}
-			if (error instanceof LegacyTokenRotationRequiredError) {
-				this.setMigrationBlock(
-					t("notice.legacy_token_rotation_required"),
-				);
-				return false;
-			}
-			logger.warn("Legacy migration safety recheck failed", { error });
-			this.presentOperationIssue(
-				"force-preflight",
-				t("notice.force_sync_exception", {
-					message:
-						error instanceof Error ? error.message : String(error),
-				}),
-			);
-			return false;
-		}
 	}
 
 	/** Run the local-to-remote Force flow once. */
@@ -2738,59 +2576,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			getBasePath?: () => string;
 		};
 		return adapter?.getBasePath?.() || this.app.vault.getName();
-	}
-
-	private getLegacyExposureStorageKey(): string {
-		return `yandex-disk-sync:legacy-exposure:${this.getVaultStorageScope()}`;
-	}
-
-	private readLegacyExposureRemediationFlag(): boolean {
-		try {
-			return (
-				window.localStorage?.getItem(
-					this.getLegacyExposureStorageKey(),
-				) === "required"
-			);
-		} catch {
-			return false;
-		}
-	}
-
-	private markLegacyExposureRemediationRequired(): void {
-		this.legacyExposureRemediationPending = true;
-		this.legacyExposedTokenInSession = this.settings.yandexTokenSecret;
-		try {
-			window.localStorage?.setItem(
-				this.getLegacyExposureStorageKey(),
-				"required",
-			);
-		} catch {
-			// The in-memory block still protects this plugin session.
-		}
-	}
-
-	private clearLegacyExposureRemediation(): void {
-		this.legacyExposureRemediationPending = false;
-		try {
-			window.localStorage?.removeItem(this.getLegacyExposureStorageKey());
-		} catch {
-			// The remote safety check still runs before every migration Force.
-		}
-	}
-
-	private updateLegacyExposureAfterTokenChange(tokenChanged: boolean): void {
-		if (
-			tokenChanged &&
-			this.settings.yandexTokenSecret &&
-			this.settings.yandexTokenSecret !== this.legacyExposedTokenInSession
-		) {
-			this.clearLegacyExposureRemediation();
-		} else if (
-			this.legacyExposedTokenInSession !== null &&
-			this.settings.yandexTokenSecret === this.legacyExposedTokenInSession
-		) {
-			this.markLegacyExposureRemediationRequired();
-		}
 	}
 
 	private configurationUpdatePending = false;
@@ -3031,9 +2816,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 		if (setLanguagePreference(this.settings.language)) {
 			this.refreshLocalizedUi();
 		}
-		const tokenChanged =
-			this.configuredToken !== null &&
-			this.configuredToken !== this.settings.yandexTokenSecret;
 		const remoteConfigurationChanged =
 			this.configuredToken !== null &&
 			(this.configuredToken !== this.settings.yandexTokenSecret ||
@@ -3086,7 +2868,6 @@ export default class YandexDiskSyncPlugin extends Plugin {
 			this.invalidateRemoteStateClassification();
 		}
 		this.mobileRecovery?.notifyActivityChanged();
-		this.updateLegacyExposureAfterTokenChange(tokenChanged);
 		if (this.yandexClient) {
 			this.configuredToken = this.settings.yandexTokenSecret;
 			this.configuredRemotePath = this.settings.remotePath;

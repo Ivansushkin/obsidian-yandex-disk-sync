@@ -19,14 +19,21 @@ const versions = readJson("versions.json");
 const version = packageJson.version;
 const stableVersion = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 
-if (typeof version !== "string" || !stableVersion.test(version)) {
-	fail("package version must have the stable x.y.z format");
+// Compatibility entries and changelog sections are keyed by stable release.
+const releaseLine =
+	typeof version === "string"
+		? version.replace(/-beta\.(?:0|[1-9]\d*)$/u, "")
+		: "";
+if (!stableVersion.test(releaseLine)) {
+	fail("package version must have the x.y.z or x.y.z-beta.N format");
 }
 if (manifest.version !== version) {
 	fail("package and manifest versions differ");
 }
-if (versions[version] !== manifest.minAppVersion) {
-	fail(`versions.json does not map ${version} to ${manifest.minAppVersion}`);
+if (versions[releaseLine] !== manifest.minAppVersion) {
+	fail(
+		`versions.json does not map ${releaseLine} to ${manifest.minAppVersion}`,
+	);
 }
 
 const historicalFallbacks = {
@@ -60,7 +67,7 @@ const releasesNewestFirst = Object.keys(versions).sort((left, right) =>
 	right.localeCompare(left, "en", { numeric: true }),
 );
 if (
-	changelogVersions[0] !== version ||
+	changelogVersions[0] !== releaseLine ||
 	JSON.stringify(changelogVersions) !== JSON.stringify(releasesNewestFirst)
 ) {
 	fail(
@@ -97,7 +104,11 @@ if (releaseTag !== undefined) {
 
 const runtime = packageJson.dependencies ?? {};
 const development = packageJson.devDependencies ?? {};
-if (runtime["@noble/ciphers"] !== "2.2.0" || runtime.fflate !== "0.8.3") {
+if (
+	runtime["@noble/ciphers"] !== "2.2.0" ||
+	runtime["@noble/hashes"] !== "2.4.0" ||
+	runtime.fflate !== "0.8.3"
+) {
 	fail("runtime dependency pins changed");
 }
 if (runtime.obsidian || development.obsidian !== "1.13.1") {

@@ -1,5 +1,74 @@
 # Changelog
 
+## 2.5.0
+
+Changes since `2.4.0`. Requires Obsidian `1.13.1` or later.
+
+### Changed
+
+- Local deletion during Force and reception after an encryption change follows
+  Obsidian's deletion preference. Local replacement preserves files outside
+  Obsidian's file tree and stops if a replacement would overwrite them.
+- The vault root's `.trash` is excluded from sync, Force replacement and
+  encryption changes on both sides, including recovery of older queued work.
+- Force from Disk verifies and fetches independent files concurrently and
+  applies local writes in order. Force and ordinary full sync group downloads
+  by file size to limit how much content is held in memory at once.
+
+### Fixed
+
+- Force recovery after a lost response to the final index upload preserves
+  revisions published later by another device. Regular full sync receives
+  those edits before acknowledging their revision.
+- A pending Force deletion holds back copies and folder creation at affected
+  paths. A file or folder that changed type while awaiting deletion is preserved,
+  and unrelated transfers continue.
+- Recreating a deleted file offline preserves a concurrent edit at the original
+  path and saves the recreated version in one conflict copy. If the published
+  version has returned to its original contents, the recreated file keeps its
+  original path.
+- Late writes to the old encrypted trash stay outside the vault after key
+  rotation or decryption. A device with the new password can finish interrupted
+  rotation cleanup once it verifies that the old file is already absent.
+- Full sync checks downloaded content before writing it locally. A stale
+  response leaves the published version available for the next sync. Verified
+  edits made directly on Disk still reach connected devices.
+- If Disk returns stale bytes for the sync index, the plugin requests a fresh
+  download link and verifies the index before applying it.
+- A folder rename can now finish when another device last edited its files,
+  including when identical copies already exist at the destination.
+- Full sync records the last successful revision and time after saving the
+  local state. A failed save leaves the sync available to retry.
+- Avoid false conflict copies after an interrupted sync when only one device
+  edited a file, including when Disk supplies only an MD5 checksum for the
+  interrupted upload. Recover conflicts in queue order alongside pending uploads,
+  moves and deletions, including retries after a conflict fails mid-batch.
+- Preserve files created or edited by another device after an offline folder
+  deletion. If a device deletes a folder while its peer is offline, the peer's
+  new files and edits sync back on reconnect, including after a restart.
+  Unchanged files stay deleted. Verified edits made directly on Disk can also
+  survive the deletion.
+- Preserve hidden files when deleting the last visible note in a folder.
+  Ordinary sync asks the adapter to remove an empty parent non-recursively.
+  If the adapter refuses, the folder stays and the note deletion still completes.
+- Resume interrupted Force copies into hidden folders and keep a copy pending
+  if Disk returns invalid file metadata or the local recovery state fails to save.
+- Hidden names that differ only by case can coexist during Force recovery when
+  they are outside the remaining destinations. A name or type collision with a
+  remaining destination still blocks that write.
+- Allow Force from Disk to skip directories left by an earlier encryption mode
+  after verifying that the full subtree contains no files. Preserve exclusions
+  from earlier encryption changes during recovery.
+- Handle programmatic moves into and out of the vault root's `.trash` during
+  realtime sync.
+
+### Upgrade
+
+- Existing sync indexes and encryption metadata retain their formats. Either
+  direction of Force can replace a supported legacy index using the standard
+  confirmation and optional archive. If an older saved Force operation cannot
+  safely resume, the plugin asks for confirmation of a new replacement.
+
 ## 2.4.0
 
 Changes since `2.3.0`. Requires Obsidian `1.13.1` or later.
